@@ -1,0 +1,68 @@
+# Phase-chained sweep for a hypothetical 16 MB language model.
+#
+# Phase 1: pick the best n_layers at default lr/wd/dropout.
+# Phase 2: with n_layers locked, find the best lr.
+# Phase 3: with n_layers + lr locked, tune regularization (wd, dropout).
+
+experiment: tiny_lm_16mb
+storage: sqlite:///./runs/phases.db
+workdir: ./runs
+trial_command: "python examples/fake_train.py --out {trial_dir}/result.json {overrides}"
+override_format: hydra
+
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json
+    path: result.json
+    key: eval_loss
+
+constraints:
+  - name: param_bytes
+    extractor:
+      type: json
+      path: result.json
+      key: param_bytes
+    max: 16777216  # 16 MiB
+
+phases:
+  - name: depth
+    comment: |
+      Settle on a network depth before tuning anything else.
+      Grid over a small set of integer choices because we expect a clear
+      optimum near 8 layers under the 16 MB constraint, and we want every
+      depth to actually run (TPE could miss the boundary cases).
+    n_trials: 4
+    sampler:
+      type: grid
+    search_space:
+      n_layers: { type: categorical, choices: [4, 8, 12, 16] }
+
+  - name: lr
+    comment: |
+      With depth locked, find the LR. Log-scale sweep over four orders of
+      magnitude — that's where LRs live. TPE is fine here; the response
+      surface is smooth in log-LR.
+    inherits: [depth]
+    n_trials: 12
+    sampler:
+      type: tpe
+      seed: 0
+      n_startup_trials: 4
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+
+  - name: regularization
+    comment: |
+      Last: jointly tune weight_decay and dropout. They interact, so a
+      single TPE phase over both is more efficient than two greedy 1D sweeps.
+    inherits: [lr]   # lr transitively carries depth.n_layers; no need to list depth.
+    n_trials: 16
+    sampler:
+      type: tpe
+      seed: 1
+      n_startup_trials: 4
+    search_space:
+      weight_decay: { type: float, low: 0.0, high: 0.3 }
+      dropout: { type: float, low: 0.0, high: 0.3 }

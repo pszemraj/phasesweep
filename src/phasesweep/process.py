@@ -1,0 +1,754 @@
+"""Child process lifecycle management.
+
+Owns the dangerous parts: process groups, signal forwarding, PID tracking,
+and graceful + forceful termination. Every child subprocess created by
+phasesweep goes through this module.
+
+Design:
+  - Children run in their own process group (start_new_session=True) so we
+    can kill the whole tree with os.killpg, not just the shell.
+  - A global registry of live children lets us clean up on orchestrator death.
+  - PID files in each trial_dir let operators identify orphans manually.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import signal
+import subprocess
+import threading
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from types import FrameType
+from typing import IO
+
+log = logging.getLogger("phasesweep.process")
+
+_KILL_GRACE_SECONDS = 10.0
+
+# ---------------------------------------------------------------------------
+# Global child registry + signal handler
+# ---------------------------------------------------------------------------
+
+_lock = threading.Lock()
+_active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
+# signal.signal returns the previous handler, which can be a callable, an int
+# constant (SIG_IGN/SIG_DFL), or None. We don't actually need to restore them
+# anywhere right now, but keep the slots typed correctly for if we do.
+_HandlerType = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+_original_sigterm: _HandlerType = None
+_original_sigint: _HandlerType = None
+_installed = False
+
+# The launch lock guards the Popen() -> _register() critical section so the
+# shutdown handler cannot snapshot _active_children while a child has been
+# spawned but not yet registered (review v0.5.7 / blocker 3). The handler
+# acquires the same lock before snapshotting, which forces it to wait until
+# every in-flight launch has either registered its PGID or failed.
+_launch_lock = threading.Lock()
+_SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGTERM, signal.SIGINT)
+
+
+def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
+    """Kill all tracked child process groups, then exit.
+
+    CRITICAL: we must NOT call proc.wait() here because the main thread may
+    already be inside proc.wait() on the same Popen object, and Python's
+    internal _waitpid_lock is non-reentrant. Calling wait() from the signal
+    handler would deadlock.
+
+    Instead: send SIGTERM to all groups, brief sleep, SIGKILL for stragglers,
+    then raise SystemExit. The original wait() call unblocks when the child dies.
+
+    We snapshot the PGID set once under the lock and use that snapshot for both
+    the SIGTERM and SIGKILL phases (review v0.5.5 / blocker 1). Without this,
+    a worker thread can unregister a PGID after the root process exits on
+    SIGTERM but before we escalate to SIGKILL — leaving descendants alive.
+
+    The handler also acquires ``_launch_lock`` before snapshotting (review
+    v0.5.7 / blocker 3) so a child that was just ``Popen()``-ed but not yet
+    ``_register()``-ed cannot escape the snapshot. The launch path holds
+    ``_launch_lock`` across both calls; this handler will block until the
+    launch site releases it, then see the new PGID in ``_active_children``.
+
+    Args:
+        signum: The signal number that fired (``SIGTERM`` or ``SIGINT``).
+        frame: The interrupted stack frame at signal-delivery time; unused
+            but required by the ``signal.signal`` handler protocol.
+
+    Raises:
+        SystemExit: Always, with exit code ``128 + signum`` (POSIX
+            ``signaled-exit`` convention).
+
+    """
+    import time
+
+    with _launch_lock, _lock:
+        pgids = list(_active_children)
+
+    log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
+
+    # Phase 1: SIGTERM all groups.
+    for pgid in pgids:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGTERM)
+
+    if pgids:
+        time.sleep(0.5)  # Brief grace for clean shutdown.
+
+    # Phase 2: SIGKILL any survivors from the *same snapshot*.
+    for pgid in pgids:
+        if _process_group_alive(pgid):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pgid, signal.SIGKILL)
+
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers() -> None:
+    """Install SIGTERM/SIGINT handlers that clean up child process groups.
+
+    Safe to call multiple times; only installs once. Must be called from the
+    main thread.
+    """
+    global _original_sigterm, _original_sigint, _installed  # noqa: PLW0603
+    if _installed:
+        return
+    try:
+        _original_sigterm = signal.signal(signal.SIGTERM, _shutdown_handler)
+        _original_sigint = signal.signal(signal.SIGINT, _shutdown_handler)
+        _installed = True
+    except ValueError:
+        log.debug("Cannot install signal handlers (not on main thread)")
+
+
+@contextlib.contextmanager
+def _defer_shutdown_signals() -> Iterator[None]:
+    """Temporarily block SIGTERM/SIGINT in the calling thread.
+
+    Used to keep the ``Popen() -> _register()`` window atomic from the
+    perspective of the signal handler (review v0.5.7 / blocker 3). CPython
+    delivers signals to the main thread, so when ``n_jobs == 1`` the same
+    thread is both the launcher and the handler target — taking
+    ``_launch_lock`` from the handler would deadlock against the launcher's
+    own lock acquisition. Blocking the signal at the kernel level instead
+    queues it until the launcher exits the critical section.
+
+    For worker threads (``n_jobs > 1``) the handler still runs on the main
+    thread, so the signal-mask state of the worker is irrelevant. The
+    ``_launch_lock`` acquired by the launcher closes the race in that case.
+
+    No-op on platforms without ``signal.pthread_sigmask`` (Windows).
+
+    Yields:
+        ``None``. Use as ``with _defer_shutdown_signals(): ...``.
+
+    """
+    if hasattr(signal, "pthread_sigmask"):
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    else:
+        yield
+
+
+def _register(proc: subprocess.Popen) -> int:
+    """Add a freshly-launched subprocess to the global child registry.
+
+    Args:
+        proc: The ``Popen`` object returned by a just-completed ``Popen()`` call.
+
+    Returns:
+        The process-group ID (``pgid``) the subprocess was registered under.
+        Callers store this for later ``_unregister`` and signal targeting.
+
+    """
+    pgid = os.getpgid(proc.pid)
+    with _lock:
+        _active_children[pgid] = proc
+    return pgid
+
+
+def _unregister(pgid: int) -> None:
+    """Remove a finished process group from the global child registry.
+
+    Defers shutdown signals while holding ``_lock`` so the signal handler
+    (which also acquires ``_lock``) cannot interrupt and deadlock against
+    the same thread (review v0.5.9 / blocker 2).
+
+    Args:
+        pgid: The process-group ID returned by :func:`_register`. A pgid not
+            currently registered is silently ignored.
+
+    """
+    with _defer_shutdown_signals(), _lock:
+        _active_children.pop(pgid, None)
+
+
+def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
+    """Terminate the trial process group and return whether cleanup is confirmed.
+
+    Returns ``True`` when the group is confirmed gone, ``False`` when cleanup
+    is uncertain (survived SIGKILL, permission denied, etc.). Callers must
+    propagate uncertainty so the orchestrator can refuse to schedule more work
+    onto a potentially-leaked GPU (review v0.5.9 / blocker 3).
+
+    Args:
+        pgid: Process-group ID of the trial subprocess.
+        proc: The root subprocess's :class:`subprocess.Popen` handle. Used
+            for a final non-blocking ``wait`` to reap the zombie root.
+
+    Returns:
+        ``True`` if every process in the group is gone after the SIGTERM →
+        SIGKILL escalation; ``False`` if at least one survived or cleanup
+        status was inconclusive.
+
+    """
+    cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
+    if proc.poll() is not None:
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=0)
+    return cleanup_confirmed
+
+
+# ---------------------------------------------------------------------------
+# Supervised subprocess execution
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProcessResult:
+    """Result of a supervised subprocess execution."""
+
+    return_code: int
+    timed_out: bool
+    pid: int
+    duration_seconds: float
+    failure_reason: str | None = None
+    cleanup_confirmed: bool = True
+
+
+def run_supervised(
+    cmd: str,
+    *,
+    env: dict[str, str],
+    stdout: IO[str],
+    stderr: IO[str],
+    timeout: float | None,
+    trial_dir: Path,
+) -> ProcessResult:
+    """Launch a shell command in its own process group with full lifecycle management.
+
+    On launch, writes three identity files into ``trial_dir``:
+
+    * ``pid`` — root subprocess PID, for forensic identification.
+    * ``pgid`` — process-group ID, used by the stale reaper as a fallback when
+      the root PID has exited but descendants are still alive (review v0.5.2 /
+      blocker 7). Without this, a reaper that only knows the root PID cannot
+      recover the PGID via ``os.getpgid`` once the shell has exited.
+    * ``pid_starttime`` — ``/proc/<pid>/stat`` field 22, used to detect PID
+      reuse so the reaper never kills an unrelated process that recycled the PID.
+
+    Identity files are removed only on a fully clean exit: root returned 0
+    **and** no descendant processes were left alive. If the root exits cleanly
+    but leaves GPU-holding descendants running, we treat that as a lifecycle
+    failure, kill the group, and preserve identity files for forensics (review
+    v0.5.5 / blocker 1).
+
+    On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
+
+    Args:
+        cmd: Shell command string to execute (passed to ``Popen(shell=True)``).
+        env: Full process environment for the subprocess.
+        stdout: Already-open file handle that receives the subprocess stdout.
+        stderr: Already-open file handle that receives the subprocess stderr.
+        timeout: Wall-clock timeout in seconds, or ``None`` for no timeout.
+        trial_dir: Per-trial directory; identity files (``pid``, ``pgid``,
+            ``pid_starttime``) are written here.
+
+    Returns:
+        :class:`ProcessResult` capturing return code, wall-clock duration,
+        timeout flag, ``failure_reason`` (set on timeout or descendant
+        survival), and ``cleanup_confirmed`` (``False`` when SIGKILL did not
+        confirm the group is gone).
+
+    """
+    import time
+
+    started = time.time()
+
+    # The launch + register + identity-file writes must be atomic from the
+    # signal handler's perspective. Signal deferral MUST come first so that
+    # SIGTERM/SIGINT cannot land between ``_launch_lock`` acquisition and
+    # signal masking (review v0.5.9 / blocker 2). Reversing the order
+    # (``_launch_lock`` first, then ``_defer_shutdown_signals()``) creates
+    # two deadlock windows:
+    #
+    # 1. Signal lands after lock acquired but before mask set: handler runs
+    #    in same thread and blocks on the lock it already holds.
+    # 2. On exit, mask is restored before lock released: pending signal is
+    #    delivered while the thread still owns the lock -> same deadlock.
+    #
+    # Correct ordering: block signals -> take lock -> work -> release lock
+    # -> unblock signals. Any pending signal is delivered after the lock is
+    # released, so the handler can safely acquire it.
+    with _defer_shutdown_signals(), _launch_lock:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,  # noqa: S602
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+
+        # Register in the global child registry immediately so the signal handler
+        # can reach this group even if we haven't written files yet.
+        pgid = _register(proc)
+
+        pid_path = trial_dir / "pid"
+        pgid_path = trial_dir / "pgid"
+        starttime_path = trial_dir / "pid_starttime"
+
+        pid_path.write_text(f"{proc.pid}\n")
+        pgid_path.write_text(f"{pgid}\n")
+
+        starttime = read_proc_starttime(proc.pid)
+        if starttime is not None:
+            starttime_path.write_text(f"{starttime}\n")
+
+    timed_out = False
+    failure_reason: str | None = None
+    cleanup_confirmed = True
+
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            failure_reason = f"timeout after {timeout}s"
+            log.warning("Trial PID %d (pgid %d) timed out — terminating group", proc.pid, pgid)
+            cleanup_confirmed = _kill_group(pgid, proc)
+        else:
+            # Root process exited normally. That is not sufficient — the trial
+            # is only clean once the entire process group is gone. A common
+            # pathological case: `python launcher.py &` exits immediately while
+            # the training worker stays alive holding GPU memory.
+            if _process_group_alive(pgid):
+                failure_reason = (
+                    f"root process exited with code {proc.returncode}, "
+                    f"but process group {pgid} still had live descendants"
+                )
+                log.warning(
+                    "Trial PID %d exited with code %s but process group %d "
+                    "still has live descendants — terminating group",
+                    proc.pid,
+                    proc.returncode,
+                    pgid,
+                )
+                cleanup_confirmed = _kill_group(pgid, proc)
+
+    finally:
+        _unregister(pgid)
+
+        # Only clean identity files when the trial exited cleanly AND no
+        # descendant cleanup was required.
+        if failure_reason is None and proc.returncode == 0:
+            for path in (pid_path, pgid_path, starttime_path):
+                path.unlink(missing_ok=True)
+
+    duration = time.time() - started
+    return ProcessResult(
+        return_code=proc.returncode if proc.returncode is not None else -9,
+        timed_out=timed_out,
+        pid=proc.pid,
+        duration_seconds=duration,
+        failure_reason=failure_reason,
+        cleanup_confirmed=cleanup_confirmed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stale process utilities
+# ---------------------------------------------------------------------------
+
+
+def read_proc_starttime(pid: int) -> int | None:
+    """Read the start time of a process from /proc/<pid>/stat.
+
+    On Linux, (pid, starttime) uniquely identifies a process across its
+    lifetime. This is the only reliable way to avoid PID-reuse hazards
+    when killing stale processes from a prior orchestrator run.
+
+    Args:
+        pid: The process ID to inspect.
+
+    Returns:
+        The starttime in clock ticks (``/proc/<pid>/stat`` field 22), or
+        ``None`` on non-Linux systems and when the proc entry is unreadable.
+
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        # Field 22 (1-indexed) is starttime in clock ticks.
+        # The comm field (field 2) can contain spaces and parens, so find
+        # the last ')' to skip past it safely.
+        rparen = data.rfind(b")")
+        if rparen == -1:
+            return None
+        fields = data[rparen + 2 :].split()
+        # After comm, field 3 = state, field 4 = ppid, ... field 22 = starttime.
+        # That's index 19 in the post-comm split (fields 3..N map to indices 0..N-3).
+        return int(fields[19])
+    except (FileNotFoundError, ValueError, IndexError, OSError):
+        return None
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Check if a PID exists (best-effort; race-free check is impossible).
+
+    Args:
+        pid: The process ID to probe via ``kill(pid, 0)``.
+
+    Returns:
+        ``True`` if the PID exists (or exists but is owned by another user);
+        ``False`` if the kernel reports ``ProcessLookupError``.
+
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+
+
+def is_same_process(pid: int, saved_starttime: int | None) -> bool:
+    """Check whether `pid` is the same process that recorded `saved_starttime`.
+
+    If starttime verification is unavailable (non-Linux, or no saved starttime),
+    falls back to pid-alive check only (the pre-v0.4 behavior).
+
+    Args:
+        pid: PID read from a stale ``trial_dir/pid`` file.
+        saved_starttime: Starttime read from the matching ``pid_starttime``
+            file, or ``None`` if unavailable.
+
+    Returns:
+        ``True`` if ``pid`` is alive AND (no saved starttime, OR the current
+        ``/proc`` starttime matches the saved value). ``False`` if the PID is
+        dead or has been reused by an unrelated process.
+
+    """
+    if not is_pid_alive(pid):
+        return False
+    if saved_starttime is None:
+        # No starttime to verify — fall back to alive-only (best effort).
+        return True
+    current_starttime = read_proc_starttime(pid)
+    if current_starttime is None:
+        # Can't read /proc — non-Linux or proc vanished. Fall back.
+        return True
+    return current_starttime == saved_starttime
+
+
+@dataclass
+class StaleProcessIdentity:
+    """Forensic identity files left in a trial directory after launch.
+
+    Persisted by ``run_supervised`` and read by the orchestrator's stale-trial
+    reaper (review v0.5.2 / blocker 7). PGID is the fallback when the root PID
+    has exited but descendants are still alive.
+    """
+
+    pid: int | None
+    pgid: int | None
+    starttime: int | None
+
+
+def read_stale_process_identity(trial_dir: Path) -> StaleProcessIdentity:
+    """Load all available identity files for a possibly-stale trial.
+
+    Args:
+        trial_dir: A trial directory possibly containing ``pid``, ``pgid``,
+            and ``pid_starttime`` files written by :func:`run_supervised`.
+
+    Returns:
+        :class:`StaleProcessIdentity` with whichever fields could be read.
+        Missing or malformed files surface as ``None`` on the respective
+        attributes; this is the input the stale reaper uses to decide
+        whether to kill the group.
+
+    """
+    pid: int | None = None
+    pgid: int | None = None
+    starttime: int | None = None
+
+    pid_file = trial_dir / "pid"
+    pgid_file = trial_dir / "pgid"
+    starttime_file = trial_dir / "pid_starttime"
+
+    if pid_file.is_file():
+        with contextlib.suppress(ValueError, OSError):
+            pid = int(pid_file.read_text().strip())
+    if pgid_file.is_file():
+        with contextlib.suppress(ValueError, OSError):
+            pgid = int(pgid_file.read_text().strip())
+    if starttime_file.is_file():
+        with contextlib.suppress(ValueError, OSError):
+            starttime = int(starttime_file.read_text().strip())
+
+    return StaleProcessIdentity(pid=pid, pgid=pgid, starttime=starttime)
+
+
+def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
+    """Send SIGTERM, wait, then SIGKILL — and confirm the group is actually gone.
+
+    Returns ``True`` only when the process group is confirmed gone. Returns
+    ``False`` when delivery fails (permission denied, OS error) or the group
+    is still alive after SIGKILL. Pre-v0.5.8 this function returned ``True``
+    even when the group survived SIGKILL — callers then marked the trial
+    ``FAIL`` and proceeded, potentially launching new trials onto a GPU still
+    held by the leaked process (review v0.5.7 / blocker 2).
+
+    ``ProcessLookupError`` from ``killpg`` means the group is already gone, so
+    those branches return ``True``.
+
+    Args:
+        pgid: Target process-group ID.
+        grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL.
+
+    Returns:
+        ``True`` if the group is confirmed dead (already gone, or died within
+        the SIGTERM grace, or died within 2s after SIGKILL). ``False`` if
+        signal delivery failed for non-``ProcessLookupError`` reasons, or the
+        group is still alive 2s after SIGKILL.
+
+    """
+    import time
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError) as exc:
+        log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
+        return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _process_group_alive(pgid):
+            return True
+        time.sleep(0.1)
+
+    log.warning("Stale process group %d survived SIGTERM — sending SIGKILL", pgid)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError) as exc:
+        log.error("Failed to send SIGKILL to process group %d: %s", pgid, exc)
+        return False
+
+    # Wait briefly for the kernel to actually reap descendants so the reaper's
+    # "marked FAIL" state means cleanup completed, not requested.
+    kill_deadline = time.monotonic() + 2.0
+    while time.monotonic() < kill_deadline:
+        if not _process_group_alive(pgid):
+            return True
+        time.sleep(0.05)
+
+    log.error("Process group %d still appears alive after SIGKILL", pgid)
+    return False
+
+
+def _process_state(pid: int) -> str | None:
+    """Read the runtime state code from ``/proc/<pid>/stat`` (POSIX-only).
+
+    Used to filter zombies out of liveness checks: a zombie still occupies a
+    PID table entry so ``kill(0)`` succeeds, but it holds no GPU memory and
+    isn't a process we need to wait on.
+
+    Args:
+        pid: PID to inspect via ``/proc/<pid>/stat``.
+
+    Returns:
+        Single-letter state code: ``R``/``S``/``D``/``Z``/``T``/``X``/``I``/...,
+        or ``None`` when the file is unreadable (non-Linux, process gone,
+        permission denied).
+
+    """
+    try:
+        # Field layout: "pid (comm) state ppid ...". The comm field can contain
+        # spaces and parens, so split from the right of the closing paren.
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            text = fh.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    rparen = text.rfind(")")
+    if rparen < 0:
+        return None
+    rest = text[rparen + 1 :].strip().split()
+    if not rest:
+        return None
+    return rest[0]
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """Check whether any non-zombie process in the group ``pgid`` is alive.
+
+    ``os.killpg(pgid, 0)`` returns success for zombie processes too, because
+    they still occupy the PID table. For our purposes a zombie is dead — it
+    holds no GPU memory, no file descriptors, no shared resources. Skipping
+    zombies stops the cleanup escalation from looping after SIGKILL when the
+    parent hasn't reaped its child yet (review v0.5.7 / blocker 2 follow-up).
+
+    On non-Linux, ``/proc/<pid>/stat`` doesn't exist; we fall back to the
+    previous behavior (``killpg(0)`` semantics).
+
+    Args:
+        pgid: Process-group ID to probe.
+
+    Returns:
+        ``True`` if at least one non-zombie member of the group exists.
+        ``False`` if the group is gone, or every remaining member is a zombie
+        (state ``Z``/``X``).
+
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Group exists but is owned by a different user. Treat as alive.
+        return True
+
+    # killpg(0) succeeded → at least one PID-table entry exists. Filter out
+    # zombies by walking /proc/*/stat and checking which ones are in this PGID.
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        # Non-Linux: cannot distinguish zombies. Preserve legacy semantics.
+        return True
+
+    any_live = False
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            with (entry / "stat").open(encoding="utf-8") as fh:
+                text = fh.read()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        rparen = text.rfind(")")
+        if rparen < 0:
+            continue
+        rest = text[rparen + 1 :].strip().split()
+        if len(rest) < 3:
+            continue
+        # Field 5 of the post-comm split is pgrp (state, ppid, pgrp, ...).
+        state = rest[0]
+        try:
+            entry_pgrp = int(rest[2])
+        except ValueError:
+            continue
+        if entry_pgrp != pgid:
+            continue
+        if state == "Z":
+            continue
+        any_live = True
+        break
+    return any_live
+
+
+def kill_stale_group(
+    pid: int | None,
+    saved_starttime: int | None,
+    *,
+    pgid: int | None = None,
+    grace_seconds: float = _KILL_GRACE_SECONDS,
+) -> bool:
+    """Terminate a stale trial process group, escalating SIGTERM -> SIGKILL.
+
+    Returns ``True`` only when it is safe to mark the trial ``FAIL``: either
+    nothing was alive to clean up, or cleanup ran and the process group is
+    confirmed gone. Returns ``False`` when cleanup is uncertain — PID was
+    reused, permission was denied, or the group survived SIGKILL. Callers
+    must not advance state when this returns ``False`` (review v0.5.7 /
+    blocker 2): a leaked training process can still hold a GPU, scribble
+    over W&B runs, or starve the host scheduler.
+
+    Recovery order (review v0.5.3 / blocker 2):
+
+    1. ``pid`` is alive AND saved starttime matches: derive PGID from the live
+       PID and kill the group. Starttime check guards against PID reuse.
+    2. ``pid`` is alive but starttime mismatches: this is PID reuse by an
+       unrelated process. **Refuse to use the stored PGID** — group leader
+       PID and PGID are typically the same number, so the stored PGID is
+       likely now stamped on the unrelated reused process group too. Killing
+       it would target the wrong group.
+    3. ``pid`` is unrecoverable (dead or never recorded) but ``pgid`` was
+       persisted at launch: best-effort PGID kill with a loud warning. The
+       root PID may have exited (``shell=True`` shells often do) while
+       descendants are still holding GPU memory.
+    4. No PID and no PGID: nothing to clean up, return ``True``.
+
+    Args:
+        pid: Root PID read from ``trial_dir/pid``, or ``None`` if unrecorded.
+        saved_starttime: Starttime read from ``trial_dir/pid_starttime``, or
+            ``None`` if unavailable / non-Linux.
+        pgid: Process-group ID read from ``trial_dir/pgid`` (the fallback
+            target when ``pid`` cannot be trusted).
+        grace_seconds: Seconds to wait after SIGTERM before escalating to
+            SIGKILL; passed through to :func:`_terminate_process_group`.
+
+    Returns:
+        ``True`` when it is safe to mark the trial ``FAIL`` (cleanup
+        confirmed or nothing to clean). ``False`` when cleanup is uncertain
+        and callers must NOT advance state.
+
+    """
+    target_pgid: int | None = None
+
+    if pid is not None:
+        if is_same_process(pid, saved_starttime):
+            try:
+                target_pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                target_pgid = None
+            except (PermissionError, OSError) as exc:
+                log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
+                return False
+        elif is_pid_alive(pid) and saved_starttime is not None:
+            # PID reuse detected. Stored PGID is no longer trustworthy because
+            # group leader PID typically equals PGID — refuse to fall through.
+            log.warning(
+                "PID %d is alive but starttime does not match saved value; "
+                "PID was reused. Refusing PGID fallback to avoid killing an "
+                "unrelated process group.",
+                pid,
+            )
+            return False
+
+    if target_pgid is None:
+        if pgid is None:
+            # No identity at all → nothing alive to clean up.
+            return True
+        log.warning(
+            "Root PID is gone or unrecoverable; using stored PGID %d for "
+            "best-effort cleanup of stale trial process group.",
+            pgid,
+        )
+        target_pgid = pgid
+
+    if not _process_group_alive(target_pgid):
+        return True
+
+    log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
+    return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)

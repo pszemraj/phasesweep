@@ -1,0 +1,179 @@
+"""CLI commands: validate, show-winners, --dry-run."""
+
+from __future__ import annotations
+
+import logging
+import textwrap
+from pathlib import Path
+
+from click.testing import CliRunner
+
+from phasesweep import load_experiment, run_experiment
+from phasesweep.cli import main as cli_main
+from tests.conftest import write_yaml
+
+
+def test_dry_run_winner_includes_inherited_and_fixed_overrides(tmp_path):
+    """Dry-run placeholder Winner must compose inherited + fixed + sampled placeholders.
+
+    Otherwise downstream phases' dry-run command previews omit the locked context
+    a real run would carry.
+    """
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: arch
+            fixed_overrides:
+              model_family: llama
+            n_trials: 2
+            sampler: {{ type: grid }}
+            search_space:
+              n_layers: {{ type: categorical, choices: [4, 8] }}
+          - name: lr
+            inherits: [arch]
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+        """,
+    )
+    exp = load_experiment(p)
+    winners = run_experiment(exp, dry_run=True)
+
+    # Phase 1 (arch) winner: includes its own fixed_override.
+    assert winners["arch"].effective_overrides["model_family"] == "llama"
+    assert "n_layers" in winners["arch"].effective_overrides
+
+    # Phase 2 (lr) winner: includes inherited n_layers AND model_family + its own sampled lr.
+    lr_eff = winners["lr"].effective_overrides
+    assert "model_family" in lr_eff, "Inherited fixed_override must propagate to dry-run"
+    assert "n_layers" in lr_eff, "Inherited search-space winner must propagate to dry-run"
+    assert "lr" in lr_eff, "Phase's own sampled placeholder must be present"
+
+
+def test_validate_cli_renders_comment(tmp_path: Path) -> None:
+    """``phasesweep validate`` surfaces phase comments so the operator sees
+    design intent next to the spec, with a ``#`` prefix to read as documentation."""
+    p = tmp_path / "exp.yaml"
+    p.write_text(
+        textwrap.dedent("""
+        experiment: t
+        trial_command: "echo {overrides}"
+        metric:
+          extractor: { type: json, path: r.json, key: x }
+        phases:
+          - name: depth
+            comment: |
+              first phase: figure out the depth.
+              grid because we want every choice to actually run.
+            n_trials: 1
+            search_space: { x: { type: int, low: 0, high: 1 } }
+        """)
+    )
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["validate", str(p)])
+    assert result.exit_code == 0
+    assert "first phase: figure out the depth." in result.output
+    assert "grid because we want every choice" in result.output
+    for line in result.output.splitlines():
+        if "first phase" in line or "grid because" in line:
+            assert line.lstrip().startswith("#"), f"comment line not prefixed: {line!r}"
+
+
+def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
+    """``show-winners`` prints comment before the winner block so the reader
+    frames numerical results against intent. Also covers the no-winner-yet
+    branch — the comment is still surfaced even before a phase has run."""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    phase_dir = workdir / "t" / "depth"
+    phase_dir.mkdir(parents=True)
+    (phase_dir / "winner.yaml").write_text(
+        textwrap.dedent("""
+        phase: depth
+        trial_number: 2
+        metric:
+          x: 0.5
+          goal: minimize
+        params:
+          x: 5
+        effective_overrides:
+          x: 5
+        constraints: {}
+        """).lstrip()
+    )
+
+    def make_cfg(workdir_str: str) -> Path:
+        cfg = tmp_path / "exp.yaml"
+        cfg.write_text(
+            textwrap.dedent(f"""
+            experiment: t
+            workdir: {workdir_str}
+            trial_command: "echo {{overrides}}"
+            metric:
+              extractor: {{ type: json, path: r.json, key: x }}
+            phases:
+              - name: depth
+                comment: settle the depth before anything else.
+                n_trials: 1
+                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+            """)
+        )
+        return cfg
+
+    runner = CliRunner()
+
+    # With a winner: comment must come BEFORE the winner block.
+    result_with = runner.invoke(cli_main, ["show-winners", str(make_cfg(str(workdir)))])
+    assert result_with.exit_code == 0
+    comment_line = "# settle the depth before anything else."
+    metric_line = "trial_number: 2"
+    assert comment_line in result_with.output
+    assert metric_line in result_with.output
+    assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
+
+    # Without a winner (different workdir → no winner.yaml): comment is still surfaced.
+    result_without = runner.invoke(
+        cli_main, ["show-winners", str(make_cfg(str(tmp_path / "empty_wd")))]
+    )
+    assert result_without.exit_code == 0
+    assert "(no winner yet)" in result_without.output
+    assert comment_line in result_without.output
+
+
+def test_dry_run_does_not_launch(tmp_path, caplog):
+    """dry-run should log an example command but never call the trial_command."""
+
+    caplog.set_level(logging.INFO)
+    body = f"""
+experiment: dry
+storage: sqlite:///{tmp_path}/dry.db
+workdir: {tmp_path}/runs
+trial_command: "false {{overrides}}"
+metric:
+  name: loss
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: loss }}
+phases:
+  - name: a
+    n_trials: 5
+    search_space: {{ lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }} }}
+  - name: b
+    inherits: [a]
+    n_trials: 5
+    search_space: {{ wd: {{ type: float, low: 0, high: 0.3 }} }}
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+    winners = run_experiment(exp, dry_run=True)
+    assert set(winners) == {"a", "b"}
+    # No summary written
+    assert not (Path(tmp_path / "runs") / "summary.yaml").exists()
+    # An example command was logged
+    assert any("DRY RUN example command" in r.message for r in caplog.records)

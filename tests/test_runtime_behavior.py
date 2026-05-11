@@ -1,0 +1,340 @@
+"""Runtime semantics: NaN/inf propagation through extractors, parallel trial behavior, sampler configuration at study-creation time, max_consecutive_failures abort, and Optuna logging suppression."""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from pathlib import Path
+
+import optuna
+import pytest
+
+from phasesweep import load_experiment, run_experiment
+from phasesweep.selector import NoFeasibleTrialError
+from tests.conftest import REPO, write_trainer, write_yaml
+
+
+def test_parallel_trials_e2e(tmp_path):
+    """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
+    - JournalFileStorage via explicit journal:/// URL (B3, v0.5.2 / blocker 6)
+    - constant_liar on TPE (B4)
+    - concurrent subprocess execution
+    - no database-locked errors
+    """
+    examples_dst = tmp_path / "examples"
+    examples_dst.mkdir(parents=True)
+    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+
+    journal_path = tmp_path / "phases.journal"
+    yaml_text = f"""
+experiment: parallel_test
+storage: journal:///{journal_path}
+workdir: {tmp_path / "runs"}
+trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: result.json, key: eval_loss }}
+phases:
+  - name: lr_sweep
+    n_trials: 8
+    n_jobs: 4
+    allow_no_gpu_isolation: true
+    sampler: {{ type: tpe, seed: 42 }}
+    search_space:
+      lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
+"""
+    yaml_path = tmp_path / "exp.yaml"
+    yaml_path.write_text(yaml_text)
+
+    exp = load_experiment(yaml_path)
+    winners = run_experiment(exp)
+
+    assert "lr_sweep" in winners
+    assert 1e-5 <= winners["lr_sweep"].params["lr"] <= 1e-2
+
+    # Verify all 8 trials actually ran (trial directories exist).
+    # v0.5.7: outputs are now namespaced as <workdir>/<experiment>/<phase>/.
+    runs_dir = tmp_path / "runs" / "parallel_test" / "lr_sweep"
+    trial_dirs = sorted(runs_dir.glob("trial_*"))
+    assert len(trial_dirs) == 8
+
+    assert journal_path.exists(), "JournalFileStorage file should exist"
+
+
+def test_failed_trials_marked_fail_not_complete(tmp_path):
+    """Process crashes should produce FAIL trials, not COMPLETE with inf."""
+    examples_dst = tmp_path / "examples"
+    examples_dst.mkdir(parents=True)
+    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+
+    db_path = tmp_path / "phases.db"
+    yaml_text = f"""
+experiment: fail_state_test
+storage: sqlite:///{db_path}
+workdir: {tmp_path / "runs"}
+trial_command: "false {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: result.json, key: eval_loss }}
+phases:
+  - name: a
+    n_trials: 3
+    max_consecutive_failures: 10
+    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+"""
+    yaml_path = tmp_path / "exp.yaml"
+    yaml_path.write_text(yaml_text)
+    exp = load_experiment(yaml_path)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="fail_state_test::a", storage=f"sqlite:///{db_path}")
+    for trial in study.get_trials():
+        # Every trial should be FAIL, not COMPLETE.
+        assert trial.state == optuna.trial.TrialState.FAIL, (
+            f"Trial {trial.number} is {trial.state.name}, expected FAIL"
+        )
+
+
+def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
+    """Missing constraint output -> TrialState.FAIL, not COMPLETE+infeasible."""
+    trainer = tmp_path / "trainer.py"
+    write_trainer(
+        trainer,
+        """
+        import json, sys, argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--out', required=True)
+        args, _ = ap.parse_known_args()
+        # Write metric only — constraint extractor will fail to find param_bytes.
+        with open(args.out, 'w') as f:
+            json.dump({'eval_loss': 1.0}, f)
+        """,
+    )
+
+    db = tmp_path / "phases.db"
+    yaml_text = f"""
+experiment: c2
+storage: sqlite:///{db}
+workdir: {tmp_path / "runs"}
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: result.json, key: eval_loss }}
+constraints:
+  - name: param_bytes
+    extractor: {{ type: json, path: result.json, key: param_bytes }}
+    max: 1000
+phases:
+  - name: a
+    n_trials: 2
+    max_consecutive_failures: 10
+    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+"""
+    p = tmp_path / "exp.yaml"
+    p.write_text(yaml_text)
+    exp = load_experiment(p)
+    from phasesweep.selector import NoFeasibleTrialError
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="c2::a", storage=f"sqlite:///{db}")
+    for trial in study.get_trials():
+        assert trial.state == optuna.trial.TrialState.FAIL, (
+            f"Trial {trial.number} is {trial.state.name}; expected FAIL because "
+            "constraint extractor could not find param_bytes."
+        )
+        # The failure_reason user_attr should mention the constraint name.
+        assert "param_bytes" in trial.user_attrs.get("phasesweep_failure_reason", "")
+
+
+@pytest.mark.parametrize(
+    ("trainer_payload", "constraints_yaml", "exp_name"),
+    [
+        # Constraint extractor returns NaN
+        (
+            "{'eval_loss': 1.0, 'param_bytes': float('nan')}",
+            "constraints:\n  - name: param_bytes\n    extractor: { type: json, path: result.json, key: param_bytes }\n    max: 1000\n",
+            "nan_c",
+        ),
+        # Metric extractor returns +inf
+        (
+            "{'eval_loss': float('inf')}",
+            "",
+            "inf_m",
+        ),
+    ],
+    ids=["nan_constraint", "inf_metric"],
+)
+def test_non_finite_extracted_value_marks_trial_fail(
+    tmp_path, trainer_payload: str, constraints_yaml: str, exp_name: str
+):
+    """A non-finite metric or constraint value is a malformed trial — FAIL,
+    not COMPLETE-with-sentinel. Both the metric path and the constraint path
+    must surface the failure the same way; one parametrized test exercises
+    both routes through the same end-to-end pipeline."""
+    trainer = tmp_path / "trainer.py"
+    write_trainer(
+        trainer,
+        f"""
+        import json, sys, argparse, math
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--out', required=True)
+        args, _ = ap.parse_known_args()
+        with open(args.out, 'w') as f:
+            json.dump({trainer_payload}, f)
+        """,
+    )
+
+    db = tmp_path / "phases.db"
+    yaml_text = f"""
+experiment: {exp_name}
+storage: sqlite:///{db}
+workdir: {tmp_path / "runs"}
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: result.json, key: eval_loss }}
+{constraints_yaml}
+phases:
+  - name: a
+    n_trials: 2
+    max_consecutive_failures: 10
+    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+"""
+    p = tmp_path / "exp.yaml"
+    p.write_text(yaml_text)
+    exp = load_experiment(p)
+    from phasesweep.selector import NoFeasibleTrialError
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name=f"{exp_name}::a", storage=f"sqlite:///{db}")
+    for trial in study.get_trials():
+        assert trial.state == optuna.trial.TrialState.FAIL
+
+
+def test_abort_after_gpu_acquire_prevents_queued_trials(tmp_path: Path) -> None:
+    """With n_jobs > GPU pool, queued trials must re-check abort after acquiring.
+
+    Setup: single GPU, 4 parallel jobs, all trials fail, max_consecutive_failures=1.
+    Without the post-acquire recheck, ~4 trials launch before abort fires;
+    with the recheck only the first 1-2 actually launch subprocesses.
+    """
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import sys, time
+        # Simulate slow failing trial so peers queue behind us.
+        time.sleep(0.2)
+        sys.exit(1)
+        """,
+    )
+    yaml_text = f"""
+experiment: abort_recheck
+workdir: {tmp_path / "runs"}
+trial_command: "python {trainer} {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: eval_loss }}
+phases:
+  - name: p
+    n_trials: 16
+    n_jobs: 4
+    gpu_ids: [0]   # only one slot — n_jobs=4 will queue
+    max_consecutive_failures: 1
+    sampler: {{ type: random, seed: 0 }}
+    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+"""
+    p = tmp_path / "exp.yaml"
+    p.write_text(yaml_text)
+    exp = load_experiment(p)
+
+    from phasesweep.selector import NoFeasibleTrialError
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(exp)
+
+    # Count actual subprocess launches (each launch creates a stdout.log).
+    # With the post-acquire recheck, the first failure aborts queued threads
+    # before they launch their subprocess. Without it, all 4 would launch.
+    # Derive the directory from the experiment to track the
+    # ``<workdir>/<experiment>/<phase>/`` layout (review v0.5.12 caught the
+    # earlier hard-coded ``<workdir>/<phase>/`` path silently matching nothing
+    # and rendering the assertion vacuous).
+    runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
+    trial_dirs = sorted(runs_dir.glob("trial_*"))
+    launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
+    assert len(launched) <= 2, (
+        f"With max_consecutive_failures=1 and a 1-slot GPU pool, expected at "
+        f"most 2 trial launches (1 failing + 1 in-flight before abort propagates); "
+        f"got {len(launched)}. Launched: {[d.name for d in launched]}. "
+        "Queued threads ignored the post-acquire abort flag."
+    )
+
+
+def test_optuna_logging_quieted_when_not_verbose() -> None:
+    """Default (no -v) sets Optuna logger to WARNING.
+
+    Optuna's per-trial INFO messages are nearly 1:1 with phasesweep's own
+    runner.info "[phase/trial_N] <cmd>" line and add nothing.
+    """
+    # Reset to a known noisy level first; the test must demonstrate the change.
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    assert optuna.logging.get_verbosity() == optuna.logging.INFO
+
+    from phasesweep.cli import _configure_logging
+
+    _configure_logging(verbose=False)
+    assert optuna.logging.get_verbosity() == optuna.logging.WARNING
+
+
+def test_optuna_logging_restored_when_verbose() -> None:
+    """`-v` keeps Optuna at INFO so debug runs are fully verbose."""
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    from phasesweep.cli import _configure_logging
+
+    _configure_logging(verbose=True)
+    assert optuna.logging.get_verbosity() == optuna.logging.INFO
+
+    # Reset for any later tests.
+    logging.getLogger().handlers.clear()
+
+
+def test_max_consecutive_failures_aborts_phase(tmp_path):
+    """Trial command always fails -> phase aborts before running n_trials."""
+    body = f"""
+experiment: failtest
+storage: sqlite:///{tmp_path}/fail.db
+workdir: {tmp_path}/runs
+trial_command: "false {{overrides}}"
+metric:
+  name: loss
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: loss }}
+phases:
+  - name: a
+    n_trials: 100
+    max_consecutive_failures: 3
+    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(exp)
+    # Verify only a small number of trials actually executed before the abort.
+    # We can't predict exactly how many because Optuna may have a few in flight,
+    # but it should be << 100.
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "fail.db")
+    n = conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
+    conn.close()
+    assert n < 30, f"expected early abort, got {n} trials"

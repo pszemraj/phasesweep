@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phasesweep"
+version = "0.5.15"
+description = "YAML-driven phase-chained hyperparameter sweeps. Phase N's winner becomes a fixed override for phase N+1. No LLM in the runtime loop."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "optuna>=4.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+cmaes = ["cmaes>=0.10"]
+wandb = ["wandb>=0.16"]
+dev = ["pytest>=7", "ruff>=0.5", "mypy>=1.10", "types-PyYAML>=6.0"]
+
+[project.scripts]
+phasesweep = "phasesweep.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "D", "ANN"]
+ignore = [
+    "E501",     # let formatter handle line length
+    "D100",     # missing docstring in public module (we have them on all important ones)
+    "D104",     # missing docstring in public package
+    "D105",     # missing docstring in magic method
+    "D107",     # missing docstring in __init__
+    "D203",     # conflicts with D211
+    "D213",     # conflicts with D212
+    "ANN401",   # Dynamically typed expressions (typing.Any)
+    "ANN002",   # missing *args annotation
+    "ANN003",   # missing **kwargs annotation
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ANN"]  # tests don't need docstrings or annotations
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

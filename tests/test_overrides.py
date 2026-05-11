@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import shutil
+
+import pytest
+from pydantic import ValidationError
+
+from phasesweep import load_experiment, run_experiment
+from phasesweep.overrides import format_argparse, format_hydra, render_command
+from tests.conftest import REPO, write_yaml
+
+
+def test_hydra_basic():
+    s = format_hydra({"n_layers": 8, "lr": 3e-4})
+    assert s == "n_layers=8 lr=0.0003"
+
+
+def test_hydra_dotted():
+    s = format_hydra({"model.n_layers": 12})
+    assert s == "model.n_layers=12"
+
+
+def test_hydra_bool():
+    s = format_hydra({"flag": True, "off": False})
+    assert s == "flag=true off=false"
+
+
+def test_argparse():
+    s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
+    assert s == "--lr 0.0003 --weight_decay 0.05"
+
+
+def test_render_command_hydra(tmp_path):
+    cmd = render_command(
+        "python train.py {overrides} --out {trial_dir}/r.json",
+        {"n_layers": 8},
+        "hydra",
+        trial_dir=tmp_path,
+        trial_id=3,
+        phase="depth",
+        run_name="x-depth-3",
+    )
+    assert "n_layers=8" in cmd
+    assert str(tmp_path) in cmd
+
+
+def test_render_command_json_file(tmp_path):
+    cmd = render_command(
+        "python train.py --overrides-path {overrides_path}",
+        {"a.b": 1, "a.c": 2, "d": "x"},
+        "json_file",
+        trial_dir=tmp_path,
+        trial_id=0,
+        phase="p",
+        run_name="r",
+    )
+    assert "overrides.json" in cmd
+    import json
+
+    data = json.loads((tmp_path / "overrides.json").read_text())
+    assert data == {"a": {"b": 1, "c": 2}, "d": "x"}
+
+
+# ---- migrated from version-named files ----
+
+
+def test_effective_overrides_include_fixed(tmp_path):
+    """Winner's effective_overrides must include parent's fixed_overrides, not just sampled params."""
+    examples_dst = tmp_path / "examples"
+    examples_dst.mkdir(parents=True)
+    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+
+    db_path = tmp_path / "phases.db"
+    yaml_text = f"""
+experiment: eff_override_test
+storage: sqlite:///{db_path}
+workdir: {tmp_path / "runs"}
+trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {{ type: json, path: result.json, key: eval_loss }}
+phases:
+  - name: arch
+    fixed_overrides:
+      model_family: llama
+    n_trials: 2
+    sampler: {{ type: grid }}
+    search_space:
+      n_layers: {{ type: categorical, choices: [4, 8] }}
+  - name: opt
+    inherits: [arch]
+    n_trials: 4
+    sampler: {{ type: tpe, seed: 0 }}
+    search_space:
+      lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
+"""
+    yaml_path = tmp_path / "exp.yaml"
+    yaml_path.write_text(yaml_text)
+    exp = load_experiment(yaml_path)
+    winners = run_experiment(exp)
+
+    # The opt phase winner should have model_family in effective_overrides
+    opt_winner = winners["opt"]
+    assert "model_family" in opt_winner.effective_overrides
+    assert opt_winner.effective_overrides["model_family"] == "llama"
+    # And also the inherited n_layers
+    assert "n_layers" in opt_winner.effective_overrides
+
+
+def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
+    """A grandchild may not re-sample a key locked two levels up."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: arch
+            n_trials: 1
+            search_space:
+              n_layers: {{ type: categorical, choices: [4, 8] }}
+          - name: lr
+            inherits: [arch]
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+          - name: reg
+            inherits: [lr]
+            n_trials: 1
+            search_space:
+              n_layers: {{ type: categorical, choices: [12, 16] }}
+        """,
+    )
+    with pytest.raises(ValidationError, match="re-samples key"):
+        load_experiment(p)
+
+
+def test_multi_parent_collision_unresolved_errors(tmp_path):
+    """Two independent parents both lock 'lr'; child must resolve via fixed_overrides."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: a
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+          - name: b
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+          - name: c
+            inherits: [a, b]
+            n_trials: 1
+            search_space:
+              dropout: {{ type: float, low: 0, high: 0.5 }}
+        """,
+    )
+    with pytest.raises(ValidationError, match="conflicting locked key"):
+        load_experiment(p)
+
+
+def test_multi_parent_collision_resolved_by_fixed_override(tmp_path):
+    """Same conflict but child explicitly resolves with fixed_overrides — accepted."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: a
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+          - name: b
+            n_trials: 1
+            search_space:
+              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
+          - name: c
+            inherits: [a, b]
+            fixed_overrides:
+              lr: 5.0e-4
+            n_trials: 1
+            search_space:
+              dropout: {{ type: float, low: 0, high: 0.5 }}
+        """,
+    )
+    exp = load_experiment(p)  # must not raise
+    assert exp.phases[-1].fixed_overrides["lr"] == 5.0e-4
