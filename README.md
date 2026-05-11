@@ -13,23 +13,23 @@ A successful full run produces:
 
 ```
 runs/
-├── tiny_lm_16mb/                          # <experiment> namespace
-│   ├── depth/
-│   │   ├── trial_00000/                   # one dir per trial
-│   │   │   ├── command.txt                # rendered shell command
-│   │   │   ├── overrides_resolved.json    # final {sampled} ∪ {fixed} ∪ {inherited}
-│   │   │   ├── result.json                # whatever your extractor reads
-│   │   │   ├── stdout.log, stderr.log
-│   │   │   └── pid, pgid, pid_starttime   # cleaned on success
-│   │   ├── trials.csv
-│   │   └── winner.yaml                    # carries phase_fingerprint (SHA-256)
-│   ├── lr/
-│   ├── regularization/
-│   └── summary.yaml                       # written at end of full run
-└── phases.db                              # Optuna SQLite (path from `storage:`)
+ tiny_lm_16mb/                          # <experiment> namespace
+ depth/
+ trial_00000/                   # one dir per trial
+ command.txt                # rendered shell command
+ overrides_resolved.json    # final {sampled} {fixed} {inherited}
+ result.json                # whatever your extractor reads
+ stdout.log, stderr.log
+ pid, pgid, pid_starttime   # cleaned on success
+ trials.csv
+ winner.yaml                    # carries phase_fingerprint (SHA-256)
+ lr/
+ regularization/
+ summary.yaml                       # written at end of full run
+ phases.db                              # Optuna SQLite (path from `storage:`)
 ```
 
-Every winner carries a `phase_fingerprint`. Edit a parent phase's search space and `--from-phase` a child → loud refusal, never silent reuse. (Bump `n_trials` to top up trials → still works; run-control fields are excluded from the fingerprint.)
+Every winner carries a `phase_fingerprint`. Edit a parent phase's search space and `--from-phase` a child loud refusal, never silent reuse. (Bump `n_trials` to top up trials still works; run-control fields are excluded from the fingerprint.)
 
 ---
 
@@ -55,7 +55,7 @@ Sequential phase chaining is the right tool when:
 - A single joint sweep over all of them is too expensive.
 - You want each phase's outcome to be inspectable, resumable, and explainable on its own.
 
-It's the wrong tool when dimensions strongly interact — sweep them jointly in one phase.
+It's the wrong tool when dimensions strongly interact - sweep them jointly in one phase.
 
 ---
 
@@ -117,21 +117,21 @@ phases:
 ### Top-level keys
 
 - **`experiment`** *(required)*: study namespace. Doubles as the filesystem path component (`<workdir>/<experiment>/...`) and is part of the lock identity. Must match `[A-Za-z0-9_-]+`.
-- **`storage`** *(optional, recommended)*: Optuna storage URL. Pick the scheme intentionally — phasesweep does **not** silently rewrite SQLite to JournalStorage, so study identity stays stable across `n_jobs` changes.
-  - `sqlite:///path.db` — sequential studies (`n_jobs == 1`). `optuna-dashboard sqlite:///path.db` reads them directly. **SQLite + `n_jobs > 1` is rejected at config-load** because SQLite serializes writers and will deadlock. The check matches all SQLAlchemy SQLite dialects (`sqlite:///`, `sqlite+pysqlite:///`, `sqlite+pysqlcipher:///`, ...) — no dialect-spelling bypass.
-  - `journal:///path.journal` — Optuna `JournalFileStorage`. Safe for parallel `n_jobs` on a single host. Not dashboard-readable.
-  - `postgresql://...`, `mysql://...` — passed straight to Optuna. Use these when you want both parallel `n_jobs` and live `optuna-dashboard` access from one orchestrator.
-  - `null` (default) — non-resumable in-memory study. Not recommended.
+- **`storage`** *(optional, recommended)*: Optuna storage URL. Pick the scheme intentionally - phasesweep does **not** silently rewrite SQLite to JournalStorage, so study identity stays stable across `n_jobs` changes.
+  - `sqlite:///path.db` - sequential studies (`n_jobs == 1`). `optuna-dashboard sqlite:///path.db` reads them directly. **SQLite + `n_jobs > 1` is rejected at config-load** because SQLite serializes writers and will deadlock. The check matches all SQLAlchemy SQLite dialects (`sqlite:///`, `sqlite+pysqlite:///`, `sqlite+pysqlcipher:///`, ...) - no dialect-spelling bypass.
+  - `journal:///path.journal` - Optuna `JournalFileStorage`. Safe for parallel `n_jobs` on a single host. Not dashboard-readable.
+  - `postgresql://...`, `mysql://...` - passed straight to Optuna. Use these when you want both parallel `n_jobs` and live `optuna-dashboard` access from one orchestrator.
+  - `null` (default) - non-resumable in-memory study. Not recommended.
 - **`workdir`** *(optional, default `./runs`)*: outputs root. Final layout is `<workdir>/<experiment>/<phase>/...`.
 - **`trial_command`** *(required)*: shell template. Placeholders:
-  - `{overrides}` — required for hydra/argparse phases that have any inherited / fixed / sampled overrides. **A phase with overrides whose `trial_command` does not reference `{overrides}` is rejected at config-load** (otherwise Optuna samples 20 different LRs and the trainer sees zero — silent no-op sweep). Detection uses `string.Formatter().parse()`, so `{{overrides}}` (literal text) does not satisfy it.
-  - `{overrides_path}` — required for json_file phases with overrides. Same silent-no-op protection.
-  - `{trial_dir}`, `{trial_id}`, `{phase}`, `{run_name}` — always available.
+  - `{overrides}` - required for hydra/argparse phases that have any inherited / fixed / sampled overrides. **A phase with overrides whose `trial_command` does not reference `{overrides}` is rejected at config-load** (otherwise Optuna samples 20 different LRs and the trainer sees zero - silent no-op sweep). Detection uses `string.Formatter().parse()`, so `{{overrides}}` (literal text) does not satisfy it.
+  - `{overrides_path}` - required for json_file phases with overrides. Same silent-no-op protection.
+  - `{trial_dir}`, `{trial_id}`, `{phase}`, `{run_name}` - always available.
 - **`override_format`** *(optional, default `hydra`)*: how overrides are spliced into the command.
-  - `hydra` → `key=value key2=value2`
-  - `argparse` → `--key value --key2 value2`
-  - `json_file` → writes `{trial_dir}/overrides.json` and exposes `{overrides_path}`.
-  - All values pass through `shlex.quote` before substitution — no shell-injection surface from sampled values.
+  - `hydra` `key=value key2=value2`
+  - `argparse` `--key value --key2 value2`
+  - `json_file` writes `{trial_dir}/overrides.json` and exposes `{overrides_path}`.
+  - All values pass through `shlex.quote` before substitution - no shell-injection surface from sampled values.
 - **`metric`** *(required)*: `name`, `goal` (`minimize` | `maximize`), and an `extractor` (json | log_regex | wandb).
 - **`constraints`** *(optional)*: list of additional extracted scalars with min/max bounds. Constraint-violating trials are recorded but excluded from winner selection.
 - **`phases`** *(required, ordered)*: see below.
@@ -139,16 +139,16 @@ phases:
 ### Phase keys
 
 - **`name`** *(required)*: must match `[A-Za-z0-9_-]+`.
-- **`inherits`** *(optional, default `[]`)*: list of prior phase names whose winners become fixed overrides for this phase. Transitive — inherit from `lr` and you get `depth.n_layers` for free.
-- **`fixed_overrides`** *(optional)*: hard-coded overrides applied to every trial in this phase. May intentionally re-set an inherited key — this is the *sole* way to resolve a multi-parent locked-key collision.
-- **`search_space`** *(optional)*: map of override-key → sampler spec. Keys may be dotted (`model.depth`) for hydra/json_file. Override-key syntax is validated — empty / leading-or-trailing-dot / consecutive-dot / whitespace-bearing / shell-special-char keys are rejected.
-- **`n_trials`** *(required, ≥ 1)*: trial budget. **Bumping `n_trials` between runs is a compatible change** — the fingerprint excludes run-control fields.
+- **`inherits`** *(optional, default `[]`)*: list of prior phase names whose winners become fixed overrides for this phase. Transitive - inherit from `lr` and you get `depth.n_layers` for free.
+- **`fixed_overrides`** *(optional)*: hard-coded overrides applied to every trial in this phase. May intentionally re-set an inherited key - this is the *sole* way to resolve a multi-parent locked-key collision.
+- **`search_space`** *(optional)*: map of override-key sampler spec. Keys may be dotted (`model.depth`) for hydra/json_file. Override-key syntax is validated - empty / leading-or-trailing-dot / consecutive-dot / whitespace-bearing / shell-special-char keys are rejected.
+- **`n_trials`** *(required, 1)*: trial budget. **Bumping `n_trials` between runs is a compatible change** - the fingerprint excludes run-control fields.
 - **`n_jobs`** *(optional, default 1)*: parallel trials within this phase. When combined with `gpu_ids`, each trial gets exclusive `CUDA_VISIBLE_DEVICES` via a blocking pool.
 - **`gpu_ids`** *(optional)*: explicit list of CUDA device indices, e.g. `[0, 1, 2, 3]`. Honored at `n_jobs == 1` too (lets a single-job phase isolate to a specific GPU on shared hardware). Auto-detected via ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` when omitted and `n_jobs > 1`.
 - **`max_consecutive_failures`** *(optional, default 5)*: abort the phase after this many consecutive failed/infeasible trials. Prevents a broken trainer from burning through `n_trials`.
 - **`sampler`** *(optional, default `{type: tpe}`)*: `tpe` | `random` | `grid` | `cmaes`. Sampler-vs-search-space compatibility is checked at config-load: cmaes-with-categoricals, grid-with-log-floats, grid-with-non-step-divisible-floats are all rejected. cmaes also import-checks the optional `cmaes` package at config-load.
 - **`timeout_seconds_per_trial`** *(optional)*: kill the trial's entire process group if it runs longer. Semantic: changing this value invalidates the study fingerprint, since a different timeout changes which trials FAIL vs COMPLETE under the same sampled params.
-- **`comment`** *(optional)*: free-text design note. Surfaced by `phasesweep validate` and `phasesweep show-winners` so the *why* of each phase lives next to the spec. Excluded from the fingerprint — editing the comment never invalidates the study.
+- **`comment`** *(optional)*: free-text design note. Surfaced by `phasesweep validate` and `phasesweep show-winners` so the *why* of each phase lives next to the spec. Excluded from the fingerprint - editing the comment never invalidates the study.
 
 ### Override priority within a trial (low to high)
 
@@ -156,7 +156,7 @@ phases:
 2. Phase's `fixed_overrides`.
 3. Sampled values from `phase.search_space`.
 
-Inverse of YAML order. Reasoning: a child phase's `fixed_overrides` is the explicit, intentional knob — it must be able to override an inherited value. A sampled value is the most local, most specific decision and trumps both.
+Inverse of YAML order. Reasoning: a child phase's `fixed_overrides` is the explicit, intentional knob - it must be able to override an inherited value. A sampled value is the most local, most specific decision and trumps both.
 
 ### Validation guarantees (all at config-load, before any trial runs)
 
@@ -175,13 +175,13 @@ Inverse of YAML order. Reasoning: a child phase's `fixed_overrides` is the expli
 
 ## Process management
 
-phasesweep treats subprocess lifecycle as a first-class concern. Reviewers should focus here — it's the most adversarial surface.
+phasesweep treats subprocess lifecycle as a first-class concern. Reviewers should focus here - it's the most adversarial surface.
 
 **Process group isolation.** Every trial runs in its own process group (`start_new_session=True`). Timeouts, signals, and even *normal* root-process exits all verify the entire group is gone via `os.killpg`. So child processes spawned by your trainer (`torchrun` workers, dataloader subprocs, accelerator launchers) are cleaned up too. If the root shell exits cleanly but leaves descendants alive, phasesweep treats that as a lifecycle failure, kills the group, and preserves identity files for forensics.
 
-**Signal forwarding.** SIGTERM/SIGINT to the orchestrator (Ctrl-C, `kill`, OOM-killer, SSH disconnect) → SIGTERM to every active child group → wait briefly → SIGKILL → exit. The PGID list is snapshotted *once* at signal time so a registration race during teardown can't leave a child unsignalled. Handlers are installed by both the CLI and the public `run_experiment()` entrypoint, so library callers using `from phasesweep import run_experiment` get the same cleanup contract as `phasesweep run`. The `Popen()` → `_register()` window is protected by a launch lock plus `pthread_sigmask`-based signal deferral so a SIGTERM that lands mid-launch waits until the child is registered before snapshotting.
+**Signal forwarding.** SIGTERM/SIGINT to the orchestrator (Ctrl-C, `kill`, OOM-killer, SSH disconnect) SIGTERM to every active child group wait briefly SIGKILL exit. The PGID list is snapshotted *once* at signal time so a registration race during teardown can't leave a child unsignalled. Handlers are installed by both the CLI and the public `run_experiment()` entrypoint, so library callers using `from phasesweep import run_experiment` get the same cleanup contract as `phasesweep run`. The `Popen()` `_register()` window is protected by a launch lock plus `pthread_sigmask`-based signal deferral so a SIGTERM that lands mid-launch waits until the child is registered before snapshotting.
 
-**PID tracking.** Each trial writes `{trial_dir}/pid`, `{trial_dir}/pgid`, and `{trial_dir}/pid_starttime` on launch. They persist on failure (`nvidia-smi` → find PID → `cat runs/.../trial_00003/pid` → confirmed). On a clean exit they are removed. PID + start-time match is checked before any kill so PID reuse can't trick the reaper into killing an unrelated process.
+**PID tracking.** Each trial writes `{trial_dir}/pid`, `{trial_dir}/pgid`, and `{trial_dir}/pid_starttime` on launch. They persist on failure (`nvidia-smi` find PID `cat runs/.../trial_00003/pid` confirmed). On a clean exit they are removed. PID + start-time match is checked before any kill so PID reuse can't trick the reaper into killing an unrelated process.
 
 **Stale trial reaper.** If the orchestrator dies mid-sweep, Optuna's storage shows those trials as `RUNNING` forever. On the next launch, phasesweep:
 1. Looks up each `RUNNING` trial's persisted `phasesweep_trial_dir` user attribute (so changing `workdir` between runs doesn't break reaping).
@@ -201,14 +201,14 @@ phasesweep is **single-orchestrator-per-experiment, single-host**. Within one or
 
 **Same-host advisory locking.** A `phasesweep run` takes **two** `flock`s under `$TMPDIR/phasesweep-locks/` for the duration of the run:
 
-- **Output lock** — keyed by the resolved `<workdir>/<experiment>/` path. Prevents two configs that share that path but disagree on storage from corrupting each other's `trial_*/`, `winner.yaml`, and `summary.yaml`.
-- **Storage lock** — keyed by canonical Optuna storage identity + experiment name. Prevents two configs that share the study but live in different workdirs from interleaving phases against the same backend. SQLite identity is dialect-folded: `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide on the same lock.
+- **Output lock** - keyed by the resolved `<workdir>/<experiment>/` path. Prevents two configs that share that path but disagree on storage from corrupting each other's `trial_*/`, `winner.yaml`, and `summary.yaml`.
+- **Storage lock** - keyed by canonical Optuna storage identity + experiment name. Prevents two configs that share the study but live in different workdirs from interleaving phases against the same backend. SQLite identity is dialect-folded: `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide on the same lock.
 
 Either lock alone misses a real collision mode. The locks are taken in deterministic path-sorted order; a held lock causes a second invocation to fail fast with a clear error rather than corrupt the first run.
 
 A phase-level lock backs the run lock as defense in depth for direct callers of internal `_run_phase` (tests, future code paths). The public CLI never reaches it without first acquiring the run lock.
 
-**Multi-host phasesweep against a shared Postgres/MySQL is unsafe today.** The stale-trial reaper marks every `RUNNING` trial it sees as `FAIL` on startup; with two orchestrators against the same study, one would `FAIL` the other's live trials. Use Postgres/MySQL for *durable storage and dashboards from a single host*, not concurrent multi-host runs. Safe multi-host needs per-trial leases plus heartbeat-based reaping — tracked in `TODO.md`.
+**Multi-host phasesweep against a shared Postgres/MySQL is unsafe today.** The stale-trial reaper marks every `RUNNING` trial it sees as `FAIL` on startup; with two orchestrators against the same study, one would `FAIL` the other's live trials. Use Postgres/MySQL for *durable storage and dashboards from a single host*, not concurrent multi-host runs. Safe multi-host needs per-trial leases plus heartbeat-based reaping - tracked in `TODO.md`.
 
 ---
 
@@ -220,12 +220,12 @@ There are two kinds of resume:
 
 **`--from-phase <name>`** skips earlier phases by reading their `winner.yaml` files. Each `winner.yaml` is stamped with the producing phase's fingerprint. On resume, phasesweep recomputes the fingerprint of each *current* skipped phase against the *currently-resolved* inherited winners and refuses to load if:
 
-- The stored fingerprint is missing → hand-edited file, re-run the phase.
-- The stored fingerprint differs from the recomputed one → parent config has changed since the winner was produced. Re-run the parent, change the experiment name, or restore the matching config.
+- The stored fingerprint is missing hand-edited file, re-run the phase.
+- The stored fingerprint differs from the recomputed one parent config has changed since the winner was produced. Re-run the parent, change the experiment name, or restore the matching config.
 
 The earlier phases' Optuna studies are not touched by `--from-phase`.
 
-`--dry-run` renders one example command per phase (with placeholder overrides for inherited values) without launching subprocesses or touching storage. Dry-run does not take the run lock — inspecting the plan during a real run is a legitimate workflow.
+`--dry-run` renders one example command per phase (with placeholder overrides for inherited values) without launching subprocesses or touching storage. Dry-run does not take the run lock - inspecting the plan during a real run is a legitimate workflow.
 
 ---
 
@@ -253,7 +253,7 @@ metric:
     select: last         # first | last | min | max
 ```
 
-**Weights & Biases** (read-only — W&B does not drive anything):
+**Weights & Biases** (read-only - W&B does not drive anything):
 
 ```yaml
 metric:
@@ -285,13 +285,13 @@ mypy src/phasesweep --ignore-missing-imports
 Tests are organized by topic, one file per surface. To find the tests that
 guard a given behavior, look in the file named after that behavior:
 
-- `tests/test_e2e.py` — full sweep + `--from-phase` replay against the fake trainer.
-- `tests/test_storage_urls.py` — backend detection, SQLAlchemy dialect folding, absolute vs. relative path preservation, lock-identity collapse across equivalent URLs.
-- `tests/test_locking.py` — phase / experiment-run / storage-identity flock collisions; same on-disk state must collide, unrelated state must not.
-- `tests/test_process_supervision.py` — `Popen` lifecycle, signal handler installation, descendant cleanup, `cleanup_confirmed` propagation, launch-window deadlock guard. Several cases run as real subprocesses because POSIX signal delivery isn't mockable.
-- `tests/test_stale_reaper.py` — startup reaper, PID-reuse detection via starttime check, fail-closed contract.
-- `tests/test_fingerprint.py` — phase fingerprint, `--from-phase` verification, run-control field exclusion (so `n_trials` top-ups stay compatible).
-- `tests/test_filesystem_layout.py` — `<workdir>/<experiment>/<phase>/` namespacing, `summary.yaml` placement, experiment-name validation.
-- `tests/test_param_validation.py` — search-space and override validation: param-type bounds (NaN/inf rejection), categorical scalar-only, dotted-prefix collisions, override-key shell safety, sampler/search-space compatibility, trial-command template placeholder enforcement.
-- `tests/test_runtime_behavior.py` — NaN/inf propagation through extractors, parallel-trial sampler config, `max_consecutive_failures` abort, Optuna logging suppression.
-- `tests/test_config.py`, `test_extractors.py`, `test_overrides.py`, `test_selector.py`, `test_gpu_pool.py`, `test_cli.py`, `test_wandb_extractor.py` — schema, extractors, override composition, winner selection, GPU pool, CLI commands, W&B extractor.
+- `tests/test_e2e.py` - full sweep + `--from-phase` replay against the fake trainer.
+- `tests/test_storage_urls.py` - backend detection, SQLAlchemy dialect folding, absolute vs. relative path preservation, lock-identity collapse across equivalent URLs.
+- `tests/test_locking.py` - phase / experiment-run / storage-identity flock collisions; same on-disk state must collide, unrelated state must not.
+- `tests/test_process_supervision.py` - `Popen` lifecycle, signal handler installation, descendant cleanup, `cleanup_confirmed` propagation, launch-window deadlock guard. Several cases run as real subprocesses because POSIX signal delivery isn't mockable.
+- `tests/test_stale_reaper.py` - startup reaper, PID-reuse detection via starttime check, fail-closed contract.
+- `tests/test_fingerprint.py` - phase fingerprint, `--from-phase` verification, run-control field exclusion (so `n_trials` top-ups stay compatible).
+- `tests/test_filesystem_layout.py` - `<workdir>/<experiment>/<phase>/` namespacing, `summary.yaml` placement, experiment-name validation.
+- `tests/test_param_validation.py` - search-space and override validation: param-type bounds (NaN/inf rejection), categorical scalar-only, dotted-prefix collisions, override-key shell safety, sampler/search-space compatibility, trial-command template placeholder enforcement.
+- `tests/test_runtime_behavior.py` - NaN/inf propagation through extractors, parallel-trial sampler config, `max_consecutive_failures` abort, Optuna logging suppression.
+- `tests/test_config.py`, `test_extractors.py`, `test_overrides.py`, `test_selector.py`, `test_gpu_pool.py`, `test_cli.py`, `test_wandb_extractor.py` - schema, extractors, override composition, winner selection, GPU pool, CLI commands, W&B extractor.

@@ -109,7 +109,6 @@ phases:
 
 
 def test_phase_name_validation():
-
     with pytest.raises(ValidationError):
         Phase(name="bad name with spaces", n_trials=1, search_space={})
 
