@@ -723,8 +723,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
         except ImportError as exc:
             raise ValueError(
                 f"Phase {phase.name!r}: sampler.type='cmaes' requires the "
-                "optional 'cmaes' package, which is not installed. Install "
-                "with `pip install cmaes` or `pip install phasesweep[cmaes]`."
+                "'cmaes' package, which is not installed. Reinstall phasesweep "
+                "or install it directly with `pip install cmaes`."
             ) from exc
 
     if sampler_type == "grid":

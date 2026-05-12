@@ -62,9 +62,8 @@ It's the wrong tool when dimensions strongly interact - sweep them jointly in on
 ## Install
 
 ```bash
-pip install -e .                  # core
+pip install -e .                  # core, including Optuna CMA-ES sampler support
 pip install -e .[dev]             # + pytest, ruff, mypy, types-PyYAML
-pip install -e .[cmaes]           # + optional CMA-ES sampler
 pip install -e .[wandb]           # + optional W&B extractor
 ```
 
@@ -108,7 +107,7 @@ phases:
   - name: regularization
     inherits: [lr]                                                        # lr transitively carries depth.n_layers
     n_trials: 16
-    sampler: { type: tpe, seed: 1 }
+    sampler: { type: cmaes, seed: 1 }
     search_space:
       weight_decay: { type: float, low: 0.0, high: 0.3 }
       dropout:      { type: float, low: 0.0, high: 0.3 }
@@ -146,7 +145,7 @@ phases:
 - **`n_jobs`** *(optional, default 1)*: parallel trials within this phase. When combined with `gpu_ids`, each trial gets exclusive `CUDA_VISIBLE_DEVICES` via a blocking pool.
 - **`gpu_ids`** *(optional)*: explicit list of CUDA device indices, e.g. `[0, 1, 2, 3]`. Honored at `n_jobs == 1` too (lets a single-job phase isolate to a specific GPU on shared hardware). Auto-detected via ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` when omitted and `n_jobs > 1`.
 - **`max_consecutive_failures`** *(optional, default 5)*: abort the phase after this many consecutive failed/infeasible trials. Prevents a broken trainer from burning through `n_trials`.
-- **`sampler`** *(optional, default `{type: tpe}`)*: `tpe` | `random` | `grid` | `cmaes`. Sampler-vs-search-space compatibility is checked at config-load: cmaes-with-categoricals, grid-with-log-floats, grid-with-non-step-divisible-floats are all rejected. cmaes also import-checks the optional `cmaes` package at config-load.
+- **`sampler`** *(optional, default `{type: tpe}`)*: `tpe` | `random` | `grid` | `cmaes`. Sampler-vs-search-space compatibility is checked at config-load: cmaes-with-categoricals, grid-with-log-floats, grid-with-non-step-divisible-floats are all rejected. `cmaes` is useful for continuous numeric phases on a single node/GPU, for example learning rate, weight decay, dropout, or scheduler constants. It also import-checks the `cmaes` package at config-load.
 - **`timeout_seconds_per_trial`** *(optional)*: kill the trial's entire process group if it runs longer. Semantic: changing this value invalidates the study fingerprint, since a different timeout changes which trials FAIL vs COMPLETE under the same sampled params.
 - **`comment`** *(optional)*: free-text design note. Surfaced by `phasesweep validate` and `phasesweep show-winners` so the *why* of each phase lives next to the spec. Excluded from the fingerprint - editing the comment never invalidates the study.
 
@@ -276,7 +275,7 @@ Constraint extraction uses the same three extractor types.
 ## Tests
 
 ```bash
-pytest                                # 244 passed, 1 skipped (cmaes optional dep)
+pytest                                # 245 passed
 ruff check src tests
 ruff format --check src tests
 mypy src/phasesweep --ignore-missing-imports

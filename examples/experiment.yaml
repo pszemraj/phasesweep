@@ -56,13 +56,12 @@ phases:
   - name: regularization
     comment: |
       Last: jointly tune weight_decay and dropout. They interact, so a
-      single TPE phase over both is more efficient than two greedy 1D sweeps.
+      single CMA-ES phase over both is more efficient than two greedy 1D sweeps.
     inherits: [lr]   # lr transitively carries depth.n_layers; no need to list depth.
     n_trials: 16
     sampler:
-      type: tpe
+      type: cmaes
       seed: 1
-      n_startup_trials: 4
     search_space:
       weight_decay: { type: float, low: 0.0, high: 0.3 }
       dropout: { type: float, low: 0.0, high: 0.3 }

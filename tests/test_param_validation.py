@@ -819,16 +819,9 @@ def test_cmaes_phase_rejected_at_config_load_when_package_missing(
 
 
 def test_cmaes_phase_loads_when_package_present() -> None:
-    """Sanity: a cmaes phase loads cleanly when the package is available
-    (which it should be in our test env via the [dev] extra). If this
-    fails, the missing-package test above would be a tautology.
-    """
-    # Confirm the package really is importable in this environment, otherwise
-    # skip rather than silently asserting nothing.
-    try:
-        import cmaes  # noqa: F401
-    except ImportError:
-        pytest.skip("cmaes not installed in this environment")
+    """Sanity: a cmaes phase loads cleanly with the packaged dependency."""
+
+    import cmaes  # noqa: F401
 
     exp = make_experiment(
         sampler=Sampler(type="cmaes", seed=0),
