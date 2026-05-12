@@ -30,7 +30,7 @@ runs/
  phases.db                              # Optuna SQLite (path from `storage:`)
 ```
 
-Every winner carries a `phase_fingerprint`. Edit a parent phase's search space and `--from-phase` a child loud refusal, never silent reuse. (Bump `n_trials` to top up trials still works; run-control fields are excluded from the fingerprint.)
+Every persisted winner carries a `phase_fingerprint`. Edit a parent phase's search space and `--from-phase` refuses loudly, never silently reuses stale state. Bumping `n_trials` to top up trials still works; run-control fields are excluded from the fingerprint.
 
 ---
 
@@ -41,7 +41,7 @@ Every winner carries a `phase_fingerprint`. Edit a parent phase's search space a
 **Isn't.**
 - Not a training framework. Bring your own trainer.
 - Not a joint search. Sequential phases are greedy; if you need joint optimization, use one phase with the full space.
-- Not a cluster scheduler. **Multi-host parallelism against a shared study is unsafe and rejected** (see "Concurrency model"). One orchestrator per host with distinct experiment names if you need multiple boxes.
+- Not a cluster scheduler. Multi-host parallelism against one shared study is unsupported; same-host collisions are rejected by advisory locks. Use distinct experiment names if you need multiple boxes.
 - Not an analysis tool. `optuna-dashboard sqlite:///runs/phases.db` works directly for sequential SQLite studies.
 - No LLMs in the runtime loop. Phasesweep does HPO; an upstream tool can write the YAML if it wants to.
 
@@ -285,7 +285,7 @@ under `$TMPDIR/phasesweep-locks/`. That prevents independent same-host
 phasesweep processes from double-booking the same GPU, including single-job
 phases with explicit `gpu_ids`.
 
-**Multi-host phasesweep against a shared Postgres/MySQL is unsafe today.** The stale-trial reaper marks every `RUNNING` trial it sees as `FAIL` on startup; with two orchestrators against the same study, one would `FAIL` the other's live trials. Use Postgres/MySQL for *durable storage and dashboards from a single host*, not concurrent multi-host runs. Safe multi-host needs per-trial leases plus heartbeat-based reaping - tracked in `TODO.md`.
+**Multi-host phasesweep against a shared Postgres/MySQL is unsupported.** The stale-trial reaper marks every `RUNNING` trial it sees as `FAIL` on startup; with two orchestrators against the same study, one would `FAIL` the other's live trials. Use Postgres/MySQL for durable storage and dashboards from a single host, not concurrent multi-host runs. Safe multi-host work is tracked in [TODO.md](TODO.md).
 
 ---
 
@@ -295,10 +295,10 @@ There are two kinds of resume:
 
 **Re-running the same YAML** reuses the existing Optuna study and tops it up. The study's user_attr stores the fingerprint of the producing config; re-launch recomputes it and either accepts (top-up) or refuses with a fingerprint-mismatch error. Run-control fields excluded from the fingerprint: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_partial_grid`, `allow_seed_search`, `comment`. Bumping `n_trials` to top up is therefore always compatible. Changes to search space, sampler, fixed overrides, contracts, gates, promotion rules, trial command, override format, metric, constraints, env vars, inherited winners, or `timeout_seconds_per_trial` *do* invalidate the study. `timeout_seconds_per_trial` is intentionally semantic: a 60s vs 3600s budget changes which trials FAIL vs COMPLETE, which changes the observation distribution under one fingerprint and would silently mix censored and uncensored trials.
 
-**`--from-phase <name>`** skips earlier phases by reading their `winner.yaml` files. Each `winner.yaml` is stamped with the producing phase's fingerprint. On resume, phasesweep recomputes the fingerprint of each *current* skipped phase against the *currently-resolved* inherited winners and refuses to load if:
+**`--from-phase <name>`** skips earlier phases by reading their `winner.yaml` files. Promotion is already applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner, not the raw candidate trial. Each `winner.yaml` is stamped with the producing phase's fingerprint. On resume, phasesweep recomputes the fingerprint of each *current* skipped phase against the *currently-resolved* inherited winners and refuses to load if:
 
-- The stored fingerprint is missing hand-edited file, re-run the phase.
-- The stored fingerprint differs from the recomputed one parent config has changed since the winner was produced. Re-run the parent, change the experiment name, or restore the matching config.
+- The stored fingerprint is missing: the file is legacy or hand-edited. Re-run the phase.
+- The stored fingerprint differs from the recomputed one: parent config changed since the winner was produced. Re-run the parent, change the experiment name, or restore the matching config.
 
 Before loading a skipped phase's `winner.yaml`, phasesweep reaps stale RUNNING
 trials in that skipped study. A resume cannot leave old GPU-holding processes

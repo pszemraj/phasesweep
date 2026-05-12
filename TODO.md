@@ -2,7 +2,6 @@
 
 ## v0.6+
 
-- Design safe multi-host orchestration with per-trial leases and heartbeat-based stale
-  trial reaping. The current stale reaper is intentionally single-orchestrator,
-  single-host only because a second orchestrator against the same study could mark live
-  trials from the first orchestrator as failed.
+- Add safe multi-host orchestration: per-trial leases, heartbeats, and stale-trial
+  reaping that cannot fail another host's live trials. Current limits are described in
+  [Concurrency model](README.md#concurrency-model).
