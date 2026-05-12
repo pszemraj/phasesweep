@@ -154,8 +154,8 @@ phases:
 - **`timeout_seconds_per_phase`** *(optional)*: phase wallclock guard; active subprocess cleanup still uses `timeout_seconds_per_trial`.
 - **`allow_partial_grid`** *(optional, default `false`)*: grid phases must run the full matrix by default. Set true only when a deliberately partial grid is acceptable.
 - **`allow_seed_search`** *(optional, default `false`)*: by default, `seed` and `*.seed` search-space keys are rejected. Put trainer seeds in `fixed_overrides`, or set this true for a variance audit.
-- **`gates`** *(optional)*: evidence gates that must pass after metric/constraint extraction. Supported: `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`. Gate failures mark the trial `FAIL`.
-- **`promotion`** *(optional)*: compare this phase winner against an earlier baseline winner before exposing it downstream. Fields: `min_delta_vs`, `min_delta`, `requires_gates`, `on_fail: stop|skip|continue_baseline`.
+- **`gates`** *(optional)*: evidence gates evaluated after metric/constraint extraction. Supported: `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`. Gate failures mark the trial `FAIL` unless the phase has `promotion.requires_gates: false`, in which case they are recorded as advisory evidence.
+- **`promotion`** *(optional)*: compare this phase winner against an earlier phase winner before exposing it downstream. Fields: `min_delta_vs`, `min_delta`, `requires_gates`, `on_fail: stop|skip|continue_baseline`.
 - **`comment`** *(optional)*: free-text design note. Surfaced by `phasesweep validate` and `phasesweep show-winners` so the *why* of each phase lives next to the spec. Excluded from the fingerprint - editing the comment never invalidates the study.
 
 ### Override priority within a trial (low to high)
@@ -217,6 +217,10 @@ studies:
 
   - name: candidate
     depends_on: [baseline]
+    promotion:
+      min_delta_vs: baseline
+      min_delta: 0.01
+      on_fail: stop
     phases:
       - name: lr
         contracts: [k7_eval]
@@ -228,6 +232,12 @@ studies:
 Each study compiles to a normal isolated experiment named `<suite>__<study>`, so
 Optuna studies and output dirs do not collide. Suite runs also write
 `<workdir>/<suite>/run.log` and `suite_summary.yaml`.
+
+Study-level `promotion` compares the final winner of the current study against a
+prior study's final winner. `min_delta_vs: baseline` targets the prior study's
+last phase; `min_delta_vs: baseline.lr` targets a specific phase. `on_fail:
+continue_baseline` exposes the baseline winner for the current study's final
+phase; `skip` omits the study from downstream dependencies; `stop` aborts.
 
 `phasesweep status CONFIG` is read-only and reports winner files plus Optuna trial
 counts for either a single experiment or a suite.
@@ -345,7 +355,7 @@ Constraint extraction uses the same three extractor types.
 ## Tests
 
 ```bash
-pytest                                # 252 passed
+pytest                                # 254 passed
 ruff check src tests
 ruff format --check src tests
 mypy src/phasesweep --ignore-missing-imports

@@ -107,6 +107,110 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     assert winners["candidate"].effective_overrides == winners["baseline"].effective_overrides
 
 
+def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
+    """``requires_gates: false`` records gate failures without failing the trial."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, rest = ap.parse_known_args()
+        value = 1.0
+        for item in rest:
+            if item.startswith("score="):
+                value = float(item.split("=", 1)[1])
+        with open(args.out, "w") as f:
+            json.dump({"x": value}, f)
+        """,
+    )
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="baseline",
+                n_trials=1,
+                fixed_overrides={"score": 1.0},
+                search_space={},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 0.5},
+                search_space={},
+                gates=[RequiredFileGate(type="required_file", path="missing.txt")],
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "min_delta": 0.1,
+                    "requires_gates": False,
+                    "on_fail": "stop",
+                },
+            ),
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    assert winners["candidate"].metric == 0.5
+    assert winners["candidate"].gates[0]["passed"] is False
+
+
+def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
+    """Suite-level promotion compares final study winners across studies."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, rest = ap.parse_known_args()
+        value = 1.0
+        for item in rest:
+            if item.startswith("score="):
+                value = float(item.split("=", 1)[1])
+        with open(args.out, "w") as f:
+            json.dump({"x": value}, f)
+        """,
+    )
+    p = write_yaml(
+        tmp_path,
+        f"""
+        suite: promote_suite
+        defaults:
+          workdir: {tmp_path}/runs
+          trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          metric:
+            name: x
+            goal: minimize
+            extractor: {{ type: json, path: r.json, key: x }}
+        studies:
+          - name: baseline
+            phases:
+              - name: eval
+                n_trials: 1
+                fixed_overrides: {{ score: 1.0 }}
+                search_space: {{}}
+          - name: candidate
+            depends_on: [baseline]
+            promotion:
+              min_delta_vs: baseline
+              min_delta: 0.1
+              on_fail: continue_baseline
+            phases:
+              - name: eval
+                n_trials: 1
+                fixed_overrides: {{ score: 0.95 }}
+                search_space: {{}}
+        """,
+    )
+
+    config = load_config(p)
+    winners = run_config(config)
+
+    assert winners["candidate"]["eval"].metric == winners["baseline"]["eval"].metric
+
+
 def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
     """Suite configs compile studies to isolated experiments and run through dispatch."""
     p = write_yaml(

@@ -904,6 +904,7 @@ class StudySpec(_Frozen):
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] | None = None
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    promotion: Promotion | None = None
 
     @field_validator("name")
     @classmethod
@@ -940,6 +941,13 @@ class Suite(_Frozen):
                 if dep not in seen:
                     raise ValueError(
                         f"Study {study.name!r} depends_on {dep!r}, which is not a prior study."
+                    )
+            if study.promotion is not None:
+                baseline_study = study.promotion.min_delta_vs.split(".", 1)[0]
+                if baseline_study not in seen:
+                    raise ValueError(
+                        f"Study {study.name!r} promotion references {baseline_study!r}, "
+                        "which is not a prior study."
                     )
             seen.add(study.name)
         return self

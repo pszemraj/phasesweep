@@ -78,6 +78,7 @@ class Winner:
     effective_overrides: dict[str, Any]  # full composed overrides (fixed + inherited + sampled)
     metric: float
     constraints: dict[str, float] = field(default_factory=dict)
+    gates: list[dict[str, Any]] = field(default_factory=list)
     phase_fingerprint: str | None = None
 
 
@@ -525,6 +526,29 @@ def _phase_gates(experiment: Experiment, phase: Phase) -> list[Gate]:
     return gates
 
 
+def _gates_pass(gates: list[dict[str, Any]]) -> bool:
+    """Return whether every recorded gate result passed."""
+    return all(bool(gate.get("passed")) for gate in gates)
+
+
+def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
+    """Load persisted gate result payload for a selected trial."""
+    for trial in study.get_trials(deepcopy=False):
+        if trial.number != trial_number:
+            continue
+        raw = trial.user_attrs.get("phasesweep_gates")
+        if not isinstance(raw, str) or not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
 # --------------------------------------------------------------------------------------
 # Phase helpers
 # --------------------------------------------------------------------------------------
@@ -685,6 +709,7 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         "params": winner.params,
         "effective_overrides": winner.effective_overrides,
         "constraints": winner.constraints,
+        "gates": winner.gates,
         "phase_fingerprint": winner.phase_fingerprint,
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
@@ -754,6 +779,7 @@ def _load_winner(
         effective_overrides=dict(data.get("effective_overrides") or data["params"]),
         metric=float(data["metric"][experiment.metric.name]),
         constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
+        gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
         phase_fingerprint=str(stored_fp),
     )
 
@@ -788,6 +814,24 @@ def _apply_promotion(
         raise RuntimeError(
             f"Phase {phase.name!r} promotion references unknown baseline "
             f"{promotion.min_delta_vs!r}."
+        )
+    if promotion.requires_gates and not _gates_pass(candidate.gates):
+        message = f"Phase {phase.name!r} failed promotion: required evidence gates did not pass."
+        if promotion.on_fail == "stop":
+            raise RuntimeError(message)
+        if promotion.on_fail == "skip":
+            log.warning("%s Skipping remaining dependent phases.", message)
+            return None
+        log.warning("%s Continuing with baseline winner.", message)
+        baseline_for_gates = winners[promotion.min_delta_vs]
+        return Winner(
+            trial_number=baseline_for_gates.trial_number,
+            params=dict(baseline_for_gates.params),
+            effective_overrides=dict(baseline_for_gates.effective_overrides),
+            metric=baseline_for_gates.metric,
+            constraints=dict(baseline_for_gates.constraints),
+            gates=list(baseline_for_gates.gates),
+            phase_fingerprint=candidate.phase_fingerprint,
         )
 
     baseline = winners[promotion.min_delta_vs]
@@ -824,6 +868,7 @@ def _apply_promotion(
         effective_overrides=dict(baseline.effective_overrides),
         metric=baseline.metric,
         constraints=dict(baseline.constraints),
+        gates=list(baseline.gates),
         phase_fingerprint=candidate.phase_fingerprint,
     )
 
@@ -1393,6 +1438,7 @@ def _run_phase_inner(
             experiment=experiment,
             executed=executed,
             gates=_phase_gates(experiment, phase),
+            enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
         )
 
         trial.set_user_attr("phasesweep_feasible", result.feasible)
@@ -1517,12 +1563,14 @@ def _run_phase_inner(
     # _save_winner independent of study state.
     selected = select_winner(study, experiment)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
+    gate_payload = _trial_gate_payload(study, selected.trial_number)
     winner = Winner(
         trial_number=selected.trial_number,
         params=selected.params,
         effective_overrides=effective,
         metric=selected.metric,
         constraints=selected.constraints,
+        gates=gate_payload,
         phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
     )
     _save_winner(experiment, phase.name, winner)
@@ -1628,6 +1676,7 @@ def _placeholder_winner(
         effective_overrides=effective,
         metric=float("nan"),
         constraints={},
+        gates=[],
     )
 
 
@@ -1779,6 +1828,7 @@ def _run_experiment_inner(
                 "params": w.params,
                 "effective_overrides": w.effective_overrides,
                 "constraints": w.constraints,
+                "gates": w.gates,
             }
             for pname, w in winners.items()
         ],
@@ -1865,9 +1915,121 @@ def _suite_lock(suite: Suite) -> Iterator[None]:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def _study_phase_winner(
+    study_name: str,
+    results: dict[str, dict[str, Winner]],
+    selector: str,
+) -> tuple[str, Winner]:
+    """Resolve a suite promotion selector to a prior study winner."""
+    if "." in selector:
+        baseline_study, phase_name = selector.split(".", 1)
+    else:
+        baseline_study, phase_name = selector, ""
+    if baseline_study not in results:
+        raise RuntimeError(
+            f"Study {study_name!r} promotion references unknown baseline study {baseline_study!r}."
+        )
+    study_winners = results[baseline_study]
+    if not study_winners:
+        raise RuntimeError(f"Baseline study {baseline_study!r} has no winners.")
+    if phase_name:
+        if phase_name not in study_winners:
+            raise RuntimeError(
+                f"Study {study_name!r} promotion references missing baseline phase {selector!r}."
+            )
+        return baseline_study, study_winners[phase_name]
+    final_phase = next(reversed(study_winners))
+    return f"{baseline_study}.{final_phase}", study_winners[final_phase]
+
+
+def _apply_study_promotion(
+    *,
+    suite: Suite,
+    study_name: str,
+    experiment: Experiment,
+    study_winners: dict[str, Winner],
+    prior_results: dict[str, dict[str, Winner]],
+) -> tuple[dict[str, Winner] | None, dict[str, Any] | None]:
+    """Apply a suite study promotion rule against a prior study winner."""
+    study_spec = next(study for study in suite.studies if study.name == study_name)
+    promotion = study_spec.promotion
+    if promotion is None:
+        return study_winners, None
+    if not study_winners:
+        raise RuntimeError(f"Study {study_name!r} has no winner to promote.")
+
+    baseline_label, baseline = _study_phase_winner(
+        study_name,
+        prior_results,
+        promotion.min_delta_vs,
+    )
+    final_phase = next(reversed(study_winners))
+    candidate = study_winners[final_phase]
+
+    gate_passed = _gates_pass(candidate.gates)
+    if promotion.requires_gates and not gate_passed:
+        promoted = False
+        improvement = None
+    else:
+        if experiment.metric.goal == "minimize":
+            improvement = baseline.metric - candidate.metric
+        else:
+            improvement = candidate.metric - baseline.metric
+        promoted = improvement >= promotion.min_delta
+
+    decision: dict[str, Any] = {
+        "study": study_name,
+        "phase": final_phase,
+        "baseline": baseline_label,
+        "candidate_metric": candidate.metric,
+        "baseline_metric": baseline.metric,
+        "min_delta": promotion.min_delta,
+        "improvement": improvement,
+        "requires_gates": promotion.requires_gates,
+        "gates_passed": gate_passed,
+        "promoted": promoted,
+        "on_fail": promotion.on_fail,
+    }
+    if promoted:
+        log.info(
+            "suite=%s study=%s PROMOTED improvement=%s baseline=%s min_delta=%g",
+            suite.suite,
+            study_name,
+            improvement,
+            baseline_label,
+            promotion.min_delta,
+        )
+        return study_winners, decision
+
+    message = (
+        f"Study {study_name!r} failed promotion against {baseline_label!r}: "
+        f"improvement {improvement!r}, min_delta {promotion.min_delta:g}, "
+        f"gates_passed={gate_passed}."
+    )
+    if promotion.on_fail == "stop":
+        raise RuntimeError(message)
+    if promotion.on_fail == "skip":
+        log.warning("%s Skipping this study for downstream dependencies.", message)
+        return None, decision
+
+    log.warning("%s Continuing with baseline winner.", message)
+    exposed = dict(study_winners)
+    exposed[final_phase] = Winner(
+        trial_number=baseline.trial_number,
+        params=dict(baseline.params),
+        effective_overrides=dict(baseline.effective_overrides),
+        metric=baseline.metric,
+        constraints=dict(baseline.constraints),
+        gates=list(baseline.gates),
+        phase_fingerprint=candidate.phase_fingerprint,
+    )
+    return exposed, decision
+
+
 def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Winner]]:
     """Run every study in a suite in dependency order."""
     results: dict[str, dict[str, Winner]] = {}
+    promotion_decisions: dict[str, dict[str, Any]] = {}
     if dry_run:
         for study_spec in suite.studies:
             experiment = suite.experiment_for_study(study_spec)
@@ -1884,14 +2046,27 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     )
             experiment = suite.experiment_for_study(study_spec)
             log.info("suite=%s study=%s START", suite.suite, study_spec.name)
-            results[study_spec.name] = run_experiment(experiment, dry_run=False)
+            study_winners = run_experiment(experiment, dry_run=False)
+            exposed_winners, decision = _apply_study_promotion(
+                suite=suite,
+                study_name=study_spec.name,
+                experiment=experiment,
+                study_winners=study_winners,
+                prior_results=results,
+            )
+            if decision is not None:
+                promotion_decisions[study_spec.name] = decision
+            if exposed_winners is not None:
+                results[study_spec.name] = exposed_winners
             log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
 
         summary = {
             "suite": suite.suite,
+            "promotion_decisions": list(promotion_decisions.values()),
             "studies": [
                 {
                     "name": study_name,
+                    "promotion": promotion_decisions.get(study_name),
                     "phases": [
                         {
                             "name": phase_name,
@@ -1900,6 +2075,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                             "params": winner.params,
                             "effective_overrides": winner.effective_overrides,
                             "constraints": winner.constraints,
+                            "gates": winner.gates,
                         }
                         for phase_name, winner in study_winners.items()
                     ],

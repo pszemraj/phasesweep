@@ -214,6 +214,7 @@ def extract_trial_result(
     experiment: Experiment,
     executed: ExecutedTrial,
     gates: list[Gate] | None = None,
+    enforce_gates: bool = True,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -234,6 +235,9 @@ def extract_trial_result(
         executed: Output of :func:`launch_trial`; provides the trial context
             and the :class:`ProcessResult`.
         gates: Evidence gates that must pass for the trial to count.
+        enforce_gates: If ``True``, failed gates fail the trial. If ``False``,
+            gates are advisory and are recorded without changing the metric
+            result.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -315,7 +319,7 @@ def extract_trial_result(
 
     gate_results = evaluate_gates(executed.ctx, gates or [])
     failed_gates = [gate for gate in gate_results if not gate.passed]
-    if failed_gates:
+    if failed_gates and enforce_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
         log.warning(
             "[%s/trial_%d] evidence gate(s) failed: %s",
