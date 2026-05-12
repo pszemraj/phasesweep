@@ -85,6 +85,7 @@ metric:
 phases:
   - name: a
     n_trials: 2
+    allow_partial_grid: true
     sampler: {{ type: grid }}
     search_space:
       n_layers: {{ type: categorical, choices: [4, 8] }}

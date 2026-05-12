@@ -173,7 +173,43 @@ phases:
     exp = load_experiment(write_yaml(tmp_path, body))
     winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"a", "b"}
-    # No summary written
+    # No filesystem artifacts written.
+    assert not (Path(tmp_path / "runs") / "dry").exists()
     assert not (Path(tmp_path / "runs") / "summary.yaml").exists()
     # An example command was logged
     assert any("DRY RUN example command" in r.message for r in caplog.records)
+
+
+def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
+    """``phasesweep status`` is read-only and reports study trial state counts."""
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        "import argparse, json\n"
+        "ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)\n"
+        "args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))\n"
+    )
+    trainer.chmod(0o755)
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: status_test
+        storage: sqlite:///{tmp_path}/status.db
+        workdir: {tmp_path}/runs
+        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: p
+            n_trials: 1
+            search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+        """,
+    )
+    exp = load_experiment(p)
+    run_experiment(exp)
+
+    result = CliRunner().invoke(cli_main, ["status", str(p)])
+    assert result.exit_code == 0
+    assert "status_test" in result.output
+    assert "COMPLETE: 1" in result.output

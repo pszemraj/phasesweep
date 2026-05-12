@@ -18,20 +18,29 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without insta
 # orchestrator and runner reach back into this module for ``__version__`` at
 # import time; moving them up would break that chain. ``noqa: E402`` /
 # ``isort: split`` keep formatters from "fixing" the order.
-from phasesweep.config import Experiment, load_experiment  # noqa: E402
+from phasesweep.config import Config, Experiment, Suite, load_config, load_experiment  # noqa: E402
 from phasesweep.orchestrator import (  # noqa: E402
     NoFeasibleTrialError,
     Winner,
+    config_status,
+    run_config,
     run_experiment,
+    run_suite,
 )
 from phasesweep.runner import UnsafeProcessCleanupError  # noqa: E402
 
 __all__ = [
     "Experiment",
     "NoFeasibleTrialError",
+    "Config",
+    "Suite",
     "UnsafeProcessCleanupError",
     "Winner",
     "__version__",
+    "config_status",
+    "load_config",
     "load_experiment",
+    "run_config",
     "run_experiment",
+    "run_suite",
 ]

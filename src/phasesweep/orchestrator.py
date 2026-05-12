@@ -18,6 +18,7 @@ import json
 import logging
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,12 +30,15 @@ import yaml
 from phasesweep import __version__
 from phasesweep.config import (
     CategoricalParam,
+    Config,
     Experiment,
     FloatParam,
+    Gate,
     IntParam,
     Phase,
     Sampler,
     SearchParam,
+    Suite,
 )
 from phasesweep.gpu_pool import GpuPool
 from phasesweep.runner import (
@@ -226,6 +230,10 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_no_gpu_isolation",
         "max_consecutive_failures",
         "comment",
+        "allow_unbounded_trials",
+        "timeout_seconds_per_phase",
+        "allow_partial_grid",
+        "allow_seed_search",
     }
 )
 
@@ -264,6 +272,9 @@ def _phase_semantic_payload(
         "env": dict(sorted(experiment.env.items())),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        "contracts": {
+            name: experiment.contracts[name].model_dump(mode="json") for name in phase.contracts
+        },
         "phase": semantic_phase,
         "inherited_effective_overrides": {
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
@@ -476,13 +487,15 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
 
 
 def _composed_overrides(
+    experiment: Experiment,
     phase: Phase,
     sampled: dict[str, Any],
     inherited_winners: dict[str, Winner],
 ) -> dict[str, Any]:
-    """Merge in priority order: inherited effective_overrides < fixed_overrides < sampled.
+    """Merge inherited winners, contracts, fixed overrides, and sampled params.
 
     Args:
+        experiment: Parsed experiment; provides named contracts.
         phase: The phase whose ``fixed_overrides`` and inheritance list apply.
         sampled: The values Optuna just suggested for this trial.
         inherited_winners: Parent-phase winners; their ``effective_overrides``
@@ -496,9 +509,20 @@ def _composed_overrides(
     out: dict[str, Any] = {}
     for parent in phase.inherits:
         out.update(inherited_winners[parent].effective_overrides)
+    for contract_name in phase.contracts:
+        out.update(experiment.contracts[contract_name].fixed_overrides)
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
+
+
+def _phase_gates(experiment: Experiment, phase: Phase) -> list[Gate]:
+    """Return contract gates followed by phase-local gates."""
+    gates: list[Gate] = []
+    for contract_name in phase.contracts:
+        gates.extend(experiment.contracts[contract_name].gates)
+    gates.extend(phase.gates)
+    return gates
 
 
 # --------------------------------------------------------------------------------------
@@ -549,6 +573,43 @@ def _summary_path(experiment: Experiment) -> Path:
 
     """
     return _experiment_dir(experiment) / "summary.yaml"
+
+
+def _run_log_path(experiment: Experiment) -> Path:
+    """Path to the durable run log for one experiment."""
+    return _experiment_dir(experiment) / "run.log"
+
+
+@contextlib.contextmanager
+def _file_log_handler(path: Path) -> Iterator[None]:
+    """Attach a durable file handler for phasesweep logs."""
+    logger = logging.getLogger("phasesweep")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s %(levelname).1s %(name)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler.setLevel(logging.DEBUG)
+    old_level = logger.level
+    if old_level in (logging.NOTSET, 0) or old_level > logging.INFO:
+        logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+        logger.setLevel(old_level)
+
+
+@contextlib.contextmanager
+def _run_log_handler(experiment: Experiment) -> Iterator[None]:
+    """Attach a durable file handler for one experiment run."""
+    with _file_log_handler(_run_log_path(experiment)):
+        yield
 
 
 def _trial_dir_for(experiment: Experiment, phase_name: str, trial_number: int) -> Path:
@@ -694,6 +755,76 @@ def _load_winner(
         metric=float(data["metric"][experiment.metric.name]),
         constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
         phase_fingerprint=str(stored_fp),
+    )
+
+
+def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
+    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``."""
+    if experiment.storage is None:
+        return
+    direction = "minimize" if experiment.metric.goal == "minimize" else "maximize"
+    study = optuna.create_study(
+        study_name=f"{experiment.experiment}::{phase.name}",
+        storage=_resolve_storage(experiment.storage),
+        sampler=_build_sampler(phase.sampler, phase.search_space, n_jobs=phase.n_jobs),
+        pruner=optuna.pruners.NopPruner(),
+        direction=direction,
+        load_if_exists=True,
+    )
+    _reap_stale_trials(study, experiment, phase.name)
+
+
+def _apply_promotion(
+    experiment: Experiment,
+    phase: Phase,
+    candidate: Winner,
+    winners: dict[str, Winner],
+) -> Winner | None:
+    """Apply a phase promotion rule, returning the winner to expose downstream."""
+    promotion = phase.promotion
+    if promotion is None:
+        return candidate
+    if promotion.min_delta_vs not in winners:
+        raise RuntimeError(
+            f"Phase {phase.name!r} promotion references unknown baseline "
+            f"{promotion.min_delta_vs!r}."
+        )
+
+    baseline = winners[promotion.min_delta_vs]
+    if experiment.metric.goal == "minimize":
+        improvement = baseline.metric - candidate.metric
+    else:
+        improvement = candidate.metric - baseline.metric
+
+    passed = improvement >= promotion.min_delta
+    if passed:
+        log.info(
+            "phase=%s PROMOTED improvement=%g baseline=%s min_delta=%g",
+            phase.name,
+            improvement,
+            promotion.min_delta_vs,
+            promotion.min_delta,
+        )
+        return candidate
+
+    message = (
+        f"Phase {phase.name!r} failed promotion: improvement {improvement:g} "
+        f"vs {promotion.min_delta_vs!r} is below min_delta {promotion.min_delta:g}."
+    )
+    if promotion.on_fail == "stop":
+        raise RuntimeError(message)
+    if promotion.on_fail == "skip":
+        log.warning("%s Skipping remaining dependent phases.", message)
+        return None
+
+    log.warning("%s Continuing with baseline winner.", message)
+    return Winner(
+        trial_number=baseline.trial_number,
+        params=dict(baseline.params),
+        effective_overrides=dict(baseline.effective_overrides),
+        metric=baseline.metric,
+        constraints=dict(baseline.constraints),
+        phase_fingerprint=candidate.phase_fingerprint,
     )
 
 
@@ -1006,6 +1137,7 @@ def _run_phase(
     inherited_winners: dict[str, Winner],
     *,
     dry_run: bool = False,
+    run_deadline: float | None = None,
 ) -> Winner:
     """Wrap :func:`_run_phase_inner` in the phase lock (skipped on ``dry_run``).
 
@@ -1015,6 +1147,8 @@ def _run_phase(
         inherited_winners: Winners loaded for phases earlier in the chain.
         dry_run: When ``True``, skip the lock and the subprocess launch; just
             render an example command for the user.
+        run_deadline: Optional ``time.monotonic()`` deadline inherited from
+            the experiment-level wallclock guard.
 
     Returns:
         The phase :class:`Winner` (real for normal runs, placeholder midpoint
@@ -1022,9 +1156,21 @@ def _run_phase(
 
     """
     if dry_run:
-        return _run_phase_inner(experiment, phase, inherited_winners, dry_run=True)
+        return _run_phase_inner(
+            experiment,
+            phase,
+            inherited_winners,
+            dry_run=True,
+            run_deadline=run_deadline,
+        )
     with _phase_lock(experiment, phase):
-        return _run_phase_inner(experiment, phase, inherited_winners, dry_run=False)
+        return _run_phase_inner(
+            experiment,
+            phase,
+            inherited_winners,
+            dry_run=False,
+            run_deadline=run_deadline,
+        )
 
 
 def _run_phase_inner(
@@ -1033,6 +1179,7 @@ def _run_phase_inner(
     inherited_winners: dict[str, Winner],
     *,
     dry_run: bool = False,
+    run_deadline: float | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
@@ -1046,6 +1193,8 @@ def _run_phase_inner(
         inherited_winners: Winners loaded for phases earlier in the chain.
         dry_run: When ``True``, render an example trial command and return a
             placeholder midpoint winner instead of launching any subprocesses.
+        run_deadline: Optional ``time.monotonic()`` deadline inherited from
+            the experiment-level wallclock guard.
 
     Returns:
         The selected phase :class:`Winner`.
@@ -1175,7 +1324,7 @@ def _run_phase_inner(
             raise optuna.TrialPruned("phase aborted")
 
         sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
-        overrides = _composed_overrides(phase, sampled, inherited_winners)
+        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
 
         # Persist the resolved trial directory BEFORE launching the subprocess
         # so a later reaper can locate identity files even if the user moved
@@ -1240,7 +1389,11 @@ def _run_phase_inner(
                 raise UnsafeProcessCleanupError(message)
 
         # Extraction happens outside GPU lease.
-        result = extract_trial_result(experiment=experiment, executed=executed)
+        result = extract_trial_result(
+            experiment=experiment,
+            executed=executed,
+            gates=_phase_gates(experiment, phase),
+        )
 
         trial.set_user_attr("phasesweep_feasible", result.feasible)
         trial.set_user_attr("phasesweep_return_code", result.return_code)
@@ -1248,6 +1401,21 @@ def _run_phase_inner(
         trial.set_user_attr(
             "phasesweep_overrides", json.dumps(overrides, default=str, sort_keys=True)
         )
+        if result.gate_results is not None:
+            trial.set_user_attr(
+                "phasesweep_gates",
+                json.dumps(
+                    [
+                        {
+                            "type": gate.gate_type,
+                            "passed": gate.passed,
+                            "detail": gate.detail,
+                        }
+                        for gate in result.gate_results
+                    ],
+                    sort_keys=True,
+                ),
+            )
 
         # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf (#4).
         if result.failure_reason:
@@ -1289,13 +1457,28 @@ def _run_phase_inner(
                 )
             abort["flag"] = True
             study.stop()
+        with contextlib.suppress(Exception):
+            _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
     if remaining > 0:
+        optimize_timeout = phase.timeout_seconds_per_phase
+        if run_deadline is not None:
+            remaining_run_seconds = max(0.0, run_deadline - time.monotonic())
+            optimize_timeout = (
+                remaining_run_seconds
+                if optimize_timeout is None
+                else min(optimize_timeout, remaining_run_seconds)
+            )
+        if optimize_timeout is not None and optimize_timeout <= 0.0:
+            raise TimeoutError(
+                f"Run wallclock deadline reached before phase {phase.name!r} could launch."
+            )
         try:
             study.optimize(
                 objective,
                 n_trials=remaining,
                 n_jobs=phase.n_jobs,
+                timeout=optimize_timeout,
                 gc_after_trial=True,
                 callbacks=[abort_callback],
                 catch=(TrialExecutionError,),
@@ -1333,7 +1516,7 @@ def _run_phase_inner(
     # _verify_fingerprint stamps on the Optuna study; recomputing here keeps
     # _save_winner independent of study state.
     selected = select_winner(study, experiment)
-    effective = _composed_overrides(phase, selected.params, inherited_winners)
+    effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
     winner = Winner(
         trial_number=selected.trial_number,
         params=selected.params,
@@ -1381,9 +1564,8 @@ def _dry_run_phase(
         sample_trial = study.ask()
         sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
         study.tell(sample_trial, state=optuna.trial.TrialState.FAIL)
-        overrides = _composed_overrides(phase, sampled, inherited_winners)
+        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
         preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
-        preview_dir.mkdir(parents=True, exist_ok=True)
         cmd = render_command(
             experiment.trial_command,
             overrides,
@@ -1392,10 +1574,11 @@ def _dry_run_phase(
             trial_id=-1,
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
+            write_files=False,
         )
         log.info("DRY RUN example command:\n  %s", cmd)
 
-    return _placeholder_winner(phase, inherited_winners)
+    return _placeholder_winner(experiment, phase, inherited_winners)
 
 
 def _midpoint_params(phase: Phase) -> dict[str, Any]:
@@ -1417,13 +1600,18 @@ def _midpoint_params(phase: Phase) -> dict[str, Any]:
     return {name: _placeholder_value_for(p) for name, p in phase.search_space.items()}
 
 
-def _placeholder_winner(phase: Phase, inherited_winners: dict[str, Winner]) -> Winner:
+def _placeholder_winner(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+) -> Winner:
     """Synthesize a midpoint-valued placeholder winner for dry-run mode.
 
     Includes inherited effective_overrides so downstream dry-run previews see the
     same locked context they would at runtime (review item #10).
 
     Args:
+        experiment: Parsed experiment; supplies named contracts.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
 
@@ -1433,7 +1621,7 @@ def _placeholder_winner(phase: Phase, inherited_winners: dict[str, Winner]) -> W
 
     """
     placeholder_params = _midpoint_params(phase)
-    effective = _composed_overrides(phase, placeholder_params, inherited_winners)
+    effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,
         params=placeholder_params,
@@ -1501,12 +1689,11 @@ def run_experiment(
 
         install_signal_handlers()
 
-    _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
-
     if dry_run:
         return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=True)
 
-    with _experiment_lock(experiment):
+    _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
+    with _run_log_handler(experiment), _experiment_lock(experiment):
         return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=False)
 
 
@@ -1530,8 +1717,17 @@ def _run_experiment_inner(
     """
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
+    run_deadline = (
+        None
+        if dry_run or experiment.timeout_seconds_per_run is None
+        else time.monotonic() + experiment.timeout_seconds_per_run
+    )
 
     for phase in experiment.phases:
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            raise TimeoutError(
+                f"Run wallclock deadline reached before phase {phase.name!r} could start."
+            )
         # Inherited winners must be resolved before either the skip-path winner
         # load (so we can verify its fingerprint against the *current* parent
         # context) or the actual run path. Keeping the construction in one
@@ -1540,17 +1736,30 @@ def _run_experiment_inner(
 
         if skip_until and phase.name != from_phase:
             try:
+                if not dry_run:
+                    _reap_skipped_phase(experiment, phase)
                 winners[phase.name] = _load_winner(experiment, phase, inherited)
                 log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
             except FileNotFoundError:
                 if not dry_run:
                     raise
-                winners[phase.name] = _placeholder_winner(phase, inherited)
+                winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
                 log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue
         skip_until = False
 
-        winner = _run_phase(experiment, phase, inherited, dry_run=dry_run)
+        winner = _run_phase(
+            experiment,
+            phase,
+            inherited,
+            dry_run=dry_run,
+            run_deadline=run_deadline,
+        )
+        if not dry_run:
+            promoted = _apply_promotion(experiment, phase, winner, winners)
+            if promoted is None:
+                break
+            winner = promoted
         winners[phase.name] = winner
 
     if dry_run:
@@ -1580,4 +1789,167 @@ def _run_experiment_inner(
     return winners
 
 
-__all__ = ["NoFeasibleTrialError", "Winner", "run_experiment"]
+def _study_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
+    """Return Optuna trial counts by state without creating a missing study."""
+    if experiment.storage is None:
+        return {}
+    try:
+        study = optuna.load_study(
+            study_name=f"{experiment.experiment}::{phase.name}",
+            storage=_resolve_storage(experiment.storage),
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    counts: dict[str, int] = {}
+    for trial in study.get_trials(deepcopy=False):
+        counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
+    return counts
+
+
+def experiment_status(experiment: Experiment) -> dict[str, Any]:
+    """Collect read-only status for one experiment config."""
+    phases: list[dict[str, Any]] = []
+    for phase in experiment.phases:
+        winner_path = _winner_path(experiment, phase.name)
+        counts = _study_trial_counts(experiment, phase)
+        phases.append(
+            {
+                "name": phase.name,
+                "winner": str(winner_path) if winner_path.is_file() else None,
+                "trials": counts,
+                "running": counts.get("RUNNING", 0),
+            }
+        )
+    return {
+        "kind": "experiment",
+        "experiment": experiment.experiment,
+        "workdir": str(_experiment_dir(experiment)),
+        "phases": phases,
+    }
+
+
+def _suite_dir(suite: Suite) -> Path:
+    """Filesystem namespace for suite-level summary/log artifacts."""
+    return Path(suite.defaults.workdir).expanduser().resolve() / suite.suite
+
+
+def _suite_summary_path(suite: Suite) -> Path:
+    """Path to a suite-level summary."""
+    return _suite_dir(suite) / "suite_summary.yaml"
+
+
+def _suite_log_path(suite: Suite) -> Path:
+    """Path to a suite-level run log."""
+    return _suite_dir(suite) / "run.log"
+
+
+@contextlib.contextmanager
+def _suite_lock(suite: Suite) -> Iterator[None]:
+    """Take a same-host lock for suite-level log and summary artifacts."""
+    import fcntl
+
+    material = {"kind": "suite", "suite_dir": str(_suite_dir(suite))}
+    path = _lock_dir() / f"{suite.suite}__suite__{_lock_digest(material)}.lock"
+    with path.open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another phasesweep suite process appears to be using {suite.suite!r} "
+                f"(lock file: {path})."
+            ) from exc
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Winner]]:
+    """Run every study in a suite in dependency order."""
+    results: dict[str, dict[str, Winner]] = {}
+    if dry_run:
+        for study_spec in suite.studies:
+            experiment = suite.experiment_for_study(study_spec)
+            results[study_spec.name] = run_experiment(experiment, dry_run=True)
+        return results
+
+    _suite_dir(suite).mkdir(parents=True, exist_ok=True)
+    with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
+        for study_spec in suite.studies:
+            for dep in study_spec.depends_on:
+                if dep not in results:
+                    raise RuntimeError(
+                        f"Study {study_spec.name!r} dependency {dep!r} did not complete."
+                    )
+            experiment = suite.experiment_for_study(study_spec)
+            log.info("suite=%s study=%s START", suite.suite, study_spec.name)
+            results[study_spec.name] = run_experiment(experiment, dry_run=False)
+            log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
+
+        summary = {
+            "suite": suite.suite,
+            "studies": [
+                {
+                    "name": study_name,
+                    "phases": [
+                        {
+                            "name": phase_name,
+                            "trial_number": winner.trial_number,
+                            "metric": winner.metric,
+                            "params": winner.params,
+                            "effective_overrides": winner.effective_overrides,
+                            "constraints": winner.constraints,
+                        }
+                        for phase_name, winner in study_winners.items()
+                    ],
+                }
+                for study_name, study_winners in results.items()
+            ],
+        }
+        _suite_summary_path(suite).write_text(yaml.safe_dump(summary, sort_keys=False))
+    return results
+
+
+def run_config(
+    config: Config,
+    *,
+    from_phase: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Winner] | dict[str, dict[str, Winner]]:
+    """Run an experiment or suite config."""
+    if isinstance(config, Suite):
+        if from_phase is not None:
+            raise RuntimeError("--from-phase is only supported for single experiment configs.")
+        return run_suite(config, dry_run=dry_run)
+    return run_experiment(config, from_phase=from_phase, dry_run=dry_run)
+
+
+def config_status(config: Config) -> dict[str, Any]:
+    """Collect read-only status for an experiment or suite config."""
+    if isinstance(config, Suite):
+        return {
+            "kind": "suite",
+            "suite": config.suite,
+            "workdir": str(_suite_dir(config)),
+            "studies": [
+                {
+                    "name": study.name,
+                    "depends_on": study.depends_on,
+                    "status": experiment_status(config.experiment_for_study(study)),
+                }
+                for study in config.studies
+            ],
+        }
+    return experiment_status(config)
+
+
+__all__ = [
+    "NoFeasibleTrialError",
+    "Winner",
+    "config_status",
+    "experiment_status",
+    "run_config",
+    "run_experiment",
+    "run_suite",
+]

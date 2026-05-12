@@ -6,6 +6,8 @@ it in EXTRACTORS below. That's it.
 
 from __future__ import annotations
 
+import queue
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,8 +181,12 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
     deadline = time.time() + cfg.timeout_seconds
     last_err: Exception | None = None
     while time.time() < deadline:
+        remaining = max(0.0, deadline - time.time())
         try:
-            runs = api.runs(path, filters={"display_name": target_name})
+            runs = _call_with_timeout(
+                lambda: api.runs(path, filters={"display_name": target_name}),
+                timeout=min(cfg.poll_seconds, remaining),
+            )
             if len(runs) >= 1:
                 run = runs[0]
                 if run.state in {"finished", "crashed", "failed"}:
@@ -195,6 +201,27 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
     if last_err is not None:
         msg += f" Last error: {last_err}"
     raise ExtractorError(msg)
+
+
+def _call_with_timeout(fn: Callable[[], Any], *, timeout: float) -> Any:
+    """Run a blocking function in a daemon thread and bound caller wait time."""
+    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            q.put((True, fn()))
+        except Exception as exc:  # noqa: BLE001
+            q.put((False, exc))
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.0, timeout))
+    if thread.is_alive():
+        raise TimeoutError(f"call exceeded {timeout:g}s")
+    ok, value = q.get_nowait()
+    if ok:
+        return value
+    raise value
 
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {

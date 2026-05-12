@@ -3,7 +3,8 @@
 When n_jobs > 1, every trial subprocess would otherwise see the full GPU list and
 race for cuda:0. This pool assigns disjoint CUDA_VISIBLE_DEVICES per trial.
 
-If no GPUs are detected (cpu-only box) or n_jobs=1, this is a transparent no-op.
+If no GPUs are detected (cpu-only box), or n_jobs=1 with no explicit GPU list,
+this is a transparent no-op.
 """
 
 from __future__ import annotations
@@ -11,11 +12,65 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import threading
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO
 
 log = logging.getLogger("phasesweep.gpu_pool")
+
+
+@dataclass
+class _HostGpuLease:
+    """Host-wide flock handle for one CUDA device index."""
+
+    gpu_id: int
+    handle: IO[str]
+
+
+def _gpu_lock_dir() -> Path:
+    """Return the shared host lock directory used for GPU leases."""
+    path = Path(tempfile.gettempdir()) / "phasesweep-locks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _gpu_lock_path(gpu_id: int) -> Path:
+    """Return the host-wide lock file for a CUDA device index."""
+    return _gpu_lock_dir() / f"gpu_{gpu_id}.lock"
+
+
+def _try_host_gpu_lease(gpu_id: int) -> _HostGpuLease | None:
+    """Try to acquire the per-GPU host lock without blocking."""
+    import fcntl
+
+    handle = _gpu_lock_path(gpu_id).open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return _HostGpuLease(gpu_id=gpu_id, handle=handle)
+
+
+def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
+    """Release a host-wide GPU lock."""
+    if lease is None:
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(lease.handle, fcntl.LOCK_UN)
+    finally:
+        lease.handle.close()
 
 
 def _detect_gpu_ids() -> list[int]:
@@ -65,12 +120,10 @@ class GpuPool:
 
         """
         self._gpu_ids = gpu_ids
-        self._semaphore: threading.Semaphore | None = None
         self._available: list[int] = []
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
 
         if gpu_ids:
-            self._semaphore = threading.Semaphore(len(gpu_ids))
             self._available = list(gpu_ids)
 
     @classmethod
@@ -168,33 +221,56 @@ class GpuPool:
         """
         return bool(self._gpu_ids)
 
-    def _acquire(self) -> int | None:
-        """Block until a GPU is free, then claim it.
+    def _acquire(self) -> tuple[int, _HostGpuLease] | None:
+        """Block until a local slot and host-wide GPU lease are available.
 
         Returns:
-            A GPU index, or ``None`` if the pool is inactive (no isolation
-            requested; caller's environment is passed through unchanged).
+            ``(gpu_id, lease)`` or ``None`` if the pool is inactive (no
+            isolation requested; caller's environment is passed through
+            unchanged).
 
         """
-        if not self._semaphore:
+        if not self._gpu_ids:
             return None
-        self._semaphore.acquire()
-        with self._lock:
-            return self._available.pop(0)
+        while True:
+            with self._condition:
+                while not self._available:
+                    self._condition.wait()
+                candidates = list(self._available)
+                self._available.clear()
 
-    def _release(self, gpu_id: int | None) -> None:
+            remaining: list[int] = []
+            for index, gpu_id in enumerate(candidates):
+                lease = _try_host_gpu_lease(gpu_id)
+                if lease is not None:
+                    remaining.extend(candidates[index + 1 :])
+                    with self._condition:
+                        self._available.extend(remaining)
+                        self._condition.notify_all()
+                    log.debug("GPU %d host lease acquired", gpu_id)
+                    return gpu_id, lease
+                remaining.append(gpu_id)
+
+            with self._condition:
+                self._available.extend(remaining)
+                self._condition.notify_all()
+            time.sleep(0.2)
+
+    def _release(self, acquired: tuple[int, _HostGpuLease] | None) -> None:
         """Return a previously-acquired GPU index to the pool.
 
         Args:
-            gpu_id: The index returned by :meth:`_acquire`. ``None`` is a
-                no-op (inactive pool).
+            acquired: Pair returned by :meth:`_acquire`. ``None`` is a no-op
+                (inactive pool).
 
         """
-        if gpu_id is None or not self._semaphore:
+        if acquired is None:
             return
-        with self._lock:
+        gpu_id, lease = acquired
+        _release_host_gpu_lease(lease)
+        with self._condition:
             self._available.append(gpu_id)
-        self._semaphore.release()
+            self._condition.notify()
 
     @contextmanager
     def acquire(self) -> Generator[int | None, None, None]:
@@ -205,8 +281,8 @@ class GpuPool:
             pool is inactive.
 
         """
-        gpu_id = self._acquire()
+        acquired = self._acquire()
         try:
-            yield gpu_id
+            yield None if acquired is None else acquired[0]
         finally:
-            self._release(gpu_id)
+            self._release(acquired)

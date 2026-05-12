@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Constraint, Experiment
+from phasesweep.config import Constraint, Experiment, Gate
 from phasesweep.extractors import ExtractorError, TrialContext, run_extractor
+from phasesweep.gates import GateResult, evaluate_gates
 from phasesweep.overrides import render_command
 from phasesweep.process import ProcessResult, run_supervised
 
@@ -41,6 +42,7 @@ class TrialResult:
     duration_seconds: float
     feasible: bool
     failure_reason: str | None = None
+    gate_results: list[GateResult] | None = None
 
 
 class TrialExecutionError(RuntimeError):
@@ -88,6 +90,7 @@ def _failed_trial(
     duration: float,
     failure_reason: str,
     constraints: dict[str, float] | None = None,
+    gate_results: list[GateResult] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
 
@@ -101,6 +104,7 @@ def _failed_trial(
         duration: Wall-clock seconds the subprocess ran for.
         failure_reason: Human-readable cause; surfaced in logs and Optuna user attrs.
         constraints: Constraint readings collected before the failure, if any.
+        gate_results: Evidence gate results collected before the failure, if any.
 
     Returns:
         A :class:`TrialResult` with ``metric=None`` and ``feasible=False``.
@@ -113,6 +117,7 @@ def _failed_trial(
         duration_seconds=duration,
         feasible=False,
         failure_reason=failure_reason,
+        gate_results=gate_results,
     )
 
 
@@ -208,6 +213,7 @@ def extract_trial_result(
     *,
     experiment: Experiment,
     executed: ExecutedTrial,
+    gates: list[Gate] | None = None,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -227,6 +233,7 @@ def extract_trial_result(
         experiment: Parsed config; supplies the metric and constraint extractors.
         executed: Output of :func:`launch_trial`; provides the trial context
             and the :class:`ProcessResult`.
+        gates: Evidence gates that must pass for the trial to count.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -306,6 +313,24 @@ def extract_trial_result(
         if not _check_constraint(v, c):
             feasible = False
 
+    gate_results = evaluate_gates(executed.ctx, gates or [])
+    failed_gates = [gate for gate in gate_results if not gate.passed]
+    if failed_gates:
+        detail = "; ".join(gate.detail for gate in failed_gates)
+        log.warning(
+            "[%s/trial_%d] evidence gate(s) failed: %s",
+            executed.ctx.phase,
+            executed.ctx.trial_id,
+            detail,
+        )
+        return _failed_trial(
+            rc=rc,
+            duration=duration,
+            failure_reason=f"evidence gates failed: {detail}",
+            constraints=constraint_values,
+            gate_results=gate_results,
+        )
+
     return TrialResult(
         metric=metric_value,
         constraints=constraint_values,
@@ -313,6 +338,7 @@ def extract_trial_result(
         duration_seconds=duration,
         feasible=feasible,
         failure_reason=None,
+        gate_results=gate_results,
     )
 
 

@@ -355,13 +355,36 @@ def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
           extractor: { type: json, path: r.json, key: x }
         phases:
           - name: p
-            n_trials: 1
+            n_trials: 5
             sampler: { type: grid }
             search_space:
               x: { type: float, low: 0.0, high: 1.0, step: 0.25 }
         """,
     )
     load_experiment(p)  # must not raise
+
+
+def test_grid_sampler_requires_full_matrix_by_default(tmp_path: Path) -> None:
+    """Grid phases must run every combination unless explicitly allowed partial."""
+    p = write_yaml(
+        tmp_path,
+        """
+        experiment: t
+        trial_command: "echo {overrides}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: { type: json, path: r.json, key: x }
+        phases:
+          - name: p
+            n_trials: 2
+            sampler: { type: grid }
+            search_space:
+              x: { type: categorical, choices: [1, 2, 3] }
+        """,
+    )
+    with pytest.raises(ValidationError, match="grid sampler has 3 combinations"):
+        load_experiment(p)
 
 
 def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:

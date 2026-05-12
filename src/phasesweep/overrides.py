@@ -102,6 +102,7 @@ def render_command(
     trial_id: int,
     phase: str,
     run_name: str,
+    write_files: bool = True,
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
@@ -120,6 +121,9 @@ def render_command(
         phase: Phase name, used for ``{phase}``.
         run_name: Composite ``<experiment>__<phase>__trial_<NNNN>`` identifier,
             used for ``{run_name}``.
+        write_files: When ``False``, render paths without writing
+            ``overrides.json``. Used by dry-run previews so they are
+            filesystem-pure.
 
     Returns:
         The fully rendered, shell-ready command string.
@@ -136,7 +140,9 @@ def render_command(
         overrides_path = ""
     elif fmt == "json_file":
         overrides_str = ""
-        overrides_path = str(write_json_file(overrides, trial_dir))
+        overrides_path = str(
+            write_json_file(overrides, trial_dir) if write_files else trial_dir / "overrides.json"
+        )
     else:
         raise ValueError(f"Unknown override_format: {fmt}")
 

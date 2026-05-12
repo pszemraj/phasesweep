@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
+
 import pytest
 
 from phasesweep.config import (
     IntParam,
     Phase,
 )
-from phasesweep.gpu_pool import GpuPool
+from phasesweep.gpu_pool import GpuPool, _gpu_lock_path
 
 
 def test_gpu_pool_explicit_ids_from_yaml(tmp_path):
@@ -59,6 +61,17 @@ def test_explicit_gpu_ids_dedupe_preserves_order():
     """Duplicate IDs in YAML are deduped without reordering."""
     pool = GpuPool.create(n_jobs=2, explicit_ids=[2, 0, 2, 1, 0])
     assert pool._gpu_ids == [2, 0, 1]
+
+
+def test_gpu_pool_skips_host_locked_gpu() -> None:
+    """A second phasesweep process must not double-book a host-locked GPU."""
+    lock_path = _gpu_lock_path(3)
+    with lock_path.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        pool = GpuPool.create(n_jobs=1, explicit_ids=[3, 4])
+        with pool.acquire() as gid:
+            assert gid == 4
+        fcntl.flock(held, fcntl.LOCK_UN)
 
 
 def test_gpu_ids_rejects_negative() -> None:

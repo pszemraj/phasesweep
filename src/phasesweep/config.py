@@ -1,4 +1,4 @@
-"""YAML config schema for phasesweep experiments.
+"""YAML config schema for phasesweep experiments and suites.
 
 The full schema is validated up-front before any phase runs, so a typo in the
 last phase fails immediately rather than three hours into the sweep.
@@ -7,12 +7,13 @@ last phase fails immediately rather than three hours into the sweep.
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import re
 import string
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -98,6 +99,116 @@ class WandbExtractor(_Frozen):
 
 
 Extractor = JsonExtractor | LogRegexExtractor | WandbExtractor
+
+
+# --------------------------------------------------------------------------------------
+# Evidence gates
+# --------------------------------------------------------------------------------------
+
+
+class RequiredFileGate(_Frozen):
+    """Require a file to exist under the trial directory."""
+
+    type: Literal["required_file"]
+    path: str
+
+
+class JsonEqualsGate(_Frozen):
+    """Require a JSON key to equal an expected scalar value."""
+
+    type: Literal["json_equals"]
+    path: str
+    key: str
+    value: Any
+
+
+class JsonScalarBoundGate(_Frozen):
+    """Require a JSON key to be a finite scalar within optional bounds."""
+
+    type: Literal["json_scalar_bound"]
+    path: str
+    key: str
+    min: float | None = None
+    max: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> JsonScalarBoundGate:
+        """Reject empty/non-finite bounds and ``min > max``."""
+        if self.min is None and self.max is None:
+            raise ValueError("json_scalar_bound gate must define at least one of min/max.")
+        if self.min is not None:
+            _require_finite("json_scalar_bound.min", self.min)
+        if self.max is not None:
+            _require_finite("json_scalar_bound.max", self.max)
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError(
+                f"json_scalar_bound gate min ({self.min}) must be <= max ({self.max})."
+            )
+        return self
+
+
+class ArtifactSizeGate(_Frozen):
+    """Require an artifact file size to fall inside optional byte bounds."""
+
+    type: Literal["artifact_size"]
+    path: str
+    min_bytes: int | None = Field(default=None, ge=0)
+    max_bytes: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> ArtifactSizeGate:
+        """Reject empty bounds and ``min_bytes > max_bytes``."""
+        if self.min_bytes is None and self.max_bytes is None:
+            raise ValueError("artifact_size gate must define min_bytes and/or max_bytes.")
+        if (
+            self.min_bytes is not None
+            and self.max_bytes is not None
+            and self.min_bytes > self.max_bytes
+        ):
+            raise ValueError(
+                f"artifact_size gate min_bytes ({self.min_bytes}) must be <= "
+                f"max_bytes ({self.max_bytes})."
+            )
+        return self
+
+
+class Sha256Gate(_Frozen):
+    """Require a file's SHA-256 digest to match an expected hex string."""
+
+    type: Literal["sha256"]
+    path: str
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256(cls, value: str) -> str:
+        """Require a full 64-character lowercase/uppercase hex digest."""
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("sha256 gate requires a full 64-character hex digest.")
+        return value.lower()
+
+
+class WandbSummaryRequiredGate(_Frozen):
+    """Require keys to be present in a completed W&B run summary."""
+
+    type: Literal["wandb_summary_required"]
+    entity: str
+    project: str
+    keys: list[str] = Field(min_length=1)
+    run_name_template: str = "{experiment}-{phase}-{trial_id}"
+    poll_seconds: float = Field(default=2.0, gt=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=0.0)
+
+
+Gate = Annotated[
+    RequiredFileGate
+    | JsonEqualsGate
+    | JsonScalarBoundGate
+    | ArtifactSizeGate
+    | Sha256Gate
+    | WandbSummaryRequiredGate,
+    Field(discriminator="type"),
+]
 
 
 # --------------------------------------------------------------------------------------
@@ -257,6 +368,35 @@ class Sampler(_Frozen):
     n_startup_trials: int = Field(default=10, ge=0)  # tpe only
 
 
+class Contract(_Frozen):
+    """Named fixed-comparison contract shared across phases or studies."""
+
+    fixed_overrides: dict[str, Any] = Field(default_factory=dict)
+    gates: list[Gate] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_override_key_syntax(self) -> Contract:
+        """Reject malformed contract override keys."""
+        for key in self.fixed_overrides:
+            _validate_override_key(key, label="contract fixed_overrides")
+        return self
+
+
+class Promotion(_Frozen):
+    """Conditional phase promotion against a previously-computed baseline winner."""
+
+    min_delta_vs: str
+    min_delta: float = 0.0
+    requires_gates: bool = True
+    on_fail: Literal["stop", "skip", "continue_baseline"] = "stop"
+
+    @model_validator(mode="after")
+    def _validate_delta(self) -> Promotion:
+        """Require a finite promotion delta."""
+        _require_finite("promotion.min_delta", self.min_delta)
+        return self
+
+
 # --------------------------------------------------------------------------------------
 # Phase / experiment
 # --------------------------------------------------------------------------------------
@@ -283,6 +423,10 @@ class Phase(_Frozen):
     fixed_overrides: dict[str, Any] = Field(
         default_factory=dict,
         description="Hard-coded overrides applied to every trial in this phase.",
+    )
+    contracts: list[str] = Field(
+        default_factory=list,
+        description="Named fixed-comparison contracts applied to every trial in this phase.",
     )
     search_space: dict[str, SearchParam] = Field(
         default_factory=dict,
@@ -348,7 +492,31 @@ class Phase(_Frozen):
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_trial: float | None = Field(default=86400.0, ge=0)
+    allow_unbounded_trials: bool = Field(
+        default=False,
+        description=(
+            "Set true only when an intentionally unbounded trial is acceptable. "
+            "Otherwise timeout_seconds_per_trial must be finite."
+        ),
+    )
+    timeout_seconds_per_phase: float | None = Field(default=None, ge=0)
+    allow_partial_grid: bool = Field(
+        default=False,
+        description=(
+            "Grid phases must run the full matrix by default. Set true to permit "
+            "n_trials smaller than the grid cardinality."
+        ),
+    )
+    allow_seed_search: bool = Field(
+        default=False,
+        description=(
+            "By default, search-space keys named seed or ending in .seed are rejected "
+            "so stochastic variance is not mistaken for a model/config improvement."
+        ),
+    )
+    gates: list[Gate] = Field(default_factory=list)
+    promotion: Promotion | None = None
 
     @field_validator("name")
     @classmethod
@@ -389,6 +557,37 @@ class Phase(_Frozen):
             _validate_override_key(key, label=f"phase {self.name!r} fixed_overrides")
         for key in self.search_space:
             _validate_override_key(key, label=f"phase {self.name!r} search_space")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_timeouts_and_seed_policy(self) -> Phase:
+        """Require bounded trials unless explicitly waived and reject seed sweeps."""
+        if self.timeout_seconds_per_trial is None:
+            if not self.allow_unbounded_trials:
+                raise ValueError(
+                    f"Phase {self.name!r}: timeout_seconds_per_trial is required unless "
+                    "allow_unbounded_trials: true is set."
+                )
+        elif not math.isfinite(self.timeout_seconds_per_trial):
+            raise ValueError(
+                f"Phase {self.name!r}: timeout_seconds_per_trial must be finite, "
+                f"got {self.timeout_seconds_per_trial!r}."
+            )
+        if self.timeout_seconds_per_phase is not None and not math.isfinite(
+            self.timeout_seconds_per_phase
+        ):
+            raise ValueError(
+                f"Phase {self.name!r}: timeout_seconds_per_phase must be finite, "
+                f"got {self.timeout_seconds_per_phase!r}."
+            )
+        if not self.allow_seed_search:
+            seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
+            if seed_keys:
+                raise ValueError(
+                    f"Phase {self.name!r}: trainer seed keys cannot be in search_space "
+                    f"by default: {seed_keys}. Move seeds to fixed_overrides or set "
+                    "allow_seed_search: true for an explicit variance audit."
+                )
         return self
 
 
@@ -460,8 +659,21 @@ class Experiment(_Frozen):
     override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
+    contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_run_timeout(self) -> Experiment:
+        """Reject non-finite run wallclock guards."""
+        if self.timeout_seconds_per_run is not None and not math.isfinite(
+            self.timeout_seconds_per_run
+        ):
+            raise ValueError(
+                f"timeout_seconds_per_run must be finite, got {self.timeout_seconds_per_run!r}."
+            )
+        return self
 
     @field_validator("experiment")
     @classmethod
@@ -504,6 +716,11 @@ class Experiment(_Frozen):
         for phase in self.phases:
             if phase.name in seen:
                 raise ValueError(f"Duplicate phase name {phase.name!r}.")
+            for contract_name in phase.contracts:
+                if contract_name not in self.contracts:
+                    raise ValueError(
+                        f"Phase {phase.name!r} references unknown contract {contract_name!r}."
+                    )
             for parent in phase.inherits:
                 if parent not in seen:
                     raise ValueError(
@@ -522,10 +739,34 @@ class Experiment(_Frozen):
                     "fixed or sampled, not both."
                 )
 
+            contract_keys: set[str] = set()
+            contract_key_owner: dict[str, str] = {}
+            for contract_name in phase.contracts:
+                contract = self.contracts[contract_name]
+                for key in contract.fixed_overrides:
+                    if key in contract_key_owner:
+                        raise ValueError(
+                            f"Phase {phase.name!r} applies contracts with conflicting "
+                            f"fixed key {key!r}: {contract_key_owner[key]!r} and "
+                            f"{contract_name!r}."
+                        )
+                    contract_keys.add(key)
+                    contract_key_owner[key] = contract_name
+
+            contract_local_collisions = contract_keys & (
+                set(phase.fixed_overrides) | set(phase.search_space)
+            )
+            if contract_local_collisions:
+                raise ValueError(
+                    f"Phase {phase.name!r} tries to override contract-locked key(s) "
+                    f"{sorted(contract_local_collisions)}. Contract keys are immutable "
+                    "inside the applying phase."
+                )
+
             # Local dotted-key namespace collision (review v0.5.3 / blocker 5):
             # `{model: llama, model.depth: 16}` is silently corrupting in every
             # render format we support. Reject at config-load.
-            local_keys = set(phase.fixed_overrides) | set(phase.search_space.keys())
+            local_keys = set(phase.fixed_overrides) | set(phase.search_space.keys()) | contract_keys
             prefix_collisions = _find_prefix_collisions(local_keys)
             if prefix_collisions:
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
@@ -572,7 +813,12 @@ class Experiment(_Frozen):
             # blocker 5). E.g. parent locks `model` and child samples
             # `model.depth`, or vice-versa. Same render-time corruption hazard
             # as the local-only case but caught across the inheritance graph.
-            combined_keys = inherited_keys | set(phase.fixed_overrides) | set(phase.search_space)
+            combined_keys = (
+                inherited_keys
+                | contract_keys
+                | set(phase.fixed_overrides)
+                | set(phase.search_space)
+            )
             inh_prefix_collisions = _find_prefix_collisions(combined_keys)
             if inh_prefix_collisions:
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in inh_prefix_collisions)
@@ -598,7 +844,10 @@ class Experiment(_Frozen):
             _validate_trial_command_template(self, phase, inherited_keys)
 
             locked_keys_by_phase[phase.name] = (
-                inherited_keys | set(phase.fixed_overrides) | set(phase.search_space)
+                inherited_keys
+                | contract_keys
+                | set(phase.fixed_overrides)
+                | set(phase.search_space)
             )
             seen[phase.name] = phase
 
@@ -624,6 +873,116 @@ class Experiment(_Frozen):
             if p.name == name:
                 return p
         raise KeyError(name)
+
+
+class SuiteDefaults(_Frozen):
+    """Shared defaults applied to every study in a suite."""
+
+    storage: str | None = None
+    workdir: str = "./runs"
+    trial_command: str | None = None
+    override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
+    metric: Metric | None = None
+    constraints: list[Constraint] = Field(default_factory=list)
+    contracts: dict[str, Contract] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+
+class StudySpec(_Frozen):
+    """One experiment-like study inside a suite run plan."""
+
+    name: str
+    depends_on: list[str] = Field(default_factory=list)
+    storage: str | None = None
+    workdir: str | None = None
+    trial_command: str | None = None
+    override_format: Literal["hydra", "argparse", "json_file"] | None = None
+    metric: Metric | None = None
+    constraints: list[Constraint] | None = None
+    contracts: dict[str, Contract] = Field(default_factory=dict)
+    phases: list[Phase] = Field(min_length=1)
+    env: dict[str, str] | None = None
+    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+    @field_validator("name")
+    @classmethod
+    def _study_name_is_safe(cls, value: str) -> str:
+        """Study names are used as experiment-name suffixes and path components."""
+        if not value or not all(c.isalnum() or c in "_-" for c in value):
+            raise ValueError(f"Study name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
+        return value
+
+
+class Suite(_Frozen):
+    """Suite of independent or dependency-ordered phase-chain studies."""
+
+    suite: str
+    defaults: SuiteDefaults = Field(default_factory=SuiteDefaults)
+    studies: list[StudySpec] = Field(min_length=1)
+
+    @field_validator("suite")
+    @classmethod
+    def _suite_name_is_safe(cls, value: str) -> str:
+        """Suite names are used as output path and experiment-name prefixes."""
+        if not value or not all(c.isalnum() or c in "_-" for c in value):
+            raise ValueError(f"Suite name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_study_graph(self) -> Suite:
+        """Require unique, prior-only study dependencies."""
+        seen: set[str] = set()
+        for study in self.studies:
+            if study.name in seen:
+                raise ValueError(f"Duplicate study name {study.name!r}.")
+            for dep in study.depends_on:
+                if dep not in seen:
+                    raise ValueError(
+                        f"Study {study.name!r} depends_on {dep!r}, which is not a prior study."
+                    )
+            seen.add(study.name)
+        return self
+
+    def experiment_for_study(self, study: StudySpec) -> Experiment:
+        """Compile a suite study into a normal :class:`Experiment`."""
+        defaults = self.defaults
+
+        def value(name: str, *, required: bool = False) -> Any:
+            if name in study.model_fields_set:
+                selected = getattr(study, name)
+            else:
+                selected = getattr(defaults, name)
+            if required and selected is None:
+                raise ValueError(
+                    f"Suite {self.suite!r} study {study.name!r} must define {name!r} "
+                    "or inherit it from suite.defaults."
+                )
+            return copy.deepcopy(selected)
+
+        env = copy.deepcopy(defaults.env)
+        if "env" in study.model_fields_set and study.env is not None:
+            env.update(study.env)
+
+        contracts = copy.deepcopy(defaults.contracts)
+        contracts.update(copy.deepcopy(study.contracts))
+
+        return Experiment(
+            experiment=f"{self.suite}__{study.name}",
+            storage=value("storage"),
+            workdir=value("workdir", required=True),
+            trial_command=value("trial_command", required=True),
+            override_format=value("override_format", required=True),
+            metric=value("metric", required=True),
+            constraints=value("constraints") or [],
+            contracts=contracts,
+            phases=copy.deepcopy(study.phases),
+            env=env,
+            timeout_seconds_per_run=value("timeout_seconds_per_run"),
+        )
+
+
+Config = Experiment | Suite
 
 
 # --------------------------------------------------------------------------------------
@@ -728,6 +1087,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             ) from exc
 
     if sampler_type == "grid":
+        cardinality = 1
         for name, param in space.items():
             if isinstance(param, FloatParam):
                 if param.log:
@@ -741,11 +1101,23 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                         f"for float param {name!r}."
                     )
                 _validate_float_grid_divides(phase.name, name, param)
+                assert param.step is not None
+                cardinality *= int(round((param.high - param.low) / param.step)) + 1
             elif isinstance(param, IntParam) and param.log:
                 raise ValueError(
                     f"Phase {phase.name!r}: grid sampler does not support "
                     f"log-scale int param {name!r}."
                 )
+            elif isinstance(param, IntParam):
+                cardinality *= ((param.high - param.low) // param.step) + 1
+            elif isinstance(param, CategoricalParam):
+                cardinality *= len(param.choices)
+        if not phase.allow_partial_grid and phase.n_trials < cardinality:
+            raise ValueError(
+                f"Phase {phase.name!r}: grid sampler has {cardinality} combinations "
+                f"but n_trials={phase.n_trials}. Grid phases run the full matrix by "
+                "default; increase n_trials or set allow_partial_grid: true."
+            )
 
 
 def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatParam) -> None:
@@ -911,6 +1283,8 @@ def _validate_trial_command_template(
     # winners), so the placeholder set must include them or render_command
     # could miss a key the trainer expects.
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
+    for contract_name in phase.contracts:
+        overrides.update(experiment.contracts[contract_name].fixed_overrides)
     overrides.update(phase.fixed_overrides)
     for name, param in phase.search_space.items():
         overrides[name] = _placeholder_value_for(param)
@@ -1065,8 +1439,37 @@ _StrictMappingLoader.add_constructor(
 )
 
 
+def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
+    """Load a YAML file as a strict mapping."""
+    text = Path(path).read_text()
+    try:
+        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
+    except yaml.constructor.ConstructorError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top level must be a mapping.")
+    return data
+
+
+def load_config(path: str | Path) -> Config:
+    """Parse and validate either a single experiment YAML or a suite YAML.
+
+    Args:
+        path: Filesystem path to a phasesweep YAML file.
+
+    Returns:
+        :class:`Experiment` for legacy/current single-study configs, or
+        :class:`Suite` for configs with a top-level ``suite`` key.
+
+    """
+    data = _load_yaml_mapping(path)
+    if "suite" in data:
+        return Suite.model_validate(data)
+    return Experiment.model_validate(data)
+
+
 def load_experiment(path: str | Path) -> Experiment:
-    """Parse and validate an experiment YAML.
+    """Parse and validate a single experiment YAML.
 
     Uses a strict loader that rejects duplicate mapping keys. PyYAML's default
     ``safe_load`` silently keeps the last value for a duplicate key, which can
@@ -1085,11 +1488,7 @@ def load_experiment(path: str | Path) -> Experiment:
             mapping keys, or any Pydantic / cross-phase validation failure.
 
     """
-    text = Path(path).read_text()
-    try:
-        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict subclass of SafeLoader
-    except yaml.constructor.ConstructorError as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: top level must be a mapping.")
+    data = _load_yaml_mapping(path)
+    if "suite" in data:
+        raise ValueError(f"{path}: expected a single experiment config, got a suite config.")
     return Experiment.model_validate(data)

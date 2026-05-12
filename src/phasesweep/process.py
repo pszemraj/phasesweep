@@ -41,6 +41,7 @@ _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
 _HandlerType = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
 _original_sigterm: _HandlerType = None
 _original_sigint: _HandlerType = None
+_original_sighup: _HandlerType = None
 _installed = False
 
 # The launch lock guards the Popen() -> _register() critical section so the
@@ -49,7 +50,15 @@ _installed = False
 # acquires the same lock before snapshotting, which forces it to wait until
 # every in-flight launch has either registered its PGID or failed.
 _launch_lock = threading.Lock()
-_SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGTERM, signal.SIGINT)
+_SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
+    sig
+    for sig in (
+        signal.SIGTERM,
+        signal.SIGINT,
+        getattr(signal, "SIGHUP", None),
+    )
+    if sig is not None
+)
 
 
 def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
@@ -75,7 +84,8 @@ def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
     launch site releases it, then see the new PGID in ``_active_children``.
 
     Args:
-        signum: The signal number that fired (``SIGTERM`` or ``SIGINT``).
+        signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
+            ``SIGHUP`` where available).
         frame: The interrupted stack frame at signal-delivery time; unused
             but required by the ``signal.signal`` handler protocol.
 
@@ -109,17 +119,20 @@ def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
 
 
 def install_signal_handlers() -> None:
-    """Install SIGTERM/SIGINT handlers that clean up child process groups.
+    """Install shutdown handlers that clean up child process groups.
 
-    Safe to call multiple times; only installs once. Must be called from the
-    main thread.
+    Handles SIGTERM/SIGINT and SIGHUP where the platform exposes it. Safe to
+    call multiple times; only installs once. Must be called from the main
+    thread.
     """
-    global _original_sigterm, _original_sigint, _installed  # noqa: PLW0603
+    global _original_sighup, _original_sigint, _original_sigterm, _installed  # noqa: PLW0603
     if _installed:
         return
     try:
         _original_sigterm = signal.signal(signal.SIGTERM, _shutdown_handler)
         _original_sigint = signal.signal(signal.SIGINT, _shutdown_handler)
+        if hasattr(signal, "SIGHUP"):
+            _original_sighup = signal.signal(signal.SIGHUP, _shutdown_handler)
         _installed = True
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")
@@ -127,7 +140,7 @@ def install_signal_handlers() -> None:
 
 @contextlib.contextmanager
 def _defer_shutdown_signals() -> Iterator[None]:
-    """Temporarily block SIGTERM/SIGINT in the calling thread.
+    """Temporarily block shutdown signals in the calling thread.
 
     Used to keep the ``Popen() -> _register()`` window atomic from the
     perspective of the signal handler (review v0.5.7 / blocker 3). CPython
