@@ -27,6 +27,22 @@ from phasesweep.runner import UnsafeProcessCleanupError
 from tests.conftest import make_experiment
 
 
+def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch group termination to clean up the group but report uncertainty."""
+    import phasesweep.process as _process
+
+    real_terminate = _process._terminate_process_group
+
+    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
+        real_terminate(pgid, grace_seconds=0.05)
+        return False
+
+    monkeypatch.setattr(
+        "phasesweep.process._terminate_process_group",
+        terminate_then_report_uncertain,
+    )
+
+
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
     """Failing trials leave pid + pgid + starttime files for forensic recovery."""
     if not Path("/proc/self/stat").exists():
@@ -486,18 +502,7 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     # report uncertain. Exercises the orchestrator's "cleanup uncertainty"
     # branch without leaving real ``time.sleep(60)`` zombies behind for the
     # rest of the test run (review v0.5.11).
-    import phasesweep.process as _process
-
-    real_terminate = _process._terminate_process_group
-
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
-
-    monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
-        terminate_then_report_uncertain,
-    )
+    _report_uncertain_after_real_terminate(monkeypatch)
 
     with (
         (tmp_path / "stdout.log").open("w") as stdout,
@@ -530,18 +535,7 @@ def test_uncertain_cleanup_aborts_optimization_not_just_trial(
     mechanism that surfaces this for n_jobs>1; n_jobs=1 still works through
     direct exception propagation, but we re-raise from hard_abort regardless
     so both paths share a common contract."""
-    import phasesweep.process as _process
-
-    real_terminate = _process._terminate_process_group
-
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
-
-    monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
-        terminate_then_report_uncertain,
-    )
+    _report_uncertain_after_real_terminate(monkeypatch)
 
     exp = make_experiment(
         workdir=tmp_path / "runs",
@@ -575,18 +569,7 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
     """
     import contextlib as _contextlib
 
-    import phasesweep.process as _process
-
-    real_terminate = _process._terminate_process_group
-
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
-
-    monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
-        terminate_then_report_uncertain,
-    )
+    _report_uncertain_after_real_terminate(monkeypatch)
 
     exp = make_experiment(
         workdir=tmp_path / "runs",
@@ -633,18 +616,7 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
     user needs it most — after a safety-critical abort. Review v0.5.12."""
     import contextlib as _contextlib
 
-    import phasesweep.process as _process
-
-    real_terminate = _process._terminate_process_group
-
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
-
-    monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
-        terminate_then_report_uncertain,
-    )
+    _report_uncertain_after_real_terminate(monkeypatch)
 
     exp = make_experiment(
         workdir=tmp_path / "runs",

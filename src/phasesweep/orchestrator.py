@@ -16,7 +16,6 @@ import csv
 import hashlib
 import json
 import logging
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -28,6 +27,7 @@ import optuna
 import yaml
 
 from phasesweep import __version__
+from phasesweep._runtime import lock_dir as _lock_dir
 from phasesweep.config import (
     CategoricalParam,
     Config,
@@ -531,6 +531,39 @@ def _gates_pass(gates: list[dict[str, Any]]) -> bool:
     return all(bool(gate.get("passed")) for gate in gates)
 
 
+def _clone_winner_from_baseline(baseline: Winner, *, phase_fingerprint: str | None) -> Winner:
+    """Clone a baseline winner for exposure under another phase/study."""
+    return Winner(
+        trial_number=baseline.trial_number,
+        params=dict(baseline.params),
+        effective_overrides=dict(baseline.effective_overrides),
+        metric=baseline.metric,
+        constraints=dict(baseline.constraints),
+        gates=list(baseline.gates),
+        phase_fingerprint=phase_fingerprint,
+    )
+
+
+def _metric_improvement(goal: str, candidate: Winner, baseline: Winner) -> float:
+    """Return candidate improvement over baseline for a metric goal."""
+    if goal == "minimize":
+        return baseline.metric - candidate.metric
+    return candidate.metric - baseline.metric
+
+
+def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
+    """Return the compact winner payload used in run summaries."""
+    return {
+        "name": name,
+        "trial_number": winner.trial_number,
+        "metric": winner.metric,
+        "params": winner.params,
+        "effective_overrides": winner.effective_overrides,
+        "constraints": winner.constraints,
+        "gates": winner.gates,
+    }
+
+
 def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
     """Load persisted gate result payload for a selected trial."""
     for trial in study.get_trials(deepcopy=False):
@@ -823,23 +856,13 @@ def _apply_promotion(
             log.warning("%s Skipping remaining dependent phases.", message)
             return None
         log.warning("%s Continuing with baseline winner.", message)
-        baseline_for_gates = winners[promotion.min_delta_vs]
-        return Winner(
-            trial_number=baseline_for_gates.trial_number,
-            params=dict(baseline_for_gates.params),
-            effective_overrides=dict(baseline_for_gates.effective_overrides),
-            metric=baseline_for_gates.metric,
-            constraints=dict(baseline_for_gates.constraints),
-            gates=list(baseline_for_gates.gates),
+        return _clone_winner_from_baseline(
+            winners[promotion.min_delta_vs],
             phase_fingerprint=candidate.phase_fingerprint,
         )
 
     baseline = winners[promotion.min_delta_vs]
-    if experiment.metric.goal == "minimize":
-        improvement = baseline.metric - candidate.metric
-    else:
-        improvement = candidate.metric - baseline.metric
-
+    improvement = _metric_improvement(experiment.metric.goal, candidate, baseline)
     passed = improvement >= promotion.min_delta
     if passed:
         log.info(
@@ -862,57 +885,12 @@ def _apply_promotion(
         return None
 
     log.warning("%s Continuing with baseline winner.", message)
-    return Winner(
-        trial_number=baseline.trial_number,
-        params=dict(baseline.params),
-        effective_overrides=dict(baseline.effective_overrides),
-        metric=baseline.metric,
-        constraints=dict(baseline.constraints),
-        gates=list(baseline.gates),
-        phase_fingerprint=candidate.phase_fingerprint,
-    )
+    return _clone_winner_from_baseline(baseline, phase_fingerprint=candidate.phase_fingerprint)
 
 
 # --------------------------------------------------------------------------------------
 # Phase runner
 # --------------------------------------------------------------------------------------
-
-
-def _canonical_storage_identity(storage: str | None) -> str | None:
-    """Stable same-host identity string for the configured Optuna storage URL.
-
-    Delegates to :func:`phasesweep.storage_urls.canonical_storage_identity` so
-    we share the SQLite-dialect normalization that the config validator uses.
-    Pre-v0.5.8 this function only matched the bare ``sqlite:///`` prefix and
-    treated ``sqlite+pysqlite:///`` as an opaque RDB URL — two configs that
-    pointed at the same SQLite file via different dialects produced different
-    lock identities (review v0.5.7 / blocker 1).
-
-    Args:
-        storage: The configured storage URL, or ``None`` (in-memory).
-
-    Returns:
-        The canonical identity (SQLite dialect-folded, absolute file path),
-        or ``None`` for in-memory storage.
-
-    """
-    return canonical_storage_identity(storage)
-
-
-def _lock_dir() -> Path:
-    """Same-host advisory lock directory shared by run-level and phase-level locks.
-
-    Living under ``$TMPDIR`` (rather than ``workdir``) means two configs that
-    differ only in ``workdir`` but target the same Optuna study still collide
-    on the same lock file (review v0.5.5 / blocker 2).
-
-    Returns:
-        Path to ``$TMPDIR/phasesweep-locks/`` (created if missing).
-
-    """
-    lock_dir = Path(tempfile.gettempdir()) / "phasesweep-locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    return lock_dir
 
 
 def _lock_material(experiment: Experiment, *, scope: dict[str, str]) -> dict[str, Any]:
@@ -932,7 +910,7 @@ def _lock_material(experiment: Experiment, *, scope: dict[str, str]) -> dict[str
         :func:`_lock_digest` into a path-safe filename.
 
     """
-    storage_identity = _canonical_storage_identity(experiment.storage)
+    storage_identity = canonical_storage_identity(experiment.storage)
     if storage_identity is None:
         return {
             "kind": "in_memory_workdir",
@@ -1016,7 +994,7 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
         when storage is in-memory.
 
     """
-    storage_identity = _canonical_storage_identity(experiment.storage)
+    storage_identity = canonical_storage_identity(experiment.storage)
     if storage_identity is None:
         return None
     return {
@@ -1573,14 +1551,6 @@ def _run_phase_inner(
         gates=gate_payload,
         phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
     )
-    _save_winner(experiment, phase.name, winner)
-    log.info(
-        "phase=%s WINNER trial=%d metric=%g params=%s",
-        phase.name,
-        winner.trial_number,
-        winner.metric,
-        winner.params,
-    )
     return winner
 
 
@@ -1807,8 +1777,18 @@ def _run_experiment_inner(
         if not dry_run:
             promoted = _apply_promotion(experiment, phase, winner, winners)
             if promoted is None:
+                with contextlib.suppress(FileNotFoundError):
+                    _winner_path(experiment, phase.name).unlink()
                 break
             winner = promoted
+            _save_winner(experiment, phase.name, winner)
+            log.info(
+                "phase=%s WINNER trial=%d metric=%g params=%s",
+                phase.name,
+                winner.trial_number,
+                winner.metric,
+                winner.params,
+            )
         winners[phase.name] = winner
 
     if dry_run:
@@ -1820,18 +1800,7 @@ def _run_experiment_inner(
     summary = {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
-        "phases": [
-            {
-                "name": pname,
-                "trial_number": w.trial_number,
-                "metric": w.metric,
-                "params": w.params,
-                "effective_overrides": w.effective_overrides,
-                "constraints": w.constraints,
-                "gates": w.gates,
-            }
-            for pname, w in winners.items()
-        ],
+        "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
     }
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     log.info("Wrote %s", summary_path)
@@ -1971,10 +1940,7 @@ def _apply_study_promotion(
         promoted = False
         improvement = None
     else:
-        if experiment.metric.goal == "minimize":
-            improvement = baseline.metric - candidate.metric
-        else:
-            improvement = candidate.metric - baseline.metric
+        improvement = _metric_improvement(experiment.metric.goal, candidate, baseline)
         promoted = improvement >= promotion.min_delta
 
     decision: dict[str, Any] = {
@@ -2014,13 +1980,8 @@ def _apply_study_promotion(
 
     log.warning("%s Continuing with baseline winner.", message)
     exposed = dict(study_winners)
-    exposed[final_phase] = Winner(
-        trial_number=baseline.trial_number,
-        params=dict(baseline.params),
-        effective_overrides=dict(baseline.effective_overrides),
-        metric=baseline.metric,
-        constraints=dict(baseline.constraints),
-        gates=list(baseline.gates),
+    exposed[final_phase] = _clone_winner_from_baseline(
+        baseline,
         phase_fingerprint=candidate.phase_fingerprint,
     )
     return exposed, decision
@@ -2068,15 +2029,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     "name": study_name,
                     "promotion": promotion_decisions.get(study_name),
                     "phases": [
-                        {
-                            "name": phase_name,
-                            "trial_number": winner.trial_number,
-                            "metric": winner.metric,
-                            "params": winner.params,
-                            "effective_overrides": winner.effective_overrides,
-                            "constraints": winner.constraints,
-                            "gates": winner.gates,
-                        }
+                        _winner_summary_item(phase_name, winner)
                         for phase_name, winner in study_winners.items()
                     ],
                 }

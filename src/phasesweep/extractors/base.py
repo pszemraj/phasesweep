@@ -6,13 +6,19 @@ it in EXTRACTORS below. That's it.
 
 from __future__ import annotations
 
-import queue
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
+from phasesweep._runtime import (
+    WandbPollTimeout,
+    json_path,
+    load_json_file,
+    poll_wandb_summary,
+    render_trial_run_name,
+)
 from phasesweep.config import (
     Extractor,
     JsonExtractor,
@@ -24,8 +30,7 @@ from phasesweep.config import (
 class ExtractorError(RuntimeError):
     """Raised when an extractor cannot produce a value (file missing, key missing, etc).
 
-    Phase runner catches this and either fails the trial or treats the metric as
-    `inf`/`-inf` depending on goal direction (configured at runner level).
+    The phase runner catches this and marks the trial as failed.
     """
 
 
@@ -58,22 +63,20 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
             not coercible to ``float``.
 
     """
-    import json
-
     target = ctx.trial_dir / cfg.path
     if not target.is_file():
         raise ExtractorError(f"JSON file not found: {target}")
     try:
-        data = json.loads(target.read_text())
-    except json.JSONDecodeError as exc:
+        data = load_json_file(target)
+    except JSONDecodeError as exc:
         raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
 
-    cur: Any = data
-    for part in cfg.key.split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            raise ExtractorError(f"Key {cfg.key!r} not found in {target} (failed at {part!r}).")
+    try:
+        cur = json_path(data, cfg.key)
+    except KeyError as exc:
+        raise ExtractorError(
+            f"Key {cfg.key!r} not found in {target} (failed at {exc.args[0]!r})."
+        ) from exc
 
     try:
         return float(cur)
@@ -157,71 +160,36 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
             or metric key missing on the finished run's summary.
 
     """
+    target_name = render_trial_run_name(cfg.run_name_template, ctx)
     try:
-        import wandb  # noqa: F401
+        summary = poll_wandb_summary(
+            entity=cfg.entity,
+            project=cfg.project,
+            run_name=target_name,
+            poll_seconds=cfg.poll_seconds,
+            timeout_seconds=cfg.timeout_seconds,
+            required_keys=[cfg.metric_key],
+        )
     except ImportError as exc:
         raise ExtractorError(
             "W&B extractor requested but the 'wandb' package is not installed. "
             "Install with: pip install phasesweep[wandb]"
         ) from exc
+    except WandbPollTimeout as exc:
+        msg = (
+            f"W&B run {target_name!r} not found or metric {cfg.metric_key!r} "
+            f"missing within {cfg.timeout_seconds}s."
+        )
+        if exc.last_error is not None:
+            msg += f" Last error: {exc.last_error}"
+        raise ExtractorError(msg) from exc
 
-    import time
-
-    from wandb.apis.public import Api  # type: ignore[import-not-found]
-
-    api = Api()
-    target_name = cfg.run_name_template.format(
-        experiment=ctx.experiment,
-        phase=ctx.phase,
-        trial_id=ctx.trial_id,
-        run_name=ctx.run_name,
-    )
-    path = f"{cfg.entity}/{cfg.project}"
-
-    deadline = time.time() + cfg.timeout_seconds
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        remaining = max(0.0, deadline - time.time())
-        try:
-            runs = _call_with_timeout(
-                lambda: api.runs(path, filters={"display_name": target_name}),
-                timeout=min(cfg.poll_seconds, remaining),
-            )
-            if len(runs) >= 1:
-                run = runs[0]
-                if run.state in {"finished", "crashed", "failed"}:
-                    summary = dict(run.summary)
-                    if cfg.metric_key in summary:
-                        return float(summary[cfg.metric_key])
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-        time.sleep(cfg.poll_seconds)
-
-    msg = f"W&B run {target_name!r} not found or metric {cfg.metric_key!r} missing within {cfg.timeout_seconds}s."
-    if last_err is not None:
-        msg += f" Last error: {last_err}"
-    raise ExtractorError(msg)
-
-
-def _call_with_timeout(fn: Callable[[], Any], *, timeout: float) -> Any:
-    """Run a blocking function in a daemon thread and bound caller wait time."""
-    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            q.put((True, fn()))
-        except Exception as exc:  # noqa: BLE001
-            q.put((False, exc))
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout=max(0.0, timeout))
-    if thread.is_alive():
-        raise TimeoutError(f"call exceeded {timeout:g}s")
-    ok, value = q.get_nowait()
-    if ok:
-        return value
-    raise value
+    try:
+        return float(summary[cfg.metric_key])
+    except (TypeError, ValueError) as exc:
+        raise ExtractorError(
+            f"Value at W&B metric {cfg.metric_key!r} is not numeric: {summary[cfg.metric_key]!r}"
+        ) from exc
 
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {

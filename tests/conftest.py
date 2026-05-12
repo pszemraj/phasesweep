@@ -20,6 +20,7 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
+from phasesweep.extractors import TrialContext
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -116,4 +117,24 @@ def write_constant_trainer(tmp_path: Path) -> Path:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"x": 0.5}))
         """,
+    )
+
+
+def make_trial_context(
+    tmp_path: Path,
+    *,
+    experiment: str = "t",
+    phase: str = "p",
+    trial_id: int = 0,
+    run_name: str | None = None,
+) -> TrialContext:
+    """Build a minimal extractor trial context for unit tests."""
+    return TrialContext(
+        experiment=experiment,
+        phase=phase,
+        trial_id=trial_id,
+        trial_dir=tmp_path,
+        run_name=run_name or f"{experiment}-{phase}-{trial_id}",
+        return_code=0,
+        duration_seconds=0.0,
     )

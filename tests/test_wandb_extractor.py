@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
 from phasesweep.config import WandbExtractor
-from phasesweep.extractors import ExtractorError, TrialContext, run_extractor
+from phasesweep.extractors import ExtractorError, run_extractor
+from tests.conftest import make_trial_context
 
 
 class _FakeRun:
@@ -81,18 +81,6 @@ def fake_wandb_missing(monkeypatch):
         sys.modules.pop(k, None)
 
 
-def _ctx(tmp_path: Path) -> TrialContext:
-    return TrialContext(
-        experiment="exp",
-        phase="ph",
-        trial_id=7,
-        trial_dir=tmp_path,
-        run_name="exp-ph-7",
-        return_code=0,
-        duration_seconds=0.0,
-    )
-
-
 def test_wandb_extractor_finds_metric(fake_wandb_finished, tmp_path):
     cfg = WandbExtractor(
         type="wandb",
@@ -103,7 +91,8 @@ def test_wandb_extractor_finds_metric(fake_wandb_finished, tmp_path):
         poll_seconds=0.01,
         timeout_seconds=1.0,
     )
-    assert run_extractor(_ctx(tmp_path), cfg) == pytest.approx(0.123)
+    ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
+    assert run_extractor(ctx, cfg) == pytest.approx(0.123)
 
 
 def test_wandb_extractor_timeout(fake_wandb_missing, tmp_path):
@@ -117,4 +106,5 @@ def test_wandb_extractor_timeout(fake_wandb_missing, tmp_path):
         timeout_seconds=0.1,  # bail fast
     )
     with pytest.raises(ExtractorError, match="not found or metric"):
-        run_extractor(_ctx(tmp_path), cfg)
+        ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
+        run_extractor(ctx, cfg)

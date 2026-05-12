@@ -38,7 +38,6 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [])
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True)
-    assert not pool.active
     with pool.acquire() as gid:
         assert gid is None
 
@@ -46,7 +45,6 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
 def test_explicit_gpu_ids_honored_for_single_job():
     """A single-job phase with gpu_ids=[3] must isolate to GPU 3, not no-op."""
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
-    assert pool.active, "Pool should be active when explicit IDs are set, even at n_jobs=1"
     with pool.acquire() as gid:
         assert gid == 3
 

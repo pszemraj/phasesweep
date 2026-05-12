@@ -582,38 +582,6 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     return False
 
 
-def _process_state(pid: int) -> str | None:
-    """Read the runtime state code from ``/proc/<pid>/stat`` (POSIX-only).
-
-    Used to filter zombies out of liveness checks: a zombie still occupies a
-    PID table entry so ``kill(0)`` succeeds, but it holds no GPU memory and
-    isn't a process we need to wait on.
-
-    Args:
-        pid: PID to inspect via ``/proc/<pid>/stat``.
-
-    Returns:
-        Single-letter state code: ``R``/``S``/``D``/``Z``/``T``/``X``/``I``/...,
-        or ``None`` when the file is unreadable (non-Linux, process gone,
-        permission denied).
-
-    """
-    try:
-        # Field layout: "pid (comm) state ppid ...". The comm field can contain
-        # spaces and parens, so split from the right of the closing paren.
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            text = fh.read()
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
-    rparen = text.rfind(")")
-    if rparen < 0:
-        return None
-    rest = text[rparen + 1 :].strip().split()
-    if not rest:
-        return None
-    return rest[0]
-
-
 def _process_group_alive(pgid: int) -> bool:
     """Check whether any non-zombie process in the group ``pgid`` is alive.
 

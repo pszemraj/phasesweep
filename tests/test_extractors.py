@@ -5,45 +5,34 @@ import json
 import pytest
 
 from phasesweep.config import JsonExtractor, LogRegexExtractor
-from phasesweep.extractors import ExtractorError, TrialContext, run_extractor
-
-
-def _ctx(tmp_path):
-    return TrialContext(
-        experiment="t",
-        phase="p",
-        trial_id=0,
-        trial_dir=tmp_path,
-        run_name="t-p-0",
-        return_code=0,
-        duration_seconds=0.0,
-    )
+from phasesweep.extractors import ExtractorError, run_extractor
+from tests.conftest import make_trial_context
 
 
 def test_json_basic(tmp_path):
     (tmp_path / "result.json").write_text(json.dumps({"eval": {"loss": 0.42}}))
     cfg = JsonExtractor(type="json", path="result.json", key="eval.loss")
-    assert run_extractor(_ctx(tmp_path), cfg) == pytest.approx(0.42)
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.42)
 
 
 def test_json_missing_file(tmp_path):
     cfg = JsonExtractor(type="json", path="nope.json", key="x")
     with pytest.raises(ExtractorError, match="not found"):
-        run_extractor(_ctx(tmp_path), cfg)
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_json_missing_key(tmp_path):
     (tmp_path / "result.json").write_text(json.dumps({"a": {"b": 1}}))
     cfg = JsonExtractor(type="json", path="result.json", key="a.c")
     with pytest.raises(ExtractorError, match="not found"):
-        run_extractor(_ctx(tmp_path), cfg)
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_json_non_numeric(tmp_path):
     (tmp_path / "result.json").write_text(json.dumps({"x": "abc"}))
     cfg = JsonExtractor(type="json", path="result.json", key="x")
     with pytest.raises(ExtractorError, match="not numeric"):
-        run_extractor(_ctx(tmp_path), cfg)
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_log_regex_last(tmp_path):
@@ -56,7 +45,7 @@ def test_log_regex_last(tmp_path):
         pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
         select="last",
     )
-    assert run_extractor(_ctx(tmp_path), cfg) == 0.25
+    assert run_extractor(make_trial_context(tmp_path), cfg) == 0.25
 
 
 def test_log_regex_min(tmp_path):
@@ -67,7 +56,7 @@ def test_log_regex_min(tmp_path):
         pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
         select="min",
     )
-    assert run_extractor(_ctx(tmp_path), cfg) == 0.5
+    assert run_extractor(make_trial_context(tmp_path), cfg) == 0.5
 
 
 def test_log_regex_no_value_group(tmp_path):
@@ -79,7 +68,7 @@ def test_log_regex_no_value_group(tmp_path):
         select="last",
     )
     with pytest.raises(ExtractorError, match="named group 'value'"):
-        run_extractor(_ctx(tmp_path), cfg)
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_log_regex_no_match(tmp_path):
@@ -91,4 +80,4 @@ def test_log_regex_no_match(tmp_path):
         select="last",
     )
     with pytest.raises(ExtractorError, match="No matches"):
-        run_extractor(_ctx(tmp_path), cfg)
+        run_extractor(make_trial_context(tmp_path), cfg)

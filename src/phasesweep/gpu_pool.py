@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Generator
@@ -20,6 +19,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
+
+from phasesweep._runtime import lock_dir
 
 log = logging.getLogger("phasesweep.gpu_pool")
 
@@ -32,16 +33,9 @@ class _HostGpuLease:
     handle: IO[str]
 
 
-def _gpu_lock_dir() -> Path:
-    """Return the shared host lock directory used for GPU leases."""
-    path = Path(tempfile.gettempdir()) / "phasesweep-locks"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def _gpu_lock_path(gpu_id: int) -> Path:
     """Return the host-wide lock file for a CUDA device index."""
-    return _gpu_lock_dir() / f"gpu_{gpu_id}.lock"
+    return lock_dir() / f"gpu_{gpu_id}.lock"
 
 
 def _try_host_gpu_lease(gpu_id: int) -> _HostGpuLease | None:
@@ -209,17 +203,6 @@ class GpuPool:
         else:
             log.info("GPU pool: %d GPUs for %d parallel jobs.", len(ids), n_jobs)
         return cls(gpu_ids=ids)
-
-    @property
-    def active(self) -> bool:
-        """Whether the pool has GPUs to hand out.
-
-        Returns:
-            ``True`` iff ``acquire()`` yields a real integer device index;
-            ``False`` for the no-op (CPU-only or single-job) pool.
-
-        """
-        return bool(self._gpu_ids)
 
     def _acquire(self) -> tuple[int, _HostGpuLease] | None:
         """Block until a local slot and host-wide GPU lease are available.

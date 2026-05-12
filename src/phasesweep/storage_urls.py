@@ -5,7 +5,7 @@ Two callers need the same notion of "what backend is this URL?":
 * :func:`phasesweep.config._validate_storage_policy` — must reject SQLite under
   ``n_jobs > 1`` regardless of which SQLAlchemy dialect was spelled
   (``sqlite:///``, ``sqlite+pysqlite:///``, ``sqlite+pysqlcipher:///``, ...).
-* :func:`phasesweep.orchestrator._canonical_storage_identity` — must produce
+* :func:`canonical_storage_identity` — must produce
   the same lock-identity string for two URLs that point at the same SQLite
   file even if their dialect differs, so the same-host lock collides.
 

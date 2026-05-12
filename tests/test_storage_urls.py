@@ -16,7 +16,6 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.orchestrator import (
-    _canonical_storage_identity,
     _resolve_storage,
 )
 from phasesweep.storage_urls import (
@@ -141,18 +140,18 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     pins the path-resolution and None-handling contract.
     """
     # SQLite path with `..` must be resolved away.
-    sqlite_id = _canonical_storage_identity(f"sqlite:///{tmp_path}/sub/../db.sqlite3")
+    sqlite_id = canonical_storage_identity(f"sqlite:///{tmp_path}/sub/../db.sqlite3")
     assert sqlite_id is not None
     assert ".." not in sqlite_id
     assert str(tmp_path / "db.sqlite3") in sqlite_id
 
     # Journal path resolves the same way.
-    journal_id = _canonical_storage_identity(f"journal:///{tmp_path}/study.journal")
+    journal_id = canonical_storage_identity(f"journal:///{tmp_path}/study.journal")
     assert journal_id is not None
     assert str(tmp_path) in journal_id
 
     # None → None (in-memory study).
-    assert _canonical_storage_identity(None) is None
+    assert canonical_storage_identity(None) is None
 
 
 def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
@@ -197,8 +196,8 @@ def test_sqlite_driver_and_plain_collide_on_lock_identity(tmp_path: Path) -> Non
     plain = f"sqlite:///{tmp_path / 'x.db'}"
     driver = f"sqlite+pysqlite:///{tmp_path / 'x.db'}"
 
-    plain_id = _canonical_storage_identity(plain)
-    driver_id = _canonical_storage_identity(driver)
+    plain_id = canonical_storage_identity(plain)
+    driver_id = canonical_storage_identity(driver)
 
     assert plain_id is not None
     assert plain_id == driver_id

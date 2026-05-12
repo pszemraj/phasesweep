@@ -5,32 +5,19 @@ import pytest
 
 from phasesweep.config import (
     Constraint,
-    Experiment,
     JsonExtractor,
-    Metric,
     Phase,
 )
 from phasesweep.selector import NoFeasibleTrialError, select_winner
+from tests.conftest import make_experiment
 
 
 def _make_exp(constraints=None):
-    return Experiment(
-        experiment="t",
+    return make_experiment(
         storage=":memory:",
         trial_command="echo",
-        metric=Metric(
-            name="loss",
-            goal="minimize",
-            extractor=JsonExtractor(type="json", path="r.json", key="loss"),
-        ),
         constraints=constraints or [],
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                search_space={},  # unused for these tests
-            )
-        ],
+        phases=[Phase(name="p", n_trials=1, search_space={})],
     )
 
 

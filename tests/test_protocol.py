@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from phasesweep import load_config, run_config
 from phasesweep.config import (
@@ -19,6 +20,25 @@ from phasesweep.config import (
 )
 from phasesweep.orchestrator import run_experiment
 from tests.conftest import make_experiment, write_trainer, write_yaml
+
+
+def _write_score_trainer(tmp_path: Path) -> Path:
+    """Write a trainer that records the ``score=`` override as metric ``x``."""
+    return write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, rest = ap.parse_known_args()
+        value = 1.0
+        for item in rest:
+            if item.startswith("score="):
+                value = float(item.split("=", 1)[1])
+        with open(args.out, "w") as f:
+            json.dump({"x": value}, f)
+        """,
+    )
 
 
 def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> None:
@@ -62,21 +82,7 @@ def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> No
 
 def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -> None:
     """A phase can run a candidate but expose the baseline if promotion fails."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, rest = ap.parse_known_args()
-        value = 1.0
-        for item in rest:
-            if item.startswith("score="):
-                value = float(item.split("=", 1)[1])
-        with open(args.out, "w") as f:
-            json.dump({"x": value}, f)
-        """,
-    )
+    trainer = _write_score_trainer(tmp_path)
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
@@ -105,25 +111,14 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
 
     assert winners["candidate"].metric == winners["baseline"].metric
     assert winners["candidate"].effective_overrides == winners["baseline"].effective_overrides
+    stored = yaml.safe_load((tmp_path / "runs" / "t" / "candidate" / "winner.yaml").read_text())
+    assert stored["metric"]["objective"] == pytest.approx(winners["baseline"].metric)
+    assert stored["effective_overrides"] == winners["baseline"].effective_overrides
 
 
 def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     """``requires_gates: false`` records gate failures without failing the trial."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, rest = ap.parse_known_args()
-        value = 1.0
-        for item in rest:
-            if item.startswith("score="):
-                value = float(item.split("=", 1)[1])
-        with open(args.out, "w") as f:
-            json.dump({"x": value}, f)
-        """,
-    )
+    trainer = _write_score_trainer(tmp_path)
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
@@ -158,21 +153,7 @@ def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
 
 def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     """Suite-level promotion compares final study winners across studies."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, rest = ap.parse_known_args()
-        value = 1.0
-        for item in rest:
-            if item.startswith("score="):
-                value = float(item.split("=", 1)[1])
-        with open(args.out, "w") as f:
-            json.dump({"x": value}, f)
-        """,
-    )
+    trainer = _write_score_trainer(tmp_path)
     p = write_yaml(
         tmp_path,
         f"""
