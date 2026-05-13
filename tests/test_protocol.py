@@ -13,6 +13,7 @@ from phasesweep.config import (
     Contract,
     Experiment,
     IntParam,
+    JsonEqualsGate,
     JsonExtractor,
     Metric,
     Phase,
@@ -295,6 +296,25 @@ def test_artifact_size_gate_supports_file_directory_and_json_estimate(tmp_path: 
     )
 
     assert [result.passed for result in results] == [True, True, True]
+
+
+def test_json_equals_gate_requires_matching_json_type(tmp_path: Path) -> None:
+    """Protocol equality is type-strict; numeric tolerance belongs in scalar bounds."""
+    (tmp_path / "result.json").write_text('{"flag": true, "count": 1}')
+    ctx = make_trial_context(tmp_path)
+
+    results = evaluate_gates(
+        ctx,
+        [
+            JsonEqualsGate(type="json_equals", path="result.json", key="flag", value=True),
+            JsonEqualsGate(type="json_equals", path="result.json", key="flag", value=1),
+            JsonEqualsGate(type="json_equals", path="result.json", key="count", value=1.0),
+        ],
+    )
+
+    assert [result.passed for result in results] == [True, False, False]
+    assert "bool" in results[1].detail
+    assert "float" in results[2].detail
 
 
 def test_artifact_size_gate_reports_bad_sources(tmp_path: Path) -> None:

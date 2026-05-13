@@ -11,7 +11,7 @@ pathlint src tests
 python doc_check.py src --check-lazy
 ```
 
-Current expected test result: `262 passed` with Optuna `constant_liar` experimental warnings.
+Current expected test result: `264 passed` with Optuna `constant_liar` experimental warnings.
 
 ## Test Map
 

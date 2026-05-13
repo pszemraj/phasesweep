@@ -826,6 +826,14 @@ def _load_winner(
             f"experiment name, or restore the matching config before resuming."
         )
 
+    completion = data["completion"]
+    if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
+        raise RuntimeError(
+            f"Winner file {path} records an incomplete phase result. Refusing to "
+            f"use it for skipped phase {phase.name!r} unless the current config "
+            "sets allow_incomplete_on_timeout: true."
+        )
+
     return Winner(
         trial_number=int(data["trial_number"]),
         params=dict(data["params"]),
@@ -833,7 +841,7 @@ def _load_winner(
         metric=float(data["metric"][experiment.metric.name]),
         constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
         gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
-        completion=dict(data["completion"]),
+        completion=dict(completion),
         promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
         phase_fingerprint=str(stored_fp),
     )

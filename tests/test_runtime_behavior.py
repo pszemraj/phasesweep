@@ -11,6 +11,7 @@ import pytest
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
+from phasesweep.orchestrator import _load_winner
 from phasesweep.selector import NoFeasibleTrialError
 from tests.conftest import REPO, write_trainer, write_yaml
 
@@ -408,6 +409,24 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
         "reason": "timeout",
         "timeout_scope": "phase",
     }
+
+
+def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
+    accepted = _sleeping_score_experiment(
+        tmp_path,
+        experiment="phase_timeout_resume_guard",
+        timeout_seconds_per_phase=0.05,
+        allow_incomplete_on_timeout=True,
+    )
+    run_experiment(accepted)
+
+    current = _sleeping_score_experiment(
+        tmp_path,
+        experiment="phase_timeout_resume_guard",
+        timeout_seconds_per_phase=0.05,
+    )
+    with pytest.raises(RuntimeError, match="incomplete phase result"):
+        _load_winner(current, current.phases[0], {})
 
 
 def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:

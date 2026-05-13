@@ -46,9 +46,14 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
         actual = json_path(load_json_file(ctx.trial_dir / gate.path), gate.key)
     except Exception as exc:  # noqa: BLE001
         return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
-    if actual == gate.value:
+    if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
-    return GateResult(gate.type, False, f"{gate.key} was {actual!r}, expected {gate.value!r}")
+    return GateResult(
+        gate.type,
+        False,
+        f"{gate.key} was {actual!r} ({type(actual).__name__}), "
+        f"expected {gate.value!r} ({type(gate.value).__name__})",
+    )
 
 
 def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResult:
