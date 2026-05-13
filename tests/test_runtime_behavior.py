@@ -15,6 +15,44 @@ from phasesweep.selector import NoFeasibleTrialError
 from tests.conftest import REPO, write_trainer, write_yaml
 
 
+def _sleeping_score_experiment(
+    tmp_path: Path,
+    *,
+    experiment: str,
+    timeout_seconds_per_phase: float | None = None,
+    timeout_seconds_per_run: float | None = None,
+    allow_incomplete_on_timeout: bool = False,
+) -> Experiment:
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(0.15)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        """,
+    )
+    return Experiment(
+        experiment=experiment,
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        timeout_seconds_per_run=timeout_seconds_per_run,
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                timeout_seconds_per_phase=timeout_seconds_per_phase,
+                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
+                search_space={},
+            )
+        ],
+    )
+
+
 def test_parallel_trials_e2e(tmp_path):
     """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
     - JournalFileStorage via explicit journal:/// URL (B3, v0.5.2 / blocker 6)
@@ -343,31 +381,10 @@ phases:
 
 def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     """A phase wallclock timeout must not bless the best partial trial by default."""
-    trainer = write_trainer(
+    exp = _sleeping_score_experiment(
         tmp_path,
-        """
-        import argparse, json, time
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        time.sleep(0.15)
-        with open(args.out, "w") as f:
-            json.dump({"x": 1.0}, f)
-        """,
-    )
-    exp = Experiment(
         experiment="phase_timeout",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=3,
-                timeout_seconds_per_phase=0.05,
-                search_space={},
-            )
-        ],
+        timeout_seconds_per_phase=0.05,
     )
 
     with pytest.raises(TimeoutError, match="1/3 trials finished"):
@@ -375,32 +392,11 @@ def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
-    trainer = write_trainer(
+    exp = _sleeping_score_experiment(
         tmp_path,
-        """
-        import argparse, json, time
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        time.sleep(0.15)
-        with open(args.out, "w") as f:
-            json.dump({"x": 1.0}, f)
-        """,
-    )
-    exp = Experiment(
         experiment="phase_timeout_allowed",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=3,
-                timeout_seconds_per_phase=0.05,
-                allow_incomplete_on_timeout=True,
-                search_space={},
-            )
-        ],
+        timeout_seconds_per_phase=0.05,
+        allow_incomplete_on_timeout=True,
     )
 
     winners = run_experiment(exp)
@@ -415,25 +411,10 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
 
 
 def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
-    trainer = write_trainer(
+    exp = _sleeping_score_experiment(
         tmp_path,
-        """
-        import argparse, json, time
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        time.sleep(0.15)
-        with open(args.out, "w") as f:
-            json.dump({"x": 1.0}, f)
-        """,
-    )
-    exp = Experiment(
         experiment="run_timeout",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
         timeout_seconds_per_run=0.05,
-        phases=[Phase(name="p", n_trials=3, search_space={})],
     )
 
     with pytest.raises(TimeoutError, match="run guard"):

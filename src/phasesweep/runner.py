@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Constraint, Experiment, Gate
+from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.extractors import ExtractorError, TrialContext, run_extractor
 from phasesweep.gates import GateResult, evaluate_gates
 from phasesweep.overrides import render_command
@@ -29,7 +29,6 @@ class ExecutedTrial:
 
     ctx: TrialContext
     process: ProcessResult
-    overrides: dict[str, Any]
 
 
 @dataclass
@@ -61,27 +60,6 @@ class UnsafeProcessCleanupError(RuntimeError):
     process group can hold GPU memory, write conflicting outputs, or starve
     the host scheduler (review v0.5.9 / blocker 3).
     """
-
-
-def _check_constraint(value: float, constraint: Constraint) -> bool:
-    """Return whether a finite constraint value satisfies its configured bounds.
-
-    Non-finite values (NaN/inf) are always infeasible (review item #3) — without this
-    guard, NaN silently passes both `>` and `<` comparisons and corrupts winner selection.
-
-    Args:
-        value: Numeric reading produced by a constraint extractor.
-        constraint: The constraint definition (``name``, ``min``, ``max``).
-
-    Returns:
-        ``True`` iff ``value`` is finite and within the configured bounds.
-
-    """
-    if not math.isfinite(value):
-        return False
-    if constraint.max is not None and value > constraint.max:
-        return False
-    return not (constraint.min is not None and value < constraint.min)
 
 
 def _failed_trial(
@@ -153,7 +131,7 @@ def launch_trial(
 
     Returns:
         :class:`ExecutedTrial` bundling the trial context, the supervised
-        :class:`ProcessResult`, and the overrides actually applied.
+        :class:`ProcessResult`.
 
     """
     workdir = trial_dir
@@ -206,7 +184,7 @@ def launch_trial(
         duration_seconds=proc_result.duration_seconds,
     )
 
-    return ExecutedTrial(ctx=ctx, process=proc_result, overrides=overrides)
+    return ExecutedTrial(ctx=ctx, process=proc_result)
 
 
 def extract_trial_result(
@@ -314,7 +292,7 @@ def extract_trial_result(
                 constraints=constraint_values,
             )
         constraint_values[c.name] = v
-        if not _check_constraint(v, c):
+        if not check_bounds(v, min_value=c.min, max_value=c.max):
             feasible = False
 
     gate_results = evaluate_gates(executed.ctx, gates or [])

@@ -22,11 +22,11 @@ from phasesweep.config import (
     Sampler,
     _find_prefix_collisions,
     _key_parts,
+    check_bounds,
 )
 from phasesweep.orchestrator import (
     _build_sampler,
 )
-from phasesweep.runner import _check_constraint
 from phasesweep.selector import select_winner
 from tests.conftest import make_experiment, write_yaml
 
@@ -107,18 +107,12 @@ def test_int_param_step_must_be_positive():
         IntParam(type="int", low=0, high=10, step=0)
 
 
-def test_check_constraint_rejects_nan():
-    """Direct unit test on the helper — NaN is always infeasible."""
-    c = Constraint(
-        name="x",
-        extractor=JsonExtractor(type="json", path="r.json", key="x"),
-        max=100.0,
-        min=0.0,
-    )
-    assert _check_constraint(50.0, c) is True
-    assert _check_constraint(float("nan"), c) is False
-    assert _check_constraint(float("inf"), c) is False
-    assert _check_constraint(float("-inf"), c) is False
+def test_check_bounds_rejects_non_finite_values():
+    """NaN/inf are always out of bounds."""
+    assert check_bounds(50.0, min_value=0.0, max_value=100.0) is True
+    assert check_bounds(float("nan"), min_value=0.0, max_value=100.0) is False
+    assert check_bounds(float("inf"), min_value=0.0, max_value=100.0) is False
+    assert check_bounds(float("-inf"), min_value=0.0, max_value=100.0) is False
 
 
 def test_selector_rejects_nan_constraint_values_defensively(tmp_path):

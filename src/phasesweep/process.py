@@ -19,7 +19,7 @@ import os
 import signal
 import subprocess
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -35,13 +35,6 @@ _KILL_GRACE_SECONDS = 10.0
 
 _lock = threading.Lock()
 _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
-# signal.signal returns the previous handler, which can be a callable, an int
-# constant (SIG_IGN/SIG_DFL), or None. We don't actually need to restore them
-# anywhere right now, but keep the slots typed correctly for if we do.
-_HandlerType = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
-_original_sigterm: _HandlerType = None
-_original_sigint: _HandlerType = None
-_original_sighup: _HandlerType = None
 _installed = False
 
 # The launch lock guards the Popen() -> _register() critical section so the
@@ -125,14 +118,14 @@ def install_signal_handlers() -> None:
     call multiple times; only installs once. Must be called from the main
     thread.
     """
-    global _original_sighup, _original_sigint, _original_sigterm, _installed  # noqa: PLW0603
+    global _installed  # noqa: PLW0603
     if _installed:
         return
     try:
-        _original_sigterm = signal.signal(signal.SIGTERM, _shutdown_handler)
-        _original_sigint = signal.signal(signal.SIGINT, _shutdown_handler)
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+        signal.signal(signal.SIGINT, _shutdown_handler)
         if hasattr(signal, "SIGHUP"):
-            _original_sighup = signal.signal(signal.SIGHUP, _shutdown_handler)
+            signal.signal(signal.SIGHUP, _shutdown_handler)
         _installed = True
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")

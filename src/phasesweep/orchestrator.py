@@ -39,6 +39,7 @@ from phasesweep.config import (
     Sampler,
     SearchParam,
     Suite,
+    grid_search_space,
 )
 from phasesweep.gpu_pool import GpuPool
 from phasesweep.runner import (
@@ -48,7 +49,7 @@ from phasesweep.runner import (
     launch_trial,
 )
 from phasesweep.selector import NoFeasibleTrialError, select_winner
-from phasesweep.storage_urls import canonical_storage_identity
+from phasesweep.storage_urls import _file_url_path, canonical_storage_identity, storage_backend
 
 log = logging.getLogger("phasesweep.orchestrator")
 
@@ -203,14 +204,14 @@ def _resolve_storage(url: str | None) -> Any:
     """
     if url is None:
         return None
-    if url.startswith("journal:///"):
-        path = url.removeprefix("journal:///")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if storage_backend(url) == "journal":
+        path = Path(_file_url_path(url)).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Using JournalFileStorage at %s", path)
         from optuna.storages import JournalStorage
         from optuna.storages.journal import JournalFileBackend
 
-        return JournalStorage(JournalFileBackend(path))
+        return JournalStorage(JournalFileBackend(str(path)))
     return url
 
 
@@ -380,22 +381,7 @@ def _build_sampler(
     if cfg.type == "random":
         return optuna.samplers.RandomSampler(seed=cfg.seed)
     if cfg.type == "grid":
-        grid: dict[str, list[Any]] = {}
-        for name, p in search_space.items():
-            if isinstance(p, CategoricalParam):
-                grid[name] = list(p.choices)
-            elif isinstance(p, IntParam):
-                if p.log:
-                    raise ValueError("Grid sampler does not support log-int spaces.")
-                grid[name] = list(range(p.low, p.high + 1, p.step))
-            elif isinstance(p, FloatParam):
-                if p.step is None:
-                    raise ValueError(f"Grid sampler requires a 'step' on float param {name!r}.")
-                n_steps = int(round((p.high - p.low) / p.step))
-                grid[name] = [round(p.low + i * p.step, 12) for i in range(n_steps + 1)]
-            else:  # pragma: no cover
-                raise ValueError(f"Unhandled param type for grid: {p!r}")
-        return optuna.samplers.GridSampler(grid, seed=cfg.seed)
+        return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":
         # Defense in depth. ``_validate_sampler_search_space`` already rejects
         # categorical-on-cmaes at config-load and import-checks the cmaes

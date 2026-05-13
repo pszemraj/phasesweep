@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import main as cli_main
-from tests.conftest import write_yaml
+from tests.conftest import write_trainer, write_yaml
 
 
 def test_dry_run_winner_includes_inherited_and_fixed_overrides(tmp_path):
@@ -182,13 +182,14 @@ phases:
 
 def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     """``phasesweep status`` is read-only and reports study trial state counts."""
-    trainer = tmp_path / "trainer.py"
-    trainer.write_text(
-        "import argparse, json\n"
-        "ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)\n"
-        "args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))\n"
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)
+        args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))
+        """,
     )
-    trainer.chmod(0o755)
     p = write_yaml(
         tmp_path,
         f"""

@@ -82,12 +82,13 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
         cur = nested
         parts = k.split(".")
         for part in parts[:-1]:
-            cur = cur.setdefault(part, {})
-            if not isinstance(cur, dict):
-                nested[k] = v
-                break
-        else:
-            cur[parts[-1]] = v
+            next_value = cur.setdefault(part, {})
+            if not isinstance(next_value, dict):
+                raise ValueError(f"Cannot expand override {k!r}: {part!r} is already scalar.")
+            cur = next_value
+        if parts[-1] in cur and isinstance(cur[parts[-1]], dict):
+            raise ValueError(f"Cannot expand override {k!r}: it would replace a nested object.")
+        cur[parts[-1]] = v
     path = trial_dir / "overrides.json"
     path.write_text(json.dumps(nested, indent=2, sort_keys=True))
     return path

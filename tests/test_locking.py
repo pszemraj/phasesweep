@@ -78,42 +78,14 @@ def test_phase_lock_distinct_phases_dont_collide(tmp_path: Path) -> None:
         pass
 
 
+@pytest.mark.parametrize("storage_name", ["shared.db", "shared.journal"])
 def test_phase_lock_collides_for_same_storage_different_workdirs(
     tmp_path: Path,
+    storage_name: str,
 ) -> None:
-    """Two configs sharing the same SQLite storage but different workdirs must
-    collide on the same lock file — they target the same Optuna study.
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
-
-    held = threading.Event()
-    released = threading.Event()
-
-    def hold_first() -> None:
-        with _phase_lock(exp_a, exp_a.phases[0]):
-            held.set()
-            released.wait(timeout=5.0)
-
-    t = threading.Thread(target=hold_first, daemon=True)
-    t.start()
-    assert held.wait(timeout=2.0)
-
-    try:
-        with _phase_lock(exp_b, exp_b.phases[0]):
-            pytest.fail("second lock should have been blocked")
-    except RuntimeError as exc:
-        assert "Another phasesweep process" in str(exc)
-
-    released.set()
-    t.join(timeout=2.0)
-
-
-def test_phase_lock_collides_for_same_journal_storage_different_workdirs(
-    tmp_path: Path,
-) -> None:
-    storage = f"journal:///{tmp_path / 'shared.journal'}"
+    """Two configs sharing storage but different workdirs must collide."""
+    scheme = "journal" if storage_name.endswith(".journal") else "sqlite"
+    storage = f"{scheme}:///{tmp_path / storage_name}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
 

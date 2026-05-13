@@ -8,7 +8,7 @@ from typing import Any
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, check_bounds
 
 
 @dataclass
@@ -77,13 +77,7 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             except (TypeError, ValueError):
                 ok = False
                 break
-            if not math.isfinite(v_f):
-                ok = False
-                break
-            if c.max is not None and v_f > c.max:
-                ok = False
-                break
-            if c.min is not None and v_f < c.min:
+            if not check_bounds(v_f, min_value=c.min, max_value=c.max):
                 ok = False
                 break
         if not ok:

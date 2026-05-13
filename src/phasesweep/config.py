@@ -6,12 +6,10 @@ last phase fails immediately rather than three hours into the sweep.
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import math
 import re
 import string
-import tempfile
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -45,6 +43,39 @@ def _require_finite(label: str, value: float) -> None:
     """
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite; got {value!r}")
+
+
+def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
+    """Return whether ``value`` is finite and inside optional numeric bounds."""
+    if not math.isfinite(value):
+        return False
+    if min_value is not None and value < min_value:
+        return False
+    return not (max_value is not None and value > max_value)
+
+
+def _validate_optional_bounds(
+    *,
+    label: str,
+    min_value: float | None,
+    max_value: float | None,
+) -> None:
+    """Reject empty, non-finite, or inverted optional bounds."""
+    if min_value is None and max_value is None:
+        raise ValueError(f"{label} must define at least one of min/max.")
+    if min_value is not None:
+        _require_finite(f"{label} min", min_value)
+    if max_value is not None:
+        _require_finite(f"{label} max", max_value)
+    if min_value is not None and max_value is not None and min_value > max_value:
+        raise ValueError(f"{label}: min ({min_value}) > max ({max_value}).")
+
+
+def _validate_safe_name(kind: str, value: str) -> str:
+    """Reject empty names and characters unsafe for path/study-name components."""
+    if not value or not all(c.isalnum() or c in "_-" for c in value):
+        raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
+    return value
 
 
 # --------------------------------------------------------------------------------------
@@ -134,16 +165,11 @@ class JsonScalarBoundGate(_Frozen):
     @model_validator(mode="after")
     def _validate_bounds(self) -> JsonScalarBoundGate:
         """Reject empty/non-finite bounds and ``min > max``."""
-        if self.min is None and self.max is None:
-            raise ValueError("json_scalar_bound gate must define at least one of min/max.")
-        if self.min is not None:
-            _require_finite("json_scalar_bound.min", self.min)
-        if self.max is not None:
-            _require_finite("json_scalar_bound.max", self.max)
-        if self.min is not None and self.max is not None and self.min > self.max:
-            raise ValueError(
-                f"json_scalar_bound gate min ({self.min}) must be <= max ({self.max})."
-            )
+        _validate_optional_bounds(
+            label="json_scalar_bound gate",
+            min_value=self.min,
+            max_value=self.max,
+        )
         return self
 
 
@@ -246,14 +272,11 @@ class Constraint(_Frozen):
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
 
         """
-        if self.max is None and self.min is None:
-            raise ValueError(f"Constraint {self.name!r} must define at least one of min/max.")
-        if self.max is not None:
-            _require_finite(f"Constraint {self.name!r} max", self.max)
-        if self.min is not None:
-            _require_finite(f"Constraint {self.name!r} min", self.min)
-        if self.max is not None and self.min is not None and self.min > self.max:
-            raise ValueError(f"Constraint {self.name!r}: min ({self.min}) > max ({self.max}).")
+        _validate_optional_bounds(
+            label=f"Constraint {self.name!r}",
+            min_value=self.min,
+            max_value=self.max,
+        )
         return self
 
 
@@ -545,9 +568,7 @@ class Phase(_Frozen):
             is disallowed (the name is used as a filesystem path component).
 
         """
-        if not v or not all(c.isalnum() or c in "_-" for c in v):
-            raise ValueError(f"Phase name {v!r} must be non-empty and [A-Za-z0-9_-] only.")
-        return v
+        return _validate_safe_name("Phase", v)
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Phase:
@@ -703,9 +724,7 @@ class Experiment(_Frozen):
             on any disallowed character.
 
         """
-        if not v or not all(c.isalnum() or c in "_-" for c in v):
-            raise ValueError(f"Experiment name {v!r} must be non-empty and [A-Za-z0-9_-] only.")
-        return v
+        return _validate_safe_name("Experiment", v)
 
     @model_validator(mode="after")
     def _validate_phase_graph(self) -> Experiment:
@@ -870,24 +889,6 @@ class Experiment(_Frozen):
             raise ValueError("Metric and constraint names must all be distinct.")
         return self
 
-    def phase_by_name(self, name: str) -> Phase:
-        """Look up a phase by name.
-
-        Args:
-            name: Phase name to search for.
-
-        Returns:
-            The matching :class:`Phase`.
-
-        Raises:
-            KeyError: No phase in ``self.phases`` has that name.
-
-        """
-        for p in self.phases:
-            if p.name == name:
-                return p
-        raise KeyError(name)
-
 
 class SuiteDefaults(_Frozen):
     """Shared defaults applied to every study in a suite."""
@@ -924,9 +925,7 @@ class StudySpec(_Frozen):
     @classmethod
     def _study_name_is_safe(cls, value: str) -> str:
         """Study names are used as experiment-name suffixes and path components."""
-        if not value or not all(c.isalnum() or c in "_-" for c in value):
-            raise ValueError(f"Study name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
-        return value
+        return _validate_safe_name("Study", value)
 
 
 class Suite(_Frozen):
@@ -940,9 +939,7 @@ class Suite(_Frozen):
     @classmethod
     def _suite_name_is_safe(cls, value: str) -> str:
         """Suite names are used as output path and experiment-name prefixes."""
-        if not value or not all(c.isalnum() or c in "_-" for c in value):
-            raise ValueError(f"Suite name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
-        return value
+        return _validate_safe_name("Suite", value)
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:
@@ -1109,31 +1106,10 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             ) from exc
 
     if sampler_type == "grid":
-        cardinality = 1
-        for name, param in space.items():
-            if isinstance(param, FloatParam):
-                if param.log:
-                    raise ValueError(
-                        f"Phase {phase.name!r}: grid sampler does not support "
-                        f"log-scale float param {name!r}."
-                    )
-                if param.step is None:
-                    raise ValueError(
-                        f"Phase {phase.name!r}: grid sampler requires 'step' "
-                        f"for float param {name!r}."
-                    )
-                _validate_float_grid_divides(phase.name, name, param)
-                assert param.step is not None
-                cardinality *= int(round((param.high - param.low) / param.step)) + 1
-            elif isinstance(param, IntParam) and param.log:
-                raise ValueError(
-                    f"Phase {phase.name!r}: grid sampler does not support "
-                    f"log-scale int param {name!r}."
-                )
-            elif isinstance(param, IntParam):
-                cardinality *= ((param.high - param.low) // param.step) + 1
-            elif isinstance(param, CategoricalParam):
-                cardinality *= len(param.choices)
+        cardinality = math.prod(
+            len(values)
+            for values in grid_search_space(phase.search_space, phase_name=phase.name).values()
+        )
         if not phase.allow_partial_grid and phase.n_trials < cardinality:
             raise ValueError(
                 f"Phase {phase.name!r}: grid sampler has {cardinality} combinations "
@@ -1169,6 +1145,41 @@ def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatP
             f"Got low={param.low}, high={param.high}, step={param.step} "
             f"(ratio={ratio}). Pick a step that evenly divides the interval."
         )
+
+
+def grid_search_space(
+    search_space: dict[str, SearchParam],
+    *,
+    phase_name: str = "<direct>",
+) -> dict[str, list[Any]]:
+    """Build Optuna ``GridSampler`` values and validate grid-only constraints."""
+    grid: dict[str, list[Any]] = {}
+    for name, param in search_space.items():
+        if isinstance(param, CategoricalParam):
+            grid[name] = list(param.choices)
+        elif isinstance(param, IntParam):
+            if param.log:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler does not support "
+                    f"log-scale int param {name!r}."
+                )
+            grid[name] = list(range(param.low, param.high + 1, param.step))
+        elif isinstance(param, FloatParam):
+            if param.log:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler does not support "
+                    f"log-scale float param {name!r}."
+                )
+            if param.step is None:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
+                )
+            _validate_float_grid_divides(phase_name, name, param)
+            n_steps = int(round((param.high - param.low) / param.step))
+            grid[name] = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
+        else:  # pragma: no cover
+            raise ValueError(f"Unhandled param type for grid: {param!r}")
+    return grid
 
 
 def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
@@ -1313,78 +1324,70 @@ def _validate_trial_command_template(
 
     has_overrides = bool(overrides)
 
-    placeholder_dir = Path(tempfile.mkdtemp(prefix="phasesweep_validate_"))
+    placeholder_dir = Path("__phasesweep_validate_trial_dir__")
+    # Parse the template once so we can both (a) preflight-render below and
+    # (b) check that the documented placeholders are actually referenced.
+    # Both arms surface the same "failed to render" wrapping for unbalanced
+    # braces so the user sees one consistent error message regardless of
+    # which check happens to detect the problem first.
     try:
-        # Parse the template once so we can both (a) preflight-render below and
-        # (b) check that the documented placeholders are actually referenced.
-        # Both arms surface the same "failed to render" wrapping for unbalanced
-        # braces so the user sees one consistent error message regardless of
-        # which check happens to detect the problem first.
-        try:
-            fields = _format_field_names(experiment.trial_command)
-        except (ValueError, IndexError) as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: trial_command failed to render — "
-                f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
-            ) from exc
+        fields = _format_field_names(experiment.trial_command)
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"Phase {phase.name!r}: trial_command failed to render — "
+            f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
+        ) from exc
 
-        try:
-            rendered = render_command(
-                experiment.trial_command,
-                overrides,
-                experiment.override_format,
-                trial_dir=placeholder_dir,
-                trial_id=0,
-                phase=phase.name,
-                run_name=f"{experiment.experiment}-{phase.name}-validate",
-            )
-        except KeyError as exc:
-            # str.format raises KeyError(name) for unknown placeholders.
-            bad = exc.args[0] if exc.args else "<unknown>"
-            raise ValueError(
-                f"Phase {phase.name!r}: trial_command references unknown placeholder "
-                f"{{{bad}}}. Supported: {{overrides}}, {{overrides_path}} (json_file "
-                f"only), {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
-            ) from exc
-        except (ValueError, IndexError) as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: trial_command failed to render — "
-                f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
-            ) from exc
+    try:
+        render_command(
+            experiment.trial_command,
+            overrides,
+            experiment.override_format,
+            trial_dir=placeholder_dir,
+            trial_id=0,
+            phase=phase.name,
+            run_name=f"{experiment.experiment}-{phase.name}-validate",
+            write_files=False,
+        )
+    except KeyError as exc:
+        # str.format raises KeyError(name) for unknown placeholders.
+        bad = exc.args[0] if exc.args else "<unknown>"
+        raise ValueError(
+            f"Phase {phase.name!r}: trial_command references unknown placeholder "
+            f"{{{bad}}}. Supported: {{overrides}}, {{overrides_path}} (json_file "
+            f"only), {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
+        ) from exc
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"Phase {phase.name!r}: trial_command failed to render — "
+            f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
+        ) from exc
 
-        # When a phase has no overrides at all (no inherited, fixed, or sampled
-        # keys), a constant trial_command is legitimate — the user is sweeping
-        # the same configuration repeatedly, e.g. for variance estimation.
-        if not has_overrides:
-            return
+    # When a phase has no overrides at all (no inherited, fixed, or sampled
+    # keys), a constant trial_command is legitimate — the user is sweeping
+    # the same configuration repeatedly, e.g. for variance estimation.
+    if not has_overrides:
+        return
 
-        if experiment.override_format == "json_file" and "overrides_path" not in fields:
-            raise ValueError(
-                f"override_format='json_file' but phase {phase.name!r} has "
-                "inherited, fixed, or sampled overrides and trial_command "
-                "does not reference {overrides_path}. The trainer would "
-                "never see the override JSON. Either add {overrides_path} "
-                "to trial_command, or switch to override_format='hydra' / "
-                "'argparse' (which use the {overrides} placeholder)."
-            )
-        if experiment.override_format in ("hydra", "argparse") and "overrides" not in fields:
-            raise ValueError(
-                f"override_format={experiment.override_format!r} but phase "
-                f"{phase.name!r} has inherited, fixed, or sampled overrides "
-                "and trial_command does not reference {overrides}. All "
-                "sampled parameters would be ignored — the trainer would "
-                "run with the same hard-coded configuration every trial. "
-                f"Add {{overrides}} to trial_command, or switch to "
-                "override_format='json_file' (which uses {overrides_path})."
-            )
-
-        del rendered  # preflight-only; we just wanted to know it didn't blow up
-    finally:
-        # json_file mode wrote an overrides.json; clean it up.
-        with contextlib.suppress(OSError):
-            for child in placeholder_dir.iterdir():
-                child.unlink()
-            placeholder_dir.rmdir()
+    if experiment.override_format == "json_file" and "overrides_path" not in fields:
+        raise ValueError(
+            f"override_format='json_file' but phase {phase.name!r} has "
+            "inherited, fixed, or sampled overrides and trial_command "
+            "does not reference {overrides_path}. The trainer would "
+            "never see the override JSON. Either add {overrides_path} "
+            "to trial_command, or switch to override_format='hydra' / "
+            "'argparse' (which use the {overrides} placeholder)."
+        )
+    if experiment.override_format in ("hydra", "argparse") and "overrides" not in fields:
+        raise ValueError(
+            f"override_format={experiment.override_format!r} but phase "
+            f"{phase.name!r} has inherited, fixed, or sampled overrides "
+            "and trial_command does not reference {overrides}. All "
+            "sampled parameters would be ignored — the trainer would "
+            "run with the same hard-coded configuration every trial. "
+            f"Add {{overrides}} to trial_command, or switch to "
+            "override_format='json_file' (which uses {overrides_path})."
+        )
 
 
 class _StrictMappingLoader(yaml.SafeLoader):

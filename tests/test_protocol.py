@@ -19,10 +19,9 @@ from phasesweep.config import (
     RequiredFileGate,
     Suite,
 )
-from phasesweep.extractors import TrialContext
 from phasesweep.gates import evaluate_gates
 from phasesweep.orchestrator import run_experiment
-from tests.conftest import make_experiment, write_trainer, write_yaml
+from tests.conftest import make_experiment, make_trial_context, write_trainer, write_yaml
 
 
 def _write_score_trainer(tmp_path: Path) -> Path:
@@ -266,15 +265,7 @@ def test_artifact_size_gate_supports_file_directory_and_json_estimate(tmp_path: 
     (artifact_dir / "a.bin").write_bytes(b"abc")
     (nested / "b.bin").write_bytes(b"defg")
     (tmp_path / "result.json").write_text('{"artifact_estimate_bytes": 7}')
-    ctx = TrialContext(
-        experiment="e",
-        phase="p",
-        trial_id=0,
-        trial_dir=tmp_path,
-        run_name="e-p-0",
-        return_code=0,
-        duration_seconds=0.1,
-    )
+    ctx = make_trial_context(tmp_path, experiment="e")
 
     results = evaluate_gates(
         ctx,
@@ -308,15 +299,7 @@ def test_artifact_size_gate_supports_file_directory_and_json_estimate(tmp_path: 
 
 def test_artifact_size_gate_reports_bad_sources(tmp_path: Path) -> None:
     (tmp_path / "result.json").write_text('{"artifact_estimate_bytes": "7"}')
-    ctx = TrialContext(
-        experiment="e",
-        phase="p",
-        trial_id=0,
-        trial_dir=tmp_path,
-        run_name="e-p-0",
-        return_code=0,
-        duration_seconds=0.1,
-    )
+    ctx = make_trial_context(tmp_path, experiment="e")
 
     results = evaluate_gates(
         ctx,

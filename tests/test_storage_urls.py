@@ -191,20 +191,6 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
         make_experiment(workdir=tmp_path / "runs", storage=storage, n_jobs=2)
 
 
-def test_sqlite_driver_and_plain_collide_on_lock_identity(tmp_path: Path) -> None:
-    """Two URLs pointing at the same SQLite file must share one lock identity."""
-    plain = f"sqlite:///{tmp_path / 'x.db'}"
-    driver = f"sqlite+pysqlite:///{tmp_path / 'x.db'}"
-
-    plain_id = canonical_storage_identity(plain)
-    driver_id = canonical_storage_identity(driver)
-
-    assert plain_id is not None
-    assert plain_id == driver_id
-    # Spelling consistency: dialect is folded to the canonical ``sqlite:///``.
-    assert plain_id.startswith("sqlite:///")
-
-
 def test_canonical_storage_identity_rdb_passes_through() -> None:
     """RDB URLs are not rewritten — same-host advisory lock has no business
     second-guessing a remote DB URL."""
@@ -232,14 +218,19 @@ def test_file_url_path_preserves_absolute_paths(url: str, expected_path: str) ->
     assert _file_url_path(url) == expected_path
 
 
-def test_absolute_sqlite_identity_is_not_cwd_relative(
+@pytest.mark.parametrize(
+    ("scheme", "filename"),
+    [("sqlite", "phases.db"), ("journal", "study.journal")],
+)
+def test_absolute_file_storage_identity_is_not_cwd_relative(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scheme: str,
+    filename: str,
 ) -> None:
-    """The canonical identity of an absolute SQLite URL must be the same
-    regardless of the caller's working directory."""
-    db = tmp_path / "phases.db"
-    url = f"sqlite:///{db}"
+    """Absolute file-storage identities must not depend on caller cwd."""
+    path = tmp_path / filename
+    url = f"{scheme}:///{path}"
 
     cwd_a = tmp_path / "cwd_a"
     cwd_b = tmp_path / "cwd_b"
@@ -252,31 +243,7 @@ def test_absolute_sqlite_identity_is_not_cwd_relative(
     monkeypatch.chdir(cwd_b)
     identity_b = canonical_storage_identity(url)
 
-    expected = "sqlite:///" + str(db.resolve())
-    assert identity_a == expected
-    assert identity_b == expected
-
-
-def test_absolute_journal_identity_is_not_cwd_relative(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same as the SQLite test, but for ``journal:///`` URLs."""
-    journal = tmp_path / "study.journal"
-    url = f"journal:///{journal}"
-
-    cwd_a = tmp_path / "cwd_a"
-    cwd_b = tmp_path / "cwd_b"
-    cwd_a.mkdir()
-    cwd_b.mkdir()
-
-    monkeypatch.chdir(cwd_a)
-    identity_a = canonical_storage_identity(url)
-
-    monkeypatch.chdir(cwd_b)
-    identity_b = canonical_storage_identity(url)
-
-    expected = "journal:///" + str(journal.resolve())
+    expected = f"{scheme}:///" + str(path.resolve())
     assert identity_a == expected
     assert identity_b == expected
 
@@ -286,4 +253,7 @@ def test_plain_and_driver_sqlite_absolute_urls_collide(tmp_path: Path) -> None:
     db = tmp_path / "phases.db"
     plain = f"sqlite:///{db}"
     driver = f"sqlite+pysqlite:///{db}"
-    assert canonical_storage_identity(plain) == canonical_storage_identity(driver)
+    identity = canonical_storage_identity(plain)
+    assert identity is not None
+    assert identity.startswith("sqlite:///")
+    assert identity == canonical_storage_identity(driver)
