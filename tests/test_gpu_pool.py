@@ -1,4 +1,4 @@
-"""GPU pool: explicit-id resolution, autodetection, parallel-no-GPU rejection, allow_no_gpu_isolation opt-in."""
+"""GPU pool: explicit IDs, autodetection, host locks, and no-GPU policy."""
 
 from __future__ import annotations
 
@@ -47,6 +47,48 @@ def test_explicit_gpu_ids_honored_for_single_job():
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
     with pool.acquire() as gid:
         assert gid == 3
+
+
+def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
+    """Single-job GPU work still takes a host-wide lease when a GPU is visible."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [3, 4])
+
+    pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid == 3
+
+
+def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
+    """CPU-only single-job work does not need an explicit no-GPU opt-in."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [])
+
+    pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid is None
+
+
+def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+
+    pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid == 2
+
+
+def test_nonnumeric_cuda_visible_devices_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-deadbeef")
+
+    with pytest.raises(RuntimeError, match="non-numeric device identifiers"):
+        GpuPool.create(n_jobs=1)
+
+    pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
+    with pool.acquire() as gid:
+        assert gid is None
 
 
 def test_empty_explicit_gpu_ids_raises():

@@ -148,16 +148,22 @@ class JsonScalarBoundGate(_Frozen):
 
 
 class ArtifactSizeGate(_Frozen):
-    """Require an artifact file size to fall inside optional byte bounds."""
+    """Require artifact bytes to fall inside optional bounds."""
 
     type: Literal["artifact_size"]
+    source: Literal["file", "directory", "json"]
     path: str
+    key: str | None = None
     min_bytes: int | None = Field(default=None, ge=0)
     max_bytes: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _validate_bounds(self) -> ArtifactSizeGate:
-        """Reject empty bounds and ``min_bytes > max_bytes``."""
+    def _validate_source_and_bounds(self) -> ArtifactSizeGate:
+        """Reject ambiguous source specs and invalid byte bounds."""
+        if self.source == "json" and self.key is None:
+            raise ValueError("artifact_size gate with source=json must define key.")
+        if self.source != "json" and self.key is not None:
+            raise ValueError("artifact_size gate key is only valid with source=json.")
         if self.min_bytes is None and self.max_bytes is None:
             raise ValueError("artifact_size gate must define min_bytes and/or max_bytes.")
         if (
@@ -445,8 +451,8 @@ class Phase(_Frozen):
         default=None,
         description=(
             "Explicit list of CUDA device indices to partition across parallel trials. "
-            "When None and n_jobs > 1, phasesweep auto-detects via CUDA_VISIBLE_DEVICES "
-            "or nvidia-smi."
+            "When None, phasesweep auto-detects numeric CUDA_VISIBLE_DEVICES or "
+            "nvidia-smi output, including for n_jobs == 1."
         ),
     )
 
@@ -486,9 +492,9 @@ class Phase(_Frozen):
     allow_no_gpu_isolation: bool = Field(
         default=False,
         description=(
-            "When n_jobs > 1 and no GPUs are detected, phasesweep fails by default "
-            "to prevent parallel trials from stampeding the same device. Set True "
-            "for intentional CPU-only parallel sweeps."
+            "When GPU isolation cannot be established, phasesweep fails by default "
+            "for parallel sweeps and non-numeric CUDA_VISIBLE_DEVICES. Set True for "
+            "intentional CPU-only or externally-isolated runs."
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
@@ -501,6 +507,14 @@ class Phase(_Frozen):
         ),
     )
     timeout_seconds_per_phase: float | None = Field(default=None, ge=0)
+    allow_incomplete_on_timeout: bool = Field(
+        default=False,
+        description=(
+            "By default, phase/run wallclock timeouts fail closed before winner "
+            "selection if fewer than n_trials finished. Set true to allow a "
+            "partial phase winner and persist completion metadata."
+        ),
+    )
     allow_partial_grid: bool = Field(
         default=False,
         description=(

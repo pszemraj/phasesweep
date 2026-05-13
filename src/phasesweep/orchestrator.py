@@ -79,6 +79,8 @@ class Winner:
     metric: float
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
+    completion: dict[str, Any] = field(default_factory=dict)
+    promotion: dict[str, Any] | None = None
     phase_fingerprint: str | None = None
 
 
@@ -233,6 +235,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "comment",
         "allow_unbounded_trials",
         "timeout_seconds_per_phase",
+        "allow_incomplete_on_timeout",
         "allow_partial_grid",
         "allow_seed_search",
     }
@@ -531,7 +534,13 @@ def _gates_pass(gates: list[dict[str, Any]]) -> bool:
     return all(bool(gate.get("passed")) for gate in gates)
 
 
-def _clone_winner_from_baseline(baseline: Winner, *, phase_fingerprint: str | None) -> Winner:
+def _clone_winner_from_baseline(
+    baseline: Winner,
+    *,
+    phase_fingerprint: str | None,
+    completion: dict[str, Any] | None = None,
+    promotion: dict[str, Any] | None = None,
+) -> Winner:
     """Clone a baseline winner for exposure under another phase/study."""
     return Winner(
         trial_number=baseline.trial_number,
@@ -540,6 +549,8 @@ def _clone_winner_from_baseline(baseline: Winner, *, phase_fingerprint: str | No
         metric=baseline.metric,
         constraints=dict(baseline.constraints),
         gates=list(baseline.gates),
+        completion=dict(completion or baseline.completion),
+        promotion=promotion,
         phase_fingerprint=phase_fingerprint,
     )
 
@@ -553,7 +564,7 @@ def _metric_improvement(goal: str, candidate: Winner, baseline: Winner) -> float
 
 def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     """Return the compact winner payload used in run summaries."""
-    return {
+    payload = {
         "name": name,
         "trial_number": winner.trial_number,
         "metric": winner.metric,
@@ -561,7 +572,11 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
         "effective_overrides": winner.effective_overrides,
         "constraints": winner.constraints,
         "gates": winner.gates,
+        "completion": winner.completion,
     }
+    if winner.promotion is not None:
+        payload["promotion"] = winner.promotion
+    return payload
 
 
 def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
@@ -743,9 +758,28 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         "effective_overrides": winner.effective_overrides,
         "constraints": winner.constraints,
         "gates": winner.gates,
+        "completion": winner.completion,
         "phase_fingerprint": winner.phase_fingerprint,
     }
+    if winner.promotion is not None:
+        payload["promotion"] = winner.promotion
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+
+def _promotion_decision_path(experiment: Experiment, phase_name: str) -> Path:
+    """Path to the persisted phase promotion decision."""
+    return _phase_dir(experiment, phase_name) / "promotion.yaml"
+
+
+def _save_promotion_decision(
+    experiment: Experiment,
+    phase_name: str,
+    decision: dict[str, Any],
+) -> None:
+    """Persist a phase promotion decision independently of exposed winner state."""
+    path = _promotion_decision_path(experiment, phase_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(decision, sort_keys=False))
 
 
 def _load_winner(
@@ -809,10 +843,12 @@ def _load_winner(
     return Winner(
         trial_number=int(data["trial_number"]),
         params=dict(data["params"]),
-        effective_overrides=dict(data.get("effective_overrides") or data["params"]),
+        effective_overrides=dict(data["effective_overrides"]),
         metric=float(data["metric"][experiment.metric.name]),
         constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
         gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
+        completion=dict(data["completion"]),
+        promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
         phase_fingerprint=str(stored_fp),
     )
 
@@ -838,33 +874,77 @@ def _apply_promotion(
     phase: Phase,
     candidate: Winner,
     winners: dict[str, Winner],
-) -> Winner | None:
-    """Apply a phase promotion rule, returning the winner to expose downstream."""
+) -> tuple[Winner | None, dict[str, Any] | None]:
+    """Apply a phase promotion rule and return the exposed winner plus audit payload."""
     promotion = phase.promotion
     if promotion is None:
-        return candidate
+        return candidate, None
     if promotion.min_delta_vs not in winners:
         raise RuntimeError(
             f"Phase {phase.name!r} promotion references unknown baseline "
             f"{promotion.min_delta_vs!r}."
         )
-    if promotion.requires_gates and not _gates_pass(candidate.gates):
-        message = f"Phase {phase.name!r} failed promotion: required evidence gates did not pass."
-        if promotion.on_fail == "stop":
-            raise RuntimeError(message)
-        if promotion.on_fail == "skip":
-            log.warning("%s Skipping remaining dependent phases.", message)
-            return None
-        log.warning("%s Continuing with baseline winner.", message)
-        return _clone_winner_from_baseline(
-            winners[promotion.min_delta_vs],
-            phase_fingerprint=candidate.phase_fingerprint,
-        )
 
     baseline = winners[promotion.min_delta_vs]
-    improvement = _metric_improvement(experiment.metric.goal, candidate, baseline)
-    passed = improvement >= promotion.min_delta
-    if passed:
+    gates_passed = _gates_pass(candidate.gates)
+    if promotion.requires_gates and not gates_passed:
+        improvement = None
+        promoted = False
+        reason = "gates_failed"
+        message = f"Phase {phase.name!r} failed promotion: required evidence gates did not pass."
+    else:
+        improvement = _metric_improvement(experiment.metric.goal, candidate, baseline)
+        promoted = improvement >= promotion.min_delta
+        reason = "promoted" if promoted else "insufficient_delta"
+        message = (
+            ""
+            if promoted
+            else f"Phase {phase.name!r} failed promotion: improvement {improvement:g} "
+            f"vs {promotion.min_delta_vs!r} is below min_delta {promotion.min_delta:g}."
+        )
+
+    action = (
+        "promote"
+        if promoted
+        else "continue_baseline"
+        if promotion.on_fail == "continue_baseline"
+        else promotion.on_fail
+    )
+    exposed_trial_number = (
+        candidate.trial_number
+        if action == "promote"
+        else baseline.trial_number
+        if action == "continue_baseline"
+        else None
+    )
+    exposed_source = (
+        "candidate"
+        if action == "promote"
+        else "baseline"
+        if action == "continue_baseline"
+        else None
+    )
+    decision: dict[str, Any] = {
+        "phase": phase.name,
+        "baseline": promotion.min_delta_vs,
+        "candidate_trial_number": candidate.trial_number,
+        "exposed_trial_number": exposed_trial_number,
+        "exposed_source": exposed_source,
+        "candidate_metric": candidate.metric,
+        "baseline_metric": baseline.metric,
+        "min_delta": promotion.min_delta,
+        "improvement": improvement,
+        "requires_gates": promotion.requires_gates,
+        "gates_passed": gates_passed,
+        "promoted": promoted,
+        "on_fail": promotion.on_fail,
+        "action": action,
+        "reason": reason,
+    }
+    if message:
+        decision["message"] = message
+
+    if promoted:
         log.info(
             "phase=%s PROMOTED improvement=%g baseline=%s min_delta=%g",
             phase.name,
@@ -872,20 +952,25 @@ def _apply_promotion(
             promotion.min_delta_vs,
             promotion.min_delta,
         )
-        return candidate
+        candidate.promotion = decision
+        return candidate, decision
 
-    message = (
-        f"Phase {phase.name!r} failed promotion: improvement {improvement:g} "
-        f"vs {promotion.min_delta_vs!r} is below min_delta {promotion.min_delta:g}."
-    )
     if promotion.on_fail == "stop":
-        raise RuntimeError(message)
+        return None, decision
     if promotion.on_fail == "skip":
         log.warning("%s Skipping remaining dependent phases.", message)
-        return None
+        return None, decision
 
     log.warning("%s Continuing with baseline winner.", message)
-    return _clone_winner_from_baseline(baseline, phase_fingerprint=candidate.phase_fingerprint)
+    return (
+        _clone_winner_from_baseline(
+            baseline,
+            phase_fingerprint=candidate.phase_fingerprint,
+            completion=candidate.completion,
+            promotion=decision,
+        ),
+        decision,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -1484,10 +1569,16 @@ def _run_phase_inner(
         with contextlib.suppress(Exception):
             _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
+    timeout_source: str | None = None
+    optimize_deadline: float | None = None
     if remaining > 0:
         optimize_timeout = phase.timeout_seconds_per_phase
+        if optimize_timeout is not None:
+            timeout_source = "phase"
         if run_deadline is not None:
             remaining_run_seconds = max(0.0, run_deadline - time.monotonic())
+            if optimize_timeout is None or remaining_run_seconds <= optimize_timeout:
+                timeout_source = "run"
             optimize_timeout = (
                 remaining_run_seconds
                 if optimize_timeout is None
@@ -1497,6 +1588,8 @@ def _run_phase_inner(
             raise TimeoutError(
                 f"Run wallclock deadline reached before phase {phase.name!r} could launch."
             )
+        if optimize_timeout is not None:
+            optimize_deadline = time.monotonic() + optimize_timeout
         try:
             study.optimize(
                 objective,
@@ -1534,6 +1627,27 @@ def _run_phase_inner(
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
 
+    finished_after = sum(1 for t in study.get_trials(deepcopy=False) if t.state.is_finished())
+    timed_out_incomplete = (
+        optimize_deadline is not None
+        and time.monotonic() >= optimize_deadline
+        and finished_after < phase.n_trials
+    )
+    if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
+        raise TimeoutError(
+            f"Phase {phase.name!r} timed out via {timeout_source or 'wallclock'} guard "
+            f"after {finished_after}/{phase.n_trials} trials finished. Refusing to "
+            "select a winner from an incomplete phase; set allow_incomplete_on_timeout: "
+            "true only when a partial decision is intentional."
+        )
+    completion = {
+        "requested_trials": phase.n_trials,
+        "finished_trials": finished_after,
+        "incomplete": timed_out_incomplete,
+        "reason": "timeout" if timed_out_incomplete else None,
+        "timeout_scope": timeout_source if timed_out_incomplete else None,
+    }
+
     # Build winner with effective_overrides (#9). Stamp it with the phase
     # fingerprint so a later --from-phase resume can detect stale parent
     # config (review v0.5.6 / blocker 3). The fingerprint is the same one
@@ -1549,6 +1663,7 @@ def _run_phase_inner(
         metric=selected.metric,
         constraints=selected.constraints,
         gates=gate_payload,
+        completion=completion,
         phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
     )
     return winner
@@ -1647,6 +1762,13 @@ def _placeholder_winner(
         metric=float("nan"),
         constraints={},
         gates=[],
+        completion={
+            "requested_trials": phase.n_trials,
+            "finished_trials": 0,
+            "incomplete": True,
+            "reason": "dry_run",
+            "timeout_scope": None,
+        },
     )
 
 
@@ -1736,6 +1858,7 @@ def _run_experiment_inner(
     """
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
+    promotion_decisions: dict[str, dict[str, Any]] = {}
     run_deadline = (
         None
         if dry_run or experiment.timeout_seconds_per_run is None
@@ -1775,10 +1898,15 @@ def _run_experiment_inner(
             run_deadline=run_deadline,
         )
         if not dry_run:
-            promoted = _apply_promotion(experiment, phase, winner, winners)
+            promoted, promotion_decision = _apply_promotion(experiment, phase, winner, winners)
+            if promotion_decision is not None:
+                promotion_decisions[phase.name] = promotion_decision
+                _save_promotion_decision(experiment, phase.name, promotion_decision)
             if promoted is None:
                 with contextlib.suppress(FileNotFoundError):
                     _winner_path(experiment, phase.name).unlink()
+                if promotion_decision is not None and promotion_decision["action"] == "stop":
+                    raise RuntimeError(str(promotion_decision["message"]))
                 break
             winner = promoted
             _save_winner(experiment, phase.name, winner)
@@ -1800,6 +1928,7 @@ def _run_experiment_inner(
     summary = {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
+        "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
     }
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))

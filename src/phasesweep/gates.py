@@ -67,14 +67,33 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
 
 def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     path = ctx.trial_dir / gate.path
-    if not path.is_file():
-        return GateResult(gate.type, False, f"{gate.path} is missing")
-    size = path.stat().st_size
+    if gate.source == "file":
+        if not path.is_file():
+            return GateResult(gate.type, False, f"{gate.path} is not a file")
+        size = path.stat().st_size
+        label = f"{gate.path} file size"
+    elif gate.source == "directory":
+        if not path.is_dir():
+            return GateResult(gate.type, False, f"{gate.path} is not a directory")
+        size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        label = f"{gate.path} directory size"
+    else:
+        assert gate.key is not None
+        try:
+            raw_size = json_path(load_json_file(path), gate.key)
+        except Exception as exc:  # noqa: BLE001
+            return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+        if not isinstance(raw_size, int) or isinstance(raw_size, bool):
+            return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
+        if raw_size < 0:
+            return GateResult(gate.type, False, f"{gate.key} was negative: {raw_size}")
+        size = raw_size
+        label = f"{gate.path}:{gate.key}"
     if gate.min_bytes is not None and size < gate.min_bytes:
-        return GateResult(gate.type, False, f"{gate.path} size {size} < {gate.min_bytes}")
+        return GateResult(gate.type, False, f"{label} {size} < {gate.min_bytes}")
     if gate.max_bytes is not None and size > gate.max_bytes:
-        return GateResult(gate.type, False, f"{gate.path} size {size} > {gate.max_bytes}")
-    return GateResult(gate.type, True, f"{gate.path} size {size} within bounds")
+        return GateResult(gate.type, False, f"{label} {size} > {gate.max_bytes}")
+    return GateResult(gate.type, True, f"{label} {size} within bounds")
 
 
 def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:

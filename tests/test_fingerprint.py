@@ -189,10 +189,14 @@ def test_fingerprint_unchanged_when_n_trials_increased() -> None:
     )
 
 
-def test_fingerprint_unchanged_when_n_jobs_or_gpu_ids_change() -> None:
-    """Throughput knobs (n_jobs / gpu_ids) must not invalidate the study."""
+def test_fingerprint_unchanged_when_run_control_changes() -> None:
+    """Throughput and timeout-acceptance knobs must not invalidate the study."""
     a = make_experiment(n_jobs=1)
-    b = make_experiment(n_jobs=4, allow_no_gpu_isolation=True)
+    b = make_experiment(
+        n_jobs=4,
+        allow_no_gpu_isolation=True,
+        allow_incomplete_on_timeout=True,
+    )
     fp_a = _phase_fingerprint(a, a.phases[0], {})
     fp_b = _phase_fingerprint(b, b.phases[0], {})
     assert fp_a == fp_b

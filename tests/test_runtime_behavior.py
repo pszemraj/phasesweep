@@ -10,6 +10,7 @@ import optuna
 import pytest
 
 from phasesweep import load_experiment, run_experiment
+from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
 from phasesweep.selector import NoFeasibleTrialError
 from tests.conftest import REPO, write_trainer, write_yaml
 
@@ -338,3 +339,102 @@ phases:
     n = conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
     conn.close()
     assert n < 30, f"expected early abort, got {n} trials"
+
+
+def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
+    """A phase wallclock timeout must not bless the best partial trial by default."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(0.15)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                timeout_seconds_per_phase=0.05,
+                search_space={},
+            )
+        ],
+    )
+
+    with pytest.raises(TimeoutError, match="1/3 trials finished"):
+        run_experiment(exp)
+
+
+def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(0.15)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout_allowed",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                timeout_seconds_per_phase=0.05,
+                allow_incomplete_on_timeout=True,
+                search_space={},
+            )
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].completion == {
+        "requested_trials": 3,
+        "finished_trials": 1,
+        "incomplete": True,
+        "reason": "timeout",
+        "timeout_scope": "phase",
+    }
+
+
+def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(0.15)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        """,
+    )
+    exp = Experiment(
+        experiment="run_timeout",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        timeout_seconds_per_run=0.05,
+        phases=[Phase(name="p", n_trials=3, search_space={})],
+    )
+
+    with pytest.raises(TimeoutError, match="run guard"):
+        run_experiment(exp)

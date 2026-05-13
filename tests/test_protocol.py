@@ -9,6 +9,7 @@ import yaml
 
 from phasesweep import load_config, run_config
 from phasesweep.config import (
+    ArtifactSizeGate,
     Contract,
     Experiment,
     IntParam,
@@ -18,6 +19,8 @@ from phasesweep.config import (
     RequiredFileGate,
     Suite,
 )
+from phasesweep.extractors import TrialContext
+from phasesweep.gates import evaluate_gates
 from phasesweep.orchestrator import run_experiment
 from tests.conftest import make_experiment, write_trainer, write_yaml
 
@@ -114,6 +117,19 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     stored = yaml.safe_load((tmp_path / "runs" / "t" / "candidate" / "winner.yaml").read_text())
     assert stored["metric"]["objective"] == pytest.approx(winners["baseline"].metric)
     assert stored["effective_overrides"] == winners["baseline"].effective_overrides
+    assert stored["promotion"]["action"] == "continue_baseline"
+
+    decision = yaml.safe_load(
+        (tmp_path / "runs" / "t" / "candidate" / "promotion.yaml").read_text()
+    )
+    assert decision["promoted"] is False
+    assert decision["candidate_metric"] == pytest.approx(0.95)
+    assert decision["baseline_metric"] == pytest.approx(1.0)
+    assert decision["action"] == "continue_baseline"
+    assert decision["exposed_source"] == "baseline"
+    summary = yaml.safe_load((tmp_path / "runs" / "t" / "summary.yaml").read_text())
+    assert summary["promotion_decisions"][0]["action"] == "continue_baseline"
+    assert summary["phases"][1]["promotion"]["action"] == "continue_baseline"
 
 
 def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
@@ -239,3 +255,84 @@ def test_contract_keys_cannot_be_resampled() -> None:
                 )
             ],
         )
+
+
+def test_artifact_size_gate_supports_file_directory_and_json_estimate(tmp_path: Path) -> None:
+    """Artifact byte gates cover materialized artifacts and trainer-reported estimates."""
+    (tmp_path / "model.bin").write_bytes(b"abcd")
+    artifact_dir = tmp_path / "bundle"
+    nested = artifact_dir / "nested"
+    nested.mkdir(parents=True)
+    (artifact_dir / "a.bin").write_bytes(b"abc")
+    (nested / "b.bin").write_bytes(b"defg")
+    (tmp_path / "result.json").write_text('{"artifact_estimate_bytes": 7}')
+    ctx = TrialContext(
+        experiment="e",
+        phase="p",
+        trial_id=0,
+        trial_dir=tmp_path,
+        run_name="e-p-0",
+        return_code=0,
+        duration_seconds=0.1,
+    )
+
+    results = evaluate_gates(
+        ctx,
+        [
+            ArtifactSizeGate(
+                type="artifact_size",
+                source="file",
+                path="model.bin",
+                min_bytes=4,
+                max_bytes=4,
+            ),
+            ArtifactSizeGate(
+                type="artifact_size",
+                source="directory",
+                path="bundle",
+                min_bytes=7,
+                max_bytes=7,
+            ),
+            ArtifactSizeGate(
+                type="artifact_size",
+                source="json",
+                path="result.json",
+                key="artifact_estimate_bytes",
+                max_bytes=7,
+            ),
+        ],
+    )
+
+    assert [result.passed for result in results] == [True, True, True]
+
+
+def test_artifact_size_gate_reports_bad_sources(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text('{"artifact_estimate_bytes": "7"}')
+    ctx = TrialContext(
+        experiment="e",
+        phase="p",
+        trial_id=0,
+        trial_dir=tmp_path,
+        run_name="e-p-0",
+        return_code=0,
+        duration_seconds=0.1,
+    )
+
+    results = evaluate_gates(
+        ctx,
+        [
+            ArtifactSizeGate(type="artifact_size", source="file", path="missing.bin", max_bytes=1),
+            ArtifactSizeGate(
+                type="artifact_size",
+                source="json",
+                path="result.json",
+                key="artifact_estimate_bytes",
+                max_bytes=10,
+            ),
+        ],
+    )
+
+    assert results[0].passed is False
+    assert "not a file" in results[0].detail
+    assert results[1].passed is False
+    assert "not an integer" in results[1].detail

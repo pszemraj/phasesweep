@@ -1,10 +1,8 @@
 """GPU pool: hands out GPU indices to parallel trials, prevents double-booking.
 
-When n_jobs > 1, every trial subprocess would otherwise see the full GPU list and
-race for cuda:0. This pool assigns disjoint CUDA_VISIBLE_DEVICES per trial.
-
-If no GPUs are detected (cpu-only box), or n_jobs=1 with no explicit GPU list,
-this is a transparent no-op.
+Every trial subprocess gets at most one visible CUDA device when phasesweep can
+resolve numeric device IDs. If no GPUs are visible, single-job CPU work remains
+a transparent no-op; parallel CPU work requires an explicit opt-in.
 """
 
 from __future__ import annotations
@@ -131,11 +129,11 @@ class GpuPool:
 
         Args:
             n_jobs: number of parallel trials.
-            explicit_ids: GPU indices from YAML config. If None, auto-detect when n_jobs>1.
-                Explicit IDs are honored even for n_jobs==1 — single-job phases on shared
-                hardware still need device isolation (review item #1).
-            allow_no_gpu: if True, n_jobs > 1 with no GPUs is allowed (CPU-only sweep).
-                If False (default), that combination raises RuntimeError.
+            explicit_ids: GPU indices from YAML config. If ``None``, auto-detect
+                numeric visible devices even for ``n_jobs == 1`` so independent
+                single-job phasesweep processes do not double-book cuda:0.
+            allow_no_gpu: if ``True``, run without CUDA isolation when no numeric
+                GPU IDs can be resolved. Parallel CPU-only sweeps need this opt-in.
 
         Returns:
             A configured :class:`GpuPool`. The pool is "active" (hands out
@@ -143,12 +141,12 @@ class GpuPool:
 
         Raises:
             RuntimeError: ``explicit_ids`` was provided but empty; or
-                ``CUDA_VISIBLE_DEVICES`` is set to non-numeric IDs and ``n_jobs > 1``;
-                or no GPUs are visible and ``n_jobs > 1`` without ``allow_no_gpu``.
+                ``CUDA_VISIBLE_DEVICES`` is set to non-numeric IDs without
+                ``allow_no_gpu``; or no GPUs are visible and ``n_jobs > 1``
+                without ``allow_no_gpu``.
 
         """
-        # Explicit IDs always win, even at n_jobs==1. Without explicit IDs, single-job
-        # phases are a transparent no-op and inherit the caller's CUDA_VISIBLE_DEVICES.
+        # Explicit IDs always win, even at n_jobs==1.
         if explicit_ids is not None:
             ids = list(dict.fromkeys(explicit_ids))  # dedupe, preserve order
             if not ids:
@@ -165,22 +163,30 @@ class GpuPool:
                 log.info("GPU pool: %d GPUs for %d parallel job(s).", len(ids), n_jobs)
             return cls(gpu_ids=ids)
 
-        if n_jobs <= 1:
-            return cls(gpu_ids=[])
-
         user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         if user_cvd is not None:
             raw = [x.strip() for x in user_cvd.split(",") if x.strip()]
             if raw and not all(x.isdigit() for x in raw):
+                if allow_no_gpu:
+                    log.warning(
+                        "CUDA_VISIBLE_DEVICES=%r contains non-numeric device identifiers; "
+                        "running without CUDA isolation because allow_no_gpu_isolation=true.",
+                        user_cvd,
+                    )
+                    return cls(gpu_ids=[])
                 raise RuntimeError(
                     "CUDA_VISIBLE_DEVICES contains non-numeric device identifiers "
                     f"({user_cvd!r}). Set phase.gpu_ids explicitly with integer indices, "
-                    "or add string/UUID GPU ID support before using MIG/UUID devices."
+                    "or set allow_no_gpu_isolation: true if this run intentionally "
+                    "does not need CUDA isolation."
                 )
             ids = [int(x) for x in raw]
         else:
             ids = _detect_gpu_ids()
         if not ids:
+            if n_jobs <= 1:
+                log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
+                return cls(gpu_ids=[])
             if allow_no_gpu:
                 log.warning(
                     "n_jobs=%d, no GPUs detected — running without CUDA_VISIBLE_DEVICES "

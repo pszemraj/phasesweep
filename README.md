@@ -146,16 +146,17 @@ phases:
 - **`contracts`** *(optional, default `[]`)*: named top-level contracts applied to this phase. Contract keys cannot be resampled or locally overridden.
 - **`search_space`** *(optional)*: map of override-key sampler spec. Keys may be dotted (`model.depth`) for hydra/json_file. Override-key syntax is validated - empty / leading-or-trailing-dot / consecutive-dot / whitespace-bearing / shell-special-char keys are rejected.
 - **`n_trials`** *(required, 1)*: trial budget. **Bumping `n_trials` between runs is a compatible change** - the fingerprint excludes run-control fields.
-- **`n_jobs`** *(optional, default 1)*: parallel trials within this phase. When combined with `gpu_ids`, each trial gets exclusive `CUDA_VISIBLE_DEVICES` via a blocking pool.
-- **`gpu_ids`** *(optional)*: explicit list of CUDA device indices, e.g. `[0, 1, 2, 3]`. Honored at `n_jobs == 1` too (lets a single-job phase isolate to a specific GPU on shared hardware). Auto-detected via ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` when omitted and `n_jobs > 1`.
+- **`n_jobs`** *(optional, default 1)*: parallel trials within this phase. Each trial gets at most one exclusive `CUDA_VISIBLE_DEVICES` entry when numeric GPU IDs can be resolved.
+- **`gpu_ids`** *(optional)*: explicit list of CUDA device indices, e.g. `[0, 1, 2, 3]`. Honored at `n_jobs == 1` too. When omitted, phasesweep auto-detects numeric ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` output even for single-job phases, so independent local processes do not all stampede cuda:0.
 - **`max_consecutive_failures`** *(optional, default 5)*: abort the phase after this many consecutive failed/infeasible trials. Prevents a broken trainer from burning through `n_trials`.
 - **`sampler`** *(optional, default `{type: tpe}`)*: `tpe` | `random` | `grid` | `cmaes`. Sampler-vs-search-space compatibility is checked at config-load: cmaes-with-categoricals, grid-with-log-floats, grid-with-non-step-divisible-floats are all rejected. `cmaes` is useful for continuous numeric phases on a single node/GPU, for example learning rate, weight decay, dropout, or scheduler constants. It also import-checks the `cmaes` package at config-load.
 - **`timeout_seconds_per_trial`** *(optional, default 86400)*: kill the trial's entire process group if it runs longer. Semantic: changing this value invalidates the study fingerprint, since a different timeout changes which trials FAIL vs COMPLETE under the same sampled params. Set `allow_unbounded_trials: true` only when `timeout_seconds_per_trial: null` is intentional.
-- **`timeout_seconds_per_phase`** *(optional)*: phase wallclock guard; active subprocess cleanup still uses `timeout_seconds_per_trial`.
+- **`timeout_seconds_per_phase`** *(optional)*: phase wallclock guard; active subprocess cleanup still uses `timeout_seconds_per_trial`. If the guard fires before `n_trials` finishes, phasesweep refuses winner selection unless `allow_incomplete_on_timeout: true`.
+- **`allow_incomplete_on_timeout`** *(optional, default `false`)*: allow a phase/run wallclock timeout to select a winner from completed trials. Persisted winners and summaries record `completion.incomplete: true`, the finished/requested trial counts, and the timeout scope.
 - **`allow_partial_grid`** *(optional, default `false`)*: grid phases must run the full matrix by default. Set true only when a deliberately partial grid is acceptable.
 - **`allow_seed_search`** *(optional, default `false`)*: by default, `seed` and `*.seed` search-space keys are rejected. Put trainer seeds in `fixed_overrides`, or set this true for a variance audit.
-- **`gates`** *(optional)*: evidence gates evaluated after metric/constraint extraction. Supported: `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`. Gate failures mark the trial `FAIL` unless the phase has `promotion.requires_gates: false`, in which case they are recorded as advisory evidence.
-- **`promotion`** *(optional)*: compare this phase winner against an earlier phase winner before exposing it downstream. Fields: `min_delta_vs`, `min_delta`, `requires_gates`, `on_fail: stop|skip|continue_baseline`.
+- **`gates`** *(optional)*: evidence gates evaluated after metric/constraint extraction. Supported: `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`. `artifact_size` requires `source: file|directory|json`; file/directory sources measure materialized bytes, while `json` reads an integer byte estimate from `path` + `key`. Gate failures mark the trial `FAIL` unless the phase has `promotion.requires_gates: false`, in which case they are recorded as advisory evidence.
+- **`promotion`** *(optional)*: compare this phase winner against an earlier phase winner before exposing it downstream. Fields: `min_delta_vs`, `min_delta`, `requires_gates`, `on_fail: stop|skip|continue_baseline`. Every promotion writes `<phase>/promotion.yaml`; promoted/exposed winners also carry the decision in `winner.yaml` and `summary.yaml`.
 - **`comment`** *(optional)*: free-text design note. Surfaced by `phasesweep validate` and `phasesweep show-winners` so the *why* of each phase lives next to the spec. Excluded from the fingerprint - editing the comment never invalidates the study.
 
 ### Override priority within a trial (low to high)
@@ -279,11 +280,12 @@ Either lock alone misses a real collision mode. The locks are taken in determini
 
 A phase-level lock backs the run lock as defense in depth for direct callers of internal `_run_phase` (tests, future code paths). The public CLI never reaches it without first acquiring the run lock.
 
-**Host-wide GPU leases.** Whenever phasesweep isolates a CUDA device via `gpu_ids`
-or auto-detected parallel GPUs, each yielded GPU also takes a per-device `flock`
-under `$TMPDIR/phasesweep-locks/`. That prevents independent same-host
-phasesweep processes from double-booking the same GPU, including single-job
-phases with explicit `gpu_ids`.
+**Host-wide GPU leases.** Whenever phasesweep resolves numeric CUDA device IDs,
+including auto-detected single-job phases, each yielded GPU also takes a
+per-device `flock` under `$TMPDIR/phasesweep-locks/`. That prevents independent
+same-host phasesweep processes from double-booking the same GPU. CPU-only
+single-job phases run without a GPU lease; parallel CPU-only phases require
+`allow_no_gpu_isolation: true`.
 
 **Multi-host phasesweep against a shared Postgres/MySQL is unsupported.** The stale-trial reaper marks every `RUNNING` trial it sees as `FAIL` on startup; with two orchestrators against the same study, one would `FAIL` the other's live trials. Use Postgres/MySQL for durable storage and dashboards from a single host, not concurrent multi-host runs. Safe multi-host work is tracked in [TODO.md](TODO.md).
 
@@ -293,7 +295,7 @@ phases with explicit `gpu_ids`.
 
 There are two kinds of resume:
 
-**Re-running the same YAML** reuses the existing Optuna study and tops it up. The study's user_attr stores the fingerprint of the producing config; re-launch recomputes it and either accepts (top-up) or refuses with a fingerprint-mismatch error. Run-control fields excluded from the fingerprint: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_partial_grid`, `allow_seed_search`, `comment`. Bumping `n_trials` to top up is therefore always compatible. Changes to search space, sampler, fixed overrides, contracts, gates, promotion rules, trial command, override format, metric, constraints, env vars, inherited winners, or `timeout_seconds_per_trial` *do* invalidate the study. `timeout_seconds_per_trial` is intentionally semantic: a 60s vs 3600s budget changes which trials FAIL vs COMPLETE, which changes the observation distribution under one fingerprint and would silently mix censored and uncensored trials.
+**Re-running the same YAML** reuses the existing Optuna study and tops it up. The study's user_attr stores the fingerprint of the producing config; re-launch recomputes it and either accepts (top-up) or refuses with a fingerprint-mismatch error. Run-control fields excluded from the fingerprint: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, `comment`. Bumping `n_trials` to top up is therefore always compatible. Changes to search space, sampler, fixed overrides, contracts, gates, promotion rules, trial command, override format, metric, constraints, env vars, inherited winners, or `timeout_seconds_per_trial` *do* invalidate the study. `timeout_seconds_per_trial` is intentionally semantic: a 60s vs 3600s budget changes which trials FAIL vs COMPLETE, which changes the observation distribution under one fingerprint and would silently mix censored and uncensored trials.
 
 **`--from-phase <name>`** skips earlier phases by reading their `winner.yaml` files. Promotion is already applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner, not the raw candidate trial. Each `winner.yaml` is stamped with the producing phase's fingerprint. On resume, phasesweep recomputes the fingerprint of each *current* skipped phase against the *currently-resolved* inherited winners and refuses to load if:
 
