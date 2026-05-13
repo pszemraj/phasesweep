@@ -54,7 +54,7 @@ phasesweep status examples/experiment.yaml
 - [Config reference](docs/config.md): experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [Development](docs/development.md): test commands and test-suite map.
-- [TODO](TODO.md): future work that is intentionally outside the current single-host design.
+- [TODO](docs/TODO.md): future work that is intentionally outside the current single-host design.
 
 ## Runtime Boundaries
 
