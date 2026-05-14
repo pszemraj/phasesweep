@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from phasesweep._runtime import lock_dir
+from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
-log = logging.getLogger("phasesweep.gpu_pool")
+log = logging.getLogger("phasesweep.runtime.gpu")
 
 
 @dataclass
@@ -38,13 +38,8 @@ def _gpu_lock_path(gpu_id: int) -> Path:
 
 def _try_host_gpu_lease(gpu_id: int) -> _HostGpuLease | None:
     """Try to acquire the per-GPU host lock without blocking."""
-    import fcntl
-
-    handle = _gpu_lock_path(gpu_id).open("a+")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
+    handle = try_lock_file(_gpu_lock_path(gpu_id))
+    if handle is None:
         return None
     handle.seek(0)
     handle.truncate()
@@ -57,12 +52,7 @@ def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
     """Release a host-wide GPU lock."""
     if lease is None:
         return
-    import fcntl
-
-    try:
-        fcntl.flock(lease.handle, fcntl.LOCK_UN)
-    finally:
-        lease.handle.close()
+    unlock_file(lease.handle)
 
 
 def _detect_gpu_ids() -> list[int]:

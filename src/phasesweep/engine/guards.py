@@ -1,0 +1,478 @@
+"""Engine locks, fingerprints, and stale-trial recovery guards."""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import optuna
+
+from phasesweep._metadata import __version__
+from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.engine.optuna import _create_phase_study
+from phasesweep.engine.state import (
+    TRIAL_DIR_ATTR,
+    Winner,
+    _experiment_dir,
+    _suite_dir,
+    _trial_dir_for,
+)
+from phasesweep.runtime.files import (
+    canonical_storage_identity,
+    exclusive_lock,
+    try_lock_file,
+    unlock_file,
+)
+from phasesweep.runtime.files import (
+    lock_dir as _lock_dir,
+)
+from phasesweep.runtime.process import kill_stale_group, read_stale_process_identity
+
+
+def _lock_digest(material: dict[str, Any]) -> str:
+    """Hash a lock-material dict into a 24-char hex digest.
+
+    Args:
+        material: The output of :func:`_lock_material` (or any
+            JSON-serialisable dict).
+
+    Returns:
+        First 24 hex characters of the SHA-256 of the canonicalised JSON. 24
+        chars = 96 bits — well past collision risk for a same-host advisory
+        lock filename.
+
+    """
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def _lock_path_from_material(experiment: Experiment, material: dict[str, str], label: str) -> Path:
+    """Lock path under ``$TMPDIR/phasesweep-locks/`` named ``<exp>__<label>__<digest>.lock``.
+
+    Args:
+        experiment: Parsed experiment config; the experiment name is part of
+            the filename for human readability.
+        material: Lock-material dict produced by :func:`_lock_material` or
+            similar; hashed into the digest segment.
+        label: A short human-readable label (``"output"``, ``"storage"``,
+            phase name, ...).
+
+    Returns:
+        Resolved absolute path to the lock file (the file itself is not
+        created here; ``open(...).flock()`` does that lazily).
+
+    """
+    return _lock_dir() / f"{experiment.experiment}__{label}__{_lock_digest(material)}.lock"
+
+
+def _output_lock_material(experiment: Experiment) -> dict[str, str]:
+    """Identity for the *output namespace* lock: which directory we write to.
+
+    Catches the case where two configs share a workdir + experiment name but
+    point at different storage backends — without an output lock those would
+    silently overwrite each other's ``trial_*/``, ``winner.yaml``, and
+    ``summary.yaml`` (review v0.5.6 / blocker 1). Always taken regardless of
+    storage backend, including in-memory storage.
+
+    Args:
+        experiment: Parsed experiment config; supplies workdir + experiment name.
+
+    Returns:
+        Lock-material dict keyed on the resolved experiment directory.
+
+    """
+    return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment))}
+
+
+def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
+    """Identity for the *Optuna storage* lock: which study namespace we write to.
+
+    Catches the case where two configs share storage + experiment name but
+    point at different workdirs. Returns ``None`` for in-memory storage —
+    there is no shared backend, so the output lock alone is sufficient.
+
+    Args:
+        experiment: Parsed experiment config; supplies storage + experiment name.
+
+    Returns:
+        Lock-material dict keyed on canonical storage identity, or ``None``
+        when storage is in-memory.
+
+    """
+    storage_identity = canonical_storage_identity(experiment.storage)
+    if storage_identity is None:
+        return None
+    return {
+        "kind": "persistent_storage",
+        "storage": storage_identity,
+        "experiment": experiment.experiment,
+    }
+
+
+def _run_lock_paths(experiment: Experiment) -> list[Path]:
+    """All same-host locks required for one full experiment run.
+
+    For persistent storage we take *both* locks (output + storage); for
+    in-memory storage we take only the output lock. The list is sorted by
+    path so acquisition order is deterministic across processes — relevant
+    for clear error messages, not for deadlock avoidance (we use
+    ``LOCK_NB``).
+
+    Args:
+        experiment: Parsed experiment config.
+
+    Returns:
+        Lock-file paths sorted by string order. Length is 1 (output only) for
+        in-memory storage, 2 (output + storage) otherwise.
+
+    """
+    materials: list[tuple[str, dict[str, str]]] = [
+        ("output", _output_lock_material(experiment)),
+    ]
+    storage_material = _storage_run_lock_material(experiment)
+    if storage_material is not None:
+        materials.append(("storage", storage_material))
+    return sorted(
+        (_lock_path_from_material(experiment, m, label) for label, m in materials),
+        key=str,
+    )
+
+
+@contextlib.contextmanager
+def _experiment_lock(experiment: Experiment) -> Iterator[None]:
+    """Take all same-host locks needed for one full experiment run.
+
+    The phase-chained pipeline has cross-phase state — parent ``winner.yaml``,
+    child fingerprints, ``summary.yaml``, ``--from-phase`` semantics — so the
+    consistency domain is the entire run, not a single phase study. v0.5.7
+    extends this further: the consistency domain spans both the *output
+    namespace* (filesystem artifacts under ``<workdir>/<experiment>/``) and
+    the *Optuna storage namespace* (review v0.5.6 / blocker 1).
+
+    Two configs can disagree on storage but share output paths, or vice
+    versa; either case can corrupt skipped-phase reuse and trial logs. We
+    therefore take an output lock *always*, and a storage lock additionally
+    whenever storage is persistent. In-memory storage has no shared backend,
+    so the output lock alone suffices.
+
+    Both locks are *same-host advisory only*. Multi-host coordination needs
+    per-trial leases + heartbeats (see ``TODO.md``).
+
+    Args:
+        experiment: Parsed experiment config.
+
+    Yields:
+        ``None``. Use as ``with _experiment_lock(exp): ...``.
+
+    Raises:
+        RuntimeError: Another phasesweep process holds one of the required
+            locks (output namespace or storage identity).
+
+    """
+    paths = _run_lock_paths(experiment)
+    handles: list[Any] = []
+    try:
+        for path in paths:
+            handle = try_lock_file(path)
+            if handle is None:
+                raise RuntimeError(
+                    f"Another phasesweep process appears to be using the same "
+                    f"experiment backend or output namespace for "
+                    f"{experiment.experiment!r} (lock file: {path}). phasesweep "
+                    f"supports one active orchestrator per experiment output "
+                    f"namespace and per persistent storage identity."
+                )
+            handles.append(handle)
+        yield
+    finally:
+        # Reverse-order release isn't required by flock semantics, but it
+        # keeps the "stack" mental model intact and parallels typical
+        # acquire-A-then-B / release-B-then-A discipline.
+        for handle in reversed(handles):
+            unlock_file(handle)
+
+
+@contextlib.contextmanager
+def _suite_lock(suite: Suite) -> Iterator[None]:
+    """Take a same-host lock for suite-level log and summary artifacts."""
+    material = {"kind": "suite", "suite_dir": str(_suite_dir(suite))}
+    path = _lock_dir() / f"{suite.suite}__suite__{_lock_digest(material)}.lock"
+    with exclusive_lock(
+        path,
+        busy_message=(
+            f"Another phasesweep suite process appears to be using {suite.suite!r} "
+            f"(lock file: {path})."
+        ),
+    ):
+        yield
+
+
+_RUN_CONTROL_KEYS = frozenset(
+    {
+        # Fields excluded from the fingerprint because they don't change trial
+        # meaning. Top-up workflow (re-run with a higher n_trials) must work;
+        # throughput knobs (n_jobs / gpu_ids) and circuit breakers
+        # (max_consecutive_failures) likewise must not invalidate a study.
+        # `comment` is operator-facing documentation — editing it is never a
+        # semantic change to the experiment.
+        "n_trials",
+        "n_jobs",
+        "gpu_ids",
+        "allow_no_gpu_isolation",
+        "max_consecutive_failures",
+        "comment",
+        "allow_unbounded_trials",
+        "timeout_seconds_per_phase",
+        "allow_incomplete_on_timeout",
+        "allow_partial_grid",
+        "allow_seed_search",
+    }
+)
+
+
+def _phase_semantic_payload(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+) -> dict[str, Any]:
+    """Return a dict capturing only fields that change *trial meaning*.
+
+    Excludes run-control fields (review v0.5.2 / blocker 1) so that bumping
+    ``n_trials`` to top up a study is a compatible operation. Includes
+    ``experiment.env`` which v0.5.1 missed: env vars like ``CUBLAS_WORKSPACE_CONFIG``
+    or ``MY_TRAINER_SEED`` change training behavior and must invalidate reuse.
+
+    Args:
+        experiment: The full experiment config; contributes ``trial_command``,
+            ``override_format``, ``env``, metric, and constraints.
+        phase: The phase being fingerprinted; ``_RUN_CONTROL_KEYS`` are stripped.
+        inherited_winners: Winners loaded from parent phases; their
+            ``effective_overrides`` are part of this phase's identity.
+
+    Returns:
+        A JSON-serialisable dict whose contents fully determine trial meaning
+        for the phase. Stable across irrelevant config edits, varies on
+        anything that would change a trial's outcome.
+
+    """
+    phase_dump = phase.model_dump(mode="json")
+    semantic_phase = {k: v for k, v in phase_dump.items() if k not in _RUN_CONTROL_KEYS}
+    return {
+        "phasesweep_version": __version__,
+        "trial_command": experiment.trial_command,
+        "override_format": experiment.override_format,
+        "env": dict(sorted(experiment.env.items())),
+        "metric": experiment.metric.model_dump(mode="json"),
+        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        "contracts": {
+            name: experiment.contracts[name].model_dump(mode="json") for name in phase.contracts
+        },
+        "phase": semantic_phase,
+        "inherited_effective_overrides": {
+            parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
+        },
+    }
+
+
+def _phase_fingerprint(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+) -> str:
+    """Hash the semantic execution context for resume-compatibility checks.
+
+    Uses the full SHA-256 hex digest. Earlier versions truncated to 16 hex
+    chars (64 bits) — defensible against accidental collision but no reason
+    to leave the door open in scientific-workflow metadata.
+
+    Args:
+        experiment: The experiment config (forwarded to
+            :func:`_phase_semantic_payload`).
+        phase: The phase being fingerprinted.
+        inherited_winners: Parent-phase winners; their effective overrides
+            contribute to identity.
+
+    Returns:
+        SHA-256 hex digest (64 characters) of the canonicalised semantic
+        payload. Used to detect incompatible re-runs and stamped onto
+        ``winner.yaml`` files for cross-version verification.
+
+    """
+    payload = _phase_semantic_payload(experiment, phase, inherited_winners)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_fingerprint(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+) -> None:
+    """Stamp a fresh study with its fingerprint or fail on mismatch.
+
+    Args:
+        study: The Optuna study being verified or stamped.
+        experiment: The current experiment config.
+        phase: The phase whose fingerprint should match the stored one.
+        inherited_winners: Parent-phase winners contributing to identity.
+
+    Raises:
+        RuntimeError: The study already has a fingerprint and it does not
+            match the current computed value (incompatible config edit).
+
+    """
+    fp = _phase_fingerprint(experiment, phase, inherited_winners)
+    existing = study.user_attrs.get("phasesweep_fingerprint")
+    if existing is None:
+        study.set_user_attr("phasesweep_fingerprint", fp)
+    elif existing != fp:
+        raise RuntimeError(
+            f"Study {study.study_name!r} was created with a different phase config "
+            f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
+            f"old study, or rename the phase."
+        )
+
+
+log = logging.getLogger("phasesweep.engine.guards")
+
+
+def _trial_dir_for_reaping(
+    trial: optuna.trial.FrozenTrial,
+    experiment: Experiment,
+    phase_name: str,
+    study_name: str,
+) -> Path:
+    """Return the trial directory to inspect during stale-trial reaping.
+
+    Prefer the persisted ``phasesweep_trial_dir`` attr because it preserves the
+    original workdir even if the operator resumes from a different cwd or edits
+    ``experiment.workdir``. If the attr is absent, the trial died before the
+    current launch path could persist the directory and before any subprocess
+    could be started, so the canonical directory is safe to use for recovery.
+
+    Args:
+        trial: RUNNING Optuna trial being reaped.
+        experiment: Parsed experiment.
+        phase_name: Phase containing the trial.
+        study_name: Study name for operator-facing diagnostics.
+
+    Returns:
+        Persisted trial directory, or the canonical directory for a pre-launch
+        RUNNING trial with no persisted directory attr.
+
+    Raises:
+        RuntimeError: ``phasesweep_trial_dir`` exists but is not a non-empty
+            string, which indicates storage corruption rather than the known
+            pre-launch crash window.
+
+    """
+    if TRIAL_DIR_ATTR not in trial.user_attrs:
+        trial_dir = _trial_dir_for(experiment, phase_name, trial.number)
+        log.warning(
+            "RUNNING trial %d in study %s is missing %r; falling back to "
+            "canonical trial_dir=%s. No subprocess can be launched by the "
+            "current orchestrator before this attr is normally persisted.",
+            trial.number,
+            study_name,
+            TRIAL_DIR_ATTR,
+            trial_dir,
+        )
+        return trial_dir
+
+    stored = trial.user_attrs[TRIAL_DIR_ATTR]
+    if not isinstance(stored, str) or not stored:
+        raise RuntimeError(
+            f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
+            f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
+            "tied to its identity files safely."
+        )
+    return Path(stored)
+
+
+def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: str) -> int:
+    """Mark RUNNING trials as FAIL on startup, killing orphaned process groups.
+
+    Uses the per-trial identity files left by ``run_supervised`` (review v0.5.2 /
+    blocker 7): pid + starttime for the safe path, pgid as the fallback when the
+    root PID has exited but descendants are still alive.
+
+    The trial directory is normally loaded from the trial's
+    ``phasesweep_trial_dir`` user attribute (review v0.5.3 / blocker 4) so the
+    reaper works correctly even if the user changed ``experiment.workdir`` or
+    invoked phasesweep from a different cwd. If that attr is absent, the trial
+    died before the current launch path could start a subprocess, so the reaper
+    falls back to the canonical trial directory and marks the trial failed.
+
+    **Fail-closed contract** (review v0.5.7 / blocker 2): if
+    :func:`kill_stale_group` returns ``False`` we cannot prove the leaked
+    process group is gone. Marking the trial ``FAIL`` would let new trials
+    schedule onto a GPU still held by the leaked process. We raise a
+    ``RuntimeError`` instead so the operator sees a loud failure and can
+    investigate manually. Pre-v0.5.8 we logged the survivor and continued.
+
+    Args:
+        study: Optuna study for the phase being recovered.
+        experiment: Parsed experiment.
+        phase_name: Name of the phase being recovered.
+
+    Returns:
+        The number of RUNNING trials successfully reaped (i.e. cleanup
+        confirmed AND ``study.tell(...FAIL)`` succeeded).
+
+    Raises:
+        RuntimeError: Cleanup of a stale process group could not be confirmed,
+            or ``study.tell`` could not persist the FAIL state.
+
+    """
+    reaped = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+
+        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+
+        identity = read_stale_process_identity(trial_dir)
+        if identity.pid is not None or identity.pgid is not None:
+            safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
+            if not safe_to_fail:
+                raise RuntimeError(
+                    f"Refusing to mark RUNNING trial {trial.number} as FAIL: "
+                    f"stale process cleanup could not prove the process group "
+                    f"is gone. trial_dir={trial_dir} pid={identity.pid} "
+                    f"pgid={identity.pgid}. A leaked training process may still "
+                    "be holding GPU memory. Investigate (e.g. `ps -o pid,pgid,cmd "
+                    f"-p {identity.pid}` and `kill -9 -- -{identity.pgid}` if "
+                    "appropriate), then re-run phasesweep."
+                )
+            log.warning(
+                "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
+                trial.number,
+                identity.pid,
+                identity.pgid,
+            )
+
+        try:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Stale process cleanup completed for RUNNING trial {trial.number}, "
+                f"but Optuna state could not be updated to FAIL. Refusing to continue "
+                f"with an inconsistent study. trial_dir={trial_dir}"
+            ) from exc
+
+        reaped += 1
+        log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
+    return reaped
+
+
+def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
+    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``."""
+    if experiment.storage is None:
+        return
+    _reap_stale_trials(_create_phase_study(experiment, phase), experiment, phase.name)

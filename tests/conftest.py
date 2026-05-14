@@ -20,7 +20,7 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.extractors import TrialContext
+from phasesweep.evidence import TrialContext
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.

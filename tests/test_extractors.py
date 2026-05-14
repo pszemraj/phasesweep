@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
-from phasesweep.config import JsonExtractor, LogRegexExtractor
-from phasesweep.extractors import ExtractorError, run_extractor
+from phasesweep.config import JsonEqualsGate, JsonExtractor, LogRegexExtractor
+from phasesweep.evidence import ExtractorError, run_extractor
 from tests.conftest import make_trial_context
 
 
@@ -33,6 +34,18 @@ def test_json_non_numeric(tmp_path):
     cfg = JsonExtractor(type="json", path="result.json", key="x")
     with pytest.raises(ExtractorError, match="not numeric"):
         run_extractor(make_trial_context(tmp_path), cfg)
+
+
+@pytest.mark.parametrize("bad_path", ["/tmp/result.json", "../result.json", ""])
+def test_evidence_paths_must_be_trial_relative(bad_path: str) -> None:
+    with pytest.raises(ValidationError, match="trial-relative path required"):
+        JsonExtractor(type="json", path=bad_path, key="x")
+
+
+@pytest.mark.parametrize("bad_key", ["", ".x", "x."])
+def test_json_keys_must_be_non_empty_dotted_paths(bad_key: str) -> None:
+    with pytest.raises(ValidationError, match="JSON key"):
+        JsonEqualsGate(type="json_equals", path="result.json", key=bad_key, value=1)
 
 
 def test_log_regex_last(tmp_path):

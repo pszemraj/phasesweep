@@ -1,62 +1,13 @@
-"""Shared runtime helpers for subprocess-adjacent code."""
+"""W&B polling helpers."""
 
 from __future__ import annotations
 
-import json
-import queue
-import tempfile
-import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
-T = TypeVar("T")
-
-
-def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
-    """Run a blocking function in a daemon thread and bound caller wait time."""
-    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            q.put((True, fn()))
-        except Exception as exc:  # noqa: BLE001
-            q.put((False, exc))
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout=max(0.0, timeout))
-    if thread.is_alive():
-        raise TimeoutError(f"call exceeded {timeout:g}s")
-    ok, value = q.get_nowait()
-    if ok:
-        return value
-    raise value
-
-
-def json_path(data: Any, key: str) -> Any:
-    """Resolve a dotted key in a JSON-like object."""
-    cur = data
-    for part in key.split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            raise KeyError(part)
-    return cur
-
-
-def load_json_file(path: Path) -> Any:
-    """Load JSON from ``path``."""
-    return json.loads(path.read_text())
-
-
-def lock_dir() -> Path:
-    """Return the shared same-host phasesweep lock directory."""
-    path = Path(tempfile.gettempdir()) / "phasesweep-locks"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+from phasesweep.runtime.files import call_with_timeout
 
 
 @dataclass(frozen=True)

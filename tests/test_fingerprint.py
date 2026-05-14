@@ -19,12 +19,8 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.orchestrator import (
-    Winner,
-    _phase_dir,
-    _phase_fingerprint,
-    _winner_path,
-)
+from phasesweep.engine.guards import _phase_fingerprint
+from phasesweep.engine.state import Winner, _phase_dir, _winner_path
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
@@ -291,7 +287,7 @@ def test_version_sources_agree() -> None:
 
 def test_fingerprint_uses_package_version() -> None:
     """Fingerprint payload's `phasesweep_version` equals the package version."""
-    from phasesweep.orchestrator import _phase_semantic_payload
+    from phasesweep.engine.guards import _phase_semantic_payload
 
     exp = make_experiment()
     payload = _phase_semantic_payload(exp, exp.phases[0], {})

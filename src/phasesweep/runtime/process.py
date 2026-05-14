@@ -25,7 +25,7 @@ from pathlib import Path
 from types import FrameType
 from typing import IO
 
-log = logging.getLogger("phasesweep.process")
+log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
 
@@ -111,14 +111,25 @@ def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
     raise SystemExit(128 + signum)
 
 
+def _unblock_shutdown_signals() -> None:
+    """Ensure shutdown signals can reach the main-thread handler."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
+
+
 def install_signal_handlers() -> None:
     """Install shutdown handlers that clean up child process groups.
 
     Handles SIGTERM/SIGINT and SIGHUP where the platform exposes it. Safe to
-    call multiple times; only installs once. Must be called from the main
-    thread.
+    call multiple times; only installs once. The main thread's shutdown signals
+    are unblocked on each call so an inherited signal mask cannot prevent the
+    handlers from running. Must be called from the main thread.
     """
     global _installed  # noqa: PLW0603
+    _unblock_shutdown_signals()
     if _installed:
         return
     try:

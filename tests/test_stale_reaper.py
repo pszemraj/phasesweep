@@ -17,11 +17,10 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.orchestrator import (
-    _reap_stale_trials,
-    _run_phase,
-)
-from phasesweep.process import (
+from phasesweep.engine.guards import _reap_stale_trials
+from phasesweep.engine.phase import _run_phase
+from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_dir_for
+from phasesweep.runtime.process import (
     StaleProcessIdentity,
     is_same_process,
     kill_stale_group,
@@ -115,7 +114,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     reap_called = {"flag": False}
     fingerprint_called = {"flag": False}
 
-    import phasesweep.orchestrator as orch
+    import phasesweep.engine.phase as orch
 
     real_verify = orch._verify_fingerprint
 
@@ -174,7 +173,7 @@ def test_kill_stale_group_escalates_to_sigkill(tmp_path):
     try:
         # Give it a moment to install the handler.
         time.sleep(0.3)
-        from phasesweep.process import read_proc_starttime
+        from phasesweep.runtime.process import read_proc_starttime
 
         st = read_proc_starttime(proc.pid)
         assert st is not None
@@ -269,10 +268,10 @@ def test_kill_stale_group_refuses_pgid_fallback_on_pid_reuse(
     """
     calls: list[int] = []
 
-    monkeypatch.setattr("phasesweep.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.process.read_proc_starttime", lambda pid: 999)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 999)
     monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
@@ -286,13 +285,13 @@ def test_kill_stale_group_uses_pgid_when_pid_dead(monkeypatch: pytest.MonkeyPatc
     """PID gone, no starttime check possible — PGID fallback is correct here."""
     calls: list[int] = []
 
-    monkeypatch.setattr("phasesweep.process.is_pid_alive", lambda pid: False)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: False)
     # Force the early-out gate to see the group as alive so the test exercises
     # the delegation to _terminate_process_group (post-v0.5.8 the gate would
     # otherwise short-circuit when the fake pgid 42 isn't a real process).
-    monkeypatch.setattr("phasesweep.process._process_group_alive", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
     monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
@@ -308,14 +307,14 @@ def test_kill_stale_group_uses_live_pid_when_starttime_matches(
     """PID alive + starttime match => derive PGID and kill (the safe path)."""
     calls: list[int] = []
 
-    monkeypatch.setattr("phasesweep.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.process.read_proc_starttime", lambda pid: 111)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 111)
     monkeypatch.setattr("os.getpgid", lambda pid: 7777)
     # Force the early-out gate (post-v0.5.8) to see the group as alive so the
     # test exercises delegation to _terminate_process_group.
-    monkeypatch.setattr("phasesweep.process._process_group_alive", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
     monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
@@ -337,18 +336,16 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
     persisted_trial_dir = workdir_A / "p" / "trial_00000"
     persisted_trial_dir.mkdir(parents=True)
 
-    # Plant identity files at the *real* (persisted) trial dir.
+    # Plant identity files at the persisted trial dir.
     (persisted_trial_dir / "pid").write_text("99999\n")
     (persisted_trial_dir / "pgid").write_text("99999\n")
 
-    # Now build the experiment pointed at workdir_B (the recomputed path would
-    # land under workdir_B/p/trial_00000, which has no identity files).
     exp = make_experiment(workdir=workdir_B)
 
     # Set up an in-memory study with one RUNNING trial that has the user_attr.
     study = optuna.create_study(study_name="t::p")
     trial = study.ask()
-    trial.set_user_attr("phasesweep_trial_dir", str(persisted_trial_dir))
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(persisted_trial_dir))
     # Leave it RUNNING — that's what the reaper looks for.
 
     seen_dirs: list[str] = []
@@ -356,52 +353,73 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
     def fake_read_identity(trial_dir: Path) -> object:
         seen_dirs.append(str(trial_dir))
 
-        from phasesweep.process import StaleProcessIdentity
+        from phasesweep.runtime.process import StaleProcessIdentity
 
         return StaleProcessIdentity(pid=None, pgid=None, starttime=None)
 
-    import phasesweep.process as _proc
+    import phasesweep.engine.guards as _reaper
 
-    real_read = _proc.read_stale_process_identity
-    _proc.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_read = _reaper.read_stale_process_identity
+    _reaper.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
     try:
         _reap_stale_trials(study, exp, "p")
     finally:
-        _proc.read_stale_process_identity = real_read  # type: ignore[assignment]
+        _reaper.read_stale_process_identity = real_read  # type: ignore[assignment]
 
     assert seen_dirs == [str(persisted_trial_dir)], (
         f"reaper should have used persisted trial_dir; got {seen_dirs}"
     )
 
 
-def test_reaper_falls_back_to_recomputed_dir_when_attr_missing(tmp_path: Path) -> None:
-    """Old trials predating v0.5.3 don't have the user_attr; reaper still works."""
-    exp = make_experiment(workdir=tmp_path / "wd")
+def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RUNNING trial without ``phasesweep_trial_dir`` is safe to mark FAIL.
 
-    study = optuna.create_study(study_name="t::p")
-    study.ask()  # creates trial 0; do NOT set the user_attr
+    Optuna creates the RUNNING trial before ``objective()`` persists the trial
+    directory. A crash in that window cannot have launched a subprocess yet, so
+    startup recovery must not strand the study.
+    """
+    exp = make_experiment(workdir=tmp_path / "runs")
+    study = optuna.create_study(direction="maximize")
+    trial = study.ask()
+    expected_trial_dir = _trial_dir_for(exp, exp.phases[0].name, trial.number)
 
-    seen_dirs: list[str] = []
+    seen_dirs: list[Path] = []
 
-    def fake_read_identity(trial_dir: Path) -> object:
-        seen_dirs.append(str(trial_dir))
-        from phasesweep.process import StaleProcessIdentity
-
+    def fake_read_identity(trial_dir: Path) -> StaleProcessIdentity:
+        seen_dirs.append(trial_dir)
         return StaleProcessIdentity(pid=None, pgid=None, starttime=None)
 
-    import phasesweep.process as _proc
+    def fail_if_called(pid: int | None, starttime: int | None, *, pgid: int | None) -> bool:
+        raise AssertionError("no process cleanup should run when no identity files exist")
 
-    real_read = _proc.read_stale_process_identity
-    _proc.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
-    try:
-        _reap_stale_trials(study, exp, "p")
-    finally:
-        _proc.read_stale_process_identity = real_read  # type: ignore[assignment]
+    monkeypatch.setattr("phasesweep.engine.guards.read_stale_process_identity", fake_read_identity)
+    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fail_if_called)
 
-    # v0.5.7: reaper recomputed-dir fallback now points at the namespaced layout
-    # <workdir>/<experiment>/<phase>/, so the expected path includes "t".
-    expected = Path(exp.workdir).resolve() / exp.experiment / "p" / "trial_00000"
-    assert seen_dirs == [str(expected)]
+    reaped = _reap_stale_trials(study, exp, exp.phases[0].name)
+
+    assert reaped == 1
+    assert seen_dirs == [expected_trial_dir]
+    assert study.trials[trial.number].state == optuna.trial.TrialState.FAIL
+
+
+@pytest.mark.parametrize("bad_value", ["", 123])
+def test_reaper_raises_for_malformed_trial_dir_attr(
+    tmp_path: Path,
+    bad_value: object,
+) -> None:
+    """Malformed persisted trial dirs are storage corruption, not prelaunch recovery."""
+    exp = make_experiment(workdir=tmp_path / "runs")
+    study = optuna.create_study(direction="maximize")
+    trial = study.ask()
+    trial.set_user_attr(TRIAL_DIR_ATTR, bad_value)
+
+    with pytest.raises(RuntimeError, match="invalid persisted"):
+        _reap_stale_trials(study, exp, exp.phases[0].name)
+
+    assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
 
 def test_kill_stale_group_returns_true_when_no_identity() -> None:
@@ -420,9 +438,10 @@ def test_reaper_raises_when_tell_fails_after_cleanup(
     exp = make_experiment(workdir=tmp_path / "runs")
     study = optuna.create_study(direction="maximize")
     trial = study.ask()
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
 
     monkeypatch.setattr(
-        "phasesweep.process.read_stale_process_identity",
+        "phasesweep.engine.guards.read_stale_process_identity",
         lambda trial_dir: StaleProcessIdentity(pid=None, pgid=None, starttime=None),
     )
 

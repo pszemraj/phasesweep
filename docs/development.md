@@ -11,20 +11,27 @@ pathlint src tests
 python doc_check.py src --check-lazy
 ```
 
-Current expected test result: `264 passed` with Optuna `constant_liar` experimental warnings.
+Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected.
+
+## Package Map
+
+- `phasesweep.config`: Pydantic config models and strict YAML loading.
+- `phasesweep.engine`: Optuna study orchestration, fingerprints, locks, promotion, persistence, status, and suite execution.
+- `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
+- `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
+- `phasesweep.cli`: Click command surface.
+
+Stable API calls live at the package root: `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, or `runtime`.
 
 ## Test Map
 
 Tests are organized by behavior:
 
 - `tests/test_e2e.py`: full sweep and `--from-phase` replay.
-- `tests/test_storage_urls.py`: storage backend parsing, dialect folding, absolute and relative path identity.
-- `tests/test_locking.py`: run locks, storage locks, output namespace locks, and phase locks.
-- `tests/test_process_supervision.py`: subprocess lifecycle, signal handling, cleanup confirmation, launch-window safety.
-- `tests/test_stale_reaper.py`: startup reaping, PID-reuse checks, fail-closed cleanup.
+- `tests/test_storage_urls.py`, `tests/test_locking.py`: storage identity, URL parsing, and same-host advisory locks.
+- `tests/test_process_supervision.py`, `tests/test_stale_reaper.py`: subprocess cleanup, signal handling, startup/skipped-phase reaping.
 - `tests/test_fingerprint.py`: semantic fingerprints, resume verification, run-control exclusions.
 - `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
-- `tests/test_runtime_behavior.py`: extractor NaN/inf behavior, parallel sampler config, failure aborts, timeout completion policy.
-- `tests/test_protocol.py`: contracts, evidence gates, promotion, suites.
+- `tests/test_runtime_behavior.py`, `tests/test_protocol.py`: timeout policy, contracts, evidence gates, promotion, and suites.
 - `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_wandb_extractor.py`: focused unit surfaces.

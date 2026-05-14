@@ -1,8 +1,4 @@
-"""W&B extractor test with a stubbed API.
-
-We don't want a real W&B account in CI, so we install a fake `wandb.apis.public`
-module before importing the extractor, then drive different scenarios.
-"""
+"""W&B extractor tests with a stubbed API."""
 
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ import types
 import pytest
 
 from phasesweep.config import WandbExtractor
-from phasesweep.extractors import ExtractorError, run_extractor
+from phasesweep.evidence import ExtractorError, run_extractor
 from tests.conftest import make_trial_context
 
 
@@ -32,56 +28,36 @@ class _FakeApi:
         return self._runs_for_filter(path, name)
 
 
-def _install_fake_wandb(api_factory):
-    # `wandb` top-level
-    wandb_mod = types.ModuleType("wandb")
-    sys.modules["wandb"] = wandb_mod
-    # `wandb.apis`
-    apis_mod = types.ModuleType("wandb.apis")
-    sys.modules["wandb.apis"] = apis_mod
-    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
-    # `wandb.apis.public`
-    public_mod = types.ModuleType("wandb.apis.public")
-
-    class Api:
-        def __init__(self):
-            self._inner = api_factory()
-
-        def runs(self, path, filters):
-            return self._inner.runs(path, filters)
-
-    public_mod.Api = Api
-    sys.modules["wandb.apis.public"] = public_mod
-    apis_mod.public = public_mod  # type: ignore[attr-defined]
-
-
 @pytest.fixture
-def fake_wandb_finished(monkeypatch):
-    def factory():
-        return _FakeApi(
-            runs_for_filter=lambda path, name: [
-                _FakeRun(name=name, state="finished", summary={"eval/loss": 0.123})
-            ]
-        )
+def fake_wandb(monkeypatch: pytest.MonkeyPatch):
+    """Install a fake ``wandb.apis.public.Api`` backed by a supplied runs callable."""
 
-    _install_fake_wandb(factory)
-    yield
-    for k in ("wandb", "wandb.apis", "wandb.apis.public"):
-        sys.modules.pop(k, None)
+    def install(runs_for_filter):
+        wandb_mod = types.ModuleType("wandb")
+        apis_mod = types.ModuleType("wandb.apis")
+        public_mod = types.ModuleType("wandb.apis.public")
+
+        class Api:
+            def __init__(self):
+                self._inner = _FakeApi(runs_for_filter)
+
+            def runs(self, path, filters):
+                return self._inner.runs(path, filters)
+
+        public_mod.Api = Api
+        wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
+        apis_mod.public = public_mod  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
+        monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
+        monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+
+    return install
 
 
-@pytest.fixture
-def fake_wandb_missing(monkeypatch):
-    def factory():
-        return _FakeApi(runs_for_filter=lambda path, name: [])
-
-    _install_fake_wandb(factory)
-    yield
-    for k in ("wandb", "wandb.apis", "wandb.apis.public"):
-        sys.modules.pop(k, None)
-
-
-def test_wandb_extractor_finds_metric(fake_wandb_finished, tmp_path):
+def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
+    fake_wandb(
+        lambda path, name: [_FakeRun(name=name, state="finished", summary={"eval/loss": 0.123})]
+    )
     cfg = WandbExtractor(
         type="wandb",
         entity="me",
@@ -95,7 +71,8 @@ def test_wandb_extractor_finds_metric(fake_wandb_finished, tmp_path):
     assert run_extractor(ctx, cfg) == pytest.approx(0.123)
 
 
-def test_wandb_extractor_timeout(fake_wandb_missing, tmp_path):
+def test_wandb_extractor_timeout(fake_wandb, tmp_path):
+    fake_wandb(lambda path, name: [])
     cfg = WandbExtractor(
         type="wandb",
         entity="me",

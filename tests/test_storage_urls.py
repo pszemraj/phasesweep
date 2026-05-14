@@ -15,12 +15,10 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.orchestrator import (
-    _resolve_storage,
-)
-from phasesweep.storage_urls import (
-    _file_url_path,
+from phasesweep.engine.optuna import _resolve_storage
+from phasesweep.runtime.files import (
     canonical_storage_identity,
+    file_url_path,
     storage_backend,
 )
 from tests.conftest import make_experiment, write_yaml
@@ -212,10 +210,10 @@ def test_canonical_storage_identity_rdb_passes_through() -> None:
     ],
 )
 def test_file_url_path_preserves_absolute_paths(url: str, expected_path: str) -> None:
-    """``_file_url_path`` must distinguish three-slash (relative) from
+    """``file_url_path`` must distinguish three-slash (relative) from
     four-slash (absolute) URLs. Pre-v0.5.10 it used ``lstrip("/")`` which
     destroyed the leading ``/`` on absolute paths."""
-    assert _file_url_path(url) == expected_path
+    assert file_url_path(url) == expected_path
 
 
 @pytest.mark.parametrize(

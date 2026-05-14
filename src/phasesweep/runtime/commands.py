@@ -1,4 +1,4 @@
-"""Format override dicts into the shape the trial command expects.
+"""Format override dictionaries into the shape the trial command expects.
 
 All values are unconditionally shell-quoted via shlex.quote to prevent
 injection or misparse from shell metacharacters in paths or categorical values.

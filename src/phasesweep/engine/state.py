@@ -1,0 +1,335 @@
+"""Engine state types, paths, logs, and persisted artifacts."""
+
+from __future__ import annotations
+
+import contextlib
+import csv
+import json
+import logging
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import optuna
+import yaml
+
+from phasesweep.config import Experiment, Phase, Suite
+
+
+@dataclass
+class Winner:
+    """Phase winner: sampled params, full effective overrides, and metric value.
+
+    ``phase_fingerprint`` is the SHA-256 of the phase's semantic execution
+    context at the time the winner was selected (review v0.5.6 / blocker 3).
+    Persisted into ``winner.yaml`` and re-checked when ``--from-phase`` skips
+    earlier phases — without that check, editing a parent phase's search
+    space, fixed overrides, env, metric, or trial command and then resuming
+    would silently inherit the *old* winner against the *new* parent config.
+
+    ``None`` only on placeholder winners produced for the dry-run skip path,
+    which never get persisted.
+    """
+
+    trial_number: int
+    params: dict[str, Any]  # sampled params only
+    effective_overrides: dict[str, Any]  # full composed overrides (fixed + inherited + sampled)
+    metric: float
+    constraints: dict[str, float] = field(default_factory=dict)
+    gates: list[dict[str, Any]] = field(default_factory=list)
+    completion: dict[str, Any] = field(default_factory=dict)
+    promotion: dict[str, Any] | None = None
+    phase_fingerprint: str | None = None
+
+
+TRIAL_DIR_ATTR = "phasesweep_trial_dir"
+FEASIBLE_ATTR = "phasesweep_feasible"
+GATES_ATTR = "phasesweep_gates"
+RETURN_CODE_ATTR = "phasesweep_return_code"
+DURATION_ATTR = "phasesweep_duration_s"
+OVERRIDES_ATTR = "phasesweep_overrides"
+CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
+FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+CONSTRAINT_PREFIX = "constraint:"
+
+
+def constraint_attr(name: str) -> str:
+    """Return the persisted user-attr key for a constraint value."""
+    return f"{CONSTRAINT_PREFIX}{name}"
+
+
+def _experiment_dir(experiment: Experiment) -> Path:
+    """Return the artifact namespace for one experiment."""
+    return Path(experiment.workdir).expanduser().resolve() / experiment.experiment
+
+
+def _phase_dir(experiment: Experiment, phase_name: str) -> Path:
+    """Return the artifact namespace for one phase."""
+    return _experiment_dir(experiment) / phase_name
+
+
+def _summary_path(experiment: Experiment) -> Path:
+    """Return the experiment summary path."""
+    return _experiment_dir(experiment) / "summary.yaml"
+
+
+def _run_log_path(experiment: Experiment) -> Path:
+    """Path to the durable run log for one experiment."""
+    return _experiment_dir(experiment) / "run.log"
+
+
+def _trial_dir_for(experiment: Experiment, phase_name: str, trial_number: int) -> Path:
+    """Return the canonical per-trial directory."""
+    return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
+
+
+def _winner_path(experiment: Experiment, phase_name: str) -> Path:
+    """Return the path to a phase's persisted winner."""
+    return _phase_dir(experiment, phase_name) / "winner.yaml"
+
+
+def _promotion_decision_path(experiment: Experiment, phase_name: str) -> Path:
+    """Path to the persisted phase promotion decision."""
+    return _phase_dir(experiment, phase_name) / "promotion.yaml"
+
+
+def _suite_dir(suite: Suite) -> Path:
+    """Filesystem namespace for suite-level summary/log artifacts."""
+    return Path(suite.defaults.workdir).expanduser().resolve() / suite.suite
+
+
+def _suite_summary_path(suite: Suite) -> Path:
+    """Path to a suite-level summary."""
+    return _suite_dir(suite) / "suite_summary.yaml"
+
+
+def _suite_log_path(suite: Suite) -> Path:
+    """Path to a suite-level run log."""
+    return _suite_dir(suite) / "run.log"
+
+
+@contextlib.contextmanager
+def _file_log_handler(path: Path) -> Iterator[None]:
+    """Attach a durable file handler for phasesweep logs."""
+    logger = logging.getLogger("phasesweep")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s %(levelname).1s %(name)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler.setLevel(logging.DEBUG)
+    old_level = logger.level
+    if old_level in (logging.NOTSET, 0) or old_level > logging.INFO:
+        logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+        logger.setLevel(old_level)
+
+
+@contextlib.contextmanager
+def _run_log_handler(experiment: Experiment) -> Iterator[None]:
+    """Attach a durable file handler for one experiment run."""
+    with _file_log_handler(_run_log_path(experiment)):
+        yield
+
+
+def _write_trials_csv(study: optuna.Study, path: Path) -> None:
+    """Snapshot every trial in ``study`` to ``path`` as stdlib CSV."""
+    trials = study.get_trials(deepcopy=False)
+    if not trials:
+        return
+    param_names = sorted({n for t in trials for n in t.params})
+    attr_names = sorted({n for t in trials for n in t.user_attrs})
+    fieldnames = [
+        "number",
+        "state",
+        "value",
+        "datetime_start",
+        "datetime_complete",
+        "duration",
+        *[f"param:{n}" for n in param_names],
+        *[f"user_attr:{n}" for n in attr_names],
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for t in trials:
+            row: dict[str, Any] = {
+                "number": t.number,
+                "state": t.state.name,
+                "value": t.value,
+                "datetime_start": t.datetime_start,
+                "datetime_complete": t.datetime_complete,
+                "duration": t.duration,
+            }
+            for n in param_names:
+                row[f"param:{n}"] = t.params.get(n)
+            for n in attr_names:
+                row[f"user_attr:{n}"] = t.user_attrs.get(n)
+            writer.writerow(row)
+
+
+def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
+    """Load persisted gate result payload for a selected trial."""
+    for trial in study.get_trials(deepcopy=False):
+        if trial.number != trial_number:
+            continue
+        raw = trial.user_attrs.get(GATES_ATTR)
+        if not isinstance(raw, str) or not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> None:
+    """Persist a phase winner.
+
+    The phase fingerprint is included so ``_load_winner`` can refuse stale
+    winners on ``--from-phase`` resume (review v0.5.6 / blocker 3). Real
+    winners always carry a fingerprint by construction in ``_run_phase``;
+    placeholder winners (dry-run skip) are never saved.
+
+    Args:
+        experiment: Parsed experiment config; supplies the metric name used
+            in the persisted payload.
+        phase_name: Name of the phase whose winner is being saved.
+        winner: The winning trial. Must have ``phase_fingerprint`` set.
+
+    Raises:
+        RuntimeError: ``winner.phase_fingerprint`` is ``None``. This is an
+            internal invariant; placeholder winners must not reach this path.
+
+    """
+    if winner.phase_fingerprint is None:
+        # Defense in depth: should not happen — _run_phase always sets
+        # this before calling _save_winner. Failing loudly here prevents a
+        # silently un-resumable winner from landing on disk.
+        raise RuntimeError(
+            f"Refusing to save winner for phase {phase_name!r} without a "
+            "phase_fingerprint. This is an internal invariant — please file "
+            "a bug."
+        )
+
+    path = _winner_path(experiment, phase_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "phase": phase_name,
+        "trial_number": winner.trial_number,
+        "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
+        "params": winner.params,
+        "effective_overrides": winner.effective_overrides,
+        "constraints": winner.constraints,
+        "gates": winner.gates,
+        "completion": winner.completion,
+        "phase_fingerprint": winner.phase_fingerprint,
+    }
+    if winner.promotion is not None:
+        payload["promotion"] = winner.promotion
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+
+def _save_promotion_decision(
+    experiment: Experiment,
+    phase_name: str,
+    decision: dict[str, Any],
+) -> None:
+    """Persist a phase promotion decision independently of exposed winner state."""
+    path = _promotion_decision_path(experiment, phase_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(decision, sort_keys=False))
+
+
+def _load_winner(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+) -> Winner:
+    """Load a phase winner from disk and verify it matches the *current* config.
+
+    ``--from-phase`` skips earlier phases by reading their persisted winners.
+    Without verification, editing a parent phase's YAML between runs leaves
+    the child phase silently inheriting the *old* winner against the *new*
+    parent config — a correctness bug, not just a performance one.
+
+    We re-compute the fingerprint of the current parent ``phase`` against the
+    currently-resolved ``inherited_winners`` and refuse the load if either
+    (a) the stored winner has no fingerprint at all (legacy or hand-edited),
+    or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
+
+    Args:
+        experiment: Parsed experiment config.
+        phase: The phase whose winner is being loaded.
+        inherited_winners: Winners loaded for phases earlier in the chain;
+            contribute to the recomputed fingerprint.
+
+    Returns:
+        The reconstructed :class:`Winner` for ``phase``.
+
+    Raises:
+        FileNotFoundError: ``winner.yaml`` does not exist for the phase.
+        RuntimeError: The file is unfingerprinted (legacy/hand-edited) or its
+            fingerprint disagrees with the freshly computed one.
+
+    """
+    path = _winner_path(experiment, phase.name)
+    if not path.is_file():
+        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
+
+    data = yaml.safe_load(path.read_text())
+
+    from phasesweep.engine.guards import _phase_fingerprint
+
+    current_fp = _phase_fingerprint(experiment, phase, inherited_winners)
+    stored_fp = data.get("phase_fingerprint")
+
+    if stored_fp is None:
+        raise RuntimeError(
+            f"Winner file {path} has no phase_fingerprint. Refusing to use it "
+            f"for --from-phase because phasesweep cannot prove it matches the "
+            f"current config for skipped phase {phase.name!r}. Re-run the "
+            f"phase, or — if you know the config is unchanged — delete the "
+            f"file and re-run to regenerate it with a fingerprint."
+        )
+
+    if stored_fp != current_fp:
+        raise RuntimeError(
+            f"Winner file {path} was produced by a different phase config "
+            f"(stored fingerprint {stored_fp[:16]}... != current "
+            f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "
+            f"experiment name, or restore the matching config before resuming."
+        )
+
+    completion = data["completion"]
+    if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
+        raise RuntimeError(
+            f"Winner file {path} records an incomplete phase result. Refusing to "
+            f"use it for skipped phase {phase.name!r} unless the current config "
+            "sets allow_incomplete_on_timeout: true."
+        )
+
+    return Winner(
+        trial_number=int(data["trial_number"]),
+        params=dict(data["params"]),
+        effective_overrides=dict(data["effective_overrides"]),
+        metric=float(data["metric"][experiment.metric.name]),
+        constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
+        gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
+        completion=dict(completion),
+        promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
+        phase_fingerprint=str(stored_fp),
+    )

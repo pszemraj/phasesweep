@@ -14,22 +14,21 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.orchestrator import (
-    _reap_stale_trials,
-)
-from phasesweep.process import (
+from phasesweep.engine.guards import _reap_stale_trials
+from phasesweep.engine.state import TRIAL_DIR_ATTR
+from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.runtime.process import (
     _defer_shutdown_signals,
     _shutdown_handler,
     _terminate_process_group,
     run_supervised,
 )
-from phasesweep.runner import UnsafeProcessCleanupError
 from tests.conftest import make_experiment
 
 
 def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch group termination to clean up the group but report uncertainty."""
-    import phasesweep.process as _process
+    import phasesweep.runtime.process as _process
 
     real_terminate = _process._terminate_process_group
 
@@ -38,7 +37,7 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
         return False
 
     monkeypatch.setattr(
-        "phasesweep.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_group",
         terminate_then_report_uncertain,
     )
 
@@ -218,8 +217,8 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     killed: list[tuple[int, int]] = []
     active: dict[int, object] = {1234: object()}
 
-    monkeypatch.setattr("phasesweep.process._active_children", active)
-    monkeypatch.setattr("phasesweep.process._process_group_alive", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
 
     def fake_killpg(pgid: int, sig: int) -> None:
         killed.append((pgid, sig))
@@ -253,8 +252,8 @@ def test_terminate_process_group_returns_false_when_group_survives_sigkill(
     def fake_killpg(pgid: int, sig: int) -> None:
         calls.append((pgid, sig))
 
-    monkeypatch.setattr("phasesweep.process.os.killpg", fake_killpg)
-    monkeypatch.setattr("phasesweep.process._process_group_alive", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
 
     assert _terminate_process_group(1234, grace_seconds=0.0) is False
     # Both SIGTERM and SIGKILL must have been attempted.
@@ -271,7 +270,7 @@ def test_terminate_process_group_returns_true_when_already_gone(
     def raise_lookup(pgid: int, sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr("phasesweep.process.os.killpg", raise_lookup)
+    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", raise_lookup)
     assert _terminate_process_group(1234, grace_seconds=0.0) is True
 
 
@@ -283,7 +282,7 @@ def test_terminate_process_group_returns_false_on_permission_error(
     def raise_perm(pgid: int, sig: int) -> None:
         raise PermissionError
 
-    monkeypatch.setattr("phasesweep.process.os.killpg", raise_perm)
+    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", raise_perm)
     assert _terminate_process_group(1234, grace_seconds=0.0) is False
 
 
@@ -298,13 +297,13 @@ def test_reaper_raises_when_cleanup_uncertain(
     """
 
     monkeypatch.setattr(
-        "phasesweep.process.read_stale_process_identity",
+        "phasesweep.engine.guards.read_stale_process_identity",
         lambda trial_dir: __import__(
-            "phasesweep.process", fromlist=["StaleProcessIdentity"]
+            "phasesweep.runtime.process", fromlist=["StaleProcessIdentity"]
         ).StaleProcessIdentity(pid=99999, pgid=99999, starttime=12345),
     )
     monkeypatch.setattr(
-        "phasesweep.process.kill_stale_group",
+        "phasesweep.engine.guards.kill_stale_group",
         lambda pid, starttime, *, pgid: False,
     )
 
@@ -313,6 +312,7 @@ def test_reaper_raises_when_cleanup_uncertain(
 
     # Inject one RUNNING trial so the reaper has something to chew on.
     trial = study.ask()
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
     with pytest.raises(RuntimeError, match="cleanup could not prove"):
@@ -330,7 +330,7 @@ def test_public_run_experiment_installs_signal_handlers(
     def fake_install() -> None:
         installed["called"] = True
 
-    monkeypatch.setattr("phasesweep.process.install_signal_handlers", fake_install)
+    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
 
     # Minimal trial_command that writes the metric file the JsonExtractor expects.
     # Avoid {} literals in the script so the override-template parser doesn't
@@ -357,7 +357,7 @@ def test_dry_run_does_not_install_signal_handlers(
     def fake_install() -> None:
         installed["called"] = True
 
-    monkeypatch.setattr("phasesweep.process.install_signal_handlers", fake_install)
+    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
 
     exp = make_experiment(workdir=tmp_path / "runs")
     run_experiment(exp, dry_run=True)
@@ -382,6 +382,32 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, before)
 
 
+def test_install_signal_handlers_unblocks_inherited_shutdown_mask() -> None:
+    """Startup should recover if the orchestrator inherited blocked SIGTERM."""
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask not available")
+
+    code = r"""
+import os, signal
+from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals
+signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
+install_signal_handlers()
+with _defer_shutdown_signals():
+    print("queued", flush=True)
+    os.kill(os.getpid(), signal.SIGTERM)
+print("post-context", flush=True)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        timeout=5.0,
+        check=False,
+    )
+    assert "queued" in proc.stdout
+    assert proc.returncode == 128 + signal.SIGTERM
+
+
 def test_launch_lock_serializes_signal_handler_against_in_flight_launch() -> None:
     """The shutdown handler must wait for ``_launch_lock`` before snapshotting.
 
@@ -390,7 +416,7 @@ def test_launch_lock_serializes_signal_handler_against_in_flight_launch() -> Non
     handler is a function that takes the same lock and snapshots
     ``_active_children``. It must block until the worker finishes register.
     """
-    from phasesweep.process import _active_children, _launch_lock, _lock
+    from phasesweep.runtime.process import _active_children, _launch_lock, _lock
 
     snapshot_done = threading.Event()
     snapshot: list[int] = []
@@ -444,7 +470,7 @@ def test_pending_sigterm_during_launch_context_does_not_deadlock() -> None:
     """
     code = r"""
 import os, signal
-from phasesweep.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
+from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
 install_signal_handlers()
 with _defer_shutdown_signals(), _launch_lock:
     print("queued", flush=True)
@@ -472,7 +498,7 @@ def test_signal_while_registry_lock_held_does_not_deadlock() -> None:
     """
     code = r"""
 import os, signal
-from phasesweep.process import install_signal_handlers, _defer_shutdown_signals, _lock
+from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _lock
 install_signal_handlers()
 with _defer_shutdown_signals():
     with _lock:

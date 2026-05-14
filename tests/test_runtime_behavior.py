@@ -11,8 +11,8 @@ import pytest
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
-from phasesweep.orchestrator import _load_winner
-from phasesweep.selector import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import _load_winner
 from tests.conftest import REPO, write_trainer, write_yaml
 
 
@@ -104,10 +104,6 @@ phases:
 
 def test_failed_trials_marked_fail_not_complete(tmp_path):
     """Process crashes should produce FAIL trials, not COMPLETE with inf."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
-
     db_path = tmp_path / "phases.db"
     yaml_text = f"""
 experiment: fail_state_test
@@ -177,7 +173,7 @@ phases:
     p = tmp_path / "exp.yaml"
     p.write_text(yaml_text)
     exp = load_experiment(p)
-    from phasesweep.selector import NoFeasibleTrialError
+    from phasesweep.engine.selection import NoFeasibleTrialError
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
@@ -250,7 +246,7 @@ phases:
     p = tmp_path / "exp.yaml"
     p.write_text(yaml_text)
     exp = load_experiment(p)
-    from phasesweep.selector import NoFeasibleTrialError
+    from phasesweep.engine.selection import NoFeasibleTrialError
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
@@ -297,7 +293,7 @@ phases:
     p.write_text(yaml_text)
     exp = load_experiment(p)
 
-    from phasesweep.selector import NoFeasibleTrialError
+    from phasesweep.engine.selection import NoFeasibleTrialError
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)

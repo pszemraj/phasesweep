@@ -1,0 +1,199 @@
+"""Evidence extractor and gate config models."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from pydantic import Field, field_validator, model_validator
+
+from phasesweep.config.common import _Frozen, _validate_optional_bounds
+
+
+def _validate_trial_path(value: str) -> str:
+    """Require a non-empty path inside the trial directory."""
+    path = Path(value)
+    if not value or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"trial-relative path required; got {value!r}.")
+    return value
+
+
+def _validate_json_key(value: str | None) -> str | None:
+    """Require dotted JSON keys with non-empty segments."""
+    if value is None:
+        return None
+    if not value or any(not part for part in value.split(".")):
+        raise ValueError(f"JSON key must be a non-empty dotted path; got {value!r}.")
+    return value
+
+
+class _TrialPathModel(_Frozen):
+    @field_validator("path", "file", check_fields=False)
+    @classmethod
+    def _trial_path_is_relative(cls, value: str) -> str:
+        """Validate trial-relative path fields."""
+        return _validate_trial_path(value)
+
+
+class _JsonKeyModel(_Frozen):
+    @field_validator("key", check_fields=False)
+    @classmethod
+    def _json_key_is_valid(cls, value: str | None) -> str | None:
+        """Validate dotted JSON key fields."""
+        return _validate_json_key(value)
+
+
+class JsonExtractor(_TrialPathModel, _JsonKeyModel):
+    """Extract a scalar from a JSON file via a dot-separated key path."""
+
+    type: Literal["json"]
+    path: str = Field(description="Path relative to trial_dir, e.g. 'result.json'.")
+    key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
+
+
+class LogRegexExtractor(_TrialPathModel):
+    """Extract a scalar from a log file via regex with a named 'value' group."""
+
+    type: Literal["log_regex"]
+    file: str = Field(
+        default="stdout.log",
+        description=(
+            "File relative to trial_dir. 'stdout.log' and 'stderr.log' are written "
+            "automatically; supply a custom path if your trainer logs elsewhere."
+        ),
+    )
+    pattern: str = Field(
+        description=(
+            "Python regex with a named group 'value' that captures the metric. "
+            r"Example: r'eval_loss=(?P<value>[0-9.eE+-]+)'."
+        )
+    )
+    select: Literal["last", "first", "min", "max"] = "last"
+
+
+class WandbExtractor(_Frozen):
+    """Extract a scalar from a completed W&B run's summary."""
+
+    type: Literal["wandb"]
+    entity: str
+    project: str
+    run_name_template: str = Field(
+        default="{experiment}-{phase}-{trial_id}",
+        description=(
+            "Template the trial uses to name its W&B run. Available substitutions: "
+            "{experiment}, {phase}, {trial_id}, {run_name}."
+        ),
+    )
+    metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
+    poll_seconds: float = Field(default=2.0, gt=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=0.0)
+
+
+Extractor = JsonExtractor | LogRegexExtractor | WandbExtractor
+
+
+class RequiredFileGate(_TrialPathModel):
+    """Require a file to exist under the trial directory."""
+
+    type: Literal["required_file"]
+    path: str
+
+
+class JsonEqualsGate(_TrialPathModel, _JsonKeyModel):
+    """Require a JSON key to equal an expected scalar value."""
+
+    type: Literal["json_equals"]
+    path: str
+    key: str
+    value: Any
+
+
+class JsonScalarBoundGate(_TrialPathModel, _JsonKeyModel):
+    """Require a JSON key to be a finite scalar within optional bounds."""
+
+    type: Literal["json_scalar_bound"]
+    path: str
+    key: str
+    min: float | None = None
+    max: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> JsonScalarBoundGate:
+        """Reject empty/non-finite bounds and ``min > max``."""
+        _validate_optional_bounds(
+            label="json_scalar_bound gate",
+            min_value=self.min,
+            max_value=self.max,
+        )
+        return self
+
+
+class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
+    """Require artifact bytes to fall inside optional bounds."""
+
+    type: Literal["artifact_size"]
+    source: Literal["file", "directory", "json"]
+    path: str
+    key: str | None = None
+    min_bytes: int | None = Field(default=None, ge=0)
+    max_bytes: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_source_and_bounds(self) -> ArtifactSizeGate:
+        """Reject ambiguous source specs and invalid byte bounds."""
+        if self.source == "json" and self.key is None:
+            raise ValueError("artifact_size gate with source=json must define key.")
+        if self.source != "json" and self.key is not None:
+            raise ValueError("artifact_size gate key is only valid with source=json.")
+        if self.min_bytes is None and self.max_bytes is None:
+            raise ValueError("artifact_size gate must define min_bytes and/or max_bytes.")
+        if (
+            self.min_bytes is not None
+            and self.max_bytes is not None
+            and self.min_bytes > self.max_bytes
+        ):
+            raise ValueError(
+                f"artifact_size gate min_bytes ({self.min_bytes}) must be <= "
+                f"max_bytes ({self.max_bytes})."
+            )
+        return self
+
+
+class Sha256Gate(_TrialPathModel):
+    """Require a file's SHA-256 digest to match an expected hex string."""
+
+    type: Literal["sha256"]
+    path: str
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256(cls, value: str) -> str:
+        """Require a full 64-character lowercase/uppercase hex digest."""
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("sha256 gate requires a full 64-character hex digest.")
+        return value.lower()
+
+
+class WandbSummaryRequiredGate(_Frozen):
+    """Require keys to be present in a completed W&B run summary."""
+
+    type: Literal["wandb_summary_required"]
+    entity: str
+    project: str
+    keys: list[str] = Field(min_length=1)
+    run_name_template: str = "{experiment}-{phase}-{trial_id}"
+    poll_seconds: float = Field(default=2.0, gt=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=0.0)
+
+
+Gate = Annotated[
+    RequiredFileGate
+    | JsonEqualsGate
+    | JsonScalarBoundGate
+    | ArtifactSizeGate
+    | Sha256Gate
+    | WandbSummaryRequiredGate,
+    Field(discriminator="type"),
+]

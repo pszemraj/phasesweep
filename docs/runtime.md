@@ -31,7 +31,7 @@ Every trial runs in a new process group via `start_new_session=True`. Timeouts a
 
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
-Launch is protected by a lock plus signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
+Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
 
 If cleanup cannot prove the process group is gone, phasesweep fails closed with `UnsafeProcessCleanupError`. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
 
@@ -39,7 +39,9 @@ If cleanup cannot prove the process group is gone, phasesweep fails closed with 
 
 On startup and before skipped phases in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
 
-1. Read the persisted `phasesweep_trial_dir` user attribute.
+1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the
+   canonical trial directory when a crash left a pre-launch `RUNNING` trial
+   before that attr was written.
 2. Match PID plus process start time to avoid PID-reuse kills.
 3. Fall back to PGID cleanup when the root PID is gone but descendants remain.
 4. Mark the trial `FAIL` only after cleanup is confirmed.
@@ -50,10 +52,10 @@ Reaping runs before fingerprint checks, so a config mismatch cannot leave old GP
 
 phasesweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
-A run takes two same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
+A run always takes same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
-- Storage lock: canonical Optuna storage identity plus experiment name.
+- Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
 
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 

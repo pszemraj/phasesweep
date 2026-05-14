@@ -13,11 +13,11 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.orchestrator import (
+from phasesweep.engine import run_experiment
+from phasesweep.engine.state import (
     _experiment_dir,
     _phase_dir,
     _summary_path,
-    run_experiment,
 )
 from tests.conftest import make_experiment, write_constant_trainer
 

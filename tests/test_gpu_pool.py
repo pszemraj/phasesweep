@@ -10,7 +10,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
 )
-from phasesweep.gpu_pool import GpuPool, _gpu_lock_path
+from phasesweep.runtime.gpu import GpuPool, _gpu_lock_path
 
 
 def test_gpu_pool_explicit_ids_from_yaml(tmp_path):
@@ -28,7 +28,7 @@ def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
     """n_jobs > 1 with no GPUs and allow_no_gpu=False must raise, not silently degrade."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     # Force nvidia-smi to fail
-    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
     with pytest.raises(RuntimeError, match="no GPUs detected"):
         GpuPool.create(n_jobs=4, allow_no_gpu=False)
 
@@ -36,7 +36,7 @@ def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
 def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
     """n_jobs > 1 with allow_no_gpu=True should warn but not crash."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True)
     with pool.acquire() as gid:
         assert gid is None
@@ -52,7 +52,7 @@ def test_explicit_gpu_ids_honored_for_single_job():
 def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
     """Single-job GPU work still takes a host-wide lease when a GPU is visible."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [3, 4])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [3, 4])
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -63,7 +63,7 @@ def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
 def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
     """CPU-only single-job work does not need an explicit no-GPU opt-in."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.gpu_pool._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -103,14 +103,19 @@ def test_explicit_gpu_ids_dedupe_preserves_order():
     assert pool._gpu_ids == [2, 0, 1]
 
 
-def test_gpu_pool_skips_host_locked_gpu() -> None:
+def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
     """A second phasesweep process must not double-book a host-locked GPU."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     lock_path = _gpu_lock_path(3)
+    holder_marker = "holder-pid\n"
     with lock_path.open("w") as held:
+        held.write(holder_marker)
+        held.flush()
         fcntl.flock(held, fcntl.LOCK_EX)
         pool = GpuPool.create(n_jobs=1, explicit_ids=[3, 4])
         with pool.acquire() as gid:
             assert gid == 4
+        assert lock_path.read_text() == holder_marker
         fcntl.flock(held, fcntl.LOCK_UN)
 
 

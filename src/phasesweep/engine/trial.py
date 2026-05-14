@@ -15,12 +15,17 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
-from phasesweep.extractors import ExtractorError, TrialContext, run_extractor
-from phasesweep.gates import GateResult, evaluate_gates
-from phasesweep.overrides import render_command
-from phasesweep.process import ProcessResult, run_supervised
+from phasesweep.evidence.evaluation import (
+    ExtractorError,
+    GateResult,
+    TrialContext,
+    evaluate_gates,
+    run_extractor,
+)
+from phasesweep.runtime.commands import render_command
+from phasesweep.runtime.process import ProcessResult, run_supervised
 
-log = logging.getLogger("phasesweep.runner")
+log = logging.getLogger("phasesweep.engine.trial")
 
 
 @dataclass

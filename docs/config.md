@@ -142,8 +142,8 @@ studies:
           lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
 ```
 
-Each study compiles to an experiment named `<suite>__<study>`. Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`.
+Each study compiles to an experiment named `<suite>__<study>`. Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase.
 
 ## Validation
 
-Config-load validation rejects graph errors, duplicate YAML keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, unknown contracts, and stale or incompatible inherited keys.
+Config-load validation rejects graph errors, duplicate YAML keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, and unknown contracts. Resume checks reject stale studies and incompatible persisted winners.

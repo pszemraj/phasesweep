@@ -1,26 +1,83 @@
-"""Shared parsing utilities for Optuna storage URLs.
-
-Two callers need the same notion of "what backend is this URL?":
-
-* :func:`phasesweep.config._validate_storage_policy` — must reject SQLite under
-  ``n_jobs > 1`` regardless of which SQLAlchemy dialect was spelled
-  (``sqlite:///``, ``sqlite+pysqlite:///``, ``sqlite+pysqlcipher:///``, ...).
-* :func:`canonical_storage_identity` — must produce
-  the same lock-identity string for two URLs that point at the same SQLite
-  file even if their dialect differs, so the same-host lock collides.
-
-Pre-v0.5.8 each caller hand-rolled ``startswith("sqlite:///")`` and missed
-driver-qualified URLs (review v0.5.7 / blocker 1). Centralizing the parser
-removes the duplication and the bypass.
-
-The implementation deliberately avoids importing SQLAlchemy directly: scheme
-parsing is trivial, and we want config validation to keep working even if
-SQLAlchemy is later trimmed from the dependency tree.
-"""
+"""Filesystem, lock, timeout, and storage-URL runtime helpers."""
 
 from __future__ import annotations
 
+import contextlib
+import os
+import queue
+import tempfile
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import IO, Any, TypeVar
+
+T = TypeVar("T")
+
+
+def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
+    """Run a blocking function in a daemon thread and bound caller wait time."""
+    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            q.put((True, fn()))
+        except Exception as exc:  # noqa: BLE001
+            q.put((False, exc))
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.0, timeout))
+    if thread.is_alive():
+        raise TimeoutError(f"call exceeded {timeout:g}s")
+    ok, value = q.get_nowait()
+    if ok:
+        return value
+    raise value
+
+
+def lock_dir() -> Path:
+    """Return the shared same-host phasesweep lock directory."""
+    path = Path(tempfile.gettempdir()) / "phasesweep-locks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def try_lock_file(path: Path) -> IO[str] | None:
+    """Open ``path`` without truncating and take an exclusive flock, or return ``None``."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Create the file if needed, but preserve holder diagnostics until we own it.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def unlock_file(handle: IO[str]) -> None:
+    """Release and close a handle returned by :func:`try_lock_file`."""
+    import fcntl
+
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        handle.close()
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
+    """Hold a non-blocking exclusive flock for the context duration."""
+    handle = try_lock_file(path)
+    if handle is None:
+        raise RuntimeError(busy_message)
+    try:
+        yield
+    finally:
+        unlock_file(handle)
 
 
 def storage_backend(storage: str | None) -> str | None:
@@ -54,7 +111,7 @@ def storage_backend(storage: str | None) -> str | None:
     return scheme.split("+", 1)[0]
 
 
-def _file_url_path(storage: str) -> str:
+def file_url_path(storage: str) -> str:
     """Return the filesystem path component of a phasesweep file-style URL.
 
     SQLAlchemy's URL grammar for file-based backends uses three slashes for
@@ -123,13 +180,13 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     backend = storage_backend(storage)
 
     if backend == "sqlite":
-        database = _file_url_path(storage)
+        database = file_url_path(storage)
         if database in ("", ":memory:"):
             return "sqlite:///:memory:"
         return "sqlite:///" + str(Path(database).expanduser().resolve())
 
     if backend == "journal":
-        path = _file_url_path(storage)
+        path = file_url_path(storage)
         return "journal:///" + str(Path(path).expanduser().resolve())
 
     # RDB URLs (postgres, mysql, ...) are passed through.

@@ -20,8 +20,8 @@ from phasesweep.config import (
     RequiredFileGate,
     Suite,
 )
-from phasesweep.gates import evaluate_gates
-from phasesweep.orchestrator import run_experiment
+from phasesweep.engine import run_experiment
+from phasesweep.evidence.evaluation import evaluate_gates
 from tests.conftest import make_experiment, make_trial_context, write_trainer, write_yaml
 
 

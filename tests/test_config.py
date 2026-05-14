@@ -12,28 +12,6 @@ from phasesweep.config import (
 from tests.conftest import write_yaml
 
 
-def test_load_example(tmp_path):
-    cfg = tmp_path / "exp.yaml"
-    cfg.write_text(
-        """
-experiment: t
-storage: sqlite:///./db.sqlite
-workdir: ./runs
-trial_command: "echo {trial_dir} {overrides}"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
-phases:
-  - name: a
-    n_trials: 2
-    search_space: { x: { type: float, low: 0.0, high: 1.0 } }
-"""
-    )
-    exp = load_experiment(cfg)
-    assert exp.phases[0].name == "a"
-
-
 def test_inherit_must_be_prior(tmp_path):
     cfg = tmp_path / "exp.yaml"
     cfg.write_text(
@@ -116,11 +94,10 @@ def test_phase_name_validation():
 # ---- migrated from version-named files ----
 
 
-def test_duplicate_top_level_key_rejected(tmp_path: Path) -> None:
-    """Two ``trial_command`` entries → load fails. Pre-v0.5.7 this silently
-    kept the second value with no warning.
-    """
-    body = """
+@pytest.mark.parametrize(
+    "body",
+    [
+        """
 experiment: t
 storage: ":memory:"
 trial_command: "first {overrides}"
@@ -133,16 +110,8 @@ phases:
   - name: a
     n_trials: 1
     search_space: { x: { type: float, low: 0, high: 1 } }
-"""
-    with pytest.raises(ValueError, match="duplicate key"):
-        load_experiment(write_yaml(tmp_path, body))
-
-
-def test_duplicate_search_space_key_rejected(tmp_path: Path) -> None:
-    """Two ``lr`` entries in a search space → load fails. This is the
-    reviewer's example: silent overwrite of a sweep range.
-    """
-    body = """
+""",
+        """
 experiment: t
 storage: ":memory:"
 trial_command: "echo {overrides}"
@@ -156,13 +125,8 @@ phases:
     search_space:
       lr: {type: float, low: 1e-5, high: 1e-3, log: true}
       lr: {type: float, low: 1e-4, high: 1e-2, log: true}
-"""
-    with pytest.raises(ValueError, match="duplicate key"):
-        load_experiment(write_yaml(tmp_path, body))
-
-
-def test_duplicate_phase_keys_within_one_phase_rejected(tmp_path: Path) -> None:
-    body = """
+""",
+        """
 experiment: t
 storage: ":memory:"
 trial_command: "echo {overrides}"
@@ -175,7 +139,12 @@ phases:
     n_trials: 1
     n_trials: 5
     search_space: { x: { type: float, low: 0, high: 1 } }
-"""
+""",
+    ],
+    ids=["top_level", "search_space", "phase_mapping"],
+)
+def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str) -> None:
+    """Duplicate keys fail loudly anywhere in the config tree."""
     with pytest.raises(ValueError, match="duplicate key"):
         load_experiment(write_yaml(tmp_path, body))
 

@@ -1,4 +1,4 @@
-"""Same-host advisory locks: phase lock, experiment-level run lock, output namespace lock, and storage-identity lock. Two orchestrators against the same on-disk state must collide; against unrelated state they must not."""
+"""Same-host advisory run locks: output namespace and storage identity."""
 
 from __future__ import annotations
 
@@ -7,145 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import (
-    Experiment,
-    FloatParam,
-    IntParam,
-    JsonExtractor,
-    Metric,
-    Phase,
-)
-from phasesweep.orchestrator import (
+from phasesweep.config import FloatParam, IntParam, Phase
+from phasesweep.engine import run_experiment
+from phasesweep.engine.guards import (
     _experiment_lock,
-    _phase_lock,
-    _phase_lock_path,
     _run_lock_paths,
-    run_experiment,
 )
 from tests.conftest import make_experiment
-
-
-def test_phase_lock_blocks_second_acquirer(tmp_path: Path) -> None:
-    """Two processes targeting the same experiment::phase fail fast on the second."""
-    exp = make_experiment(workdir=tmp_path / "wd")
-    phase = exp.phases[0]
-
-    held = threading.Event()
-    released = threading.Event()
-    second_error: list[BaseException] = []
-
-    def hold_first() -> None:
-        with _phase_lock(exp, phase):
-            held.set()
-            released.wait(timeout=5.0)
-
-    t = threading.Thread(target=hold_first, daemon=True)
-    t.start()
-    assert held.wait(timeout=2.0)
-
-    try:
-        with _phase_lock(exp, phase):
-            pytest.fail("second lock acquisition should have raised")
-    except RuntimeError as exc:  # noqa: BLE001
-        second_error.append(exc)
-
-    released.set()
-    t.join(timeout=2.0)
-
-    assert len(second_error) == 1
-    assert "Another phasesweep process" in str(second_error[0])
-
-
-def test_phase_lock_distinct_phases_dont_collide(tmp_path: Path) -> None:
-    """Lock is per-phase, not per-experiment — different phases can coexist."""
-    base: dict[str, object] = dict(
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=10)},
-    )
-    exp = Experiment(
-        experiment="t",
-        workdir=str(tmp_path / "wd"),
-        trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[
-            Phase(name="a", **base),  # type: ignore[arg-type]
-            Phase(name="b", **base),  # type: ignore[arg-type]
-        ],
-    )
-
-    # Different phase, same experiment, same host — must succeed.
-    with _phase_lock(exp, exp.phases[0]), _phase_lock(exp, exp.phases[1]):
-        pass
-
-
-@pytest.mark.parametrize("storage_name", ["shared.db", "shared.journal"])
-def test_phase_lock_collides_for_same_storage_different_workdirs(
-    tmp_path: Path,
-    storage_name: str,
-) -> None:
-    """Two configs sharing storage but different workdirs must collide."""
-    scheme = "journal" if storage_name.endswith(".journal") else "sqlite"
-    storage = f"{scheme}:///{tmp_path / storage_name}"
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
-
-    held = threading.Event()
-    released = threading.Event()
-
-    def hold_first() -> None:
-        with _phase_lock(exp_a, exp_a.phases[0]):
-            held.set()
-            released.wait(timeout=5.0)
-
-    t = threading.Thread(target=hold_first, daemon=True)
-    t.start()
-    assert held.wait(timeout=2.0)
-
-    try:
-        with _phase_lock(exp_b, exp_b.phases[0]):
-            pytest.fail("second lock should have been blocked")
-    except RuntimeError as exc:
-        assert "Another phasesweep process" in str(exc)
-
-    released.set()
-    t.join(timeout=2.0)
-
-
-def test_phase_lock_does_not_collide_for_different_storage(
-    tmp_path: Path,
-) -> None:
-    """Different storage backends = different studies = no lock collision."""
-    exp_a = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'a.db'}"
-    )
-    exp_b = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'b.db'}"
-    )
-
-    with _phase_lock(exp_a, exp_a.phases[0]), _phase_lock(exp_b, exp_b.phases[0]):
-        pass  # must not raise
-
-
-def test_in_memory_lock_collides_on_same_workdir(tmp_path: Path) -> None:
-    """In-memory storage: no shared study, so lock falls back to workdir+study."""
-    exp_a = make_experiment(workdir=str(tmp_path / "runs"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"))
-
-    path_a = _phase_lock_path(exp_a, exp_a.phases[0])
-    path_b = _phase_lock_path(exp_b, exp_b.phases[0])
-    assert path_a == path_b
-
-
-def test_in_memory_lock_does_not_collide_on_different_workdir(
-    tmp_path: Path,
-) -> None:
-    """In-memory storage with different workdirs = separate studies."""
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"))
-
-    path_a = _phase_lock_path(exp_a, exp_a.phases[0])
-    path_b = _phase_lock_path(exp_b, exp_b.phases[0])
-    assert path_a != path_b
 
 
 def test_run_lock_collides_for_same_storage_different_workdirs(
@@ -317,16 +185,6 @@ def test_in_memory_run_lock_does_not_collide_for_different_workdirs(
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 
-def test_run_lock_paths_differ_from_phase_lock_path(tmp_path: Path) -> None:
-    """Run lock(s) and phase lock must be distinct files for the same
-    experiment, so a phase lock held internally never blocks an outer run lock
-    of the same identity (and vice versa).
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
-    assert _phase_lock_path(exp, exp.phases[0]) not in _run_lock_paths(exp)
-
-
 def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> None:
     """A second concurrent ``run_experiment`` against the same experiment
     fails fast with the expected error while the run lock is held.
@@ -378,13 +236,3 @@ def test_run_experiment_dry_run_does_not_take_experiment_lock(tmp_path: Path) ->
         # Dry-run must succeed with the run lock held by another caller.
         winners = run_experiment(exp_b, dry_run=True)
         assert "p" in winners
-
-
-def test_phase_lock_still_works_under_held_run_lock(tmp_path: Path) -> None:
-    """The two locks have distinct files, so holding the run lock for an
-    experiment must not block a phase lock for the same experiment.
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
-    with _experiment_lock(exp), _phase_lock(exp, exp.phases[0]):
-        pass  # must not raise

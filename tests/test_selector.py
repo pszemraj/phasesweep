@@ -8,7 +8,8 @@ from phasesweep.config import (
     JsonExtractor,
     Phase,
 )
-from phasesweep.selector import NoFeasibleTrialError, select_winner
+from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
+from phasesweep.engine.state import FEASIBLE_ATTR, constraint_attr
 from tests.conftest import make_experiment
 
 
@@ -31,9 +32,9 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
     for k, v in (params or {}).items():
         distributions[k] = optuna.distributions.IntDistribution(low=int(v), high=int(v))
         pvals[k] = int(v)
-    user_attrs = {"phasesweep_feasible": feasible}
+    user_attrs = {FEASIBLE_ATTR: feasible}
     for cn, cv in (constraint_vals or {}).items():
-        user_attrs[f"constraint:{cn}"] = cv
+        user_attrs[constraint_attr(cn)] = cv
     trial = optuna.trial.create_trial(
         params=pvals,
         distributions=distributions,

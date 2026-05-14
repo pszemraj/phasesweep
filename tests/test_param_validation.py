@@ -20,14 +20,12 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
-    _find_prefix_collisions,
-    _key_parts,
     check_bounds,
 )
-from phasesweep.orchestrator import (
-    _build_sampler,
-)
-from phasesweep.selector import select_winner
+from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.engine.optuna import _build_sampler
+from phasesweep.engine.selection import select_winner
+from phasesweep.engine.state import FEASIBLE_ATTR, constraint_attr
 from tests.conftest import make_experiment, write_yaml
 
 
@@ -62,47 +60,48 @@ def _exp_with_template(
     )
 
 
-def test_tpe_sampler_constant_liar_with_parallel():
-    """TPE with n_jobs > 1 should enable constant_liar."""
+def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
+    """Write a minimal grid-sampler config with caller-supplied search space."""
+    return write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        trial_command: "echo {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json, path: r.json, key: x }}
+        phases:
+          - name: p
+            n_trials: {n_trials}
+            sampler: {{ type: grid }}
+            search_space:
+{textwrap.indent(textwrap.dedent(search_space).strip(), "              ")}
+        """,
+    )
+
+
+@pytest.mark.parametrize(("n_jobs", "constant_liar"), [(4, True), (1, False)])
+def test_tpe_sampler_constant_liar_policy(n_jobs: int, constant_liar: bool) -> None:
+    """TPE enables constant_liar only for parallel optimization."""
     cfg = Sampler(type="tpe", seed=0)
     space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3])}
-    sampler = _build_sampler(cfg, space, n_jobs=4)
+    sampler = _build_sampler(cfg, space, n_jobs=n_jobs)
     assert isinstance(sampler, optuna.samplers.TPESampler)
-    # constant_liar is stored as _constant_liar in TPESampler internals
-    assert sampler._constant_liar is True
-
-
-def test_tpe_sampler_no_constant_liar_single_job():
-    """TPE with n_jobs=1 should NOT enable constant_liar."""
-    cfg = Sampler(type="tpe", seed=0)
-    space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3])}
-    sampler = _build_sampler(cfg, space, n_jobs=1)
-    assert sampler._constant_liar is False
+    assert sampler._constant_liar is constant_liar
 
 
 def test_float_param_low_gt_high():
-    from pydantic import ValidationError
-
-    from phasesweep.config import FloatParam
-
     with pytest.raises(ValidationError, match="low.*high"):
         FloatParam(type="float", low=1.0, high=0.0)
 
 
 def test_float_param_log_requires_positive():
-    from pydantic import ValidationError
-
-    from phasesweep.config import FloatParam
-
     with pytest.raises(ValidationError, match="low > 0"):
         FloatParam(type="float", low=0.0, high=1.0, log=True)
 
 
 def test_int_param_step_must_be_positive():
-    from pydantic import ValidationError
-
-    from phasesweep.config import IntParam
-
     with pytest.raises(ValidationError, match="step must be > 0"):
         IntParam(type="int", low=0, high=10, step=0)
 
@@ -123,14 +122,14 @@ def test_selector_rejects_nan_constraint_values_defensively(tmp_path):
 
     # Trial 0: clean, feasible.
     t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
-    t0.set_user_attr("phasesweep_feasible", True)
-    t0.set_user_attr("constraint:size", 100.0)
+    t0.set_user_attr(FEASIBLE_ATTR, True)
+    t0.set_user_attr(constraint_attr("size"), 100.0)
     study.tell(t0, 0.5)
 
     # Trial 1: legacy NaN constraint value but mistakenly marked feasible.
     t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
-    t1.set_user_attr("phasesweep_feasible", True)
-    t1.set_user_attr("constraint:size", float("nan"))
+    t1.set_user_attr(FEASIBLE_ATTR, True)
+    t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric — would beat trial 0 if not rejected.
 
     exp = Experiment(
@@ -175,16 +174,6 @@ def test_categorical_rejects_nan_float_choice():
         CategoricalParam(type="categorical", choices=[1.0, float("nan")])
 
 
-def test_cmaes_rejects_categorical_search_space():
-    """CMA-ES is float-only in Optuna; categorical params silently fail every trial."""
-    with pytest.raises(ValueError, match="cmaes.*does not support categorical"):
-        _build_sampler(
-            Sampler(type="cmaes", seed=0),
-            {"x": CategoricalParam(type="categorical", choices=["a", "b"])},
-            n_jobs=1,
-        )
-
-
 def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
     """`phasesweep validate` must catch CMA-ES + categorical, not first trial."""
     p = write_yaml(
@@ -208,73 +197,26 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
         load_experiment(p)
 
 
-def test_validate_rejects_grid_with_log_float(tmp_path: Path) -> None:
-    """Grid sampler cannot enumerate log-spaced floats; reject at config-load."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json, path: r.json, key: x }
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: { type: grid }
-            search_space:
-              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-        """,
-    )
-    with pytest.raises(ValidationError, match="grid.*log-scale float"):
-        load_experiment(p)
-
-
-def test_validate_rejects_grid_with_log_int(tmp_path: Path) -> None:
-    """Grid sampler cannot enumerate log-spaced ints; reject at config-load."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json, path: r.json, key: x }
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: { type: grid }
-            search_space:
-              n: { type: int, low: 1, high: 1024, log: true }
-        """,
-    )
-    with pytest.raises(ValidationError, match="grid.*log-scale int"):
-        load_experiment(p)
-
-
-def test_validate_rejects_grid_float_without_step(tmp_path: Path) -> None:
-    """Grid float without explicit step is ambiguous; reject at config-load."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json, path: r.json, key: x }
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: { type: grid }
-            search_space:
-              x: { type: float, low: 0.0, high: 1.0 }
-        """,
-    )
-    with pytest.raises(ValidationError, match="grid sampler requires 'step'"):
-        load_experiment(p)
+@pytest.mark.parametrize(
+    ("search_space", "n_trials", "match"),
+    [
+        ("lr: { type: float, low: 1e-5, high: 1e-2, log: true }", 1, "grid.*log-scale float"),
+        ("n: { type: int, low: 1, high: 1024, log: true }", 1, "grid.*log-scale int"),
+        ("x: { type: float, low: 0.0, high: 1.0 }", 1, "grid sampler requires 'step'"),
+        ("x: { type: float, low: 0.0, high: 1.0, step: 0.6 }", 1, "must be an integer"),
+        ("x: { type: categorical, choices: [1, 2, 3] }", 2, "grid sampler has 3 combinations"),
+    ],
+    ids=["log_float", "log_int", "float_no_step", "non_divisible_float", "partial_matrix"],
+)
+def test_validate_rejects_invalid_grid_configs(
+    tmp_path: Path,
+    search_space: str,
+    n_trials: int,
+    match: str,
+) -> None:
+    """Grid sampler configs must be exactly enumerable and complete by default."""
+    with pytest.raises(ValidationError, match=match):
+        load_experiment(_grid_yaml(tmp_path, search_space, n_trials=n_trials))
 
 
 @pytest.mark.parametrize(
@@ -313,53 +255,15 @@ def test_float_param_rejects_non_finite_bounds(kwargs: dict[str, float]) -> None
         FloatParam(type="float", **kwargs)
 
 
-def test_validate_rejects_non_divisible_grid_float(tmp_path: Path) -> None:
-    """low=0, high=1, step=0.6 would generate [0, 0.6, 1.2] -- 1.2 > high."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json, path: r.json, key: x }
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: { type: grid }
-            search_space:
-              x: { type: float, low: 0.0, high: 1.0, step: 0.6 }
-        """,
-    )
-    with pytest.raises(ValidationError, match="must be an integer"):
-        load_experiment(p)
-
-
 def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
     """low=0, high=1, step=0.25 -> exactly [0, 0.25, 0.5, 0.75, 1.0]."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json, path: r.json, key: x }
-        phases:
-          - name: p
-            n_trials: 5
-            sampler: { type: grid }
-            search_space:
-              x: { type: float, low: 0.0, high: 1.0, step: 0.25 }
-        """,
+    load_experiment(
+        _grid_yaml(tmp_path, "x: { type: float, low: 0.0, high: 1.0, step: 0.25 }", n_trials=5)
     )
-    load_experiment(p)  # must not raise
 
 
-def test_grid_sampler_requires_full_matrix_by_default(tmp_path: Path) -> None:
-    """Grid phases must run every combination unless explicitly allowed partial."""
+def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
+    """Partial grid phases are allowed only when explicitly requested."""
     p = write_yaml(
         tmp_path,
         """
@@ -373,12 +277,12 @@ def test_grid_sampler_requires_full_matrix_by_default(tmp_path: Path) -> None:
           - name: p
             n_trials: 2
             sampler: { type: grid }
+            allow_partial_grid: true
             search_space:
               x: { type: categorical, choices: [1, 2, 3] }
         """,
     )
-    with pytest.raises(ValidationError, match="grid sampler has 3 combinations"):
-        load_experiment(p)
+    load_experiment(p)
 
 
 def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
@@ -402,15 +306,6 @@ def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> N
     )
     with pytest.raises(ValidationError, match="both fixed_overrides and search_space"):
         load_experiment(p)
-
-
-def test_key_parts_handles_dots_and_empties() -> None:
-    """Splitter normalizes leading/trailing/double dots so collision detection
-    is order-insensitive."""
-    assert _key_parts("a") == ("a",)
-    assert _key_parts("a.b.c") == ("a", "b", "c")
-    assert _key_parts(".a") == ("a",)
-    assert _key_parts("a..b") == ("a", "b")
 
 
 @pytest.mark.parametrize(
@@ -533,61 +428,67 @@ def test_yaml_load_rejects_prefix_collision(tmp_path: Path) -> None:
         load_experiment(p)
 
 
-def test_hydra_phase_with_search_space_requires_overrides_placeholder() -> None:
-    """A hydra trial_command without ``{overrides}`` would silently no-op
-    every sweep — Optuna samples 20 different LRs, the trainer sees zero.
-    """
-    with pytest.raises(ValueError, match=r"does not reference \{overrides\}"):
-        _exp_with_template(
+@pytest.mark.parametrize(
+    ("template", "override_format", "search_space", "fixed_overrides", "match"),
+    [
+        (
             "python train.py --out {trial_dir}/result.json",
-            override_format="hydra",
-            search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-        )
-
-
-def test_argparse_phase_with_search_space_requires_overrides_placeholder() -> None:
-    with pytest.raises(ValueError, match=r"does not reference \{overrides\}"):
-        _exp_with_template(
+            "hydra",
+            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            None,
+            r"does not reference \{overrides\}",
+        ),
+        (
             "python train.py --out {trial_dir}/result.json",
-            override_format="argparse",
-            search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-        )
-
-
-def test_argparse_phase_with_fixed_overrides_requires_overrides_placeholder() -> None:
-    """Fixed overrides count as overrides — same silent-no-op risk as
-    sampled params if the trial_command never references them.
-    """
-    with pytest.raises(ValueError, match=r"does not reference \{overrides\}"):
-        _exp_with_template(
+            "argparse",
+            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            None,
+            r"does not reference \{overrides\}",
+        ),
+        (
             "python train.py --out {trial_dir}/result.json",
-            override_format="argparse",
-            fixed_overrides={"lr": 1e-3},
-        )
-
-
-def test_escaped_overrides_does_not_count_as_real_placeholder() -> None:
-    """``{{overrides}}`` renders as the *literal* string ``{overrides}``;
-    the real ``str.format`` field set is empty. Pre-v0.5.7 the substring
-    check was fooled and accepted this as referencing the placeholder.
-    """
-    with pytest.raises(ValueError, match=r"does not reference \{overrides\}"):
-        _exp_with_template(
+            "argparse",
+            None,
+            {"lr": 1e-3},
+            r"does not reference \{overrides\}",
+        ),
+        (
             "python train.py --out {trial_dir} '{{overrides}}'",
-            override_format="hydra",
-            search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-        )
-
-
-def test_escaped_overrides_path_does_not_count_for_json_file() -> None:
-    """Same trick, json_file branch: ``{{overrides_path}}`` is a literal,
-    not a real placeholder.
-    """
-    with pytest.raises(ValueError, match=r"does not reference \{overrides_path\}"):
-        _exp_with_template(
+            "hydra",
+            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            None,
+            r"does not reference \{overrides\}",
+        ),
+        (
             "python train.py '{{overrides_path}}'",
-            override_format="json_file",
-            search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            "json_file",
+            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            None,
+            r"does not reference \{overrides_path\}",
+        ),
+        (
+            "python train.py --out {trial_dir}/result.json {overrides}",
+            "json_file",
+            {"x": IntParam(type="int", low=0, high=10)},
+            None,
+            r"\{overrides_path\}",
+        ),
+    ],
+)
+def test_trial_command_requires_live_override_placeholder(
+    template: str,
+    override_format: str,
+    search_space: dict | None,
+    fixed_overrides: dict | None,
+    match: str,
+) -> None:
+    """Override-bearing phases must expose the active placeholder to the trainer."""
+    with pytest.raises(ValueError, match=match):
+        _exp_with_template(
+            template,
+            override_format=override_format,
+            search_space=search_space,
+            fixed_overrides=fixed_overrides,
         )
 
 
@@ -635,16 +536,6 @@ def test_trial_command_valid_template_accepted() -> None:
     make_experiment(
         trial_command="python train.py --out {trial_dir}/result.json {overrides}", n_trials=1
     )
-
-
-def test_json_file_without_overrides_path_rejected() -> None:
-    """`json_file` mode silently no-ops the override JSON if {overrides_path} is missing."""
-    with pytest.raises(ValueError, match=r"\{overrides_path\}"):
-        make_experiment(
-            override_format="json_file",
-            trial_command="python train.py --out {trial_dir}/result.json {overrides}",
-            n_trials=1,
-        )
 
 
 def test_json_file_with_overrides_path_accepted() -> None:
