@@ -33,7 +33,13 @@ def _supports_posix_runtime_features(
     has_killpg: bool | None = None,
     has_fcntl: bool | None = None,
 ) -> bool:
-    """Return whether the current runtime has the Unix features phasesweep needs."""
+    """Return whether the runtime has the Unix features phasesweep needs.
+
+    :param str | None os_name: Optional `os.name` override for tests.
+    :param bool | None has_killpg: Optional `os.killpg` availability override.
+    :param bool | None has_fcntl: Optional `fcntl` import availability override.
+    :return bool: Whether execution can rely on POSIX process groups and `flock`.
+    """
     if os_name is None:
         os_name = os.name
     if has_killpg is None:
@@ -44,7 +50,10 @@ def _supports_posix_runtime_features(
 
 
 def _fcntl_available() -> bool:
-    """Return whether the Unix ``fcntl`` module can be imported."""
+    """Return whether the Unix ``fcntl`` module can be imported.
+
+    :return bool: `True` when `fcntl` is importable in the current interpreter.
+    """
     try:
         import fcntl  # noqa: F401
     except ImportError:
