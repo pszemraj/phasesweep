@@ -1,5 +1,7 @@
 # phasesweep
 
+[![CI](https://github.com/pszemraj/phasesweep/actions/workflows/ci.yml/badge.svg)](https://github.com/pszemraj/phasesweep/actions/workflows/ci.yml)
+
 YAML-driven, phase-chained hyperparameter sweeps. Each phase is an Optuna study; the winner becomes a fixed override for downstream phases. Trials run as external subprocesses. Runtime orchestration is single-host and single-orchestrator-per-experiment.
 
 Use phasesweep when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. Use one phase with the full search space when dimensions strongly interact.

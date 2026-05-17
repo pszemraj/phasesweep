@@ -23,4 +23,5 @@ def test_public_metadata_sets_license_platform_and_typing() -> None:
 
     assert project["license"] == "MIT"
     assert "Operating System :: POSIX" in classifiers
+    assert "Programming Language :: Python :: 3.12" in classifiers
     assert "Typing :: Typed" in classifiers
