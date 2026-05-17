@@ -173,62 +173,75 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
     assert "n_layers" in winners["arch"].effective_overrides
 
 
-def test_fingerprint_unchanged_when_n_trials_increased() -> None:
-    """Bumping n_trials must not invalidate the study (top-up workflow)."""
-    a = make_experiment(n_trials=4)
-    b = make_experiment(n_trials=64)
-    fp_a = _phase_fingerprint(a, a.phases[0], {})
-    fp_b = _phase_fingerprint(b, b.phases[0], {})
-    assert fp_a == fp_b, (
-        "Fingerprint must ignore n_trials so users can top up a study; "
-        "v0.5.1 hashed the whole phase model_dump and broke this."
-    )
+def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
+    """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
 
+    def env_pair() -> tuple[Experiment, Experiment]:
+        base_phase = Phase(
+            name="p", n_trials=4, search_space={"x": IntParam(type="int", low=0, high=10)}
+        )
+        return (
+            Experiment(
+                experiment="t",
+                trial_command="echo {overrides}",
+                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                phases=[base_phase],
+                env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
+            ),
+            Experiment(
+                experiment="t",
+                trial_command="echo {overrides}",
+                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                phases=[base_phase],
+                env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"},
+            ),
+        )
 
-def test_fingerprint_unchanged_when_run_control_changes() -> None:
-    """Throughput and timeout-acceptance knobs must not invalidate the study."""
-    a = make_experiment(n_jobs=1)
-    b = make_experiment(
-        n_jobs=4,
-        allow_no_gpu_isolation=True,
-        allow_incomplete_on_timeout=True,
-    )
-    fp_a = _phase_fingerprint(a, a.phases[0], {})
-    fp_b = _phase_fingerprint(b, b.phases[0], {})
-    assert fp_a == fp_b
+    cases = [
+        (
+            "n_trials_top_up",
+            lambda: (make_experiment(n_trials=4), make_experiment(n_trials=64)),
+            True,
+        ),
+        (
+            "throughput_run_control",
+            lambda: (
+                make_experiment(n_jobs=1),
+                make_experiment(
+                    n_jobs=4,
+                    allow_no_gpu_isolation=True,
+                    allow_incomplete_on_timeout=True,
+                ),
+            ),
+            True,
+        ),
+        ("env", env_pair, False),
+        (
+            "search_space",
+            lambda: (
+                make_experiment(search_space={"x": IntParam(type="int", low=0, high=10)}),
+                make_experiment(search_space={"x": IntParam(type="int", low=0, high=20)}),
+            ),
+            False,
+        ),
+        (
+            "timeout_seconds_per_trial",
+            lambda: (
+                make_experiment(timeout_seconds_per_trial=60.0),
+                make_experiment(timeout_seconds_per_trial=3600.0),
+            ),
+            False,
+        ),
+    ]
 
-
-def test_fingerprint_changes_when_env_changes() -> None:
-    """experiment.env affects training behavior; fingerprint must reflect it."""
-    base_phase = Phase(
-        name="p", n_trials=4, search_space={"x": IntParam(type="int", low=0, high=10)}
-    )
-    e1 = Experiment(
-        experiment="t",
-        trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[base_phase],
-        env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
-    )
-    e2 = Experiment(
-        experiment="t",
-        trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[base_phase],
-        env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"},
-    )
-    fp1 = _phase_fingerprint(e1, e1.phases[0], {})
-    fp2 = _phase_fingerprint(e2, e2.phases[0], {})
-    assert fp1 != fp2, "Changing env vars must invalidate fingerprint"
-
-
-def test_fingerprint_changes_when_search_space_changes() -> None:
-    """Sanity: things that DO change trial meaning still flip the fingerprint."""
-    a = make_experiment(search_space={"x": IntParam(type="int", low=0, high=10)})
-    b = make_experiment(search_space={"x": IntParam(type="int", low=0, high=20)})
-    fp_a = _phase_fingerprint(a, a.phases[0], {})
-    fp_b = _phase_fingerprint(b, b.phases[0], {})
-    assert fp_a != fp_b
+    for case, build_pair, expected_equal in cases:
+        exp_a, exp_b = build_pair()
+        fp_a = _phase_fingerprint(exp_a, exp_a.phases[0], {})
+        fp_b = _phase_fingerprint(exp_b, exp_b.phases[0], {})
+        if expected_equal:
+            assert fp_a == fp_b, case
+        else:
+            assert fp_a != fp_b, case
 
 
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
@@ -272,7 +285,7 @@ phases:
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
 
-def test_version_sources_agree() -> None:
+def test_version_sources_and_fingerprint_payload_agree() -> None:
     """``phasesweep.__version__`` matches the installed package metadata.
 
     Source of truth is package metadata generated by setuptools-scm from SCM
@@ -281,12 +294,9 @@ def test_version_sources_agree() -> None:
     """
     from importlib.metadata import version as pkg_version
 
-    assert __version__ == pkg_version("phasesweep")
-
-
-def test_fingerprint_uses_package_version() -> None:
-    """Fingerprint payload's `phasesweep_version` equals the package version."""
     from phasesweep.engine.guards import _phase_semantic_payload
+
+    assert __version__ == pkg_version("phasesweep")
 
     exp = make_experiment()
     payload = _phase_semantic_payload(exp, exp.phases[0], {})
@@ -375,52 +385,33 @@ def test_from_phase_accepts_skipped_winner_when_only_n_trials_changed(
     assert "lr" in winners2
 
 
-def test_from_phase_refuses_winner_yaml_with_no_fingerprint(tmp_path: Path) -> None:
-    """A pre-v0.5.7 ``winner.yaml`` (or one a user hand-edited) has no
-    fingerprint field. The reviewer asked for *loud* refusal here rather
-    than silent reuse, because phasesweep cannot prove the file matches
-    the current config.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    workdir = tmp_path / "runs"
-    exp = _two_phase_experiment(workdir=workdir, trainer=trainer)
-    run_experiment(exp)
+def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path) -> None:
+    """Skipped winners need a matching fingerprint, not just plausible YAML."""
 
-    # Strip the fingerprint as if the file were produced by an older version.
-    arch_winner_path = _winner_path(exp, "arch")
-    data = yaml.safe_load(arch_winner_path.read_text())
-    del data["phase_fingerprint"]
-    arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    def strip_fingerprint(data: dict) -> str:
+        del data["phase_fingerprint"]
+        return "no phase_fingerprint"
 
-    # Drop the lr phase artifacts so we go through _run_phase rather than
-    # short-circuiting on a current-version lr winner.
-    shutil.rmtree(_phase_dir(exp, "lr"))
+    def tamper_fingerprint(data: dict) -> str:
+        data["phase_fingerprint"] = "0" * 64
+        return "different phase config"
 
-    with pytest.raises(RuntimeError, match="no phase_fingerprint"):
-        run_experiment(exp, from_phase="lr")
+    for case, mutate in (("missing", strip_fingerprint), ("tampered", tamper_fingerprint)):
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        trainer = write_constant_trainer(case_dir)
+        exp = _two_phase_experiment(workdir=case_dir / "runs", trainer=trainer)
+        run_experiment(exp)
 
+        arch_winner_path = _winner_path(exp, "arch")
+        data = yaml.safe_load(arch_winner_path.read_text())
+        match = mutate(data)
+        arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
-def test_from_phase_refuses_winner_yaml_with_tampered_fingerprint(
-    tmp_path: Path,
-) -> None:
-    """A hand-tampered fingerprint is also refused — the stored value is
-    re-checked against the live recomputed fingerprint, not just inspected
-    for presence.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    workdir = tmp_path / "runs"
-    exp = _two_phase_experiment(workdir=workdir, trainer=trainer)
-    run_experiment(exp)
+        shutil.rmtree(_phase_dir(exp, "lr"))
 
-    arch_winner_path = _winner_path(exp, "arch")
-    data = yaml.safe_load(arch_winner_path.read_text())
-    data["phase_fingerprint"] = "0" * 64  # plausible-looking but wrong
-    arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
-
-    shutil.rmtree(_phase_dir(exp, "lr"))
-
-    with pytest.raises(RuntimeError, match="different phase config"):
-        run_experiment(exp, from_phase="lr")
+        with pytest.raises(RuntimeError, match=match):
+            run_experiment(exp, from_phase="lr")
 
 
 def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
@@ -465,22 +456,3 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
     fp_b = _phase_fingerprint(*(lambda e: (e, e.phases[0], {}))(build("Reworded later")))
     fp_c = _phase_fingerprint(*(lambda e: (e, e.phases[0], {}))(build(None)))
     assert fp_a == fp_b == fp_c
-
-
-def test_timeout_seconds_per_trial_invalidates_fingerprint() -> None:
-    """A different per-trial timeout means a different observation budget,
-    therefore a different fingerprint.
-
-    The sibling sanity checks (``n_trials`` and ``n_jobs`` do *not* invalidate
-    the fingerprint) live earlier in this file — they pin the run-control
-    exclusion. This test only exists to guard the contract that timeout is
-    *semantic*, not throughput: a 60s vs 3600s budget changes which trials
-    FAIL vs COMPLETE, which changes the observation distribution.
-    """
-    exp_short = make_experiment(timeout_seconds_per_trial=60.0)
-    exp_long = make_experiment(timeout_seconds_per_trial=3600.0)
-
-    fp_short = _phase_fingerprint(exp_short, exp_short.phases[0], {})
-    fp_long = _phase_fingerprint(exp_long, exp_long.phases[0], {})
-
-    assert fp_short != fp_long

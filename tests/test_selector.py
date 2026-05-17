@@ -5,7 +5,10 @@ import pytest
 
 from phasesweep.config import (
     Constraint,
+    Experiment,
+    IntParam,
     JsonExtractor,
+    Metric,
     Phase,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
@@ -94,3 +97,42 @@ def test_tie_break_lower_trial_number():
     w = select_winner(study, exp)
     # First trial wins on tie
     assert w.params == {"x": 1}
+
+
+def test_rejects_nan_constraint_values_defensively(tmp_path):
+    """If a NaN somehow made it into user_attrs (legacy study), selector must reject."""
+    db = tmp_path / "s.db"
+    storage = f"sqlite:///{db}"
+    study = optuna.create_study(study_name="t", storage=storage, direction="minimize")
+
+    # Trial 0: clean, feasible.
+    t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
+    t0.set_user_attr(FEASIBLE_ATTR, True)
+    t0.set_user_attr(constraint_attr("size"), 100.0)
+    study.tell(t0, 0.5)
+
+    # Trial 1: legacy NaN constraint value but mistakenly marked feasible.
+    t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
+    t1.set_user_attr(FEASIBLE_ATTR, True)
+    t1.set_user_attr(constraint_attr("size"), float("nan"))
+    study.tell(t1, 0.1)  # Better metric, but invalid.
+
+    exp = Experiment(
+        experiment="t",
+        trial_command="echo {overrides}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        constraints=[
+            Constraint(
+                name="size",
+                extractor=JsonExtractor(type="json", path="r.json", key="s"),
+                max=1000.0,
+            )
+        ],
+        phases=[
+            Phase(name="a", n_trials=1, search_space={"x": IntParam(type="int", low=0, high=10)}),
+        ],
+    )
+    sel = select_winner(study, exp)
+    assert sel.trial_number == 0, (
+        "NaN-constraint trial 1 must be rejected even though metric was lower"
+    )

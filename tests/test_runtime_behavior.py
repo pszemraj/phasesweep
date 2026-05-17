@@ -316,39 +316,32 @@ phases:
     )
 
 
-def test_optuna_logging_quieted_when_not_verbose() -> None:
-    """Default (no -v) sets Optuna logger to WARNING.
-
-    Optuna's per-trial INFO messages are nearly 1:1 with phasesweep's own
-    runner.info "[phase/trial_N] <cmd>" line and add nothing.
-    """
-    # Reset to a known noisy level first; the test must demonstrate the change.
-    optuna.logging.set_verbosity(optuna.logging.INFO)
-    assert optuna.logging.get_verbosity() == optuna.logging.INFO
-
+def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
+    """Default CLI output quiets Optuna; ``-v`` restores Optuna INFO logs."""
     from phasesweep.cli import _configure_logging
 
-    _configure_logging(verbose=False)
-    assert optuna.logging.get_verbosity() == optuna.logging.WARNING
+    cases = [
+        ("default_quiet", optuna.logging.INFO, False, optuna.logging.WARNING),
+        ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
+    ]
 
-
-def test_optuna_logging_restored_when_verbose() -> None:
-    """`-v` keeps Optuna at INFO so debug runs are fully verbose."""
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    from phasesweep.cli import _configure_logging
-
-    _configure_logging(verbose=True)
-    assert optuna.logging.get_verbosity() == optuna.logging.INFO
+    for case, initial, verbose, expected in cases:
+        optuna.logging.set_verbosity(initial)
+        _configure_logging(verbose=verbose)
+        assert optuna.logging.get_verbosity() == expected, case
 
     # Reset for any later tests.
     logging.getLogger().handlers.clear()
 
 
-def test_posix_runtime_guard_accepts_supported_unix_features() -> None:
-    """macOS reports ``sys.platform == 'darwin'`` but still has POSIX features."""
+def test_runtime_platform_guard_feature_checks_and_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real execution needs POSIX process groups and flock; dry-run does not."""
     from phasesweep.runtime import files as runtime_files
 
+    # macOS reports ``sys.platform == 'darwin'`` but still has POSIX features;
+    # the guard is intentionally feature-based instead of matching platform names.
     assert runtime_files._supports_posix_runtime_features(
         os_name="posix",
         has_killpg=True,
@@ -369,11 +362,6 @@ def test_posix_runtime_guard_accepts_supported_unix_features() -> None:
         has_killpg=True,
         has_fcntl=False,
     )
-
-
-def test_run_experiment_rejects_non_posix_execution(tmp_path: Path, monkeypatch) -> None:
-    """Real execution needs POSIX process groups and flock locks."""
-    from phasesweep.runtime import files as runtime_files
 
     body = f"""
 experiment: platform_check

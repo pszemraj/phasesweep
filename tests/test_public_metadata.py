@@ -11,12 +11,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib
 
 
-def test_package_includes_py_typed_marker() -> None:
+def test_public_package_metadata() -> None:
+    """Public metadata should advertise license, platform, and typing support."""
     marker = resources.files("phasesweep").joinpath("py.typed")
     assert marker.is_file()
 
-
-def test_public_metadata_sets_license_platform_and_typing() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
     project = pyproject["project"]
     classifiers = set(project["classifiers"])

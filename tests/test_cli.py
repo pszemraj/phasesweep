@@ -13,9 +13,10 @@ from phasesweep.cli import main as cli_main
 from tests.conftest import write_trainer, write_yaml
 
 
-def test_top_level_help_is_operator_readable() -> None:
-    """Top-level help should expose commands without leaking implementation docs."""
-    result = CliRunner().invoke(cli_main, ["--help"], terminal_width=120)
+def test_help_output_is_operator_readable() -> None:
+    """Help should describe CLI usage without leaking Python call signatures."""
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--help"], terminal_width=120)
 
     assert result.exit_code == 0
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
@@ -26,10 +27,6 @@ def test_top_level_help_is_operator_readable() -> None:
     assert "validate      Validate a config file." in result.output
     assert "Args:" not in result.output
 
-
-def test_command_help_hides_python_docstring_details() -> None:
-    """Subcommand help should describe CLI usage, not Python call signatures."""
-    runner = CliRunner()
     for command in ("run", "validate", "show-winners", "status"):
         result = runner.invoke(cli_main, [command, "--help"], terminal_width=120)
         assert result.exit_code == 0

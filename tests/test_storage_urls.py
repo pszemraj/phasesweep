@@ -24,33 +24,25 @@ from phasesweep.runtime.files import (
 from tests.conftest import make_experiment, write_yaml
 
 
-@pytest.mark.parametrize(
-    ("url", "expected_kind"),
-    [
-        # passthrough: SQLite URLs go to Optuna unchanged (no auto-remap)
-        ("sqlite:///./runs/phases.db", "passthrough"),
-        # passthrough: arbitrary RDB URLs go to Optuna unchanged
-        ("postgresql://user:pass@host/db", "passthrough"),
-        # in-memory: None means an Optuna InMemoryStorage (returned as None)
-        (None, "none"),
-    ],
-)
-def test_resolve_storage_passthrough_or_none(url: str | None, expected_kind: str) -> None:
-    """Non-journal URLs are returned as-is (or None for in-memory)."""
-    result = _resolve_storage(url)
-    if expected_kind == "passthrough":
-        assert result == url
-    else:
-        assert result is None
-
-
-def test_resolve_storage_journal_url_creates_journal_storage(tmp_path):
-    """Explicit journal:/// scheme constructs a JournalStorage (the only
-    URL we actually translate, since Optuna has no journal:// understanding)."""
+def test_resolve_storage_urls(tmp_path: Path) -> None:
+    """Only journal:/// is translated; other URLs pass through to Optuna."""
     from optuna.storages import JournalStorage
 
-    result = _resolve_storage(f"journal:///{tmp_path}/phases.journal")
-    assert isinstance(result, JournalStorage)
+    cases = [
+        ("sqlite_passthrough", "sqlite:///./runs/phases.db", "passthrough"),
+        ("rdb_passthrough", "postgresql://user:pass@host/db", "passthrough"),
+        ("in_memory", None, "none"),
+        ("journal", f"journal:///{tmp_path}/phases.journal", "journal"),
+    ]
+
+    for case, url, expected_kind in cases:
+        result = _resolve_storage(url)
+        if expected_kind == "passthrough":
+            assert result == url, case
+        elif expected_kind == "journal":
+            assert isinstance(result, JournalStorage), case
+        else:
+            assert result is None, case
 
 
 def test_validate_rejects_sqlite_with_parallel_n_jobs(tmp_path: Path) -> None:
@@ -196,9 +188,11 @@ def test_canonical_storage_identity_rdb_passes_through() -> None:
     assert canonical_storage_identity(url) == url
 
 
-@pytest.mark.parametrize(
-    ("url", "expected_path"),
-    [
+def test_file_url_path_preserves_absolute_paths() -> None:
+    """``file_url_path`` must distinguish three-slash (relative) from
+    four-slash (absolute) URLs. Pre-v0.5.10 it used ``lstrip("/")`` which
+    destroyed the leading ``/`` on absolute paths."""
+    cases = [
         ("sqlite:///relative.db", "relative.db"),
         ("sqlite:////tmp/absolute.db", "/tmp/absolute.db"),
         ("sqlite+pysqlite:///relative.db", "relative.db"),
@@ -207,43 +201,37 @@ def test_canonical_storage_identity_rdb_passes_through() -> None:
         ("sqlite:///:memory:", ":memory:"),
         ("journal:///relative.journal", "relative.journal"),
         ("journal:////tmp/abs.journal", "/tmp/abs.journal"),
-    ],
-)
-def test_file_url_path_preserves_absolute_paths(url: str, expected_path: str) -> None:
-    """``file_url_path`` must distinguish three-slash (relative) from
-    four-slash (absolute) URLs. Pre-v0.5.10 it used ``lstrip("/")`` which
-    destroyed the leading ``/`` on absolute paths."""
-    assert file_url_path(url) == expected_path
+    ]
+
+    for url, expected_path in cases:
+        assert file_url_path(url) == expected_path, url
 
 
-@pytest.mark.parametrize(
-    ("scheme", "filename"),
-    [("sqlite", "phases.db"), ("journal", "study.journal")],
-)
 def test_absolute_file_storage_identity_is_not_cwd_relative(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    scheme: str,
-    filename: str,
 ) -> None:
     """Absolute file-storage identities must not depend on caller cwd."""
-    path = tmp_path / filename
-    url = f"{scheme}:///{path}"
+    cases = [("sqlite", "phases.db"), ("journal", "study.journal")]
 
     cwd_a = tmp_path / "cwd_a"
     cwd_b = tmp_path / "cwd_b"
     cwd_a.mkdir()
     cwd_b.mkdir()
 
-    monkeypatch.chdir(cwd_a)
-    identity_a = canonical_storage_identity(url)
+    for scheme, filename in cases:
+        path = tmp_path / filename
+        url = f"{scheme}:///{path}"
 
-    monkeypatch.chdir(cwd_b)
-    identity_b = canonical_storage_identity(url)
+        monkeypatch.chdir(cwd_a)
+        identity_a = canonical_storage_identity(url)
 
-    expected = f"{scheme}:///" + str(path.resolve())
-    assert identity_a == expected
-    assert identity_b == expected
+        monkeypatch.chdir(cwd_b)
+        identity_b = canonical_storage_identity(url)
+
+        expected = f"{scheme}:///" + str(path.resolve())
+        assert identity_a == expected
+        assert identity_b == expected
 
 
 def test_plain_and_driver_sqlite_absolute_urls_collide(tmp_path: Path) -> None:

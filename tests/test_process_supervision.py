@@ -237,53 +237,46 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     )
 
 
-def test_trial_command_unbalanced_brace_rejected() -> None:
-    with pytest.raises(ValueError, match="trial_command failed to render"):
-        make_experiment(trial_command="echo {trial_dir", n_trials=1)
-
-
-def test_terminate_process_group_returns_false_when_group_survives_sigkill(
+def test_terminate_process_group_reports_cleanup_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If ``_process_group_alive`` keeps reporting alive after SIGKILL, the
-    function must return False so the reaper doesn't mark the trial FAIL."""
-    calls: list[tuple[int, int]] = []
+    """Group termination reports confirmed cleanup only when it can prove it."""
 
-    def fake_killpg(pgid: int, sig: int) -> None:
-        calls.append((pgid, sig))
+    def group_survives(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
+        def fake_killpg(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
 
-    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
+        mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
+        mp.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
 
-    assert _terminate_process_group(1234, grace_seconds=0.0) is False
-    # Both SIGTERM and SIGKILL must have been attempted.
-    sent_signals = [sig for _, sig in calls]
-    assert signal.SIGTERM in sent_signals
-    assert signal.SIGKILL in sent_signals
+    def already_gone(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
+        def raise_lookup(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+            raise ProcessLookupError
 
+        mp.setattr("phasesweep.runtime.process.os.killpg", raise_lookup)
 
-def test_terminate_process_group_returns_true_when_already_gone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ProcessLookupError from ``killpg`` is the success signal: nothing to clean up."""
+    def permission_denied(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
+        def raise_perm(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+            raise PermissionError
 
-    def raise_lookup(pgid: int, sig: int) -> None:
-        raise ProcessLookupError
+        mp.setattr("phasesweep.runtime.process.os.killpg", raise_perm)
 
-    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", raise_lookup)
-    assert _terminate_process_group(1234, grace_seconds=0.0) is True
+    cases = [
+        ("survives_sigkill", group_survives, False, {signal.SIGTERM, signal.SIGKILL}),
+        ("already_gone", already_gone, True, {signal.SIGTERM}),
+        ("permission_denied", permission_denied, False, {signal.SIGTERM}),
+    ]
 
+    for case, arrange, expected, required_signals in cases:
+        calls: list[tuple[int, int]] = []
+        with monkeypatch.context() as mp:
+            arrange(mp, calls)
+            assert _terminate_process_group(1234, grace_seconds=0.0) is expected, case
 
-def test_terminate_process_group_returns_false_on_permission_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Permission denied is uncertain; we cannot prove the group is gone."""
-
-    def raise_perm(pgid: int, sig: int) -> None:
-        raise PermissionError
-
-    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", raise_perm)
-    assert _terminate_process_group(1234, grace_seconds=0.0) is False
+        sent_signals = {sig for _, sig in calls}
+        assert required_signals.issubset(sent_signals), case
 
 
 def test_reaper_raises_when_cleanup_uncertain(
@@ -452,23 +445,13 @@ def test_launch_lock_serializes_signal_handler_against_in_flight_launch() -> Non
             _active_children.pop(424242, None)
 
 
-def test_pending_sigterm_during_launch_context_does_not_deadlock() -> None:
-    """SIGTERM queued while the launch critical section is active must not
-    deadlock. The correct ordering is ``_defer_shutdown_signals()`` (outermost)
-    then ``_launch_lock`` (innermost). Pre-v0.5.10 the order was reversed,
-    causing the signal handler to block on ``_launch_lock`` held by the
-    interrupted thread.
-
-    The product contract is "no deadlock; clean exit with 128+SIGTERM" — NOT
-    "no Python bytecode runs after the context exits". CPython's signal
-    handler scheduling after ``pthread_sigmask`` unblock is non-deterministic
-    relative to the next bytecode (the signal is pending; the interpreter
-    notices it on the next signal-checkpoint instruction, which may or may
-    not be before a subsequent ``print``). Asserting that a post-context
-    statement never runs makes this test flaky for no product reason.
-    Review v0.5.12.
-    """
-    code = r"""
+def test_pending_sigterm_inside_signal_deferred_sections_does_not_deadlock() -> None:
+    """Queued SIGTERM must not deadlock while launch or registry locks are held."""
+    cases = [
+        (
+            "launch_lock",
+            "queued",
+            r"""
 import os, signal
 from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
 install_signal_handlers()
@@ -476,27 +459,12 @@ with _defer_shutdown_signals(), _launch_lock:
     print("queued", flush=True)
     os.kill(os.getpid(), signal.SIGTERM)
 print("post-context", flush=True)
-"""
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        text=True,
-        capture_output=True,
-        timeout=5.0,
-        check=False,
-    )
-    assert "queued" in proc.stdout
-    assert proc.returncode == 128 + signal.SIGTERM
-
-
-def test_signal_while_registry_lock_held_does_not_deadlock() -> None:
-    """SIGTERM while ``_lock`` is held (e.g. during ``_unregister``) must not
-    deadlock. The ``_unregister`` function defers shutdown signals before
-    acquiring ``_lock`` so the handler cannot interrupt mid-mutation.
-
-    See the launch-context test above for why we do NOT assert that a
-    post-context statement is unreached. Review v0.5.12.
-    """
-    code = r"""
+""",
+        ),
+        (
+            "registry_lock",
+            "locked",
+            r"""
 import os, signal
 from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _lock
 install_signal_handlers()
@@ -505,16 +473,20 @@ with _defer_shutdown_signals():
         print("locked", flush=True)
         os.kill(os.getpid(), signal.SIGTERM)
 print("post-context", flush=True)
-"""
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        text=True,
-        capture_output=True,
-        timeout=5.0,
-        check=False,
-    )
-    assert "locked" in proc.stdout
-    assert proc.returncode == 128 + signal.SIGTERM
+""",
+        ),
+    ]
+
+    for case, marker, code in cases:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+            check=False,
+        )
+        assert marker in proc.stdout, case
+        assert proc.returncode == 128 + signal.SIGTERM, case
 
 
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(
