@@ -1,34 +1,41 @@
 # phasesweep
 
-[![CI](https://github.com/pszemraj/phasesweep/actions/workflows/ci.yml/badge.svg)](https://github.com/pszemraj/phasesweep/actions/workflows/ci.yml)
+> Orchestration layer for YAML-driven, phase-chained hyperparameter sweeps over your own training scripts
 
-YAML-driven, phase-chained hyperparameter sweeps. Each phase is an Optuna study; the winner becomes a fixed override for downstream phases. Trials run as external subprocesses. Runtime orchestration is single-host and single-orchestrator-per-experiment.
+Your trainer runs the experiments. `phasesweep` decides what to try next. Define phased Optuna sweeps in YAML; each phase's winner locks in as a fixed override for every phase downstream.
 
-Use phasesweep when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. Use one phase with the full search space when dimensions strongly interact.
+Use `phasesweep` when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. Use one phase with the full search space when dimensions strongly interact.
+
+![dag diagram](docs/images/diagramA_dag.png)
 
 ## Requirements
 
-- Python 3.10 or newer.
-- Linux or macOS. Windows is not currently supported because process cleanup and host locks use POSIX process groups and `flock`.
-- A trainer command that writes a metric artifact and parses one [supported override format](docs/config.md#override-formats). phasesweep does not train models itself.
-- GPU is optional. When CUDA devices are visible, phasesweep can lease numeric GPU IDs to avoid same-host double-booking.
+- Python 3.10+, OS: Linux or macOS[^1]
+- A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](__docs/config.md#override-formats__)**[^2]
+- GPU optional: CUDA devices are auto-detected for same-host lease management
+
+[^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`.
+[^2]: phasesweep orchestrates sweeps but never trains anything itself; your trainer must handle both of these.
 
 ## Install
 
 phasesweep is currently installed from Git:
 
 ```bash
-python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
-python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
-python -m pip install "phasesweep[dev] @ git+https://github.com/pszemraj/phasesweep.git"
+pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
+# weights-and-biases integration is optional:
+pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+# all dev dependencies:
+pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 For local development from a checkout:
 
 ```bash
-python -m pip install -e "."
-python -m pip install -e ".[dev]"
-python -m pip install -e ".[wandb]"
+git clone https://github.com/pszemraj/phasesweep.git
+cd phasesweep
+# activate venv of your choice, then:
+pip install -e ".[dev,wandb]"
 ```
 
 ## Quickstart
