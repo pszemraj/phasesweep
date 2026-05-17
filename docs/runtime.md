@@ -68,13 +68,14 @@ SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysq
 
 Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
 
-Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
+> [!WARNING]
+> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
 
 ## Fingerprints and Resume
 
 Each phase study stores a semantic fingerprint. Run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`.
 
-Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, override format, metric, constraints, environment, inherited winners, and `timeout_seconds_per_trial`.
+Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, [override format](config.md#override-formats), metric, constraints, environment, inherited winners, and `timeout_seconds_per_trial`.
 
 Re-running the same YAML reuses the study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files, after stale reaping and fingerprint verification. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 

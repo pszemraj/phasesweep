@@ -12,7 +12,7 @@ ruff format --check .
 mypy src/phasesweep --ignore-missing-imports
 ```
 
-Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected.
+Expected result: `179 passed`. Optuna `constant_liar` experimental warnings are expected.
 
 ## Package Map
 
@@ -35,4 +35,4 @@ Tests are organized by behavior:
 - `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`: timeout policy, contracts, evidence gates, promotion, and suites.
-- `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_wandb_extractor.py`: focused unit surfaces.
+- `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.

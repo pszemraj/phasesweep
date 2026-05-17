@@ -49,32 +49,25 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 
 ## Override Formats
 
-The default command contract is a normal Python CLI:
+> [!IMPORTANT]
+> The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
-```yaml
-trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
-override_format: argparse
-```
+| Format | Template placeholder | Trainer receives | Use when |
+| --- | --- | --- | --- |
+| `argparse` | `{overrides}` | `--key value` pairs | New scripts using `argparse`, Click, Typer, or similar parsers. |
+| `hydra` | `{overrides}` | `key=value` tokens | Existing Hydra/OmegaConf applications. |
+| `json_file` | `{overrides_path}` | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
 
-With `override_format: argparse`, sampled and fixed values render as `--key value` pairs. This is the recommended path for new trainers because it works with ordinary `argparse`, Typer, Click, and most command-line parsers.
+When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
 
-For an existing Hydra application, opt in explicitly:
+## Trainer Contract
 
-```yaml
-trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
-override_format: hydra
-```
+The command in `trial_command` is the training or evaluation program for one trial. It must:
 
-Hydra format renders `key=value` tokens. phasesweep supports it for compatibility with Hydra-based trainers; it is not required for normal use.
-
-For nested configuration or trainers that prefer one structured input file, use JSON:
-
-```yaml
-trial_command: "python train.py --out {trial_dir}/result.json --overrides-path {overrides_path}"
-override_format: json_file
-```
-
-JSON format writes `<trial_dir>/overrides.json` and expands dotted keys into nested objects.
+- Parse the selected [override format](#override-formats).
+- Write the metric artifact under `{trial_dir}` so the configured extractor can read it.
+- Exit nonzero when the trial failed and should be recorded as failed.
+- Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
 
 ## Override Order
 

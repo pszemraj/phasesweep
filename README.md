@@ -10,7 +10,7 @@ Use phasesweep when a full joint sweep is too expensive and the search can be br
 
 - Python 3.10 or newer.
 - Linux or macOS. Windows is not currently supported because process cleanup and host locks use POSIX process groups and `flock`.
-- A trainer command that writes a metric artifact, such as JSON, logs, or W&B summary data. phasesweep does not train models itself.
+- A trainer command that writes a metric artifact and parses one [supported override format](docs/config.md#override-formats). phasesweep does not train models itself.
 - GPU is optional. When CUDA devices are visible, phasesweep can lease numeric GPU IDs to avoid same-host double-booking.
 
 ## Install
@@ -47,8 +47,10 @@ The example launches a deterministic fake trainer, runs 32 short trials, and wri
 
 ## Config Sketch
 
-Adapt this shape to your own trainer. By default, `{overrides}` expands to ordinary
-`argparse`-style flags such as `--n_layers 8 --lr 0.0003`.
+Adapt this shape to your own trainer.
+
+> [!IMPORTANT]
+> The script in `trial_command` must parse the override format you choose. The default is `argparse`, where `{overrides}` renders flags such as `--n_layers 8 --lr 0.0003`; see [supported override formats](docs/config.md#override-formats).
 
 ```yaml
 experiment: tiny_lm_16mb
@@ -75,21 +77,20 @@ phases:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 ```
 
+## Runtime Boundaries
+
+- Bring your own trainer; see the [trainer contract](docs/config.md#trainer-contract).
+- Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly.
+- Use one orchestrator per experiment on one host. Same-host conflicts are rejected with advisory locks.
+- SQLite is for sequential `n_jobs == 1` studies. See [runtime behavior](docs/runtime.md#concurrency-model) for parallel storage and locking details.
+
 ## Docs
 
-- [Config reference](docs/config.md): experiment YAML, suites, search spaces, gates, promotion, extractors.
+- [Config reference](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [Development](docs/development.md): test commands and test-suite map.
-- [Roadmap](docs/roadmap.md): future work that is intentionally outside the current single-host design.
+- [Roadmap](docs/roadmap.md): future work outside the current single-host design.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Runtime Boundaries
-
-- Bring your own trainer. phasesweep only renders overrides, launches subprocesses, and extracts results.
-- No LLM runs inside the sweep loop.
-- Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly.
-- Multi-host writers against one shared study are unsupported. Same-host conflicts are rejected with advisory locks.
-- SQLite is for sequential `n_jobs == 1` studies. Parallel single-host studies should use `journal:///...` or an RDB storage URL.
