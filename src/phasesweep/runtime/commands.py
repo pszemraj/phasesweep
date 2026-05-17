@@ -115,7 +115,7 @@ def render_command(
             placeholders. Supported keys: ``overrides``, ``overrides_path``,
             ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
         overrides: The composed overrides for this trial.
-        fmt: One of ``"hydra"``, ``"argparse"``, ``"json_file"``.
+        fmt: One of ``"argparse"``, ``"hydra"``, ``"json_file"``.
         trial_dir: Per-trial directory used for ``{trial_dir}`` and for the
             ``overrides.json`` file when ``fmt == "json_file"``.
         trial_id: Numeric trial number, used for ``{trial_id}``.

@@ -565,7 +565,7 @@ phases:
 
 
 def test_override_keys_reject_malformed_and_shell_unsafe_values() -> None:
-    """Hydra/argparse can't render an override of an empty or
+    """argparse/Hydra can't render an override of an empty or
     whitespace-bearing key correctly. We reject these at config-load.
     """
     malformed_keys = [

@@ -26,15 +26,16 @@ from tests.conftest import make_experiment, make_trial_context, write_trainer, w
 
 
 def _write_score_trainer(tmp_path: Path) -> Path:
-    """Write a trainer that records the ``score=`` override as metric ``x``."""
+    """Write a trainer that records the ``--score`` override as metric ``x``."""
     return write_trainer(
         tmp_path,
         """
         import argparse, json
         ap = argparse.ArgumentParser()
         ap.add_argument("--out", required=True)
+        ap.add_argument("--score", type=float, default=None)
         args, rest = ap.parse_known_args()
-        value = 1.0
+        value = 1.0 if args.score is None else args.score
         for item in rest:
             if item.startswith("score="):
                 value = float(item.split("=", 1)[1])

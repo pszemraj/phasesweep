@@ -32,7 +32,7 @@ def make_experiment(
     workdir: str | Path | None = None,
     storage: str | None = None,
     trial_command: str = "echo {overrides}",
-    override_format: str = "hydra",
+    override_format: str = "argparse",
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,

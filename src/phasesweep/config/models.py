@@ -232,9 +232,9 @@ class Phase(_Frozen):
     def _validate_override_key_syntax(self) -> Phase:
         r"""Reject malformed override keys before they hit the override renderer.
 
-        Hydra/argparse rendering quotes values shell-safely, but a malformed
+        argparse/Hydra rendering quotes values shell-safely, but a malformed
         *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
-        produce broken hydra commands (``=value``, ``..a=value``) or silently
+        produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
         treat surface noise (whitespace) as part of the key (review v0.5.6 /
         non-blocking hardening item).
 
@@ -305,7 +305,7 @@ class Experiment(_Frozen):
             "{phase}, {run_name}, {overrides_path}."
         )
     )
-    override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
+    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -420,7 +420,7 @@ class Experiment(_Frozen):
                 raise ValueError(
                     f"Phase {phase.name!r} has dotted-key namespace collision(s): "
                     f"{pairs}. A key and a sub-key cannot both be overridden — the "
-                    "rendered command would be contradictory (Hydra/argparse) or the "
+                    "rendered command would be contradictory (argparse/Hydra) or the "
                     "json_file would have to be both a scalar and a nested object."
                 )
 
@@ -584,7 +584,7 @@ def _validate_trial_command_template(
     * Phases declaring ``override_format: json_file`` but a template missing
       ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
       and silently runs with defaults).
-    * Phases with ``override_format: hydra`` or ``argparse`` and any inherited,
+    * Phases with ``override_format: argparse`` or ``hydra`` and any inherited,
       fixed, or sampled overrides but a template missing ``{overrides}`` —
       same silent-no-op failure mode (review v0.5.6 / blocker 2).
 
@@ -598,7 +598,7 @@ def _validate_trial_command_template(
         experiment: The :class:`Experiment` being validated.
         phase: The specific phase whose ``trial_command`` is being rendered.
         inherited_keys: Locked keys inherited from parents — used to decide
-            whether ``{overrides}`` is required for hydra/argparse formats.
+            whether ``{overrides}`` is required for argparse/hydra formats.
 
     Raises:
         ValueError: Any of the failure modes listed above (typo, unbalanced
@@ -673,10 +673,10 @@ def _validate_trial_command_template(
             "inherited, fixed, or sampled overrides and trial_command "
             "does not reference {overrides_path}. The trainer would "
             "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or switch to override_format='hydra' / "
-            "'argparse' (which use the {overrides} placeholder)."
+            "to trial_command, or switch to override_format='argparse' / "
+            "'hydra' (which use the {overrides} placeholder)."
         )
-    if experiment.override_format in ("hydra", "argparse") and "overrides" not in fields:
+    if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
             f"{phase.name!r} has inherited, fixed, or sampled overrides "
@@ -694,7 +694,7 @@ class SuiteDefaults(_Frozen):
     storage: str | None = None
     workdir: str = "./runs"
     trial_command: str | None = None
-    override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
+    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -710,7 +710,7 @@ class StudySpec(_Frozen):
     storage: str | None = None
     workdir: str | None = None
     trial_command: str | None = None
-    override_format: Literal["hydra", "argparse", "json_file"] | None = None
+    override_format: Literal["argparse", "hydra", "json_file"] | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
     contracts: dict[str, Contract] = Field(default_factory=dict)

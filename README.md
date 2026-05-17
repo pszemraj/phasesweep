@@ -47,7 +47,8 @@ The example launches a deterministic fake trainer, runs 32 short trials, and wri
 
 ## Config Sketch
 
-Adapt this shape to your own trainer:
+Adapt this shape to your own trainer. By default, `{overrides}` expands to ordinary
+`argparse`-style flags such as `--n_layers 8 --lr 0.0003`.
 
 ```yaml
 experiment: tiny_lm_16mb
@@ -55,7 +56,6 @@ storage: sqlite:///./runs/phases.db
 workdir: ./runs
 trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
 
-override_format: hydra
 metric:
   name: eval_loss
   goal: minimize

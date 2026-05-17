@@ -8,7 +8,7 @@ A config is either one experiment or a suite of studies. A single experiment run
 - `storage`: Optuna storage URL. `sqlite:///path.db` is resumable for `n_jobs == 1`; SQLite plus parallel jobs is rejected. `journal:///path.journal` supports same-host parallel jobs. RDB URLs such as `postgresql://...` pass through to Optuna. `null` is in-memory and non-resumable.
 - `workdir`: output root. Trial artifacts live under `<workdir>/<experiment>/<phase>/`.
 - `trial_command`: shell template. Supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`.
-- `override_format`: `hydra`, `argparse`, or `json_file`. Values are shell-quoted before substitution.
+- `override_format`: `argparse` by default. Also supports `hydra` and `json_file`. Values are shell-quoted before substitution.
 - `metric`: objective name, `goal` (`minimize` or `maximize`), and extractor.
 - `constraints`: optional extracted scalars with `min` and/or `max`. Violating trials are recorded but cannot win.
 - `contracts`: named bundles of immutable `fixed_overrides` plus optional evidence gates.
@@ -46,6 +46,35 @@ search_space:
 ```
 
 Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval.
+
+## Override Formats
+
+The default command contract is a normal Python CLI:
+
+```yaml
+trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
+override_format: argparse
+```
+
+With `override_format: argparse`, sampled and fixed values render as `--key value` pairs. This is the recommended path for new trainers because it works with ordinary `argparse`, Typer, Click, and most command-line parsers.
+
+For an existing Hydra application, opt in explicitly:
+
+```yaml
+trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
+override_format: hydra
+```
+
+Hydra format renders `key=value` tokens. phasesweep supports it for compatibility with Hydra-based trainers; it is not required for normal use.
+
+For nested configuration or trainers that prefer one structured input file, use JSON:
+
+```yaml
+trial_command: "python train.py --out {trial_dir}/result.json --overrides-path {overrides_path}"
+override_format: json_file
+```
+
+JSON format writes `<trial_dir>/overrides.json` and expands dotted keys into nested objects.
 
 ## Override Order
 
