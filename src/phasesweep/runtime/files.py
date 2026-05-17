@@ -14,6 +14,44 @@ from typing import IO, Any, TypeVar
 T = TypeVar("T")
 
 
+POSIX_RUNTIME_ERROR = (
+    "phasesweep execution currently requires a POSIX platform. It relies on "
+    "fcntl.flock host locks and POSIX process groups for safe subprocess cleanup; "
+    "Windows support needs a separate locking and process-tree implementation."
+)
+
+
+def require_posix_runtime() -> None:
+    """Raise a clear error when execution is attempted on an unsupported platform."""
+    if not _supports_posix_runtime_features():
+        raise RuntimeError(POSIX_RUNTIME_ERROR)
+
+
+def _supports_posix_runtime_features(
+    *,
+    os_name: str | None = None,
+    has_killpg: bool | None = None,
+    has_fcntl: bool | None = None,
+) -> bool:
+    """Return whether the current runtime has the Unix features phasesweep needs."""
+    if os_name is None:
+        os_name = os.name
+    if has_killpg is None:
+        has_killpg = hasattr(os, "killpg")
+    if has_fcntl is None:
+        has_fcntl = _fcntl_available()
+    return os_name == "posix" and has_killpg and has_fcntl
+
+
+def _fcntl_available() -> bool:
+    """Return whether the Unix ``fcntl`` module can be imported."""
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
     """Run a blocking function in a daemon thread and bound caller wait time."""
     q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
@@ -44,6 +82,7 @@ def lock_dir() -> Path:
 
 def try_lock_file(path: Path) -> IO[str] | None:
     """Open ``path`` without truncating and take an exclusive flock, or return ``None``."""
+    require_posix_runtime()
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)

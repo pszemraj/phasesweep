@@ -1,5 +1,12 @@
 # Runtime Behavior
 
+## Platform Support
+
+Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep
+uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host
+locks. Config validation and `--dry-run` do not launch subprocesses and do not
+take those locks, but real runs fail early on unsupported platforms.
+
 ## Output Layout
 
 A completed run writes one namespace per experiment:

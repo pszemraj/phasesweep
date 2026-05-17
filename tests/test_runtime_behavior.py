@@ -345,6 +345,62 @@ def test_optuna_logging_restored_when_verbose() -> None:
     logging.getLogger().handlers.clear()
 
 
+def test_posix_runtime_guard_accepts_supported_unix_features() -> None:
+    """macOS reports ``sys.platform == 'darwin'`` but still has POSIX features."""
+    from phasesweep.runtime import files as runtime_files
+
+    assert runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=True,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="nt",
+        has_killpg=True,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=False,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=True,
+        has_fcntl=False,
+    )
+
+
+def test_run_experiment_rejects_non_posix_execution(tmp_path: Path, monkeypatch) -> None:
+    """Real execution needs POSIX process groups and flock locks."""
+    from phasesweep.runtime import files as runtime_files
+
+    body = f"""
+experiment: platform_check
+storage: sqlite:///{tmp_path}/platform.db
+workdir: {tmp_path}/runs
+trial_command: "echo {{overrides}}"
+metric:
+  name: x
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: x }}
+phases:
+  - name: p
+    n_trials: 1
+    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+
+    monkeypatch.setattr(runtime_files, "_supports_posix_runtime_features", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires a POSIX platform"):
+        run_experiment(exp)
+
+    # Dry-run remains available because it launches no subprocesses and takes no locks.
+    winners = run_experiment(exp, dry_run=True)
+    assert set(winners) == {"p"}
+
+
 def test_max_consecutive_failures_aborts_phase(tmp_path):
     """Trial command always fails -> phase aborts before running n_trials."""
     body = f"""

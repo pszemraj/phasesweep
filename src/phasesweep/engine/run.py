@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import install_signal_handlers
 
 
@@ -120,6 +121,7 @@ def run_experiment(
 
     """
     if not dry_run:
+        require_posix_runtime()
         install_signal_handlers()
 
     if dry_run:
@@ -261,6 +263,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             results[study_spec.name] = run_experiment(experiment, dry_run=True)
         return results
 
+    require_posix_runtime()
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
         for study_spec in suite.studies:
