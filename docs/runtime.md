@@ -61,7 +61,7 @@ SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysq
 
 Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
 
-Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [TODO](TODO.md).
+Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
 
 ## Fingerprints and Resume
 

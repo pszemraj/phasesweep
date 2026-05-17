@@ -11,6 +11,25 @@ requires-python = ">=3.10"
 authors = [{ name = "Peter Szemraj" }]
 license = "MIT"
 license-files = ["LICENSE"]
+keywords = [
+    "experiments",
+    "hyperparameter-optimization",
+    "machine-learning",
+    "optuna",
+    "sweeps",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "optuna>=4.0",
     "cmaes>=0.10",
@@ -21,7 +40,13 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]
-dev = ["pytest>=7", "ruff>=0.5", "mypy>=1.10", "types-PyYAML>=6.0"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "tomli>=2; python_version < '3.11'",
+    "types-PyYAML>=6.0",
+]
 
 [project.scripts]
 phasesweep = "phasesweep.cli:main"
@@ -33,6 +58,9 @@ Issues = "https://github.com/pszemraj/phasesweep/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
 
 [tool.ruff]
 line-length = 100

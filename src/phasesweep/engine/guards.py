@@ -161,7 +161,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     so the output lock alone suffices.
 
     Both locks are *same-host advisory only*. Multi-host coordination needs
-    per-trial leases + heartbeats (see ``docs/TODO.md``).
+    per-trial leases + heartbeats (see ``docs/roadmap.md``).
 
     Args:
         experiment: Parsed experiment config.

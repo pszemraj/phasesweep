@@ -197,7 +197,9 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
     except ImportError as exc:
         raise ExtractorError(
             "W&B extractor requested but the 'wandb' package is not installed. "
-            "Install with: pip install phasesweep[wandb]"
+            "Install the wandb extra for the same distribution, for example: "
+            'python -m pip install "phasesweep[wandb] @ '
+            'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
     except WandbPollTimeout as exc:
         msg = (
