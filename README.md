@@ -7,9 +7,17 @@ Use phasesweep when a full joint sweep is too expensive and the search can be br
 ## Install
 
 ```bash
-pip install -e .        # core runtime, including Optuna CMA-ES support
-pip install -e .[dev]   # pytest, ruff, mypy, types-PyYAML
-pip install -e .[wandb] # optional W&B extractor
+python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[dev] @ git+https://github.com/pszemraj/phasesweep.git"
+```
+
+For local development from a checkout:
+
+```bash
+python -m pip install -e "."
+python -m pip install -e ".[dev]"
+python -m pip install -e ".[wandb]"
 ```
 
 ## Minimal Config

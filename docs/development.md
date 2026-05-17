@@ -1,14 +1,15 @@
 # Development
 
+Repository: <https://github.com/pszemraj/phasesweep.git>
+
 ## Quality Gates
 
 ```bash
+python -m pip install -e ".[dev]"
 pytest
 ruff check .
 ruff format --check .
 mypy src/phasesweep --ignore-missing-imports
-pathlint src tests
-python doc_check.py src --check-lazy
 ```
 
 Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected.
