@@ -62,10 +62,17 @@ def _fcntl_available() -> bool:
 
 
 def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
-    """Run a blocking function in a daemon thread and bound caller wait time."""
+    """Run a blocking function in a daemon thread and bound caller wait time.
+
+    :param Callable[[], T] fn: Zero-argument function to execute.
+    :param float timeout: Maximum number of seconds to wait for completion.
+    :raises TimeoutError: If ``fn`` does not complete before ``timeout`` elapses.
+    :return T: Value returned by ``fn``.
+    """
     q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
     def target() -> None:
+        """Execute ``fn`` and store either its value or raised exception."""
         try:
             q.put((True, fn()))
         except Exception as exc:  # noqa: BLE001
@@ -83,14 +90,21 @@ def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
 
 
 def lock_dir() -> Path:
-    """Return the shared same-host phasesweep lock directory."""
+    """Return the shared same-host phasesweep lock directory.
+
+    :return Path: Directory used for host-local lock files.
+    """
     path = Path(tempfile.gettempdir()) / "phasesweep-locks"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def try_lock_file(path: Path) -> IO[str] | None:
-    """Open ``path`` without truncating and take an exclusive flock, or return ``None``."""
+    """Open ``path`` without truncating and take an exclusive flock, or return ``None``.
+
+    :param Path path: Lock file path to open or create.
+    :return IO[str] | None: Open lock handle when acquired, otherwise ``None``.
+    """
     require_posix_runtime()
     import fcntl
 
@@ -118,7 +132,13 @@ def unlock_file(handle: IO[str]) -> None:
 
 @contextlib.contextmanager
 def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
-    """Hold a non-blocking exclusive flock for the context duration."""
+    """Hold a non-blocking exclusive flock for the context duration.
+
+    :param Path path: Lock file path to hold during the context.
+    :param str busy_message: Error message used when the lock is already held.
+    :raises RuntimeError: If the lock cannot be acquired immediately.
+    :return Iterator[None]: Context manager iterator for the held lock.
+    """
     handle = try_lock_file(path)
     if handle is None:
         raise RuntimeError(busy_message)

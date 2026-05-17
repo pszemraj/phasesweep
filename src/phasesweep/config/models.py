@@ -68,7 +68,11 @@ class Contract(_Frozen):
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Contract:
-        """Reject malformed contract override keys."""
+        """Reject malformed contract override keys.
+
+        :raises ValueError: If any fixed override key has invalid syntax.
+        :return Contract: Self, unchanged.
+        """
         for key in self.fixed_overrides:
             _validate_override_key(key, label="contract fixed_overrides")
         return self
@@ -84,7 +88,11 @@ class Promotion(_Frozen):
 
     @model_validator(mode="after")
     def _validate_delta(self) -> Promotion:
-        """Require a finite promotion delta."""
+        """Require a finite promotion delta.
+
+        :raises ValueError: If ``min_delta`` is not finite.
+        :return Promotion: Self, unchanged.
+        """
         _require_finite("promotion.min_delta", self.min_delta)
         return self
 
@@ -254,7 +262,11 @@ class Phase(_Frozen):
 
     @model_validator(mode="after")
     def _validate_timeouts_and_seed_policy(self) -> Phase:
-        """Require bounded trials unless explicitly waived and reject seed sweeps."""
+        """Require bounded trials unless explicitly waived and reject seed sweeps.
+
+        :raises ValueError: If timeout or seed-search policy validation fails.
+        :return Phase: Self, unchanged.
+        """
         if self.timeout_seconds_per_trial is None:
             if not self.allow_unbounded_trials:
                 raise ValueError(
@@ -315,7 +327,11 @@ class Experiment(_Frozen):
 
     @model_validator(mode="after")
     def _validate_run_timeout(self) -> Experiment:
-        """Reject non-finite run wallclock guards."""
+        """Reject non-finite run wallclock guards.
+
+        :raises ValueError: If ``timeout_seconds_per_run`` is non-finite.
+        :return Experiment: Self, unchanged.
+        """
         if self.timeout_seconds_per_run is not None and not math.isfinite(
             self.timeout_seconds_per_run
         ):
@@ -722,7 +738,12 @@ class StudySpec(_Frozen):
     @field_validator("name")
     @classmethod
     def _study_name_is_safe(cls, value: str) -> str:
-        """Study names are used as experiment-name suffixes and path components."""
+        """Validate study names used as experiment-name suffixes and path components.
+
+        :param str value: Candidate study name.
+        :raises ValueError: If ``value`` is not a safe name.
+        :return str: The validated study name, unchanged.
+        """
         return _validate_safe_name("Study", value)
 
 
@@ -736,12 +757,21 @@ class Suite(_Frozen):
     @field_validator("suite")
     @classmethod
     def _suite_name_is_safe(cls, value: str) -> str:
-        """Suite names are used as output path and experiment-name prefixes."""
+        """Validate suite names used as output path and experiment-name prefixes.
+
+        :param str value: Candidate suite name.
+        :raises ValueError: If ``value`` is not a safe name.
+        :return str: The validated suite name, unchanged.
+        """
         return _validate_safe_name("Suite", value)
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:
-        """Require unique, prior-only study dependencies."""
+        """Require unique, prior-only study dependencies.
+
+        :raises ValueError: If study names duplicate or dependencies point forward.
+        :return Suite: Self, unchanged.
+        """
         seen: set[str] = set()
         for study in self.studies:
             if study.name in seen:
@@ -762,10 +792,23 @@ class Suite(_Frozen):
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:
-        """Compile a suite study into a normal :class:`Experiment`."""
+        """Compile a suite study into a normal :class:`Experiment`.
+
+        :param StudySpec study: Suite study to compile.
+        :raises ValueError: If a required study field is missing from both the
+            study and suite defaults.
+        :return Experiment: Concrete experiment config for ``study``.
+        """
         defaults = self.defaults
 
         def value(name: str, *, required: bool = False) -> Any:
+            """Resolve a study field, falling back to suite defaults.
+
+            :param str name: Field name to resolve.
+            :param bool required: Whether ``None`` is invalid after fallback.
+            :raises ValueError: If ``required`` is true and the resolved value is ``None``.
+            :return Any: Deep-copied resolved value.
+            """
             if name in study.model_fields_set:
                 selected = getattr(study, name)
             else:

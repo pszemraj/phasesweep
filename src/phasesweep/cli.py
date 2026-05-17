@@ -122,7 +122,11 @@ def validate(config_path: Path) -> None:
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
-    """Render phase summaries for ``validate``."""
+    """Render phase summaries for ``validate``.
+
+    :param Experiment experiment: Experiment whose phases should be printed.
+    :param str indent: Prefix to place before each rendered phase line.
+    """
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
         contracts = f" contracts={p.contracts}" if p.contracts else ""
@@ -186,7 +190,11 @@ def status(config_path: Path) -> None:
 
 
 def _format_status(status_obj: dict) -> str:
-    """Render status data as stable YAML."""
+    """Render status data as stable YAML.
+
+    :param dict status_obj: Status payload returned by :func:`config_status`.
+    :return str: YAML-formatted status text without a trailing newline.
+    """
     import yaml
 
     return yaml.safe_dump(status_obj, sort_keys=False).rstrip()

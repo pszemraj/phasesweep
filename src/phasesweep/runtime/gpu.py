@@ -32,12 +32,20 @@ class _HostGpuLease:
 
 
 def _gpu_lock_path(gpu_id: int) -> Path:
-    """Return the host-wide lock file for a CUDA device index."""
+    """Return the host-wide lock file for a CUDA device index.
+
+    :param int gpu_id: CUDA device index.
+    :return Path: Host-wide lock file path for ``gpu_id``.
+    """
     return lock_dir() / f"gpu_{gpu_id}.lock"
 
 
 def _try_host_gpu_lease(gpu_id: int) -> _HostGpuLease | None:
-    """Try to acquire the per-GPU host lock without blocking."""
+    """Try to acquire the per-GPU host lock without blocking.
+
+    :param int gpu_id: CUDA device index to lease.
+    :return _HostGpuLease | None: Acquired lease, or ``None`` if already locked.
+    """
     handle = try_lock_file(_gpu_lock_path(gpu_id))
     if handle is None:
         return None

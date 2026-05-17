@@ -79,7 +79,12 @@ def _composed_overrides(
 
 
 def _phase_gates(experiment: Experiment, phase: Phase) -> list[Gate]:
-    """Return contract gates followed by phase-local gates."""
+    """Return contract gates followed by phase-local gates.
+
+    :param Experiment experiment: Parsed experiment config containing named contracts.
+    :param Phase phase: Phase whose contract list and local gates are resolved.
+    :return list[Gate]: Gates in evaluation order.
+    """
     gates: list[Gate] = []
     for contract_name in phase.contracts:
         gates.extend(experiment.contracts[contract_name].gates)

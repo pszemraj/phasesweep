@@ -55,63 +55,117 @@ CONSTRAINT_PREFIX = "constraint:"
 
 
 def constraint_attr(name: str) -> str:
-    """Return the persisted user-attr key for a constraint value."""
+    """Return the persisted user-attr key for a constraint value.
+
+    :param str name: Constraint name from the experiment config.
+    :return str: Optuna user-attr key used to store the constraint value.
+    """
     return f"{CONSTRAINT_PREFIX}{name}"
 
 
 def _experiment_dir(experiment: Experiment) -> Path:
-    """Return the artifact namespace for one experiment."""
+    """Return the artifact namespace for one experiment.
+
+    :param Experiment experiment: Experiment config with workdir and name.
+    :return Path: Absolute directory for experiment artifacts.
+    """
     return Path(experiment.workdir).expanduser().resolve() / experiment.experiment
 
 
 def _phase_dir(experiment: Experiment, phase_name: str) -> Path:
-    """Return the artifact namespace for one phase."""
+    """Return the artifact namespace for one phase.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name to append under the experiment directory.
+    :return Path: Directory for phase artifacts.
+    """
     return _experiment_dir(experiment) / phase_name
 
 
 def _summary_path(experiment: Experiment) -> Path:
-    """Return the experiment summary path."""
+    """Return the experiment summary path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the experiment summary YAML file.
+    """
     return _experiment_dir(experiment) / "summary.yaml"
 
 
 def _run_log_path(experiment: Experiment) -> Path:
-    """Path to the durable run log for one experiment."""
+    """Path to the durable run log for one experiment.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the experiment run log.
+    """
     return _experiment_dir(experiment) / "run.log"
 
 
 def _trial_dir_for(experiment: Experiment, phase_name: str, trial_number: int) -> Path:
-    """Return the canonical per-trial directory."""
+    """Return the canonical per-trial directory.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name containing the trial.
+    :param int trial_number: Optuna trial number.
+    :return Path: Directory for the trial artifacts.
+    """
     return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
 
 
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
-    """Return the path to a phase's persisted winner."""
+    """Return the path to a phase's persisted winner.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose winner path is requested.
+    :return Path: Path to the persisted winner YAML file.
+    """
     return _phase_dir(experiment, phase_name) / "winner.yaml"
 
 
 def _promotion_decision_path(experiment: Experiment, phase_name: str) -> Path:
-    """Path to the persisted phase promotion decision."""
+    """Path to the persisted phase promotion decision.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose promotion decision path is
+        requested.
+    :return Path: Path to the persisted promotion decision YAML file.
+    """
     return _phase_dir(experiment, phase_name) / "promotion.yaml"
 
 
 def _suite_dir(suite: Suite) -> Path:
-    """Filesystem namespace for suite-level summary/log artifacts."""
+    """Filesystem namespace for suite-level summary/log artifacts.
+
+    :param Suite suite: Suite config with default artifact settings.
+    :return Path: Absolute directory for suite artifacts.
+    """
     return Path(suite.defaults.workdir).expanduser().resolve() / suite.suite
 
 
 def _suite_summary_path(suite: Suite) -> Path:
-    """Path to a suite-level summary."""
+    """Path to a suite-level summary.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the suite summary YAML file.
+    """
     return _suite_dir(suite) / "suite_summary.yaml"
 
 
 def _suite_log_path(suite: Suite) -> Path:
-    """Path to a suite-level run log."""
+    """Path to a suite-level run log.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the suite run log.
+    """
     return _suite_dir(suite) / "run.log"
 
 
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
-    """Attach a durable file handler for phasesweep logs."""
+    """Attach a durable file handler for phasesweep logs.
+
+    :param Path path: Log file path to append to.
+    :return Iterator[None]: Context manager that removes the handler on exit.
+    """
     logger = logging.getLogger("phasesweep")
     path.parent.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
@@ -136,13 +190,21 @@ def _file_log_handler(path: Path) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _run_log_handler(experiment: Experiment) -> Iterator[None]:
-    """Attach a durable file handler for one experiment run."""
+    """Attach a durable file handler for one experiment run.
+
+    :param Experiment experiment: Experiment config whose run log is used.
+    :return Iterator[None]: Context manager for the experiment run log handler.
+    """
     with _file_log_handler(_run_log_path(experiment)):
         yield
 
 
 def _write_trials_csv(study: optuna.Study, path: Path) -> None:
-    """Snapshot every trial in ``study`` to ``path`` as stdlib CSV."""
+    """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
+
+    :param optuna.Study study: Study whose trials are serialized.
+    :param Path path: Destination CSV path.
+    """
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
@@ -179,7 +241,13 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
 
 
 def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
-    """Load persisted gate result payload for a selected trial."""
+    """Load persisted gate result payload for a selected trial.
+
+    :param optuna.Study study: Study containing the selected trial.
+    :param int trial_number: Trial number whose gate payload should be loaded.
+    :return list[dict[str, Any]]: Valid gate result dictionaries, or an empty
+        list when missing or malformed.
+    """
     for trial in study.get_trials(deepcopy=False):
         if trial.number != trial_number:
             continue
@@ -248,7 +316,12 @@ def _save_promotion_decision(
     phase_name: str,
     decision: dict[str, Any],
 ) -> None:
-    """Persist a phase promotion decision independently of exposed winner state."""
+    """Persist a phase promotion decision independently of exposed winner state.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose promotion decision is being saved.
+    :param dict[str, Any] decision: Promotion decision payload to persist.
+    """
     path = _promotion_decision_path(experiment, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(decision, sort_keys=False))

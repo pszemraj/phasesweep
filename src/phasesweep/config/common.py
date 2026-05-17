@@ -35,7 +35,13 @@ def _require_finite(label: str, value: float) -> None:
 
 
 def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
-    """Return whether ``value`` is finite and inside optional numeric bounds."""
+    """Return whether ``value`` is finite and inside optional numeric bounds.
+
+    :param float value: The numeric value to test.
+    :param float | None min_value: Optional inclusive lower bound.
+    :param float | None max_value: Optional inclusive upper bound.
+    :return bool: ``True`` when ``value`` is finite and within all supplied bounds.
+    """
     if not math.isfinite(value):
         return False
     if min_value is not None and value < min_value:
@@ -49,7 +55,13 @@ def _validate_optional_bounds(
     min_value: float | None,
     max_value: float | None,
 ) -> None:
-    """Reject empty, non-finite, or inverted optional bounds."""
+    """Reject empty, non-finite, or inverted optional bounds.
+
+    :param str label: Human-readable label included in validation errors.
+    :param float | None min_value: Optional inclusive lower bound.
+    :param float | None max_value: Optional inclusive upper bound.
+    :raises ValueError: If no bound is set, a bound is non-finite, or ``min > max``.
+    """
     if min_value is None and max_value is None:
         raise ValueError(f"{label} must define at least one of min/max.")
     if min_value is not None:
@@ -61,7 +73,13 @@ def _validate_optional_bounds(
 
 
 def _validate_safe_name(kind: str, value: str) -> str:
-    """Reject empty names and characters unsafe for path/study-name components."""
+    """Reject empty names and characters unsafe for path/study-name components.
+
+    :param str kind: Human-readable object kind included in validation errors.
+    :param str value: Candidate name to validate.
+    :raises ValueError: If ``value`` is empty or contains an unsafe character.
+    :return str: The validated name, unchanged.
+    """
     if not value or not all(c.isalnum() or c in "_-" for c in value):
         raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
     return value
@@ -112,7 +130,11 @@ def _validate_override_key(key: object, *, label: str) -> None:
 
 
 def _key_parts(key: str) -> tuple[str, ...]:
-    """Split a validated dotted override key into path components."""
+    """Split a validated dotted override key into path components.
+
+    :param str key: Validated dotted override key.
+    :return tuple[str, ...]: Dot-separated path components.
+    """
     return tuple(key.split("."))
 
 
