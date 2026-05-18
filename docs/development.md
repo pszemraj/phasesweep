@@ -2,6 +2,10 @@
 
 Repository: <https://github.com/pszemraj/phasesweep.git>
 
+- [Quality Gates](#quality-gates)
+- [Package Map](#package-map)
+- [Test Map](#test-map)
+
 ## Quality Gates
 
 ```bash
@@ -16,6 +20,11 @@ Expected result: `179 passed`. Optuna `constant_liar` experimental warnings are 
 
 ## Package Map
 
+![module dependency graph](/docs/images/diagramF_moduledeps.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+
+The package is organized by behavior:
+
 - `phasesweep.config`: Pydantic config models and strict YAML loading.
 - `phasesweep.engine`: Optuna study orchestration, fingerprints, locks, promotion, persistence, status, and suite execution.
 - `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
@@ -23,6 +32,11 @@ Expected result: `179 passed`. Optuna `constant_liar` experimental warnings are 
 - `phasesweep.cli`: Click command surface.
 
 Stable API calls live at the package root: `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, or `runtime`.
+
+The control flow of a typical run is as follows:
+
+![control flow](/docs/images/diagramC_controlflow.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 ## Test Map
 

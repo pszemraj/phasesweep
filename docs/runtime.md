@@ -1,5 +1,12 @@
 # Runtime Behavior
 
+- [Platform Support](#platform-support)
+- [Output Layout](#output-layout)
+- [Process Management](#process-management)
+- [Stale Trial Reaping](#stale-trial-reaping)
+- [Concurrency Model](#concurrency-model)
+- [Fingerprints and Resume](#fingerprints-and-resume)
+
 ## Platform Support
 
 Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep
@@ -32,7 +39,13 @@ runs/
 
 `pid`, `pgid`, and `pid_starttime` are written while a trial is live. They are removed on clean exit and preserved on failure for inspection.
 
+![output layout](/docs/images/diagramG_artifacttree.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+
 ## Process Management
+
+![trial state machine](/docs/images/diagramB_statemachine.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
 
@@ -63,6 +76,9 @@ A run always takes same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
+
+![guard layer](/docs/images/diagramE_guardlayer.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 

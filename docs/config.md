@@ -2,6 +2,18 @@
 
 A config is either one experiment or a suite of studies. A single experiment runs ordered phases. A suite runs multiple isolated experiments under one run plan.
 
+- [Experiment Keys](#experiment-keys)
+- [Phase Keys](#phase-keys)
+- [Search Parameters](#search-parameters)
+- [Override Formats](#override-formats)
+- [Trainer Contract](#trainer-contract)
+- [Override Order](#override-order)
+- [Extractors](#extractors)
+- [Evidence Gates](#evidence-gates)
+- [Promotion](#promotion)
+- [Suites](#suites)
+- [Validation](#validation)
+
 ## Experiment Keys
 
 - `experiment`: required name used for Optuna study names, output paths, and lock identity. It must match `[A-Za-z0-9_-]+`.
@@ -16,6 +28,9 @@ A config is either one experiment or a suite of studies. A single experiment run
 - `phases`: ordered phase list.
 
 ## Phase Keys
+
+![dag](/docs/images/diagramA_dag.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 - `name`: required phase name matching `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.
@@ -52,11 +67,11 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 > [!IMPORTANT]
 > The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
-| Format | Template placeholder | Trainer receives | Use when |
-| --- | --- | --- | --- |
-| `argparse` | `{overrides}` | `--key value` pairs | New scripts using `argparse`, Click, Typer, or similar parsers. |
-| `hydra` | `{overrides}` | `key=value` tokens | Existing Hydra/OmegaConf applications. |
-| `json_file` | `{overrides_path}` | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
+| Format      | Template placeholder | Trainer receives                     | Use when                                                         |
+| ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
+| `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
+| `hydra`     | `{overrides}`        | `key=value` tokens                   | Existing Hydra/OmegaConf applications.                           |
+| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
 
 When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
 
@@ -70,6 +85,9 @@ The command in `trial_command` is the training or evaluation program for one tri
 - Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
 
 ## Override Order
+
+![override composition](/docs/images/diagramD_override.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 Within one trial, later layers override earlier layers:
 

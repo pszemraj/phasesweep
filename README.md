@@ -11,7 +11,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 ## Requirements
 
 - Python 3.10+, OS: Linux or macOS[^1]
-- A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](__docs/config.md#override-formats__)**[^2]
+- A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](docs/config.md#override-formats__)**[^2]
 - GPU optional: CUDA devices are auto-detected for same-host lease management
 
 [^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`. If you're mad about this, you should be using [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) anyway
