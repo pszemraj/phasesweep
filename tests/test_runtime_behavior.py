@@ -316,33 +316,77 @@ phases:
     )
 
 
-def test_optuna_logging_quieted_when_not_verbose() -> None:
-    """Default (no -v) sets Optuna logger to WARNING.
-
-    Optuna's per-trial INFO messages are nearly 1:1 with phasesweep's own
-    runner.info "[phase/trial_N] <cmd>" line and add nothing.
-    """
-    # Reset to a known noisy level first; the test must demonstrate the change.
-    optuna.logging.set_verbosity(optuna.logging.INFO)
-    assert optuna.logging.get_verbosity() == optuna.logging.INFO
-
+def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
+    """Default CLI output quiets Optuna; ``-v`` restores Optuna INFO logs."""
     from phasesweep.cli import _configure_logging
 
-    _configure_logging(verbose=False)
-    assert optuna.logging.get_verbosity() == optuna.logging.WARNING
+    cases = [
+        ("default_quiet", optuna.logging.INFO, False, optuna.logging.WARNING),
+        ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
+    ]
 
-
-def test_optuna_logging_restored_when_verbose() -> None:
-    """`-v` keeps Optuna at INFO so debug runs are fully verbose."""
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    from phasesweep.cli import _configure_logging
-
-    _configure_logging(verbose=True)
-    assert optuna.logging.get_verbosity() == optuna.logging.INFO
+    for case, initial, verbose, expected in cases:
+        optuna.logging.set_verbosity(initial)
+        _configure_logging(verbose=verbose)
+        assert optuna.logging.get_verbosity() == expected, case
 
     # Reset for any later tests.
     logging.getLogger().handlers.clear()
+
+
+def test_runtime_platform_guard_feature_checks_and_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real execution needs POSIX process groups and flock; dry-run does not."""
+    from phasesweep.runtime import files as runtime_files
+
+    # macOS reports ``sys.platform == 'darwin'`` but still has POSIX features;
+    # the guard is intentionally feature-based instead of matching platform names.
+    assert runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=True,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="nt",
+        has_killpg=True,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=False,
+        has_fcntl=True,
+    )
+    assert not runtime_files._supports_posix_runtime_features(
+        os_name="posix",
+        has_killpg=True,
+        has_fcntl=False,
+    )
+
+    body = f"""
+experiment: platform_check
+storage: sqlite:///{tmp_path}/platform.db
+workdir: {tmp_path}/runs
+trial_command: "echo {{overrides}}"
+metric:
+  name: x
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: x }}
+phases:
+  - name: p
+    n_trials: 1
+    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+
+    monkeypatch.setattr(runtime_files, "_supports_posix_runtime_features", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires a POSIX platform"):
+        run_experiment(exp)
+
+    # Dry-run remains available because it launches no subprocesses and takes no locks.
+    winners = run_experiment(exp, dry_run=True)
+    assert set(winners) == {"p"}
 
 
 def test_max_consecutive_failures_aborts_phase(tmp_path):

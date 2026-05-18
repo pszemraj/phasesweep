@@ -12,7 +12,12 @@ from phasesweep.config.common import _Frozen, _validate_optional_bounds
 
 
 def _validate_trial_path(value: str) -> str:
-    """Require a non-empty path inside the trial directory."""
+    """Require a non-empty path inside the trial directory.
+
+    :param str value: Candidate trial-relative path.
+    :raises ValueError: If ``value`` is empty, absolute, or escapes upward.
+    :return str: Validated trial-relative path.
+    """
     path = Path(value)
     if not value or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"trial-relative path required; got {value!r}.")
@@ -20,7 +25,12 @@ def _validate_trial_path(value: str) -> str:
 
 
 def _validate_json_key(value: str | None) -> str | None:
-    """Require dotted JSON keys with non-empty segments."""
+    """Require dotted JSON keys with non-empty segments.
+
+    :param str | None value: Candidate dotted JSON key, or ``None``.
+    :raises ValueError: If ``value`` has empty key segments.
+    :return str | None: Validated JSON key, or ``None``.
+    """
     if value is None:
         return None
     if not value or any(not part for part in value.split(".")):
@@ -29,18 +39,30 @@ def _validate_json_key(value: str | None) -> str | None:
 
 
 class _TrialPathModel(_Frozen):
+    """Mixin for config models containing trial-relative path fields."""
+
     @field_validator("path", "file", check_fields=False)
     @classmethod
     def _trial_path_is_relative(cls, value: str) -> str:
-        """Validate trial-relative path fields."""
+        """Validate trial-relative path fields.
+
+        :param str value: Candidate trial-relative path.
+        :return str: Validated trial-relative path.
+        """
         return _validate_trial_path(value)
 
 
 class _JsonKeyModel(_Frozen):
+    """Mixin for config models containing dotted JSON key fields."""
+
     @field_validator("key", check_fields=False)
     @classmethod
     def _json_key_is_valid(cls, value: str | None) -> str | None:
-        """Validate dotted JSON key fields."""
+        """Validate dotted JSON key fields.
+
+        :param str | None value: Candidate dotted JSON key, or ``None``.
+        :return str | None: Validated JSON key, or ``None``.
+        """
         return _validate_json_key(value)
 
 
@@ -120,7 +142,10 @@ class JsonScalarBoundGate(_TrialPathModel, _JsonKeyModel):
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> JsonScalarBoundGate:
-        """Reject empty/non-finite bounds and ``min > max``."""
+        """Reject empty/non-finite bounds and ``min > max``.
+
+        :return JsonScalarBoundGate: Validated gate config.
+        """
         _validate_optional_bounds(
             label="json_scalar_bound gate",
             min_value=self.min,
@@ -141,7 +166,11 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
 
     @model_validator(mode="after")
     def _validate_source_and_bounds(self) -> ArtifactSizeGate:
-        """Reject ambiguous source specs and invalid byte bounds."""
+        """Reject ambiguous source specs and invalid byte bounds.
+
+        :raises ValueError: If source/key pairing or byte bounds are invalid.
+        :return ArtifactSizeGate: Validated gate config.
+        """
         if self.source == "json" and self.key is None:
             raise ValueError("artifact_size gate with source=json must define key.")
         if self.source != "json" and self.key is not None:
@@ -170,7 +199,12 @@ class Sha256Gate(_TrialPathModel):
     @field_validator("sha256")
     @classmethod
     def _validate_sha256(cls, value: str) -> str:
-        """Require a full 64-character lowercase/uppercase hex digest."""
+        """Require a full 64-character lowercase/uppercase hex digest.
+
+        :param str value: Candidate SHA-256 hex digest.
+        :raises ValueError: If ``value`` is not a full hex digest.
+        :return str: Lowercase SHA-256 hex digest.
+        """
         if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
             raise ValueError("sha256 gate requires a full 64-character hex digest.")
         return value.lower()

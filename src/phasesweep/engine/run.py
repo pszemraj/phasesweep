@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import install_signal_handlers
 
 
@@ -41,7 +42,14 @@ def run_config(
     from_phase: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Winner] | dict[str, dict[str, Winner]]:
-    """Run an experiment or suite config."""
+    """Run an experiment or suite config.
+
+    :param Config config: Parsed experiment or suite config.
+    :param str | None from_phase: Optional phase name to resume from for experiment configs.
+    :param bool dry_run: If ``True``, preview commands without launching subprocesses.
+    :return dict[str, Winner] | dict[str, dict[str, Winner]]: Experiment winners, or suite
+        study winners keyed by study name.
+    """
     if isinstance(config, Suite):
         if from_phase is not None:
             raise RuntimeError("--from-phase is only supported for single experiment configs.")
@@ -50,7 +58,11 @@ def run_config(
 
 
 def config_status(config: Config) -> dict[str, Any]:
-    """Collect read-only status for an experiment or suite config."""
+    """Collect read-only status for an experiment or suite config.
+
+    :param Config config: Parsed experiment or suite config to inspect.
+    :return dict[str, Any]: Read-only status payload for the config.
+    """
     if isinstance(config, Suite):
         return {
             "kind": "suite",
@@ -120,6 +132,7 @@ def run_experiment(
 
     """
     if not dry_run:
+        require_posix_runtime()
         install_signal_handlers()
 
     if dry_run:
@@ -230,7 +243,11 @@ def _run_experiment_inner(
 
 
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
-    """Collect read-only status for one experiment config."""
+    """Collect read-only status for one experiment config.
+
+    :param Experiment experiment: Parsed experiment config to inspect.
+    :return dict[str, Any]: Status payload including phase winner paths and trial counts.
+    """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
         winner_path = _winner_path(experiment, phase.name)
@@ -252,7 +269,12 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
 
 
 def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Winner]]:
-    """Run every study in a suite in dependency order."""
+    """Run every study in a suite in dependency order.
+
+    :param Suite suite: Parsed suite config.
+    :param bool dry_run: If ``True``, preview each study without launching subprocesses.
+    :return dict[str, dict[str, Winner]]: Winners keyed by study name, then phase name.
+    """
     results: dict[str, dict[str, Winner]] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}
     if dry_run:
@@ -261,6 +283,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             results[study_spec.name] = run_experiment(experiment, dry_run=True)
         return results
 
+    require_posix_runtime()
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
         for study_spec in suite.studies:

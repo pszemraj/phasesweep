@@ -129,7 +129,11 @@ log = logging.getLogger("phasesweep.engine.selection")
 
 
 def _gates_pass(gates: list[dict[str, Any]]) -> bool:
-    """Return whether every recorded gate result passed."""
+    """Return whether every recorded gate result passed.
+
+    :param list[dict[str, Any]] gates: Recorded evidence gate payloads.
+    :return bool: ``True`` when every gate has a truthy ``passed`` value.
+    """
     return all(bool(gate.get("passed")) for gate in gates)
 
 
@@ -140,7 +144,15 @@ def _clone_winner_from_baseline(
     completion: dict[str, Any] | None = None,
     promotion: dict[str, Any] | None = None,
 ) -> Winner:
-    """Clone a baseline winner for exposure under another phase/study."""
+    """Clone a baseline winner for exposure under another phase/study.
+
+    :param Winner baseline: Winner to copy into the exposed result slot.
+    :param str | None phase_fingerprint: Fingerprint to assign to the clone.
+    :param dict[str, Any] | None completion: Optional completion payload to
+        store instead of the baseline completion.
+    :param dict[str, Any] | None promotion: Optional promotion audit payload.
+    :return Winner: Cloned winner with copied mutable payloads.
+    """
     return Winner(
         trial_number=baseline.trial_number,
         params=dict(baseline.params),
@@ -155,7 +167,14 @@ def _clone_winner_from_baseline(
 
 
 def _metric_improvement(goal: str, candidate: Winner, baseline: Winner) -> float:
-    """Return candidate improvement over baseline for a metric goal."""
+    """Return candidate improvement over baseline for a metric goal.
+
+    :param str goal: Optimization direction, either ``"minimize"`` or
+        ``"maximize"``.
+    :param Winner candidate: Candidate winner being evaluated.
+    :param Winner baseline: Baseline winner to compare against.
+    :return float: Signed improvement where larger values are better.
+    """
     if goal == "minimize":
         return baseline.metric - candidate.metric
     return candidate.metric - baseline.metric
@@ -168,7 +187,15 @@ def _evaluate_promotion_rule(
     candidate: Winner,
     baseline: Winner,
 ) -> tuple[bool, float | None, bool, str]:
-    """Evaluate shared gate and metric-delta promotion semantics."""
+    """Evaluate shared gate and metric-delta promotion semantics.
+
+    :param str goal: Optimization direction for the metric comparison.
+    :param Promotion promotion: Promotion rule to apply.
+    :param Winner candidate: Candidate winner being considered for promotion.
+    :param Winner baseline: Baseline winner used for the delta comparison.
+    :return tuple[bool, float | None, bool, str]: Promotion flag, improvement
+        value, gate pass flag, and decision reason.
+    """
     gates_passed = _gates_pass(candidate.gates)
     if promotion.requires_gates and not gates_passed:
         return False, None, gates_passed, "gates_failed"
@@ -179,7 +206,12 @@ def _evaluate_promotion_rule(
 
 
 def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
-    """Return the compact winner payload used in run summaries."""
+    """Return the compact winner payload used in run summaries.
+
+    :param str name: Phase or study label for the winner.
+    :param Winner winner: Winner to serialize into a summary item.
+    :return dict[str, Any]: Compact summary payload for the winner.
+    """
     payload = {
         "name": name,
         "trial_number": winner.trial_number,
@@ -201,7 +233,15 @@ def _apply_promotion(
     candidate: Winner,
     winners: dict[str, Winner],
 ) -> tuple[Winner | None, dict[str, Any] | None]:
-    """Apply a phase promotion rule and return the exposed winner plus audit payload."""
+    """Apply a phase promotion rule and return the exposed winner plus audit payload.
+
+    :param Experiment experiment: Experiment config that supplies metric goal.
+    :param Phase phase: Phase whose promotion rule is being applied.
+    :param Winner candidate: Candidate winner from the current phase.
+    :param dict[str, Winner] winners: Winners from previous phases.
+    :return tuple[Winner | None, dict[str, Any] | None]: Exposed winner and
+        promotion audit payload, or ``None`` values when no rule applies.
+    """
     promotion = phase.promotion
     if promotion is None:
         return candidate, None
@@ -305,7 +345,15 @@ def _study_phase_winner(
     results: dict[str, dict[str, Winner]],
     selector: str,
 ) -> tuple[str, Winner]:
-    """Resolve a suite promotion selector to a prior study winner."""
+    """Resolve a suite promotion selector to a prior study winner.
+
+    :param str study_name: Name of the study whose rule references the selector.
+    :param dict[str, dict[str, Winner]] results: Prior study winners keyed by
+        study and phase name.
+    :param str selector: Baseline selector, either a study name or
+        ``"study.phase"``.
+    :return tuple[str, Winner]: Resolved baseline label and winner.
+    """
     if "." in selector:
         baseline_study, phase_name = selector.split(".", 1)
     else:
@@ -335,7 +383,18 @@ def _apply_study_promotion(
     study_winners: dict[str, Winner],
     prior_results: dict[str, dict[str, Winner]],
 ) -> tuple[dict[str, Winner] | None, dict[str, Any] | None]:
-    """Apply a suite study promotion rule against a prior study winner."""
+    """Apply a suite study promotion rule against a prior study winner.
+
+    :param Suite suite: Suite config containing study promotion definitions.
+    :param str study_name: Study whose promotion rule is being evaluated.
+    :param Experiment experiment: Experiment config that supplies metric goal.
+    :param dict[str, Winner] study_winners: Winners produced by the current
+        study.
+    :param dict[str, dict[str, Winner]] prior_results: Winners from earlier
+        studies in the suite.
+    :return tuple[dict[str, Winner] | None, dict[str, Any] | None]: Exposed
+        study winners and promotion decision payload.
+    """
     study_spec = next(study for study in suite.studies if study.name == study_name)
     promotion = study_spec.promotion
     if promotion is None:

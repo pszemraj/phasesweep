@@ -20,7 +20,12 @@ class WandbPollTimeout(TimeoutError):
 
 
 def render_trial_run_name(template: str, ctx: Any) -> str:
-    """Render a trial run-name template from a trial context-like object."""
+    """Render a trial run-name template from a trial context-like object.
+
+    :param str template: Format string using trial context fields.
+    :param Any ctx: Object exposing experiment, phase, trial_id, and run_name.
+    :return str: Rendered W&B run display name.
+    """
     return template.format(
         experiment=ctx.experiment,
         phase=ctx.phase,
@@ -39,7 +44,18 @@ def poll_wandb_summary(
     required_keys: Iterable[str] = (),
     wait_for_keys: bool = True,
 ) -> dict[str, Any]:
-    """Poll W&B until a terminal run summary is available."""
+    """Poll W&B until a terminal run summary is available.
+
+    :param str entity: W&B entity or team name.
+    :param str project: W&B project name.
+    :param str run_name: Display name of the run to find.
+    :param float poll_seconds: Delay between polling attempts.
+    :param float timeout_seconds: Maximum time to wait for a ready run.
+    :param Iterable[str] required_keys: Summary keys that must be present.
+    :param bool wait_for_keys: Whether to wait for all required keys before returning.
+    :raises WandbPollTimeout: If the run summary is not ready before timeout.
+    :return dict[str, Any]: Terminal run summary values.
+    """
     from wandb.apis.public import Api  # type: ignore[import-not-found]
 
     api = Api()

@@ -12,6 +12,9 @@ from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import config_status, run_config
 from phasesweep.runtime.process import install_signal_handlers
 
+CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
+CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
+
 
 def _configure_logging(verbose: bool) -> None:
     """Initialize root logging and tune Optuna's verbosity.
@@ -36,32 +39,52 @@ def _configure_logging(verbose: bool) -> None:
     optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.group(
+    context_settings=CONTEXT_SETTINGS,
+    help="Phase-chained hyperparameter sweeps driven by a YAML file.",
+)
 @click.version_option(package_name="phasesweep")
 def main() -> None:
-    """Phase-chained hyperparameter sweeps driven by a YAML file."""
+    """Run the phasesweep command line interface."""
 
 
-@main.command()
-@click.argument("config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--from-phase", default=None, help="Skip prior phases; load their winners from disk.")
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Run every phase in a phasesweep experiment config. Use --from-phase to skip earlier "
+        "phases after their winner.yaml files already exist."
+    ),
+    short_help="Run configured phases.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@click.option(
+    "--from-phase",
+    metavar="PHASE",
+    default=None,
+    show_default="first phase",
+    help="Skip earlier phases and load their winners from disk.",
+)
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="Render and log an example command per phase. Don't launch any trials.",
+    show_default=True,
+    help="Render one example command per phase without launching trials.",
 )
-@click.option("-v", "--verbose", is_flag=True, help="Debug-level logging.")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    show_default=True,
+    help="Show debug logs from phasesweep and INFO logs from Optuna.",
+)
 def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool) -> None:
-    """Run all phases defined in CONFIG_PATH.
+    """Run all phases defined in ``config_path``.
 
-    Args:
-        config_path: Path to the experiment YAML file.
-        from_phase: If given, skip every phase before this one and load their
-            winners from disk; the named phase must exist in the config.
-        dry_run: Render and log one example trial command per phase instead of
-            launching any subprocesses.
-        verbose: Enable ``DEBUG`` logging for phasesweep and ``INFO`` for Optuna.
-
+    :param Path config_path: Path to the experiment or suite YAML file.
+    :param str | None from_phase: Optional phase name to start from after loading
+        earlier winners from disk.
+    :param bool dry_run: Render example commands without launching subprocesses.
+    :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     """
     _configure_logging(verbose)
     install_signal_handlers()
@@ -77,10 +100,14 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     run_config(config, from_phase=from_phase, dry_run=dry_run)
 
 
-@main.command()
-@click.argument("config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help="Validate a phasesweep experiment or suite config without launching any trials.",
+    short_help="Validate a config file.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
-    """Validate CONFIG_PATH without running anything."""
+    """Validate ``config_path`` without running anything."""
     config = load_config(config_path)
     if isinstance(config, Experiment):
         click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
@@ -95,7 +122,11 @@ def validate(config_path: Path) -> None:
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
-    """Render phase summaries for ``validate``."""
+    """Render phase summaries for ``validate``.
+
+    :param Experiment experiment: Experiment whose phases should be printed.
+    :param str indent: Prefix to place before each rendered phase line.
+    """
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
         contracts = f" contracts={p.contracts}" if p.contracts else ""
@@ -107,10 +138,15 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
                 click.echo(f"{indent}    # {line}")
 
 
-@main.command(name="show-winners")
-@click.argument("config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@main.command(
+    name="show-winners",
+    context_settings=CONTEXT_SETTINGS,
+    help="Print winner.yaml content for every phase in a phasesweep experiment or suite.",
+    short_help="Print saved phase winners.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
-    """Print winner.yaml from each phase that has one."""
+    """Print winner files from ``config_path``."""
     config = load_config(config_path)
     if isinstance(config, Suite):
         for study in config.studies:
@@ -141,16 +177,24 @@ def _show_experiment_winners(experiment: Experiment) -> None:
                     click.echo(f"# {line}")
 
 
-@main.command()
-@click.argument("config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help="Print read-only trial counts and phase state for a phasesweep experiment or suite.",
+    short_help="Print read-only run status.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def status(config_path: Path) -> None:
-    """Print read-only run status for CONFIG_PATH."""
+    """Print read-only run status for ``config_path``."""
     config = load_config(config_path)
     click.echo(_format_status(config_status(config)))
 
 
 def _format_status(status_obj: dict) -> str:
-    """Render status data as stable YAML."""
+    """Render status data as stable YAML.
+
+    :param dict status_obj: Status payload returned by :func:`config_status`.
+    :return str: YAML-formatted status text without a trailing newline.
+    """
     import yaml
 
     return yaml.safe_dump(status_obj, sort_keys=False).rstrip()

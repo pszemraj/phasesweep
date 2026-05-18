@@ -1,5 +1,19 @@
 # Runtime Behavior
 
+- [Platform Support](#platform-support)
+- [Output Layout](#output-layout)
+- [Process Management](#process-management)
+- [Stale Trial Reaping](#stale-trial-reaping)
+- [Concurrency Model](#concurrency-model)
+- [Fingerprints and Resume](#fingerprints-and-resume)
+
+## Platform Support
+
+Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep
+uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host
+locks. Config validation and `--dry-run` do not launch subprocesses and do not
+take those locks, but real runs fail early on unsupported platforms.
+
 ## Output Layout
 
 A completed run writes one namespace per experiment:
@@ -25,7 +39,13 @@ runs/
 
 `pid`, `pgid`, and `pid_starttime` are written while a trial is live. They are removed on clean exit and preserved on failure for inspection.
 
+![output layout](/docs/images/diagramG_artifacttree.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+
 ## Process Management
+
+![trial state machine](/docs/images/diagramB_statemachine.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
 
@@ -57,17 +77,21 @@ A run always takes same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
 
+![guard layer](/docs/images/diagramE_guardlayer.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 
 Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
 
-Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [TODO](TODO.md).
+> [!WARNING]
+> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
 
 ## Fingerprints and Resume
 
 Each phase study stores a semantic fingerprint. Run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`.
 
-Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, override format, metric, constraints, environment, inherited winners, and `timeout_seconds_per_trial`.
+Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, [override format](config.md#override-formats), metric, constraints, environment, inherited winners, and `timeout_seconds_per_trial`.
 
 Re-running the same YAML reuses the study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files, after stale reaping and fingerprint verification. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 

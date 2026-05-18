@@ -164,5 +164,6 @@ phases:
     search_space: { x: { type: float, low: 0, high: 1 } }
 """
     exp = load_experiment(write_yaml(tmp_path, body))
+    assert exp.override_format == "argparse"
     assert exp.phases[0].n_jobs == 1
     assert exp.phases[0].max_consecutive_failures == 5

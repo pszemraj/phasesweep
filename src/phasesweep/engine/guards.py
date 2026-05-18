@@ -161,7 +161,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     so the output lock alone suffices.
 
     Both locks are *same-host advisory only*. Multi-host coordination needs
-    per-trial leases + heartbeats (see ``TODO.md``).
+    per-trial leases + heartbeats (see ``docs/roadmap.md``).
 
     Args:
         experiment: Parsed experiment config.
@@ -199,7 +199,11 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
 
 @contextlib.contextmanager
 def _suite_lock(suite: Suite) -> Iterator[None]:
-    """Take a same-host lock for suite-level log and summary artifacts."""
+    """Take a same-host lock for suite-level log and summary artifacts.
+
+    :param Suite suite: Parsed suite config whose output directory names the lock.
+    :return Iterator[None]: Context manager yielding ``None`` while the suite lock is held.
+    """
     material = {"kind": "suite", "suite_dir": str(_suite_dir(suite))}
     path = _lock_dir() / f"{suite.suite}__suite__{_lock_digest(material)}.lock"
     with exclusive_lock(
@@ -472,7 +476,11 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
 
 
 def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
-    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``."""
+    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``.
+
+    :param Experiment experiment: Parsed experiment config containing storage details.
+    :param Phase phase: Phase being skipped and recovered before loading its winner.
+    """
     if experiment.storage is None:
         return
     _reap_stale_trials(_create_phase_study(experiment, phase), experiment, phase.name)

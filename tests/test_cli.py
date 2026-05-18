@@ -13,6 +13,36 @@ from phasesweep.cli import main as cli_main
 from tests.conftest import write_trainer, write_yaml
 
 
+def test_help_output_is_operator_readable() -> None:
+    """Help should describe CLI usage without leaking Python call signatures."""
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--help"], terminal_width=120)
+
+    assert result.exit_code == 0
+    assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
+    assert "-h, --help" in result.output
+    assert "run           Run configured phases." in result.output
+    assert "show-winners  Print saved phase winners." in result.output
+    assert "status        Print read-only run status." in result.output
+    assert "validate      Validate a config file." in result.output
+    assert "Args:" not in result.output
+
+    for command in ("run", "validate", "show-winners", "status"):
+        result = runner.invoke(cli_main, [command, "--help"], terminal_width=120)
+        assert result.exit_code == 0
+        assert "Args:" not in result.output
+        assert "config_path:" not in result.output
+        assert "Usage:" in result.output
+        assert "CONFIG" in result.output
+        assert "-h, --help" in result.output
+
+    run_help = runner.invoke(cli_main, ["run", "--help"], terminal_width=120).output
+    assert "--from-phase PHASE" in run_help
+    assert "[default: (first phase)]" in run_help
+    assert "--dry-run" in run_help
+    assert "-v, --verbose" in run_help
+
+
 def test_dry_run_winner_includes_inherited_and_fixed_overrides(tmp_path):
     """Dry-run placeholder Winner must compose inherited + fixed + sampled placeholders.
 

@@ -130,12 +130,21 @@ def _resolve_storage(url: str | None) -> Any:
 
 
 def _phase_study_name(experiment: Experiment, phase: Phase) -> str:
-    """Return the stable Optuna study name for a phase."""
+    """Return the stable Optuna study name for a phase.
+
+    :param Experiment experiment: Parsed experiment config supplying the experiment name.
+    :param Phase phase: Phase whose name is appended to the study namespace.
+    :return str: Stable Optuna study name for the experiment/phase pair.
+    """
     return f"{experiment.experiment}::{phase.name}"
 
 
 def _study_direction(experiment: Experiment) -> str:
-    """Return the Optuna direction for the experiment metric goal."""
+    """Return the Optuna direction for the experiment metric goal.
+
+    :param Experiment experiment: Parsed experiment config containing the metric goal.
+    :return str: ``"minimize"`` or ``"maximize"`` for Optuna.
+    """
     return "minimize" if experiment.metric.goal == "minimize" else "maximize"
 
 
@@ -145,7 +154,13 @@ def _create_phase_study(
     *,
     dry_run: bool = False,
 ) -> optuna.Study:
-    """Create or load the Optuna study for a phase."""
+    """Create or load the Optuna study for a phase.
+
+    :param Experiment experiment: Parsed experiment config containing storage and metric settings.
+    :param Phase phase: Phase whose sampler, search space, and study name are used.
+    :param bool dry_run: If ``True``, force in-memory storage for the preview study.
+    :return optuna.Study: Created or loaded Optuna study for the phase.
+    """
     return optuna.create_study(
         study_name=_phase_study_name(experiment, phase),
         storage=None if dry_run else _resolve_storage(experiment.storage),
@@ -157,7 +172,12 @@ def _create_phase_study(
 
 
 def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
-    """Load an existing persistent Optuna study for a phase."""
+    """Load an existing persistent Optuna study for a phase.
+
+    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param Phase phase: Phase whose stable study name is loaded.
+    :return optuna.Study: Existing Optuna study for the phase.
+    """
     return optuna.load_study(
         study_name=_phase_study_name(experiment, phase),
         storage=_resolve_storage(experiment.storage),
@@ -165,7 +185,12 @@ def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
 
 
 def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
-    """Return Optuna trial counts by state without creating a missing study."""
+    """Return Optuna trial counts by state without creating a missing study.
+
+    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param Phase phase: Phase whose existing study is inspected.
+    :return dict[str, int]: Counts keyed by Optuna trial-state name.
+    """
     if experiment.storage is None:
         return {}
     try:

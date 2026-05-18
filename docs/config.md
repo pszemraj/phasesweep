@@ -1,21 +1,44 @@
-# Config Reference
+# Config Guide
 
-A config is either one experiment or a suite of studies. A single experiment runs ordered phases. A suite runs multiple isolated experiments under one run plan.
+A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer remains responsible for parsing overrides, running the actual experiment, and writing the artifacts that the configured extractors read.
+
+This page explains how the parts fit together. For the exhaustive schema dump with every field, type, default, enum value, and point-of-use constraint, use [config_reference.yaml](config_reference.yaml). Treat that file as the implementation reference when reviewing or migrating YAML.
+
+- [Typed Schema Reference](#typed-schema-reference)
+- [Experiment Keys](#experiment-keys)
+- [Phase Keys](#phase-keys)
+- [Search Parameters](#search-parameters)
+- [Override Formats](#override-formats)
+- [Trainer Contract](#trainer-contract)
+- [Override Order](#override-order)
+- [Extractors](#extractors)
+- [Evidence Gates](#evidence-gates)
+- [Promotion](#promotion)
+- [Suites](#suites)
+- [Validation](#validation)
+
+## Typed Schema Reference
+
+The schema-complete reference lives in [config_reference.yaml](config_reference.yaml). It is intentionally YAML-shaped but not a runnable config: each value is a type signature with the required/default status inline, and the comments document operational consequences such as unsafe storage combinations, placeholder requirements, sampler restrictions, and gate/promotion behavior.
+
+Use this guide when you need the mental model. Use the YAML reference when you need to answer "what keys are legal here?", "what happens if I omit this?", or "which exact enum spelling does the validator accept?"
 
 ## Experiment Keys
 
-- `experiment`: required name used for Optuna study names, output paths, and lock identity. It must match `[A-Za-z0-9_-]+`.
-- `storage`: Optuna storage URL. `sqlite:///path.db` is resumable for `n_jobs == 1`; SQLite plus parallel jobs is rejected. `journal:///path.journal` supports same-host parallel jobs. RDB URLs such as `postgresql://...` pass through to Optuna. `null` is in-memory and non-resumable.
-- `workdir`: output root. Trial artifacts live under `<workdir>/<experiment>/<phase>/`.
-- `trial_command`: shell template. Supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`.
-- `override_format`: `hydra`, `argparse`, or `json_file`. Values are shell-quoted before substitution.
-- `metric`: objective name, `goal` (`minimize` or `maximize`), and extractor.
-- `constraints`: optional extracted scalars with `min` and/or `max`. Violating trials are recorded but cannot win.
-- `contracts`: named bundles of immutable `fixed_overrides` plus optional evidence gates.
-- `timeout_seconds_per_run`: wallclock guard for the whole experiment.
-- `phases`: ordered phase list.
+The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to `[A-Za-z0-9_-]+`.
+
+`storage` controls whether a run can resume. `null` is in-memory and non-resumable. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
+
+`trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. It does not teach your trainer to parse the chosen format; your trainer must already understand `argparse`, `hydra`, or the JSON file path you selected with `override_format`.
+
+`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still a completed evaluation, so it can inform the sampler, but it cannot be selected as the phase winner. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
 
 ## Phase Keys
+
+Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is deliberate: it makes expensive searches inspectable, but it is not a substitute for joint optimization when dimensions interact strongly.
+
+![dag](/docs/images/diagramA_dag.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 - `name`: required phase name matching `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.
@@ -38,6 +61,8 @@ A config is either one experiment or a suite of studies. A single experiment run
 
 ## Search Parameters
 
+`search_space` is a mapping from trainer override key to a typed parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing `model` while sampling `model.depth`, because no supported override format can represent that cleanly.
+
 ```yaml
 search_space:
   lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
@@ -45,9 +70,36 @@ search_space:
   activation: { type: categorical, choices: [gelu, relu] }
 ```
 
-Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval.
+Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports continuous numeric spaces only, so categorical parameters are rejected when `sampler.type: cmaes`.
+
+## Override Formats
+
+> [!IMPORTANT]
+> The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
+
+| Format      | Template placeholder | Trainer receives                     | Use when                                                         |
+| ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
+| `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
+| `hydra`     | `{overrides}`        | `key=value` tokens                   | Existing Hydra/OmegaConf applications.                           |
+| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
+
+When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
+
+## Trainer Contract
+
+The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trainer must:
+
+- Parse the selected [override format](#override-formats).
+- Write the metric artifact under `{trial_dir}` so the configured extractor can read it.
+- Exit nonzero when the trial failed and should be recorded as failed.
+- Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
+
+Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials, preserving information for the sampler while keeping those trials out of winner selection.
 
 ## Override Order
+
+![override composition](/docs/images/diagramD_override.png)
+<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
 
 Within one trial, later layers override earlier layers:
 
@@ -59,6 +111,8 @@ Within one trial, later layers override earlier layers:
 A child phase may intentionally reset an inherited key with `fixed_overrides`. A sampled key cannot also be fixed or inherited.
 
 ## Extractors
+
+Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
 
 JSON extractors read a dotted key from a file under `{trial_dir}`:
 
@@ -98,7 +152,7 @@ Supported gates are `required_file`, `json_equals`, `json_scalar_bound`, `artifa
 
 ## Promotion
 
-Promotion gates whether a candidate winner is exposed downstream.
+Promotion decides whether a phase or suite study winner is exposed downstream. The comparison uses signed improvement: for `minimize`, improvement is `baseline.metric - candidate.metric`; for `maximize`, it is `candidate.metric - baseline.metric`. The candidate promotes when improvement is at least `min_delta` and required gates passed.
 
 ```yaml
 promotion:
@@ -112,7 +166,7 @@ promotion:
 
 ## Suites
 
-Suites group independent or dependency-ordered studies:
+Suites group independent or dependency-ordered studies under one run plan. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`.
 
 ```yaml
 suite: coreamp_ablation
@@ -142,8 +196,8 @@ studies:
           lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
 ```
 
-Each study compiles to an experiment named `<suite>__<study>`. Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase.
+Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase.
 
 ## Validation
 
-Config-load validation rejects graph errors, duplicate YAML keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, and unknown contracts. Resume checks reject stale studies and incompatible persisted winners.
+Config-load validation rejects graph errors, duplicate YAML keys, unknown object keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, and unknown contracts. Resume checks reject stale studies and incompatible persisted winners.

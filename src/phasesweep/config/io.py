@@ -85,7 +85,12 @@ _StrictMappingLoader.add_constructor(
 
 
 def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
-    """Load a YAML file as a strict mapping."""
+    """Load a YAML file as a strict mapping.
+
+    :param str | Path path: Filesystem path to the YAML file.
+    :raises ValueError: If parsing fails or the top level is not a mapping.
+    :return dict[str, Any]: Parsed top-level YAML mapping.
+    """
     text = Path(path).read_text()
     try:
         data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass

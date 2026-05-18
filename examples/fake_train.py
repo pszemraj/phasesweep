@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Toy training script used by phasesweep examples and tests.
 
-Reads hyperparameters either from Hydra-style key=value args on argv or from a
-JSON file (--overrides-path). Computes a deterministic synthetic eval_loss and
-param_bytes, writes both to result.json, and also logs them to stdout in a form
-the log_regex extractor can parse.
+Reads hyperparameters from ordinary argparse flags, legacy Hydra-style
+``key=value`` args, or a JSON file (``--overrides-path``). Computes a
+deterministic synthetic eval_loss and param_bytes, writes both to result.json,
+and also logs them to stdout in a form the log_regex extractor can parse.
 
 The synthetic objective rewards moderate depth (8 layers) and small lr (~3e-4)
 and weight_decay (~0.05). param_bytes scales with n_layers so the 16 MB
@@ -56,6 +56,10 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True)
     p.add_argument("--overrides-path", default=None)
+    p.add_argument("--n_layers", type=int)
+    p.add_argument("--lr", type=float)
+    p.add_argument("--weight_decay", type=float)
+    p.add_argument("--dropout", type=float)
     p.add_argument("--fail", action="store_true", help="simulate a crash")
     args, rest = p.parse_known_args()
 
@@ -76,6 +80,15 @@ def main() -> None:
 
         overrides = flatten(overrides)
 
+    overrides.update(
+        {
+            "n_layers": args.n_layers,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "dropout": args.dropout,
+        }
+    )
+    overrides = {k: v for k, v in overrides.items() if v is not None}
     overrides.update(_parse_kv(rest))
 
     if args.fail:

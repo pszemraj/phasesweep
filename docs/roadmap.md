@@ -1,6 +1,6 @@
-# phasesweep TODO
+# Roadmap
 
-## v0.6+
+## Future Work
 
 - Add safe multi-host orchestration: per-trial leases, heartbeats, and stale-trial
   reaping that cannot fail another host's live trials. Current limits are described in

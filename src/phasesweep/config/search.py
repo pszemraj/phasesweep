@@ -204,7 +204,13 @@ def grid_search_space(
     *,
     phase_name: str = "<direct>",
 ) -> dict[str, list[Any]]:
-    """Build Optuna ``GridSampler`` values and validate grid-only constraints."""
+    """Build Optuna ``GridSampler`` values and validate grid-only constraints.
+
+    :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
+    :param str phase_name: Phase name included in validation errors.
+    :raises ValueError: If a parameter cannot be represented as a grid.
+    :return dict[str, list[Any]]: Concrete grid values keyed by parameter name.
+    """
     grid: dict[str, list[Any]] = {}
     for name, param in search_space.items():
         if isinstance(param, CategoricalParam):

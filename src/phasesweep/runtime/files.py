@@ -14,11 +14,65 @@ from typing import IO, Any, TypeVar
 T = TypeVar("T")
 
 
+POSIX_RUNTIME_ERROR = (
+    "phasesweep execution currently requires a POSIX platform. It relies on "
+    "fcntl.flock host locks and POSIX process groups for safe subprocess cleanup; "
+    "Windows support needs a separate locking and process-tree implementation."
+)
+
+
+def require_posix_runtime() -> None:
+    """Raise a clear error when execution is attempted on an unsupported platform."""
+    if not _supports_posix_runtime_features():
+        raise RuntimeError(POSIX_RUNTIME_ERROR)
+
+
+def _supports_posix_runtime_features(
+    *,
+    os_name: str | None = None,
+    has_killpg: bool | None = None,
+    has_fcntl: bool | None = None,
+) -> bool:
+    """Return whether the runtime has the Unix features phasesweep needs.
+
+    :param str | None os_name: Optional `os.name` override for tests.
+    :param bool | None has_killpg: Optional `os.killpg` availability override.
+    :param bool | None has_fcntl: Optional `fcntl` import availability override.
+    :return bool: Whether execution can rely on POSIX process groups and `flock`.
+    """
+    if os_name is None:
+        os_name = os.name
+    if has_killpg is None:
+        has_killpg = hasattr(os, "killpg")
+    if has_fcntl is None:
+        has_fcntl = _fcntl_available()
+    return os_name == "posix" and has_killpg and has_fcntl
+
+
+def _fcntl_available() -> bool:
+    """Return whether the Unix ``fcntl`` module can be imported.
+
+    :return bool: `True` when `fcntl` is importable in the current interpreter.
+    """
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
-    """Run a blocking function in a daemon thread and bound caller wait time."""
+    """Run a blocking function in a daemon thread and bound caller wait time.
+
+    :param Callable[[], T] fn: Zero-argument function to execute.
+    :param float timeout: Maximum number of seconds to wait for completion.
+    :raises TimeoutError: If ``fn`` does not complete before ``timeout`` elapses.
+    :return T: Value returned by ``fn``.
+    """
     q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
     def target() -> None:
+        """Execute ``fn`` and store either its value or raised exception."""
         try:
             q.put((True, fn()))
         except Exception as exc:  # noqa: BLE001
@@ -36,14 +90,22 @@ def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
 
 
 def lock_dir() -> Path:
-    """Return the shared same-host phasesweep lock directory."""
+    """Return the shared same-host phasesweep lock directory.
+
+    :return Path: Directory used for host-local lock files.
+    """
     path = Path(tempfile.gettempdir()) / "phasesweep-locks"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def try_lock_file(path: Path) -> IO[str] | None:
-    """Open ``path`` without truncating and take an exclusive flock, or return ``None``."""
+    """Open ``path`` without truncating and take an exclusive flock, or return ``None``.
+
+    :param Path path: Lock file path to open or create.
+    :return IO[str] | None: Open lock handle when acquired, otherwise ``None``.
+    """
+    require_posix_runtime()
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +132,13 @@ def unlock_file(handle: IO[str]) -> None:
 
 @contextlib.contextmanager
 def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
-    """Hold a non-blocking exclusive flock for the context duration."""
+    """Hold a non-blocking exclusive flock for the context duration.
+
+    :param Path path: Lock file path to hold during the context.
+    :param str busy_message: Error message used when the lock is already held.
+    :raises RuntimeError: If the lock cannot be acquired immediately.
+    :return Iterator[None]: Context manager iterator for the held lock.
+    """
     handle = try_lock_file(path)
     if handle is None:
         raise RuntimeError(busy_message)

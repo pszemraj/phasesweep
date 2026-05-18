@@ -32,7 +32,13 @@ from phasesweep.evidence.wandb import (
 
 
 def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path, Any]:
-    """Load a dotted JSON value from a trial-relative file."""
+    """Load a dotted JSON value from a trial-relative file.
+
+    :param Path trial_dir: Directory containing the trial outputs.
+    :param str relative_path: JSON file path relative to ``trial_dir``.
+    :param str key: Dot-separated key path to read from the JSON object.
+    :return tuple[Path, Any]: Resolved JSON file path and loaded value.
+    """
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
@@ -46,7 +52,13 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
 
 
 def json_float(value: Any, *, label: str) -> float:
-    """Coerce a JSON value to float with a keyed error message."""
+    """Coerce a JSON value to float with a keyed error message.
+
+    :param Any value: JSON scalar value to coerce.
+    :param str label: Human-readable key or metric label for errors.
+    :raises ValueError: If ``value`` cannot be converted to ``float``.
+    :return float: Coerced numeric value.
+    """
     try:
         return float(value)
     except (TypeError, ValueError) as exc:
@@ -197,7 +209,9 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
     except ImportError as exc:
         raise ExtractorError(
             "W&B extractor requested but the 'wandb' package is not installed. "
-            "Install with: pip install phasesweep[wandb]"
+            "Install the wandb extra for the same distribution, for example: "
+            'python -m pip install "phasesweep[wandb] @ '
+            'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
     except WandbPollTimeout as exc:
         msg = (
@@ -255,6 +269,12 @@ class GateResult:
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
+    """Check that a required trial-relative file exists.
+
+    :param TrialContext ctx: Trial context containing the trial directory.
+    :param RequiredFileGate gate: Gate config naming the required file path.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     path = ctx.trial_dir / gate.path
     if path.is_file():
         return GateResult(gate.type, True, f"{gate.path} exists")
@@ -262,6 +282,12 @@ def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
 
 
 def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
+    """Check that a JSON value exactly equals the expected scalar.
+
+    :param TrialContext ctx: Trial context containing the trial directory.
+    :param JsonEqualsGate gate: Gate config naming the JSON path, key, and value.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     try:
         _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
     except Exception as exc:  # noqa: BLE001
@@ -277,6 +303,12 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
 
 
 def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResult:
+    """Check that a JSON scalar is finite and within configured bounds.
+
+    :param TrialContext ctx: Trial context containing the trial directory.
+    :param JsonScalarBoundGate gate: Gate config naming the JSON scalar and bounds.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     try:
         _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
         value = json_float(raw_value, label=gate.key)
@@ -292,6 +324,12 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
 
 
 def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
+    """Check that an artifact byte size falls within configured bounds.
+
+    :param TrialContext ctx: Trial context containing the trial directory.
+    :param ArtifactSizeGate gate: Gate config for file, directory, or JSON byte size.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     path = ctx.trial_dir / gate.path
     if gate.source == "file":
         if not path.is_file():
@@ -323,6 +361,12 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
 
 
 def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
+    """Check that a file's SHA-256 digest matches the expected value.
+
+    :param TrialContext ctx: Trial context containing the trial directory.
+    :param Sha256Gate gate: Gate config naming the file and expected digest.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     path = ctx.trial_dir / gate.path
     if not path.is_file():
         return GateResult(gate.type, False, f"{gate.path} is missing")
@@ -333,6 +377,12 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
 
 
 def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -> GateResult:
+    """Check that a finished W&B run summary contains required keys.
+
+    :param TrialContext ctx: Trial context used to render the W&B run name.
+    :param WandbSummaryRequiredGate gate: Gate config for W&B lookup and keys.
+    :return GateResult: Pass/fail result and human-readable detail.
+    """
     target_name = render_trial_run_name(gate.run_name_template, ctx)
     try:
         summary = poll_wandb_summary(
@@ -368,7 +418,12 @@ _GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
 
 
 def evaluate_gates(ctx: TrialContext, gates: list[Gate]) -> list[GateResult]:
-    """Evaluate all gates against a completed trial context."""
+    """Evaluate all gates against a completed trial context.
+
+    :param TrialContext ctx: Trial context containing outputs and run metadata.
+    :param list[Gate] gates: Gate configs to evaluate in order.
+    :return list[GateResult]: One result for each gate in ``gates``.
+    """
     results: list[GateResult] = []
     for gate in gates:
         fn = _GATE_DISPATCH.get(type(gate))

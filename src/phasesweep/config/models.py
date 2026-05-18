@@ -68,7 +68,11 @@ class Contract(_Frozen):
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Contract:
-        """Reject malformed contract override keys."""
+        """Reject malformed contract override keys.
+
+        :raises ValueError: If any fixed override key has invalid syntax.
+        :return Contract: Self, unchanged.
+        """
         for key in self.fixed_overrides:
             _validate_override_key(key, label="contract fixed_overrides")
         return self
@@ -84,7 +88,11 @@ class Promotion(_Frozen):
 
     @model_validator(mode="after")
     def _validate_delta(self) -> Promotion:
-        """Require a finite promotion delta."""
+        """Require a finite promotion delta.
+
+        :raises ValueError: If ``min_delta`` is not finite.
+        :return Promotion: Self, unchanged.
+        """
         _require_finite("promotion.min_delta", self.min_delta)
         return self
 
@@ -232,9 +240,9 @@ class Phase(_Frozen):
     def _validate_override_key_syntax(self) -> Phase:
         r"""Reject malformed override keys before they hit the override renderer.
 
-        Hydra/argparse rendering quotes values shell-safely, but a malformed
+        argparse/Hydra rendering quotes values shell-safely, but a malformed
         *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
-        produce broken hydra commands (``=value``, ``..a=value``) or silently
+        produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
         treat surface noise (whitespace) as part of the key (review v0.5.6 /
         non-blocking hardening item).
 
@@ -254,7 +262,11 @@ class Phase(_Frozen):
 
     @model_validator(mode="after")
     def _validate_timeouts_and_seed_policy(self) -> Phase:
-        """Require bounded trials unless explicitly waived and reject seed sweeps."""
+        """Require bounded trials unless explicitly waived and reject seed sweeps.
+
+        :raises ValueError: If timeout or seed-search policy validation fails.
+        :return Phase: Self, unchanged.
+        """
         if self.timeout_seconds_per_trial is None:
             if not self.allow_unbounded_trials:
                 raise ValueError(
@@ -305,7 +317,7 @@ class Experiment(_Frozen):
             "{phase}, {run_name}, {overrides_path}."
         )
     )
-    override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
+    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -315,7 +327,11 @@ class Experiment(_Frozen):
 
     @model_validator(mode="after")
     def _validate_run_timeout(self) -> Experiment:
-        """Reject non-finite run wallclock guards."""
+        """Reject non-finite run wallclock guards.
+
+        :raises ValueError: If ``timeout_seconds_per_run`` is non-finite.
+        :return Experiment: Self, unchanged.
+        """
         if self.timeout_seconds_per_run is not None and not math.isfinite(
             self.timeout_seconds_per_run
         ):
@@ -420,7 +436,7 @@ class Experiment(_Frozen):
                 raise ValueError(
                     f"Phase {phase.name!r} has dotted-key namespace collision(s): "
                     f"{pairs}. A key and a sub-key cannot both be overridden — the "
-                    "rendered command would be contradictory (Hydra/argparse) or the "
+                    "rendered command would be contradictory (argparse/Hydra) or the "
                     "json_file would have to be both a scalar and a nested object."
                 )
 
@@ -584,7 +600,7 @@ def _validate_trial_command_template(
     * Phases declaring ``override_format: json_file`` but a template missing
       ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
       and silently runs with defaults).
-    * Phases with ``override_format: hydra`` or ``argparse`` and any inherited,
+    * Phases with ``override_format: argparse`` or ``hydra`` and any inherited,
       fixed, or sampled overrides but a template missing ``{overrides}`` —
       same silent-no-op failure mode (review v0.5.6 / blocker 2).
 
@@ -598,7 +614,7 @@ def _validate_trial_command_template(
         experiment: The :class:`Experiment` being validated.
         phase: The specific phase whose ``trial_command`` is being rendered.
         inherited_keys: Locked keys inherited from parents — used to decide
-            whether ``{overrides}`` is required for hydra/argparse formats.
+            whether ``{overrides}`` is required for argparse/hydra formats.
 
     Raises:
         ValueError: Any of the failure modes listed above (typo, unbalanced
@@ -673,10 +689,10 @@ def _validate_trial_command_template(
             "inherited, fixed, or sampled overrides and trial_command "
             "does not reference {overrides_path}. The trainer would "
             "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or switch to override_format='hydra' / "
-            "'argparse' (which use the {overrides} placeholder)."
+            "to trial_command, or switch to override_format='argparse' / "
+            "'hydra' (which use the {overrides} placeholder)."
         )
-    if experiment.override_format in ("hydra", "argparse") and "overrides" not in fields:
+    if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
             f"{phase.name!r} has inherited, fixed, or sampled overrides "
@@ -694,7 +710,7 @@ class SuiteDefaults(_Frozen):
     storage: str | None = None
     workdir: str = "./runs"
     trial_command: str | None = None
-    override_format: Literal["hydra", "argparse", "json_file"] = "hydra"
+    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -710,7 +726,7 @@ class StudySpec(_Frozen):
     storage: str | None = None
     workdir: str | None = None
     trial_command: str | None = None
-    override_format: Literal["hydra", "argparse", "json_file"] | None = None
+    override_format: Literal["argparse", "hydra", "json_file"] | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -722,7 +738,12 @@ class StudySpec(_Frozen):
     @field_validator("name")
     @classmethod
     def _study_name_is_safe(cls, value: str) -> str:
-        """Study names are used as experiment-name suffixes and path components."""
+        """Validate study names used as experiment-name suffixes and path components.
+
+        :param str value: Candidate study name.
+        :raises ValueError: If ``value`` is not a safe name.
+        :return str: The validated study name, unchanged.
+        """
         return _validate_safe_name("Study", value)
 
 
@@ -736,12 +757,21 @@ class Suite(_Frozen):
     @field_validator("suite")
     @classmethod
     def _suite_name_is_safe(cls, value: str) -> str:
-        """Suite names are used as output path and experiment-name prefixes."""
+        """Validate suite names used as output path and experiment-name prefixes.
+
+        :param str value: Candidate suite name.
+        :raises ValueError: If ``value`` is not a safe name.
+        :return str: The validated suite name, unchanged.
+        """
         return _validate_safe_name("Suite", value)
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:
-        """Require unique, prior-only study dependencies."""
+        """Require unique, prior-only study dependencies.
+
+        :raises ValueError: If study names duplicate or dependencies point forward.
+        :return Suite: Self, unchanged.
+        """
         seen: set[str] = set()
         for study in self.studies:
             if study.name in seen:
@@ -762,10 +792,23 @@ class Suite(_Frozen):
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:
-        """Compile a suite study into a normal :class:`Experiment`."""
+        """Compile a suite study into a normal :class:`Experiment`.
+
+        :param StudySpec study: Suite study to compile.
+        :raises ValueError: If a required study field is missing from both the
+            study and suite defaults.
+        :return Experiment: Concrete experiment config for ``study``.
+        """
         defaults = self.defaults
 
         def value(name: str, *, required: bool = False) -> Any:
+            """Resolve a study field, falling back to suite defaults.
+
+            :param str name: Field name to resolve.
+            :param bool required: Whether ``None`` is invalid after fallback.
+            :raises ValueError: If ``required`` is true and the resolved value is ``None``.
+            :return Any: Deep-copied resolved value.
+            """
             if name in study.model_fields_set:
                 selected = getattr(study, name)
             else:
