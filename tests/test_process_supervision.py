@@ -597,7 +597,7 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         )
     finally:
         # Defense in depth: if the fake cleanup is ever changed to actually
-        # leak, kill the surviving group here so we don't pollute CI.
+        # leak, kill the surviving group here so we don't pollute the host.
         for pgid_file in phase_dir.glob("trial_*/pgid"):
             with _contextlib.suppress(Exception):
                 os.killpg(int(pgid_file.read_text().strip()), signal.SIGKILL)
