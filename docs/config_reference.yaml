@@ -1,0 +1,431 @@
+# phasesweep complete config reference.
+#
+# This file is a reference document, not a runnable experiment. Values are
+# schema signatures: type, required/nullability, and default. Comments explain
+# runtime consequences and cross-field constraints at the field they affect.
+#
+# Schema source of truth:
+#   - src/phasesweep/config/models.py
+#   - src/phasesweep/config/search.py
+#   - src/phasesweep/evidence/models.py
+#
+# All models reject unknown keys. Config loading uses a strict YAML loader that
+# rejects duplicate mapping keys before Pydantic validation runs.
+
+Root:
+  Config: "Experiment | Suite"
+  dispatch: "top-level `suite` key selects Suite; otherwise the file is parsed as Experiment"
+  unknown_keys: "forbidden"
+  duplicate_yaml_keys: "forbidden"
+
+Experiment:
+  # A single phase-chained sweep. This is the normal root shape when the file
+  # does not contain `suite:`.
+  experiment: "str (required)"
+  # Safe name used in paths, study names, locks, and run identity.
+  # Must be non-empty and match [A-Za-z0-9_-]+.
+
+  storage: "str | None = null"
+  # Optuna storage URL. null is in-memory and cannot resume.
+  # sqlite:///path.db is durable only for n_jobs == 1; parallel SQLite is
+  # rejected because writer contention can deadlock or corrupt run semantics.
+  # journal:///path.journal is the intended same-host parallel storage.
+  # RDB URLs such as postgresql://... pass through to Optuna.
+
+  workdir: "str = './runs'"
+  # Output root. Experiment artifacts live under <workdir>/<experiment>/.
+
+  trial_command: "str (required)"
+  # Shell command template for one trial. Supported placeholders:
+  # {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}.
+  # The template is rendered once at config load with synthetic values to catch
+  # unknown placeholders, escaped-placeholder mistakes, and missing override
+  # placeholders before any trial launches.
+
+  override_format: "Literal['argparse', 'hydra', 'json_file'] = 'argparse'"
+  # argparse: {overrides} becomes shell-quoted `--key value` pairs.
+  # hydra: {overrides} becomes shell-quoted `key=value` tokens.
+  # json_file: {overrides_path} points at <trial_dir>/overrides.json with
+  # dotted override keys expanded into nested objects.
+  # If a phase has inherited, fixed, contract, or sampled overrides, argparse
+  # and hydra require {overrides}; json_file requires {overrides_path}.
+
+  metric:
+    name: "str = 'objective'"
+    # Human-readable objective name. Must not duplicate any constraint name.
+    goal: "Literal['minimize', 'maximize'] = 'minimize'"
+    # Controls Optuna direction and promotion-delta sign.
+    extractor: "Extractor (required)"
+    # Must be one of JsonExtractor, LogRegexExtractor, or WandbExtractor.
+    # The extractor result must coerce to a finite float or the trial fails.
+
+  constraints:
+    - name: "str (required)"
+      # Constraint metric name. Must be distinct from the objective and other
+      # constraints.
+      extractor: "Extractor (required)"
+      # Constraint extractor failures are trial failures, not infeasible trials.
+      max: "float | None = null"
+      min: "float | None = null"
+      # At least one of min/max is required when a constraint exists. Bounds
+      # must be finite and min <= max. Violating finite values mark the trial
+      # COMPLETE but infeasible, so they still inform the sampler but cannot win.
+
+  contracts:
+    "<contract_name>":
+      fixed_overrides: "dict[str, Any] = {}"
+      # Fixed comparison bundle applied by name from phase.contracts.
+      # Keys use the same dotted override-key syntax as phase fixed/search keys.
+      gates: "list[Gate] = []"
+      # Contract gates run before phase-local gates. Applying a contract makes
+      # its fixed override keys immutable inside that phase.
+
+  phases:
+    - name: "str (required)"
+      # Safe phase name, non-empty [A-Za-z0-9_-]+. Used in output paths and
+      # Optuna study names.
+      comment: "str | None = null"
+      # Free-text design note surfaced by validate/show-winners. Excluded from
+      # semantic fingerprints, so editing it never invalidates a study.
+
+      inherits: "list[str] = []"
+      # Prior phase names whose exposed winners become fixed overrides here.
+      # Inheritance is prior-only. Transitive locked keys cannot be resampled.
+      # Multi-parent collisions must be resolved with local fixed_overrides.
+
+      fixed_overrides: "dict[str, Any] = {}"
+      # Hard overrides applied to every trial in this phase. A key cannot be
+      # both fixed and sampled in the same phase. Dotted keys are allowed, but
+      # prefix collisions such as `model` plus `model.depth` are rejected.
+
+      contracts: "list[str] = []"
+      # Names from top-level contracts. Unknown names are rejected. Contract
+      # fixed_overrides cannot be resampled or overridden locally.
+
+      search_space:
+        "<override_key>": "SearchParam (required)"
+      # Map from trainer override key to a FloatParam, IntParam, or
+      # CategoricalParam. Override keys must be non-empty dotted paths whose
+      # segments match [A-Za-z0-9_-]+. Keys named `seed` or ending in `.seed`
+      # are rejected unless allow_seed_search is true, because variance audits
+      # should be explicit.
+
+      n_trials: "int >= 1 (required)"
+      # Trial budget for this phase. Re-running a compatible config can top up
+      # the study when n_trials increases.
+
+      n_jobs: "int >= 1 = 1"
+      # Parallel trials within one phase. Parallelism is inside one local
+      # orchestrator only. SQLite storage is rejected when n_jobs > 1.
+
+      gpu_ids: "list[int] | None = null"
+      # Explicit non-negative CUDA device IDs to lease. When null, phasesweep
+      # auto-detects numeric CUDA_VISIBLE_DEVICES or nvidia-smi output, even
+      # for n_jobs == 1, to avoid double-booking GPUs across local runs.
+
+      max_consecutive_failures: "int >= 1 = 5"
+      # Abort after this many consecutive failed or infeasible trials. Set high
+      # only when failures are expected and informative; otherwise this catches
+      # broken configs early.
+
+      allow_no_gpu_isolation: "bool = false"
+      # Parallel GPU isolation is fail-closed. Set true only for intentional
+      # CPU-only runs or when an external scheduler already isolates devices.
+
+      sampler:
+        type: "Literal['tpe', 'random', 'grid', 'cmaes'] = 'tpe'"
+        seed: "int | None = null"
+        n_startup_trials: "int >= 0 = 10"
+        # n_startup_trials is only used by TPE. It is ignored by random, grid,
+        # and CMA-ES.
+
+      timeout_seconds_per_trial: "float >= 0 | None = 86400.0"
+      # Per-trial process-group timeout. null is rejected unless
+      # allow_unbounded_trials is true.
+
+      allow_unbounded_trials: "bool = false"
+      # Set true only when an unbounded trial is intentional. Otherwise a null
+      # trial timeout is treated as a config error.
+
+      timeout_seconds_per_phase: "float >= 0 | None = null"
+      # Wallclock cap for this phase's Optuna optimize call. Finite values only.
+
+      allow_incomplete_on_timeout: "bool = false"
+      # Timeouts fail closed before winner selection by default. Set true to
+      # select from completed trials after a phase/run timeout and persist
+      # completion metadata on the winner.
+
+      allow_partial_grid: "bool = false"
+      # Grid phases must cover the full matrix by default. Set true only when
+      # intentionally truncating the grid with n_trials < cardinality.
+
+      allow_seed_search: "bool = false"
+      # Set true only for explicit variance audits. Otherwise `seed` and
+      # `*.seed` search-space keys are rejected at config load.
+
+      gates: "list[Gate] = []"
+      # Evidence gates evaluated after metric and constraints. If promotion is
+      # absent or promotion.requires_gates is true, any failed gate fails the
+      # trial. If promotion.requires_gates is false, gate results are advisory
+      # and recorded for the promotion decision.
+
+      promotion: "Promotion | None = null"
+      # Compare this phase winner to a prior exposed phase winner before making
+      # it available downstream.
+
+  env: "dict[str, str] = {}"
+  # Environment variables added to every trial subprocess. Included in semantic
+  # fingerprints because they can change trainer behavior.
+
+  timeout_seconds_per_run: "float >= 0 | None = null"
+  # Whole-experiment wallclock guard. A run timeout can stop before launching a
+  # phase or bound the current phase's remaining optimize time.
+
+Suite:
+  # A suite is a group of independent or dependency-ordered studies. Each study
+  # compiles to an Experiment named <suite>__<study>.
+  suite: "str (required)"
+  # Safe suite name, non-empty [A-Za-z0-9_-]+. Used in output paths, locks, and
+  # experiment-name prefixes.
+
+  defaults:
+    storage: "str | None = null"
+    workdir: "str = './runs'"
+    trial_command: "str | None = null"
+    override_format: "Literal['argparse', 'hydra', 'json_file'] = 'argparse'"
+    metric: "Metric | None = null"
+    constraints: "list[Constraint] = []"
+    contracts: "dict[str, Contract] = {}"
+    env: "dict[str, str] = {}"
+    timeout_seconds_per_run: "float >= 0 | None = null"
+    # Defaults are deep-copied into each study when the study omits that field.
+    # study.env merges over defaults.env; study.contracts merges over
+    # defaults.contracts. Required experiment fields must be provided either
+    # here or on every study.
+
+  studies:
+    - name: "str (required)"
+      # Safe study name, non-empty [A-Za-z0-9_-]+.
+      depends_on: "list[str] = []"
+      # Prior study names that must complete before this study starts.
+      # Dependencies are prior-only; forward references are rejected.
+
+      storage: "str | None = null"
+      workdir: "str | None = null"
+      trial_command: "str | None = null"
+      override_format: "Literal['argparse', 'hydra', 'json_file'] | None = null"
+      metric: "Metric | None = null"
+      constraints: "list[Constraint] | None = null"
+      contracts: "dict[str, Contract] = {}"
+      phases: "list[Phase] min_length=1 (required)"
+      env: "dict[str, str] | None = null"
+      timeout_seconds_per_run: "float >= 0 | None = null"
+      # These fields fall back to Suite.defaults when omitted. For env,
+      # explicit non-null study values update defaults.env instead of replacing
+      # it. For contracts, study contracts update defaults.contracts.
+
+      promotion: "Promotion | None = null"
+      # Suite-level promotion compares this study's final phase winner against
+      # a prior study winner. min_delta_vs can be `study` for that study's
+      # final phase or `study.phase` for an explicit phase.
+
+Definitions:
+  Metric:
+    name: "str = 'objective'"
+    goal: "Literal['minimize', 'maximize'] = 'minimize'"
+    extractor: "Extractor (required)"
+
+  Constraint:
+    name: "str (required)"
+    extractor: "Extractor (required)"
+    max: "float | None = null"
+    min: "float | None = null"
+    # At least one bound must be set. Bounds are inclusive and finite.
+
+  Contract:
+    fixed_overrides: "dict[str, Any] = {}"
+    gates: "list[Gate] = []"
+    # Contract fixed keys are immutable in phases that apply the contract.
+
+  Promotion:
+    min_delta_vs: "str (required)"
+    # Phase promotion: prior phase name. Suite promotion: prior study name or
+    # `study.phase`. The referenced baseline must already be exposed.
+    min_delta: "float = 0.0"
+    # Finite signed improvement threshold. For minimize, improvement is
+    # baseline.metric - candidate.metric. For maximize, it is
+    # candidate.metric - baseline.metric.
+    requires_gates: "bool = true"
+    # true: failed gates block promotion and normally fail the trial. false:
+    # gate results are advisory and the metric delta decides promotion.
+    on_fail: "Literal['stop', 'skip', 'continue_baseline'] = 'stop'"
+    # stop: abort on insufficient delta. skip: stop exposing this branch.
+    # continue_baseline: expose a clone of the baseline winner downstream.
+
+  Phase:
+    name: "str (required)"
+    comment: "str | None = null"
+    inherits: "list[str] = []"
+    fixed_overrides: "dict[str, Any] = {}"
+    contracts: "list[str] = []"
+    search_space: "dict[str, SearchParam] = {}"
+    n_trials: "int >= 1 (required)"
+    n_jobs: "int >= 1 = 1"
+    gpu_ids: "list[int] | None = null"
+    max_consecutive_failures: "int >= 1 = 5"
+    allow_no_gpu_isolation: "bool = false"
+    sampler: "Sampler = Sampler(type='tpe', seed=None, n_startup_trials=10)"
+    timeout_seconds_per_trial: "float >= 0 | None = 86400.0"
+    allow_unbounded_trials: "bool = false"
+    timeout_seconds_per_phase: "float >= 0 | None = null"
+    allow_incomplete_on_timeout: "bool = false"
+    allow_partial_grid: "bool = false"
+    allow_seed_search: "bool = false"
+    gates: "list[Gate] = []"
+    promotion: "Promotion | None = null"
+
+  Sampler:
+    type: "Literal['tpe', 'random', 'grid', 'cmaes'] = 'tpe'"
+    # tpe: Optuna TPESampler with n_startup_trials.
+    # random: Optuna RandomSampler.
+    # grid: exhaustive GridSampler over concrete values; log-scale params are
+    # rejected, float params require step, and full matrix coverage is required
+    # unless phase.allow_partial_grid is true.
+    # cmaes: continuous numeric search with cmaes>=0.10. Categorical params are
+    # rejected at config load. Good fit for later continuous tuning phases.
+    seed: "int | None = null"
+    n_startup_trials: "int >= 0 = 10"
+
+  SearchParam:
+    FloatParam:
+      type: "Literal['float'] (required)"
+      low: "float (required)"
+      high: "float (required)"
+      log: "bool = false"
+      step: "float | None = null"
+      # low/high/step must be finite; low <= high; step > 0 when set.
+      # log requires low > 0 and is mutually exclusive with step.
+      # grid sampler rejects log floats and requires step to evenly divide
+      # high - low.
+
+    IntParam:
+      type: "Literal['int'] (required)"
+      low: "int (required)"
+      high: "int (required)"
+      log: "bool = false"
+      step: "int = 1"
+      # low <= high and step > 0. log requires low > 0 and step == 1.
+      # grid sampler rejects log ints.
+
+    CategoricalParam:
+      type: "Literal['categorical'] (required)"
+      choices: "list[Any] min_length=1 (required)"
+      # Choices must be Optuna-compatible scalars: null, bool, int, finite
+      # float, or str. Lists, dicts, objects, NaN, and infinities are rejected.
+      # cmaes sampler rejects categorical params.
+
+  Extractor:
+    JsonExtractor:
+      type: "Literal['json'] (required)"
+      path: "str (required)"
+      # Trial-relative path. Must be non-empty, relative, and cannot escape
+      # upward with `..`.
+      key: "str (required)"
+      # Non-empty dotted JSON path. The selected value must coerce to float.
+
+    LogRegexExtractor:
+      type: "Literal['log_regex'] (required)"
+      file: "str = 'stdout.log'"
+      # Trial-relative log path. stdout.log and stderr.log are captured
+      # automatically for subprocess trials.
+      pattern: "str (required)"
+      # Python regex containing a named group `(?P<value>...)`. Invalid regexes,
+      # missing value groups, and no matches fail the trial.
+      select: "Literal['last', 'first', 'min', 'max'] = 'last'"
+      # first returns immediately. last/min/max stream the file line-by-line.
+
+    WandbExtractor:
+      type: "Literal['wandb'] (required)"
+      entity: "str (required)"
+      project: "str (required)"
+      run_name_template: "str = '{experiment}-{phase}-{trial_id}'"
+      # Available substitutions: {experiment}, {phase}, {trial_id}, {run_name}.
+      # The trainer should use PHASESWEEP_RUN_NAME or the same template.
+      metric_key: "str (required)"
+      # Key on wandb.run.summary; selected value must coerce to float.
+      poll_seconds: "float > 0 = 2.0"
+      timeout_seconds: "float >= 0 = 120.0"
+      # Requires the optional wandb dependency. A missing run or missing metric
+      # before timeout fails the trial.
+
+  Gate:
+    RequiredFileGate:
+      type: "Literal['required_file'] (required)"
+      path: "str (required)"
+      # Passes only when the trial-relative path exists and is a file.
+
+    JsonEqualsGate:
+      type: "Literal['json_equals'] (required)"
+      path: "str (required)"
+      key: "str (required)"
+      value: "Any (required)"
+      # Type-strict equality: true, 1, and 1.0 are different. Use
+      # json_scalar_bound for numeric comparisons across int/float encodings.
+
+    JsonScalarBoundGate:
+      type: "Literal['json_scalar_bound'] (required)"
+      path: "str (required)"
+      key: "str (required)"
+      min: "float | None = null"
+      max: "float | None = null"
+      # At least one bound must be set. Value must be present, numeric, finite,
+      # and within inclusive bounds.
+
+    ArtifactSizeGate:
+      type: "Literal['artifact_size'] (required)"
+      source: "Literal['file', 'directory', 'json'] (required)"
+      path: "str (required)"
+      key: "str | None = null"
+      min_bytes: "int >= 0 | None = null"
+      max_bytes: "int >= 0 | None = null"
+      # At least one byte bound must be set. For source=json, key is required
+      # and the JSON value must be a non-negative integer byte count. For
+      # source=file or directory, key must be null. Directory size sums files
+      # under the directory recursively.
+
+    Sha256Gate:
+      type: "Literal['sha256'] (required)"
+      path: "str (required)"
+      sha256: "str (required)"
+      # Expected full 64-character hex digest. Stored normalized to lowercase.
+
+    WandbSummaryRequiredGate:
+      type: "Literal['wandb_summary_required'] (required)"
+      entity: "str (required)"
+      project: "str (required)"
+      keys: "list[str] min_length=1 (required)"
+      run_name_template: "str = '{experiment}-{phase}-{trial_id}'"
+      poll_seconds: "float > 0 = 2.0"
+      timeout_seconds: "float >= 0 = 120.0"
+      # Checks that a completed W&B run summary contains all required keys.
+      # Missing wandb, timeout, or missing keys produce a failed gate result.
+
+Validation:
+  name_syntax: "experiment, suite, study, and phase names are [A-Za-z0-9_-]+"
+  override_key_syntax: "dotted [A-Za-z0-9_-]+ segments; no empty segments or whitespace"
+  duplicate_yaml_keys: "rejected by the strict YAML loader"
+  unknown_model_keys: "rejected by Pydantic extra='forbid'"
+  duplicate_phase_names: "rejected"
+  duplicate_study_names: "rejected"
+  phase_inherits: "must name prior phases only"
+  study_depends_on: "must name prior studies only"
+  fixed_vs_sampled_collision: "same key cannot be fixed and sampled in one phase"
+  dotted_prefix_collision: "`model` and `model.depth` cannot both be overridden in one composed phase"
+  inherited_resample_collision: "inherited locked keys cannot be resampled downstream"
+  contract_collision: "contract fixed keys cannot conflict with each other or local phase keys"
+  metric_constraint_names: "objective and constraint names must be distinct"
+  storage_parallel_policy: "SQLite storage with phase.n_jobs > 1 is rejected"
+  sampler_space_policy: "grid/cmaes constraints are checked at config load"
+  timeout_policy: "trial timeout null requires allow_unbounded_trials=true"
+  seed_search_policy: "`seed` and `*.seed` search keys require allow_seed_search=true"
+  placeholder_policy: "trial_command must include the placeholder required by override_format when overrides exist"
