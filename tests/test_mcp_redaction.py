@@ -1,0 +1,77 @@
+"""The redaction invariant: no payload ever contains the trial command, the
+storage URL, the workdir, or any env value.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from phasesweep.engine import PhaseWinnerView
+from phasesweep.mcp.redaction import assert_no_sensitive, status_payload, winners_payload
+from phasesweep.mcp.registry import Registry
+
+
+def _write_catalog(tmp_path: Path) -> Path:
+    # A config whose dangerous fields contain unmistakable sentinels.
+    config = tmp_path / "exp.yaml"
+    config.write_text(
+        f"""\
+experiment: redact_me
+storage: sqlite:///{tmp_path}/SECRET_DB.db
+workdir: {tmp_path}/SECRET_WORKDIR
+trial_command: "python /opt/secret/train.py --token DANGER_TOKEN --out {{trial_dir}}/r.json {{overrides}}"
+override_format: argparse
+metric:
+  name: loss
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: loss }}
+env:
+  HF_TOKEN: SECRET_ENV_VALUE
+phases:
+  - name: p
+    n_trials: 1
+    search_space:
+      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
+"""
+    )
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        f"state_dir: {tmp_path}/state\nexperiments:\n  - id: redact_me\n    config: {config}\n"
+    )
+    return catalog
+
+
+def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
+    reg = Registry.load(_write_catalog(tmp_path)).get("redact_me")
+    sensitive = [
+        reg.experiment.trial_command,
+        reg.experiment.storage,
+        *reg.experiment.env.values(),
+        "SECRET_WORKDIR",
+        "DANGER_TOKEN",
+        "SECRET_ENV_VALUE",
+    ]
+
+    winners = winners_payload(
+        reg.id,
+        [PhaseWinnerView("p", 0, 0.1, {"lr": 3e-4}, {"lr": 3e-4}, None, False)],
+    )
+    status = status_payload(
+        reg.id,
+        {"metric": {"name": "loss", "goal": "minimize"}, "phases": [], "summary_present": False},
+        None,
+    )
+
+    assert_no_sensitive(winners, sensitive)
+    assert_no_sensitive(status, sensitive)
+    assert str(reg.config_path) not in str(winners)  # the catalog path is never exposed
+
+
+def test_assert_no_sensitive_actually_catches_a_leak() -> None:
+    # Guard against a vacuous scanner: it must fail when a needle IS present.
+    leaky = {"experiment_id": "x", "note": "token=DANGER_TOKEN"}
+    try:
+        assert_no_sensitive(leaky, ["DANGER_TOKEN"])
+    except AssertionError:
+        return
+    raise AssertionError("assert_no_sensitive failed to detect a planted leak")

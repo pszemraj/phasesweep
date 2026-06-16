@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,12 @@ def main() -> None:
     p.add_argument("--weight_decay", type=float)
     p.add_argument("--dropout", type=float)
     p.add_argument("--fail", action="store_true", help="simulate a crash")
+    p.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="seconds to sleep before writing result (simulates a long trial; used by tests)",
+    )
     args, rest = p.parse_known_args()
 
     overrides: dict[str, Any] = {}
@@ -94,6 +101,9 @@ def main() -> None:
     if args.fail:
         print("simulated failure", file=sys.stderr)
         sys.exit(3)
+
+    if args.sleep > 0:
+        time.sleep(args.sleep)
 
     n_layers = int(overrides.get("n_layers", 8))
     lr = float(overrides.get("lr", 3e-4))
