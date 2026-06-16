@@ -476,6 +476,37 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
     return current_starttime == saved_starttime
 
 
+def is_pid_zombie(pid: int) -> bool:
+    """Return whether ``pid`` is a zombie (exited but not yet reaped by its parent).
+
+    A zombie still answers ``kill(pid, 0)`` because it occupies the PID table,
+    so :func:`is_pid_alive` and :func:`is_same_process` both report it as alive.
+    For a liveness decision it is effectively dead — it holds no resources and
+    is doing no work. This reads ``/proc/<pid>/stat`` (state is the first field
+    after the ``)`` that closes ``comm``) and returns ``True`` only for state
+    ``Z``. On non-Linux (no ``/proc``) it returns ``False``, preserving the
+    legacy alive-only semantics used elsewhere.
+
+    Args:
+        pid: Process ID to probe.
+
+    Returns:
+        ``True`` if the process exists and is a zombie; ``False`` if it is live,
+        gone, or undeterminable (non-Linux).
+
+    """
+    try:
+        with Path(f"/proc/{pid}/stat").open(encoding="utf-8") as fh:
+            text = fh.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    rparen = text.rfind(")")
+    if rparen < 0:
+        return False
+    fields = text[rparen + 1 :].split()
+    return bool(fields) and fields[0] == "Z"
+
+
 @dataclass
 class StaleProcessIdentity:
     """Forensic identity files left in a trial directory after launch.

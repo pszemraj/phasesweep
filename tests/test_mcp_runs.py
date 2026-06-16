@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from phasesweep.mcp.runs import RunHandle, RunStore, utc_now_iso
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.process import is_pid_zombie, read_proc_starttime
 
 
 def _make_handle(
@@ -114,3 +117,26 @@ def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
     assert live is not None
     assert live.run_id == "exp-run"
     assert store.live_run_for("other-experiment") is None
+
+
+def test_state_failed_for_zombie_runner_without_status(tmp_path: Path) -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("zombie detection relies on /proc")
+    store = RunStore(tmp_path / "state")
+    # Spawn a child that exits immediately. As its (unreaping) parent, the pid
+    # lingers as a zombie that os.kill(pid, 0) still reports as alive - exactly
+    # the SIGKILL/OOM case that must report failed, not running, or relaunch
+    # would be blocked forever.
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not is_pid_zombie(proc.pid):
+            time.sleep(0.02)
+        if not is_pid_zombie(proc.pid):
+            pytest.skip("could not observe a zombie (fast reaper?)")
+        handle = _make_handle(
+            store, run_id="zomb", pid=proc.pid, starttime=read_proc_starttime(proc.pid)
+        )
+        assert store.state(handle) == "failed"
+    finally:
+        proc.wait()

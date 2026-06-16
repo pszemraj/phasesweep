@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from phasesweep.runtime.process import is_same_process
+from phasesweep.runtime.process import is_pid_zombie, is_same_process
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 
@@ -96,9 +96,9 @@ class RunStore:
 
         status.json (written by the runner on every exit) is authoritative when
         present: returncode 0 -> succeeded, a signalled code -> cancelled, any
-        other -> failed. With no status.json, a live PID means running; a dead
-        PID with no status means the process died without recording a cause
-        (e.g. SIGKILL or OOM) and is reported as failed.
+        other -> failed. With no status.json, a live (non-zombie) PID means
+        running; a dead or zombie PID with no status means the process died
+        without recording a cause (e.g. SIGKILL or OOM) and is reported as failed.
 
         Args:
             handle: The run handle to evaluate.
@@ -115,7 +115,12 @@ class RunStore:
             if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
                 return "cancelled"
             return "failed"
-        if is_same_process(handle.pid, handle.pid_starttime):
+        # No status.json: the run is live only if its process is genuinely alive.
+        # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
+        # SIGTERM before the engine installed its handlers) still answers
+        # kill(pid, 0), so it must be filtered out or a dead run would report
+        # "running" forever and block relaunch.
+        if is_same_process(handle.pid, handle.pid_starttime) and not is_pid_zombie(handle.pid):
             return "running"
         return "failed"
 
