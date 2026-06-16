@@ -1,0 +1,16 @@
+# Example MCP catalog. Start the server with:
+#   phasesweep-mcp --catalog examples/catalog.yaml
+#
+# The agent only ever sends an experiment `id`. It cannot pass a path, author a
+# config, or reach trial_command / env / storage / workdir. You curate which
+# experiments exist by editing this file (same trust as the experiment YAML).
+
+state_dir: ./runs/.mcp          # run handles + per-run logs (operator-owned)
+experiments:
+  - id: tiny-lm                 # the only token the agent ever sends
+    config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
+    description: "16 MB LM: pick depth, then lr, then regularization"
+    allow:
+      launch: true              # defaults are all true; set false to make read-only
+      cancel: true
+      from_phase: true

@@ -41,16 +41,19 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]
+mcp = ["mcp>=1.27,<2"]
 dev = [
     "pytest>=7",
     "ruff>=0.5",
     "mypy>=1.10",
     "tomli>=2; python_version < '3.11'",
     "types-PyYAML>=6.0",
+    "mcp>=1.27,<2",
 ]
 
 [project.scripts]
 phasesweep = "phasesweep.cli:main"
+phasesweep-mcp = "phasesweep.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/phasesweep"
