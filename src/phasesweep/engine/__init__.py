@@ -1,5 +1,11 @@
 """Sweep execution engine API."""
 
+from phasesweep.engine.read import (
+    PhaseWinnerView,
+    read_status,
+    read_winner,
+    read_winners,
+)
 from phasesweep.engine.run import (
     config_status,
     run_config,
@@ -12,9 +18,13 @@ from phasesweep.engine.trial import UnsafeProcessCleanupError
 
 __all__ = [
     "NoFeasibleTrialError",
+    "PhaseWinnerView",
     "UnsafeProcessCleanupError",
     "Winner",
     "config_status",
+    "read_status",
+    "read_winner",
+    "read_winners",
     "run_config",
     "run_experiment",
     "run_suite",

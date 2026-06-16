@@ -737,3 +737,23 @@ def kill_stale_group(
 
     log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
     return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)
+
+
+def terminate_group(pgid: int, *, grace_seconds: float = _KILL_GRACE_SECONDS) -> bool:
+    """Public SIGTERM -> grace -> SIGKILL of a process group; confirm it is gone.
+
+    Thin wrapper over the internal escalation used by trial cleanup, exposed so
+    callers outside ``runtime`` (the MCP cancel path) do not reach into a
+    private helper. Same contract: returns ``True`` only when the group is
+    confirmed dead (already gone, died in the SIGTERM grace, or died within 2s
+    of SIGKILL), ``False`` when cleanup is uncertain.
+
+    Args:
+        pgid: Target process-group ID.
+        grace_seconds: Seconds to wait after SIGTERM before escalating.
+
+    Returns:
+        Whether the group is confirmed gone.
+
+    """
+    return _terminate_process_group(pgid, grace_seconds=grace_seconds)
