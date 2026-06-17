@@ -25,6 +25,8 @@ phasesweep is currently installed from Git:
 pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
 # weights-and-biases integration is optional:
 pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+# MCP server, to drive sweeps from an AI agent:
+pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 # all dev dependencies:
 pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
@@ -91,11 +93,23 @@ phases:
 - Use one orchestrator per experiment on one host. Same-host conflicts are rejected with advisory locks.
 - SQLite is for sequential `n_jobs == 1` studies. See [runtime behavior](docs/runtime.md#concurrency-model) for parallel storage and locking details.
 
+## MCP server (agent integration)
+
+`phasesweep-mcp` exposes an experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) so it can **launch a sweep, monitor it, and read the winning hyperparameters** — and nothing else. The agent picks an experiment from a human-curated catalog by id; it never sees or sets `trial_command`, `env`, `storage`, or `workdir`, and no tool returns log text.
+
+```bash
+pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
+phasesweep-mcp --catalog examples/catalog.yaml
+```
+
+The sweep runs as a detached background process that survives a server restart. By default one sweep runs at a time (`max_concurrent_runs: 1`), so a single GPU is not oversubscribed; raise it on multi-GPU hosts. See the [MCP guide](docs/mcp.md) for the catalog format, the six tools, the security model, and multi-GPU configuration.
+
 ## Docs
 
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
+- [MCP server](docs/mcp.md): expose an experiment to an AI agent — catalog format, the six tools, security model, single-host operation.
 - [Development](docs/development.md): test commands and test-suite map.
 - [Roadmap](docs/roadmap.md): future work outside the current single-host design.
 

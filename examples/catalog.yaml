@@ -6,6 +6,7 @@
 # experiments exist by editing this file (same trust as the experiment YAML).
 
 state_dir: ./runs/.mcp          # run handles + per-run logs (operator-owned)
+max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane
 experiments:
   - id: tiny-lm                 # the only token the agent ever sends
     config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
