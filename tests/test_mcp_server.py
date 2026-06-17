@@ -205,7 +205,9 @@ def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> No
     assert store.list_handles() == []
 
 
-def test_launch_passes_config_snapshot_to_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_launch_passes_config_snapshot_to_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = _config(tmp_path)
     app, registry, _store = make_mcp_app(_catalog(tmp_path, config))
     captured: dict[str, list[str]] = {}
