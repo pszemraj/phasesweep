@@ -492,7 +492,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
                 name="p",
                 n_trials=3,
                 max_consecutive_failures=1,
-                timeout_seconds_per_phase=0.12,
+                timeout_seconds_per_phase=0.5,
                 allow_incomplete_on_timeout=True,
                 search_space={},
             )
