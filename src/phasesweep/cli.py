@@ -189,6 +189,37 @@ def status(config_path: Path) -> None:
     click.echo(_format_status(config_status(config)))
 
 
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help="Serve the optional MCP broker over stdio using an operator-authored catalog.",
+    short_help="Serve the MCP broker.",
+)
+@click.option(
+    "--catalog",
+    required=True,
+    metavar="PATH",
+    type=CONFIG_PATH,
+    help="MCP catalog that maps agent-visible experiment ids to config files.",
+)
+@click.pass_context
+def mcp(ctx: click.Context, catalog: Path) -> None:
+    """Serve the MCP broker over stdio.
+
+    The MCP SDK import stays behind this command so the base CLI still works
+    without installing the ``mcp`` optional dependency.
+    """
+    try:
+        from phasesweep.mcp.server import serve
+
+        ctx.exit(serve(catalog))
+    except ModuleNotFoundError as exc:
+        if exc.name == "mcp":
+            raise click.ClickException(
+                "MCP support is not installed; install with `pip install 'phasesweep[mcp]'`."
+            ) from None
+        raise
+
+
 def _format_status(status_obj: dict) -> str:
     """Render status data as stable YAML.
 

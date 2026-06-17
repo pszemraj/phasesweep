@@ -29,7 +29,7 @@ def _write_status(status_path: Path, payload: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json."""
-    parser = argparse.ArgumentParser(prog="phasesweep-mcp-runner")
+    parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--config", required=True, type=Path)  # frozen, server-supplied
     parser.add_argument("--status-path", required=True, type=Path)

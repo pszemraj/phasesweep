@@ -1,6 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` exposes a phasesweep experiment to an AI agent over the
+`phasesweep mcp` exposes a phasesweep experiment to an AI agent over the
 [Model Context Protocol](https://modelcontextprotocol.io) so the agent can
 **launch a sweep, monitor it, and read the winning hyperparameters** - and
 nothing else. The agent never supplies, edits, or sees a `trial_command`,
@@ -45,7 +45,7 @@ invalid, is a suite, or uses in-memory storage. Catalog ids must match
 ## Start the server
 
 ```bash
-phasesweep-mcp --catalog examples/catalog.yaml
+phasesweep mcp --catalog examples/catalog.yaml
 ```
 
 The server speaks JSON-RPC over stdio; all logging goes to stderr. Wire it into
@@ -55,8 +55,8 @@ an MCP client (for example, Claude Desktop) as a stdio server:
 {
   "mcpServers": {
     "phasesweep": {
-      "command": "phasesweep-mcp",
-      "args": ["--catalog", "/abs/path/to/examples/catalog.yaml"]
+      "command": "phasesweep",
+      "args": ["mcp", "--catalog", "/abs/path/to/examples/catalog.yaml"]
     }
   }
 }

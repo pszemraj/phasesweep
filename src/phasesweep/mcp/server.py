@@ -2,7 +2,7 @@
 
 PhaseSweepMCP holds all logic and is SDK-free and unit-testable. build_server
 wraps each method as a FastMCP tool; _safe_tool guarantees tool errors are
-redacted. main() loads the catalog, builds the store, and serves over stdio.
+redacted. serve() loads the catalog, builds the store, and serves over stdio.
 """
 
 from __future__ import annotations
@@ -285,12 +285,8 @@ def build_server(app: PhaseSweepMCP) -> Any:
     return mcp
 
 
-def main(argv: list[str] | None = None) -> int:
+def serve(catalog: Path) -> int:
     """Load the catalog, build the run store, and serve the six tools over stdio."""
-    parser = argparse.ArgumentParser(prog="phasesweep-mcp")
-    parser.add_argument("--catalog", required=True, type=str)
-    args = parser.parse_args(argv)
-
     # stdio transport owns stdout for JSON-RPC. All logging goes to stderr.
     logging.basicConfig(
         level=logging.INFO,
@@ -300,14 +296,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        registry = Registry.load(Path(args.catalog))
+        registry = Registry.load(catalog)
     except CatalogError as exc:
-        print(f"phasesweep-mcp: {exc}", file=sys.stderr)
+        print(f"phasesweep mcp: {exc}", file=sys.stderr)
         return 2
 
     app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
     build_server(app).run(transport="stdio")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Serve via ``python -m phasesweep.mcp.server``."""
+    parser = argparse.ArgumentParser(prog="phasesweep mcp")
+    parser.add_argument("--catalog", required=True, type=Path)
+    args = parser.parse_args(argv)
+    return serve(args.catalog)
 
 
 if __name__ == "__main__":

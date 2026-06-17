@@ -95,11 +95,11 @@ phases:
 
 ## MCP server (agent integration)
 
-`phasesweep-mcp` exposes cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings.
+`phasesweep mcp` exposes cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings.
 
 ```bash
 pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
-phasesweep-mcp --catalog examples/catalog.yaml
+phasesweep mcp --catalog examples/catalog.yaml
 ```
 
 The sweep runs as a detached background process that survives a server restart. See the [MCP guide](docs/mcp.md) for the catalog format, tool behavior, security model, and concurrency settings.

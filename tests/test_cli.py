@@ -21,6 +21,7 @@ def test_help_output_is_operator_readable() -> None:
     assert result.exit_code == 0
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
     assert "-h, --help" in result.output
+    assert "mcp           Serve the MCP broker." in result.output
     assert "run           Run configured phases." in result.output
     assert "show-winners  Print saved phase winners." in result.output
     assert "status        Print read-only run status." in result.output
@@ -41,6 +42,11 @@ def test_help_output_is_operator_readable() -> None:
     assert "[default: (first phase)]" in run_help
     assert "--dry-run" in run_help
     assert "-v, --verbose" in run_help
+
+    mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
+    assert mcp_help.exit_code == 0
+    assert "Serve the optional MCP broker over stdio" in mcp_help.output
+    assert "--catalog PATH" in mcp_help.output
 
 
 def test_dry_run_winner_includes_inherited_and_fixed_overrides(tmp_path):

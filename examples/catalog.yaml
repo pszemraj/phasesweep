@@ -1,5 +1,5 @@
 # Example MCP catalog. Start the server with:
-#   phasesweep-mcp --catalog examples/catalog.yaml
+#   phasesweep mcp --catalog examples/catalog.yaml
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which
