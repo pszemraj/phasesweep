@@ -17,8 +17,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config import Experiment, Suite, load_config
+from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.io import load_config_bytes
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.runtime.files import file_url_path, storage_backend
 
@@ -160,7 +161,8 @@ class Registry:
             if not cfg_path.is_file():
                 raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
             try:
-                config = load_config(cfg_path)
+                config_bytes = cfg_path.read_bytes()
+                config = load_config_bytes(config_bytes, source=cfg_path)
             except (ValueError, OSError, yaml.YAMLError) as exc:
                 raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
             if isinstance(config, Suite):
@@ -173,10 +175,11 @@ class Registry:
                     f"{entry.id!r}: storage must be persistent; in-memory studies "
                     "cannot be monitored across processes"
                 )
+            config_sha256 = hashlib.sha256(config_bytes).hexdigest()
             items[entry.id] = RegisteredExperiment(
                 id=entry.id,
                 config_path=cfg_path,
-                config_sha256=hashlib.sha256(cfg_path.read_bytes()).hexdigest(),
+                config_sha256=config_sha256,
                 experiment=config,
                 description=entry.description,
                 allow_launch=entry.allow.launch,

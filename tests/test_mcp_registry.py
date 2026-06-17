@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import textwrap
 from pathlib import Path
 
@@ -103,6 +104,30 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
     assert reg.allow_launch and reg.allow_cancel and reg.allow_from_phase
+
+
+def test_config_hash_and_model_come_from_same_startup_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, name="mutated"))
+    snapshot_bytes = textwrap.dedent(_experiment_yaml(tmp_path, name="snapshot")).lstrip().encode()
+    original_read_bytes = Path.read_bytes
+    calls = 0
+
+    def read_bytes_once(path: Path) -> bytes:
+        nonlocal calls
+        if path == config:
+            calls += 1
+            return snapshot_bytes
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_once)
+
+    reg = Registry.load(_catalog(tmp_path, config, entry_id="snapshot")).get("snapshot")
+
+    assert calls == 1
+    assert reg.experiment.experiment == "snapshot"
+    assert reg.config_sha256 == hashlib.sha256(snapshot_bytes).hexdigest()
 
 
 def test_unknown_id_raises(tmp_path: Path) -> None:
