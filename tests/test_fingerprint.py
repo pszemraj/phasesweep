@@ -65,6 +65,7 @@ def _two_phase_experiment(
 def test_fingerprint_mismatch_raises(tmp_path):
     """Changing phase config and re-running should fail, not silently mix results."""
     from tests.conftest import copy_fake_train
+
     trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"

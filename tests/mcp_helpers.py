@@ -44,7 +44,9 @@ def write_mcp_config_catalog(
         config = tmp_path / f"{entry_id}.yaml"
         config.write_text(body)
         entries[entry_id] = config
-    return write_mcp_catalog(tmp_path, entries, max_concurrent_runs=max_concurrent_runs, filename=filename)
+    return write_mcp_catalog(
+        tmp_path, entries, max_concurrent_runs=max_concurrent_runs, filename=filename
+    )
 
 
 def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
