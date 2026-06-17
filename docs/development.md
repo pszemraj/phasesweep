@@ -13,10 +13,10 @@ python -m pip install -e ".[dev]"
 pytest
 ruff check .
 ruff format --check .
-mypy src/phasesweep --ignore-missing-imports
+mypy src/phasesweep
 ```
 
-Expected result: `179 passed`. Optuna `constant_liar` experimental warnings are expected.
+Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected.
 
 ## Package Map
 
