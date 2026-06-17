@@ -10,6 +10,7 @@ import click
 
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import config_status, run_config
+from phasesweep.engine.state import _winner_path
 from phasesweep.runtime.process import install_signal_handlers
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -158,9 +159,8 @@ def show_winners(config_path: Path) -> None:
 
 def _show_experiment_winners(experiment: Experiment) -> None:
     """Print winner files for one experiment."""
-    primary_root = Path(experiment.workdir).expanduser().resolve() / experiment.experiment
     for p in experiment.phases:
-        wpath = primary_root / p.name / "winner.yaml"
+        wpath = _winner_path(experiment, p.name)
         if wpath.is_file():
             click.echo(f"=== {p.name} ===")
             if p.comment:

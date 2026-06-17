@@ -7,6 +7,8 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
+SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 class _Frozen(BaseModel):
     """Base for all config models: frozen + reject unknown keys."""
@@ -80,7 +82,7 @@ def _validate_safe_name(kind: str, value: str) -> str:
     :raises ValueError: If ``value`` is empty or contains an unsafe character.
     :return str: The validated name, unchanged.
     """
-    if not value or not all(c.isalnum() or c in "_-" for c in value):
+    if not SAFE_NAME_PATTERN.match(value):
         raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
     return value
 

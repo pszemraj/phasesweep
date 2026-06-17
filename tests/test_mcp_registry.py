@@ -106,7 +106,6 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
     assert reg.allow_launch and reg.allow_cancel and reg.allow_from_phase
-    assert reg.expose_trial_logs is False
 
 
 def test_unknown_id_raises(tmp_path: Path) -> None:

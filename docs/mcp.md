@@ -161,8 +161,7 @@ reaper state in that case.
 - **Persistent storage required.** In-memory studies cannot be monitored across
   processes, so `storage: null` is rejected at startup.
 - **Single host.** The server, runner, and lock assume one host.
-- **No log-access tool.** A redacted, opt-in `get_trial_logs` (behind the
-  reserved `expose_trial_logs` catalog flag, present but unused in v1) is a
-  possible follow-up.
+- **No log-access tool.** A redacted, opt-in log view is a possible follow-up,
+  but v1 exposes no catalog flag or tool for logs.
 - The only agent-tunable knob is `from_phase`; `n_trials`, timeouts, and all
   safety waivers stay with the config author.

@@ -10,7 +10,6 @@ fails server startup.
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,12 +18,8 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite, load_config
+from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-
-# Same character class the engine enforces on experiment/phase names
-# (config.common._validate_safe_name). The id appears in run ids and handle
-# filenames, so keep it path-safe even though the operator writes it.
-_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class _Allow(BaseModel):
@@ -46,13 +41,13 @@ class _Entry(BaseModel):
     config: Path
     description: str = ""
     allow: _Allow = Field(default_factory=_Allow)
-    # Reserved for a future, redacted get_trial_logs. No tool reads logs in v1.
-    expose_trial_logs: bool = False
 
     @field_validator("id")
     @classmethod
     def _safe_id(cls, value: str) -> str:
-        if not _SAFE_ID.match(value):
+        # The id appears in run ids and handle filenames, so keep it path-safe
+        # even though the operator writes it.
+        if not SAFE_NAME_PATTERN.match(value):
             raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
         return value
 
@@ -83,7 +78,6 @@ class RegisteredExperiment:
     allow_launch: bool
     allow_cancel: bool
     allow_from_phase: bool
-    expose_trial_logs: bool
 
     @property
     def phase_names(self) -> list[str]:
@@ -164,7 +158,6 @@ class Registry:
                 allow_launch=entry.allow.launch,
                 allow_cancel=entry.allow.cancel,
                 allow_from_phase=entry.allow.from_phase,
-                expose_trial_logs=entry.expose_trial_logs,
             )
         return cls(
             state_dir=catalog.state_dir.expanduser(),
