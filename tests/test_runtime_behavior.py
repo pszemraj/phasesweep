@@ -467,6 +467,51 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     }
 
 
+def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+        else:
+            time.sleep(1.0)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout_allowed_abort_counter",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                max_consecutive_failures=1,
+                timeout_seconds_per_phase=0.12,
+                allow_incomplete_on_timeout=True,
+                search_space={},
+            )
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].trial_number == 0
+    assert winners["p"].completion == {
+        "requested_trials": 3,
+        "finished_trials": 2,
+        "completed_trials": 1,
+        "incomplete": True,
+        "reason": "timeout",
+        "timeout_scope": "phase",
+    }
+
+
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
     accepted = _sleeping_score_experiment(
         tmp_path,

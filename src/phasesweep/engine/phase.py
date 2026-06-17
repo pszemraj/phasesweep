@@ -439,13 +439,6 @@ def _run_phase(
     # Review v0.5.11 / v0.5.12.
     _raise_if_hard_aborted()
 
-    if abort["flag"]:
-        raise NoFeasibleTrialError(
-            f"Phase {phase.name!r} aborted after "
-            f"{phase.max_consecutive_failures} consecutive failures. "
-            f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
-        )
-
     trials_after = study.get_trials(deepcopy=False)
     finished_after = sum(1 for t in trials_after if t.state.is_finished())
     completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
@@ -461,6 +454,12 @@ def _run_phase(
             f"({finished_after} terminal trials). Refusing to select a winner "
             "from an incomplete phase; set allow_incomplete_on_timeout: true "
             "only when a partial decision is intentional."
+        )
+    if abort["flag"] and not timed_out_incomplete:
+        raise NoFeasibleTrialError(
+            f"Phase {phase.name!r} aborted after "
+            f"{phase.max_consecutive_failures} consecutive failures. "
+            f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
     completion = {
         "requested_trials": phase.n_trials,
