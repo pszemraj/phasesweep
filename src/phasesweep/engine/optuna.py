@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import optuna
 
@@ -184,6 +186,43 @@ def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
     )
 
 
+def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
+    """Return trial-state counts from a SQLite Optuna DB without creating schema.
+
+    Status polling must be read-only. Passing a fresh SQLite URL through
+    Optuna's storage constructor can create the database/schema and race the
+    runner's first ``create_study`` call. Opening the file in SQLite read-only
+    mode avoids both side effects: a missing, locked, or still-initializing DB
+    simply reports no counts for now.
+    """
+    assert experiment.storage is not None
+    database = file_url_path(experiment.storage)
+    if database in ("", ":memory:"):
+        return {}
+    path = Path(database).expanduser().resolve()
+    if not path.is_file():
+        return {}
+    try:
+        uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+        try:
+            rows = conn.execute(
+                """
+                SELECT trials.state, COUNT(*)
+                FROM trials
+                JOIN studies ON trials.study_id = studies.study_id
+                WHERE studies.study_name = ?
+                GROUP BY trials.state
+                """,
+                (_phase_study_name(experiment, phase),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {str(state): int(count) for state, count in rows}
+
+
 def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     """Return Optuna trial counts by state without creating a missing study.
 
@@ -193,6 +232,8 @@ def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     """
     if experiment.storage is None:
         return {}
+    if storage_backend(experiment.storage) == "sqlite":
+        return _sqlite_trial_counts(experiment, phase)
     try:
         study = _load_phase_study(experiment, phase)
     except Exception:  # noqa: BLE001

@@ -143,7 +143,7 @@ class Registry:
                 raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
             try:
                 config = load_config(cfg_path)
-            except (ValueError, OSError) as exc:
+            except (ValueError, OSError, yaml.YAMLError) as exc:
                 raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
             if isinstance(config, Suite):
                 raise CatalogError(

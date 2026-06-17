@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -104,8 +105,27 @@ class RunStore:
         return self._logs_dir / f"{run_id}.status.json"
 
     def save(self, handle: RunHandle) -> None:
-        """Persist a run handle as JSON under the runs dir."""
-        (self._runs_dir / f"{handle.run_id}.json").write_text(json.dumps(asdict(handle), indent=2))
+        """Persist a run handle as JSON under the runs dir.
+
+        Writes through a same-directory temp file and then replaces the target so
+        readers never observe a partially-written handle.
+        """
+        target = self._runs_dir / f"{handle.run_id}.json"
+        tmp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        payload = json.dumps(asdict(handle), indent=2)
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(target)
+            dir_fd = os.open(self._runs_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.

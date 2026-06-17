@@ -124,6 +124,23 @@ def test_invalid_config_raises_catalog_error(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
+def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
+    config = _write(tmp_path / "broken.yaml", "experiment: [\n")
+    with pytest.raises(CatalogError, match="invalid config"):
+        Registry.load(_catalog(tmp_path, config))
+
+
+def test_unknown_sampler_raises_catalog_error(tmp_path: Path) -> None:
+    bad = _experiment_yaml(tmp_path).replace(
+        "n_trials: 2\n            search_space:",
+        "n_trials: 2\n            sampler: { type: nope }\n            search_space:",
+        1,
+    )
+    config = _write(tmp_path / "exp.yaml", bad)
+    with pytest.raises(CatalogError, match="invalid config"):
+        Registry.load(_catalog(tmp_path, config))
+
+
 def test_suite_config_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "suite.yaml", _suite_yaml(tmp_path))
     with pytest.raises(CatalogError, match="suite"):

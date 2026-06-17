@@ -59,6 +59,19 @@ def test_save_get_roundtrip(tmp_path: Path) -> None:
     assert store.get("missing") is None
 
 
+def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    first = _live_handle(store, run_id="exp-1", experiment_id="old")
+    second = _live_handle(store, run_id="exp-1", experiment_id="new")
+
+    store.save(first)
+    store.save(second)
+
+    assert store.get("exp-1") == second
+    assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
+    assert list((tmp_path / "state" / "runs").glob(".*.tmp")) == []
+
+
 @pytest.mark.parametrize(
     "unsafe",
     ["../../etc/passwd", "a/b", "..", "exp-1/../../../secret", "exp 1", "exp.1", ""],
