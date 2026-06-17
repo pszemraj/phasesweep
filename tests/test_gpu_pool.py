@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import time
 
 import pytest
 
@@ -47,6 +48,15 @@ def test_explicit_gpu_ids_honored_for_single_job():
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
     with pool.acquire() as gid:
         assert gid == 3
+
+
+def test_gpu_acquire_respects_deadline_when_local_slot_is_busy() -> None:
+    pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
+
+    with pool.acquire():
+        with pytest.raises(TimeoutError, match="Wallclock deadline"):
+            with pool.acquire(deadline=time.monotonic() + 0.02):
+                pass
 
 
 def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):

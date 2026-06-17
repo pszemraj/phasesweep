@@ -208,13 +208,30 @@ class GpuPool:
             log.info("GPU pool: %d GPUs for %d parallel jobs.", len(ids), n_jobs)
         return cls(gpu_ids=ids)
 
-    def _acquire(self) -> tuple[int, _HostGpuLease] | None:
+    def _remaining_seconds(self, deadline: float | None) -> float | None:
+        """Return seconds until ``deadline``, or raise when it has expired."""
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
+        return remaining
+
+    def _acquire(self, *, deadline: float | None = None) -> tuple[int, _HostGpuLease] | None:
         """Block until a local slot and host-wide GPU lease are available.
+
+        Args:
+            deadline: Optional ``time.monotonic()`` deadline. When set, waiting
+                for a local slot or host-wide lock fails with ``TimeoutError``
+                instead of extending a phase/run wallclock budget.
 
         Returns:
             ``(gpu_id, lease)`` or ``None`` if the pool is inactive (no
             isolation requested; caller's environment is passed through
             unchanged).
+
+        Raises:
+            TimeoutError: ``deadline`` expired before a GPU could be leased.
 
         """
         if not self._gpu_ids:
@@ -222,7 +239,8 @@ class GpuPool:
         while True:
             with self._condition:
                 while not self._available:
-                    self._condition.wait()
+                    remaining = self._remaining_seconds(deadline)
+                    self._condition.wait(timeout=remaining)
                 candidates = list(self._available)
                 self._available.clear()
 
@@ -241,7 +259,8 @@ class GpuPool:
             with self._condition:
                 self._available.extend(remaining)
                 self._condition.notify_all()
-            time.sleep(0.2)
+            remaining_seconds = self._remaining_seconds(deadline)
+            time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
     def _release(self, acquired: tuple[int, _HostGpuLease] | None) -> None:
         """Return a previously-acquired GPU index to the pool.
@@ -260,15 +279,21 @@ class GpuPool:
             self._condition.notify()
 
     @contextmanager
-    def acquire(self) -> Generator[int | None, None, None]:
+    def acquire(self, *, deadline: float | None = None) -> Generator[int | None, None, None]:
         """Block until a GPU is available, yield its index, release on exit.
+
+        Args:
+            deadline: Optional ``time.monotonic()`` deadline for the wait.
 
         Yields:
             The GPU index for this critical section, or ``None`` when the
             pool is inactive.
 
+        Raises:
+            TimeoutError: ``deadline`` expired before a GPU could be leased.
+
         """
-        acquired = self._acquire()
+        acquired = self._acquire(deadline=deadline)
         try:
             yield None if acquired is None else acquired[0]
         finally:

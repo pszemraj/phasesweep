@@ -43,7 +43,7 @@ Each phase is one Optuna study in an ordered chain. A phase may inherit winners 
 - `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
 - `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for continuous numeric phases.
 - `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.
-- `timeout_seconds_per_phase`: phase wallclock guard.
+- `timeout_seconds_per_phase`: hard phase wallclock guard. The budget caps Optuna scheduling, GPU-lease waiting, and active trial subprocess runtime.
 - `allow_incomplete_on_timeout`: select from completed trials after a phase or run timeout. Defaults to fail-closed.
 - `allow_partial_grid`: permit `n_trials` smaller than the grid cardinality.
 - `allow_seed_search`: permit `seed` or `*.seed` in `search_space`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import optuna
@@ -422,18 +423,37 @@ def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout",
+        timeout_seconds_per_phase=0.2,
+    )
+
+    with pytest.raises(TimeoutError, match="1/3 completed evaluations"):
+        run_experiment(exp)
+
+
+def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
+    """A phase wallclock timeout is a hard subprocess deadline, not only an Optuna scheduler timeout."""
+    exp = _sleeping_score_experiment(
+        tmp_path,
+        experiment="phase_timeout_hard",
         timeout_seconds_per_phase=0.05,
     )
 
-    with pytest.raises(TimeoutError, match="1/3 trials finished"):
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="0/3 completed evaluations"):
         run_experiment(exp)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert not (
+        tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json"
+    ).exists()
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_allowed",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
         allow_incomplete_on_timeout=True,
     )
 
@@ -442,6 +462,7 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     assert winners["p"].completion == {
         "requested_trials": 3,
         "finished_trials": 1,
+        "completed_trials": 1,
         "incomplete": True,
         "reason": "timeout",
         "timeout_scope": "phase",
@@ -452,7 +473,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     accepted = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
         allow_incomplete_on_timeout=True,
     )
     run_experiment(accepted)
@@ -460,7 +481,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     current = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
         _load_winner(current, current.phases[0], {})
@@ -470,7 +491,7 @@ def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="run_timeout",
-        timeout_seconds_per_run=0.05,
+        timeout_seconds_per_run=0.2,
     )
 
     with pytest.raises(TimeoutError, match="run guard"):

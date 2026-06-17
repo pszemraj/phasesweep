@@ -47,6 +47,8 @@ runs/
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
 
+`timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` and top-level `timeout_seconds_per_run` are hard wallclock caps for the larger execution scope: phasesweep passes the remaining budget into GPU lease acquisition and active trial supervision, so a queued or running trial cannot extend past the phase/run deadline. When a phase or run deadline stops the phase before the requested number of completed evaluations exists, phasesweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
+
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
 Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
