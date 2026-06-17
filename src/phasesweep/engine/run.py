@@ -11,8 +11,8 @@ import yaml
 
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import _experiment_lock, _reap_skipped_phase, _suite_lock
-from phasesweep.engine.optuna import _phase_trial_counts
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.read import _phase_status_payloads
 from phasesweep.engine.selection import (
     _apply_promotion,
     _apply_study_promotion,
@@ -248,23 +248,11 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload including phase winner paths and trial counts.
     """
-    phases: list[dict[str, Any]] = []
-    for phase in experiment.phases:
-        winner_path = _winner_path(experiment, phase.name)
-        counts = _phase_trial_counts(experiment, phase)
-        phases.append(
-            {
-                "name": phase.name,
-                "winner": str(winner_path) if winner_path.is_file() else None,
-                "trials": counts,
-                "running": counts.get("RUNNING", 0),
-            }
-        )
     return {
         "kind": "experiment",
         "experiment": experiment.experiment,
         "workdir": str(_experiment_dir(experiment)),
-        "phases": phases,
+        "phases": _phase_status_payloads(experiment, include_winner_path=True),
     }
 
 

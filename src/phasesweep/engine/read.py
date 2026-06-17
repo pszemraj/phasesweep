@@ -42,6 +42,24 @@ class PhaseWinnerView:
     incomplete: bool  # True when a wallclock timeout produced a partial winner
 
 
+def _phase_status_payloads(
+    experiment: Experiment, *, include_winner_path: bool
+) -> list[dict[str, Any]]:
+    phases: list[dict[str, Any]] = []
+    for phase in experiment.phases:
+        winner_path = _winner_path(experiment, phase.name)
+        counts = _phase_trial_counts(experiment, phase)
+        payload: dict[str, Any] = {"trials": counts, "running": counts.get("RUNNING", 0)}
+        if include_winner_path:
+            payload.update(
+                {"name": phase.name, "winner": str(winner_path) if winner_path.is_file() else None}
+            )
+        else:
+            payload.update({"phase": phase.name, "winner_present": winner_path.is_file()})
+        phases.append(payload)
+    return phases
+
+
 def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | None:
     """Read a single phase's persisted winner, or ``None`` if not yet written.
 
@@ -121,20 +139,9 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
         experiment summary has been written.
 
     """
-    phases: list[dict[str, Any]] = []
-    for phase in experiment.phases:
-        counts = _phase_trial_counts(experiment, phase)
-        phases.append(
-            {
-                "phase": phase.name,
-                "trials": counts,  # {"COMPLETE": n, "RUNNING": m, "FAIL": k, ...}
-                "running": counts.get("RUNNING", 0),
-                "winner_present": _winner_path(experiment, phase.name).is_file(),
-            }
-        )
     return {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
-        "phases": phases,
+        "phases": _phase_status_payloads(experiment, include_winner_path=False),
         "summary_present": _summary_path(experiment).is_file(),
     }
