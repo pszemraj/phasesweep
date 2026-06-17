@@ -15,14 +15,21 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.runtime.files import file_url_path, storage_backend
 
 
-class _Allow(BaseModel):
+class _CatalogModel(BaseModel):
+    """Strict base for operator-authored catalog documents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _Allow(_CatalogModel):
     """Per-experiment permission flags.
 
     Default-open for the read/launch verbs. Safety waivers are intentionally
@@ -34,7 +41,7 @@ class _Allow(BaseModel):
     from_phase: bool = True
 
 
-class _Entry(BaseModel):
+class _Entry(_CatalogModel):
     """One catalog entry: an opaque id mapped to a local config path."""
 
     id: str
@@ -52,7 +59,7 @@ class _Entry(BaseModel):
         return value
 
 
-class _Catalog(BaseModel):
+class _Catalog(_CatalogModel):
     """Top-level catalog file: a server state dir plus one or more entries."""
 
     state_dir: Path
@@ -83,6 +90,23 @@ class RegisteredExperiment:
     def phase_names(self) -> list[str]:
         """Declared phase names, in order."""
         return [phase.name for phase in self.experiment.phases]
+
+
+def _storage_is_in_memory(storage: str | None) -> bool:
+    """Return whether a storage URL resolves to an in-memory Optuna backend."""
+    if storage is None:
+        return True
+    if storage == ":memory:":
+        return True
+    if storage_backend(storage) != "sqlite":
+        return False
+    database = file_url_path(storage)
+    return (
+        database == ""
+        or database == ":memory:"
+        or database.startswith(":memory:?")
+        or database.startswith("file::memory:")
+    )
 
 
 class Registry:
@@ -144,10 +168,10 @@ class Registry:
                     f"{entry.id!r}: suite configs are not supported by the MCP layer "
                     "in this version; register single-experiment configs"
                 )
-            if config.storage is None:
+            if _storage_is_in_memory(config.storage):
                 raise CatalogError(
-                    f"{entry.id!r}: storage must be set; in-memory studies cannot be "
-                    "monitored across processes"
+                    f"{entry.id!r}: storage must be persistent; in-memory studies "
+                    "cannot be monitored across processes"
                 )
             items[entry.id] = RegisteredExperiment(
                 id=entry.id,

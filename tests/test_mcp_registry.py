@@ -149,6 +149,57 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
+@pytest.mark.parametrize(
+    "storage",
+    ['"sqlite://"', '"sqlite:///:memory:"', '"sqlite+pysqlite:///:memory:"', '":memory:"'],
+)
+def test_in_memory_storage_urls_rejected(tmp_path: Path, storage: str) -> None:
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+    )
+    with pytest.raises(CatalogError, match="storage must be persistent"):
+        Registry.load(_catalog(tmp_path, config))
+
+
+@pytest.mark.parametrize(
+    "catalog_body",
+    [
+        """
+        state_dir: {state}
+        extra: true
+        experiments:
+          - id: reg_ok
+            config: {config}
+        """,
+        """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            cancle: false
+        """,
+        """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            allow:
+              from-phase: false
+        """,
+    ],
+    ids=["top_level", "entry", "allow"],
+)
+def test_unknown_catalog_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog = _write(
+        tmp_path / "catalog.yaml",
+        catalog_body.format(state=tmp_path / "state", config=config),
+    )
+    with pytest.raises(CatalogError, match="Extra inputs are not permitted"):
+        Registry.load(catalog)
+
+
 def test_config_not_found_rejected(tmp_path: Path) -> None:
     with pytest.raises(CatalogError, match="not found"):
         Registry.load(_catalog(tmp_path, tmp_path / "nope.yaml"))

@@ -39,8 +39,9 @@ experiments:
 At startup the server resolves every `config` path to absolute (relative paths
 are resolved against the catalog file), validates it with the same loader the
 CLI uses, computes a content hash, and **refuses to start** if any config is
-invalid, is a suite, or uses in-memory storage. Catalog ids must match
-`[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime.
+invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`,
+`sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`.
+The id-to-path mapping is then frozen for the server's lifetime.
 
 ## Start the server
 
@@ -159,7 +160,8 @@ reaper state in that case.
 
 - **Single-experiment configs only.** Suites are rejected at startup.
 - **Persistent storage required.** In-memory studies cannot be monitored across
-  processes, so `storage: null` is rejected at startup.
+  processes, so `storage: null` and SQLite in-memory URL forms are rejected at
+  startup.
 - **Single host.** The server, runner, and lock assume one host.
 - **No log-access tool.** A redacted, opt-in log view is a possible follow-up,
   but v1 exposes no catalog flag or tool for logs.
