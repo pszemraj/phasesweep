@@ -256,6 +256,12 @@ def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
         app.status(run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
         app.cancel("nope-123")
+    # A path-shaped run_id never reaches the filesystem: it reads as unknown.
+    for traversal in ("../../etc/passwd", "../../../runs/secret"):
+        with pytest.raises(Exception, match="unknown run id"):
+            app.status(run_id=traversal)
+        with pytest.raises(Exception, match="unknown run id"):
+            app.cancel(traversal)
     with pytest.raises(Exception, match="either experiment_id or run_id"):
         app.status()
     # No run launched yet: experiment-level status reports no live run.
@@ -281,3 +287,15 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
         "cancel_sweep",
     }
     assert all(t.description for t in tools)
+
+    # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
+    # the parameter schema FastMCP derives from each signature, or the agent
+    # could not call the tools. Lock the shapes in.
+    schemas = {t.name: t.inputSchema for t in tools}
+    assert sorted(schemas["launch_sweep"]["properties"]) == ["experiment_id", "from_phase"]
+    assert schemas["launch_sweep"]["required"] == ["experiment_id"]
+    assert sorted(schemas["get_status"]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas["get_status"].get("required") is None  # both optional
+    assert schemas["cancel_sweep"]["required"] == ["run_id"]
+    assert schemas["validate_config"]["required"] == ["experiment_id"]
+    assert not schemas["list_experiments"]["properties"]
