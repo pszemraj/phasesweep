@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from phasesweep.runtime.process import is_pid_zombie, is_same_process
+from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 
@@ -107,6 +107,10 @@ class RunStore:
             One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
 
         """
+        # Reap the runner if it has exited. The runner is our child; without
+        # this it lingers as a zombie until the server dies, and every state
+        # query is a natural place to clean it up (no signal handler needed).
+        reap_child(handle.pid)
         status = self._read_status(handle)
         if status is not None:
             rc = status.get("returncode")

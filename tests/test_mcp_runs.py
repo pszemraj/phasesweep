@@ -138,5 +138,7 @@ def test_state_failed_for_zombie_runner_without_status(tmp_path: Path) -> None:
             store, run_id="zomb", pid=proc.pid, starttime=read_proc_starttime(proc.pid)
         )
         assert store.state(handle) == "failed"
+        # state() reaped the child, so the zombie is gone, not merely filtered.
+        assert not is_pid_zombie(proc.pid)
     finally:
         proc.wait()
