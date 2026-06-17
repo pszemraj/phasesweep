@@ -5,6 +5,7 @@ and the status.json written on the cancel path.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -76,6 +77,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         "r1",
         "--config",
         str(config),
+        "--config-sha256",
+        hashlib.sha256(config.read_bytes()).hexdigest(),
         "--status-path",
         str(status_path),
     ]

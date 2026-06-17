@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
+import yaml
 
+from phasesweep.config import Experiment, load_config
+from phasesweep.engine.guards import _phase_fingerprint
+from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import UnknownExperimentError
+from phasesweep.mcp.runner import main as runner_main
 from phasesweep.mcp.runs import RunHandle, utc_now_iso
 from phasesweep.mcp.server import _safe_tool
 from phasesweep.runtime.process import read_proc_starttime
@@ -113,6 +119,137 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="earlier phase 'p' has no winner yet"):
         app.launch("srv", from_phase="q")
+
+
+def _write_winner_yaml(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    phase_fingerprint: str,
+    incomplete: bool = False,
+) -> None:
+    path = _winner_path(experiment, phase_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "phase": phase_name,
+                "trial_number": 0,
+                "metric": {experiment.metric.name: 0.123, "goal": experiment.metric.goal},
+                "params": {"lr": 0.001},
+                "effective_overrides": {"lr": 0.001},
+                "completion": {"incomplete": incomplete},
+                "phase_fingerprint": phase_fingerprint,
+            }
+        )
+    )
+
+
+def test_resume_rejects_stale_winner_before_spawn(tmp_path: Path) -> None:
+    phases = """\
+  - name: p
+    n_trials: 1
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+  - name: q
+    inherits: [p]
+    n_trials: 1
+    search_space:
+      wd: { type: float, low: 0.0, high: 0.1 }
+"""
+    config = _config(tmp_path, phases=phases)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    _write_winner_yaml(exp, "p", phase_fingerprint="0" * 64)
+
+    with pytest.raises(Exception, match="compatible winner"):
+        app.launch("srv", from_phase="q")
+
+    assert store.list_handles() == []
+
+
+def test_resume_rejects_incomplete_winner_before_spawn(tmp_path: Path) -> None:
+    phases = """\
+  - name: p
+    n_trials: 1
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+  - name: q
+    inherits: [p]
+    n_trials: 1
+    search_space:
+      wd: { type: float, low: 0.0, high: 0.1 }
+"""
+    config = _config(tmp_path, phases=phases)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    fp = _phase_fingerprint(exp, exp.phases[0], {})
+    _write_winner_yaml(exp, "p", phase_fingerprint=fp, incomplete=True)
+
+    with pytest.raises(Exception, match="compatible winner"):
+        app.launch("srv", from_phase="q")
+
+    assert store.list_handles() == []
+
+
+def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    config.write_text(config.read_text().replace("python train.py", "python changed.py"))
+
+    with pytest.raises(Exception, match="changed since server startup"):
+        app.launch("srv")
+
+    assert store.list_handles() == []
+
+
+def test_launch_passes_config_snapshot_to_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    app, registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    captured: dict[str, list[str]] = {}
+
+    class DummyProc:
+        pid = os.getpid()
+
+    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
+        captured["cmd"] = cmd
+        return DummyProc()
+
+    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+
+    app.launch("srv")
+
+    cmd = captured["cmd"]
+    config_arg = Path(cmd[cmd.index("--config") + 1])
+    sha_arg = cmd[cmd.index("--config-sha256") + 1]
+    assert config_arg != config.resolve()
+    assert config_arg.read_bytes() == config.read_bytes()
+    assert sha_arg == registry.get("srv").config_sha256
+
+
+def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    status_path = tmp_path / "status.json"
+
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        runner_main(
+            [
+                "--run-id",
+                "r1",
+                "--config",
+                str(config),
+                "--config-sha256",
+                "0" * 64,
+                "--status-path",
+                str(status_path),
+            ]
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["returncode"] == 1
+    assert status["error_class"] == "RuntimeError"
 
 
 def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:

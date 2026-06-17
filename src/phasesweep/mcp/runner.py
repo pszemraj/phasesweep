@@ -10,6 +10,7 @@ from the frozen registry; it is never agent input.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -27,11 +28,16 @@ def _write_status(status_path: Path, payload: dict) -> None:
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
 
 
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json."""
     parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--config", required=True, type=Path)  # frozen, server-supplied
+    parser.add_argument("--config", required=True, type=Path)  # snapshot, server-supplied
+    parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--status-path", required=True, type=Path)
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
@@ -48,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
 
     status: dict = {"run_id": args.run_id, "returncode": 0, "error_class": None}
     try:
+        actual_sha256 = _sha256_file(args.config)
+        if actual_sha256 != args.config_sha256:
+            raise RuntimeError("config snapshot hash mismatch; refusing to run")
         config = load_config(args.config)
         # run_config installs signal handlers and takes the flock internally.
         run_config(config, from_phase=args.from_phase, dry_run=False)

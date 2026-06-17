@@ -102,6 +102,10 @@ class RunStore:
         """Path to the runner-written terminal-cause ``status.json`` for a run."""
         return self._logs_dir / f"{run_id}.status.json"
 
+    def config_snapshot_path(self, run_id: str) -> Path:
+        """Path to the per-run config snapshot consumed by the detached runner."""
+        return self._logs_dir / f"{run_id}.config.yaml"
+
     def save(self, handle: RunHandle) -> None:
         """Persist a run handle as JSON under the runs dir.
 

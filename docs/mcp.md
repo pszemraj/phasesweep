@@ -41,7 +41,10 @@ are resolved against the catalog file), validates it with the same loader the
 CLI uses, computes a content hash, and **refuses to start** if any config is
 invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`,
 `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`.
-The id-to-path mapping is then frozen for the server's lifetime.
+The id-to-path mapping is then frozen for the server's lifetime. On launch,
+the server verifies the config still matches the startup hash and hands the
+detached runner a per-run snapshot, so later edits to the original file cannot
+change what the runner executes.
 
 ## Start the server
 
@@ -137,6 +140,8 @@ Run handles and per-run logs live under `state_dir`:
 - `state_dir/runs/<run_id>.json` - the run handle.
 - `state_dir/logs/<run_id>.log` - captured runner stdout/stderr (operator-only).
 - `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
+- `state_dir/logs/<run_id>.config.yaml` - the exact config snapshot executed by
+  the runner (operator-only; may contain command, storage, env, and overrides).
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 

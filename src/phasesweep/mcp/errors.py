@@ -53,6 +53,16 @@ class PermissionDeniedError(McpToolError):
         super().__init__(f"action {action!r} is not permitted for experiment {experiment_id!r}")
 
 
+class ConfigChangedError(McpToolError):
+    """Raised when a cataloged config no longer matches the startup snapshot."""
+
+    def __init__(self, experiment_id: str) -> None:
+        super().__init__(
+            f"cataloged config for experiment {experiment_id!r} changed since server startup; "
+            "restart the server to reload and validate it"
+        )
+
+
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 
@@ -87,10 +97,16 @@ class LaunchInProgressError(McpToolError):
 
 
 class ResumeNotReadyError(McpToolError):
-    """Raised when ``from_phase`` resume is requested but an earlier winner is missing."""
+    """Raised when ``from_phase`` resume is requested but an earlier winner is unusable."""
 
-    def __init__(self, experiment_id: str, from_phase: str, missing_phase: str) -> None:
+    def __init__(
+        self,
+        experiment_id: str,
+        from_phase: str,
+        missing_phase: str,
+        reason: str = "has no winner yet",
+    ) -> None:
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} has no winner yet"
+            f"earlier phase {missing_phase!r} {reason}"
         )

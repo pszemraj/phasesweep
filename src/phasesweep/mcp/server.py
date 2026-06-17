@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import logging
 import subprocess
 import sys
@@ -16,10 +17,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from phasesweep.engine import read_status, read_winner, read_winners
+import yaml
+
+from phasesweep.engine import read_status, read_winners
+from phasesweep.engine.state import Winner, _load_winner
 from phasesweep.mcp.errors import (
     CatalogError,
     ConcurrencyLimitError,
+    ConfigChangedError,
     ExperimentBusyError,
     InvalidPhaseError,
     LaunchInProgressError,
@@ -165,14 +170,52 @@ class PhaseSweepMCP:
 
     def _require_resume_ready(self, reg: RegisteredExperiment, from_phase: str) -> None:
         names = reg.phase_names
-        for earlier in names[: names.index(from_phase)]:
-            if read_winner(reg.experiment, earlier) is None:
-                raise ResumeNotReadyError(reg.id, from_phase, earlier)
+        winners: dict[str, Winner] = {}
+        for phase in reg.experiment.phases[: names.index(from_phase)]:
+            inherited = {parent: winners[parent] for parent in phase.inherits}
+            try:
+                winners[phase.name] = _load_winner(reg.experiment, phase, inherited)
+            except FileNotFoundError:
+                raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
+            except (
+                RuntimeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                AttributeError,
+                OSError,
+                yaml.YAMLError,
+            ) as exc:
+                log.info(
+                    "resume preflight rejected winner for experiment=%s phase=%s: %s",
+                    reg.id,
+                    phase.name,
+                    exc,
+                )
+                raise ResumeNotReadyError(
+                    reg.id,
+                    from_phase,
+                    phase.name,
+                    reason="has no compatible winner for the current config",
+                ) from None
+
+    def _snapshot_config(self, reg: RegisteredExperiment, run_id: str) -> Path:
+        try:
+            data = reg.config_path.read_bytes()
+        except OSError as exc:
+            log.info("cannot read cataloged config for experiment=%s: %s", reg.id, exc)
+            raise ConfigChangedError(reg.id) from None
+        if hashlib.sha256(data).hexdigest() != reg.config_sha256:
+            raise ConfigChangedError(reg.id)
+        snapshot_path = self._runs.config_snapshot_path(run_id)
+        snapshot_path.write_bytes(data)
+        return snapshot_path
 
     def _spawn(self, reg: RegisteredExperiment, from_phase: str | None) -> RunHandle:
         run_id = self._runs.new_run_id(reg.id)
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
+        config_snapshot_path = self._snapshot_config(reg, run_id)
         cmd = [
             sys.executable,
             "-m",
@@ -180,7 +223,9 @@ class PhaseSweepMCP:
             "--run-id",
             run_id,
             "--config",
-            str(reg.config_path),  # server-internal path, not agent input
+            str(config_snapshot_path),  # per-run snapshot, not agent input
+            "--config-sha256",
+            reg.config_sha256,
             "--status-path",
             str(status_path),
         ]
