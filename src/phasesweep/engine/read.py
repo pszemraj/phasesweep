@@ -71,13 +71,12 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
     Returns:
         A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
         winner on disk: never run, still running, selection failed, or the file
-        is mid-write / malformed. A partial read is treated as "not yet
-        written" - consistent with this module's permissive contract and with
-        ``_phase_trial_counts`` swallowing transient backend errors - because
-        ``winner.yaml`` is written non-atomically at phase completion and a
-        status query may observe it torn. The strict, fingerprint-verifying
-        read used for ``--from-phase`` resume lives in
-        ``engine.state._load_winner`` and is intentionally not relaxed here.
+        is malformed. A malformed read is treated as "not yet written" -
+        consistent with this module's permissive contract and with
+        ``_phase_trial_counts`` swallowing transient backend errors. The
+        strict, fingerprint-verifying read used for ``--from-phase`` resume
+        lives in ``engine.state._load_winner`` and is intentionally not
+        relaxed here.
 
     """
     path = _winner_path(experiment, phase_name)

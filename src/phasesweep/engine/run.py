@@ -7,8 +7,6 @@ import logging
 import time
 from typing import Any
 
-import yaml
-
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import _experiment_lock, _reap_skipped_phase, _suite_lock
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
@@ -30,6 +28,7 @@ from phasesweep.engine.state import (
     _suite_log_path,
     _suite_summary_path,
     _summary_path,
+    _write_yaml_atomic,
     _winner_path,
 )
 from phasesweep.runtime.files import require_posix_runtime
@@ -236,7 +235,7 @@ def _run_experiment_inner(
         "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
     }
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _write_yaml_atomic(summary_path, summary)
     log.info("Wrote %s", summary_path)
 
     return winners
@@ -311,5 +310,5 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 for study_name, study_winners in results.items()
             ],
         }
-        _suite_summary_path(suite).write_text(yaml.safe_dump(summary, sort_keys=False))
+        _write_yaml_atomic(_suite_summary_path(suite), summary)
     return results

@@ -6,10 +6,12 @@ import contextlib
 import csv
 import json
 import logging
+import os
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import optuna
 import yaml
@@ -159,6 +161,54 @@ def _suite_log_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "run.log"
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory after an atomic replace."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
+    """Write text through a same-directory temp file and atomically replace ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    replaced = False
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline=newline,
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with handle:
+            tmp_path = Path(handle.name)
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert tmp_path is not None
+        os.replace(tmp_path, path)
+        replaced = True
+        _fsync_directory(path.parent)
+    finally:
+        if tmp_path is not None and not replaced:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _write_yaml_atomic(path: Path, payload: Any) -> None:
+    """Atomically write a YAML document to ``path``."""
+    with _atomic_text_writer(path) as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
     """Attach a durable file handler for phasesweep logs.
@@ -221,7 +271,7 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         *[f"user_attr:{n}" for n in attr_names],
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
+    with _atomic_text_writer(path, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for t in trials:
@@ -308,7 +358,7 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
-    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+    _write_yaml_atomic(path, payload)
 
 
 def _save_promotion_decision(
@@ -323,8 +373,7 @@ def _save_promotion_decision(
     :param dict[str, Any] decision: Promotion decision payload to persist.
     """
     path = _promotion_decision_path(experiment, phase_name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(decision, sort_keys=False))
+    _write_yaml_atomic(path, decision)
 
 
 def _load_winner(
@@ -363,7 +412,18 @@ def _load_winner(
     if not path.is_file():
         raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
 
-    data = yaml.safe_load(path.read_text())
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: top level must be a mapping."
+        )
 
     from phasesweep.engine.guards import _phase_fingerprint
 
@@ -387,7 +447,12 @@ def _load_winner(
             f"experiment name, or restore the matching config before resuming."
         )
 
-    completion = data["completion"]
+    completion = data.get("completion")
+    if not isinstance(completion, dict):
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: missing mapping field 'completion'."
+        )
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
         raise RuntimeError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
@@ -395,14 +460,20 @@ def _load_winner(
             "sets allow_incomplete_on_timeout: true."
         )
 
-    return Winner(
-        trial_number=int(data["trial_number"]),
-        params=dict(data["params"]),
-        effective_overrides=dict(data["effective_overrides"]),
-        metric=float(data["metric"][experiment.metric.name]),
-        constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
-        gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
-        completion=dict(completion),
-        promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
-        phase_fingerprint=str(stored_fp),
-    )
+    try:
+        return Winner(
+            trial_number=int(data["trial_number"]),
+            params=dict(data["params"]),
+            effective_overrides=dict(data["effective_overrides"]),
+            metric=float(data["metric"][experiment.metric.name]),
+            constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
+            gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
+            completion=dict(completion),
+            promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
+            phase_fingerprint=str(stored_fp),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: {exc}"
+        ) from exc

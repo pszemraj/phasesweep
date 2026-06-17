@@ -64,9 +64,9 @@ def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:
 
 
 def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path) -> None:
-    # winner.yaml is written non-atomically at phase completion; a status query
-    # may observe it torn. Both a truncated file (invalid YAML) and a valid-YAML
-    # file missing required keys must read as "no winner yet", never raise.
+    # Status reads stay permissive for legacy, hand-edited, or externally corrupted files.
+    # Both a truncated file (invalid YAML) and a valid-YAML file missing required keys must
+    # read as "no winner yet", never raise.
     exp = _experiment(tmp_path)
     path = _winner_path(exp, "p")
     path.parent.mkdir(parents=True, exist_ok=True)

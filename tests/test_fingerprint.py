@@ -20,7 +20,7 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.engine.guards import _phase_fingerprint
-from phasesweep.engine.state import Winner, _phase_dir, _winner_path
+from phasesweep.engine.state import Winner, _load_winner, _phase_dir, _save_winner, _winner_path
 from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
@@ -412,6 +412,72 @@ def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path)
 
         with pytest.raises(RuntimeError, match=match):
             run_experiment(exp, from_phase="lr")
+
+
+def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"trial_number": 0, "metric": {"objective":')
+
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+        _load_winner(exp, exp.phases[0], {})
+
+
+def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
+                "completion": {"incomplete": False},
+            },
+            sort_keys=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+        _load_winner(exp, exp.phases[0], {})
+
+
+def test_save_winner_replace_failure_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    phase = exp.phases[0]
+    fingerprint = _phase_fingerprint(exp, phase, {})
+    original = Winner(
+        trial_number=0,
+        params={"x": 0},
+        effective_overrides={"x": 0},
+        metric=1.0,
+        phase_fingerprint=fingerprint,
+    )
+    replacement = Winner(
+        trial_number=1,
+        params={"x": 1},
+        effective_overrides={"x": 1},
+        metric=0.5,
+        phase_fingerprint=fingerprint,
+    )
+
+    _save_winner(exp, phase.name, original)
+    path = _winner_path(exp, phase.name)
+    before = path.read_text()
+
+    def fail_replace(src: Path | str, dst: Path | str) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("phasesweep.engine.state.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _save_winner(exp, phase.name, replacement)
+
+    assert path.read_text() == before
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
 def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
