@@ -190,6 +190,7 @@ def file_url_path(storage: str) -> str:
     Supported forms::
 
         sqlite:///relative.db             -> relative.db
+        sqlite:///relative.db?timeout=30  -> relative.db
         sqlite:////tmp/absolute.db        -> /tmp/absolute.db
         sqlite+pysqlite:///relative.db    -> relative.db
         sqlite+pysqlite:////tmp/x.db      -> /tmp/x.db
@@ -211,17 +212,18 @@ def file_url_path(storage: str) -> str:
 
     if rest.startswith("////"):
         # POSIX absolute file path. The fourth slash IS the root ``/``.
-        return "/" + rest[4:]
-
-    if rest.startswith("///"):
+        path = "/" + rest[4:]
+    elif rest.startswith("///"):
         # Relative file path (or :memory: sentinel) under SQLAlchemy grammar.
-        return rest[3:]
-
-    if rest.startswith("//"):
+        path = rest[3:]
+    elif rest.startswith("//"):
         # Handles bare ``sqlite://`` (in-memory shorthand).
-        return rest[2:]
+        path = rest[2:]
+    else:
+        path = rest
 
-    return rest
+    path = path.split("?", 1)[0]
+    return path.split("#", 1)[0]
 
 
 def canonical_storage_identity(storage: str | None) -> str | None:

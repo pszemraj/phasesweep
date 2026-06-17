@@ -173,11 +173,14 @@ def test_file_url_path_preserves_absolute_paths() -> None:
     destroyed the leading ``/`` on absolute paths."""
     cases = [
         ("sqlite:///relative.db", "relative.db"),
+        ("sqlite:///relative.db?timeout=30", "relative.db"),
         ("sqlite:////tmp/absolute.db", "/tmp/absolute.db"),
+        ("sqlite:////tmp/absolute.db?timeout=30#frag", "/tmp/absolute.db"),
         ("sqlite+pysqlite:///relative.db", "relative.db"),
         ("sqlite+pysqlite:////tmp/x.db", "/tmp/x.db"),
         ("sqlite://", ""),
         ("sqlite:///:memory:", ":memory:"),
+        ("sqlite:///:memory:?cache=shared", ":memory:"),
         ("journal:///relative.journal", "relative.journal"),
         ("journal:////tmp/abs.journal", "/tmp/abs.journal"),
     ]

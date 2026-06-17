@@ -113,3 +113,16 @@ def test_read_status_counts_existing_sqlite_trials_without_optuna_loader(
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+
+def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:
+    db = tmp_path / "phases.db"
+    storage = f"sqlite:///{db}"
+    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
+        lambda trial: 1.0, n_trials=1
+    )
+    exp = _experiment(tmp_path, storage=f"{storage}?timeout=30")
+
+    status = read_status(exp)
+
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
