@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.mcp.errors import (
     CatalogError,
+    ConcurrencyLimitError,
     ExperimentBusyError,
     InvalidPhaseError,
     McpToolError,
@@ -102,7 +103,8 @@ class PhaseSweepMCP:
         """Start the sweep as a detached background run; return its run_id.
 
         Refuses if launch is not permitted, if a ``from_phase`` resume is not
-        ready (an earlier phase has no winner), or if a run is already live.
+        ready (an earlier phase has no winner), if this experiment already has a
+        live run, or if the server is at its max_concurrent_runs cap.
         """
         reg = self._registry.get(experiment_id)
         if not reg.allow_launch:
@@ -113,9 +115,15 @@ class PhaseSweepMCP:
             if from_phase not in reg.phase_names:
                 raise InvalidPhaseError(experiment_id, from_phase)
             self._require_resume_ready(reg, from_phase)
-        busy = self._runs.live_run_for(experiment_id)
+        # One scan covers both guards: the same experiment can't double-launch,
+        # and no more than max_concurrent_runs sweeps run at once (default 1, so
+        # a single GPU isn't oversubscribed by launching a second experiment).
+        live = self._runs.live_runs()
+        busy = next((h for h in live if h.experiment_id == experiment_id), None)
         if busy is not None:
             raise ExperimentBusyError(experiment_id, busy.run_id)
+        if len(live) >= self._registry.max_concurrent_runs:
+            raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
         handle = self._spawn(reg, from_phase)
         self._runs.save(handle)
         return {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}

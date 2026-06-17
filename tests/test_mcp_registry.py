@@ -66,13 +66,12 @@ def _catalog(
     *,
     entry_id: str = "reg_ok",
     allow: dict | None = None,
+    max_concurrent_runs: int | None = None,
 ) -> Path:
-    lines = [
-        f"state_dir: {tmp_path}/state",
-        "experiments:",
-        f"  - id: {entry_id}",
-        f"    config: {config}",
-    ]
+    lines = [f"state_dir: {tmp_path}/state"]
+    if max_concurrent_runs is not None:
+        lines.append(f"max_concurrent_runs: {max_concurrent_runs}")
+    lines += ["experiments:", f"  - id: {entry_id}", f"    config: {config}"]
     if allow is not None:
         lines.append("    allow:")
         lines.extend(f"      {k}: {str(v).lower()}" for k, v in allow.items())
@@ -146,6 +145,17 @@ def test_unsafe_catalog_id_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
     with pytest.raises(CatalogError):
         Registry.load(_catalog(tmp_path, config, entry_id="bad-id.evil"))
+
+
+def test_max_concurrent_runs_defaults_to_one(tmp_path: Path) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    assert Registry.load(_catalog(tmp_path, config)).max_concurrent_runs == 1
+
+
+def test_max_concurrent_runs_override(tmp_path: Path) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    reg = Registry.load(_catalog(tmp_path, config, max_concurrent_runs=3))
+    assert reg.max_concurrent_runs == 3
 
 
 def test_permission_flags_propagate(tmp_path: Path) -> None:

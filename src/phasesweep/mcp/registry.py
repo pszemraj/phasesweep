@@ -61,6 +61,10 @@ class _Catalog(BaseModel):
     """Top-level catalog file: a server state dir plus one or more entries."""
 
     state_dir: Path
+    # Cap on simultaneously-running sweeps across ALL experiments. Defaults to 1
+    # because the common deployment is a single GPU, where a second concurrent
+    # sweep would contend for the device. Raise it on multi-GPU hosts.
+    max_concurrent_runs: int = Field(default=1, ge=1)
     experiments: list[_Entry] = Field(min_length=1)
 
 
@@ -90,8 +94,14 @@ class RegisteredExperiment:
 class Registry:
     """Immutable id -> RegisteredExperiment map plus the server state dir."""
 
-    def __init__(self, state_dir: Path, items: dict[str, RegisteredExperiment]) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        items: dict[str, RegisteredExperiment],
+        max_concurrent_runs: int = 1,
+    ) -> None:
         self.state_dir = state_dir
+        self.max_concurrent_runs = max_concurrent_runs
         self._items = items
 
     @classmethod
@@ -156,7 +166,11 @@ class Registry:
                 allow_from_phase=entry.allow.from_phase,
                 expose_trial_logs=entry.expose_trial_logs,
             )
-        return cls(state_dir=catalog.state_dir.expanduser(), items=items)
+        return cls(
+            state_dir=catalog.state_dir.expanduser(),
+            items=items,
+            max_concurrent_runs=catalog.max_concurrent_runs,
+        )
 
     def get(self, experiment_id: str) -> RegisteredExperiment:
         """Look up a registered experiment by id, or raise ``UnknownExperimentError``."""

@@ -34,6 +34,22 @@ def _write_catalog(tmp_path: Path, *, entry_id: str, config_body: str) -> Path:
     return catalog
 
 
+def _write_multi_catalog(
+    tmp_path: Path, configs: dict[str, str], *, max_concurrent_runs: int | None = None
+) -> Path:
+    lines = [f"state_dir: {tmp_path}/state"]
+    if max_concurrent_runs is not None:
+        lines.append(f"max_concurrent_runs: {max_concurrent_runs}")
+    lines.append("experiments:")
+    for entry_id, body in configs.items():
+        config = tmp_path / f"{entry_id}.yaml"
+        config.write_text(body)
+        lines += [f"  - id: {entry_id}", f"    config: {config}"]
+    catalog = tmp_path / "multi.catalog.yaml"
+    catalog.write_text("\n".join(lines) + "\n")
+    return catalog
+
+
 def _chained_config(tmp_path: Path) -> str:
     return f"""\
 experiment: e2e_lm
@@ -64,11 +80,11 @@ phases:
 """
 
 
-def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> str:
+def _slow_config(tmp_path: Path, *, name: str = "slow", sleep: float = 30.0) -> str:
     return f"""\
-experiment: slow
-storage: sqlite:///{tmp_path}/phases.db
-workdir: {tmp_path}/runs
+experiment: {name}
+storage: sqlite:///{tmp_path}/{name}.db
+workdir: {tmp_path}/runs/{name}
 trial_command: "{sys.executable} {_TRAINER} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
 override_format: argparse
 metric:
@@ -177,6 +193,34 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
         _cancel_quietly(app, run_id)
         if second_run_id is not None:
             _cancel_quietly(app, second_run_id)
+
+
+def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
+    catalog = _write_multi_catalog(
+        tmp_path,
+        {
+            "slowa": _slow_config(tmp_path, name="slowa"),
+            "slowb": _slow_config(tmp_path, name="slowb"),
+        },
+    )  # default max_concurrent_runs == 1
+    app, _store = _app(catalog)
+
+    run_a = app.launch("slowa")["run_id"]
+    run_b = None
+    try:
+        assert _wait_for_running_trial(app, run_a, timeout=30) == "running"
+        # A *different* experiment cannot start while one sweep is live (single-GPU cap).
+        with pytest.raises(Exception, match="limit 1"):
+            app.launch("slowb")
+        # Freeing the slot lets the other experiment launch.
+        assert app.cancel(run_a)["state"] == "cancelled"
+        result = app.launch("slowb")
+        run_b = result["run_id"]
+        assert result["state"] == "running"
+    finally:
+        _cancel_quietly(app, run_a)
+        if run_b is not None:
+            _cancel_quietly(app, run_b)
 
 
 def test_status_and_cancel_error_paths(tmp_path: Path) -> None:

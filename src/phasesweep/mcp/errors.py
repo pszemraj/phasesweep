@@ -63,6 +63,16 @@ class ExperimentBusyError(McpToolError):
         )
 
 
+class ConcurrencyLimitError(McpToolError):
+    """Raised when launching would exceed the server's max concurrent runs."""
+
+    def __init__(self, running: int, limit: int) -> None:
+        super().__init__(
+            f"server is already running {running} sweep(s) (limit {limit}); "
+            "wait for one to finish or cancel it"
+        )
+
+
 class ResumeNotReadyError(McpToolError):
     """Raised when ``from_phase`` resume is requested but an earlier winner is missing."""
 

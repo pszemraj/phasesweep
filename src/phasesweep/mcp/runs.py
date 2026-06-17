@@ -138,6 +138,14 @@ class RunStore:
                 return handle
         return None
 
+    def live_runs(self) -> list[RunHandle]:
+        """Every currently-running handle across all experiments.
+
+        Scanning calls ``state`` on each handle, which also reaps any runner
+        that has since exited - so this doubles as the cleanup sweep.
+        """
+        return [handle for handle in self.list_handles() if self.state(handle) == "running"]
+
     def _read_status(self, handle: RunHandle) -> dict | None:
         path = Path(handle.status_path)
         if not path.is_file():
