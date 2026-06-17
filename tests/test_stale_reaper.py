@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
@@ -28,12 +29,6 @@ from phasesweep.runtime.process import (
     read_stale_process_identity,
 )
 from tests.conftest import make_experiment, write_trainer
-
-
-def contextlib_suppress():
-    import contextlib
-
-    return contextlib.suppress(Exception)
 
 
 def test_read_proc_starttime_self():
@@ -191,7 +186,7 @@ def test_kill_stale_group_escalates_to_sigkill(tmp_path):
             time.sleep(0.1)
         assert proc.poll() is not None, "Child survived kill_stale_group despite SIGKILL escalation"
     finally:
-        with contextlib_suppress():
+        with contextlib.suppress(Exception):
             proc.kill()
             proc.wait(timeout=2)
 

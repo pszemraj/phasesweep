@@ -42,6 +42,16 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
+def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    installed = {"called": False}
+
+    def fake_install() -> None:
+        installed["called"] = True
+
+    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    return installed
+
+
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
     """Failing trials leave pid + pgid + starttime files for forensic recovery."""
     if not Path("/proc/self/stat").exists():
@@ -318,12 +328,7 @@ def test_public_run_experiment_installs_signal_handlers(
 ) -> None:
     """Library callers using ``run_experiment`` directly get the same cleanup
     contract as CLI callers."""
-    installed = {"called": False}
-
-    def fake_install() -> None:
-        installed["called"] = True
-
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    installed = _install_signal_probe(monkeypatch)
 
     # Minimal trial_command that writes the metric file the JsonExtractor expects.
     # Avoid {} literals in the script so the override-template parser doesn't
@@ -345,12 +350,7 @@ def test_dry_run_does_not_install_signal_handlers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dry-run launches no children, so it must not perturb the signal mask."""
-    installed = {"called": False}
-
-    def fake_install() -> None:
-        installed["called"] = True
-
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    installed = _install_signal_probe(monkeypatch)
 
     exp = make_experiment(workdir=tmp_path / "runs")
     run_experiment(exp, dry_run=True)
