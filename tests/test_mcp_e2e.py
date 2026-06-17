@@ -195,6 +195,25 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
             _cancel_quietly(app, second_run_id)
 
 
+def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
+    catalog = _write_catalog(tmp_path, entry_id="slow", config_body=_slow_config(tmp_path))
+    app, _store = _app(catalog)
+
+    run_id = app.launch("slow")["run_id"]
+    try:
+        assert _wait_for_running_trial(app, run_id, timeout=30) == "running"
+
+        restarted_app, _restarted_store = _app(catalog)
+        status = restarted_app.status(run_id=run_id)
+        assert status["run"]["state"] == "running"
+
+        result = restarted_app.cancel(run_id)
+        assert result["state"] == "cancelled"
+        assert result["cleanup_confirmed"] is True
+    finally:
+        _cancel_quietly(app, run_id)
+
+
 def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
     catalog = _write_multi_catalog(
         tmp_path,
