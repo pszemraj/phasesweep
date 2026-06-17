@@ -8,6 +8,7 @@ their local helpers — this covers the >80% common case.
 
 from __future__ import annotations
 
+import shutil
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,13 @@ from phasesweep.evidence import TrialContext
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+
+
+def copy_fake_train(tmp_path: Path) -> Path:
+    trainer = tmp_path / "examples" / "fake_train.py"
+    trainer.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "examples" / "fake_train.py", trainer)
+    return trainer
 
 
 def make_experiment(

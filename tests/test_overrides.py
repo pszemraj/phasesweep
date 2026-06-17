@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import shutil
-
 import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.runtime.commands import format_argparse, format_hydra, render_command
-from tests.conftest import REPO, write_yaml
+from tests.conftest import copy_fake_train, write_yaml
 
 
 def test_hydra_basic():
@@ -66,16 +64,14 @@ def test_render_command_json_file(tmp_path):
 
 def test_effective_overrides_include_fixed(tmp_path):
     """Winner's effective_overrides must include parent's fixed_overrides, not just sampled params."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
     yaml_text = f"""
 experiment: eff_override_test
 storage: sqlite:///{db_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize

@@ -21,7 +21,7 @@ from phasesweep.config import (
 )
 from phasesweep.engine.guards import _phase_fingerprint
 from phasesweep.engine.state import Winner, _phase_dir, _winner_path
-from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer, write_yaml
+from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
 def _two_phase_experiment(
@@ -64,16 +64,15 @@ def _two_phase_experiment(
 
 def test_fingerprint_mismatch_raises(tmp_path):
     """Changing phase config and re-running should fail, not silently mix results."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    from tests.conftest import copy_fake_train
+    trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
     base_yaml = f"""
 experiment: fp_test
 storage: sqlite:///{db_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize

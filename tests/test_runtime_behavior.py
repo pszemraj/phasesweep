@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 import optuna
@@ -13,7 +12,7 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import _load_winner
-from tests.conftest import REPO, write_trainer, write_yaml
+from tests.conftest import copy_fake_train, write_trainer, write_yaml
 
 
 def _sleeping_score_experiment(
@@ -61,16 +60,14 @@ def test_parallel_trials_e2e(tmp_path):
     - concurrent subprocess execution
     - no database-locked errors
     """
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    trainer = copy_fake_train(tmp_path)
 
     journal_path = tmp_path / "phases.journal"
     yaml_text = f"""
 experiment: parallel_test
 storage: journal:///{journal_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
