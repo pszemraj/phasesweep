@@ -22,6 +22,7 @@ from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
     ExperimentBusyError,
     InvalidPhaseError,
+    LaunchInProgressError,
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
@@ -115,17 +116,22 @@ class PhaseSweepMCP:
             if from_phase not in reg.phase_names:
                 raise InvalidPhaseError(experiment_id, from_phase)
             self._require_resume_ready(reg, from_phase)
-        # One scan covers both guards: the same experiment can't double-launch,
-        # and no more than max_concurrent_runs sweeps run at once (default 1, so
-        # a single GPU isn't oversubscribed by launching a second experiment).
-        live = self._runs.live_runs()
-        busy = next((h for h in live if h.experiment_id == experiment_id), None)
-        if busy is not None:
-            raise ExperimentBusyError(experiment_id, busy.run_id)
-        if len(live) >= self._registry.max_concurrent_runs:
-            raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
-        handle = self._spawn(reg, from_phase)
-        self._runs.save(handle)
+        # The cap check and the spawn must be atomic, or two near-simultaneous
+        # launches both pass the cap and oversubscribe the GPU it protects. Hold
+        # the launch lock across the whole decision. One scan then covers both
+        # guards: the same experiment can't double-launch, and no more than
+        # max_concurrent_runs sweeps run at once (default 1).
+        with self._runs.launch_lock() as acquired:
+            if not acquired:
+                raise LaunchInProgressError()
+            live = self._runs.live_runs()
+            busy = next((h for h in live if h.experiment_id == experiment_id), None)
+            if busy is not None:
+                raise ExperimentBusyError(experiment_id, busy.run_id)
+            if len(live) >= self._registry.max_concurrent_runs:
+                raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
+            handle = self._spawn(reg, from_phase)
+            self._runs.save(handle)
         return {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
 
     def cancel(self, run_id: str) -> dict[str, Any]:

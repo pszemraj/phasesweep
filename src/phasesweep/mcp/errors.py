@@ -73,6 +73,19 @@ class ConcurrencyLimitError(McpToolError):
         )
 
 
+class LaunchInProgressError(McpToolError):
+    """Raised when another launch holds the launch lock. Transient; retry.
+
+    The launch decision (count live runs against the cap, then spawn) is
+    serialized so the cap can't be exceeded by a check-then-spawn race. When a
+    concurrent launch holds that lock, this asks the caller to retry rather than
+    silently proceeding past the cap.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("another launch is in progress on this server; retry in a moment")
+
+
 class ResumeNotReadyError(McpToolError):
     """Raised when ``from_phase`` resume is requested but an earlier winner is missing."""
 

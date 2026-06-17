@@ -9,14 +9,17 @@ loses nothing and there is no stale-state write race.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from phasesweep.runtime.files import try_lock_file, unlock_file
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
@@ -64,8 +67,29 @@ class RunStore:
     def __init__(self, state_dir: Path) -> None:
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
+        self._launch_lock_path = state_dir / ".launch.lock"
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._logs_dir.mkdir(parents=True, exist_ok=True)
+
+    @contextlib.contextmanager
+    def launch_lock(self) -> Iterator[bool]:
+        """Hold the launch lock for the context, yielding whether it was acquired.
+
+        The concurrency cap is enforced by counting live runs and then
+        spawning; that check-then-spawn must be atomic or two near-simultaneous
+        launches can both pass the cap and oversubscribe the GPU. This is an
+        ``flock`` on a file under ``state_dir``, so it serializes launches both
+        across threads in one server and across servers that share a state dir
+        (which scan the same runs dir). It is non-blocking: the manager yields
+        ``False`` when another launch already holds it, leaving the caller to
+        surface a retryable error rather than block a request handler.
+        """
+        handle = try_lock_file(self._launch_lock_path)
+        try:
+            yield handle is not None
+        finally:
+            if handle is not None:
+                unlock_file(handle)
 
     def new_run_id(self, experiment_id: str) -> str:
         """Mint a fresh, collision-resistant run id prefixed with the experiment id."""

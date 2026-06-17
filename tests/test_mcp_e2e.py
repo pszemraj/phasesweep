@@ -223,6 +223,31 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
             _cancel_quietly(app, run_b)
 
 
+def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
+    # Holding the launch lock stands in for a concurrent launch mid-decision.
+    # The cap check and spawn are serialized under it, so a second launch is
+    # told to retry rather than racing past the cap. The refused path spawns
+    # nothing (it raises before _spawn), so no real sweep is needed and the
+    # test stays deterministic. White-box: reach for the store's lock directly.
+    from phasesweep.runtime.files import try_lock_file, unlock_file
+
+    catalog = _write_catalog(tmp_path, entry_id="slow", config_body=_slow_config(tmp_path))
+    app, store = _app(catalog)
+
+    held = try_lock_file(store._launch_lock_path)
+    assert held is not None
+    try:
+        with pytest.raises(Exception, match="launch is in progress"):
+            app.launch("slow")
+    finally:
+        unlock_file(held)
+
+    # The lock is advisory and released on unlock: a fresh acquire succeeds.
+    regrab = try_lock_file(store._launch_lock_path)
+    assert regrab is not None
+    unlock_file(regrab)
+
+
 def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
     catalog = _write_catalog(tmp_path, entry_id="e2e_lm", config_body=_chained_config(tmp_path))
     app, _store = _app(catalog)
