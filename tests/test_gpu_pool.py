@@ -53,10 +53,12 @@ def test_explicit_gpu_ids_honored_for_single_job():
 def test_gpu_acquire_respects_deadline_when_local_slot_is_busy() -> None:
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
 
-    with pool.acquire():
-        with pytest.raises(TimeoutError, match="Wallclock deadline"):
-            with pool.acquire(deadline=time.monotonic() + 0.02):
-                pass
+    with (
+        pool.acquire(),
+        pytest.raises(TimeoutError, match="Wallclock deadline"),
+        pool.acquire(deadline=time.monotonic() + 0.02),
+    ):
+        pass
 
 
 def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):

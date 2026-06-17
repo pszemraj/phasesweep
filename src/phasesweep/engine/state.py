@@ -179,17 +179,16 @@ def _atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[I
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     replaced = False
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline=newline,
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    )
     try:
-        with handle:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline=newline,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
             tmp_path = Path(handle.name)
             yield handle
             handle.flush()
@@ -416,8 +415,7 @@ def _load_winner(
         data = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as exc:
         raise RuntimeError(
-            f"Winner file {path} is invalid or incomplete for skipped phase "
-            f"{phase.name!r}: {exc}"
+            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc
     if not isinstance(data, dict):
         raise RuntimeError(
@@ -474,6 +472,5 @@ def _load_winner(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            f"Winner file {path} is invalid or incomplete for skipped phase "
-            f"{phase.name!r}: {exc}"
+            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc

@@ -239,25 +239,25 @@ class GpuPool:
         while True:
             with self._condition:
                 while not self._available:
-                    remaining = self._remaining_seconds(deadline)
-                    self._condition.wait(timeout=remaining)
+                    wait_seconds = self._remaining_seconds(deadline)
+                    self._condition.wait(timeout=wait_seconds)
                 candidates = list(self._available)
                 self._available.clear()
 
-            remaining: list[int] = []
+            remaining_ids: list[int] = []
             for index, gpu_id in enumerate(candidates):
                 lease = _try_host_gpu_lease(gpu_id)
                 if lease is not None:
-                    remaining.extend(candidates[index + 1 :])
+                    remaining_ids.extend(candidates[index + 1 :])
                     with self._condition:
-                        self._available.extend(remaining)
+                        self._available.extend(remaining_ids)
                         self._condition.notify_all()
                     log.debug("GPU %d host lease acquired", gpu_id)
                     return gpu_id, lease
-                remaining.append(gpu_id)
+                remaining_ids.append(gpu_id)
 
             with self._condition:
-                self._available.extend(remaining)
+                self._available.extend(remaining_ids)
                 self._condition.notify_all()
             remaining_seconds = self._remaining_seconds(deadline)
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))

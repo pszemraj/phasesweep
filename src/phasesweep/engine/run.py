@@ -28,8 +28,8 @@ from phasesweep.engine.state import (
     _suite_log_path,
     _suite_summary_path,
     _summary_path,
-    _write_yaml_atomic,
     _winner_path,
+    _write_yaml_atomic,
 )
 from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import install_signal_handlers

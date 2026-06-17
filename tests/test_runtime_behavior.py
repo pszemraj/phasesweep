@@ -444,9 +444,7 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
-    assert not (
-        tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json"
-    ).exists()
+    assert not (tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json").exists()
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
