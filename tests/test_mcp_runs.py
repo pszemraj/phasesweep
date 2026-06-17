@@ -59,6 +59,18 @@ def test_save_get_roundtrip(tmp_path: Path) -> None:
     assert store.get("missing") is None
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    ["../../etc/passwd", "a/b", "..", "exp-1/../../../secret", "exp 1", "exp.1", ""],
+)
+def test_get_rejects_unsafe_run_id(tmp_path: Path, unsafe: str) -> None:
+    # An agent-supplied id must never be interpolated into a path it could use
+    # to escape the runs dir; an out-of-shape id reads as a missing handle.
+    store = RunStore(tmp_path / "state")
+    store.save(_live_handle(store, run_id="exp-1"))
+    assert store.get(unsafe) is None
+
+
 def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     store.save(_live_handle(store, run_id="exp-1"))

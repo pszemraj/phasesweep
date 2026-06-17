@@ -10,6 +10,7 @@ loses nothing and there is no stale-state write race.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,14 @@ from uuid import uuid4
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
+
+# Run ids are minted by ``new_run_id`` from this same character class. A lookup
+# id, however, arrives from the (untrusted) agent and is interpolated into a
+# handle path, so re-validate it here: this is the one place an id becomes a
+# filesystem path, and the class excludes ``/`` and ``.`` so ``..`` traversal
+# cannot escape the runs dir. Mirrors the engine's name rule
+# (config.common._validate_safe_name) and the catalog id rule.
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
@@ -75,7 +84,15 @@ class RunStore:
         (self._runs_dir / f"{handle.run_id}.json").write_text(json.dumps(asdict(handle), indent=2))
 
     def get(self, run_id: str) -> RunHandle | None:
-        """Load a run handle by id, or ``None`` if there is no such handle."""
+        """Load a run handle by id, or ``None`` if there is no such handle.
+
+        An id that is not of the minted shape (``[A-Za-z0-9_-]+``) can never
+        match a stored handle, so it is reported as absent rather than used to
+        build a path - this keeps an agent-supplied id from traversing out of
+        the runs dir (e.g. ``../../etc/foo``).
+        """
+        if not _SAFE_RUN_ID.match(run_id):
+            return None
         path = self._runs_dir / f"{run_id}.json"
         if not path.is_file():
             return None
