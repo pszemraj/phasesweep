@@ -47,7 +47,7 @@ class _Entry(BaseModel):
     def _safe_id(cls, value: str) -> str:
         # The id appears in run ids and handle filenames, so keep it path-safe
         # even though the operator writes it.
-        if not SAFE_NAME_PATTERN.match(value):
+        if not SAFE_NAME_PATTERN.fullmatch(value):
             raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
         return value
 

@@ -74,7 +74,16 @@ def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize(
     "unsafe",
-    ["../../etc/passwd", "a/b", "..", "exp-1/../../../secret", "exp 1", "exp.1", ""],
+    [
+        "../../etc/passwd",
+        "a/b",
+        "..",
+        "exp-1/../../../secret",
+        "exp 1",
+        "exp.1",
+        "exp-1\n",
+        "",
+    ],
 )
 def test_get_rejects_unsafe_run_id(tmp_path: Path, unsafe: str) -> None:
     # An agent-supplied id must never be interpolated into a path it could use

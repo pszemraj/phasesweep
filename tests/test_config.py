@@ -86,9 +86,10 @@ phases:
         load_experiment(cfg)
 
 
-def test_phase_name_validation():
+@pytest.mark.parametrize("name", ["bad name with spaces", "bad\n"])
+def test_phase_name_validation(name: str) -> None:
     with pytest.raises(ValidationError):
-        Phase(name="bad name with spaces", n_trials=1, search_space={})
+        Phase(name=name, n_trials=1, search_space={})
 
 
 # ---- migrated from version-named files ----

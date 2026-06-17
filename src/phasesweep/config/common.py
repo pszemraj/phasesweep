@@ -82,7 +82,7 @@ def _validate_safe_name(kind: str, value: str) -> str:
     :raises ValueError: If ``value`` is empty or contains an unsafe character.
     :return str: The validated name, unchanged.
     """
-    if not SAFE_NAME_PATTERN.match(value):
+    if not SAFE_NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
     return value
 

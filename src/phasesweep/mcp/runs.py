@@ -133,7 +133,7 @@ class RunStore:
         build a path - this keeps an agent-supplied id from traversing out of
         the runs dir (e.g. ``../../etc/foo``).
         """
-        if not SAFE_NAME_PATTERN.match(run_id):
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return None
         path = self._runs_dir / f"{run_id}.json"
         if not path.is_file():
