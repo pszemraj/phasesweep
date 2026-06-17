@@ -14,7 +14,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 - A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](docs/config.md#override-formats)**[^2]
 - GPU optional: CUDA devices are auto-detected for same-host lease management
 
-[^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`. If you're mad about this, you should be using [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) anyway
+[^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`. Use WSL for Windows-hosted development.
 [^2]: phasesweep orchestrates sweeps but never trains anything itself; your trainer must handle both of these.
 
 ## Install
@@ -95,23 +95,22 @@ phases:
 
 ## MCP server (agent integration)
 
-`phasesweep-mcp` exposes an experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) so it can **launch a sweep, monitor it, and read the winning hyperparameters** — and nothing else. The agent picks an experiment from a human-curated catalog by id; it never sees or sets `trial_command`, `env`, `storage`, or `workdir`, and no tool returns log text.
+`phasesweep-mcp` exposes cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings.
 
 ```bash
 pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 phasesweep-mcp --catalog examples/catalog.yaml
 ```
 
-The sweep runs as a detached background process that survives a server restart. By default one sweep runs at a time (`max_concurrent_runs: 1`), so a single GPU is not oversubscribed; raise it on multi-GPU hosts. See the [MCP guide](docs/mcp.md) for the catalog format, the six tools, the security model, and multi-GPU configuration.
+The sweep runs as a detached background process that survives a server restart. See the [MCP guide](docs/mcp.md) for the catalog format, tool behavior, security model, and concurrency settings.
 
 ## Docs
 
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
-- [MCP server](docs/mcp.md): expose an experiment to an AI agent — catalog format, the six tools, security model, single-host operation.
+- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the six tools, security model, single-host operation.
 - [Development](docs/development.md): test commands and test-suite map.
-- [Roadmap](docs/roadmap.md): future work outside the current single-host design.
 
 ## License
 

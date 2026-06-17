@@ -1,10 +1,9 @@
 # Config Guide
 
-A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer remains responsible for parsing overrides, running the actual experiment, and writing the artifacts that the configured extractors read.
+A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and writes the artifacts that configured extractors read.
 
-This page explains how the parts fit together. For the exhaustive schema dump with every field, type, default, enum value, and point-of-use constraint, use [config_reference.yaml](config_reference.yaml). Treat that file as the implementation reference when reviewing or migrating YAML.
+For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml).
 
-- [Typed Schema Reference](#typed-schema-reference)
 - [Experiment Keys](#experiment-keys)
 - [Phase Keys](#phase-keys)
 - [Search Parameters](#search-parameters)
@@ -16,12 +15,6 @@ This page explains how the parts fit together. For the exhaustive schema dump wi
 - [Promotion](#promotion)
 - [Suites](#suites)
 - [Validation](#validation)
-
-## Typed Schema Reference
-
-The schema-complete reference lives in [config_reference.yaml](config_reference.yaml). It is intentionally YAML-shaped but not a runnable config: each value is a type signature with the required/default status inline, and the comments document operational consequences such as unsafe storage combinations, placeholder requirements, sampler restrictions, and gate/promotion behavior.
-
-Use this guide when you need the mental model. Use the YAML reference when you need to answer "what keys are legal here?", "what happens if I omit this?", or "which exact enum spelling does the validator accept?"
 
 ## Experiment Keys
 
@@ -37,8 +30,7 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is deliberate: it makes expensive searches inspectable, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-![dag](/docs/images/diagramA_dag.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![dag](images/diagramA_dag.png)
 
 - `name`: required phase name matching `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.
@@ -98,8 +90,7 @@ Metric extractor failures, non-finite metrics, nonzero exits, and missing requir
 
 ## Override Order
 
-![override composition](/docs/images/diagramD_override.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![override composition](images/diagramD_override.png)
 
 Within one trial, later layers override earlier layers:
 

@@ -39,13 +39,11 @@ runs/
 
 `pid`, `pgid`, and `pid_starttime` are written while a trial is live. They are removed on clean exit and preserved on failure for inspection.
 
-![output layout](/docs/images/diagramG_artifacttree.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![output layout](images/diagramG_artifacttree.png)
 
 ## Process Management
 
-![trial state machine](/docs/images/diagramB_statemachine.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![trial state machine](images/diagramB_statemachine.png)
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
 
@@ -77,15 +75,14 @@ A run always takes same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
 
-![guard layer](/docs/images/diagramE_guardlayer.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![guard layer](images/diagramE_guardlayer.png)
 
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 
 Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
 
 > [!WARNING]
-> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
+> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
 
 ## Fingerprints and Resume
 

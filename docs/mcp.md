@@ -2,7 +2,7 @@
 
 `phasesweep-mcp` exposes a phasesweep experiment to an AI agent over the
 [Model Context Protocol](https://modelcontextprotocol.io) so the agent can
-**launch a sweep, monitor it, and read the winning hyperparameters** — and
+**launch a sweep, monitor it, and read the winning hyperparameters** - and
 nothing else. The agent never supplies, edits, or sees a `trial_command`,
 `env`, `storage`, or `workdir`. It picks an experiment from a human-curated
 catalog by id and calls one of six tools.
@@ -19,7 +19,7 @@ The server is started with a **catalog**: a fixed allowlist mapping opaque ids
 to local config paths plus per-experiment permissions. The agent only ever
 sends an id; it cannot enumerate the filesystem, pass a path, or author a
 config. Author the catalog with the same trust and out-of-band process as the
-experiment YAML — in an editor, in git, reviewed by a human. The server never
+experiment YAML - in an editor, in git, reviewed by a human. The server never
 writes it.
 
 ```yaml
@@ -40,7 +40,7 @@ At startup the server resolves every `config` path to absolute (relative paths
 are resolved against the catalog file), validates it with the same loader the
 CLI uses, computes a content hash, and **refuses to start** if any config is
 invalid, is a suite, or uses in-memory storage. Catalog ids must match
-`[A-Za-z0-9_-]+`. The id→path mapping is then frozen for the server's lifetime.
+`[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime.
 
 ## Start the server
 
@@ -67,7 +67,7 @@ an MCP client (for example, Claude Desktop) as a stdio server:
 Relative paths resolve against the directory you start the server from:
 `state_dir` in the catalog and `workdir` / `storage` inside each experiment
 YAML are all relative to the server's current working directory (matching the
-engine's convention). The `config:` paths in the catalog are the exception —
+engine's convention). The `config:` paths in the catalog are the exception -
 they resolve against the catalog file. **For production, prefer absolute
 paths** for `state_dir`, `workdir`, and `storage`, or always start the server
 from the same project directory.
@@ -89,7 +89,7 @@ same-host lock), regardless of the cap.
 
 | Tool | Inputs | Effect | Returns |
 | --- | --- | --- | --- |
-| `list_experiments` | — | read | catalog ids, description, phase names, metric name + goal |
+| `list_experiments` | none | read | catalog ids, description, phase names, metric name + goal |
 | `validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `get_status` | `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
 | `get_winners` | `experiment_id` | read | per-phase trial number, metric, params, and full effective overrides |
@@ -107,11 +107,11 @@ exist on disk; the server checks resume-readiness before launching.
 The catalog is the trust boundary. By construction the agent **cannot**:
 
 - set or change `trial_command`, `env`, `storage`, `workdir`, search spaces,
-  samplers, gates, or any safety waiver — no tool accepts a config or these
+  samplers, gates, or any safety waiver - no tool accepts a config or these
   fields;
-- reference a config by path — every tool takes an `experiment_id` resolved
+- reference a config by path - every tool takes an `experiment_id` resolved
   against the frozen catalog; an unknown id is a clean error;
-- read trainer output or rendered commands — **no tool returns log text**,
+- read trainer output or rendered commands - **no tool returns log text**,
   because the engine logs the fully rendered command (template + absolute
   paths) and trainer output can carry secrets or PII. Logs stay under
   `state_dir` for the operator to inspect directly;
@@ -124,7 +124,7 @@ generic `"internal error"` rather than leaking a traceback.
 
 This layer narrows the **agent's** authority. It does **not** sandbox the
 training subprocess, which remains as trusted as the human who wrote its
-command. Registering a malicious config runs it — your decision, identical to
+command. Registering a malicious config runs it - your decision, identical to
 running `phasesweep run` by hand. A secret placed in `fixed_overrides` will
 surface in `get_winners` (it is, by design, "the best parameters"); that is
 config hygiene, not an MCP leak.
@@ -133,9 +133,9 @@ config hygiene, not an MCP leak.
 
 Run handles and per-run logs live under `state_dir`:
 
-- `state_dir/runs/<run_id>.json` — the run handle.
-- `state_dir/logs/<run_id>.log` — captured runner stdout/stderr (operator-only).
-- `state_dir/logs/<run_id>.status.json` — the recorded terminal cause.
+- `state_dir/runs/<run_id>.json` - the run handle.
+- `state_dir/logs/<run_id>.log` - captured runner stdout/stderr (operator-only).
+- `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 
@@ -144,7 +144,7 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 The server is built to stay up across multi-hour sweeps. Detached runners are
 reaped as they exit (no zombie buildup), the server does not hold per-run log
 file descriptors open, and run state is derived from disk on each query rather
-than kept in memory — so a server restart re-discovers live runs from their
+than kept in memory - so a server restart re-discovers live runs from their
 handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
