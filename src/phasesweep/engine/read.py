@@ -51,28 +51,40 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         phase_name: Phase whose ``winner.yaml`` to read.
 
     Returns:
-        A :class:`PhaseWinnerView`, or ``None`` when the phase has no winner on
-        disk yet (still running, never run, or selection failed).
+        A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
+        winner on disk: never run, still running, selection failed, or the file
+        is mid-write / malformed. A partial read is treated as "not yet
+        written" - consistent with this module's permissive contract and with
+        ``_phase_trial_counts`` swallowing transient backend errors - because
+        ``winner.yaml`` is written non-atomically at phase completion and a
+        status query may observe it torn. The strict, fingerprint-verifying
+        read used for ``--from-phase`` resume lives in
+        ``engine.state._load_winner`` and is intentionally not relaxed here.
 
     """
     path = _winner_path(experiment, phase_name)
     if not path.is_file():
         return None
-    data = yaml.safe_load(path.read_text()) or {}
-    # winner.yaml stores metric as {<metric_name>: value, "goal": ...}; pull the
-    # value by the configured metric name rather than positionally.
-    metric_block = data.get("metric") or {}
-    gates = [g for g in (data.get("gates") or []) if isinstance(g, dict)]
-    completion = data.get("completion") or {}
-    return PhaseWinnerView(
-        phase=phase_name,
-        trial_number=int(data["trial_number"]),
-        metric=float(metric_block[experiment.metric.name]),
-        params=dict(data.get("params") or {}),
-        effective_overrides=dict(data.get("effective_overrides") or {}),
-        gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
-        incomplete=bool(completion.get("incomplete", False)),
-    )
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+        # winner.yaml stores metric as {<metric_name>: value, "goal": ...}; pull
+        # the value by the configured metric name rather than positionally.
+        metric_block = data.get("metric") or {}
+        gates = [g for g in (data.get("gates") or []) if isinstance(g, dict)]
+        completion = data.get("completion") or {}
+        return PhaseWinnerView(
+            phase=phase_name,
+            trial_number=int(data["trial_number"]),
+            metric=float(metric_block[experiment.metric.name]),
+            params=dict(data.get("params") or {}),
+            effective_overrides=dict(data.get("effective_overrides") or {}),
+            gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
+            incomplete=bool(completion.get("incomplete", False)),
+        )
+    except (KeyError, ValueError, TypeError, OSError, yaml.YAMLError):
+        # Partially-written or malformed file (or unlinked between the is_file
+        # check and the read): report as no-winner-yet rather than raising.
+        return None
 
 
 def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
