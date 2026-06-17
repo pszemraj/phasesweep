@@ -169,6 +169,31 @@ class RunStore:
             return "running"
         return "failed"
 
+    def mark_cancelled_if_unrecorded(self, handle: RunHandle) -> None:
+        """Record a ``cancelled`` cause when a force-killed runner left none.
+
+        The runner writes ``status.json`` (returncode 143) from its SIGTERM
+        handler. If the server had to escalate to SIGKILL - the runner did not
+        exit within the grace window - it is killed before recording anything,
+        and a later read would derive ``failed`` from the now-dead PID. The
+        canceller is the authority on a termination it performed, so attribute
+        it faithfully. No-op when a status file already exists, so a graceful
+        143 (or a genuine failure) is never clobbered.
+
+        Args:
+            handle: The run handle whose terminal cause is being recorded.
+
+        """
+        status_path = Path(handle.status_path)
+        if status_path.is_file():
+            return
+        # 137 == 128 + SIGKILL(9). state() keys "cancelled" off error_class, not
+        # the code, so an OOM/other SIGKILL - which never writes status - still
+        # reads as failed; only a cancel we performed records this cause.
+        payload = {"run_id": handle.run_id, "returncode": 137, "error_class": "cancelled"}
+        with contextlib.suppress(OSError):
+            status_path.write_text(json.dumps(payload, indent=2))
+
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.
 

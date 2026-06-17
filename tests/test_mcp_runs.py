@@ -108,6 +108,25 @@ def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     assert store.state(handle) == "running"
 
 
+def test_mark_cancelled_records_cancel_when_runner_left_no_status(tmp_path: Path) -> None:
+    # SIGKILL escalation leaves no runner-written status; the canceller records
+    # the cause so a later read is 'cancelled', not 'failed'.
+    store = RunStore(tmp_path / "state")
+    handle = _live_handle(store, run_id="exp-1")
+    store.mark_cancelled_if_unrecorded(handle)
+    assert store.state(handle) == "cancelled"
+    assert json.loads(store.status_path("exp-1").read_text())["error_class"] == "cancelled"
+
+
+def test_mark_cancelled_is_noop_when_status_exists(tmp_path: Path) -> None:
+    # A graceful terminal cause (or genuine failure) is never clobbered.
+    store = RunStore(tmp_path / "state")
+    handle = _live_handle(store, run_id="exp-1")
+    _write_status(store, "exp-1", returncode=0, error_class=None)  # succeeded
+    store.mark_cancelled_if_unrecorded(handle)
+    assert store.state(handle) == "succeeded"
+
+
 def test_state_failed_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())

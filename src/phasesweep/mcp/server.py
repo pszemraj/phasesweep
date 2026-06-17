@@ -135,7 +135,13 @@ class PhaseSweepMCP:
         return {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
 
     def cancel(self, run_id: str) -> dict[str, Any]:
-        """Stop a running sweep: SIGTERM -> grace -> SIGKILL the runner's group."""
+        """Stop a running sweep: SIGTERM -> grace -> SIGKILL the runner's group.
+
+        The terminal state is reported as ``cancelled`` on both the graceful
+        path (the runner's handler writes status.json(143)) and the SIGKILL
+        escalation (the runner is force-killed before it can; this attributes
+        the cause faithfully rather than reporting ``failed``).
+        """
         handle = self._runs.get(run_id)
         if handle is None:
             raise UnknownRunError(run_id)
@@ -150,6 +156,11 @@ class PhaseSweepMCP:
         # a guarantee about trial descendants (those are handled by the runner's
         # handler, or by the next launch's stale reaper on a SIGKILL escalation).
         confirmed = terminate_group(handle.pgid)
+        if confirmed:
+            # If escalation to SIGKILL killed the runner before it recorded a
+            # graceful 143, attribute this operator-initiated stop as cancelled
+            # so the state below isn't a misleading 'failed'. No-op otherwise.
+            self._runs.mark_cancelled_if_unrecorded(handle)
         return {"run_id": run_id, "state": self._runs.state(handle), "cleanup_confirmed": confirmed}
 
     def _require_resume_ready(self, reg: RegisteredExperiment, from_phase: str) -> None:
