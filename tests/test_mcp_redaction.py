@@ -9,6 +9,7 @@ from pathlib import Path
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.mcp.redaction import assert_no_sensitive, status_payload, winners_payload
 from phasesweep.mcp.registry import Registry
+from tests.mcp_helpers import write_mcp_catalog
 
 
 def _write_catalog(tmp_path: Path) -> Path:
@@ -34,11 +35,7 @@ phases:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
     )
-    catalog = tmp_path / "catalog.yaml"
-    catalog.write_text(
-        f"state_dir: {tmp_path}/state\nexperiments:\n  - id: redact_me\n    config: {config}\n"
-    )
-    return catalog
+    return write_mcp_catalog(tmp_path, {"redact_me": config})
 
 
 def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:

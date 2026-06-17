@@ -9,6 +9,7 @@ import pytest
 
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import Registry
+from tests.mcp_helpers import write_mcp_catalog
 
 
 def _write(path: Path, body: str) -> Path:
@@ -68,16 +69,12 @@ def _catalog(
     allow: dict | None = None,
     max_concurrent_runs: int | None = None,
 ) -> Path:
-    lines = [f"state_dir: {tmp_path}/state"]
-    if max_concurrent_runs is not None:
-        lines.append(f"max_concurrent_runs: {max_concurrent_runs}")
-    lines += ["experiments:", f"  - id: {entry_id}", f"    config: {config}"]
-    if allow is not None:
-        lines.append("    allow:")
-        lines.extend(f"      {k}: {str(v).lower()}" for k, v in allow.items())
-    path = tmp_path / "catalog.yaml"
-    path.write_text("\n".join(lines) + "\n")
-    return path
+    return write_mcp_catalog(
+        tmp_path,
+        {entry_id: config},
+        allow=allow,
+        max_concurrent_runs=max_concurrent_runs,
+    )
 
 
 def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None:

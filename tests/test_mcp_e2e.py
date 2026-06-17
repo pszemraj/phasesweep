@@ -11,10 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
 from tests.conftest import REPO
+from tests.mcp_helpers import make_mcp_app, write_mcp_config_catalog
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -22,32 +21,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 _TRAINER = REPO / "examples" / "fake_train.py"
-
-
-def _write_catalog(tmp_path: Path, *, entry_id: str, config_body: str) -> Path:
-    config = tmp_path / f"{entry_id}.yaml"
-    config.write_text(config_body)
-    catalog = tmp_path / f"{entry_id}.catalog.yaml"
-    catalog.write_text(
-        f"state_dir: {tmp_path}/state\nexperiments:\n  - id: {entry_id}\n    config: {config}\n"
-    )
-    return catalog
-
-
-def _write_multi_catalog(
-    tmp_path: Path, configs: dict[str, str], *, max_concurrent_runs: int | None = None
-) -> Path:
-    lines = [f"state_dir: {tmp_path}/state"]
-    if max_concurrent_runs is not None:
-        lines.append(f"max_concurrent_runs: {max_concurrent_runs}")
-    lines.append("experiments:")
-    for entry_id, body in configs.items():
-        config = tmp_path / f"{entry_id}.yaml"
-        config.write_text(body)
-        lines += [f"  - id: {entry_id}", f"    config: {config}"]
-    catalog = tmp_path / "multi.catalog.yaml"
-    catalog.write_text("\n".join(lines) + "\n")
-    return catalog
 
 
 def _chained_config(tmp_path: Path) -> str:
@@ -99,12 +72,6 @@ phases:
 """
 
 
-def _app(catalog: Path) -> tuple[PhaseSweepMCP, RunStore]:
-    registry = Registry.load(catalog)
-    store = RunStore(registry.state_dir)
-    return PhaseSweepMCP(registry, store), store
-
-
 def _wait_state(app: PhaseSweepMCP, run_id: str, *, want: set[str], timeout: float) -> str:
     deadline = time.time() + timeout
     state = "unknown"
@@ -137,8 +104,8 @@ def _cancel_quietly(app: PhaseSweepMCP, run_id: str) -> None:
 
 
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
-    catalog = _write_catalog(tmp_path, entry_id="e2e_lm", config_body=_chained_config(tmp_path))
-    app, store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, store = make_mcp_app(catalog)
 
     # Catalog metadata is path-free and well-formed.
     summaries = app.list_experiments()
@@ -169,8 +136,8 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
 
 def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
-    catalog = _write_catalog(tmp_path, entry_id="slow", config_body=_slow_config(tmp_path))
-    app, _store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
 
     run_id = app.launch("slow")["run_id"]
     second_run_id = None
@@ -196,14 +163,14 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
 
 
 def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
-    catalog = _write_catalog(tmp_path, entry_id="slow", config_body=_slow_config(tmp_path))
-    app, _store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
 
     run_id = app.launch("slow")["run_id"]
     try:
         assert _wait_for_running_trial(app, run_id, timeout=30) == "running"
 
-        restarted_app, _restarted_store = _app(catalog)
+        restarted_app, _restarted_registry, _restarted_store = make_mcp_app(catalog)
         status = restarted_app.status(run_id=run_id)
         assert status["run"]["state"] == "running"
 
@@ -215,14 +182,15 @@ def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) ->
 
 
 def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
-    catalog = _write_multi_catalog(
+    catalog = write_mcp_config_catalog(
         tmp_path,
         {
             "slowa": _slow_config(tmp_path, name="slowa"),
             "slowb": _slow_config(tmp_path, name="slowb"),
         },
+        filename="multi.catalog.yaml",
     )  # default max_concurrent_runs == 1
-    app, _store = _app(catalog)
+    app, _registry, _store = make_mcp_app(catalog)
 
     run_a = app.launch("slowa")["run_id"]
     run_b = None
@@ -250,8 +218,8 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     # test stays deterministic. White-box: reach for the store's lock directly.
     from phasesweep.runtime.files import try_lock_file, unlock_file
 
-    catalog = _write_catalog(tmp_path, entry_id="slow", config_body=_slow_config(tmp_path))
-    app, store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    app, _registry, store = make_mcp_app(catalog)
 
     held = try_lock_file(store._launch_lock_path)
     assert held is not None
@@ -268,8 +236,8 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
 
 
 def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
-    catalog = _write_catalog(tmp_path, entry_id="e2e_lm", config_body=_chained_config(tmp_path))
-    app, _store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
 
     with pytest.raises(Exception, match="unknown run id"):
         app.status(run_id="nope-123")
@@ -293,8 +261,8 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
 
     from phasesweep.mcp.server import build_server
 
-    catalog = _write_catalog(tmp_path, entry_id="e2e_lm", config_body=_chained_config(tmp_path))
-    app, _store = _app(catalog)
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
     server = build_server(app)
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
