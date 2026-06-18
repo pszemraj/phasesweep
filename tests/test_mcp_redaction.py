@@ -51,7 +51,17 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
 
     winners = winners_payload(
         reg.id,
-        [PhaseWinnerView("p", 0, 0.1, {"lr": 3e-4}, {"lr": 3e-4}, None, False)],
+        [
+            PhaseWinnerView(
+                "p",
+                0,
+                0.1,
+                {"lr": 3e-4},
+                {"lr": 3e-4, "token": "SECRET_FIXED_OVERRIDE", "data": "/private/data"},
+                None,
+                False,
+            )
+        ],
     )
     status = status_payload(
         reg.id,
@@ -62,6 +72,9 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
     assert_no_sensitive(winners, sensitive)
     assert_no_sensitive(status, sensitive)
     assert str(reg.config_path) not in str(winners)  # the catalog path is never exposed
+    assert "effective_overrides" not in winners["phases"][0]
+    assert "SECRET_FIXED_OVERRIDE" not in str(winners)
+    assert "/private/data" not in str(winners)
 
 
 def test_assert_no_sensitive_actually_catches_a_leak() -> None:

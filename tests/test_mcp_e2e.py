@@ -5,6 +5,7 @@ read winners, and exercise the launch -> cancel -> relaunch cycle.
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -128,9 +129,11 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         for p in phases:
             assert isinstance(p["metric"], float)
             assert p["metric"] == p["metric"]  # not NaN
-            assert "effective_overrides" in p
-        # The chained phase carries the inherited depth winner.
-        assert "n_layers" in phases[1]["effective_overrides"]
+            assert "params" in p
+            assert "effective_overrides" not in p
+        # The chained phase reports only its sampled winner params; inherited
+        # fixed/effective values stay out of MCP tool output.
+        assert set(phases[1]["params"]) == {"lr"}
     finally:
         _cancel_quietly(app, run_id)
 
@@ -249,8 +252,10 @@ def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
             app.status(run_id=traversal)
         with pytest.raises(Exception, match="unknown run id"):
             app.cancel(traversal)
-    with pytest.raises(Exception, match="either experiment_id or run_id"):
+    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
         app.status()
+    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
+        app.status(experiment_id="e2e_lm", run_id="nope-123")
     # No run launched yet: experiment-level status reports no live run.
     assert app.status(experiment_id="e2e_lm")["run"] is None
 
@@ -274,15 +279,57 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
         "cancel_sweep",
     }
     assert all(t.description for t in tools)
+    assert all(t.annotations is not None for t in tools)
+    assert all(t.outputSchema for t in tools)
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
     # could not call the tools. Lock the shapes in.
     schemas = {t.name: t.inputSchema for t in tools}
+    assert all(schema.get("additionalProperties") is False for schema in schemas.values())
     assert sorted(schemas["launch_sweep"]["properties"]) == ["experiment_id", "from_phase"]
     assert schemas["launch_sweep"]["required"] == ["experiment_id"]
+    assert schemas["launch_sweep"]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    assert schemas["launch_sweep"]["properties"]["experiment_id"]["description"]
     assert sorted(schemas["get_status"]["properties"]) == ["experiment_id", "run_id"]
     assert schemas["get_status"].get("required") is None  # both optional
+    assert "oneOf" in schemas["get_status"]
     assert schemas["cancel_sweep"]["required"] == ["run_id"]
     assert schemas["validate_config"]["required"] == ["experiment_id"]
     assert not schemas["list_experiments"]["properties"]
+
+    annotations = {t.name: t.annotations for t in tools}
+    assert annotations["list_experiments"].readOnlyHint is True
+    assert annotations["launch_sweep"].readOnlyHint is False
+    assert annotations["launch_sweep"].destructiveHint is False
+    assert annotations["cancel_sweep"].destructiveHint is True
+
+    output_schemas = {t.name: t.outputSchema for t in tools}
+    assert "experiments" in output_schemas["list_experiments"]["properties"]
+    assert "effective_overrides" not in json.dumps(output_schemas["get_winners"])
+    assert "params" in json.dumps(output_schemas["get_winners"])
+
+
+def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from mcp import types
+
+    from phasesweep.mcp.server import build_server
+
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+    server = build_server(app)
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    req = types.CallToolRequest(
+        params=types.CallToolRequestParams(
+            name="validate_config",
+            arguments={"experiment_id": "missing"},
+        )
+    )
+
+    result = asyncio.run(handler(req)).root
+
+    assert result.isError is True
+    assert "unknown experiment id 'missing'" in result.content[0].text

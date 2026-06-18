@@ -15,7 +15,12 @@ from phasesweep.engine import PhaseWinnerView
 
 
 def winners_payload(experiment_id: str, views: list[PhaseWinnerView]) -> dict[str, Any]:
-    """Build the ``get_winners`` payload from path-free phase-winner views."""
+    """Build the ``get_winners`` payload from path-free phase-winner views.
+
+    MCP output exposes sampled ``params`` only. ``effective_overrides`` can
+    include config-authored fixed or inherited values, so it is intentionally
+    kept out of agent-visible tool results.
+    """
     return {
         "experiment_id": experiment_id,
         "phases": [
@@ -24,7 +29,6 @@ def winners_payload(experiment_id: str, views: list[PhaseWinnerView]) -> dict[st
                 "trial_number": v.trial_number,
                 "metric": v.metric,
                 "params": v.params,
-                "effective_overrides": v.effective_overrides,
                 "gates_passed": v.gates_passed,
                 "incomplete": v.incomplete,
             }

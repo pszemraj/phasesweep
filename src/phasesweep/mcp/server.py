@@ -15,10 +15,12 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field
 
+from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
 from phasesweep.mcp.errors import (
@@ -35,10 +37,163 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
-from phasesweep.mcp.runs import RunHandle, RunStore, utc_now_iso
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore, utc_now_iso
 from phasesweep.runtime.process import read_proc_starttime, terminate_group
 
 log = logging.getLogger("phasesweep.mcp.server")
+
+SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
+
+ExperimentId = Annotated[
+    str,
+    Field(
+        description="Catalog experiment id exposed by list_experiments.",
+        pattern=SAFE_NAME_JSON_PATTERN,
+    ),
+]
+MaybeExperimentId = Annotated[
+    str | None,
+    Field(
+        description="Catalog experiment id. Provide exactly one of experiment_id or run_id.",
+        pattern=SAFE_NAME_JSON_PATTERN,
+    ),
+]
+RunId = Annotated[
+    str,
+    Field(description="MCP run id returned by launch_sweep.", pattern=SAFE_NAME_JSON_PATTERN),
+]
+MaybeRunId = Annotated[
+    str | None,
+    Field(
+        description="MCP run id returned by launch_sweep. Provide exactly one of experiment_id or run_id.",
+        pattern=SAFE_NAME_JSON_PATTERN,
+    ),
+]
+PhaseName = Annotated[
+    str,
+    Field(description="Phase name from the experiment config.", pattern=SAFE_NAME_JSON_PATTERN),
+]
+MaybePhaseName = Annotated[
+    str | None,
+    Field(
+        description="Optional phase name to resume from after earlier phases already have winners.",
+        pattern=SAFE_NAME_JSON_PATTERN,
+    ),
+]
+
+
+class _ToolPayload(BaseModel):
+    """Strict base for structured MCP tool results."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MetricPayload(_ToolPayload):
+    """Optimization metric descriptor."""
+
+    name: str = Field(description="Metric key extracted from trial output.")
+    goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
+
+
+class ExperimentSummaryPayload(_ToolPayload):
+    """Path-free catalog entry summary."""
+
+    id: ExperimentId
+    description: str = Field(description="Operator-authored catalog description.")
+    phases: list[PhaseName] = Field(description="Declared phases, in execution order.")
+    metric: MetricPayload
+
+
+class ListExperimentsResult(_ToolPayload):
+    """Structured output for list_experiments."""
+
+    experiments: list[ExperimentSummaryPayload]
+
+
+class PhaseValidationPayload(_ToolPayload):
+    """Agent-safe phase structure."""
+
+    name: PhaseName
+    n_trials: int = Field(ge=0, description="Number of trials configured for this phase.")
+    sampler: str = Field(description="Sampler type only; sampler internals stay in the config.")
+    inherits: list[PhaseName] = Field(description="Parent phases inherited by this phase.")
+    search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")
+
+
+class ValidateConfigResult(_ToolPayload):
+    """Structured output for validate_config."""
+
+    experiment_id: ExperimentId
+    metric: MetricPayload
+    phases: list[PhaseValidationPayload]
+
+
+class RunPayload(_ToolPayload):
+    """Agent-visible run process state."""
+
+    run_id: RunId
+    state: RunState
+    started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
+
+
+class PhaseStatusPayload(_ToolPayload):
+    """Per-phase status without filesystem paths."""
+
+    phase: PhaseName
+    trials: dict[str, int] = Field(description="Optuna trial counts by state.")
+    running: int = Field(ge=0, description="Number of currently running trials.")
+    winner_present: bool = Field(description="Whether this phase has a winner artifact.")
+
+
+class GetStatusResult(_ToolPayload):
+    """Structured output for get_status."""
+
+    experiment_id: ExperimentId
+    metric: MetricPayload
+    phases: list[PhaseStatusPayload]
+    summary_present: bool
+    run: RunPayload | None
+
+
+class WinnerPhasePayload(_ToolPayload):
+    """Agent-visible phase winner."""
+
+    phase: PhaseName
+    trial_number: int = Field(ge=0)
+    metric: float
+    params: dict[str, Any] = Field(
+        description="Sampled winning hyperparameters only; fixed/inherited overrides are omitted."
+    )
+    gates_passed: bool | None = Field(
+        description="True/false when gates were declared; null when the phase has no gates."
+    )
+    incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
+
+
+class GetWinnersResult(_ToolPayload):
+    """Structured output for get_winners."""
+
+    experiment_id: ExperimentId
+    phases: list[WinnerPhasePayload]
+
+
+class LaunchSweepResult(_ToolPayload):
+    """Structured output for launch_sweep."""
+
+    run_id: RunId
+    experiment_id: ExperimentId
+    state: Literal["running"]
+
+
+class CancelSweepResult(_ToolPayload):
+    """Structured output for cancel_sweep."""
+
+    run_id: RunId
+    state: RunState
+    cleanup_confirmed: bool | None = Field(
+        default=None,
+        description="Whether the runner process group is gone; null when the run was already terminal.",
+    )
 
 
 class PhaseSweepMCP:
@@ -78,6 +233,8 @@ class PhaseSweepMCP:
         Provide either ``experiment_id`` (reports the live run, if any) or
         ``run_id`` (reports that specific run). Raises if neither is given.
         """
+        if (experiment_id is None) == (run_id is None):
+            raise McpToolError("provide exactly one of experiment_id or run_id")
         if run_id is not None:
             handle = self._runs.get(run_id)
             if handle is None:
@@ -89,16 +246,15 @@ class PhaseSweepMCP:
                 "started_at": handle.started_at,
             }
             return status_payload(reg.id, read_status(reg.experiment), run)
-        if experiment_id is not None:
-            reg = self._registry.get(experiment_id)
-            live = self._runs.live_run_for(experiment_id)
-            run = (
-                {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
-                if live is not None
-                else None
-            )
-            return status_payload(reg.id, read_status(reg.experiment), run)
-        raise McpToolError("provide either experiment_id or run_id")
+        assert experiment_id is not None
+        reg = self._registry.get(experiment_id)
+        live = self._runs.live_run_for(experiment_id)
+        run = (
+            {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
+            if live is not None
+            else None
+        )
+        return status_payload(reg.id, read_status(reg.experiment), run)
 
     def winners(self, experiment_id: str) -> dict[str, Any]:
         """Return the winning hyperparameters per completed phase."""
@@ -262,10 +418,12 @@ F = TypeVar("F", bound=Callable[..., Any])
 def _safe_tool(fn: F) -> F:
     """Translate exceptions into redacted tool errors.
 
-    ``McpToolError`` -> re-raised with its safe message. Anything else -> logged
-    to stderr and replaced with a generic message so an unexpected error (e.g.
-    an OSError carrying a path) never reaches the agent. ``functools.wraps``
-    preserves the signature so FastMCP still derives the tool schema.
+    ``McpToolError`` -> re-raised as ``ValueError`` with its safe message.
+    FastMCP's low-level handler serializes tool exceptions as
+    ``CallToolResult(isError=True)``. Anything else -> logged to stderr and
+    replaced with a generic message so an unexpected error (e.g. an OSError
+    carrying a path) never reaches the agent. ``functools.wraps`` preserves the
+    signature so FastMCP still derives the tool schema.
     """
 
     @functools.wraps(fn)
@@ -281,6 +439,61 @@ def _safe_tool(fn: F) -> F:
     return wrapper  # type: ignore[return-value]
 
 
+def _read_annotations(title: str) -> Any:
+    """Return MCP annotations for read-only, idempotent tools."""
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+
+def _launch_annotations() -> Any:
+    """Return MCP annotations for the side-effecting launch tool."""
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(
+        title="Launch Sweep",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+
+
+def _cancel_annotations() -> Any:
+    """Return MCP annotations for the process-terminating cancel tool."""
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(
+        title="Cancel Sweep",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+
+
+def _strict_tool_inputs(mcp: Any) -> None:
+    """Make FastMCP's generated argument models reject undeclared keys."""
+    for tool in mcp._tool_manager.list_tools():
+        arg_model = tool.fn_metadata.arg_model
+        arg_model.model_config["extra"] = "forbid"
+        arg_model.model_rebuild(force=True)
+        tool.parameters = arg_model.model_json_schema(by_alias=True)
+
+    status_tool = mcp._tool_manager.get_tool("get_status")
+    if status_tool is not None:
+        status_tool.parameters["oneOf"] = [
+            {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
+            {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
+        ]
+
+
 def build_server(app: PhaseSweepMCP) -> Any:
     """Construct the FastMCP server.
 
@@ -291,42 +504,51 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     mcp = FastMCP("phasesweep")
 
-    @mcp.tool()
+    @mcp.tool(annotations=_read_annotations("List Experiments"), structured_output=True)
     @_safe_tool
-    def list_experiments() -> list[dict]:
+    def list_experiments() -> ListExperimentsResult:
         """List the experiments this server exposes: ids, descriptions, phase names, and the optimization metric. Use an id with the other tools."""
-        return app.list_experiments()
+        return ListExperimentsResult.model_validate({"experiments": app.list_experiments()})
 
-    @mcp.tool()
+    @mcp.tool(annotations=_read_annotations("Validate Config"), structured_output=True)
     @_safe_tool
-    def validate_config(experiment_id: str) -> dict:
+    def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing."""
-        return app.validate(experiment_id)
+        return ValidateConfigResult.model_validate(app.validate(experiment_id))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_read_annotations("Get Status"), structured_output=True)
     @_safe_tool
-    def get_status(experiment_id: str | None = None, run_id: str | None = None) -> dict:
-        """Per-phase trial counts and winner presence, plus the run process state. Provide either experiment_id or run_id. Read-only."""
-        return app.status(experiment_id=experiment_id, run_id=run_id)
+    def get_status(
+        experiment_id: MaybeExperimentId = None,
+        run_id: MaybeRunId = None,
+    ) -> GetStatusResult:
+        """Per-phase trial counts and winner presence, plus the run process state. Provide exactly one of experiment_id or run_id. Read-only."""
+        return GetStatusResult.model_validate(
+            app.status(experiment_id=experiment_id, run_id=run_id)
+        )
 
-    @mcp.tool()
+    @mcp.tool(annotations=_read_annotations("Get Winners"), structured_output=True)
     @_safe_tool
-    def get_winners(experiment_id: str) -> dict:
-        """Return the winning hyperparameters per completed phase: trial number, metric, sampled params, and the full effective overrides. Read-only."""
-        return app.winners(experiment_id)
+    def get_winners(experiment_id: ExperimentId) -> GetWinnersResult:
+        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Read-only."""
+        return GetWinnersResult.model_validate(app.winners(experiment_id))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_launch_annotations(), structured_output=True)
     @_safe_tool
-    def launch_sweep(experiment_id: str, from_phase: str | None = None) -> dict:
+    def launch_sweep(
+        experiment_id: ExperimentId,
+        from_phase: MaybePhaseName = None,
+    ) -> LaunchSweepResult:
         """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id."""
-        return app.launch(experiment_id, from_phase=from_phase)
+        return LaunchSweepResult.model_validate(app.launch(experiment_id, from_phase=from_phase))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_cancel_annotations(), structured_output=True)
     @_safe_tool
-    def cancel_sweep(run_id: str) -> dict:
+    def cancel_sweep(run_id: RunId) -> CancelSweepResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes."""
-        return app.cancel(run_id)
+        return CancelSweepResult.model_validate(app.cancel(run_id))
 
+    _strict_tool_inputs(mcp)
     return mcp
 
 

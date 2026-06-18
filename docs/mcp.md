@@ -95,8 +95,8 @@ same-host lock), regardless of the cap.
 | --- | --- | --- | --- |
 | `list_experiments` | none | read | catalog ids, description, phase names, metric name + goal |
 | `validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
-| `get_status` | `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
-| `get_winners` | `experiment_id` | read | per-phase trial number, metric, params, and full effective overrides |
+| `get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
+| `get_winners` | `experiment_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
 | `launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
@@ -122,16 +122,9 @@ The catalog is the trust boundary. By construction the agent **cannot**:
 - double-launch (rejected by a run-handle check and ultimately the engine's
   same-host lock), delete runs, or corrupt state.
 
-Outbound payloads are built only from path-free typed views, so there is
-structurally nothing to scrub; a backstop converts any unexpected error into a
-generic `"internal error"` rather than leaking a traceback.
+Outbound payloads are built only from path-free typed views. `get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
 
-This layer narrows the **agent's** authority. It does **not** sandbox the
-training subprocess, which remains as trusted as the human who wrote its
-command. Registering a malicious config runs it - your decision, identical to
-running `phasesweep run` by hand. A secret placed in `fixed_overrides` will
-surface in `get_winners` (it is, by design, "the best parameters"); that is
-config hygiene, not an MCP leak.
+This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
 
 ## Inspecting runs
 
