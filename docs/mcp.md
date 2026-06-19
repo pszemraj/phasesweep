@@ -9,12 +9,6 @@ catalog by id and calls one of six tools.
 
 For copy/paste MCP client config and agent instructions, start with [MCP agent setup](mcp_setup.md).
 
-## Install
-
-```bash
-python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
-```
-
 ## The catalog
 
 The server is started with a **catalog**: a fixed allowlist mapping opaque ids
@@ -24,43 +18,20 @@ config. Author the catalog with the same trust and out-of-band process as the
 experiment YAML - in an editor, in git, reviewed by a human. The server never
 writes it.
 
-```yaml
-# examples/catalog.yaml
-state_dir: ./runs/.mcp          # run handles + per-run logs (operator-owned)
-max_concurrent_runs: 1          # sweeps running at once across all experiments (single GPU -> 1)
-experiments:
-  - id: tiny-lm                 # the only token the agent ever sends
-    config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
-    description: "16 MB LM: pick depth, then lr, then regularization"
-    allow:
-      launch: true              # side effects default false; opt in deliberately
-      cancel: true
-      from_phase: true
-```
+Catalog keys:
+
+- `state_dir`: operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`.
+- `max_concurrent_runs`: cap on live sweeps across all catalog entries. The default is `1`.
+- `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
+- `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
+- `experiments[].description`: optional text shown by `phasesweep_list_experiments`.
+- `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
 At startup the server resolves every `config` path to absolute (relative paths are resolved against the catalog file), validates it with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
 Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `phasesweep_launch_sweep`, `phasesweep_cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
-## Start the server
-
-```bash
-phasesweep mcp --catalog examples/catalog.yaml
-```
-
-The server speaks JSON-RPC over stdio; all logging goes to stderr. Wire it into
-an MCP client (for example, Claude Desktop) as a stdio server:
-
-```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "phasesweep",
-      "args": ["mcp", "--catalog", "/abs/path/to/examples/catalog.yaml"]
-    }
-  }
-}
-```
+The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 

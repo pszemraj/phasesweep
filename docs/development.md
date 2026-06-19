@@ -1,7 +1,5 @@
 # Development
 
-Repository: <https://github.com/pszemraj/phasesweep.git>
-
 - [Quality Gates](#quality-gates)
 - [Package Map](#package-map)
 - [Test Map](#test-map)

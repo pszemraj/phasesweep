@@ -22,13 +22,13 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 phasesweep is currently installed from Git:
 
 ```bash
-pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
 # weights-and-biases integration is optional:
-pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 # MCP server, to drive sweeps from an AI agent:
-pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 # all dev dependencies:
-pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 For local development from a checkout:
@@ -37,7 +37,7 @@ For local development from a checkout:
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
 # activate venv of your choice, then:
-pip install -e ".[dev,wandb]"
+python -m pip install -e ".[dev,wandb]"
 ```
 
 ## Quickstart
@@ -54,57 +54,17 @@ phasesweep status examples/experiment.yaml
 
 The example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`.
 
-## Config Sketch
+## Config
 
-Adapt this shape to your own trainer.
+Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the metric artifact configured in the extractor, and exit nonzero on failed trials.
 
-> [!IMPORTANT]
-> The script in `trial_command` must parse the override format you choose. The default is `argparse`, where `{overrides}` renders flags such as `--n_layers 8 --lr 0.0003`; see [supported override formats](docs/config.md#override-formats).
-
-```yaml
-experiment: tiny_lm_16mb
-storage: sqlite:///./runs/phases.db
-workdir: ./runs
-trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
-
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: { type: json, path: result.json, key: eval_loss }
-
-phases:
-  - name: depth
-    n_trials: 4
-    sampler: { type: grid }
-    search_space:
-      n_layers: { type: categorical, choices: [4, 8, 12, 16] }
-
-  - name: lr
-    inherits: [depth]
-    n_trials: 12
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-```
-
-## Runtime Boundaries
-
-- Bring your own trainer; see the [trainer contract](docs/config.md#trainer-contract).
-- Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly.
-- Use one orchestrator per experiment on one host. Same-host conflicts are rejected with advisory locks.
-- SQLite is for sequential `n_jobs == 1` studies. See [runtime behavior](docs/runtime.md#concurrency-model) for parallel storage and locking details.
+Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly. Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
 
 ## MCP server (agent integration)
 
 `phasesweep mcp` exposes cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings.
 
-```bash
-pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
-phasesweep mcp --catalog examples/catalog.yaml
-```
-
-The sweep runs as a detached background process that survives a server restart. See the [MCP guide](docs/mcp.md) for the catalog format, tool behavior, security model, and concurrency settings.
-
-For copy/paste MCP client config and agent instructions, see [MCP agent setup](docs/mcp_setup.md).
+For install commands, MCP client config, and agent instructions, see [MCP agent setup](docs/mcp_setup.md). The [MCP guide](docs/mcp.md) covers catalog behavior, tools, security boundaries, and run state.
 
 ## Docs
 

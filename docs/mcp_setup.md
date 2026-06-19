@@ -1,6 +1,6 @@
 # MCP agent setup
 
-This page is the practical setup sheet for connecting an AI agent to `phasesweep mcp`. For the full security model and tool behavior, see [MCP server](mcp.md).
+Use `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are covered in [MCP server](mcp.md).
 
 ## Install
 
