@@ -36,6 +36,7 @@ def write_mcp_config_catalog(
     tmp_path: Path,
     configs: Mapping[str, str],
     *,
+    allow: Mapping[str, bool] | None = None,
     max_concurrent_runs: int | None = None,
     filename: str = "catalog.yaml",
 ) -> Path:
@@ -45,7 +46,11 @@ def write_mcp_config_catalog(
         config.write_text(body)
         entries[entry_id] = config
     return write_mcp_catalog(
-        tmp_path, entries, max_concurrent_runs=max_concurrent_runs, filename=filename
+        tmp_path,
+        entries,
+        allow=allow,
+        max_concurrent_runs=max_concurrent_runs,
+        filename=filename,
     )
 
 

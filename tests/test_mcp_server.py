@@ -19,6 +19,8 @@ from phasesweep.mcp.server import _safe_tool
 from phasesweep.runtime.process import read_proc_starttime
 from tests.mcp_helpers import make_mcp_app, write_mcp_catalog
 
+ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+
 
 def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
     if phases is None:
@@ -76,9 +78,7 @@ def test_safe_tool_redacts_unexpected_exception() -> None:
 
 def test_launch_permission_denied_before_spawn(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(
-        _catalog(tmp_path, config, allow={"launch": False, "cancel": True, "from_phase": True}),
-    )
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
 
     with pytest.raises(Exception, match="action 'launch' is not permitted"):
         app.launch("srv")
@@ -96,7 +96,7 @@ def test_from_phase_permission_denied_before_validation(tmp_path: Path) -> None:
 
 def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
     with pytest.raises(Exception, match="phase 'missing' is not a phase"):
         app.launch("srv", from_phase="missing")
@@ -115,7 +115,7 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
     config = _config(tmp_path, phases=phases)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
     with pytest.raises(Exception, match="earlier phase 'p' has no winner yet"):
         app.launch("srv", from_phase="q")
@@ -158,7 +158,7 @@ def test_resume_rejects_stale_winner_before_spawn(tmp_path: Path) -> None:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
     config = _config(tmp_path, phases=phases)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     exp = load_config(config)
     assert isinstance(exp, Experiment)
     _write_winner_yaml(exp, "p", phase_fingerprint="0" * 64)
@@ -182,7 +182,7 @@ def test_resume_rejects_incomplete_winner_before_spawn(tmp_path: Path) -> None:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
     config = _config(tmp_path, phases=phases)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     exp = load_config(config)
     assert isinstance(exp, Experiment)
     fp = _phase_fingerprint(exp, exp.phases[0], {})
@@ -196,7 +196,7 @@ def test_resume_rejects_incomplete_winner_before_spawn(tmp_path: Path) -> None:
 
 def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     config.write_text(config.read_text().replace("python train.py", "python changed.py"))
 
     with pytest.raises(Exception, match="changed since server startup"):
@@ -209,7 +209,7 @@ def test_launch_passes_config_snapshot_to_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
-    app, registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    app, registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     captured: dict[str, list[str]] = {}
 
     class DummyProc:

@@ -16,6 +16,8 @@ from phasesweep.mcp.server import PhaseSweepMCP
 from tests.conftest import REPO
 from tests.mcp_helpers import make_mcp_app, write_mcp_config_catalog
 
+ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="detached runner + cancel rely on POSIX process groups + /proc liveness",
@@ -105,7 +107,11 @@ def _cancel_quietly(app: PhaseSweepMCP, run_id: str) -> None:
 
 
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
-    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"e2e_lm": _chained_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
     app, _registry, store = make_mcp_app(catalog)
 
     # Catalog metadata is path-free and well-formed.
@@ -139,7 +145,11 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
 
 def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
-    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"slow": _slow_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
     app, _registry, _store = make_mcp_app(catalog)
 
     run_id = app.launch("slow")["run_id"]
@@ -166,7 +176,11 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
 
 
 def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
-    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"slow": _slow_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
     app, _registry, _store = make_mcp_app(catalog)
 
     run_id = app.launch("slow")["run_id"]
@@ -191,6 +205,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
             "slowa": _slow_config(tmp_path, name="slowa"),
             "slowb": _slow_config(tmp_path, name="slowb"),
         },
+        allow=ALLOW_SIDE_EFFECTS,
         filename="multi.catalog.yaml",
     )  # default max_concurrent_runs == 1
     app, _registry, _store = make_mcp_app(catalog)
@@ -221,7 +236,11 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     # test stays deterministic. White-box: reach for the store's lock directly.
     from phasesweep.runtime.files import try_lock_file, unlock_file
 
-    catalog = write_mcp_config_catalog(tmp_path, {"slow": _slow_config(tmp_path)})
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"slow": _slow_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
     app, _registry, store = make_mcp_app(catalog)
 
     held = try_lock_file(store._launch_lock_path)

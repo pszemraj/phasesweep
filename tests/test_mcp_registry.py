@@ -103,7 +103,9 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert reg.config_path == config.resolve()
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
-    assert reg.allow_launch and reg.allow_cancel and reg.allow_from_phase
+    assert not reg.allow_launch
+    assert not reg.allow_cancel
+    assert not reg.allow_from_phase
 
 
 def test_config_hash_and_model_come_from_same_startup_snapshot(
@@ -252,9 +254,9 @@ def test_permission_flags_propagate(tmp_path: Path) -> None:
     catalog = _catalog(
         tmp_path,
         config,
-        allow={"launch": False, "cancel": False, "from_phase": False},
+        allow={"launch": True, "cancel": True, "from_phase": True},
     )
     reg = Registry.load(catalog).get("reg_ok")
-    assert reg.allow_launch is False
-    assert reg.allow_cancel is False
-    assert reg.allow_from_phase is False
+    assert reg.allow_launch is True
+    assert reg.allow_cancel is True
+    assert reg.allow_from_phase is True

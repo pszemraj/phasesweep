@@ -33,13 +33,14 @@ class _CatalogModel(BaseModel):
 class _Allow(_CatalogModel):
     """Per-experiment permission flags.
 
-    Default-open for the read/launch verbs. Safety waivers are intentionally
-    not expressible here - they are not config the agent may touch.
+    Side effects are opt-in: omitting ``allow`` leaves the experiment
+    read-only. Safety waivers are intentionally not expressible here - they are
+    not config the agent may touch.
     """
 
-    launch: bool = True
-    cancel: bool = True
-    from_phase: bool = True
+    launch: bool = False
+    cancel: bool = False
+    from_phase: bool = False
 
 
 class _Entry(_CatalogModel):

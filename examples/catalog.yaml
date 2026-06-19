@@ -12,6 +12,6 @@ experiments:
     config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
     description: "16 MB LM: pick depth, then lr, then regularization"
     allow:
-      launch: true              # defaults are all true; set false to make read-only
+      launch: true              # side effects default false; opt in deliberately
       cancel: true
       from_phase: true

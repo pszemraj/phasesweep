@@ -31,20 +31,14 @@ experiments:
     config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
     description: "16 MB LM: pick depth, then lr, then regularization"
     allow:
-      launch: true              # all default true; set false to make an experiment read-only
+      launch: true              # side effects default false; opt in deliberately
       cancel: true
       from_phase: true
 ```
 
-At startup the server resolves every `config` path to absolute (relative paths
-are resolved against the catalog file), validates it with the same loader the
-CLI uses, computes a content hash, and **refuses to start** if any config is
-invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`,
-`sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`.
-The id-to-path mapping is then frozen for the server's lifetime. On launch,
-the server verifies the config still matches the startup hash and hands the
-detached runner a per-run snapshot, so later edits to the original file cannot
-change what the runner executes.
+At startup the server resolves every `config` path to absolute (relative paths are resolved against the catalog file), validates it with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
+
+Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `launch_sweep`, `cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
 ## Start the server
 
