@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.server import PhaseSweepMCP
+from phasesweep.mcp.server import (
+    TOOL_CANCEL_SWEEP,
+    TOOL_GET_STATUS,
+    TOOL_GET_WINNERS,
+    TOOL_LAUNCH_SWEEP,
+    TOOL_LIST_EXPERIMENTS,
+    TOOL_VALIDATE_CONFIG,
+    PhaseSweepMCP,
+)
 from tests.conftest import REPO
 from tests.mcp_helpers import make_mcp_app, write_mcp_config_catalog
 
@@ -290,12 +298,12 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     server = build_server(app)
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
-        "list_experiments",
-        "validate_config",
-        "get_status",
-        "get_winners",
-        "launch_sweep",
-        "cancel_sweep",
+        TOOL_LIST_EXPERIMENTS,
+        TOOL_VALIDATE_CONFIG,
+        TOOL_GET_STATUS,
+        TOOL_GET_WINNERS,
+        TOOL_LAUNCH_SWEEP,
+        TOOL_CANCEL_SWEEP,
     }
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
@@ -306,27 +314,29 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     # could not call the tools. Lock the shapes in.
     schemas = {t.name: t.inputSchema for t in tools}
     assert all(schema.get("additionalProperties") is False for schema in schemas.values())
-    assert sorted(schemas["launch_sweep"]["properties"]) == ["experiment_id", "from_phase"]
-    assert schemas["launch_sweep"]["required"] == ["experiment_id"]
-    assert schemas["launch_sweep"]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
-    assert schemas["launch_sweep"]["properties"]["experiment_id"]["description"]
-    assert sorted(schemas["get_status"]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas["get_status"].get("required") is None  # both optional
-    assert "oneOf" in schemas["get_status"]
-    assert schemas["cancel_sweep"]["required"] == ["run_id"]
-    assert schemas["validate_config"]["required"] == ["experiment_id"]
-    assert not schemas["list_experiments"]["properties"]
+    assert sorted(schemas[TOOL_LAUNCH_SWEEP]["properties"]) == ["experiment_id", "from_phase"]
+    assert schemas[TOOL_LAUNCH_SWEEP]["required"] == ["experiment_id"]
+    assert (
+        schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    )
+    assert schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["description"]
+    assert sorted(schemas[TOOL_GET_STATUS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_STATUS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_STATUS]
+    assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
+    assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
+    assert not schemas[TOOL_LIST_EXPERIMENTS]["properties"]
 
     annotations = {t.name: t.annotations for t in tools}
-    assert annotations["list_experiments"].readOnlyHint is True
-    assert annotations["launch_sweep"].readOnlyHint is False
-    assert annotations["launch_sweep"].destructiveHint is False
-    assert annotations["cancel_sweep"].destructiveHint is True
+    assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
+    assert annotations[TOOL_LAUNCH_SWEEP].readOnlyHint is False
+    assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is False
+    assert annotations[TOOL_CANCEL_SWEEP].destructiveHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
-    assert "experiments" in output_schemas["list_experiments"]["properties"]
-    assert "effective_overrides" not in json.dumps(output_schemas["get_winners"])
-    assert "params" in json.dumps(output_schemas["get_winners"])
+    assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
+    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_WINNERS])
+    assert "params" in json.dumps(output_schemas[TOOL_GET_WINNERS])
 
 
 def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
@@ -343,7 +353,7 @@ def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name="validate_config",
+            name=TOOL_VALIDATE_CONFIG,
             arguments={"experiment_id": "missing"},
         )
     )

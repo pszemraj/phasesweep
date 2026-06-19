@@ -38,7 +38,7 @@ experiments:
 
 At startup the server resolves every `config` path to absolute (relative paths are resolved against the catalog file), validates it with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
-Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `launch_sweep`, `cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
+Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `phasesweep_launch_sweep`, `phasesweep_cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
 ## Start the server
 
@@ -72,12 +72,7 @@ from the same project directory.
 
 ### Concurrency and single-GPU hosts
 
-`max_concurrent_runs` (catalog top level, default `1`) caps how many sweeps run
-at once across **all** experiments. The default of `1` suits a single-GPU host:
-each sweep's trials use the GPU, so a second concurrent sweep would contend for
-the device and slow both down. A `launch_sweep` that would exceed the cap is
-refused until a running sweep finishes or is cancelled. Raise it on multi-GPU
-hosts where independent sweeps can run side by side.
+`max_concurrent_runs` (catalog top level, default `1`) caps how many sweeps run at once across **all** experiments. The default of `1` suits a single-GPU host: each sweep's trials use the GPU, so a second concurrent sweep would contend for the device and slow both down. A `phasesweep_launch_sweep` that would exceed the cap is refused until a running sweep finishes or is cancelled. Raise it on multi-GPU hosts where independent sweeps can run side by side.
 
 This is separate from the per-experiment guard: the same experiment can never
 double-launch (rejected by a run-handle check and ultimately the engine's
@@ -87,18 +82,14 @@ same-host lock), regardless of the cap.
 
 | Tool | Inputs | Effect | Returns |
 | --- | --- | --- | --- |
-| `list_experiments` | none | read | catalog ids, description, phase names, metric name + goal |
-| `validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
-| `get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
-| `get_winners` | `experiment_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
-| `launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
-| `cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
+| `phasesweep_list_experiments` | none | read | catalog ids, description, phase names, metric name + goal |
+| `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
+| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
+| `phasesweep_get_winners` | `experiment_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
+| `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
+| `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
-A launched sweep runs as a **detached background process** in its own session,
-so it survives the agent's tool call, survives a server restart, and can be
-cancelled as a group. `get_status` reports `running` / `succeeded` / `failed` /
-`cancelled`. `from_phase` resumes from a phase whose earlier winners already
-exist on disk; the server checks resume-readiness before launching.
+A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
 
 ## Security model
 
@@ -116,7 +107,7 @@ The catalog is the trust boundary. By construction the agent **cannot**:
 - double-launch (rejected by a run-handle check and ultimately the engine's
   same-host lock), delete runs, or corrupt state.
 
-Outbound payloads are built only from path-free typed views. `get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
+Outbound payloads are built only from path-free typed views. `phasesweep_get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
 
 This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
 

@@ -43,11 +43,17 @@ from phasesweep.runtime.process import read_proc_starttime, terminate_group
 log = logging.getLogger("phasesweep.mcp.server")
 
 SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
+TOOL_LIST_EXPERIMENTS = "phasesweep_list_experiments"
+TOOL_VALIDATE_CONFIG = "phasesweep_validate_config"
+TOOL_GET_STATUS = "phasesweep_get_status"
+TOOL_GET_WINNERS = "phasesweep_get_winners"
+TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
+TOOL_CANCEL_SWEEP = "phasesweep_cancel_sweep"
 
 ExperimentId = Annotated[
     str,
     Field(
-        description="Catalog experiment id exposed by list_experiments.",
+        description=f"Catalog experiment id exposed by {TOOL_LIST_EXPERIMENTS}.",
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
@@ -60,12 +66,14 @@ MaybeExperimentId = Annotated[
 ]
 RunId = Annotated[
     str,
-    Field(description="MCP run id returned by launch_sweep.", pattern=SAFE_NAME_JSON_PATTERN),
+    Field(
+        description=f"MCP run id returned by {TOOL_LAUNCH_SWEEP}.", pattern=SAFE_NAME_JSON_PATTERN
+    ),
 ]
 MaybeRunId = Annotated[
     str | None,
     Field(
-        description="MCP run id returned by launch_sweep. Provide exactly one of experiment_id or run_id.",
+        description=f"MCP run id returned by {TOOL_LAUNCH_SWEEP}. Provide exactly one of experiment_id or run_id.",
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
@@ -486,7 +494,7 @@ def _strict_tool_inputs(mcp: Any) -> None:
         arg_model.model_rebuild(force=True)
         tool.parameters = arg_model.model_json_schema(by_alias=True)
 
-    status_tool = mcp._tool_manager.get_tool("get_status")
+    status_tool = mcp._tool_manager.get_tool(TOOL_GET_STATUS)
     if status_tool is not None:
         status_tool.parameters["oneOf"] = [
             {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
@@ -504,19 +512,31 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     mcp = FastMCP("phasesweep")
 
-    @mcp.tool(annotations=_read_annotations("List Experiments"), structured_output=True)
+    @mcp.tool(
+        name=TOOL_LIST_EXPERIMENTS,
+        annotations=_read_annotations("List Experiments"),
+        structured_output=True,
+    )
     @_safe_tool
     def list_experiments() -> ListExperimentsResult:
         """List the experiments this server exposes: ids, descriptions, phase names, and the optimization metric. Use an id with the other tools."""
         return ListExperimentsResult.model_validate({"experiments": app.list_experiments()})
 
-    @mcp.tool(annotations=_read_annotations("Validate Config"), structured_output=True)
+    @mcp.tool(
+        name=TOOL_VALIDATE_CONFIG,
+        annotations=_read_annotations("Validate Config"),
+        structured_output=True,
+    )
     @_safe_tool
     def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing."""
         return ValidateConfigResult.model_validate(app.validate(experiment_id))
 
-    @mcp.tool(annotations=_read_annotations("Get Status"), structured_output=True)
+    @mcp.tool(
+        name=TOOL_GET_STATUS,
+        annotations=_read_annotations("Get Status"),
+        structured_output=True,
+    )
     @_safe_tool
     def get_status(
         experiment_id: MaybeExperimentId = None,
@@ -527,13 +547,21 @@ def build_server(app: PhaseSweepMCP) -> Any:
             app.status(experiment_id=experiment_id, run_id=run_id)
         )
 
-    @mcp.tool(annotations=_read_annotations("Get Winners"), structured_output=True)
+    @mcp.tool(
+        name=TOOL_GET_WINNERS,
+        annotations=_read_annotations("Get Winners"),
+        structured_output=True,
+    )
     @_safe_tool
     def get_winners(experiment_id: ExperimentId) -> GetWinnersResult:
         """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Read-only."""
         return GetWinnersResult.model_validate(app.winners(experiment_id))
 
-    @mcp.tool(annotations=_launch_annotations(), structured_output=True)
+    @mcp.tool(
+        name=TOOL_LAUNCH_SWEEP,
+        annotations=_launch_annotations(),
+        structured_output=True,
+    )
     @_safe_tool
     def launch_sweep(
         experiment_id: ExperimentId,
@@ -542,7 +570,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id."""
         return LaunchSweepResult.model_validate(app.launch(experiment_id, from_phase=from_phase))
 
-    @mcp.tool(annotations=_cancel_annotations(), structured_output=True)
+    @mcp.tool(
+        name=TOOL_CANCEL_SWEEP,
+        annotations=_cancel_annotations(),
+        structured_output=True,
+    )
     @_safe_tool
     def cancel_sweep(run_id: RunId) -> CancelSweepResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes."""
