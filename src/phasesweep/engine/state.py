@@ -175,7 +175,12 @@ def _fsync_directory(path: Path) -> None:
 
 @contextlib.contextmanager
 def _atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
-    """Write text through a same-directory temp file and atomically replace ``path``."""
+    """Write text through a same-directory temp file and atomically replace ``path``.
+
+    :param Path path: Destination path that should be replaced atomically.
+    :param str | None newline: Newline handling passed to ``NamedTemporaryFile``.
+    :return Iterator[IO[str]]: Writable text handle yielded for the caller to populate.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     replaced = False
@@ -203,7 +208,11 @@ def _atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[I
 
 
 def _write_yaml_atomic(path: Path, payload: Any) -> None:
-    """Atomically write a YAML document to ``path``."""
+    """Atomically write a YAML document to ``path``.
+
+    :param Path path: Destination YAML path to replace.
+    :param Any payload: YAML-serializable value to write.
+    """
     with _atomic_text_writer(path) as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 

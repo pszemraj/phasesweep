@@ -56,7 +56,11 @@ class RunHandle:
 
     @classmethod
     def from_json(cls, data: dict) -> RunHandle:
-        """Rehydrate a handle from its JSON dict (the inverse of ``asdict``)."""
+        """Rehydrate a handle from its JSON dict (the inverse of ``asdict``).
+
+        :param dict data: JSON-decoded run handle payload.
+        :return RunHandle: Reconstructed immutable run handle.
+        """
         return cls(**data)
 
 
@@ -64,6 +68,10 @@ class RunStore:
     """Filesystem store for run handles, logs, and status files under a state dir."""
 
     def __init__(self, state_dir: Path) -> None:
+        """Create the run-handle store under ``state_dir``.
+
+        :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
+        """
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
@@ -82,6 +90,8 @@ class RunStore:
         (which scan the same runs dir). It is non-blocking: the manager yields
         ``False`` when another launch already holds it, leaving the caller to
         surface a retryable error rather than block a request handler.
+
+        :return Iterator[bool]: Context manager yielding True when the lock was acquired.
         """
         handle = try_lock_file(self._launch_lock_path)
         try:
@@ -91,19 +101,35 @@ class RunStore:
                 unlock_file(handle)
 
     def new_run_id(self, experiment_id: str) -> str:
-        """Mint a fresh, collision-resistant run id prefixed with the experiment id."""
+        """Mint a fresh, collision-resistant run id prefixed with the experiment id.
+
+        :param str experiment_id: Catalog id to include in the run id prefix.
+        :return str: Newly generated safe run id.
+        """
         return f"{experiment_id}-{uuid4().hex[:12]}"
 
     def log_path(self, run_id: str) -> Path:
-        """Path to the captured stdout/stderr log for a run."""
+        """Path to the captured stdout/stderr log for a run.
+
+        :param str run_id: Run id whose log path should be returned.
+        :return Path: Operator-only runner log path.
+        """
         return self._logs_dir / f"{run_id}.log"
 
     def status_path(self, run_id: str) -> Path:
-        """Path to the runner-written terminal-cause ``status.json`` for a run."""
+        """Path to the runner-written terminal-cause ``status.json`` for a run.
+
+        :param str run_id: Run id whose terminal status path should be returned.
+        :return Path: Operator-only status JSON path.
+        """
         return self._logs_dir / f"{run_id}.status.json"
 
     def config_snapshot_path(self, run_id: str) -> Path:
-        """Path to the per-run config snapshot consumed by the detached runner."""
+        """Path to the per-run config snapshot consumed by the detached runner.
+
+        :param str run_id: Run id whose config snapshot path should be returned.
+        :return Path: Operator-only config snapshot path.
+        """
         return self._logs_dir / f"{run_id}.config.yaml"
 
     def save(self, handle: RunHandle) -> None:
@@ -136,6 +162,9 @@ class RunStore:
         match a stored handle, so it is reported as absent rather than used to
         build a path - this keeps an agent-supplied id from traversing out of
         the runs dir (e.g. ``../../etc/foo``).
+
+        :param str run_id: Agent-supplied run id to look up.
+        :return RunHandle | None: Persisted handle when present and well-shaped, otherwise ``None``.
         """
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return None
@@ -145,7 +174,10 @@ class RunStore:
         return RunHandle.from_json(json.loads(path.read_text()))
 
     def list_handles(self) -> list[RunHandle]:
-        """Load every persisted handle, skipping any that are malformed or partial."""
+        """Load every persisted handle, skipping any that are malformed or partial.
+
+        :return list[RunHandle]: Successfully decoded run handles.
+        """
         handles = []
         for path in self._runs_dir.glob("*.json"):
             try:
@@ -220,6 +252,9 @@ class RunStore:
         """Return the currently-running handle for an experiment, if any.
 
         Used to reject a second launch before the engine's flock would.
+
+        :param str experiment_id: Catalog id whose live run should be found.
+        :return RunHandle | None: Currently-running handle, if one exists.
         """
         for handle in self.list_handles():
             if handle.experiment_id == experiment_id and self.state(handle) == "running":
@@ -231,10 +266,17 @@ class RunStore:
 
         Scanning calls ``state`` on each handle, which also reaps any runner
         that has since exited - so this doubles as the cleanup sweep.
+
+        :return list[RunHandle]: All handles whose derived state is currently ``running``.
         """
         return [handle for handle in self.list_handles() if self.state(handle) == "running"]
 
     def _read_status(self, handle: RunHandle) -> dict | None:
+        """Read the runner-written terminal status payload.
+
+        :param RunHandle handle: Run handle whose status file should be read.
+        :return dict | None: Decoded JSON payload, or ``None`` when absent or malformed.
+        """
         path = Path(handle.status_path)
         if not path.is_file():
             return None
@@ -245,5 +287,8 @@ class RunStore:
 
 
 def utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string."""
+    """Return the current UTC time as an ISO-8601 string.
+
+    :return str: Timezone-aware UTC timestamp.
+    """
     return datetime.now(timezone.utc).isoformat()

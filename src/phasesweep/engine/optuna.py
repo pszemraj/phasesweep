@@ -194,6 +194,10 @@ def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]
     runner's first ``create_study`` call. Opening the file in SQLite read-only
     mode avoids both side effects: a missing, locked, or still-initializing DB
     simply reports no counts for now.
+
+    :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
+    :param Phase phase: Phase whose stable Optuna study name is counted.
+    :return dict[str, int]: Trial counts keyed by Optuna state name, or an empty dict when the backing DB cannot be read safely.
     """
     assert experiment.storage is not None
     database = file_url_path(experiment.storage)

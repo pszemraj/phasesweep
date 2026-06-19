@@ -20,6 +20,10 @@ def winners_payload(experiment_id: str, views: list[PhaseWinnerView]) -> dict[st
     MCP output exposes sampled ``params`` only. ``effective_overrides`` can
     include config-authored fixed or inherited values, so it is intentionally
     kept out of agent-visible tool results.
+
+    :param str experiment_id: Catalog id whose winners are being returned.
+    :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
+    :return dict[str, Any]: MCP-safe winners payload.
     """
     return {
         "experiment_id": experiment_id,
@@ -47,6 +51,11 @@ def status_payload(
     ``status`` is the read_status output (already path-free). ``run`` is the
     process-level state for a specific run_id, or None for an experiment-level
     query with no recorded runs.
+
+    :param str experiment_id: Catalog id whose status is being returned.
+    :param dict[str, Any] status: Path-free status payload from ``read_status``.
+    :param dict[str, Any] | None run: Optional path-free detached-run state.
+    :return dict[str, Any]: MCP-safe status payload.
     """
     return {
         "experiment_id": experiment_id,
@@ -63,10 +72,17 @@ def assert_no_sensitive(payload: Any, sensitive: Iterable[str]) -> None:
     Defensive check for tests and an optional server debug mode. ``sensitive``
     is the set of values that must never appear: the trial command, the storage
     URL, and every env value for the experiment.
+
+    :param Any payload: Nested payload to scan.
+    :param Iterable[str] sensitive: Sensitive substrings that must not appear in string leaves.
     """
     needles = [s for s in sensitive if s]
 
     def walk(node: Any) -> None:
+        """Recursively scan one payload node.
+
+        :param Any node: Current nested payload node.
+        """
         if isinstance(node, str):
             for needle in needles:
                 assert needle not in node, f"sensitive value leaked into payload: {needle!r}"

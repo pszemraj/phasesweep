@@ -21,6 +21,11 @@ from phasesweep.engine import run_config
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
+    """Best-effort write of the runner terminal status file.
+
+    :param Path status_path: JSON file where terminal cause should be recorded.
+    :param dict payload: Status payload containing run id, return code, and error class.
+    """
     # Best-effort: a failed status write must not mask the real exit cause.
     try:
         status_path.write_text(json.dumps(payload, indent=2))
@@ -29,11 +34,20 @@ def _write_status(status_path: Path, payload: dict) -> None:
 
 
 def _sha256_file(path: Path) -> str:
+    """Hash a file with SHA-256.
+
+    :param Path path: File to hash.
+    :return str: Hex-encoded SHA-256 digest.
+    """
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one config to completion and record its terminal cause in status.json."""
+    """Run one config to completion and record its terminal cause in status.json.
+
+    :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
+    :return int: Process exit code, zero on successful sweep completion.
+    """
     parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--config", required=True, type=Path)  # snapshot, server-supplied

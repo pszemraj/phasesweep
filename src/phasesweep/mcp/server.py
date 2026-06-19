@@ -211,6 +211,12 @@ class PhaseSweepMCP:
     def __init__(
         self, registry: Registry, runs: RunStore, audit: AuditLogger | None = None
     ) -> None:
+        """Create the SDK-free MCP implementation.
+
+        :param Registry registry: Validated catalog registry.
+        :param RunStore runs: Persistent detached-run store.
+        :param AuditLogger | None audit: Optional structured audit logger.
+        """
         self._registry = registry
         self._runs = runs
         self._audit = audit
@@ -225,6 +231,15 @@ class PhaseSweepMCP:
         state_after: dict[str, Any] | None = None,
         result_counts: dict[str, int] | None = None,
     ) -> None:
+        """Record a successful MCP tool call when audit logging is enabled.
+
+        :param str tool: MCP tool name.
+        :param dict[str, Any] | None args: Safe agent-supplied arguments.
+        :param dict[str, Any] | None resolved: Safe server-resolved identifiers.
+        :param dict[str, Any] | None state_before: Safe state summary before the call.
+        :param dict[str, Any] | None state_after: Safe state summary after the call.
+        :param dict[str, int] | None result_counts: Result counts that avoid copying full payloads.
+        """
         if self._audit is not None:
             self._audit.record(
                 tool=tool,
@@ -245,6 +260,14 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] | None = None,
         state_before: dict[str, Any] | None = None,
     ) -> None:
+        """Record a failed MCP tool call when audit logging is enabled.
+
+        :param str tool: MCP tool name.
+        :param dict[str, Any] | None args: Safe agent-supplied arguments.
+        :param Exception exc: Exception that will be surfaced through the safe tool wrapper.
+        :param dict[str, Any] | None resolved: Safe server-resolved identifiers known before failure.
+        :param dict[str, Any] | None state_before: Safe state summary before the failure.
+        """
         if self._audit is None:
             return
         message = exc.safe_message if isinstance(exc, McpToolError) else "internal error"
@@ -259,7 +282,10 @@ class PhaseSweepMCP:
         )
 
     def list_experiments(self) -> list[dict[str, Any]]:
-        """Return the path-free catalog listing (ids, descriptions, phases, metric)."""
+        """Return the path-free catalog listing (ids, descriptions, phases, metric).
+
+        :return list[dict[str, Any]]: Catalog summaries safe for the agent.
+        """
         try:
             experiments = self._registry.summaries()
         except Exception as exc:
@@ -273,7 +299,11 @@ class PhaseSweepMCP:
         return experiments
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
-        """Report an experiment's phase structure (never the command/env/storage)."""
+        """Report an experiment's phase structure (never the command/env/storage).
+
+        :param str experiment_id: Catalog experiment id to inspect.
+        :return dict[str, Any]: Path-free validation payload for the agent.
+        """
         args = {"experiment_id": experiment_id}
         resolved: dict[str, Any] = {}
         search_space_keys = 0
@@ -317,6 +347,10 @@ class PhaseSweepMCP:
 
         Provide either ``experiment_id`` (reports the live run, if any) or
         ``run_id`` (reports that specific run). Raises if neither is given.
+
+        :param str | None experiment_id: Optional catalog id for experiment-level status.
+        :param str | None run_id: Optional detached run id for run-specific status.
+        :return dict: Path-free status payload for the agent.
         """
         args = {"experiment_id": experiment_id, "run_id": run_id}
         resolved: dict[str, Any] = {}
@@ -365,7 +399,11 @@ class PhaseSweepMCP:
         return result
 
     def winners(self, experiment_id: str) -> dict[str, Any]:
-        """Return the winning hyperparameters per completed phase."""
+        """Return the winning hyperparameters per completed phase.
+
+        :param str experiment_id: Catalog experiment id whose winners should be read.
+        :return dict[str, Any]: Path-free winners payload for the agent.
+        """
         args = {"experiment_id": experiment_id}
         resolved: dict[str, Any] = {}
         try:
@@ -389,6 +427,10 @@ class PhaseSweepMCP:
         Refuses if launch is not permitted, if a ``from_phase`` resume is not
         ready (an earlier phase has no winner), if this experiment already has a
         live run, or if the server is at its max_concurrent_runs cap.
+
+        :param str experiment_id: Catalog experiment id to launch.
+        :param str | None from_phase: Optional phase to resume from after earlier winners exist.
+        :return dict[str, Any]: Launch result containing run id, experiment id, and running state.
         """
         args = {"experiment_id": experiment_id, "from_phase": from_phase}
         resolved: dict[str, Any] = {}
@@ -451,6 +493,9 @@ class PhaseSweepMCP:
         path (the runner's handler writes status.json(143)) and the SIGKILL
         escalation (the runner is force-killed before it can; this attributes
         the cause faithfully rather than reporting ``failed``).
+
+        :param str run_id: Detached run id to cancel.
+        :return dict[str, Any]: Cancellation result containing final state and optional cleanup confirmation.
         """
         args = {"run_id": run_id}
         resolved: dict[str, Any] = {}
@@ -510,6 +555,11 @@ class PhaseSweepMCP:
         return result
 
     def _require_resume_ready(self, reg: RegisteredExperiment, from_phase: str) -> None:
+        """Verify that every earlier phase has a compatible persisted winner.
+
+        :param RegisteredExperiment reg: Registered experiment being resumed.
+        :param str from_phase: Requested phase to resume from.
+        """
         names = reg.phase_names
         winners: dict[str, Winner] = {}
         for phase in reg.experiment.phases[: names.index(from_phase)]:
@@ -541,6 +591,12 @@ class PhaseSweepMCP:
                 ) from None
 
     def _snapshot_config(self, reg: RegisteredExperiment, run_id: str) -> Path:
+        """Write the immutable per-run config snapshot after hash verification.
+
+        :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
+        :param str run_id: Run id whose snapshot path should be used.
+        :return Path: Written config snapshot path consumed by the detached runner.
+        """
         try:
             data = reg.config_path.read_bytes()
         except OSError as exc:
@@ -553,6 +609,12 @@ class PhaseSweepMCP:
         return snapshot_path
 
     def _spawn(self, reg: RegisteredExperiment, from_phase: str | None) -> RunHandle:
+        """Spawn the detached runner process for one registered experiment.
+
+        :param RegisteredExperiment reg: Registered experiment to run.
+        :param str | None from_phase: Optional phase to resume from.
+        :return RunHandle: Unsaved run handle for the spawned runner.
+        """
         run_id = self._runs.new_run_id(reg.id)
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
@@ -609,10 +671,19 @@ def _safe_tool(fn: F) -> F:
     replaced with a generic message so an unexpected error (e.g. an OSError
     carrying a path) never reaches the agent. ``functools.wraps`` preserves the
     signature so FastMCP still derives the tool schema.
+
+    :param F fn: Tool implementation to wrap.
+    :return F: Wrapped function that raises only safe tool errors.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        """Invoke the wrapped tool and redact any exception.
+
+        :param Any args: Positional arguments passed through to the wrapped tool.
+        :param Any kwargs: Keyword arguments passed through to the wrapped tool.
+        :return Any: Wrapped tool result.
+        """
         try:
             return fn(*args, **kwargs)
         except McpToolError as exc:
@@ -625,7 +696,11 @@ def _safe_tool(fn: F) -> F:
 
 
 def _read_annotations(title: str) -> Any:
-    """Return MCP annotations for read-only, idempotent tools."""
+    """Return MCP annotations for read-only, idempotent tools.
+
+    :param str title: Human-readable tool title.
+    :return Any: MCP ``ToolAnnotations`` instance.
+    """
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
@@ -638,7 +713,10 @@ def _read_annotations(title: str) -> Any:
 
 
 def _launch_annotations() -> Any:
-    """Return MCP annotations for the side-effecting launch tool."""
+    """Return MCP annotations for the side-effecting launch tool.
+
+    :return Any: MCP ``ToolAnnotations`` instance.
+    """
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
@@ -651,7 +729,10 @@ def _launch_annotations() -> Any:
 
 
 def _cancel_annotations() -> Any:
-    """Return MCP annotations for the process-terminating cancel tool."""
+    """Return MCP annotations for the process-terminating cancel tool.
+
+    :return Any: MCP ``ToolAnnotations`` instance.
+    """
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
@@ -684,6 +765,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     The SDK is imported lazily so non-server code paths (and most tests) do not
     require the ``mcp`` package.
+
+    :param PhaseSweepMCP app: SDK-free tool implementation to expose.
+    :return Any: Configured FastMCP server.
     """
     from mcp.server.fastmcp import FastMCP
 
@@ -696,7 +780,10 @@ def build_server(app: PhaseSweepMCP) -> Any:
     )
     @_safe_tool
     def list_experiments() -> ListExperimentsResult:
-        """List the experiments this server exposes: ids, descriptions, phase names, and the optimization metric. Use an id with the other tools."""
+        """List the experiments this server exposes: ids, descriptions, phase names, and the optimization metric. Use an id with the other tools.
+
+        :return ListExperimentsResult: Structured catalog listing.
+        """
         return ListExperimentsResult.model_validate({"experiments": app.list_experiments()})
 
     @mcp.tool(
@@ -706,7 +793,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
     )
     @_safe_tool
     def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
-        """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing."""
+        """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
+
+        :param ExperimentId experiment_id: Catalog experiment id to inspect.
+        :return ValidateConfigResult: Structured validation payload.
+        """
         return ValidateConfigResult.model_validate(app.validate(experiment_id))
 
     @mcp.tool(
@@ -719,7 +810,12 @@ def build_server(app: PhaseSweepMCP) -> Any:
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetStatusResult:
-        """Per-phase trial counts and winner presence, plus the run process state. Provide exactly one of experiment_id or run_id. Read-only."""
+        """Per-phase trial counts and winner presence, plus the run process state. Provide exactly one of experiment_id or run_id. Read-only.
+
+        :param MaybeExperimentId experiment_id: Optional catalog experiment id for experiment-level status.
+        :param MaybeRunId run_id: Optional detached run id for run-specific status.
+        :return GetStatusResult: Structured status payload.
+        """
         return GetStatusResult.model_validate(
             app.status(experiment_id=experiment_id, run_id=run_id)
         )
@@ -731,7 +827,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
     )
     @_safe_tool
     def get_winners(experiment_id: ExperimentId) -> GetWinnersResult:
-        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Read-only."""
+        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Read-only.
+
+        :param ExperimentId experiment_id: Catalog experiment id whose winners should be read.
+        :return GetWinnersResult: Structured winners payload.
+        """
         return GetWinnersResult.model_validate(app.winners(experiment_id))
 
     @mcp.tool(
@@ -744,7 +844,12 @@ def build_server(app: PhaseSweepMCP) -> Any:
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
     ) -> LaunchSweepResult:
-        """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id."""
+        """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id.
+
+        :param ExperimentId experiment_id: Catalog experiment id to launch.
+        :param MaybePhaseName from_phase: Optional phase to resume from.
+        :return LaunchSweepResult: Structured launch result.
+        """
         return LaunchSweepResult.model_validate(app.launch(experiment_id, from_phase=from_phase))
 
     @mcp.tool(
@@ -754,7 +859,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
     )
     @_safe_tool
     def cancel_sweep(run_id: RunId) -> CancelSweepResult:
-        """Stop a running sweep by run_id. Terminates the orchestrator and its training processes."""
+        """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
+
+        :param RunId run_id: Detached run id to cancel.
+        :return CancelSweepResult: Structured cancellation result.
+        """
         return CancelSweepResult.model_validate(app.cancel(run_id))
 
     _strict_tool_inputs(mcp)
@@ -762,7 +871,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the six tools over stdio."""
+    """Load the catalog, build the run store, and serve the six tools over stdio.
+
+    :param Path catalog: Operator-authored catalog file.
+    :return int: Process exit code, where 2 means catalog load failure.
+    """
     # stdio transport owns stdout for JSON-RPC. All logging goes to stderr.
     logging.basicConfig(
         level=logging.INFO,
@@ -787,7 +900,11 @@ def serve(catalog: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Serve via ``python -m phasesweep.mcp.server``."""
+    """Serve via ``python -m phasesweep.mcp.server``.
+
+    :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
+    :return int: Process exit code.
+    """
     parser = argparse.ArgumentParser(prog="phasesweep mcp")
     parser.add_argument("--catalog", required=True, type=Path)
     args = parser.parse_args(argv)

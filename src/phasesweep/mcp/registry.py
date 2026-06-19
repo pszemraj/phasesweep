@@ -54,6 +54,11 @@ class _Entry(_CatalogModel):
     @field_validator("id")
     @classmethod
     def _safe_id(cls, value: str) -> str:
+        """Validate that the catalog id is safe for run ids and filenames.
+
+        :param str value: Operator-authored catalog id.
+        :return str: The validated id.
+        """
         # The id appears in run ids and handle filenames, so keep it path-safe
         # even though the operator writes it.
         if not SAFE_NAME_PATTERN.fullmatch(value):
@@ -90,12 +95,19 @@ class RegisteredExperiment:
 
     @property
     def phase_names(self) -> list[str]:
-        """Declared phase names, in order."""
+        """Declared phase names, in order.
+
+        :return list[str]: Phase names exactly as declared by the experiment config.
+        """
         return [phase.name for phase in self.experiment.phases]
 
 
 def _storage_is_in_memory(storage: str | None) -> bool:
-    """Return whether a storage URL resolves to an in-memory Optuna backend."""
+    """Return whether a storage URL resolves to an in-memory Optuna backend.
+
+    :param str | None storage: Configured Optuna storage URL.
+    :return bool: True when the storage cannot be monitored across processes.
+    """
     if storage is None:
         return True
     if storage == ":memory:":
@@ -120,6 +132,12 @@ class Registry:
         items: dict[str, RegisteredExperiment],
         max_concurrent_runs: int = 1,
     ) -> None:
+        """Create an immutable registry from already validated entries.
+
+        :param Path state_dir: Directory used for MCP run handles and operator logs.
+        :param dict[str, RegisteredExperiment] items: Validated catalog entries keyed by id.
+        :param int max_concurrent_runs: Maximum live sweeps allowed across all entries.
+        """
         self.state_dir = state_dir
         self.max_concurrent_runs = max_concurrent_runs
         self._items = items
@@ -194,14 +212,21 @@ class Registry:
         )
 
     def get(self, experiment_id: str) -> RegisteredExperiment:
-        """Look up a registered experiment by id, or raise ``UnknownExperimentError``."""
+        """Look up a registered experiment by id, or raise ``UnknownExperimentError``.
+
+        :param str experiment_id: Agent-visible catalog id.
+        :return RegisteredExperiment: Validated registry entry for the id.
+        """
         try:
             return self._items[experiment_id]
         except KeyError:
             raise UnknownExperimentError(experiment_id) from None
 
     def summaries(self) -> list[dict[str, Any]]:
-        """Path-free catalog listing for ``list_experiments``."""
+        """Path-free catalog listing for ``list_experiments``.
+
+        :return list[dict[str, Any]]: Agent-visible summaries without paths, commands, storage URLs, or env values.
+        """
         return [
             {
                 "id": item.id,

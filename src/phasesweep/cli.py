@@ -207,6 +207,9 @@ def mcp(ctx: click.Context, catalog: Path) -> None:
 
     The MCP SDK import stays behind this command so the base CLI still works
     without installing the ``mcp`` optional dependency.
+
+    :param click.Context ctx: Active Click context used to exit with the server return code.
+    :param Path catalog: Operator-authored MCP catalog to load.
     """
     try:
         from phasesweep.mcp.server import serve

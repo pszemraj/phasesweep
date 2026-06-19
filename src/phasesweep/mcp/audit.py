@@ -20,11 +20,19 @@ log = logging.getLogger("phasesweep.mcp.audit")
 
 
 def _utc_now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string.
+
+    :return str: Timezone-aware UTC timestamp.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 
 def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a shallow copy without ``None`` values."""
+    """Return a shallow copy without ``None`` values.
+
+    :param dict[str, Any] | None values: Optional mapping to compact.
+    :return dict[str, Any]: Empty dict for ``None`` or a shallow copy with null-valued entries removed.
+    """
     if values is None:
         return {}
     return {key: value for key, value in values.items() if value is not None}
@@ -58,6 +66,16 @@ class AuditLogger:
         a successful side effect should not be reported to the agent as failed
         solely because post-action audit append hit an operator filesystem
         problem.
+
+        :param str tool: MCP tool name being audited.
+        :param dict[str, Any] | None args: Agent-supplied safe arguments to record.
+        :param str outcome: Outcome label, usually ``success`` or ``error``.
+        :param dict[str, Any] | None resolved: Server-resolved ids such as ``experiment_id`` or ``run_id``.
+        :param dict[str, Any] | None state_before: Safe state summary before the operation.
+        :param dict[str, Any] | None state_after: Safe state summary after the operation.
+        :param dict[str, int] | None result_counts: Counts derived from the result without copying result payloads.
+        :param str | None error_type: Exception class name for failed tool calls.
+        :param str | None error: Redacted error message for failed tool calls.
         """
         event: dict[str, Any] = {
             "timestamp": _utc_now_iso(),

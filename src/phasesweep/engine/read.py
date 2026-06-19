@@ -45,6 +45,12 @@ class PhaseWinnerView:
 def _phase_status_payloads(
     experiment: Experiment, *, include_winner_path: bool
 ) -> list[dict[str, Any]]:
+    """Build per-phase status payloads for CLI and MCP readers.
+
+    :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
+    :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
+    :return list[dict[str, Any]]: One status payload per phase in declaration order.
+    """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
         winner_path = _winner_path(experiment, phase.name)

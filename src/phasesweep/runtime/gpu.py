@@ -209,7 +209,11 @@ class GpuPool:
         return cls(gpu_ids=ids)
 
     def _remaining_seconds(self, deadline: float | None) -> float | None:
-        """Return seconds until ``deadline``, or raise when it has expired."""
+        """Return seconds until ``deadline``, or raise when it has expired.
+
+        :param float | None deadline: Optional ``time.monotonic()`` deadline.
+        :return float | None: Remaining seconds, or ``None`` when no deadline is active.
+        """
         if deadline is None:
             return None
         remaining = deadline - time.monotonic()
