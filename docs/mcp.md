@@ -115,6 +115,7 @@ This layer narrows the **agent's** authority. It does **not** sandbox the traini
 
 Run handles and per-run logs live under `state_dir`:
 
+- `state_dir/audit.jsonl` - structured MCP tool-call audit records.
 - `state_dir/runs/<run_id>.json` - the run handle.
 - `state_dir/logs/<run_id>.log` - captured runner stdout/stderr (operator-only).
 - `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
@@ -122,6 +123,8 @@ Run handles and per-run logs live under `state_dir`:
   the runner (operator-only; may contain command, storage, env, and overrides).
 
 The engine's own durable `run.log` is under the experiment `workdir`.
+
+`audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, safe arguments (`experiment_id`, `run_id`, `from_phase`), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
 ### Long-running servers
 

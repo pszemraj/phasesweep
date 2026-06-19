@@ -12,10 +12,17 @@ import yaml
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _phase_fingerprint
 from phasesweep.engine.state import _winner_path
+from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import UnknownExperimentError
+from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import main as runner_main
-from phasesweep.mcp.runs import RunHandle, utc_now_iso
-from phasesweep.mcp.server import _safe_tool
+from phasesweep.mcp.runs import RunHandle, RunStore, utc_now_iso
+from phasesweep.mcp.server import (
+    TOOL_LAUNCH_SWEEP,
+    TOOL_VALIDATE_CONFIG,
+    PhaseSweepMCP,
+    _safe_tool,
+)
 from phasesweep.runtime.process import read_proc_starttime
 from tests.mcp_helpers import make_mcp_app, write_mcp_catalog
 
@@ -229,6 +236,68 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
+
+
+def test_audit_log_records_success_and_error_without_sensitive_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    store = RunStore(registry.state_dir)
+    audit_path = registry.state_dir / "audit.jsonl"
+    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    captured: dict[str, list[str]] = {}
+
+    class DummyProc:
+        pid = os.getpid()
+
+    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
+        captured["cmd"] = cmd
+        return DummyProc()
+
+    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+
+    app.validate("srv")
+    launched = app.launch("srv")
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
+
+    records = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert [record["tool"] for record in records] == [
+        TOOL_VALIDATE_CONFIG,
+        TOOL_LAUNCH_SWEEP,
+        TOOL_LAUNCH_SWEEP,
+    ]
+    assert {record["session_id"] for record in records}
+    assert all(record["actor"] == "local-stdio" for record in records)
+    assert all(record["transport"] == "stdio" for record in records)
+
+    validate_record = records[0]
+    assert validate_record["outcome"] == "success"
+    assert validate_record["args"] == {"experiment_id": "srv"}
+    assert validate_record["resolved"] == {"experiment_id": "srv"}
+    assert validate_record["result_counts"] == {"phases": 1, "search_space_keys": 1}
+
+    launch_record = records[1]
+    assert launch_record["outcome"] == "success"
+    assert launch_record["args"] == {"experiment_id": "srv"}
+    assert launch_record["resolved"] == {"experiment_id": "srv", "run_id": launched["run_id"]}
+    assert launch_record["state_before"] == {"live_runs": 0}
+    assert launch_record["state_after"] == {"live_runs": 1, "run_state": "running"}
+    assert launch_record["result_counts"] == {"runs": 1}
+
+    busy_record = records[2]
+    assert busy_record["outcome"] == "error"
+    assert busy_record["args"] == {"experiment_id": "srv"}
+    assert busy_record["resolved"] == {"experiment_id": "srv"}
+    assert busy_record["state_before"] == {"live_runs": 1}
+    assert busy_record["error_type"] == "ExperimentBusyError"
+    assert "already has a running sweep" in busy_record["error"]
+
+    blob = audit_path.read_text()
+    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "runs")):
+        assert needle not in blob
+    assert captured["cmd"]  # sanity: the launch path really reached Popen
 
 
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
