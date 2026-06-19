@@ -276,24 +276,27 @@ class PhaseSweepMCP:
         """Report an experiment's phase structure (never the command/env/storage)."""
         args = {"experiment_id": experiment_id}
         resolved: dict[str, Any] = {}
+        search_space_keys = 0
         try:
             reg = self._registry.get(experiment_id)
             resolved["experiment_id"] = reg.id
             exp = reg.experiment
+            search_space_keys = sum(len(p.search_space) for p in exp.phases)
+            phases = [
+                {
+                    "name": p.name,
+                    "n_trials": p.n_trials,
+                    "sampler": p.sampler.type,
+                    "inherits": p.inherits,
+                    "search_space": sorted(p.search_space),  # keys only, not ranges
+                }
+                for p in exp.phases
+            ]
             # Already validated at startup; report the structure, never the command.
             result = {
                 "experiment_id": reg.id,
                 "metric": {"name": exp.metric.name, "goal": exp.metric.goal},
-                "phases": [
-                    {
-                        "name": p.name,
-                        "n_trials": p.n_trials,
-                        "sampler": p.sampler.type,
-                        "inherits": p.inherits,
-                        "search_space": sorted(p.search_space),  # keys only, not ranges
-                    }
-                    for p in exp.phases
-                ],
+                "phases": phases,
             }
         except Exception as exc:
             self._audit_error(TOOL_VALIDATE_CONFIG, args, exc, resolved=resolved)
@@ -303,8 +306,8 @@ class PhaseSweepMCP:
             args,
             resolved=resolved,
             result_counts={
-                "phases": len(result["phases"]),
-                "search_space_keys": sum(len(p["search_space"]) for p in result["phases"]),
+                "phases": len(phases),
+                "search_space_keys": search_space_keys,
             },
         )
         return result
@@ -452,6 +455,7 @@ class PhaseSweepMCP:
         args = {"run_id": run_id}
         resolved: dict[str, Any] = {}
         state_before: dict[str, Any] | None = None
+        result: dict[str, Any]
         try:
             handle = self._runs.get(run_id)
             if handle is None:
