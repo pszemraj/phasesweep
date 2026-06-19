@@ -13,6 +13,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -115,11 +116,14 @@ def _storage_is_in_memory(storage: str | None) -> bool:
     if storage_backend(storage) != "sqlite":
         return False
     database = file_url_path(storage)
+    query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
+    options = {key.lower(): value.lower() for key, value in parse_qsl(query)}
     return (
         database == ""
         or database == ":memory:"
         or database.startswith(":memory:?")
         or database.startswith("file::memory:")
+        or (database.startswith("file:") and options.get("mode") == "memory")
     )
 
 

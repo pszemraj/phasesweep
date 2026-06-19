@@ -178,7 +178,14 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "storage",
-    ['"sqlite://"', '"sqlite:///:memory:"', '"sqlite+pysqlite:///:memory:"', '":memory:"'],
+    [
+        '"sqlite://"',
+        '"sqlite:///:memory:"',
+        '"sqlite+pysqlite:///:memory:"',
+        '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+        '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+        '":memory:"',
+    ],
 )
 def test_in_memory_storage_urls_rejected(tmp_path: Path, storage: str) -> None:
     config = _write(
@@ -187,6 +194,18 @@ def test_in_memory_storage_urls_rejected(tmp_path: Path, storage: str) -> None:
     )
     with pytest.raises(CatalogError, match="storage must be persistent"):
         Registry.load(_catalog(tmp_path, config))
+
+
+def test_persistent_sqlite_uri_file_storage_allowed(tmp_path: Path) -> None:
+    storage = f'"sqlite:///file:{tmp_path}/uri.db?mode=rwc&uri=true"'
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+    )
+
+    registry = Registry.load(_catalog(tmp_path, config))
+
+    assert registry.get("reg_ok").experiment.storage == storage.strip('"')
 
 
 @pytest.mark.parametrize(
