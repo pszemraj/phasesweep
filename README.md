@@ -104,12 +104,15 @@ phasesweep mcp --catalog examples/catalog.yaml
 
 The sweep runs as a detached background process that survives a server restart. See the [MCP guide](docs/mcp.md) for the catalog format, tool behavior, security model, and concurrency settings.
 
+For copy/paste MCP client config and agent instructions, see [MCP agent setup](docs/mcp_setup.md).
+
 ## Docs
 
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the six tools, security model, single-host operation.
+- [MCP agent setup](docs/mcp_setup.md): copy/paste MCP client config, install commands, and agent instructions.
 - [Development](docs/development.md): test commands and test-suite map.
 
 ## License

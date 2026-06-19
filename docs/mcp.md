@@ -7,10 +7,12 @@ nothing else. The agent never supplies, edits, or sees a `trial_command`,
 `env`, `storage`, or `workdir`. It picks an experiment from a human-curated
 catalog by id and calls one of six tools.
 
+For copy/paste MCP client config and agent instructions, start with [MCP agent setup](mcp_setup.md).
+
 ## Install
 
 ```bash
-pip install "phasesweep[mcp]"
+python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 ## The catalog
