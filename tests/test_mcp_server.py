@@ -19,6 +19,7 @@ from phasesweep.mcp.runner import main as runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore, utc_now_iso
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
+    TOOL_LIST_EXPERIMENTS,
     TOOL_VALIDATE_CONFIG,
     PhaseSweepMCP,
     _safe_tool,
@@ -236,6 +237,38 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
+
+
+def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:
+    configs = {f"srv{i}": _config(tmp_path, name=f"srv{i}") for i in range(3)}
+    registry = Registry.load(write_mcp_catalog(tmp_path, configs))
+    store = RunStore(registry.state_dir)
+    audit_path = registry.state_dir / "audit.jsonl"
+    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+
+    first = app.list_experiments(limit=2)
+    assert [item["id"] for item in first["experiments"]] == ["srv0", "srv1"]
+    assert first["total_count"] == 3
+    assert first["next_cursor"] == "2"
+
+    second = app.list_experiments(limit=2, cursor=first["next_cursor"])
+    assert [item["id"] for item in second["experiments"]] == ["srv2"]
+    assert second["total_count"] == 3
+    assert second["next_cursor"] is None
+
+    with pytest.raises(Exception, match="invalid cursor"):
+        app.list_experiments(cursor="not-a-cursor")
+    with pytest.raises(Exception, match="limit must be between"):
+        app.list_experiments(limit=0)
+
+    records = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert records[0]["tool"] == TOOL_LIST_EXPERIMENTS
+    assert records[0]["args"] == {"limit": 2}
+    assert records[0]["result_counts"] == {"experiments": 2, "total_count": 3}
+    assert records[1]["args"] == {"cursor": "2", "limit": 2}
+    assert records[1]["result_counts"] == {"experiments": 1, "total_count": 3}
+    assert records[2]["outcome"] == "error"
+    assert records[2]["error_type"] == "McpToolError"
 
 
 def test_audit_log_records_success_and_error_without_sensitive_fields(

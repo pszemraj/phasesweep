@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.server import (
+    CATALOG_RESOURCE_URI,
+    DEFAULT_LIST_LIMIT,
+    PROMPT_RUN_AND_MONITOR,
     TOOL_CANCEL_SWEEP,
     TOOL_GET_STATUS,
     TOOL_GET_WINNERS,
@@ -123,7 +126,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
     app, _registry, store = make_mcp_app(catalog)
 
     # Catalog metadata is path-free and well-formed.
-    summaries = app.list_experiments()
+    summaries = app.list_experiments()["experiments"]
     assert summaries[0]["id"] == "e2e_lm"
     assert summaries[0]["phases"] == ["depth", "lr"]
     structure = app.validate("e2e_lm")
@@ -325,7 +328,10 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     assert "oneOf" in schemas[TOOL_GET_STATUS]
     assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
     assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
-    assert not schemas[TOOL_LIST_EXPERIMENTS]["properties"]
+    assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
+    assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
+    assert schemas[TOOL_LIST_EXPERIMENTS]["properties"]["limit"]["default"] == DEFAULT_LIST_LIMIT
+    assert schemas[TOOL_LIST_EXPERIMENTS]["properties"]["limit"]["maximum"] == 100
 
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
@@ -335,8 +341,22 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
 
     output_schemas = {t.name: t.outputSchema for t in tools}
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
+    assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
+    assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_WINNERS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_WINNERS])
+
+    resources = asyncio.run(server.list_resources())
+    assert {str(resource.uri) for resource in resources} == {CATALOG_RESOURCE_URI}
+    resource_payload = asyncio.run(server.read_resource(CATALOG_RESOURCE_URI))
+    assert "e2e_lm" in str(resource_payload)
+    assert "trial_command" not in str(resource_payload)
+
+    prompts = asyncio.run(server.list_prompts())
+    assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
+    prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
+    assert "phasesweep_launch_sweep" in str(prompt)
+    assert "target/dependent-variable columns" in str(prompt)
 
 
 def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:

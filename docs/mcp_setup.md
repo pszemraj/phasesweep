@@ -1,6 +1,6 @@
 # MCP agent setup
 
-Use `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are covered in [MCP server](mcp.md).
+Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are covered in [MCP server](mcp.md).
 
 ## Install
 
@@ -16,7 +16,7 @@ From a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-If your MCP client runs outside your shell environment, prefer an absolute path to the environment's `phasesweep` executable in the client config.
+If your MCP client runs outside your shell environment, prefer an absolute path to the environment's `phasesweep-mcp` executable in the client config.
 
 ## Create a catalog
 
@@ -50,7 +50,7 @@ Omit `allow` or leave a flag false to make that side effect unavailable. By defa
 Run this from the same working directory you intend to use in production, because experiment-relative `workdir` and `storage` paths resolve from the server's current directory:
 
 ```bash
-phasesweep mcp --catalog /abs/path/to/project/examples/catalog.yaml
+phasesweep-mcp --catalog /abs/path/to/project/examples/catalog.yaml
 ```
 
 The server speaks JSON-RPC over stdio, so it will appear to wait for input. Stop it with `Ctrl-C` after confirming it starts without a catalog error.
@@ -63,14 +63,40 @@ Paste this into any stdio MCP-compatible client config, replacing the catalog pa
 {
   "mcpServers": {
     "phasesweep": {
-      "command": "phasesweep",
-      "args": ["mcp", "--catalog", "/abs/path/to/project/examples/catalog.yaml"]
+      "command": "phasesweep-mcp",
+      "args": ["--catalog", "/abs/path/to/project/examples/catalog.yaml"]
     }
   }
 }
 ```
 
-If the client cannot find `phasesweep`, use absolute paths:
+If the client cannot find `phasesweep-mcp`, use absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "phasesweep": {
+      "command": "/abs/path/to/venv/bin/phasesweep-mcp",
+      "args": ["--catalog", "/abs/path/to/project/examples/catalog.yaml"]
+    }
+  }
+}
+```
+
+For clients that can launch through `uvx`, use the Git install directly:
+
+```json
+{
+  "mcpServers": {
+    "phasesweep": {
+      "command": "uvx",
+      "args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/project/examples/catalog.yaml"]
+    }
+  }
+}
+```
+
+You can also use the main CLI or run the module directly:
 
 ```json
 {
@@ -82,8 +108,6 @@ If the client cannot find `phasesweep`, use absolute paths:
   }
 }
 ```
-
-You can also run the module directly:
 
 ```json
 {
@@ -97,6 +121,8 @@ You can also run the module directly:
 ```
 
 Restart the MCP client after changing the config.
+
+If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting the text below. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination.
 
 ## Paste this to your agent
 
@@ -139,5 +165,5 @@ Read the current winners for <experiment_id> and explain what the next manual ex
 - `action 'launch' is not permitted`: set `allow.launch: true` for that catalog entry and restart the MCP client.
 - `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
 - `storage must be persistent`: use a persistent Optuna storage URL such as SQLite on disk; in-memory studies cannot be monitored across processes.
-- The client cannot find `phasesweep`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
+- The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
 - Relative paths behave differently from the CLI: start the MCP server from the same project directory every time, or use absolute paths for `state_dir`, experiment `workdir`, and experiment `storage`.

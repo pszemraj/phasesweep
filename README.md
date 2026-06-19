@@ -62,7 +62,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 
 ## MCP server (agent integration)
 
-`phasesweep mcp` exposes cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings.
+`phasesweep-mcp` and `phasesweep mcp` expose cataloged experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents can list, validate, launch, monitor, cancel, and read winners by experiment id; they cannot pass config paths or edit run settings. Clients that support MCP resources can attach `phasesweep://catalog`, and clients that support prompts can load `phasesweep_run_and_monitor`.
 
 This is the intended agent workflow for data-science runs: expose a reviewed catalog, let the agent operate by id, and keep trainer commands, dataset paths, raw logs, raw result files, target/dependent-variable values, and per-trial metric histories outside the agent conversation. The agent sees phase shape, status counts, and exposed winner summaries; it does not need direct filesystem access to your run directory.
 

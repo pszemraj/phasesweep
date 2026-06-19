@@ -12,9 +12,10 @@ pytest
 ruff check .
 ruff format --check .
 mypy src/phasesweep
+python scripts/mcp_workflow_eval.py
 ```
 
-Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected.
+Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected. The MCP workflow eval prints JSON and exits nonzero if discovery, read-only safety, or launch-monitor-winners flow fails.
 
 ## Package Map
 

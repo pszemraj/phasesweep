@@ -1,11 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep mcp` exposes a phasesweep experiment to an AI agent over the
-[Model Context Protocol](https://modelcontextprotocol.io) so the agent can
-**launch a sweep, monitor it, and read the winning hyperparameters** - and
-nothing else. The agent never supplies, edits, or sees a `trial_command`,
-`env`, `storage`, or `workdir`. It picks an experiment from a human-curated
-catalog by id and calls one of six tools.
+`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) so the agent can **launch a sweep, monitor it, and read the winning hyperparameters** - and nothing else. The agent never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
 
 For copy/paste MCP client config and agent instructions, start with [MCP agent setup](mcp_setup.md).
 
@@ -24,7 +19,7 @@ Catalog keys:
 - `max_concurrent_runs`: cap on live sweeps across all catalog entries. The default is `1`.
 - `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
 - `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
-- `experiments[].description`: optional text shown by `phasesweep_list_experiments`.
+- `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
 At startup the server resolves every `config` path to absolute (relative paths are resolved against the catalog file), validates it with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
@@ -55,7 +50,7 @@ same-host lock), regardless of the cap.
 
 | Tool | Inputs | Effect | Returns |
 | --- | --- | --- | --- |
-| `phasesweep_list_experiments` | none | read | catalog ids, description, phase names, metric name + goal |
+| `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
 | `phasesweep_get_winners` | `experiment_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
@@ -63,6 +58,14 @@ same-host lock), regardless of the cap.
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
 A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
+
+`phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
+
+## Resource and prompt
+
+Clients that support MCP resources can attach `phasesweep://catalog`. It returns the first catalog page as compact JSON using the same path-free payload as `phasesweep_list_experiments`. Agents should still call `phasesweep_list_experiments` when they need pagination or autonomous discovery.
+
+Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, poll by `run_id`, summarize winners, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
 
 ## Security model
 
@@ -124,6 +127,7 @@ reaper state in that case.
   processes, so `storage: null` and SQLite in-memory URL forms are rejected at
   startup.
 - **Single host.** The server, runner, and lock assume one host.
+- **Local stdio only.** Remote Streamable HTTP, OAuth, bearer-token auth, and hosted multi-user deployments are out of scope for v1.
 - **No log-access tool.** A redacted, opt-in log view is a possible follow-up,
   but v1 exposes no catalog flag or tool for logs.
 - The only agent-tunable knob is `from_phase`; `n_trials`, timeouts, and all

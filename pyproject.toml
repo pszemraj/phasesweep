@@ -53,6 +53,7 @@ dev = [
 
 [project.scripts]
 phasesweep = "phasesweep.cli:main"
+phasesweep-mcp = "phasesweep.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/phasesweep"

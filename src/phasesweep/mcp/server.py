@@ -50,6 +50,10 @@ TOOL_GET_STATUS = "phasesweep_get_status"
 TOOL_GET_WINNERS = "phasesweep_get_winners"
 TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
 TOOL_CANCEL_SWEEP = "phasesweep_cancel_sweep"
+CATALOG_RESOURCE_URI = "phasesweep://catalog"
+PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 100
 
 ExperimentId = Annotated[
     str,
@@ -89,6 +93,20 @@ MaybePhaseName = Annotated[
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
+ListLimit = Annotated[
+    int,
+    Field(
+        description="Maximum catalog entries to return. Use the next_cursor value to fetch more.",
+        ge=1,
+        le=MAX_LIST_LIMIT,
+    ),
+]
+MaybeCursor = Annotated[
+    str | None,
+    Field(
+        description="Opaque pagination cursor returned by a previous phasesweep_list_experiments call.",
+    ),
+]
 
 
 class _ToolPayload(BaseModel):
@@ -117,6 +135,11 @@ class ListExperimentsResult(_ToolPayload):
     """Structured output for list_experiments."""
 
     experiments: list[ExperimentSummaryPayload]
+    total_count: int = Field(ge=0, description="Total catalog entries exposed by this server.")
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque cursor for the next page, or null when this page is complete.",
+    )
 
 
 class PhaseValidationPayload(_ToolPayload):
@@ -205,6 +228,27 @@ class CancelSweepResult(_ToolPayload):
     )
 
 
+def _cursor_offset(cursor: str | None) -> int:
+    """Decode the opaque v1 cursor into a list offset.
+
+    :param str | None cursor: Cursor supplied by the agent.
+    :return int: Zero-based catalog offset.
+    """
+    if cursor is None:
+        return 0
+    try:
+        offset = int(cursor)
+    except ValueError:
+        raise McpToolError(
+            "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
+        ) from None
+    if offset < 0:
+        raise McpToolError(
+            "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
+        )
+    return offset
+
+
 class PhaseSweepMCP:
     """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
 
@@ -281,22 +325,43 @@ class PhaseSweepMCP:
             error=message,
         )
 
-    def list_experiments(self) -> list[dict[str, Any]]:
-        """Return the path-free catalog listing (ids, descriptions, phases, metric).
+    def list_experiments(
+        self,
+        *,
+        limit: int = DEFAULT_LIST_LIMIT,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a path-free catalog page (ids, descriptions, phases, metric).
 
-        :return list[dict[str, Any]]: Catalog summaries safe for the agent.
+        :param int limit: Maximum catalog entries to return.
+        :param str | None cursor: Optional pagination cursor returned by a prior call.
+        :return dict[str, Any]: Catalog page safe for the agent.
         """
+        args = {"limit": limit, "cursor": cursor}
+        total_count = 0
+        page: list[dict[str, Any]] = []
         try:
+            if limit < 1 or limit > MAX_LIST_LIMIT:
+                raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+            offset = _cursor_offset(cursor)
             experiments = self._registry.summaries()
+            total_count = len(experiments)
+            page = experiments[offset : offset + limit]
+            next_offset = offset + len(page)
+            result = {
+                "experiments": page,
+                "total_count": total_count,
+                "next_cursor": str(next_offset) if next_offset < total_count else None,
+            }
         except Exception as exc:
-            self._audit_error(TOOL_LIST_EXPERIMENTS, {}, exc)
+            self._audit_error(TOOL_LIST_EXPERIMENTS, args, exc)
             raise
         self._audit_success(
             TOOL_LIST_EXPERIMENTS,
-            {},
-            result_counts={"experiments": len(experiments)},
+            args,
+            result_counts={"experiments": len(page), "total_count": total_count},
         )
-        return experiments
+        return result
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
         """Report an experiment's phase structure (never the command/env/storage).
@@ -760,6 +825,24 @@ def _strict_tool_inputs(mcp: Any) -> None:
         ]
 
 
+def _run_and_monitor_prompt_text() -> str:
+    """Return the reusable agent workflow prompt served over MCP.
+
+    :return str: Safe run-and-monitor instructions for MCP clients that support prompts.
+    """
+    return """You have access to a local phasesweep MCP server. Use it to operate only the human-curated experiment catalog exposed by the server.
+
+Start by calling phasesweep_list_experiments, then call phasesweep_validate_config for the experiment id you plan to use. Do not ask for config paths, storage URLs, workdirs, commands, environment variables, or run-control settings; the catalog is the authority for those.
+
+If asked to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when explicitly asked to resume from a phase or when earlier phase winners are already confirmed. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
+
+Use phasesweep_get_winners to summarize completed phase winners. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
+
+When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
+
+Use phasesweep_cancel_sweep only when explicitly asked to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep."""
+
+
 def build_server(app: PhaseSweepMCP) -> Any:
     """Construct the FastMCP server.
 
@@ -779,12 +862,19 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def list_experiments() -> ListExperimentsResult:
-        """List the experiments this server exposes: ids, descriptions, phase names, and the optimization metric. Use an id with the other tools.
+    def list_experiments(
+        limit: ListLimit = DEFAULT_LIST_LIMIT,
+        cursor: MaybeCursor = None,
+    ) -> ListExperimentsResult:
+        """List cataloged experiments: ids, descriptions, phase names, and optimization metric. Use next_cursor to fetch more.
 
+        :param ListLimit limit: Maximum catalog entries to return.
+        :param MaybeCursor cursor: Optional pagination cursor from a prior result.
         :return ListExperimentsResult: Structured catalog listing.
         """
-        return ListExperimentsResult.model_validate({"experiments": app.list_experiments()})
+        return ListExperimentsResult.model_validate(
+            app.list_experiments(limit=limit, cursor=cursor)
+        )
 
     @mcp.tool(
         name=TOOL_VALIDATE_CONFIG,
@@ -866,6 +956,36 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """
         return CancelSweepResult.model_validate(app.cancel(run_id))
 
+    @mcp.resource(
+        CATALOG_RESOURCE_URI,
+        name="phasesweep_catalog",
+        title="PhaseSweep Catalog",
+        description="Read-only first page of the human-curated experiment catalog.",
+        mime_type="application/json",
+    )
+    @_safe_tool
+    def catalog_resource() -> str:
+        """Return the first catalog page for clients that attach MCP resources.
+
+        :return str: Compact JSON catalog page.
+        """
+        result = ListExperimentsResult.model_validate(
+            app.list_experiments(limit=DEFAULT_LIST_LIMIT, cursor=None)
+        )
+        return result.model_dump_json(exclude_none=True)
+
+    @mcp.prompt(
+        name=PROMPT_RUN_AND_MONITOR,
+        title="Run and Monitor Sweep",
+        description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
+    )
+    def run_and_monitor_prompt() -> str:
+        """Return safe agent instructions for the normal MCP sweep workflow.
+
+        :return str: Prompt text.
+        """
+        return _run_and_monitor_prompt_text()
+
     _strict_tool_inputs(mcp)
     return mcp
 
@@ -895,7 +1015,16 @@ def serve(catalog: Path) -> int:
         RunStore(registry.state_dir),
         audit=AuditLogger(registry.state_dir / "audit.jsonl"),
     )
-    build_server(app).run(transport="stdio")
+    try:
+        build_server(app).run(transport="stdio")
+    except ModuleNotFoundError as exc:
+        if exc.name == "mcp":
+            print(
+                "phasesweep mcp: MCP support is not installed; install with `pip install 'phasesweep[mcp]'`.",
+                file=sys.stderr,
+            )
+            return 2
+        raise
     return 0
 
 
