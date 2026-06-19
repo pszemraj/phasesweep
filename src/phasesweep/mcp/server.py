@@ -38,7 +38,8 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
-from phasesweep.mcp.runs import RunHandle, RunState, RunStore, utc_now_iso
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore
+from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import read_proc_starttime, terminate_group
 
 log = logging.getLogger("phasesweep.mcp.server")

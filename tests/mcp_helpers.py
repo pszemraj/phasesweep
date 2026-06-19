@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
+from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.process import read_proc_starttime
 
 
 def write_mcp_catalog(
@@ -58,3 +63,44 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     return PhaseSweepMCP(registry, store), registry, store
+
+
+def make_run_handle(
+    store: RunStore,
+    *,
+    run_id: str,
+    experiment_id: str = "exp",
+    config_sha256: str = "0" * 64,
+    pid: int | None = None,
+    starttime: int | None = None,
+) -> RunHandle:
+    process_id = os.getpid() if pid is None else pid
+    return RunHandle(
+        run_id=run_id,
+        experiment_id=experiment_id,
+        config_sha256=config_sha256,
+        pid=process_id,
+        pgid=process_id,
+        pid_starttime=read_proc_starttime(process_id) if starttime is None else starttime,
+        started_at=utc_now_iso(),
+        log_path=str(store.log_path(run_id)),
+        status_path=str(store.status_path(run_id)),
+    )
+
+
+def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
+    store.status_path(run_id).write_text(json.dumps(payload))
+
+
+def patch_popen_capture(monkeypatch: Any) -> dict[str, list[str]]:
+    captured: dict[str, list[str]] = {}
+
+    class DummyProc:
+        pid = os.getpid()
+
+    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
+        captured["cmd"] = cmd
+        return DummyProc()
+
+    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    return captured

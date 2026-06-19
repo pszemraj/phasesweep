@@ -21,7 +21,7 @@ from phasesweep.config.common import (
 from phasesweep.config.search import (
     Sampler,
     SearchParam,
-    _placeholder_value_for,
+    _placeholder_values_for,
     _validate_sampler_search_space,
 )
 from phasesweep.evidence.models import Extractor, Gate
@@ -633,8 +633,7 @@ def _validate_trial_command_template(
     for contract_name in phase.contracts:
         overrides.update(experiment.contracts[contract_name].fixed_overrides)
     overrides.update(phase.fixed_overrides)
-    for name, param in phase.search_space.items():
-        overrides[name] = _placeholder_value_for(param)
+    overrides.update(_placeholder_values_for(phase.search_space))
 
     has_overrides = bool(overrides)
 

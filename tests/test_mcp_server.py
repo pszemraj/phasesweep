@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -16,7 +15,7 @@ from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import UnknownExperimentError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import main as runner_main
-from phasesweep.mcp.runs import RunHandle, RunStore, utc_now_iso
+from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
     TOOL_LIST_EXPERIMENTS,
@@ -24,8 +23,7 @@ from phasesweep.mcp.server import (
     PhaseSweepMCP,
     _safe_tool,
 )
-from phasesweep.runtime.process import read_proc_starttime
-from tests.mcp_helpers import make_mcp_app, write_mcp_catalog
+from tests.mcp_helpers import make_mcp_app, make_run_handle, patch_popen_capture, write_mcp_catalog
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
@@ -218,16 +216,7 @@ def test_launch_passes_config_snapshot_to_runner(
 ) -> None:
     config = _config(tmp_path)
     app, registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    captured: dict[str, list[str]] = {}
-
-    class DummyProc:
-        pid = os.getpid()
-
-    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
-        captured["cmd"] = cmd
-        return DummyProc()
-
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    captured = patch_popen_capture(monkeypatch)
 
     app.launch("srv")
 
@@ -279,16 +268,7 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"
     app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
-    captured: dict[str, list[str]] = {}
-
-    class DummyProc:
-        pid = os.getpid()
-
-    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
-        captured["cmd"] = cmd
-        return DummyProc()
-
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    captured = patch_popen_capture(monkeypatch)
 
     app.validate("srv")
     launched = app.launch("srv")
@@ -362,19 +342,13 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
         _catalog(tmp_path, config, allow={"launch": True, "cancel": False, "from_phase": True}),
     )
     reg = registry.get("srv")
-    pid = os.getpid()
     run_id = "srv-denied"
     store.save(
-        RunHandle(
+        make_run_handle(
+            store,
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
-            pid=pid,
-            pgid=pid,
-            pid_starttime=read_proc_starttime(pid),
-            started_at=utc_now_iso(),
-            log_path=str(store.log_path(run_id)),
-            status_path=str(store.status_path(run_id)),
         )
     )
 

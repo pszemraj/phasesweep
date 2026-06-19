@@ -12,7 +12,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
-from phasesweep.config.search import _placeholder_value_for
+from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.guards import (
     _phase_fingerprint,
     _reap_stale_trials,
@@ -534,23 +534,6 @@ def _dry_run_phase(
     return _placeholder_winner(experiment, phase, inherited_winners)
 
 
-def _midpoint_params(phase: Phase) -> dict[str, Any]:
-    """Synthesize midpoint values for each search-space param (dry-run placeholder).
-
-    Delegates per-param logic to ``config._placeholder_value_for`` to avoid
-    maintaining two copies of the isinstance dispatch.
-
-    Args:
-        phase: The phase whose ``search_space`` to summarise.
-
-    Returns:
-        Dict mapping each search-space key to a deterministic placeholder
-        value (interval midpoint for numeric, first choice for categorical).
-
-    """
-    return {name: _placeholder_value_for(p) for name, p in phase.search_space.items()}
-
-
 def _placeholder_winner(
     experiment: Experiment,
     phase: Phase,
@@ -571,7 +554,7 @@ def _placeholder_winner(
         accidental use in non-dry contexts surfaces obviously.
 
     """
-    placeholder_params = _midpoint_params(phase)
+    placeholder_params = _placeholder_values_for(phase.search_space)
     effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,

@@ -27,37 +27,6 @@ from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import make_experiment, write_yaml
 
 
-def _exp_with_template(
-    trial_command: str,
-    *,
-    override_format: str = "hydra",
-    search_space: dict | None = None,
-    fixed_overrides: dict | None = None,
-) -> Experiment:
-    """Build an Experiment with one phase that has the given overrides shape.
-
-    Used by the trial-command template validation tests below — they need
-    fine-grained control over ``override_format``, search-space dict, and
-    fixed-overrides dict, which the conftest ``make_experiment`` factory
-    doesn't expose. Tests that don't need that control should use
-    ``make_experiment`` from ``conftest`` instead.
-    """
-    return Experiment(
-        experiment="t",
-        trial_command=trial_command,
-        override_format=override_format,
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                search_space=search_space or {},
-                fixed_overrides=fixed_overrides or {},
-            )
-        ],
-    )
-
-
 def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
     """Write a minimal grid-sampler config with caller-supplied search space."""
     return write_yaml(
@@ -443,11 +412,12 @@ def test_trial_command_requires_live_override_placeholder(
 ) -> None:
     """Override-bearing phases must expose the active placeholder to the trainer."""
     with pytest.raises(ValueError, match=match):
-        _exp_with_template(
-            template,
+        make_experiment(
+            trial_command=template,
             override_format=override_format,
-            search_space=search_space,
-            fixed_overrides=fixed_overrides,
+            n_trials=1,
+            search_space=search_space or {},
+            fixed_overrides=fixed_overrides or {},
         )
 
 
@@ -466,25 +436,28 @@ def test_trial_command_accepts_supported_templates() -> None:
     cases = [
         (
             "field_conversion",
-            lambda: _exp_with_template(
-                "python train.py {overrides!s}",
+            lambda: make_experiment(
+                trial_command="python train.py {overrides!s}",
                 override_format="hydra",
+                n_trials=1,
                 search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
             ),
         ),
         (
             "field_format_spec",
-            lambda: _exp_with_template(
-                "python train.py '{overrides:>1}'",
+            lambda: make_experiment(
+                trial_command="python train.py '{overrides:>1}'",
                 override_format="argparse",
+                n_trials=1,
                 search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
             ),
         ),
         (
             "constant_no_overrides",
-            lambda: _exp_with_template(
-                "python train.py --out {trial_dir}/result.json",
+            lambda: make_experiment(
+                trial_command="python train.py --out {trial_dir}/result.json",
                 override_format="hydra",
+                n_trials=1,
                 search_space={},
                 fixed_overrides={},
             ),

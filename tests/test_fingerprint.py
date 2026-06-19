@@ -468,7 +468,7 @@ def test_save_winner_replace_failure_preserves_existing_file(
     path = _winner_path(exp, phase.name)
     before = path.read_text()
 
-    def fail_replace(src: Path | str, dst: Path | str) -> None:
+    def fail_replace(_src: Path | str, _dst: Path | str) -> None:
         raise OSError("replace failed")
 
     monkeypatch.setattr("phasesweep.engine.state.os.replace", fail_replace)

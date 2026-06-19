@@ -1,9 +1,7 @@
 """Shared test fixtures and helpers for phasesweep tests.
 
 One experiment factory to replace the 5+ near-identical _minimal_experiment /
-_exp / _make_exp helpers scattered across test files. Tests that need
-specialized construction (e.g. template validation, selector constraints) keep
-their local helpers — this covers the >80% common case.
+_exp / _make_exp helpers scattered across test files. Tests that need specialized construction can pass explicit phases or phase keyword overrides.
 """
 
 from __future__ import annotations

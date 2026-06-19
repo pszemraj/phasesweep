@@ -54,7 +54,7 @@ _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
 )
 
 
-def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
+def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Kill all tracked child process groups, then exit.
 
     CRITICAL: we must NOT call proc.wait() here because the main thread may

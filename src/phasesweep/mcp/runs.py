@@ -14,16 +14,18 @@ import json
 import os
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.mcp.time import utc_now_iso as utc_now_iso
 from phasesweep.runtime.files import try_lock_file, unlock_file
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
+
+__all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso"]
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -284,11 +286,3 @@ class RunStore:
             return json.loads(path.read_text())
         except json.JSONDecodeError:
             return None
-
-
-def utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string.
-
-    :return str: Timezone-aware UTC timestamp.
-    """
-    return datetime.now(timezone.utc).isoformat()

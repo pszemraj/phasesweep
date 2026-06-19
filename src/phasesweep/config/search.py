@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -262,3 +263,8 @@ def _placeholder_value_for(param: SearchParam) -> Any:
     if isinstance(param, CategoricalParam):
         return param.choices[0]
     raise ValueError(f"Unhandled param: {param!r}")  # pragma: no cover
+
+
+def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:
+    """Synthesize one deterministic valid value for each search-space param."""
+    return {name: _placeholder_value_for(param) for name, param in search_space.items()}

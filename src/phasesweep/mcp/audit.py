@@ -11,20 +11,13 @@ import json
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from phasesweep.mcp.time import utc_now_iso
+
 log = logging.getLogger("phasesweep.mcp.audit")
-
-
-def _utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string.
-
-    :return str: Timezone-aware UTC timestamp.
-    """
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
@@ -78,7 +71,7 @@ class AuditLogger:
         :param str | None error: Redacted error message for failed tool calls.
         """
         event: dict[str, Any] = {
-            "timestamp": _utc_now_iso(),
+            "timestamp": utc_now_iso(),
             "actor": self.actor,
             "session_id": self.session_id,
             "transport": "stdio",
