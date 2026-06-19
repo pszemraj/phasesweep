@@ -79,7 +79,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     Args:
         signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
             ``SIGHUP`` where available).
-        frame: The interrupted stack frame at signal-delivery time; unused
+        _frame: The interrupted stack frame at signal-delivery time; unused
             but required by the ``signal.signal`` handler protocol.
 
     Raises:

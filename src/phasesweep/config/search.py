@@ -266,5 +266,13 @@ def _placeholder_value_for(param: SearchParam) -> Any:
 
 
 def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:
-    """Synthesize one deterministic valid value for each search-space param."""
+    """Synthesize one deterministic valid value for each search-space param.
+
+    Args:
+        search_space: Search parameters keyed by override name.
+
+    Returns:
+        Placeholder values keyed by override name.
+
+    """
     return {name: _placeholder_value_for(param) for name, param in search_space.items()}
