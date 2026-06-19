@@ -105,6 +105,8 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
 
+For agent-facing workflows, keep extractor inputs to scalar summaries. Do not mix validation labels, target/dependent-variable values, prediction dumps, dataset paths, tokens, or full metric histories into the same artifact that stores the objective metric. MCP reads only the configured scalar, but small result artifacts are easier to inspect without leaking data into an agent chat or troubleshooting paste.
+
 JSON extractors read a dotted key from a file under `{trial_dir}`:
 
 ```yaml

@@ -37,6 +37,14 @@ experiments:
 
 Omit `allow` or leave a flag false to make that side effect unavailable. By default, catalog entries are read-only: agents can list, validate, inspect status, and read existing winners, but they cannot launch, cancel, or resume with `from_phase`.
 
+## Before connecting an agent
+
+- Start read-only, then enable `allow.launch`, `allow.cancel`, or `allow.from_phase` only for experiments you are comfortable letting an agent operate.
+- Keep secrets, private paths, dataset ids, hostnames, target/dependent-variable values, validation labels, prediction dumps, and metric histories out of sampled categorical choices, phase names, descriptions, and chat prompts.
+- Use fixed config fields or the trainer environment for private values. MCP does not return `trial_command`, `env`, `storage`, `workdir`, rendered commands, logs, or effective overrides.
+- Expect `phasesweep_get_winners` to return each exposed winner's objective metric value and sampled parameters. That is the summary the agent uses to compare sweep outcomes.
+- Do not give the same agent unrestricted filesystem access to the run directory if you do not want it reading raw result files, trainer logs, W&B exports, predictions, or labels.
+
 ## Test the server
 
 Run this from the same working directory you intend to use in production, because experiment-relative `workdir` and `storage` paths resolve from the server's current directory:
@@ -101,7 +109,9 @@ Start by calling phasesweep_list_experiments, then call phasesweep_validate_conf
 
 If I ask you to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when I explicitly ask to resume from a phase or when we have confirmed earlier phase winners already exist. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
 
-Use phasesweep_get_winners to summarize completed phase winners. Treat sampled params as user-visible hyperparameters, not secrets. Do not request logs through MCP; if logs are needed, ask me to inspect the operator-owned state_dir logs locally.
+Use phasesweep_get_winners to summarize completed phase winners. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless I explicitly ask for that separate work.
+
+When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I explicitly ask for config-authoring help.
 
 Use phasesweep_cancel_sweep only when I explicitly ask you to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep.
 ```
@@ -121,7 +131,7 @@ Check whether run <run_id> is still active and show me the phase-level trial cou
 ```
 
 ```text
-Read the current winners for <experiment_id> and explain what the next manual experiment should try.
+Read the current winners for <experiment_id> and explain what the next manual experiment should try using only the phasesweep MCP outputs.
 ```
 
 ## Troubleshooting
