@@ -107,7 +107,7 @@ The catalog is the trust boundary. By construction the agent **cannot**:
 - double-launch (rejected by a run-handle check and ultimately the engine's
   same-host lock), delete runs, or corrupt state.
 
-Outbound payloads are built only from path-free typed views. `phasesweep_get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
+Outbound payloads are built only from path-free typed views. `phasesweep_get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. Sampled `params` are intentionally visible so an agent can compare the winning hyperparameters; do not put secrets, access tokens, private paths, dataset ids, hostnames, or other sensitive values in searchable parameter choices. Keep sensitive values in the trainer environment or fixed config fields that MCP does not expose. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
 
 This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
 
