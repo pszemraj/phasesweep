@@ -88,6 +88,20 @@ class ConfigChangedError(McpToolError):
         )
 
 
+class RunSnapshotUnavailableError(McpToolError):
+    """Raised when a persisted run cannot be matched to its config snapshot."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create a run-snapshot tool error.
+
+        :param str run_id: MCP run id whose saved config snapshot is unusable.
+        """
+        super().__init__(
+            f"saved config snapshot for run {run_id!r} is unavailable or invalid; "
+            "the run cannot be monitored safely"
+        )
+
+
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 

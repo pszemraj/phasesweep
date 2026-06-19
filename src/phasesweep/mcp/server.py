@@ -20,7 +20,9 @@ from typing import Annotated, Any, Literal, TypeVar
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
 from phasesweep.mcp.audit import AuditLogger
@@ -34,6 +36,7 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    RunSnapshotUnavailableError,
     UnknownRunError,
 )
 from phasesweep.mcp.redaction import status_payload, winners_payload
@@ -428,16 +431,16 @@ class PhaseSweepMCP:
                 handle = self._runs.get(run_id)
                 if handle is None:
                     raise UnknownRunError(run_id)
-                reg = self._registry.get(handle.experiment_id)
+                resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
+                experiment = self._load_run_experiment(handle)
                 run_state = self._runs.state(handle)
                 run: dict[str, Any] | None = {
                     "run_id": run_id,
                     "state": run_state,
                     "started_at": handle.started_at,
                 }
-                resolved = {"experiment_id": reg.id, "run_id": run_id}
                 state_after = {"run_state": run_state}
-                result = status_payload(reg.id, read_status(reg.experiment), run)
+                result = status_payload(handle.experiment_id, read_status(experiment), run)
             else:
                 assert experiment_id is not None
                 reg = self._registry.get(experiment_id)
@@ -451,7 +454,8 @@ class PhaseSweepMCP:
                 if live is not None:
                     resolved["run_id"] = live.run_id
                     state_after["run_state"] = "running"
-                result = status_payload(reg.id, read_status(reg.experiment), run)
+                experiment = self._load_run_experiment(live) if live is not None else reg.experiment
+                result = status_payload(reg.id, read_status(experiment), run)
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise
@@ -463,6 +467,37 @@ class PhaseSweepMCP:
             result_counts={"phases": len(result["phases"]), "running_runs": int(run is not None)},
         )
         return result
+
+    def _load_run_experiment(self, handle: RunHandle) -> Experiment:
+        """Load and verify the immutable config snapshot for a persisted run.
+
+        Run-specific monitoring must follow the exact config the detached
+        runner received, even if the cataloged config has since been edited and
+        the MCP server restarted. The saved handle's hash is the guardrail: a
+        missing, corrupted, or non-experiment snapshot is rejected instead of
+        silently reporting status for the wrong storage or workdir.
+
+        :param RunHandle handle: Persisted run identity whose snapshot should be loaded.
+        :return Experiment: Parsed experiment from the launched per-run snapshot.
+        """
+        snapshot_path = self._runs.config_snapshot_path(handle.run_id)
+        try:
+            data = snapshot_path.read_bytes()
+        except OSError as exc:
+            log.info("cannot read config snapshot for run=%s: %s", handle.run_id, exc)
+            raise RunSnapshotUnavailableError(handle.run_id) from None
+        if hashlib.sha256(data).hexdigest() != handle.config_sha256:
+            log.info("config snapshot hash mismatch for run=%s", handle.run_id)
+            raise RunSnapshotUnavailableError(handle.run_id)
+        try:
+            config = load_config_bytes(data, source=f"run snapshot {handle.run_id}")
+        except (ValueError, yaml.YAMLError) as exc:
+            log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)
+            raise RunSnapshotUnavailableError(handle.run_id) from None
+        if not isinstance(config, Experiment):
+            log.info("config snapshot for run=%s is not a single experiment", handle.run_id)
+            raise RunSnapshotUnavailableError(handle.run_id)
+        return config
 
     def winners(self, experiment_id: str) -> dict[str, Any]:
         """Return the winning hyperparameters per completed phase.

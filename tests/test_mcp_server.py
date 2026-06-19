@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -226,6 +227,55 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
+
+
+def test_run_status_reads_launched_config_snapshot_after_catalog_edit(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    _app, registry, store = make_mcp_app(catalog)
+    reg = registry.get("srv")
+    run_id = "srv-launched"
+    snapshot = config.read_bytes()
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.save(
+        make_run_handle(
+            store,
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+        )
+    )
+    config.write_text(config.read_text().replace("- name: p", "- name: edited"))
+
+    restarted_registry = Registry.load(catalog)
+    restarted_app = PhaseSweepMCP(restarted_registry, store)
+
+    run_status = restarted_app.status(run_id=run_id)
+    assert run_status["run"]["state"] == "running"
+    assert [phase["phase"] for phase in run_status["phases"]] == ["p"]
+
+    experiment_status = restarted_app.status(experiment_id="srv")
+    assert experiment_status["run"]["run_id"] == run_id
+    assert [phase["phase"] for phase in experiment_status["phases"]] == ["p"]
+
+
+def test_run_status_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    run_id = "srv-mismatch"
+    snapshot = config.read_bytes()
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.save(
+        make_run_handle(
+            store,
+            run_id=run_id,
+            experiment_id=registry.get("srv").id,
+            config_sha256=hashlib.sha256(snapshot + b"\n").hexdigest(),
+        )
+    )
+
+    with pytest.raises(Exception, match="saved config snapshot"):
+        app.status(run_id=run_id)
 
 
 def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:
