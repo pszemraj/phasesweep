@@ -11,18 +11,19 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
+from phasesweep.engine.selection import WINNER_TIE_EPS, NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import FEASIBLE_ATTR, constraint_attr
 from tests.conftest import make_experiment
 
 
-def _make_exp(constraints=None):
-    return make_experiment(
+def _make_exp(constraints=None, *, goal: str = "minimize"):
+    exp = make_experiment(
         storage=":memory:",
         trial_command="echo",
         constraints=constraints or [],
         phases=[Phase(name="p", n_trials=1, search_space={})],
     )
+    return exp.model_copy(update={"metric": exp.metric.model_copy(update={"goal": goal})})
 
 
 def _make_study():
@@ -97,6 +98,50 @@ def test_tie_break_lower_trial_number():
     w = select_winner(study, exp)
     # First trial wins on tie
     assert w.params == {"x": 1}
+
+
+def test_near_tie_within_eps_prefers_lower_trial_number_minimize():
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, 0.1 + (WINNER_TIE_EPS / 2), params={"x": 1})
+    _add_trial(study, 0.1, params={"x": 2})
+
+    w = select_winner(study, exp)
+
+    assert w.params == {"x": 1}
+
+
+def test_metric_difference_beyond_eps_wins_minimize():
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, 0.1 + (WINNER_TIE_EPS * 2), params={"x": 1})
+    _add_trial(study, 0.1, params={"x": 2})
+
+    w = select_winner(study, exp)
+
+    assert w.params == {"x": 2}
+
+
+def test_near_tie_within_eps_prefers_lower_trial_number_maximize():
+    exp = _make_exp(goal="maximize")
+    study = _make_study()
+    _add_trial(study, 0.1 - (WINNER_TIE_EPS / 2), params={"x": 1})
+    _add_trial(study, 0.1, params={"x": 2})
+
+    w = select_winner(study, exp)
+
+    assert w.params == {"x": 1}
+
+
+def test_metric_difference_beyond_eps_wins_maximize():
+    exp = _make_exp(goal="maximize")
+    study = _make_study()
+    _add_trial(study, 0.1 - (WINNER_TIE_EPS * 2), params={"x": 1})
+    _add_trial(study, 0.1, params={"x": 2})
+
+    w = select_winner(study, exp)
+
+    assert w.params == {"x": 2}
 
 
 def test_rejects_nan_constraint_values_defensively(tmp_path):
