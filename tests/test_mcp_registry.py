@@ -153,6 +153,46 @@ def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
+@pytest.mark.parametrize(
+    "catalog_body",
+    [
+        """
+        state_dir: {state}
+        state_dir: {state}/other
+        experiments:
+          - id: reg_ok
+            config: {config}
+        """,
+        """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            config: {config}
+        """,
+        """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            allow:
+              launch: false
+              launch: true
+        """,
+    ],
+    ids=["top_level", "entry", "allow"],
+)
+def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog = _write(
+        tmp_path / "catalog.yaml",
+        catalog_body.format(state=tmp_path / "state", config=config),
+    )
+
+    with pytest.raises(CatalogError, match="duplicate key"):
+        Registry.load(catalog)
+
+
 def test_unknown_sampler_raises_catalog_error(tmp_path: Path) -> None:
     bad = _experiment_yaml(tmp_path).replace(
         "n_trials: 2\n            search_space:",

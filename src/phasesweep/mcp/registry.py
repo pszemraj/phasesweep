@@ -13,16 +13,15 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.config.io import load_config_bytes
+from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.runtime.files import file_url_path, storage_backend
+from phasesweep.runtime.files import file_url_path, storage_backend, storage_url_query_options
 
 
 class _CatalogModel(BaseModel):
@@ -116,8 +115,7 @@ def _storage_is_in_memory(storage: str | None) -> bool:
     if storage_backend(storage) != "sqlite":
         return False
     database = file_url_path(storage)
-    query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
-    options = {key.lower(): value.lower() for key, value in parse_qsl(query)}
+    options = storage_url_query_options(storage)
     return (
         database == ""
         or database == ":memory:"
@@ -164,11 +162,9 @@ class Registry:
 
         """
         try:
-            raw = yaml.safe_load(catalog_path.read_text())
-        except (OSError, yaml.YAMLError) as exc:
+            raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
-        if not isinstance(raw, dict):
-            raise CatalogError(f"catalog {catalog_path}: top level must be a mapping")
         try:
             catalog = _Catalog.model_validate(raw)
         except ValidationError as exc:
