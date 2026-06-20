@@ -20,7 +20,7 @@ If your MCP client runs outside your shell environment, prefer an absolute path 
 
 ## Create a catalog
 
-The agent cannot choose config paths or edit run settings. You expose experiments by writing a catalog that maps stable ids to config files:
+Write a catalog that maps stable ids to reviewed experiment configs:
 
 ```yaml
 state_dir: /abs/path/to/project/runs/.mcp
@@ -35,15 +35,15 @@ experiments:
       from_phase: true
 ```
 
-Omit `allow` or leave a flag false to make that side effect unavailable. By default, catalog entries are read-only: agents can list, validate, inspect status, and read existing winners, but they cannot launch, cancel, or resume with `from_phase`.
+Catalog validation, path rules, and side-effect permissions are described in [the catalog](mcp.md#the-catalog). The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml).
 
 ## Before connecting an agent
 
-Review the [security model](mcp.md#security-model) before enabling side effects. Start catalog entries read-only, expose only reviewed configs, and do not pair MCP access with unrestricted filesystem or dashboard access unless raw artifacts are acceptable in the agent context.
+Review the [security model](mcp.md#security-model) before enabling side effects. Start catalog entries read-only and expose only reviewed configs.
 
 ## Test the server
 
-Run this from any working directory. Catalog-relative `state_dir` and `config` paths resolve against the catalog file, and MCP rejects experiment configs with relative `workdir` or relative SQLite/Journal storage paths:
+Run this from any working directory:
 
 ```bash
 phasesweep-mcp --catalog /abs/path/to/project/examples/catalog.yaml

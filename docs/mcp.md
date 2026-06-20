@@ -1,17 +1,12 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) so the agent can **launch a sweep, monitor it, and read the winning hyperparameters** - and nothing else. The agent never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
+`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
 
 For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 
 ## The catalog
 
-The server is started with a **catalog**: a fixed allowlist mapping opaque ids
-to local config paths plus per-experiment permissions. The agent only ever
-sends an id; it cannot enumerate the filesystem, pass a path, or author a
-config. Author the catalog with the same trust and out-of-band process as the
-experiment YAML - in an editor, in git, reviewed by a human. The server never
-writes it.
+The server starts from a catalog: a fixed allowlist mapping opaque ids to local config paths plus per-experiment permissions. The agent only ever sends an id; it cannot enumerate the filesystem, pass a path, or author a config. Author the catalog with the same trust and review process as the experiment YAML. The server never writes it.
 
 Catalog keys:
 
@@ -22,7 +17,7 @@ Catalog keys:
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
-At startup the server resolves `state_dir` and every `config` path to absolute paths. Relative values in the catalog resolve against the catalog file, not the process working directory. The server validates each experiment with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`), uses a relative `workdir`, or uses relative SQLite/Journal storage. Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
+At startup the server validates each experiment with the same loader the CLI uses, computes a content hash, and refuses invalid configs, suites, in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`), and configs that violate [path stability](#paths-and-the-working-directory). The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
 Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `phasesweep_launch_sweep`, `phasesweep_cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
@@ -30,17 +25,13 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 
-`state_dir` and `config:` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients all monitor the same artifacts and Optuna studies. Relative paths inside `trial_command` are still trainer-owned shell behavior; phasesweep does not rewrite commands.
+`state_dir` and `config:` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same artifacts and Optuna studies. Relative paths inside `trial_command` are trainer-owned shell behavior; phasesweep does not rewrite commands.
 
 ### Concurrency and single-GPU hosts
 
 `max_concurrent_runs` (catalog top level, default `1`) caps how many sweeps run at once across **all** experiments. The default of `1` suits a single-GPU host: each sweep's trials use the GPU, so a second concurrent sweep would contend for the device and slow both down. A `phasesweep_launch_sweep` that would exceed the cap is refused until a running sweep finishes or is cancelled. Raise it on multi-GPU hosts where independent sweeps can run side by side.
 
 The cap counts MCP-launched runs recorded in `state_dir`; it does not count a concurrent CLI `phasesweep run` on the same host. CLI and MCP runs are still coordinated by the engine's same-host output/storage locks and per-GPU device locks, so use a shared `PHASESWEEP_LOCK_DIR` when schedulers or containers would otherwise split the lock namespace.
-
-This is separate from the per-experiment guard: the same experiment can never
-double-launch (rejected by a run-handle check and ultimately the engine's
-same-host lock), regardless of the cap.
 
 ## The six tools
 
