@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -157,6 +158,58 @@ def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
         yield
     finally:
         unlock_file(handle)
+
+
+def fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory after an atomic replace."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
+    """Write text through a same-directory temp file and atomically replace ``path``.
+
+    :param Path path: Destination path that should be replaced atomically.
+    :param str | None newline: Newline handling passed to ``NamedTemporaryFile``.
+    :return Iterator[IO[str]]: Writable text handle yielded for the caller to populate.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    replaced = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline=newline,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert tmp_path is not None
+        os.replace(tmp_path, path)
+        replaced = True
+        fsync_directory(path.parent)
+    finally:
+        if tmp_path is not None and not replaced:
+            tmp_path.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace ``path`` with UTF-8 text."""
+    with atomic_text_writer(path) as handle:
+        handle.write(text)
 
 
 def storage_backend(storage: str | None) -> str | None:

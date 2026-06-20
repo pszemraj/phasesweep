@@ -6,17 +6,16 @@ import contextlib
 import csv
 import json
 import logging
-import os
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.runtime.files import atomic_text_writer
 
 
 @dataclass
@@ -161,59 +160,13 @@ def _suite_log_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "run.log"
 
 
-def _fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory after an atomic replace."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-@contextlib.contextmanager
-def _atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
-    """Write text through a same-directory temp file and atomically replace ``path``.
-
-    :param Path path: Destination path that should be replaced atomically.
-    :param str | None newline: Newline handling passed to ``NamedTemporaryFile``.
-    :return Iterator[IO[str]]: Writable text handle yielded for the caller to populate.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    replaced = False
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline=newline,
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        assert tmp_path is not None
-        os.replace(tmp_path, path)
-        replaced = True
-        _fsync_directory(path.parent)
-    finally:
-        if tmp_path is not None and not replaced:
-            tmp_path.unlink(missing_ok=True)
-
-
 def _write_yaml_atomic(path: Path, payload: Any) -> None:
     """Atomically write a YAML document to ``path``.
 
     :param Path path: Destination YAML path to replace.
     :param Any payload: YAML-serializable value to write.
     """
-    with _atomic_text_writer(path) as handle:
+    with atomic_text_writer(path) as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
 
@@ -279,7 +232,7 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         *[f"user_attr:{n}" for n in attr_names],
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _atomic_text_writer(path, newline="") as f:
+    with atomic_text_writer(path, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for t in trials:

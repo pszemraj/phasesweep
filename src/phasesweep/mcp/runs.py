@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,13 +18,12 @@ from typing import Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.mcp.time import utc_now_iso as utc_now_iso
-from phasesweep.runtime.files import try_lock_file, unlock_file
+from phasesweep.runtime.files import atomic_write_text, try_lock_file, unlock_file
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 
-__all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso", "write_status_file"]
+__all__ = ["RunHandle", "RunState", "RunStore", "write_status_file"]
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -38,39 +36,9 @@ __all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso", "write_status_fil
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 
 
-def _fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory after an atomic replace."""
-    try:
-        dir_fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text through a same-directory temp file and atomically replace ``path``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    replaced = False
-    try:
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp.replace(path)
-        replaced = True
-        _fsync_directory(path.parent)
-    finally:
-        if not replaced:
-            tmp.unlink(missing_ok=True)
-
-
 def write_status_file(status_path: Path, payload: dict) -> None:
     """Atomically write a detached-run terminal status payload."""
-    _atomic_write_text(status_path, json.dumps(payload, indent=2))
+    atomic_write_text(status_path, json.dumps(payload, indent=2))
 
 
 @dataclass(frozen=True)
@@ -177,7 +145,7 @@ class RunStore:
         """
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
-        _atomic_write_text(target, payload)
+        atomic_write_text(target, payload)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
