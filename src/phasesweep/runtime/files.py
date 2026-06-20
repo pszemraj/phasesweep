@@ -427,8 +427,6 @@ def sqlite_readonly_uri(storage: str) -> str | None:
         return None
 
     database = file_url_path(storage)
-    options = storage_url_query_options(storage)
-    uri_path = sqlite_uri_filename_path(storage)
     if _sqlite_uri_filename_enabled(storage, database):
         params = [
             (key, value)
@@ -467,7 +465,6 @@ def canonical_storage_identity(storage: str | None) -> str | None:
 
     if backend == "sqlite":
         database = file_url_path(storage)
-        options = storage_url_query_options(storage)
         uri_path = sqlite_uri_filename_path(storage)
         if _sqlite_uri_filename_enabled(storage, database):
             if storage_is_in_memory(storage):
