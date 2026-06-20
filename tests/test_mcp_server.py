@@ -16,7 +16,7 @@ from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import UnknownExperimentError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import main as runner_main
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
     TOOL_LIST_EXPERIMENTS,
@@ -227,6 +227,34 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
+
+
+def test_launch_terminates_spawned_runner_when_handle_save_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    saved: dict[str, RunHandle] = {}
+    terminated: list[int] = []
+
+    def fail_save(handle: RunHandle) -> None:
+        saved["handle"] = handle
+        raise OSError("runs directory is not writable")
+
+    def fake_terminate_group(pgid: int) -> bool:
+        terminated.append(pgid)
+        return True
+
+    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr("phasesweep.mcp.server.terminate_group", fake_terminate_group)
+
+    with pytest.raises(OSError, match="runs directory"):
+        app.launch("srv")
+
+    handle = saved["handle"]
+    assert terminated == [handle.pgid]
+    assert store.list_handles() == []
 
 
 def test_run_status_reads_launched_config_snapshot_after_catalog_edit(tmp_path: Path) -> None:

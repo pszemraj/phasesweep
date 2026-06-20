@@ -563,7 +563,25 @@ class PhaseSweepMCP:
                 if len(live) >= self._registry.max_concurrent_runs:
                     raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
                 handle = self._spawn(reg, from_phase)
-                self._runs.save(handle)
+                try:
+                    self._runs.save(handle)
+                except Exception:
+                    try:
+                        cleanup_confirmed = terminate_group(handle.pgid)
+                    except Exception:
+                        log.exception(
+                            "failed to terminate unsaved runner run_id=%s pgid=%d",
+                            handle.run_id,
+                            handle.pgid,
+                        )
+                    else:
+                        if not cleanup_confirmed:
+                            log.error(
+                                "cleanup uncertain after failed handle save for run_id=%s pgid=%d",
+                                handle.run_id,
+                                handle.pgid,
+                            )
+                    raise
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
             self._audit_error(
