@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,25 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     return PhaseSweepMCP(registry, store), registry, store
+
+
+def assert_no_sensitive(payload: Any, sensitive: Iterable[str]) -> None:
+    """Raise ``AssertionError`` if any string leaf contains a sensitive value."""
+    needles = [s for s in sensitive if s]
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            for needle in needles:
+                assert needle not in node, f"sensitive value leaked into payload: {needle!r}"
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                walk(key)
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(payload)
 
 
 def make_run_handle(

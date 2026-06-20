@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.mcp.redaction import assert_no_sensitive, status_payload, winners_payload
+from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import Registry
-from tests.mcp_helpers import write_mcp_catalog
+from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
 
 def _write_catalog(tmp_path: Path) -> Path:
@@ -80,8 +82,5 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
 def test_assert_no_sensitive_actually_catches_a_leak() -> None:
     # Guard against a vacuous scanner: it must fail when a needle IS present.
     leaky = {"experiment_id": "x", "note": "token=DANGER_TOKEN"}
-    try:
+    with pytest.raises(AssertionError):
         assert_no_sensitive(leaky, ["DANGER_TOKEN"])
-    except AssertionError:
-        return
-    raise AssertionError("assert_no_sensitive failed to detect a planted leak")

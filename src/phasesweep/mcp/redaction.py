@@ -3,12 +3,11 @@
 Payloads are built only from typed, path-free views (PhaseWinnerView, the
 read_status dict, catalog summaries). There is no path to interpolate a
 trial_command, env value, or storage URL into a result, so there is nothing to
-redact after the fact. ``assert_no_sensitive`` makes that property checkable.
+redact after the fact.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
 from phasesweep.engine import PhaseWinnerView
@@ -64,34 +63,3 @@ def status_payload(
         "summary_present": status["summary_present"],
         "run": run,
     }
-
-
-def assert_no_sensitive(payload: Any, sensitive: Iterable[str]) -> None:
-    """Raise ``AssertionError`` if any string leaf contains a sensitive needle.
-
-    Defensive check for tests and an optional server debug mode. ``sensitive``
-    is the set of values that must never appear: the trial command, the storage
-    URL, and every env value for the experiment.
-
-    :param Any payload: Nested payload to scan.
-    :param Iterable[str] sensitive: Sensitive substrings that must not appear in string leaves.
-    """
-    needles = [s for s in sensitive if s]
-
-    def walk(node: Any) -> None:
-        """Recursively scan one payload node.
-
-        :param Any node: Current nested payload node.
-        """
-        if isinstance(node, str):
-            for needle in needles:
-                assert needle not in node, f"sensitive value leaked into payload: {needle!r}"
-        elif isinstance(node, dict):
-            for key, value in node.items():
-                walk(key)
-                walk(value)
-        elif isinstance(node, (list, tuple)):
-            for item in node:
-                walk(item)
-
-    walk(payload)
