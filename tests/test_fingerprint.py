@@ -171,6 +171,10 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
     winners = run_experiment(exp, from_phase="lr", dry_run=True)
     assert winners["arch"].effective_overrides.get("model_family") == "llama"
     assert "n_layers" in winners["arch"].effective_overrides
+    lr_eff = winners["lr"].effective_overrides
+    assert lr_eff["model_family"] == "llama"
+    assert "n_layers" in lr_eff
+    assert "lr" in lr_eff
 
 
 def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
