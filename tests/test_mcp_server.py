@@ -219,7 +219,7 @@ def test_launch_passes_config_snapshot_to_runner(
     app, registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     captured = patch_popen_capture(monkeypatch)
 
-    app.launch("srv")
+    result = app.launch("srv")
 
     cmd = captured["cmd"]
     config_arg = Path(cmd[cmd.index("--config") + 1])
@@ -227,6 +227,9 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
+    assert config_arg == registry.state_dir / "logs" / f"{result['run_id']}.config.yaml"
+    assert list(config_arg.parent.glob("*.tmp")) == []
+    assert list(config_arg.parent.glob(".*.tmp")) == []
 
 
 def test_launch_terminates_spawned_runner_when_handle_save_fails(

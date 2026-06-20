@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,60 @@ def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     # A torn/partial handle file must not crash a read.
     (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
     assert {h.run_id for h in store.list_handles()} == {"exp-1", "exp-2"}
+
+
+def test_get_skips_malformed_handle(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    assert store.get("broken") is None
+
+
+def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    payload = asdict(make_run_handle(store, run_id="other"))
+    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+
+    assert store.get("exp-1") is None
+    assert store.list_handles() == []
+
+
+def test_loaded_handle_paths_are_derived_from_store(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1")
+    payload = asdict(handle)
+    payload["log_path"] = str(tmp_path / "outside.log")
+    payload["status_path"] = str(tmp_path / "outside.status.json")
+    (tmp_path / "outside.status.json").write_text('{"run_id": "exp-1", "returncode": 0}')
+    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+
+    loaded = store.get("exp-1")
+
+    assert loaded is not None
+    assert loaded.log_path == str(store.log_path("exp-1"))
+    assert loaded.status_path == str(store.status_path("exp-1"))
+    assert store.state(loaded) == "running"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("experiment_id", "../bad"),
+        ("pid", 0),
+        ("pid", "123"),
+        ("pgid", 0),
+        ("pgid", "123"),
+        ("pid_starttime", 0),
+        ("pid_starttime", "123"),
+    ],
+)
+def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
+    store = RunStore(tmp_path / "state")
+    payload = asdict(make_run_handle(store, run_id="exp-1"))
+    payload[field] = value
+    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+
+    assert store.get("exp-1") is None
+    assert store.list_handles() == []
 
 
 def test_state_succeeded_from_status(tmp_path: Path) -> None:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -163,7 +163,7 @@ class RunStore:
         path = self._runs_dir / f"{run_id}.json"
         if not path.is_file():
             return None
-        return RunHandle.from_json(json.loads(path.read_text()))
+        return self._load_handle(path, expected_run_id=run_id)
 
     def list_handles(self) -> list[RunHandle]:
         """Load every persisted handle, skipping any that are malformed or partial.
@@ -172,11 +172,36 @@ class RunStore:
         """
         handles = []
         for path in self._runs_dir.glob("*.json"):
-            try:
-                handles.append(RunHandle.from_json(json.loads(path.read_text())))
-            except (json.JSONDecodeError, TypeError, KeyError):
-                continue  # ignore a malformed/partial handle rather than crash a read
+            handle = self._load_handle(path, expected_run_id=path.stem)
+            if handle is not None:
+                handles.append(handle)
         return handles
+
+    def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
+        """Load and normalize one run handle, returning ``None`` when malformed."""
+        if not SAFE_NAME_PATTERN.fullmatch(expected_run_id):
+            return None
+        try:
+            handle = RunHandle.from_json(json.loads(path.read_text()))
+        except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError):
+            return None
+        if handle.run_id != expected_run_id:
+            return None
+        if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
+            return None
+        if type(handle.pid) is not int or handle.pid <= 0:
+            return None
+        if type(handle.pgid) is not int or handle.pgid <= 0:
+            return None
+        if handle.pid_starttime is not None and (
+            type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
+        ):
+            return None
+        return replace(
+            handle,
+            log_path=str(self.log_path(handle.run_id)),
+            status_path=str(self.status_path(handle.run_id)),
+        )
 
     def state(self, handle: RunHandle) -> RunState:
         """Derive the current state from status.json and a live PID check.
@@ -230,7 +255,6 @@ class RunStore:
             handle: The run handle whose terminal cause is being recorded.
 
         """
-        status_path = Path(handle.status_path)
         if self._read_status(handle) is not None:
             return
         # 137 == 128 + SIGKILL(9). state() keys "cancelled" off error_class, not
@@ -238,7 +262,7 @@ class RunStore:
         # reads as failed; only a cancel we performed records this cause.
         payload = {"run_id": handle.run_id, "returncode": 137, "error_class": "cancelled"}
         with contextlib.suppress(OSError):
-            write_status_file(status_path, payload)
+            write_status_file(self.status_path(handle.run_id), payload)
 
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.
@@ -269,7 +293,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose status file should be read.
         :return dict | None: Decoded JSON payload, or ``None`` when absent or malformed.
         """
-        path = Path(handle.status_path)
+        path = self.status_path(handle.run_id)
         if not path.is_file():
             return None
         try:

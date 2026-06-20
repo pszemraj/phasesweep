@@ -43,6 +43,7 @@ from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.files import atomic_write_bytes
 from phasesweep.runtime.process import read_proc_starttime, terminate_group
 
 log = logging.getLogger("phasesweep.mcp.server")
@@ -746,7 +747,11 @@ class PhaseSweepMCP:
         if hashlib.sha256(data).hexdigest() != reg.config_sha256:
             raise ConfigChangedError(reg.id)
         snapshot_path = self._runs.config_snapshot_path(run_id)
-        snapshot_path.write_bytes(data)
+        try:
+            atomic_write_bytes(snapshot_path, data)
+        except OSError as exc:
+            log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
+            raise RuntimeError("failed to create run config snapshot") from None
         return snapshot_path
 
     def _spawn(self, reg: RegisteredExperiment, from_phase: str | None) -> RunHandle:
