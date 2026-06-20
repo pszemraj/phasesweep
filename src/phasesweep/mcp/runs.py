@@ -25,7 +25,7 @@ from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_chil
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 
-__all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso"]
+__all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso", "write_status_file"]
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -36,6 +36,41 @@ __all__ = ["RunHandle", "RunState", "RunStore", "utc_now_iso"]
 # 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync for a directory after an atomic replace."""
+    try:
+        dir_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text through a same-directory temp file and atomically replace ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    replaced = False
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        replaced = True
+        _fsync_directory(path.parent)
+    finally:
+        if not replaced:
+            tmp.unlink(missing_ok=True)
+
+
+def write_status_file(status_path: Path, payload: dict) -> None:
+    """Atomically write a detached-run terminal status payload."""
+    _atomic_write_text(status_path, json.dumps(payload, indent=2))
 
 
 @dataclass(frozen=True)
@@ -141,21 +176,8 @@ class RunStore:
         readers never observe a partially-written handle.
         """
         target = self._runs_dir / f"{handle.run_id}.json"
-        tmp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         payload = json.dumps(asdict(handle), indent=2)
-        try:
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            tmp.replace(target)
-            dir_fd = os.open(self._runs_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        finally:
-            tmp.unlink(missing_ok=True)
+        _atomic_write_text(target, payload)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -241,14 +263,14 @@ class RunStore:
 
         """
         status_path = Path(handle.status_path)
-        if status_path.is_file():
+        if self._read_status(handle) is not None:
             return
         # 137 == 128 + SIGKILL(9). state() keys "cancelled" off error_class, not
         # the code, so an OOM/other SIGKILL - which never writes status - still
         # reads as failed; only a cancel we performed records this cause.
         payload = {"run_id": handle.run_id, "returncode": 137, "error_class": "cancelled"}
         with contextlib.suppress(OSError):
-            status_path.write_text(json.dumps(payload, indent=2))
+            write_status_file(status_path, payload)
 
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.

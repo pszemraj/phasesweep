@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.process import is_pid_zombie, read_proc_starttime
 from tests.mcp_helpers import make_run_handle, write_run_status
 
@@ -35,6 +35,17 @@ def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> Non
     assert store.get("exp-1") == second
     assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
     assert list((tmp_path / "state" / "runs").glob(".*.tmp")) == []
+
+
+def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path: Path) -> None:
+    status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
+
+    write_status_file(status_path, {"run_id": "exp-1", "returncode": 1})
+    write_status_file(status_path, {"run_id": "exp-1", "returncode": 0})
+
+    assert json.loads(status_path.read_text())["returncode"] == 0
+    assert list(status_path.parent.glob("*.tmp")) == []
+    assert list(status_path.parent.glob(".*.tmp")) == []
 
 
 @pytest.mark.parametrize(
@@ -101,6 +112,17 @@ def test_mark_cancelled_records_cancel_when_runner_left_no_status(tmp_path: Path
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1")
     store.mark_cancelled_if_unrecorded(handle)
+    assert store.state(handle) == "cancelled"
+    assert json.loads(store.status_path("exp-1").read_text())["error_class"] == "cancelled"
+
+
+def test_mark_cancelled_replaces_malformed_status(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1")
+    store.status_path("exp-1").write_text('{"run_id": "exp-1", "returncode":')
+
+    store.mark_cancelled_if_unrecorded(handle)
+
     assert store.state(handle) == "cancelled"
     assert json.loads(store.status_path("exp-1").read_text())["error_class"] == "cancelled"
 

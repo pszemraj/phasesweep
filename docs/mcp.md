@@ -42,6 +42,8 @@ from the same project directory.
 
 `max_concurrent_runs` (catalog top level, default `1`) caps how many sweeps run at once across **all** experiments. The default of `1` suits a single-GPU host: each sweep's trials use the GPU, so a second concurrent sweep would contend for the device and slow both down. A `phasesweep_launch_sweep` that would exceed the cap is refused until a running sweep finishes or is cancelled. Raise it on multi-GPU hosts where independent sweeps can run side by side.
 
+The cap counts MCP-launched runs recorded in `state_dir`; it does not count a concurrent CLI `phasesweep run` on the same host. CLI and MCP runs are still coordinated by the engine's same-host output/storage locks and per-GPU device locks, so use a shared `PHASESWEEP_LOCK_DIR` when schedulers or containers would otherwise split the lock namespace.
+
 This is separate from the per-experiment guard: the same experiment can never
 double-launch (rejected by a run-handle check and ultimately the engine's
 same-host lock), regardless of the cap.

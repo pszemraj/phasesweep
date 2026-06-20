@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import logging
 import sys
 from pathlib import Path
 
 from phasesweep.config import load_config
 from phasesweep.engine import run_config
+from phasesweep.mcp.runs import write_status_file
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
@@ -28,7 +28,7 @@ def _write_status(status_path: Path, payload: dict) -> None:
     """
     # Best-effort: a failed status write must not mask the real exit cause.
     try:
-        status_path.write_text(json.dumps(payload, indent=2))
+        write_status_file(status_path, payload)
     except OSError:
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
 
