@@ -3,6 +3,7 @@
 - [Quality Gates](#quality-gates)
 - [Package Map](#package-map)
 - [Test Map](#test-map)
+- [Tracked TODOs](#tracked-todos)
 
 ## Quality Gates
 
@@ -49,3 +50,9 @@ Tests are organized by behavior:
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`: timeout policy, contracts, evidence gates, promotion, and suites.
 - `tests/test_mcp_*.py`: MCP catalog validation, redaction, run handles, detached runner, server logic, and e2e flow.
 - `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.
+
+## Tracked TODOs
+
+- TODO(runtime): Support non-numeric CUDA device identifiers such as MIG or GPU UUIDs by widening `gpu_ids` beyond `list[int]`, sanitizing lock names by device token, and preserving the current numeric-index behavior as the default compatibility path.
+- TODO(mcp): Split `mcp/server.py` into SDK-free application logic, schemas, launch lifecycle, and FastMCP adapter modules after the MCP alpha surface stabilizes; keep the current schema and request-handler tests as the safety net during that refactor.
+- TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.

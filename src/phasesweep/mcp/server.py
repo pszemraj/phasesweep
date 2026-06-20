@@ -934,6 +934,24 @@ def _strict_tool_inputs(mcp: Any) -> None:
                 {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
                 {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
             ]
+    _verify_strict_tool_inputs(mcp)
+
+
+def _verify_strict_tool_inputs(mcp: Any) -> None:
+    """Fail startup if FastMCP internals did not keep the strict schemas."""
+    expected_one_of = [
+        {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
+        {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
+    ]
+    for tool in mcp._tool_manager.list_tools():
+        if tool.parameters.get("additionalProperties") is not False:
+            raise RuntimeError(f"MCP tool {tool.name!r} accepts undeclared input keys")
+    for tool_name in (TOOL_GET_STATUS, TOOL_GET_WINNERS):
+        tool = mcp._tool_manager.get_tool(tool_name)
+        if tool is None:
+            raise RuntimeError(f"MCP tool {tool_name!r} was not registered")
+        if tool.parameters.get("oneOf") != expected_one_of:
+            raise RuntimeError(f"MCP tool {tool_name!r} lost its exactly-one-of schema")
 
 
 def _run_and_monitor_prompt_text() -> str:

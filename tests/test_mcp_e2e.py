@@ -344,3 +344,28 @@ def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
 
     assert result.isError is True
     assert "unknown experiment id 'missing'" in result.content[0].text
+
+
+def test_fastmcp_rejects_extra_tool_arguments(tmp_path: Path) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from mcp import types
+
+    from phasesweep.mcp.server import build_server
+
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+    server = build_server(app)
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    req = types.CallToolRequest(
+        params=types.CallToolRequestParams(
+            name=TOOL_VALIDATE_CONFIG,
+            arguments={"experiment_id": "e2e_lm", "unexpected": True},
+        )
+    )
+
+    result = asyncio.run(handler(req)).root
+
+    assert result.isError is True
+    assert "unexpected" in result.content[0].text
