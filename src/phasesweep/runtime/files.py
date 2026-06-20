@@ -10,6 +10,7 @@ import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO, Any, TypeVar
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 T = TypeVar("T")
 
@@ -226,6 +227,92 @@ def file_url_path(storage: str) -> str:
     return path.split("#", 1)[0]
 
 
+def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
+    """Return URL query pairs from a storage URL."""
+    query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
+    return parse_qsl(query, keep_blank_values=True)
+
+
+def storage_url_query_options(storage: str) -> dict[str, str]:
+    """Return lower-cased URL query options for storage policy checks.
+
+    :param str storage: Storage URL whose query string should be inspected.
+    :return dict[str, str]: Query parameters with lower-cased keys and values.
+    """
+    return {key.lower(): value.lower() for key, value in _url_query_pairs(storage)}
+
+
+def _truthy_url_option(value: str | None) -> bool:
+    """Return whether a URL query value opts into a boolean behavior."""
+    return value is not None and value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sqlite_uri_filename_enabled(storage: str, database: str | None = None) -> bool:
+    """Return whether SQLAlchemy will treat a SQLite ``file:`` path as a URI."""
+    database = file_url_path(storage) if database is None else database
+    if not database.startswith("file:"):
+        return False
+    return _truthy_url_option(storage_url_query_options(storage).get("uri"))
+
+
+def sqlite_uri_filename_path(storage: str) -> str | None:
+    """Return the local filesystem path named by a SQLite URI filename.
+
+    SQLAlchemy only treats a SQLite ``file:`` database string as a URI filename
+    when ``uri=true`` is present in the URL query. Without that flag,
+    ``sqlite:///file:literal.db`` is a literal filename and must keep the
+    ``file:`` prefix.
+
+    :param str storage: SQLite storage URL.
+    :return str | None: Decoded local filesystem path from the URI filename, or
+        ``None`` when the storage URL is not a local SQLite URI filename.
+    """
+    database = file_url_path(storage)
+    if not _sqlite_uri_filename_enabled(storage, database):
+        return None
+
+    parsed = urlsplit(database)
+    if parsed.scheme != "file":
+        return None
+    if parsed.netloc not in {"", "localhost"}:
+        return None
+    return unquote(parsed.path)
+
+
+def sqlite_readonly_uri(storage: str) -> str | None:
+    """Build a ``sqlite3.connect(..., uri=True)`` URI for read-only status reads.
+
+    The returned URI opens the configured persistent SQLite database in
+    ``mode=ro`` so status polling cannot create a missing DB or schema. SQLite
+    URI filenames such as ``sqlite:///file:/tmp/x.db?mode=rwc&uri=true`` are
+    preserved as URI filenames with the write mode replaced by ``mode=ro``.
+
+    :param str storage: SQLite storage URL.
+    :return str | None: Read-only SQLite URI, or ``None`` for in-memory storage.
+    """
+    database = file_url_path(storage)
+    if database in {"", ":memory:"}:
+        return None
+
+    options = storage_url_query_options(storage)
+    uri_path = sqlite_uri_filename_path(storage)
+    if _sqlite_uri_filename_enabled(storage, database):
+        if uri_path in {"", ":memory:"} or database.startswith("file::memory:"):
+            return None
+        if options.get("mode") == "memory":
+            return None
+        params = [
+            (key, value)
+            for key, value in _url_query_pairs(storage)
+            if key.lower() not in {"mode", "uri"}
+        ]
+        params.append(("mode", "ro"))
+        return f"{database}?{urlencode(params)}"
+
+    path = Path(database).expanduser().resolve()
+    return f"file:{quote(str(path), safe='/')}?mode=ro"
+
+
 def canonical_storage_identity(storage: str | None) -> str | None:
     """Stable same-host identity string for a storage URL.
 
@@ -251,6 +338,22 @@ def canonical_storage_identity(storage: str | None) -> str | None:
 
     if backend == "sqlite":
         database = file_url_path(storage)
+        options = storage_url_query_options(storage)
+        uri_path = sqlite_uri_filename_path(storage)
+        if _sqlite_uri_filename_enabled(storage, database):
+            if uri_path in ("", ":memory:") or database.startswith("file::memory:"):
+                return "sqlite:///:memory:"
+            if options.get("mode") == "memory":
+                return "sqlite:///:memory:"
+            if uri_path is None:
+                params = [
+                    (key, value)
+                    for key, value in _url_query_pairs(storage)
+                    if key.lower() not in {"mode", "uri"}
+                ]
+                query = urlencode(params)
+                return f"sqlite-uri:{database}" + (f"?{query}" if query else "")
+            database = uri_path
         if database in ("", ":memory:"):
             return "sqlite:///:memory:"
         return "sqlite:///" + str(Path(database).expanduser().resolve())

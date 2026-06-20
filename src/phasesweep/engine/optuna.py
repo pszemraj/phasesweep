@@ -6,7 +6,6 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import optuna
 
@@ -20,7 +19,7 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
-from phasesweep.runtime.files import file_url_path, storage_backend
+from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage_backend
 
 
 def _build_sampler(
@@ -200,14 +199,10 @@ def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]
     :return dict[str, int]: Trial counts keyed by Optuna state name, or an empty dict when the backing DB cannot be read safely.
     """
     assert experiment.storage is not None
-    database = file_url_path(experiment.storage)
-    if database in ("", ":memory:"):
-        return {}
-    path = Path(database).expanduser().resolve()
-    if not path.is_file():
+    uri = sqlite_readonly_uri(experiment.storage)
+    if uri is None:
         return {}
     try:
-        uri = f"file:{quote(str(path), safe='/')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(

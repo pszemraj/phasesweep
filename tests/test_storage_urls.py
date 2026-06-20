@@ -225,3 +225,18 @@ def test_plain_and_driver_sqlite_absolute_urls_collide(tmp_path: Path) -> None:
     assert identity is not None
     assert identity.startswith("sqlite:///")
     assert identity == canonical_storage_identity(driver)
+
+
+def test_sqlite_uri_file_storage_identity_resolves_actual_path(tmp_path: Path) -> None:
+    """SQLite URI filenames should lock the real DB, not a cwd-relative ``file:`` path."""
+    db = tmp_path / "uri.db"
+    uri_storage = f"sqlite:///file:{db}?mode=rwc&cache=shared&uri=true"
+    plain_storage = f"sqlite:///{db}"
+
+    assert canonical_storage_identity(uri_storage) == canonical_storage_identity(plain_storage)
+
+
+def test_sqlite_uri_memory_storage_identity_is_in_memory() -> None:
+    storage = "sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"
+
+    assert canonical_storage_identity(storage) == "sqlite:///:memory:"
