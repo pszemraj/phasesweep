@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 import threading
 from pathlib import Path
 
@@ -13,7 +14,38 @@ from phasesweep.engine.guards import (
     _experiment_lock,
     _run_lock_paths,
 )
+from phasesweep.runtime import files as runtime_files
 from tests.conftest import make_experiment
+
+
+def test_lock_dir_defaults_to_host_stable_root_not_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_tmp = tmp_path / "job-tmp"
+    job_tmp.mkdir()
+    default_lock_dir = tmp_path / "host-var-tmp" / "phasesweep-locks"
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setenv("TMPDIR", str(job_tmp))
+    monkeypatch.setattr(runtime_files, "_DEFAULT_LOCK_DIR", default_lock_dir)
+
+    path = runtime_files.lock_dir()
+
+    assert path == default_lock_dir
+    assert job_tmp not in path.parents
+    assert path.is_dir()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o1777
+
+
+def test_lock_dir_honors_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "scheduler-shared-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+
+    path = runtime_files.lock_dir()
+
+    assert path == override
+    assert path.is_dir()
 
 
 def test_run_lock_collides_for_same_storage_different_workdirs(

@@ -346,8 +346,8 @@ class Experiment(_Frozen):
         """Experiment name is used as a filesystem path component (lock files, study names).
 
         Same constraint as phase names: ``[A-Za-z0-9_-]`` only. Without this,
-        names like ``../../etc/evil`` could escape the lock-file path under
-        ``$TMPDIR/phasesweep-locks/`` and the experiment::phase study name.
+        names like ``../../etc/evil`` could escape the configured lock-file
+        directory and the experiment::phase study name.
 
         Returns:
             The validated experiment name, unchanged. Raises ``ValueError``

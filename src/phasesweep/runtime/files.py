@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
-import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -20,6 +19,8 @@ POSIX_RUNTIME_ERROR = (
     "fcntl.flock host locks and POSIX process groups for safe subprocess cleanup; "
     "Windows support needs a separate locking and process-tree implementation."
 )
+_LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
+_DEFAULT_LOCK_DIR = Path("/var/tmp") / "phasesweep-locks"
 
 
 def require_posix_runtime() -> None:
@@ -93,10 +94,19 @@ def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
 def lock_dir() -> Path:
     """Return the shared same-host phasesweep lock directory.
 
+    ``PHASESWEEP_LOCK_DIR`` can override the location for schedulers,
+    containers, and managed hosts. The default deliberately avoids
+    ``tempfile.gettempdir()`` because job schedulers commonly set per-job
+    ``TMPDIR`` values, which would split the lock namespace and break
+    cross-process GPU/output/storage exclusion.
+
     :return Path: Directory used for host-local lock files.
     """
-    path = Path(tempfile.gettempdir()) / "phasesweep-locks"
+    override = os.environ.get(_LOCK_DIR_ENV)
+    path = Path(override) if override else _DEFAULT_LOCK_DIR
     path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o1777)
     return path
 
 

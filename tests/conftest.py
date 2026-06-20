@@ -11,6 +11,8 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from phasesweep.config import (
     Constraint,
     Experiment,
@@ -24,6 +26,12 @@ from phasesweep.evidence import TrialContext
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-wide test locks inside each test's temp directory."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "phasesweep-locks"))
 
 
 def copy_fake_train(tmp_path: Path) -> Path:

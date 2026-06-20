@@ -978,7 +978,7 @@ Format: hydra (key=value), argparse (--key value),
       <title>_suite_lock(suite) → engine/guards.py:201
 
 fcntl.flock on:
-  $TMPDIR/phasesweep-locks/{suite}__suite__{hash}.lock
+  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/{suite}__suite__{hash}.lock
 
 Hash key: suite output directory.
 Held for the entire run_suite() call so cross-study
@@ -1013,7 +1013,7 @@ Why both: two configs can disagree on storage but share
 output paths (or vice versa); either case can corrupt
 --from-phase reuse and trial logs.
 
-Both held under $TMPDIR/phasesweep-locks/.
+Both held under PHASESWEEP_LOCK_DIR, or /var/tmp/phasesweep-locks by default.
 Acquired in deterministic path order. Held for the entire
 phase chain. Same-host advisory only — multi-host needs
 per-trial leases + heartbeats (runtime/process.py).</title>
@@ -1118,7 +1118,7 @@ GpuPool.create(n_jobs, gpu_ids, allow_no_gpu):
   • empty + n_jobs &gt; 1 + !allow_no_gpu → RuntimeError
 
 Each numeric GPU id takes a per-device host lock:
-  $TMPDIR/phasesweep-locks/gpu_{id}.lock
+  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/gpu_{id}.lock
 This prevents two independent local phasesweep runs from
 double-booking the same physical device even at n_jobs=1.
 
@@ -1536,7 +1536,7 @@ json_scalar_bound), as well as constraint extractors.</title>
 
     <!-- locks -->
     <g data-tip="locks outside workdir">
-      <title>$TMPDIR/phasesweep-locks/ — same-host advisory only
+      <title>PHASESWEEP_LOCK_DIR or /var/tmp/phasesweep-locks/ — same-host advisory only
 
 Lives OUTSIDE workdir so that two configs which differ
 only in workdir but share storage still collide on the
@@ -1551,7 +1551,7 @@ Files:
 Acquired non-blocking. Failure raises RuntimeError with
 the lock path printed (helpful when debugging stuck runs).</title>
       <rect class="box box-olive edge-dashed" x="60" y="420" width="520" height="60" rx="3"/>
-      <text class="t-olive" x="80" y="442" font-size="11" font-weight="700">$TMPDIR/phasesweep-locks/  ← outside workdir</text>
+      <text class="t-olive" x="80" y="442" font-size="11" font-weight="700">host lock dir (default /var/tmp/phasesweep-locks)  ← outside workdir</text>
       <text class="t-dim" x="80" y="460" font-size="10">{exp}__output__*.lock · {exp}__storage__*.lock</text>
       <text class="t-dim" x="80" y="476" font-size="10">{suite}__suite__*.lock · gpu_{id}.lock</text>
     </g>

@@ -165,6 +165,7 @@ def launch_trial(
 
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         log.debug("[%s/trial_%d] GPU assigned: %d", phase_name, trial_id, gpu_id)
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)

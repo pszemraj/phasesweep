@@ -52,7 +52,7 @@ def _lock_digest(material: dict[str, Any]) -> str:
 
 
 def _lock_path_from_material(experiment: Experiment, material: dict[str, str], label: str) -> Path:
-    """Lock path under ``$TMPDIR/phasesweep-locks/`` named ``<exp>__<label>__<digest>.lock``.
+    """Lock path under the configured host lock directory.
 
     Args:
         experiment: Parsed experiment config; the experiment name is part of
