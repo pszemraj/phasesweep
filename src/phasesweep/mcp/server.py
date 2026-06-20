@@ -585,11 +585,16 @@ class PhaseSweepMCP:
                     raise ExperimentBusyError(experiment_id, busy.run_id)
                 if len(live) >= self._registry.max_concurrent_runs:
                     raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
-                handle = self._spawn(reg, from_phase)
+                run_id = self._runs.new_run_id(reg.id)
+                config_snapshot_path = self._snapshot_config(reg, run_id)
+                pending = self._pending_handle(reg, run_id)
+                self._runs.save(pending)
+                handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
                 try:
                     self._runs.save(handle)
                 except Exception:
                     try:
+                        assert handle.pgid is not None
                         cleanup_confirmed = terminate_group(handle.pgid)
                     except Exception:
                         log.exception(
@@ -669,6 +674,7 @@ class PhaseSweepMCP:
             # status.json(143). cleanup_confirmed reports the runner group is gone, not
             # a guarantee about trial descendants (those are handled by the runner's
             # handler, or by the next launch's stale reaper on a SIGKILL escalation).
+            assert handle.pgid is not None
             confirmed = terminate_group(handle.pgid)
             if confirmed:
                 # If escalation to SIGKILL killed the runner before it recorded a
@@ -754,17 +760,39 @@ class PhaseSweepMCP:
             raise RuntimeError("failed to create run config snapshot") from None
         return snapshot_path
 
-    def _spawn(self, reg: RegisteredExperiment, from_phase: str | None) -> RunHandle:
+    def _pending_handle(self, reg: RegisteredExperiment, run_id: str) -> RunHandle:
+        """Build the pre-spawn handle persisted before ``Popen``."""
+        return RunHandle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=utc_now_iso(),
+            log_path=str(self._runs.log_path(run_id)),
+            status_path=str(self._runs.status_path(run_id)),
+            launch_state="launching",
+        )
+
+    def _spawn(
+        self,
+        reg: RegisteredExperiment,
+        from_phase: str | None,
+        pending: RunHandle,
+        config_snapshot_path: Path,
+    ) -> RunHandle:
         """Spawn the detached runner process for one registered experiment.
 
         :param RegisteredExperiment reg: Registered experiment to run.
         :param str | None from_phase: Optional phase to resume from.
+        :param RunHandle pending: Pre-spawn persisted handle.
+        :param Path config_snapshot_path: Config snapshot path consumed by the runner.
         :return RunHandle: Unsaved run handle for the spawned runner.
         """
-        run_id = self._runs.new_run_id(reg.id)
+        run_id = pending.run_id
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
-        config_snapshot_path = self._snapshot_config(reg, run_id)
         cmd = [
             sys.executable,
             "-m",
@@ -799,9 +827,10 @@ class PhaseSweepMCP:
             # pgid == pid by POSIX. Avoids a getpgid() race if the child exits fast.
             pgid=proc.pid,
             pid_starttime=read_proc_starttime(proc.pid),
-            started_at=utc_now_iso(),
+            started_at=pending.started_at,
             log_path=str(log_path),
             status_path=str(status_path),
+            launch_state="spawned",
         )
 
 

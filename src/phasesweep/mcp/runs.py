@@ -22,8 +22,9 @@ from phasesweep.runtime.files import atomic_write_text, try_lock_file, unlock_fi
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
+RunLaunchState = Literal["launching", "spawned"]
 
-__all__ = ["RunHandle", "RunState", "RunStore", "write_status_file"]
+__all__ = ["RunHandle", "RunLaunchState", "RunState", "RunStore", "write_status_file"]
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -52,12 +53,13 @@ class RunHandle:
     run_id: str
     experiment_id: str
     config_sha256: str
-    pid: int
-    pgid: int
+    pid: int | None
+    pgid: int | None
     pid_starttime: int | None  # /proc start time for PID-reuse-safe liveness; None off-Linux
     started_at: str  # ISO-8601 UTC
     log_path: str  # server-internal; never returned to the agent
     status_path: str  # server-internal
+    launch_state: RunLaunchState = "spawned"
 
     @classmethod
     def from_json(cls, data: dict) -> RunHandle:
@@ -66,7 +68,7 @@ class RunHandle:
         :param dict data: JSON-decoded run handle payload.
         :return RunHandle: Reconstructed immutable run handle.
         """
-        return cls(**data)
+        return cls(**{**data, "launch_state": data.get("launch_state", "spawned")})
 
 
 class RunStore:
@@ -189,14 +191,20 @@ class RunStore:
             return None
         if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
             return None
-        if type(handle.pid) is not int or handle.pid <= 0:
+        if handle.launch_state not in {"launching", "spawned"}:
             return None
-        if type(handle.pgid) is not int or handle.pgid <= 0:
-            return None
-        if handle.pid_starttime is not None and (
-            type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
-        ):
-            return None
+        if handle.launch_state == "launching":
+            if handle.pid is not None or handle.pgid is not None or handle.pid_starttime is not None:
+                return None
+        else:
+            if type(handle.pid) is not int or handle.pid <= 0:
+                return None
+            if type(handle.pgid) is not int or handle.pgid <= 0:
+                return None
+            if handle.pid_starttime is not None and (
+                type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
+            ):
+                return None
         return replace(
             handle,
             log_path=str(self.log_path(handle.run_id)),
@@ -222,7 +230,8 @@ class RunStore:
         # Reap the runner if it has exited. The runner is our child; without
         # this it lingers as a zombie until the server dies, and every state
         # query is a natural place to clean it up (no signal handler needed).
-        reap_child(handle.pid)
+        if handle.pid is not None:
+            reap_child(handle.pid)
         status = self._read_status(handle)
         if status is not None:
             rc = status.get("returncode")
@@ -230,6 +239,8 @@ class RunStore:
                 return "succeeded"
             if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
                 return "cancelled"
+            return "failed"
+        if handle.launch_state == "launching" or handle.pid is None:
             return "failed"
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early

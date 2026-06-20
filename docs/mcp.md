@@ -111,7 +111,7 @@ than kept in memory - so a server restart re-discovers live runs from their
 handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
-Run handles and terminal `status.json` files are written with atomic replace, so readers do not observe torn JSON. The remaining crash window is the tiny interval after the detached runner has spawned but before its first handle is persisted; if the server process dies there, the runner may continue but a restarted MCP server cannot rediscover it by `run_id`. Inspect the operator-owned logs and the engine's normal lock/stale reaper state in that case.
+Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts and replaces it with the spawned process identity after `Popen`; if the server dies during launch, a restarted server can still see the attempted run instead of losing the lifecycle record completely.
 
 ## Limitations (v1)
 

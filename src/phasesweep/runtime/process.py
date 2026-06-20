@@ -508,24 +508,34 @@ def is_pid_zombie(pid: int) -> bool:
 
 
 def reap_child(pid: int) -> None:
-    """Best-effort, non-blocking reap of an exited child to prevent zombie buildup.
+    """Best-effort bounded reap of an exited child to prevent zombie buildup.
 
     A long-lived parent (the MCP server) that spawns detached runners and never
     waits on them accumulates a zombie per runner as each one exits. Call this
     for a known runner pid to reap it if it has already exited; it is a no-op if
     the process is still running, was never our child, or has already been
-    reaped. ``WNOHANG`` makes it non-blocking, and a specific pid (never ``-1``)
-    means it can only ever reap that one process - it never touches an unrelated
-    child of an event loop or library.
+    reaped. The final blocking wait is attempted only after ``/proc`` reports
+    the specific child is already a zombie, so it should return immediately.
 
     Args:
         pid: PID of a runner this process spawned.
 
     """
-    # ChildProcessError (ECHILD): not our child, or already reaped. Any other
-    # OSError is equally non-actionable for a best-effort reap.
-    with contextlib.suppress(OSError):
-        os.waitpid(pid, os.WNOHANG)
+    import time
+
+    for _ in range(3):
+        with contextlib.suppress(ChildProcessError, OSError):
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                return
+
+        if not is_pid_zombie(pid):
+            return
+        time.sleep(0.02)
+
+    if is_pid_zombie(pid):
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(pid, 0)
 
 
 @dataclass

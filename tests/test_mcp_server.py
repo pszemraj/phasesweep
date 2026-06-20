@@ -216,7 +216,7 @@ def test_launch_passes_config_snapshot_to_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
-    app, registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     captured = patch_popen_capture(monkeypatch)
 
     result = app.launch("srv")
@@ -230,34 +230,63 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg == registry.state_dir / "logs" / f"{result['run_id']}.config.yaml"
     assert list(config_arg.parent.glob("*.tmp")) == []
     assert list(config_arg.parent.glob(".*.tmp")) == []
+    handle = store.get(result["run_id"])
+    assert handle is not None
+    assert handle.launch_state == "spawned"
 
 
-def test_launch_terminates_spawned_runner_when_handle_save_fails(
+def test_launch_does_not_spawn_when_pending_handle_save_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    captured = patch_popen_capture(monkeypatch)
+
+    def fail_save(handle: RunHandle) -> None:
+        raise OSError("runs directory is not writable")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    with pytest.raises(OSError, match="runs directory"):
+        app.launch("srv")
+
+    assert "cmd" not in captured
+    assert store.list_handles() == []
+
+
+def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    saved: dict[str, RunHandle] = {}
+    original_save = store.save
+    saved: list[RunHandle] = []
     terminated: list[int] = []
 
-    def fail_save(handle: RunHandle) -> None:
-        saved["handle"] = handle
+    def fail_second_save(handle: RunHandle) -> None:
+        saved.append(handle)
+        if len(saved) == 1:
+            original_save(handle)
+            return
         raise OSError("runs directory is not writable")
 
     def fake_terminate_group(pgid: int) -> bool:
         terminated.append(pgid)
         return True
 
-    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr(store, "save", fail_second_save)
     monkeypatch.setattr("phasesweep.mcp.server.terminate_group", fake_terminate_group)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
 
-    handle = saved["handle"]
-    assert terminated == [handle.pgid]
-    assert store.list_handles() == []
+    assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
+    assert terminated == [saved[1].pgid]
+    pending = store.get(saved[0].run_id)
+    assert pending is not None
+    assert pending.launch_state == "launching"
+    assert store.state(pending) == "failed"
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])

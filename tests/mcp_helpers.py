@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import read_proc_starttime
@@ -154,7 +154,21 @@ def make_run_handle(
     config_sha256: str = "0" * 64,
     pid: int | None = None,
     starttime: int | None = None,
+    launch_state: RunLaunchState = "spawned",
 ) -> RunHandle:
+    if launch_state == "launching":
+        return RunHandle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=utc_now_iso(),
+            log_path=str(store.log_path(run_id)),
+            status_path=str(store.status_path(run_id)),
+            launch_state=launch_state,
+        )
     process_id = os.getpid() if pid is None else pid
     return RunHandle(
         run_id=run_id,
@@ -166,6 +180,7 @@ def make_run_handle(
         started_at=utc_now_iso(),
         log_path=str(store.log_path(run_id)),
         status_path=str(store.status_path(run_id)),
+        launch_state=launch_state,
     )
 
 

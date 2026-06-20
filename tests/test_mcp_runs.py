@@ -25,6 +25,18 @@ def test_save_get_roundtrip(tmp_path: Path) -> None:
     assert store.get("missing") is None
 
 
+def test_launching_handle_roundtrip_is_failed_without_status(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1", launch_state="launching")
+
+    store.save(handle)
+    loaded = store.get("exp-1")
+
+    assert loaded == handle
+    assert store.state(loaded) == "failed"
+    assert store.live_runs() == []
+
+
 def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     first = make_run_handle(store, run_id="exp-1", experiment_id="old")
@@ -121,11 +133,25 @@ def test_loaded_handle_paths_are_derived_from_store(tmp_path: Path) -> None:
         ("pgid", "123"),
         ("pid_starttime", 0),
         ("pid_starttime", "123"),
+        ("launch_state", "bogus"),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(store, run_id="exp-1"))
+    payload[field] = value
+    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+
+    assert store.get("exp-1") is None
+    assert store.list_handles() == []
+
+
+@pytest.mark.parametrize("field,value", [("pid", os.getpid()), ("pgid", os.getpid())])
+def test_launching_handle_cannot_have_process_identity(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    store = RunStore(tmp_path / "state")
+    payload = asdict(make_run_handle(store, run_id="exp-1", launch_state="launching"))
     payload[field] = value
     (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
 
