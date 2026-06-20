@@ -388,6 +388,30 @@ def sqlite_uri_filename_path(storage: str) -> str | None:
     return unquote(parsed.path)
 
 
+def storage_is_in_memory(storage: str | None) -> bool:
+    """Return whether ``storage`` names an in-memory Optuna backend."""
+    if storage is None:
+        return True
+    if storage == ":memory:":
+        return True
+    if storage_backend(storage) != "sqlite":
+        return False
+
+    database = file_url_path(storage)
+    if database in {"", ":memory:"}:
+        return True
+    if not _sqlite_uri_filename_enabled(storage, database):
+        return False
+
+    options = storage_url_query_options(storage)
+    uri_path = sqlite_uri_filename_path(storage)
+    return (
+        uri_path in {"", ":memory:"}
+        or database.startswith("file::memory:")
+        or options.get("mode") == "memory"
+    )
+
+
 def sqlite_readonly_uri(storage: str) -> str | None:
     """Build a ``sqlite3.connect(..., uri=True)`` URI for read-only status reads.
 
@@ -399,17 +423,13 @@ def sqlite_readonly_uri(storage: str) -> str | None:
     :param str storage: SQLite storage URL.
     :return str | None: Read-only SQLite URI, or ``None`` for in-memory storage.
     """
-    database = file_url_path(storage)
-    if database in {"", ":memory:"}:
+    if storage_is_in_memory(storage):
         return None
 
+    database = file_url_path(storage)
     options = storage_url_query_options(storage)
     uri_path = sqlite_uri_filename_path(storage)
     if _sqlite_uri_filename_enabled(storage, database):
-        if uri_path in {"", ":memory:"} or database.startswith("file::memory:"):
-            return None
-        if options.get("mode") == "memory":
-            return None
         params = [
             (key, value)
             for key, value in _url_query_pairs(storage)
@@ -450,9 +470,7 @@ def canonical_storage_identity(storage: str | None) -> str | None:
         options = storage_url_query_options(storage)
         uri_path = sqlite_uri_filename_path(storage)
         if _sqlite_uri_filename_enabled(storage, database):
-            if uri_path in ("", ":memory:") or database.startswith("file::memory:"):
-                return "sqlite:///:memory:"
-            if options.get("mode") == "memory":
+            if storage_is_in_memory(storage):
                 return "sqlite:///:memory:"
             if uri_path is None:
                 params = [

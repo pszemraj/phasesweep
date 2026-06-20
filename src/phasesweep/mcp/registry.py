@@ -25,7 +25,7 @@ from phasesweep.runtime.files import (
     file_url_path,
     sqlite_uri_filename_path,
     storage_backend,
-    storage_url_query_options,
+    storage_is_in_memory,
 )
 
 
@@ -105,29 +105,6 @@ class RegisteredExperiment:
         :return list[str]: Phase names exactly as declared by the experiment config.
         """
         return [phase.name for phase in self.experiment.phases]
-
-
-def _storage_is_in_memory(storage: str | None) -> bool:
-    """Return whether a storage URL resolves to an in-memory Optuna backend.
-
-    :param str | None storage: Configured Optuna storage URL.
-    :return bool: True when the storage cannot be monitored across processes.
-    """
-    if storage is None:
-        return True
-    if storage == ":memory:":
-        return True
-    if storage_backend(storage) != "sqlite":
-        return False
-    database = file_url_path(storage)
-    options = storage_url_query_options(storage)
-    return (
-        database == ""
-        or database == ":memory:"
-        or database.startswith(":memory:?")
-        or database.startswith("file::memory:")
-        or (database.startswith("file:") and options.get("mode") == "memory")
-    )
 
 
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
@@ -228,7 +205,7 @@ class Registry:
                     f"{entry.id!r}: suite configs are not supported by the MCP layer "
                     "in this version; register single-experiment configs"
                 )
-            if _storage_is_in_memory(config.storage):
+            if storage_is_in_memory(config.storage):
                 raise CatalogError(
                     f"{entry.id!r}: storage must be persistent; in-memory studies "
                     "cannot be monitored across processes"
