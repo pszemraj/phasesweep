@@ -21,6 +21,7 @@ from phasesweep.runtime.process import (
     _defer_shutdown_signals,
     _shutdown_handler,
     _terminate_process_group,
+    _tracked_process_group_alive,
     run_supervised,
 )
 from tests.conftest import make_experiment
@@ -247,6 +248,70 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     )
 
 
+def test_shutdown_handler_uses_cheap_group_existence_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process._active_children", {1234: object()})
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._process_group_alive",
+        lambda pgid: (_ for _ in ()).throw(AssertionError("must not scan /proc")),
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        killed.append((pgid, sig))
+
+    monkeypatch.setattr("os.killpg", fake_killpg)
+
+    with pytest.raises(SystemExit):
+        _shutdown_handler(signal.SIGTERM, None)
+
+    assert (1234, signal.SIGTERM) in killed
+    assert (1234, signal.SIGKILL) in killed
+
+
+def test_tracked_process_group_alive_uses_cached_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._group_member_pids",
+        lambda pgid: (_ for _ in ()).throw(AssertionError("must not rescan /proc")),
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: True)
+
+    assert _tracked_process_group_alive(1234, {11}) is True
+
+
+def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member_sets: list[set[int]] = []
+    scans: list[int] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+
+    def fake_group_member_pids(pgid: int) -> list[int]:
+        scans.append(pgid)
+        return [22]
+
+    def fake_member_pids_alive(pgid: int, pids: set[int] | list[int]) -> bool:
+        member_sets.append(set(pids))
+        return 22 in pids
+
+    monkeypatch.setattr("phasesweep.runtime.process._group_member_pids", fake_group_member_pids)
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", fake_member_pids_alive)
+
+    member_pids = {11}
+
+    assert _tracked_process_group_alive(1234, member_pids) is True
+    assert member_pids == {22}
+    assert scans == [1234]
+    assert member_sets == [{11}, {22}]
+
+
 def test_terminate_process_group_reports_cleanup_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -257,7 +322,10 @@ def test_terminate_process_group_reports_cleanup_status(
             calls.append((pgid, sig))
 
         mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
-        mp.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
+        mp.setattr(
+            "phasesweep.runtime.process._tracked_process_group_alive",
+            lambda pgid, member_pids: True,
+        )
 
     def already_gone(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
         def raise_lookup(pgid: int, sig: int) -> None:

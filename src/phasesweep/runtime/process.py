@@ -104,7 +104,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
     # Phase 2: SIGKILL any survivors from the *same snapshot*.
     for pgid in pgids:
-        if _process_group_alive(pgid):
+        if _process_group_exists(pgid):
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                 os.killpg(pgid, signal.SIGKILL)
 
@@ -611,9 +611,10 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
         log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
         return False
 
+    member_pids = set(_group_member_pids(pgid))
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _process_group_alive(pgid):
+        if not _tracked_process_group_alive(pgid, member_pids):
             return True
         time.sleep(0.1)
 
@@ -630,7 +631,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     # "marked FAIL" state means cleanup completed, not requested.
     kill_deadline = time.monotonic() + 2.0
     while time.monotonic() < kill_deadline:
-        if not _process_group_alive(pgid):
+        if not _tracked_process_group_alive(pgid, member_pids):
             return True
         time.sleep(0.05)
 
@@ -659,6 +660,19 @@ def _process_group_alive(pgid: int) -> bool:
         (state ``Z``/``X``).
 
     """
+    if not _process_group_exists(pgid):
+        return False
+
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        # Non-Linux: cannot distinguish zombies. Preserve legacy semantics.
+        return True
+
+    return _member_pids_alive(pgid, _group_member_pids(pgid))
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Return whether the process group has any PID-table entry."""
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -666,42 +680,73 @@ def _process_group_alive(pgid: int) -> bool:
     except PermissionError:
         # Group exists but is owned by a different user. Treat as alive.
         return True
+    return True
 
-    # killpg(0) succeeded → at least one PID-table entry exists. Filter out
-    # zombies by walking /proc/*/stat and checking which ones are in this PGID.
+
+def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
+    """Check group liveness using a cached PID set, refreshing only if needed."""
+    if not _process_group_exists(pgid):
+        return False
     proc_root = Path("/proc")
     if not proc_root.exists():
-        # Non-Linux: cannot distinguish zombies. Preserve legacy semantics.
         return True
+    if _member_pids_alive(pgid, member_pids):
+        return True
+    refreshed = set(_group_member_pids(pgid))
+    member_pids.clear()
+    member_pids.update(refreshed)
+    return _member_pids_alive(pgid, member_pids)
 
-    any_live = False
+
+def _group_member_pids(pgid: int) -> list[int]:
+    """Return current ``/proc`` PIDs that belong to process group ``pgid``."""
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    member_pids: list[int] = []
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
-        try:
-            with (entry / "stat").open(encoding="utf-8") as fh:
-                text = fh.read()
-        except (FileNotFoundError, PermissionError, OSError):
+        parsed = _read_proc_state_and_pgrp(entry)
+        if parsed is None:
             continue
-        rparen = text.rfind(")")
-        if rparen < 0:
+        _state, entry_pgrp = parsed
+        if entry_pgrp == pgid:
+            member_pids.append(int(entry.name))
+    return member_pids
+
+
+def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
+    """Return whether any known member PID is still live and in ``pgid``."""
+    for pid in member_pids:
+        parsed = _read_proc_state_and_pgrp(Path("/proc") / str(pid))
+        if parsed is None:
             continue
-        rest = text[rparen + 1 :].strip().split()
-        if len(rest) < 3:
-            continue
-        # Field 5 of the post-comm split is pgrp (state, ppid, pgrp, ...).
-        state = rest[0]
-        try:
-            entry_pgrp = int(rest[2])
-        except ValueError:
-            continue
+        state, entry_pgrp = parsed
         if entry_pgrp != pgid:
             continue
-        if state == "Z":
+        if state in {"Z", "X"}:
             continue
-        any_live = True
-        break
-    return any_live
+        return True
+    return False
+
+
+def _read_proc_state_and_pgrp(proc_entry: Path) -> tuple[str, int] | None:
+    """Parse process state and process-group id from one ``/proc/<pid>/stat`` file."""
+    try:
+        text = (proc_entry / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    rparen = text.rfind(")")
+    if rparen < 0:
+        return None
+    rest = text[rparen + 1 :].strip().split()
+    if len(rest) < 3:
+        return None
+    try:
+        return rest[0], int(rest[2])
+    except ValueError:
+        return None
 
 
 def kill_stale_group(
