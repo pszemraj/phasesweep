@@ -228,7 +228,11 @@ def file_url_path(storage: str) -> str:
 
 
 def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
-    """Return URL query pairs from a storage URL."""
+    """Return URL query pairs from a storage URL.
+
+    :param str storage: Storage URL whose query string should be parsed.
+    :return list[tuple[str, str]]: Ordered query key/value pairs, preserving blank values.
+    """
     query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
     return parse_qsl(query, keep_blank_values=True)
 
@@ -243,12 +247,21 @@ def storage_url_query_options(storage: str) -> dict[str, str]:
 
 
 def _truthy_url_option(value: str | None) -> bool:
-    """Return whether a URL query value opts into a boolean behavior."""
+    """Return whether a URL query value opts into a boolean behavior.
+
+    :param str | None value: Query value to interpret as a boolean opt-in.
+    :return bool: True when the value is a recognized truthy token.
+    """
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
 def _sqlite_uri_filename_enabled(storage: str, database: str | None = None) -> bool:
-    """Return whether SQLAlchemy will treat a SQLite ``file:`` path as a URI."""
+    """Return whether SQLAlchemy will treat a SQLite ``file:`` path as a URI.
+
+    :param str storage: SQLite storage URL to inspect.
+    :param str | None database: Optional already-parsed database filename from the storage URL.
+    :return bool: True when the database uses a ``file:`` filename and the URL sets ``uri=true``.
+    """
     database = file_url_path(storage) if database is None else database
     if not database.startswith("file:"):
         return False
