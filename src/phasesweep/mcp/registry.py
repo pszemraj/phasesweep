@@ -21,7 +21,12 @@ from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.runtime.files import file_url_path, storage_backend, storage_url_query_options
+from phasesweep.runtime.files import (
+    file_url_path,
+    sqlite_uri_filename_path,
+    storage_backend,
+    storage_url_query_options,
+)
 
 
 class _CatalogModel(BaseModel):
@@ -125,6 +130,41 @@ def _storage_is_in_memory(storage: str | None) -> bool:
     )
 
 
+def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
+    """Resolve an operator path relative to the catalog file when not absolute."""
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    return (base / expanded).resolve()
+
+
+def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> None:
+    """Reject MCP configs whose filesystem targets depend on server CWD."""
+    workdir = Path(experiment.workdir).expanduser()
+    if not workdir.is_absolute():
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments must use an absolute workdir; "
+            "relative workdir values depend on the server launch directory and "
+            "break restart/recovery semantics"
+        )
+
+    storage = experiment.storage
+    backend = storage_backend(storage)
+    if storage is None or backend not in {"sqlite", "journal"}:
+        return
+
+    raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
+    raw_path = file_url_path(storage) if raw_path is None else raw_path
+    if raw_path in {"", ":memory:"} or raw_path.startswith("file::memory:"):
+        return
+    if not Path(raw_path).expanduser().is_absolute():
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
+            "storage path; relative storage URLs depend on the server launch "
+            "directory and can point at a different Optuna study after restart"
+        )
+
+
 class Registry:
     """Immutable id -> RegisteredExperiment map plus the server state dir."""
 
@@ -175,8 +215,7 @@ class Registry:
         for entry in catalog.experiments:
             if entry.id in items:
                 raise CatalogError(f"duplicate catalog id {entry.id!r}")
-            cfg_path = entry.config
-            cfg_path = (cfg_path if cfg_path.is_absolute() else base / cfg_path).resolve()
+            cfg_path = _resolve_catalog_relative_path(base, entry.config)
             if not cfg_path.is_file():
                 raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
             try:
@@ -194,6 +233,7 @@ class Registry:
                     f"{entry.id!r}: storage must be persistent; in-memory studies "
                     "cannot be monitored across processes"
                 )
+            _require_mcp_stable_paths(entry.id, config)
             config_sha256 = hashlib.sha256(config_bytes).hexdigest()
             items[entry.id] = RegisteredExperiment(
                 id=entry.id,
@@ -206,7 +246,7 @@ class Registry:
                 allow_from_phase=entry.allow.from_phase,
             )
         return cls(
-            state_dir=catalog.state_dir.expanduser(),
+            state_dir=_resolve_catalog_relative_path(base, catalog.state_dir),
             items=items,
             max_concurrent_runs=catalog.max_concurrent_runs,
         )

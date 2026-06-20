@@ -108,6 +108,54 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert not reg.allow_from_phase
 
 
+def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
+    _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog_dir = tmp_path / "catalogs"
+    catalog_dir.mkdir()
+    catalog = _write(
+        catalog_dir / "catalog.yaml",
+        """\
+        state_dir: .mcp
+        experiments:
+          - id: reg_ok
+            config: ../exp.yaml
+        """,
+    )
+
+    registry = Registry.load(catalog)
+
+    assert registry.state_dir == (catalog_dir / ".mcp").resolve()
+
+
+def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/wd_reg_ok", "workdir: runs"),
+    )
+
+    with pytest.raises(CatalogError, match="absolute workdir"):
+        Registry.load(_catalog(tmp_path, config))
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        '"sqlite:///relative.db"',
+        '"sqlite+pysqlite:///relative.db"',
+        '"sqlite:///file:relative.db?mode=rwc&uri=true"',
+        '"journal:///relative.journal"',
+    ],
+)
+def test_relative_file_storage_rejected_for_mcp(tmp_path: Path, storage: str) -> None:
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+    )
+
+    with pytest.raises(CatalogError, match="absolute .*storage path"):
+        Registry.load(_catalog(tmp_path, config))
+
+
 def test_config_hash_and_model_come_from_same_startup_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

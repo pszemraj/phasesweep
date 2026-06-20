@@ -22,7 +22,7 @@ Catalog keys:
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
-At startup the server resolves every `config` path to absolute (relative paths are resolved against the catalog file), validates it with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, or uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`). Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
+At startup the server resolves `state_dir` and every `config` path to absolute paths. Relative values in the catalog resolve against the catalog file, not the process working directory. The server validates each experiment with the same loader the CLI uses, computes a content hash, and **refuses to start** if any config is invalid, is a suite, uses in-memory storage (`null`, `sqlite://`, `sqlite:///:memory:`, or `:memory:`), uses a relative `workdir`, or uses relative SQLite/Journal storage. Catalog ids must match `[A-Za-z0-9_-]+`. The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
 Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `phasesweep_launch_sweep`, `phasesweep_cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
@@ -30,13 +30,7 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 
-Relative paths resolve against the directory you start the server from:
-`state_dir` in the catalog and `workdir` / `storage` inside each experiment
-YAML are all relative to the server's current working directory (matching the
-engine's convention). The `config:` paths in the catalog are the exception -
-they resolve against the catalog file. **For production, prefer absolute
-paths** for `state_dir`, `workdir`, and `storage`, or always start the server
-from the same project directory.
+`state_dir` and `config:` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients all monitor the same artifacts and Optuna studies. Relative paths inside `trial_command` are still trainer-owned shell behavior; phasesweep does not rewrite commands.
 
 ### Concurrency and single-GPU hosts
 

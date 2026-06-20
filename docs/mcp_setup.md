@@ -43,7 +43,7 @@ Review the [security model](mcp.md#security-model) before enabling side effects.
 
 ## Test the server
 
-Run this from the same working directory you intend to use in production, because experiment-relative `workdir` and `storage` paths resolve from the server's current directory:
+Run this from any working directory. Catalog-relative `state_dir` and `config` paths resolve against the catalog file, and MCP rejects experiment configs with relative `workdir` or relative SQLite/Journal storage paths:
 
 ```bash
 phasesweep-mcp --catalog /abs/path/to/project/examples/catalog.yaml
@@ -162,4 +162,4 @@ Read the current winners for <experiment_id> and explain what the next manual ex
 - `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
 - `storage must be persistent`: use a persistent Optuna storage URL such as SQLite on disk; in-memory studies cannot be monitored across processes.
 - The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
-- Relative paths behave differently from the CLI: start the MCP server from the same project directory every time, or use absolute paths for `state_dir`, experiment `workdir`, and experiment `storage`.
+- Relative path rejected at startup: catalog `state_dir` and `config` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be absolute for MCP.
