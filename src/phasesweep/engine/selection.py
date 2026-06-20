@@ -99,19 +99,20 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
     for candidate in survivors[1:]:
         assert candidate.value is not None  # same invariant
         if _is_better(candidate.value, best.value, minimize=minimize) or (
-            abs(candidate.value - best.value) <= WINNER_TIE_EPS
-            and candidate.number < best.number
+            abs(candidate.value - best.value) <= WINNER_TIE_EPS and candidate.number < best.number
         ):
             best = candidate
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
     }
+    best_value = best.value
+    assert best_value is not None  # same invariant
 
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
-        metric=float(best.value),
+        metric=float(best_value),
         constraints=constraint_vals,
     )
 

@@ -36,9 +36,7 @@ def test_lock_dir_defaults_to_host_stable_root_not_tmpdir(
     assert stat.S_IMODE(path.stat().st_mode) == 0o1777
 
 
-def test_lock_dir_honors_explicit_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     override = tmp_path / "scheduler-shared-locks"
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
 
