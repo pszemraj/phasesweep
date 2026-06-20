@@ -395,6 +395,33 @@ def run_supervised(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _ProcStat:
+    """Parsed fields from one Linux ``/proc/<pid>/stat`` record."""
+
+    state: str
+    pgrp: int
+    starttime: int
+
+
+def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
+    """Parse the proc stat fields phasesweep uses for liveness checks."""
+    try:
+        text = (proc_entry / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    rparen = text.rfind(")")
+    if rparen < 0:
+        return None
+    rest = text[rparen + 1 :].strip().split()
+    if len(rest) < 20:
+        return None
+    try:
+        return _ProcStat(state=rest[0], pgrp=int(rest[2]), starttime=int(rest[19]))
+    except ValueError:
+        return None
+
+
 def read_proc_starttime(pid: int) -> int | None:
     """Read the start time of a process from /proc/<pid>/stat.
 
@@ -410,21 +437,8 @@ def read_proc_starttime(pid: int) -> int | None:
         ``None`` on non-Linux systems and when the proc entry is unreadable.
 
     """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            data = f.read()
-        # Field 22 (1-indexed) is starttime in clock ticks.
-        # The comm field (field 2) can contain spaces and parens, so find
-        # the last ')' to skip past it safely.
-        rparen = data.rfind(b")")
-        if rparen == -1:
-            return None
-        fields = data[rparen + 2 :].split()
-        # After comm, field 3 = state, field 4 = ppid, ... field 22 = starttime.
-        # That's index 19 in the post-comm split (fields 3..N map to indices 0..N-3).
-        return int(fields[19])
-    except (FileNotFoundError, ValueError, IndexError, OSError):
-        return None
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    return None if stat is None else stat.starttime
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -495,16 +509,8 @@ def is_pid_zombie(pid: int) -> bool:
         gone, or undeterminable (non-Linux).
 
     """
-    try:
-        with Path(f"/proc/{pid}/stat").open(encoding="utf-8") as fh:
-            text = fh.read()
-    except (FileNotFoundError, PermissionError, OSError):
-        return False
-    rparen = text.rfind(")")
-    if rparen < 0:
-        return False
-    fields = text[rparen + 1 :].split()
-    return bool(fields) and fields[0] == "Z"
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    return stat is not None and stat.state == "Z"
 
 
 def reap_child(pid: int) -> None:
@@ -670,15 +676,7 @@ def _process_group_alive(pgid: int) -> bool:
         (state ``Z``/``X``).
 
     """
-    if not _process_group_exists(pgid):
-        return False
-
-    proc_root = Path("/proc")
-    if not proc_root.exists():
-        # Non-Linux: cannot distinguish zombies. Preserve legacy semantics.
-        return True
-
-    return _member_pids_alive(pgid, _group_member_pids(pgid))
+    return _process_group_alive_with_members(pgid, None)
 
 
 def _process_group_exists(pgid: int) -> bool:
@@ -695,11 +693,18 @@ def _process_group_exists(pgid: int) -> bool:
 
 def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
     """Check group liveness using a cached PID set, refreshing only if needed."""
+    return _process_group_alive_with_members(pgid, member_pids)
+
+
+def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
+    """Check group liveness, optionally using and refreshing a cached member set."""
     if not _process_group_exists(pgid):
         return False
     proc_root = Path("/proc")
     if not proc_root.exists():
         return True
+    if member_pids is None:
+        return _member_pids_alive(pgid, _group_member_pids(pgid))
     if _member_pids_alive(pgid, member_pids):
         return True
     refreshed = set(_group_member_pids(pgid))
@@ -717,11 +722,10 @@ def _group_member_pids(pgid: int) -> list[int]:
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
-        parsed = _read_proc_state_and_pgrp(entry)
-        if parsed is None:
+        stat = _read_proc_stat(entry)
+        if stat is None:
             continue
-        _state, entry_pgrp = parsed
-        if entry_pgrp == pgid:
+        if stat.pgrp == pgid:
             member_pids.append(int(entry.name))
     return member_pids
 
@@ -729,34 +733,15 @@ def _group_member_pids(pgid: int) -> list[int]:
 def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
     """Return whether any known member PID is still live and in ``pgid``."""
     for pid in member_pids:
-        parsed = _read_proc_state_and_pgrp(Path("/proc") / str(pid))
-        if parsed is None:
+        stat = _read_proc_stat(Path("/proc") / str(pid))
+        if stat is None:
             continue
-        state, entry_pgrp = parsed
-        if entry_pgrp != pgid:
+        if stat.pgrp != pgid:
             continue
-        if state in {"Z", "X"}:
+        if stat.state in {"Z", "X"}:
             continue
         return True
     return False
-
-
-def _read_proc_state_and_pgrp(proc_entry: Path) -> tuple[str, int] | None:
-    """Parse process state and process-group id from one ``/proc/<pid>/stat`` file."""
-    try:
-        text = (proc_entry / "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
-    rparen = text.rfind(")")
-    if rparen < 0:
-        return None
-    rest = text[rparen + 1 :].strip().split()
-    if len(rest) < 3:
-        return None
-    try:
-        return rest[0], int(rest[2])
-    except ValueError:
-        return None
 
 
 def kill_stale_group(
