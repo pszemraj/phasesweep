@@ -13,6 +13,7 @@ re-verify phase fingerprints: that check belongs to the resume path in
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,18 +90,34 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
     if not path.is_file():
         return None
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        loaded = yaml.safe_load(path.read_text())
+        if loaded is None:
+            data: Mapping[str, Any] = {}
+        elif isinstance(loaded, Mapping):
+            data = loaded
+        else:
+            return None
         # winner.yaml stores metric as {<metric_name>: value, "goal": ...}; pull
         # the value by the configured metric name rather than positionally.
         metric_block = data.get("metric") or {}
+        if not isinstance(metric_block, Mapping):
+            return None
         gates = [g for g in (data.get("gates") or []) if isinstance(g, dict)]
         completion = data.get("completion") or {}
+        if not isinstance(completion, Mapping):
+            return None
+        params = data.get("params") or {}
+        if not isinstance(params, Mapping):
+            return None
+        effective_overrides = data.get("effective_overrides") or {}
+        if not isinstance(effective_overrides, Mapping):
+            return None
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=int(data["trial_number"]),
             metric=float(metric_block[experiment.metric.name]),
-            params=dict(data.get("params") or {}),
-            effective_overrides=dict(data.get("effective_overrides") or {}),
+            params=dict(params),
+            effective_overrides=dict(effective_overrides),
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
             incomplete=bool(completion.get("incomplete", False)),
         )

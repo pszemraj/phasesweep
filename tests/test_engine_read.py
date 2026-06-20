@@ -80,6 +80,31 @@ def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path) -> None:
     assert read_winners(exp) == []
 
 
+def test_read_winner_tolerates_non_mapping_yaml_shapes(tmp_path: Path) -> None:
+    exp = _experiment(tmp_path)
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text("- not\n- a\n- mapping\n")
+    assert read_winner(exp, "p") is None
+    assert read_winners(exp) == []
+
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 3,
+                "metric": {"loss": 0.123, "goal": "minimize"},
+                "params": {"lr": 0.001},
+                "effective_overrides": {"lr": 0.001},
+                "completion": ["not", "a", "mapping"],
+            }
+        )
+    )
+    assert read_winner(exp, "p") is None
+    assert read_winners(exp) == []
+
+
 def test_read_status_does_not_create_missing_sqlite_storage(tmp_path: Path) -> None:
     db = tmp_path / "missing.db"
     exp = _experiment(tmp_path, storage=f"sqlite:///{db}")
