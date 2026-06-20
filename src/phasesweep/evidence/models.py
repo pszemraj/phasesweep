@@ -175,17 +175,11 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
             raise ValueError("artifact_size gate with source=json must define key.")
         if self.source != "json" and self.key is not None:
             raise ValueError("artifact_size gate key is only valid with source=json.")
-        if self.min_bytes is None and self.max_bytes is None:
-            raise ValueError("artifact_size gate must define min_bytes and/or max_bytes.")
-        if (
-            self.min_bytes is not None
-            and self.max_bytes is not None
-            and self.min_bytes > self.max_bytes
-        ):
-            raise ValueError(
-                f"artifact_size gate min_bytes ({self.min_bytes}) must be <= "
-                f"max_bytes ({self.max_bytes})."
-            )
+        _validate_optional_bounds(
+            label="artifact_size gate",
+            min_value=self.min_bytes,
+            max_value=self.max_bytes,
+        )
         return self
 
 
