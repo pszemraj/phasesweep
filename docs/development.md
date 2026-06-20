@@ -8,14 +8,14 @@
 
 ```bash
 python -m pip install -e ".[dev]"
-pytest
 ruff check .
 ruff format --check .
 mypy src/phasesweep
+pytest
 python scripts/mcp_workflow_eval.py
 ```
 
-Expected result: all tests pass. Optuna `constant_liar` experimental warnings are expected. The MCP workflow eval prints JSON and exits nonzero if discovery, read-only safety, or launch-monitor-winners flow fails.
+Run `pytest` by itself, with no concurrent `ruff`, `mypy`, workflow eval, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. Optuna `constant_liar` experimental warnings are expected. The MCP workflow eval prints JSON and exits nonzero if discovery, read-only safety, or launch-monitor-winners flow fails.
 
 ## Package Map
 

@@ -39,11 +39,7 @@ Omit `allow` or leave a flag false to make that side effect unavailable. By defa
 
 ## Before connecting an agent
 
-- Start read-only, then enable `allow.launch`, `allow.cancel`, or `allow.from_phase` only for experiments you are comfortable letting an agent operate.
-- Keep secrets, private paths, dataset ids, hostnames, target/dependent-variable values, validation labels, prediction dumps, and metric histories out of sampled categorical choices, phase names, descriptions, and chat prompts.
-- Use fixed config fields or the trainer environment for private values. MCP does not return `trial_command`, `env`, `storage`, `workdir`, rendered commands, logs, or effective overrides.
-- Expect `phasesweep_get_winners` to return each exposed winner's objective metric value and sampled parameters. That is the summary the agent uses to compare sweep outcomes.
-- Do not give the same agent unrestricted filesystem access to the run directory if you do not want it reading raw result files, trainer logs, W&B exports, predictions, or labels.
+Review the [security model](mcp.md#security-model) before enabling side effects. Start catalog entries read-only, expose only reviewed configs, and do not pair MCP access with unrestricted filesystem or dashboard access unless raw artifacts are acceptable in the agent context.
 
 ## Test the server
 
@@ -122,7 +118,7 @@ You can also use the main CLI or run the module directly:
 
 Restart the MCP client after changing the config.
 
-If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting the text below. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination.
+If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting the text below. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination. Tool behavior, catalog validation, run state, and exposed fields are described in [MCP server](mcp.md).
 
 ## Paste this to your agent
 

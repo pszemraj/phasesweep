@@ -2,7 +2,7 @@
 
 `phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) so the agent can **launch a sweep, monitor it, and read the winning hyperparameters** - and nothing else. The agent never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
 
-For copy/paste MCP client config and agent instructions, start with [MCP agent setup](mcp_setup.md).
+For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 
 ## The catalog
 
@@ -117,12 +117,7 @@ than kept in memory - so a server restart re-discovers live runs from their
 handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
-Run handles are written with an atomic replace, so readers do not observe torn
-JSON. The remaining crash window is the tiny interval after the detached runner
-has spawned but before its first handle is persisted; if the server process dies
-there, the runner may continue but a restarted MCP server cannot rediscover it
-by `run_id`. Inspect the operator-owned logs and the engine's normal lock/stale
-reaper state in that case.
+Run handles and terminal `status.json` files are written with atomic replace, so readers do not observe torn JSON. The remaining crash window is the tiny interval after the detached runner has spawned but before its first handle is persisted; if the server process dies there, the runner may continue but a restarted MCP server cannot rediscover it by `run_id`. Inspect the operator-owned logs and the engine's normal lock/stale reaper state in that case.
 
 ## Limitations (v1)
 
