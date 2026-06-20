@@ -135,7 +135,7 @@ Start by calling phasesweep_list_experiments, then call phasesweep_validate_conf
 
 If I ask you to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when I explicitly ask to resume from a phase or when we have confirmed earlier phase winners already exist. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
 
-Use phasesweep_get_winners to summarize completed phase winners. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless I explicitly ask for that separate work.
+Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless I explicitly ask for that separate work.
 
 When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I explicitly ask for config-authoring help.
 

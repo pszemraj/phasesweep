@@ -499,18 +499,40 @@ class PhaseSweepMCP:
             raise RunSnapshotUnavailableError(handle.run_id)
         return config
 
-    def winners(self, experiment_id: str) -> dict[str, Any]:
+    def winners(
+        self, experiment_id: str | None = None, *, run_id: str | None = None
+    ) -> dict[str, Any]:
         """Return the winning hyperparameters per completed phase.
 
-        :param str experiment_id: Catalog experiment id whose winners should be read.
+        Provide ``experiment_id`` for the current cataloged experiment, or ``run_id``
+        to read winners from the immutable config snapshot that run was launched
+        with. Run-specific reads must not drift when the cataloged config changes.
+
+        :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
+        :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
-        args = {"experiment_id": experiment_id}
+        args = {"experiment_id": experiment_id, "run_id": run_id}
         resolved: dict[str, Any] = {}
         try:
-            reg = self._registry.get(experiment_id)
-            resolved["experiment_id"] = reg.id
-            result = winners_payload(reg.id, read_winners(reg.experiment))
+            if (experiment_id is None) == (run_id is None):
+                raise McpToolError("provide exactly one of experiment_id or run_id")
+            if run_id is not None:
+                handle = self._runs.get(run_id)
+                if handle is None:
+                    raise UnknownRunError(run_id)
+                resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
+                experiment = self._load_run_experiment(handle)
+                result = winners_payload(handle.experiment_id, read_winners(experiment))
+            else:
+                assert experiment_id is not None
+                reg = self._registry.get(experiment_id)
+                resolved["experiment_id"] = reg.id
+                live = self._runs.live_run_for(experiment_id)
+                if live is not None:
+                    resolved["run_id"] = live.run_id
+                experiment = self._load_run_experiment(live) if live is not None else reg.experiment
+                result = winners_payload(reg.id, read_winners(experiment))
         except Exception as exc:
             self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
             raise
@@ -871,12 +893,13 @@ def _strict_tool_inputs(mcp: Any) -> None:
         arg_model.model_rebuild(force=True)
         tool.parameters = arg_model.model_json_schema(by_alias=True)
 
-    status_tool = mcp._tool_manager.get_tool(TOOL_GET_STATUS)
-    if status_tool is not None:
-        status_tool.parameters["oneOf"] = [
-            {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
-            {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
-        ]
+    for tool_name in (TOOL_GET_STATUS, TOOL_GET_WINNERS):
+        tool = mcp._tool_manager.get_tool(tool_name)
+        if tool is not None:
+            tool.parameters["oneOf"] = [
+                {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
+                {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
+            ]
 
 
 def _run_and_monitor_prompt_text() -> str:
@@ -890,7 +913,7 @@ Start by calling phasesweep_list_experiments, then call phasesweep_validate_conf
 
 If asked to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when explicitly asked to resume from a phase or when earlier phase winners are already confirmed. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
 
-Use phasesweep_get_winners to summarize completed phase winners. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
+Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
 
 When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
 
@@ -970,13 +993,19 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def get_winners(experiment_id: ExperimentId) -> GetWinnersResult:
-        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Read-only.
+    def get_winners(
+        experiment_id: MaybeExperimentId = None,
+        run_id: MaybeRunId = None,
+    ) -> GetWinnersResult:
+        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Provide exactly one of experiment_id or run_id. Read-only.
 
-        :param ExperimentId experiment_id: Catalog experiment id whose winners should be read.
+        :param MaybeExperimentId experiment_id: Optional catalog experiment id whose winners should be read.
+        :param MaybeRunId run_id: Optional detached run id whose snapshot should be read.
         :return GetWinnersResult: Structured winners payload.
         """
-        return GetWinnersResult.model_validate(app.winners(experiment_id))
+        return GetWinnersResult.model_validate(
+            app.winners(experiment_id=experiment_id, run_id=run_id)
+        )
 
     @mcp.tool(
         name=TOOL_LAUNCH_SWEEP,

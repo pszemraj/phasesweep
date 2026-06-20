@@ -140,7 +140,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         log = Path(store.get(run_id).log_path).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
-        winners = app.winners("e2e_lm")
+        winners = app.winners(run_id=run_id)
         phases = winners["phases"]
         assert [p["phase"] for p in phases] == ["depth", "lr"]
         for p in phases:
@@ -326,6 +326,9 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     assert sorted(schemas[TOOL_GET_STATUS]["properties"]) == ["experiment_id", "run_id"]
     assert schemas[TOOL_GET_STATUS].get("required") is None  # both optional
     assert "oneOf" in schemas[TOOL_GET_STATUS]
+    assert sorted(schemas[TOOL_GET_WINNERS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_WINNERS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_WINNERS]
     assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
     assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]

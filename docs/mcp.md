@@ -53,7 +53,7 @@ same-host lock), regardless of the cap.
 | `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
-| `phasesweep_get_winners` | `experiment_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
+| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
@@ -61,11 +61,13 @@ A launched sweep runs as a **detached background process** in its own session, s
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
+When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads.
+
 ## Resource and prompt
 
 Clients that support MCP resources can attach `phasesweep://catalog`. It returns the first catalog page as compact JSON using the same path-free payload as `phasesweep_list_experiments`. Agents should still call `phasesweep_list_experiments` when they need pagination or autonomous discovery.
 
-Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, poll by `run_id`, summarize winners, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
+Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, poll by `run_id`, summarize winners with that same `run_id`, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
 
 ## Security model
 
