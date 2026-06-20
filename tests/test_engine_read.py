@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import optuna
+import pytest
 import yaml
 
 from phasesweep.config import Experiment, load_config
@@ -63,44 +64,30 @@ def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:
     assert view.incomplete is False
 
 
-def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"trial_number": 0, "metric": {"loss":',
+        "phase: p\n",
+        "- not\n- a\n- mapping\n",
+        """\
+phase: p
+trial_number: 3
+metric: {loss: 0.123, goal: minimize}
+params: {lr: 0.001}
+effective_overrides: {lr: 0.001}
+completion: [not, a, mapping]
+""",
+    ],
+    ids=["truncated", "missing_keys", "non_mapping", "bad_completion"],
+)
+def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path, body: str) -> None:
     # Status reads stay permissive for legacy, hand-edited, or externally corrupted files.
-    # Both a truncated file (invalid YAML) and a valid-YAML file missing required keys must
-    # read as "no winner yet", never raise.
     exp = _experiment(tmp_path)
     path = _winner_path(exp, "p")
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    path.write_text('{"trial_number": 0, "metric": {"loss":')  # truncated -> YAMLError
-    assert read_winner(exp, "p") is None
-    assert read_winners(exp) == []
-
-    path.write_text("phase: p\n")  # valid YAML, missing trial_number/metric -> KeyError
-    assert read_winner(exp, "p") is None
-    assert read_winners(exp) == []
-
-
-def test_read_winner_tolerates_non_mapping_yaml_shapes(tmp_path: Path) -> None:
-    exp = _experiment(tmp_path)
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    path.write_text("- not\n- a\n- mapping\n")
-    assert read_winner(exp, "p") is None
-    assert read_winners(exp) == []
-
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "trial_number": 3,
-                "metric": {"loss": 0.123, "goal": "minimize"},
-                "params": {"lr": 0.001},
-                "effective_overrides": {"lr": 0.001},
-                "completion": ["not", "a", "mapping"],
-            }
-        )
-    )
+    path.write_text(body)
     assert read_winner(exp, "p") is None
     assert read_winners(exp) == []
 
