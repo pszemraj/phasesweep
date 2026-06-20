@@ -194,7 +194,11 @@ class RunStore:
         if handle.launch_state not in {"launching", "spawned"}:
             return None
         if handle.launch_state == "launching":
-            if handle.pid is not None or handle.pgid is not None or handle.pid_starttime is not None:
+            if (
+                handle.pid is not None
+                or handle.pgid is not None
+                or handle.pid_starttime is not None
+            ):
                 return None
         else:
             if type(handle.pid) is not int or handle.pid <= 0:
