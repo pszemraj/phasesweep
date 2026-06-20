@@ -19,6 +19,7 @@ import pytest
 from phasesweep.config import load_config
 from phasesweep.engine import read_status
 from tests.conftest import REPO
+from tests.mcp_helpers import slow_mcp_config_text
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -27,25 +28,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
-    trainer = REPO / "examples" / "fake_train.py"
     config = tmp_path / "exp.yaml"
     config.write_text(
-        f"""\
-experiment: cancel_me
-storage: sqlite:///{tmp_path}/phases.db
-workdir: {tmp_path}/runs
-trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
-phases:
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-"""
+        slow_mcp_config_text(
+            tmp_path,
+            trainer=REPO / "examples" / "fake_train.py",
+            name="cancel_me",
+            sleep=sleep,
+        )
     )
     return config
 

@@ -4,10 +4,8 @@ read winners, and exercise the launch -> cancel -> relaunch cycle.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -22,10 +20,16 @@ from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
     TOOL_LIST_EXPERIMENTS,
     TOOL_VALIDATE_CONFIG,
-    PhaseSweepMCP,
 )
 from tests.conftest import REPO
-from tests.mcp_helpers import make_mcp_app, write_mcp_config_catalog
+from tests.mcp_helpers import (
+    cancel_mcp_run_quietly,
+    make_mcp_app,
+    slow_mcp_config_text,
+    wait_for_mcp_running_trial,
+    wait_for_mcp_state,
+    write_mcp_config_catalog,
+)
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
@@ -67,56 +71,6 @@ phases:
 """
 
 
-def _slow_config(tmp_path: Path, *, name: str = "slow", sleep: float = 30.0) -> str:
-    return f"""\
-experiment: {name}
-storage: sqlite:///{tmp_path}/{name}.db
-workdir: {tmp_path}/runs/{name}
-trial_command: "{sys.executable} {_TRAINER} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
-phases:
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-"""
-
-
-def _wait_state(app: PhaseSweepMCP, run_id: str, *, want: set[str], timeout: float) -> str:
-    deadline = time.time() + timeout
-    state = "unknown"
-    while time.time() < deadline:
-        state = app.status(run_id=run_id)["run"]["state"]
-        if state in want:
-            return state
-        time.sleep(0.3)
-    return state
-
-
-def _wait_for_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: float) -> str:
-    # Wait until a trial is actually executing, which guarantees the runner has
-    # entered run_experiment and installed its signal handlers - so a cancel
-    # hits the graceful SIGTERM->143 path rather than a pre-handler startup kill.
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = app.status(run_id=run_id)
-        if status["run"]["state"] in {"succeeded", "failed", "cancelled"}:
-            return status["run"]["state"]
-        if status["phases"][0]["running"] >= 1:
-            return "running"
-        time.sleep(0.2)
-    return "timeout"
-
-
-def _cancel_quietly(app: PhaseSweepMCP, run_id: str) -> None:
-    with contextlib.suppress(Exception):
-        app.cancel(run_id)
-
-
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
@@ -136,7 +90,12 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        state = _wait_state(app, run_id, want={"succeeded", "failed", "cancelled"}, timeout=120)
+        state = wait_for_mcp_state(
+            app,
+            run_id,
+            want={"succeeded", "failed", "cancelled"},
+            timeout=120,
+        )
         log = Path(store.get(run_id).log_path).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
@@ -152,13 +111,13 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         # fixed/effective values stay out of MCP tool output.
         assert set(phases[1]["params"]) == {"lr"}
     finally:
-        _cancel_quietly(app, run_id)
+        cancel_mcp_run_quietly(app, run_id)
 
 
 def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": _slow_config(tmp_path)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, _store = make_mcp_app(catalog)
@@ -166,7 +125,7 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
     run_id = app.launch("slow")["run_id"]
     second_run_id = None
     try:
-        got = _wait_for_running_trial(app, run_id, timeout=30)
+        got = wait_for_mcp_running_trial(app, run_id, timeout=30)
         assert got == "running", f"expected a running trial, got {got}"
         # A second launch while one is live is refused.
         with pytest.raises(Exception, match="already has a running sweep"):
@@ -181,22 +140,22 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
         second_run_id = second["run_id"]
         assert second["state"] == "running"
     finally:
-        _cancel_quietly(app, run_id)
+        cancel_mcp_run_quietly(app, run_id)
         if second_run_id is not None:
-            _cancel_quietly(app, second_run_id)
+            cancel_mcp_run_quietly(app, second_run_id)
 
 
 def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": _slow_config(tmp_path)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, _store = make_mcp_app(catalog)
 
     run_id = app.launch("slow")["run_id"]
     try:
-        assert _wait_for_running_trial(app, run_id, timeout=30) == "running"
+        assert wait_for_mcp_running_trial(app, run_id, timeout=30) == "running"
 
         restarted_app, _restarted_registry, _restarted_store = make_mcp_app(catalog)
         status = restarted_app.status(run_id=run_id)
@@ -206,15 +165,15 @@ def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) ->
         assert result["state"] == "cancelled"
         assert result["cleanup_confirmed"] is True
     finally:
-        _cancel_quietly(app, run_id)
+        cancel_mcp_run_quietly(app, run_id)
 
 
 def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
         {
-            "slowa": _slow_config(tmp_path, name="slowa"),
-            "slowb": _slow_config(tmp_path, name="slowb"),
+            "slowa": slow_mcp_config_text(tmp_path, trainer=_TRAINER, name="slowa"),
+            "slowb": slow_mcp_config_text(tmp_path, trainer=_TRAINER, name="slowb"),
         },
         allow=ALLOW_SIDE_EFFECTS,
         filename="multi.catalog.yaml",
@@ -224,7 +183,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
     run_a = app.launch("slowa")["run_id"]
     run_b = None
     try:
-        assert _wait_for_running_trial(app, run_a, timeout=30) == "running"
+        assert wait_for_mcp_running_trial(app, run_a, timeout=30) == "running"
         # A *different* experiment cannot start while one sweep is live (single-GPU cap).
         with pytest.raises(Exception, match="limit 1"):
             app.launch("slowb")
@@ -234,9 +193,9 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
         run_b = result["run_id"]
         assert result["state"] == "running"
     finally:
-        _cancel_quietly(app, run_a)
+        cancel_mcp_run_quietly(app, run_a)
         if run_b is not None:
-            _cancel_quietly(app, run_b)
+            cancel_mcp_run_quietly(app, run_b)
 
 
 def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
@@ -249,7 +208,7 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
 
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": _slow_config(tmp_path)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, store = make_mcp_app(catalog)
