@@ -24,33 +24,20 @@ from phasesweep.mcp.server import (
     PhaseSweepMCP,
     _safe_tool,
 )
-from tests.mcp_helpers import make_mcp_app, make_run_handle, patch_popen_capture, write_mcp_catalog
+from tests.mcp_helpers import (
+    make_mcp_app,
+    make_run_handle,
+    mcp_experiment_config_text,
+    patch_popen_capture,
+    write_mcp_catalog,
+)
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
 
 def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
-    if phases is None:
-        phases = """\
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-"""
     path = tmp_path / f"{name}.yaml"
-    path.write_text(
-        f"""\
-experiment: {name}
-storage: sqlite:///{tmp_path}/{name}.db
-workdir: {tmp_path}/runs/{name}
-trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
-phases:
-{phases}"""
-    )
+    path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
     return path
 
 

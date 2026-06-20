@@ -426,37 +426,14 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] = {}
         state_after: dict[str, Any] = {}
         try:
-            if (experiment_id is None) == (run_id is None):
-                raise McpToolError("provide exactly one of experiment_id or run_id")
-            if run_id is not None:
-                handle = self._runs.get(run_id)
-                if handle is None:
-                    raise UnknownRunError(run_id)
-                resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
-                experiment = self._load_run_experiment(handle)
-                run_state = self._runs.state(handle)
-                run: dict[str, Any] | None = {
-                    "run_id": run_id,
-                    "state": run_state,
-                    "started_at": handle.started_at,
-                }
-                state_after = {"run_state": run_state}
-                result = status_payload(handle.experiment_id, read_status(experiment), run)
-            else:
-                assert experiment_id is not None
-                reg = self._registry.get(experiment_id)
-                live = self._runs.live_run_for(experiment_id)
-                run = (
-                    {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
-                    if live is not None
-                    else None
-                )
-                resolved = {"experiment_id": reg.id}
-                if live is not None:
-                    resolved["run_id"] = live.run_id
-                    state_after["run_state"] = "running"
-                experiment = self._load_run_experiment(live) if live is not None else reg.experiment
-                result = status_payload(reg.id, read_status(experiment), run)
+            target_id, experiment, run, resolved = self._resolve_read_target(
+                experiment_id=experiment_id,
+                run_id=run_id,
+                include_run=True,
+            )
+            if run is not None:
+                state_after = {"run_state": run["state"]}
+            result = status_payload(target_id, read_status(experiment), run)
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise
@@ -468,6 +445,45 @@ class PhaseSweepMCP:
             result_counts={"phases": len(result["phases"]), "running_runs": int(run is not None)},
         )
         return result
+
+    def _resolve_read_target(
+        self,
+        *,
+        experiment_id: str | None,
+        run_id: str | None,
+        include_run: bool,
+    ) -> tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]:
+        """Resolve status/winner reads to the catalog config or immutable run snapshot."""
+        if (experiment_id is None) == (run_id is None):
+            raise McpToolError("provide exactly one of experiment_id or run_id")
+        if run_id is not None:
+            handle = self._runs.get(run_id)
+            if handle is None:
+                raise UnknownRunError(run_id)
+            resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
+            experiment = self._load_run_experiment(handle)
+            run = None
+            if include_run:
+                run = {
+                    "run_id": run_id,
+                    "state": self._runs.state(handle),
+                    "started_at": handle.started_at,
+                }
+            return handle.experiment_id, experiment, run, resolved
+
+        assert experiment_id is not None
+        reg = self._registry.get(experiment_id)
+        live = self._runs.live_run_for(experiment_id)
+        resolved = {"experiment_id": reg.id}
+        if live is not None:
+            resolved["run_id"] = live.run_id
+        experiment = self._load_run_experiment(live) if live is not None else reg.experiment
+        run = (
+            {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
+            if include_run and live is not None
+            else None
+        )
+        return reg.id, experiment, run, resolved
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -516,24 +532,12 @@ class PhaseSweepMCP:
         args = {"experiment_id": experiment_id, "run_id": run_id}
         resolved: dict[str, Any] = {}
         try:
-            if (experiment_id is None) == (run_id is None):
-                raise McpToolError("provide exactly one of experiment_id or run_id")
-            if run_id is not None:
-                handle = self._runs.get(run_id)
-                if handle is None:
-                    raise UnknownRunError(run_id)
-                resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
-                experiment = self._load_run_experiment(handle)
-                result = winners_payload(handle.experiment_id, read_winners(experiment))
-            else:
-                assert experiment_id is not None
-                reg = self._registry.get(experiment_id)
-                resolved["experiment_id"] = reg.id
-                live = self._runs.live_run_for(experiment_id)
-                if live is not None:
-                    resolved["run_id"] = live.run_id
-                experiment = self._load_run_experiment(live) if live is not None else reg.experiment
-                result = winners_payload(reg.id, read_winners(experiment))
+            target_id, experiment, _run, resolved = self._resolve_read_target(
+                experiment_id=experiment_id,
+                run_id=run_id,
+                include_run=False,
+            )
+            result = winners_payload(target_id, read_winners(experiment))
         except Exception as exc:
             self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
             raise

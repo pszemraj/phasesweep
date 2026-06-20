@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
@@ -60,6 +61,33 @@ def write_mcp_config_catalog(
         max_concurrent_runs=max_concurrent_runs,
         filename=filename,
     )
+
+
+def mcp_experiment_config_text(
+    tmp_path: Path,
+    *,
+    name: str = "srv",
+    phases: str | None = None,
+    with_storage: bool = True,
+) -> str:
+    if phases is None:
+        phases = """\
+  - name: p
+    n_trials: 1
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+"""
+    storage = f"storage: sqlite:///{tmp_path}/{name}.db\n" if with_storage else ""
+    return f"""\
+experiment: {name}
+{storage}workdir: {tmp_path}/runs/{name}
+trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
+metric:
+  name: loss
+  goal: minimize
+  extractor: {{ type: json, path: r.json, key: loss }}
+phases:
+{phases}"""
 
 
 def slow_mcp_config_text(
@@ -188,13 +216,18 @@ def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     store.status_path(run_id).write_text(json.dumps(payload))
 
 
-def patch_popen_capture(monkeypatch: Any) -> dict[str, list[str]]:
-    captured: dict[str, list[str]] = {}
+def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
 
     class DummyProc:
-        pid = os.getpid()
+        pid = os.getppid()
 
-    def fake_popen(cmd: list[str], **_kwargs: object) -> DummyProc:
+    def fake_popen(cmd: list[str], **kwargs: object) -> DummyProc:
+        stdout = kwargs.get("stdout")
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+        assert kwargs.get("stderr") is subprocess.STDOUT
+        assert kwargs.get("start_new_session") is True
+        assert stdout is not None and not getattr(stdout, "closed", True)
         captured["cmd"] = cmd
         return DummyProc()
 

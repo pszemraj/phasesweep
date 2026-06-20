@@ -10,7 +10,7 @@ import pytest
 
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import Registry
-from tests.mcp_helpers import write_mcp_catalog
+from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
 
 
 def _write(path: Path, body: str) -> Path:
@@ -19,27 +19,18 @@ def _write(path: Path, body: str) -> Path:
 
 
 def _experiment_yaml(tmp_path: Path, *, name: str = "reg_ok", with_storage: bool = True) -> str:
-    storage = f"storage: sqlite:///{tmp_path}/{name}.db" if with_storage else ""
-    return f"""\
-        experiment: {name}
-        {storage}
-        workdir: {tmp_path}/wd_{name}
-        trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
-        metric:
-          name: loss
-          goal: minimize
-          extractor: {{ type: json, path: r.json, key: loss }}
-        phases:
-          - name: warmup
-            n_trials: 2
-            search_space:
-              lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-          - name: tune
-            inherits: [warmup]
-            n_trials: 3
-            search_space:
-              wd: {{ type: float, low: 0.0, high: 0.3 }}
-    """
+    phases = """\
+  - name: warmup
+    n_trials: 2
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+  - name: tune
+    inherits: [warmup]
+    n_trials: 3
+    search_space:
+      wd: { type: float, low: 0.0, high: 0.3 }
+"""
+    return mcp_experiment_config_text(tmp_path, name=name, phases=phases, with_storage=with_storage)
 
 
 def _suite_yaml(tmp_path: Path) -> str:
@@ -91,7 +82,7 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
 
     # The summary must carry no path, command, or storage URL.
     blob = str(summaries)
-    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "wd_reg_ok")):
+    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "runs" / "reg_ok")):
         assert needle not in blob
 
 
@@ -130,7 +121,7 @@ def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> Non
 def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:
     config = _write(
         tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/wd_reg_ok", "workdir: runs"),
+        _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/runs/reg_ok", "workdir: runs"),
     )
 
     with pytest.raises(CatalogError, match="absolute workdir"):
@@ -243,8 +234,8 @@ def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str)
 
 def test_unknown_sampler_raises_catalog_error(tmp_path: Path) -> None:
     bad = _experiment_yaml(tmp_path).replace(
-        "n_trials: 2\n            search_space:",
-        "n_trials: 2\n            sampler: { type: nope }\n            search_space:",
+        "n_trials: 2\n    search_space:",
+        "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
         1,
     )
     config = _write(tmp_path / "exp.yaml", bad)
