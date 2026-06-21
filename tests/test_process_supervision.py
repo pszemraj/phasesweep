@@ -22,6 +22,7 @@ from phasesweep.runtime.process import (
     _shutdown_handler,
     _terminate_process_group,
     _tracked_process_group_alive,
+    reap_child,
     run_supervised,
 )
 from tests.conftest import make_experiment
@@ -94,6 +95,24 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
     assert result.return_code == 0
     for name in ("pid", "pgid", "pid_starttime"):
         assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
+
+
+def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_waitpid(pid: int, flags: int) -> tuple[int, int]:
+        calls.append((pid, flags))
+        return (0, 0)
+
+    def fail_if_proc_polled(pid: int) -> bool:
+        raise AssertionError(f"reap_child should not poll /proc for pid {pid}")
+
+    monkeypatch.setattr("phasesweep.runtime.process.os.waitpid", fake_waitpid)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_zombie", fail_if_proc_polled)
+
+    reap_child(12345)
+
+    assert calls == [(12345, os.WNOHANG)]
 
 
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
