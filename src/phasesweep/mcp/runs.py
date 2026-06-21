@@ -38,7 +38,11 @@ _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 
 
 def write_status_file(status_path: Path, payload: dict) -> None:
-    """Atomically write a detached-run terminal status payload."""
+    """Atomically write a detached-run terminal status payload.
+
+    :param Path status_path: Destination ``status.json`` path for the run.
+    :param dict payload: JSON-serializable terminal status payload.
+    """
     atomic_write_text(status_path, json.dumps(payload, indent=2))
 
 
@@ -180,7 +184,12 @@ class RunStore:
         return handles
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
-        """Load and normalize one run handle, returning ``None`` when malformed."""
+        """Load and normalize one run handle, returning ``None`` when malformed.
+
+        :param Path path: Persisted run-handle JSON path to read.
+        :param str expected_run_id: Run id implied by the filename.
+        :return RunHandle | None: Normalized handle, or ``None`` when validation fails.
+        """
         if not SAFE_NAME_PATTERN.fullmatch(expected_run_id):
             return None
         try:

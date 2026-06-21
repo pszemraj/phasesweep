@@ -453,7 +453,14 @@ class PhaseSweepMCP:
         run_id: str | None,
         include_run: bool,
     ) -> tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]:
-        """Resolve status/winner reads to the catalog config or immutable run snapshot."""
+        """Resolve status/winner reads to the catalog config or immutable run snapshot.
+
+        :param str | None experiment_id: Catalog id for current experiment-level reads.
+        :param str | None run_id: Persisted run id for immutable run-specific reads.
+        :param bool include_run: Whether to include live run state in the returned payload.
+        :return tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]: Target id,
+            parsed experiment, optional run payload, and audit-safe resolved ids.
+        """
         if (experiment_id is None) == (run_id is None):
             raise McpToolError("provide exactly one of experiment_id or run_id")
         if run_id is not None:
@@ -765,7 +772,12 @@ class PhaseSweepMCP:
         return snapshot_path
 
     def _pending_handle(self, reg: RegisteredExperiment, run_id: str) -> RunHandle:
-        """Build the pre-spawn handle persisted before ``Popen``."""
+        """Build the pre-spawn handle persisted before ``Popen``.
+
+        :param RegisteredExperiment reg: Catalog entry being launched.
+        :param str run_id: Server-minted run id for the pending launch.
+        :return RunHandle: Launching-state handle without process identity.
+        """
         return RunHandle(
             run_id=run_id,
             experiment_id=reg.id,

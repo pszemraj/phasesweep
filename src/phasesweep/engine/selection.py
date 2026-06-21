@@ -118,7 +118,13 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
 
 
 def _is_better(candidate: float, incumbent: float, *, minimize: bool) -> bool:
-    """Return whether ``candidate`` beats ``incumbent`` beyond the near-tie epsilon."""
+    """Return whether ``candidate`` beats ``incumbent`` beyond the near-tie epsilon.
+
+    :param float candidate: Metric value being considered for promotion to incumbent.
+    :param float incumbent: Current best metric value.
+    :param bool minimize: Whether lower metric values are better.
+    :return bool: ``True`` when ``candidate`` improves by more than ``WINNER_TIE_EPS``.
+    """
     delta = incumbent - candidate if minimize else candidate - incumbent
     return delta > WINNER_TIE_EPS
 

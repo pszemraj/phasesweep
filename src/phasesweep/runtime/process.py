@@ -405,7 +405,12 @@ class _ProcStat:
 
 
 def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
-    """Parse the proc stat fields phasesweep uses for liveness checks."""
+    """Parse the proc stat fields phasesweep uses for liveness checks.
+
+    :param Path proc_entry: ``/proc/<pid>`` directory to inspect.
+    :return _ProcStat | None: Parsed state, process group, and starttime, or ``None`` when
+        unreadable.
+    """
     try:
         text = (proc_entry / "stat").read_text(encoding="utf-8")
     except (FileNotFoundError, PermissionError, OSError):
@@ -666,7 +671,11 @@ def _process_group_alive(pgid: int) -> bool:
 
 
 def _process_group_exists(pgid: int) -> bool:
-    """Return whether the process group has any PID-table entry."""
+    """Return whether the process group has any PID-table entry.
+
+    :param int pgid: Process-group ID to probe.
+    :return bool: ``True`` when the group exists or exists but is not inspectable.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -678,12 +687,23 @@ def _process_group_exists(pgid: int) -> bool:
 
 
 def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
-    """Check group liveness using a cached PID set, refreshing only if needed."""
+    """Check group liveness using a cached PID set, refreshing only if needed.
+
+    :param int pgid: Process-group ID to probe.
+    :param set[int] member_pids: Cached group member PIDs, refreshed in place on apparent
+        death.
+    :return bool: ``True`` when any non-zombie group member still appears live.
+    """
     return _process_group_alive_with_members(pgid, member_pids)
 
 
 def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
-    """Check group liveness, optionally using and refreshing a cached member set."""
+    """Check group liveness, optionally using and refreshing a cached member set.
+
+    :param int pgid: Process-group ID to probe.
+    :param set[int] | None member_pids: Cached group members, or ``None`` to scan once.
+    :return bool: ``True`` when a non-zombie member of the group is still alive.
+    """
     if not _process_group_exists(pgid):
         return False
     proc_root = Path("/proc")
@@ -700,7 +720,11 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
 
 
 def _group_member_pids(pgid: int) -> list[int]:
-    """Return current ``/proc`` PIDs that belong to process group ``pgid``."""
+    """Return current ``/proc`` PIDs that belong to process group ``pgid``.
+
+    :param int pgid: Process-group ID to find under ``/proc``.
+    :return list[int]: PIDs currently reporting membership in ``pgid``.
+    """
     proc_root = Path("/proc")
     if not proc_root.exists():
         return []
@@ -717,7 +741,12 @@ def _group_member_pids(pgid: int) -> list[int]:
 
 
 def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
-    """Return whether any known member PID is still live and in ``pgid``."""
+    """Return whether any known member PID is still live and in ``pgid``.
+
+    :param int pgid: Process-group ID each PID must still belong to.
+    :param set[int] | list[int] member_pids: Candidate member PIDs to inspect.
+    :return bool: ``True`` when any candidate is a live, non-zombie member.
+    """
     for pid in member_pids:
         stat = _read_proc_stat(Path("/proc") / str(pid))
         if stat is None:

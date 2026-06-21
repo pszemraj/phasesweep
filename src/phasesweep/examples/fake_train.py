@@ -12,7 +12,11 @@ from typing import Any
 
 
 def _parse_kv(tokens: list[str]) -> dict[str, Any]:
-    """Parse Hydra-style ``key=value`` tokens into a dict with light type inference."""
+    """Parse Hydra-style ``key=value`` tokens into a dict with light type inference.
+
+    :param list[str] tokens: Extra CLI tokens such as ``lr=0.001`` or ``use_amp=true``.
+    :return dict[str, Any]: Parsed override values keyed by override name.
+    """
     out: dict[str, Any] = {}
     for tok in tokens:
         if "=" not in tok:
@@ -34,7 +38,12 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
 
 
 def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Flatten nested override JSON into dotted keys."""
+    """Flatten nested override JSON into dotted keys.
+
+    :param dict[str, Any] d: Nested override mapping loaded from JSON.
+    :param str prefix: Existing dotted prefix used during recursion.
+    :return dict[str, Any]: Flat mapping where nested keys are joined with dots.
+    """
     out: dict[str, Any] = {}
     for k, v in d.items():
         key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"

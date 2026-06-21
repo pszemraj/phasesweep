@@ -207,14 +207,22 @@ def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """Atomically replace ``path`` with UTF-8 text."""
+    """Atomically replace ``path`` with UTF-8 text.
+
+    :param Path path: Destination path to replace.
+    :param str text: Text to write using UTF-8 encoding.
+    """
     with atomic_text_writer(path) as handle:
         handle.write(text)
 
 
 @contextlib.contextmanager
 def atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
-    """Write bytes through a same-directory temp file and atomically replace ``path``."""
+    """Write bytes through a same-directory temp file and atomically replace ``path``.
+
+    :param Path path: Destination path to replace when the context exits successfully.
+    :return Iterator[IO[bytes]]: Writable binary file handle for the temporary file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     replaced = False
@@ -240,7 +248,11 @@ def atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically replace ``path`` with bytes."""
+    """Atomically replace ``path`` with bytes.
+
+    :param Path path: Destination path to replace.
+    :param bytes data: Bytes to write.
+    """
     with atomic_bytes_writer(path) as handle:
         handle.write(data)
 
@@ -389,7 +401,11 @@ def sqlite_uri_filename_path(storage: str) -> str | None:
 
 
 def storage_is_in_memory(storage: str | None) -> bool:
-    """Return whether ``storage`` names an in-memory Optuna backend."""
+    """Return whether ``storage`` names an in-memory Optuna backend.
+
+    :param str | None storage: Optuna storage URL, SQLite sentinel, or ``None``.
+    :return bool: ``True`` when the storage has no durable file or external backend.
+    """
     if storage is None:
         return True
     if storage == ":memory:":

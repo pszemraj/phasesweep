@@ -108,7 +108,12 @@ class RegisteredExperiment:
 
 
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
-    """Resolve an operator path relative to the catalog file when not absolute."""
+    """Resolve an operator path relative to the catalog file when not absolute.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored path from the catalog.
+    :return Path: Absolute, resolved filesystem path.
+    """
     expanded = path.expanduser()
     if expanded.is_absolute():
         return expanded.resolve()
@@ -116,7 +121,11 @@ def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
 
 
 def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> None:
-    """Reject MCP configs whose filesystem targets depend on server CWD."""
+    """Reject MCP configs whose filesystem targets depend on server CWD.
+
+    :param str experiment_id: Catalog id being validated, used in operator-facing errors.
+    :param Experiment experiment: Parsed experiment config registered for MCP access.
+    """
     workdir = Path(experiment.workdir).expanduser()
     if not workdir.is_absolute():
         raise CatalogError(
