@@ -83,6 +83,7 @@ def _write_result(
         "step": metric_record.get("step"),
         "depth": config.get("depth"),
         "dim": config.get("dim"),
+        "grad_clip_norm": config.get("grad_clip_norm"),
         "learning_rate": config.get("learning_rate"),
         "weight_decay": config.get("weight_decay"),
     }
@@ -97,12 +98,10 @@ def _run_template(template_root: Path, config_path: Path) -> None:
             f"decoder-pytorch-template checkout not found at {template_root}; expected {train_py}"
         )
 
-    env = os.environ.copy()
-    env.setdefault("FORCE_DEVICE", "cpu")
     subprocess.run(
         [sys.executable, str(train_py), "--config", str(config_path)],
         cwd=template_root,
-        env=env,
+        env=os.environ.copy(),
         check=True,
     )
 

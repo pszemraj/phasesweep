@@ -2,14 +2,13 @@
 #
 # MCP requires absolute workdir and storage paths so detached runs survive restarts and arbitrary client working directories. Run the MCP server from the PhaseSweep repo root because the trainer command below is intentionally repo-relative.
 
-experiment: decoder_template_smoke_mcp
+experiment: decoder_template_hparam_smoke_mcp
 storage: sqlite:////tmp/phasesweep-mcp-decoder-template/phases.db
 workdir: /tmp/phasesweep-mcp-decoder-template/runs
 trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/vendor/decoder-pytorch-template --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file
 env:
-  CUDA_VISIBLE_DEVICES: ""
-  FORCE_DEVICE: cpu
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
 
 metric:
   name: val_loss
@@ -20,19 +19,28 @@ metric:
     key: val_loss
 
 phases:
-  - name: shape
-    comment: "Pick between two tiny model depths before touching optimizer settings."
-    n_trials: 2
+  - name: optimizer_scale
+    comment: "First choose learning rate, the dominant optimizer-scale decision, while keeping the decoder architecture fixed."
+    n_trials: 3
     sampler:
       type: grid
     search_space:
-      depth: { type: categorical, choices: [1, 2] }
+      learning_rate: { type: categorical, choices: [0.0003, 0.001, 0.003] }
 
-  - name: lr
-    comment: "With the chosen tiny shape locked, test two learning rates."
-    inherits: [shape]
-    n_trials: 2
+  - name: weight_decay
+    comment: "With optimizer scale locked, tune Adam weight decay as the regularization pass."
+    inherits: [optimizer_scale]
+    n_trials: 3
     sampler:
       type: grid
     search_space:
-      learning_rate: { type: categorical, choices: [0.0005, 0.001] }
+      weight_decay: { type: categorical, choices: [0.0, 0.0001, 0.001] }
+
+  - name: clip_norm
+    comment: "With scale and regularization locked, tune gradient clipping as the final stability/control pass."
+    inherits: [weight_decay]
+    n_trials: 3
+    sampler:
+      type: grid
+    search_space:
+      grad_clip_norm: { type: categorical, choices: [0.5, 1.0, 2.0] }
