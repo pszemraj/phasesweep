@@ -1,0 +1,38 @@
+# PhaseSweep smoke sweep for https://github.com/pszemraj/decoder-pytorch-template.
+#
+# The trainer accepts YAML configs, so this example uses PhaseSweep's json_file override format plus run_trial.py to compose a per-trial YAML file.
+
+experiment: decoder_template_smoke
+storage: sqlite:///./examples/decoder_pytorch_template/runs/phases.db
+workdir: ./examples/decoder_pytorch_template/runs/trials
+trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/vendor/decoder-pytorch-template --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+override_format: json_file
+env:
+  CUDA_VISIBLE_DEVICES: ""
+  FORCE_DEVICE: cpu
+
+metric:
+  name: val_loss
+  goal: minimize
+  extractor:
+    type: json
+    path: result.json
+    key: val_loss
+
+phases:
+  - name: shape
+    comment: "Pick between two tiny model depths before touching optimizer settings."
+    n_trials: 2
+    sampler:
+      type: grid
+    search_space:
+      depth: { type: categorical, choices: [1, 2] }
+
+  - name: lr
+    comment: "With the chosen tiny shape locked, test two learning rates."
+    inherits: [shape]
+    n_trials: 2
+    sampler:
+      type: grid
+    search_space:
+      learning_rate: { type: categorical, choices: [0.0005, 0.001] }

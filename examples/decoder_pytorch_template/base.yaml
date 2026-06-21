@@ -1,0 +1,32 @@
+# Tiny decoder-pytorch-template config for PhaseSweep integration smoke tests.
+run_dir: runs/phasesweep-trial
+
+num_tokens: 256
+dim: 48
+depth: 1
+heads: 2
+dim_head: 24
+tied_embedding: true
+ffn_dim_multiplier: 1.0
+flash_attn: false
+compile: false
+use_autocast: false
+
+num_batches: 2
+batch_size: 1
+grad_accum_every: 1
+learning_rate: 0.001
+weight_decay: 0.0
+grad_clip_norm: 1.0
+
+data_path: data/enwik8.gz
+seq_len: 64
+
+validate_every: 1
+val_batches: 1
+generate_every: 1000000
+save_every: 1000000
+temperature: 1.0
+min_p: 0.1
+
+seed: 7
