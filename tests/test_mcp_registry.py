@@ -12,6 +12,8 @@ from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
 
+REPO = Path(__file__).resolve().parents[1]
+
 
 def _write(path: Path, body: str) -> Path:
     path.write_text(textwrap.dedent(body).lstrip())
@@ -97,6 +99,20 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert not reg.allow_launch
     assert not reg.allow_cancel
     assert not reg.allow_from_phase
+
+
+def test_checked_in_example_catalog_loads() -> None:
+    registry = Registry.load(REPO / "examples" / "catalog.yaml")
+
+    reg = registry.get("tiny-lm")
+
+    assert reg.config_path == (REPO / "examples" / "mcp_experiment.yaml").resolve()
+    assert Path(reg.experiment.workdir).is_absolute()
+    assert reg.experiment.storage == "sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db"
+    assert registry.state_dir == Path("/tmp/phasesweep-mcp-tiny-lm/state")
+    assert reg.allow_launch
+    assert reg.allow_cancel
+    assert reg.allow_from_phase
 
 
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:

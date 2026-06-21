@@ -27,7 +27,7 @@ state_dir: /abs/path/to/project/runs/.mcp
 max_concurrent_runs: 1
 experiments:
   - id: tiny-lm
-    config: /abs/path/to/project/examples/experiment.yaml
+    config: /abs/path/to/project/examples/mcp_experiment.yaml
     description: "16 MB LM: pick depth, then lr, then regularization"
     allow:
       launch: true
@@ -35,7 +35,7 @@ experiments:
       from_phase: true
 ```
 
-Catalog validation, path rules, and side-effect permissions are described in [the catalog](mcp.md#the-catalog). The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml).
+Catalog validation, path rules, and side-effect permissions are described in [the catalog](mcp.md#the-catalog). The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml), which points at [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) and writes scratch artifacts under `/tmp/phasesweep-mcp-tiny-lm`.
 
 ## Before connecting an agent
 

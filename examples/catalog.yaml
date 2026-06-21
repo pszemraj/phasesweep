@@ -1,15 +1,14 @@
 # Example MCP catalog. Start the server with:
 #   phasesweep mcp --catalog examples/catalog.yaml
 #
-# The agent only ever sends an experiment `id`. It cannot pass a path, author a
-# config, or reach trial_command / env / storage / workdir. You curate which
-# experiments exist by editing this file (same trust as the experiment YAML).
+# The MCP-specific config below uses absolute scratch paths under /tmp. The regular CLI example in experiment.yaml intentionally keeps relative paths for checkout-local runs.
+# The agent only ever sends an experiment `id`. It cannot pass a path, author a config, or reach trial_command / env / storage / workdir. You curate which experiments exist by editing this file (same trust as the experiment YAML).
 
-state_dir: ./runs/.mcp          # run handles + per-run logs (operator-owned)
+state_dir: /tmp/phasesweep-mcp-tiny-lm/state          # run handles + per-run logs (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane
 experiments:
   - id: tiny-lm                 # the only token the agent ever sends
-    config: ./experiment.yaml   # resolved relative to this catalog, frozen at startup
+    config: ./mcp_experiment.yaml   # resolved relative to this catalog, frozen at startup
     description: "16 MB LM: pick depth, then lr, then regularization"
     allow:
       launch: true              # side effects default false; opt in deliberately
