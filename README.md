@@ -54,6 +54,8 @@ phasesweep status examples/experiment.yaml
 
 The example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`.
 
+For a real-trainer integration example, see [examples/decoder_pytorch_template](examples/decoder_pytorch_template). It shows how an agent drove a YAML-configured PyTorch trainer through PhaseSweep's existing `json_file` override path and MCP tools.
+
 ## Config
 
 Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the metric artifact configured in the extractor, and exit nonzero on failed trials.

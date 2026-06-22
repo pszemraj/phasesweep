@@ -36,3 +36,19 @@ conda run -n tr --live-stream phasesweep mcp --catalog examples/decoder_pytorch_
 ```
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-decoder-template`, as required for restart-stable MCP runs.
+
+## One Agent Run
+
+This is a report from one local validation run, not a prescription for the best decoder-pytorch-template settings. The point is to show the workflow an agent followed and the shape of the result PhaseSweep returned.
+
+The run used an NVIDIA GeForce RTX 4070 Laptop GPU through the `tr` conda environment. PhaseSweep launched 9 trials total: 3 learning-rate trials, then 3 weight-decay trials with the winning learning rate inherited, then 3 gradient-clipping trials with learning rate and weight decay inherited. Each trial trained for 1000 batches from `base.yaml`. Trainer logs for both the CLI and MCP runs reported `Device: cuda` and BF16 mixed precision.
+
+The CLI and MCP runs produced the same phase winners:
+
+```text
+optimizer_scale: learning_rate=0.001, val_loss=2.140831208229065
+weight_decay: weight_decay=0.0, val_loss=2.140831208229065
+clip_norm: grad_clip_norm=0.5, val_loss=2.096618318557739
+```
+
+The MCP path used catalog id `decoder-template-hparams`: list experiments, validate the phase structure, launch the sweep, poll status by `run_id`, and read winners by that same `run_id`. The observed MCP run completed all three phases with 3 complete trials each.
