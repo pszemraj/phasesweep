@@ -94,39 +94,38 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             "Check stdout/stderr logs in the phase's trial_* directories."
         )
 
-    best = survivors[0]
-    assert best.value is not None  # same invariant
-    for candidate in survivors[1:]:
-        assert candidate.value is not None  # same invariant
-        if _is_better(candidate.value, best.value, minimize=minimize) or (
-            abs(candidate.value - best.value) <= WINNER_TIE_EPS and candidate.number < best.number
-        ):
-            best = candidate
+    best_value = (
+        min(_trial_value(t) for t in survivors)
+        if minimize
+        else max(_trial_value(t) for t in survivors)
+    )
+    near_best = [t for t in survivors if abs(_trial_value(t) - best_value) <= WINNER_TIE_EPS]
+    best = min(near_best, key=lambda t: t.number)
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
     }
-    best_value = best.value
-    assert best_value is not None  # same invariant
+    selected_value = best.value
+    assert selected_value is not None  # same invariant
 
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
-        metric=float(best_value),
+        metric=float(selected_value),
         constraints=constraint_vals,
     )
 
 
-def _is_better(candidate: float, incumbent: float, *, minimize: bool) -> bool:
-    """Return whether ``candidate`` beats ``incumbent`` beyond the near-tie epsilon.
+def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
+    """Return the non-None metric value for a known survivor trial.
 
-    :param float candidate: Metric value being considered for promotion to incumbent.
-    :param float incumbent: Current best metric value.
-    :param bool minimize: Whether lower metric values are better.
-    :return bool: ``True`` when ``candidate`` improves by more than ``WINNER_TIE_EPS``.
+    :param optuna.trial.FrozenTrial trial: Completed feasible trial already filtered by
+        :func:`select_winner`.
+    :return float: Scalar objective value for the trial.
     """
-    delta = incumbent - candidate if minimize else candidate - incumbent
-    return delta > WINNER_TIE_EPS
+    value = trial.value
+    assert value is not None  # survivor invariant from select_winner
+    return value
 
 
 log = logging.getLogger("phasesweep.engine.selection")

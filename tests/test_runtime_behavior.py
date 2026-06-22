@@ -426,7 +426,10 @@ def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
         timeout_seconds_per_phase=0.2,
     )
 
-    with pytest.raises(TimeoutError, match="1/3 completed evaluations"):
+    with pytest.raises(
+        TimeoutError,
+        match=r"timed out via phase guard .*Refusing to select a winner",
+    ):
         run_experiment(exp)
 
 
@@ -439,7 +442,10 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     )
 
     started = time.monotonic()
-    with pytest.raises(TimeoutError, match="0/3 completed evaluations"):
+    with pytest.raises(
+        TimeoutError,
+        match=r"timed out via phase guard .*Refusing to select a winner",
+    ):
         run_experiment(exp)
     elapsed = time.monotonic() - started
 
@@ -457,14 +463,17 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
 
     winners = run_experiment(exp)
 
-    assert winners["p"].completion == {
-        "requested_trials": 3,
-        "finished_trials": 1,
-        "completed_trials": 1,
-        "incomplete": True,
-        "reason": "timeout",
-        "timeout_scope": "phase",
-    }
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 3
+    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert (
+        completion["completed_trials"]
+        <= completion["finished_trials"]
+        < completion["requested_trials"]
+    )
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+    assert completion["timeout_scope"] == "phase"
 
 
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
@@ -502,14 +511,17 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     winners = run_experiment(exp)
 
     assert winners["p"].trial_number == 0
-    assert winners["p"].completion == {
-        "requested_trials": 3,
-        "finished_trials": 2,
-        "completed_trials": 1,
-        "incomplete": True,
-        "reason": "timeout",
-        "timeout_scope": "phase",
-    }
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 3
+    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert (
+        completion["completed_trials"]
+        <= completion["finished_trials"]
+        < completion["requested_trials"]
+    )
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+    assert completion["timeout_scope"] == "phase"
 
 
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:

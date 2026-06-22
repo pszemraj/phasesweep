@@ -249,7 +249,7 @@ def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
     patch_popen_capture(monkeypatch)
     original_save = store.save
     saved: list[RunHandle] = []
-    terminated: list[int] = []
+    terminated: list[tuple[int | None, int | None, int | None]] = []
 
     def fail_second_save(handle: RunHandle) -> None:
         saved.append(handle)
@@ -258,18 +258,23 @@ def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
             return
         raise OSError("runs directory is not writable")
 
-    def fake_terminate_group(pgid: int) -> bool:
-        terminated.append(pgid)
+    def fake_kill_stale_group(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        terminated.append((pid, saved_starttime, pgid))
         return True
 
     monkeypatch.setattr(store, "save", fail_second_save)
-    monkeypatch.setattr("phasesweep.mcp.server.terminate_group", fake_terminate_group)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
 
     assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
-    assert terminated == [saved[1].pgid]
+    assert terminated == [(saved[1].pid, saved[1].pid_starttime, saved[1].pgid)]
     pending = store.get(saved[0].run_id)
     assert pending is not None
     assert pending.launch_state == "launching"

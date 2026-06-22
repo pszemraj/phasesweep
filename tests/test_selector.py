@@ -49,6 +49,16 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
     study.add_trial(trial)
 
 
+class _TrialOrderStudy:
+    """Small test double exposing trials in a deliberate non-Optuna order."""
+
+    def __init__(self, trials):
+        self._trials = trials
+
+    def get_trials(self, *, deepcopy: bool):
+        return list(self._trials)
+
+
 def test_argmin_over_feasible():
     exp = _make_exp()
     study = _make_study()
@@ -120,6 +130,20 @@ def test_metric_difference_beyond_eps_wins_minimize():
     w = select_winner(study, exp)
 
     assert w.params == {"x": 2}
+
+
+def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, WINNER_TIE_EPS * 1.5, params={"x": 0})
+    _add_trial(study, WINNER_TIE_EPS * 0.75, params={"x": 1})
+    _add_trial(study, 0.0, params={"x": 2})
+    trials = list(reversed(study.get_trials(deepcopy=False)))
+
+    w = select_winner(_TrialOrderStudy(trials), exp)  # type: ignore[arg-type]
+
+    assert w.trial_number == 1
+    assert w.params == {"x": 1}
 
 
 def test_near_tie_within_eps_prefers_lower_trial_number_maximize():

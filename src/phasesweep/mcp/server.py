@@ -44,7 +44,7 @@ from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import atomic_write_bytes
-from phasesweep.runtime.process import read_proc_starttime, terminate_group
+from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
 
 log = logging.getLogger("phasesweep.mcp.server")
 
@@ -606,7 +606,11 @@ class PhaseSweepMCP:
                 except Exception:
                     try:
                         assert handle.pgid is not None
-                        cleanup_confirmed = terminate_group(handle.pgid)
+                        cleanup_confirmed = kill_stale_group(
+                            handle.pid,
+                            handle.pid_starttime,
+                            pgid=handle.pgid,
+                        )
                     except Exception:
                         log.exception(
                             "failed to terminate unsaved runner run_id=%s pgid=%d",
@@ -685,8 +689,11 @@ class PhaseSweepMCP:
             # status.json(143). cleanup_confirmed reports the runner group is gone, not
             # a guarantee about trial descendants (those are handled by the runner's
             # handler, or by the next launch's stale reaper on a SIGKILL escalation).
-            assert handle.pgid is not None
-            confirmed = terminate_group(handle.pgid)
+            confirmed = kill_stale_group(
+                handle.pid,
+                handle.pid_starttime,
+                pgid=handle.pgid,
+            )
             if confirmed:
                 # If escalation to SIGKILL killed the runner before it recorded a
                 # graceful 143, attribute this operator-initiated stop as cancelled
@@ -936,7 +943,13 @@ def _cancel_annotations() -> Any:
 
 
 def _strict_tool_inputs(mcp: Any) -> None:
-    """Make FastMCP's generated argument models reject undeclared keys."""
+    """Make FastMCP's generated argument models reject undeclared keys.
+
+    FastMCP does not currently expose a public switch for closed input schemas,
+    so this intentionally patches the generated tool metadata. Keep the version
+    cap and startup verification together with this hook: if SDK internals move,
+    ``_verify_strict_tool_inputs`` must fail before serving permissive tools.
+    """
     for tool in mcp._tool_manager.list_tools():
         arg_model = tool.fn_metadata.arg_model
         arg_model.model_config["extra"] = "forbid"
