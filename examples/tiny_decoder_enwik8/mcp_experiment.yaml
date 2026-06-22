@@ -1,11 +1,11 @@
-# MCP-safe variant of the decoder-pytorch-template smoke sweep.
+# MCP-safe variant of the tiny Enwik8 decoder smoke sweep.
 #
 # MCP requires absolute workdir and storage paths so detached runs survive restarts and arbitrary client working directories. Run the MCP server from the PhaseSweep repo root because the trainer command below is intentionally repo-relative.
 
-experiment: decoder_template_hparam_smoke_mcp
-storage: sqlite:////tmp/phasesweep-mcp-decoder-template/phases.db
-workdir: /tmp/phasesweep-mcp-decoder-template/runs
-trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/upstream --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+experiment: tiny_decoder_enwik8_hparam_smoke_mcp
+storage: sqlite:////tmp/phasesweep-mcp-tiny-decoder-enwik8/phases.db
+workdir: /tmp/phasesweep-mcp-tiny-decoder-enwik8/runs
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file
 env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID

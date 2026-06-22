@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt PhaseSweep JSON overrides to decoder-pytorch-template YAML configs."""
+"""Adapt PhaseSweep JSON overrides to the upstream decoder trainer's YAML configs."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _write_result(
 
 
 def _run_template(template_root: Path, config_path: Path) -> None:
-    """Run the decoder-pytorch-template trainer with the composed YAML config."""
+    """Run the upstream decoder trainer with the composed YAML config."""
     train_py = template_root / "train.py"
     if not train_py.is_file():
         raise FileNotFoundError(

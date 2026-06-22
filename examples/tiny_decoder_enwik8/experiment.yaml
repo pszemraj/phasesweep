@@ -1,11 +1,11 @@
-# PhaseSweep smoke sweep for https://github.com/pszemraj/decoder-pytorch-template.
+# PhaseSweep smoke sweep for a tiny Enwik8 decoder trainer backed by https://github.com/pszemraj/decoder-pytorch-template.
 #
 # The trainer accepts YAML configs, so this example uses PhaseSweep's json_file override format plus run_trial.py to compose a per-trial YAML file.
 
-experiment: decoder_template_hparam_smoke
-storage: sqlite:///./examples/decoder_pytorch_template/runs/phases.db
-workdir: ./examples/decoder_pytorch_template/runs/trials
-trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/upstream --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+experiment: tiny_decoder_enwik8_hparam_smoke
+storage: sqlite:///./examples/tiny_decoder_enwik8/runs/phases.db
+workdir: ./examples/tiny_decoder_enwik8/runs/trials
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file
 env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID

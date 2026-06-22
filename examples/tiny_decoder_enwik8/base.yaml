@@ -1,4 +1,4 @@
-# Fixed decoder-pytorch-template config for a small GPU-backed PhaseSweep example.
+# Fixed tiny Enwik8 decoder config for a small GPU-backed PhaseSweep example.
 run_dir: runs/phasesweep-trial
 
 num_tokens: 256

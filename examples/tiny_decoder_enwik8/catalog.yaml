@@ -1,0 +1,13 @@
+# Example MCP catalog for the tiny Enwik8 decoder smoke sweep. Start it from the PhaseSweep repo root with:
+#   phasesweep mcp --catalog examples/tiny_decoder_enwik8/catalog.yaml
+
+state_dir: /tmp/phasesweep-mcp-tiny-decoder-enwik8/state
+max_concurrent_runs: 1
+experiments:
+  - id: tiny-decoder-enwik8-hparams
+    config: ./mcp_experiment.yaml
+    description: "Tiny Enwik8 decoder GPU sweep over LR, weight decay, and gradient clipping"
+    allow:
+      launch: true
+      cancel: true
+      from_phase: true

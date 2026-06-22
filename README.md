@@ -54,7 +54,7 @@ phasesweep status examples/experiment.yaml
 
 The example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`.
 
-For a real-trainer integration example, see [examples/decoder_pytorch_template](examples/decoder_pytorch_template). It uses `decoder-pytorch-template` as a git submodule and shows how an agent drove a YAML-configured PyTorch trainer through PhaseSweep's existing `json_file` override path and MCP tools.
+For a real-trainer integration example, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8). It uses `decoder-pytorch-template` as a git submodule and shows how an agent drove a tiny Enwik8 decoder training run through PhaseSweep's existing `json_file` override path and MCP tools.
 
 ## Config
 

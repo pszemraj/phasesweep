@@ -1,15 +1,15 @@
-# Decoder PyTorch Template Example
+# Tiny Decoder Enwik8 Example
 
-This example drives the real [`decoder-pytorch-template`](https://github.com/pszemraj/decoder-pytorch-template) trainer with PhaseSweep without modifying the trainer repo. The upstream trainer is checked out as the `upstream/` git submodule. It currently accepts a YAML config but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's existing `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three GPU-backed phases tune optimizer scale, regularization, and training stability.
+This example runs a tiny Enwik8 decoder training sweep with PhaseSweep. The trainer implementation comes from [`decoder-pytorch-template`](https://github.com/pszemraj/decoder-pytorch-template), checked out as the `upstream/` git submodule, but the PhaseSweep example is named for the workload rather than the upstream repo. The trainer currently accepts a YAML config but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's existing `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three GPU-backed phases tune optimizer scale, regularization, and training stability.
 
 ## Setup
 
 From the PhaseSweep repo root:
 
 ```bash
-git submodule update --init examples/decoder_pytorch_template/upstream
+git submodule update --init examples/tiny_decoder_enwik8/upstream
 conda run -n tr --live-stream python -m pip install -e ".[mcp]"
-conda run -n tr --live-stream python -m pip install -e examples/decoder_pytorch_template/upstream
+conda run -n tr --live-stream python -m pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
 The submodule pins the external trainer revision used by this example without copying its source into PhaseSweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this PhaseSweep example.
@@ -17,10 +17,10 @@ The submodule pins the external trainer revision used by this example without co
 ## CLI Smoke Sweep
 
 ```bash
-conda run -n tr --live-stream phasesweep validate examples/decoder_pytorch_template/experiment.yaml
-conda run -n tr --live-stream phasesweep run examples/decoder_pytorch_template/experiment.yaml --dry-run
-conda run -n tr --live-stream phasesweep run examples/decoder_pytorch_template/experiment.yaml
-conda run -n tr --live-stream phasesweep show-winners examples/decoder_pytorch_template/experiment.yaml
+conda run -n tr --live-stream phasesweep validate examples/tiny_decoder_enwik8/experiment.yaml
+conda run -n tr --live-stream phasesweep run examples/tiny_decoder_enwik8/experiment.yaml --dry-run
+conda run -n tr --live-stream phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
+conda run -n tr --live-stream phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
 The phase order is deliberate: pick `learning_rate` first because it is the highest-leverage optimizer scale decision, tune `weight_decay` after the update scale is fixed, then tune `grad_clip_norm` last as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
@@ -32,14 +32,14 @@ The committed config uses 1000 training batches per trial. It is still compact e
 Run from the PhaseSweep repo root so the relative `trial_command` in `mcp_experiment.yaml` resolves correctly:
 
 ```bash
-conda run -n tr --live-stream phasesweep mcp --catalog examples/decoder_pytorch_template/catalog.yaml
+conda run -n tr --live-stream phasesweep mcp --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-decoder-template`, as required for restart-stable MCP runs.
+The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
 
 ## One Agent Run
 
-This is a report from one local validation run, not a prescription for the best decoder-pytorch-template settings. The point is to show the workflow an agent followed and the shape of the result PhaseSweep returned.
+This is a report from one local validation run, not a prescription for the best tiny decoder settings. The point is to show the workflow an agent followed and the shape of the result PhaseSweep returned.
 
 The run used an NVIDIA GeForce RTX 4070 Laptop GPU through the `tr` conda environment. PhaseSweep launched 9 trials total: 3 learning-rate trials, then 3 weight-decay trials with the winning learning rate inherited, then 3 gradient-clipping trials with learning rate and weight decay inherited. Each trial trained for 1000 batches from `base.yaml`. Trainer logs for both the CLI and MCP runs reported `Device: cuda` and BF16 mixed precision.
 
@@ -51,4 +51,4 @@ weight_decay: weight_decay=0.0, val_loss=2.140831208229065
 clip_norm: grad_clip_norm=0.5, val_loss=2.096618318557739
 ```
 
-The MCP path used catalog id `decoder-template-hparams`: list experiments, validate the phase structure, launch the sweep, poll status by `run_id`, and read winners by that same `run_id`. The observed MCP run completed all three phases with 3 complete trials each.
+The MCP path used catalog id `tiny-decoder-enwik8-hparams`: list experiments, validate the phase structure, launch the sweep, poll status by `run_id`, and read winners by that same `run_id`. The observed MCP run completed all three phases with 3 complete trials each.
