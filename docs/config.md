@@ -28,9 +28,7 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 ## Phase Keys
 
-Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is deliberate: it makes expensive searches inspectable, but it is not a substitute for joint optimization when dimensions interact strongly.
-
-![dag](images/diagramA_dag.png)
+Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
 - `name`: required phase name matching `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.

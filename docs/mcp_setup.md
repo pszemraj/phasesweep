@@ -1,6 +1,6 @@
 # MCP agent setup
 
-Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are covered in [MCP server](mcp.md).
+Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are in [MCP server](mcp.md).
 
 ## Install
 
@@ -35,11 +35,7 @@ experiments:
       from_phase: true
 ```
 
-Catalog validation, path rules, and side-effect permissions are described in [the catalog](mcp.md#the-catalog). The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml), which points at [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) and writes scratch artifacts under `/tmp/phasesweep-mcp-tiny-lm`.
-
-## Before connecting an agent
-
-Review the [security model](mcp.md#security-model) before enabling side effects. Start catalog entries read-only and expose only reviewed configs.
+Catalog validation, path rules, side-effect permissions, and the security model are described in [the catalog](mcp.md#the-catalog) and [security model](mcp.md#security-model). Start entries read-only, expose only reviewed configs, and enable `allow` actions deliberately. The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml), which points at [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) and writes scratch artifacts under `/tmp/phasesweep-mcp-tiny-lm`.
 
 ## Test the server
 
@@ -118,48 +114,34 @@ You can also use the main CLI or run the module directly:
 
 Restart the MCP client after changing the config.
 
-If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting the text below. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination. Tool behavior, catalog validation, run state, and exposed fields are described in [MCP server](mcp.md).
+If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting instructions. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination. Tool behavior, catalog validation, run state, and exposed fields are described in [MCP server](mcp.md).
 
 ## Paste this to your agent
 
-Paste this into the agent's project instructions or chat before asking it to run a sweep:
+When prompts are unavailable, paste this into the agent's project instructions or chat before asking it to run a sweep:
 
 ```text
-You have access to a local phasesweep MCP server. Use it to operate only the human-curated experiment catalog exposed by the server.
-
-Start by calling phasesweep_list_experiments, then call phasesweep_validate_config for the experiment id you plan to use. Do not ask me for config paths, storage URLs, workdirs, commands, environment variables, or run-control settings; the catalog is the authority for those.
-
-If I ask you to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when I explicitly ask to resume from a phase or when we have confirmed earlier phase winners already exist. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
-
-Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless I explicitly ask for that separate work.
-
-When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I explicitly ask for config-authoring help.
-
-Use phasesweep_cancel_sweep only when I explicitly ask you to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep.
+Use the local phasesweep MCP server only through the exposed catalog.
+Start with phasesweep_list_experiments and phasesweep_validate_config.
+Launch only by catalog experiment id. After launch, poll phasesweep_get_status by run_id until terminal, then call phasesweep_get_winners with the same run_id.
+Do not ask for or infer config paths, storage URLs, workdirs, commands, environment variables, run-control settings, raw datasets, labels, predictions, logs, result files, dashboards, or per-trial histories unless I explicitly ask for separate filesystem or dashboard work.
+Base recommendations on catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective, extractor, command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I ask for config-authoring help.
+Cancel only when I ask or when stopping is necessary to prevent an unwanted active sweep.
 ```
 
 ## Useful agent requests
 
-```text
-List the available phasesweep experiments and validate the one that looks like the tiny LM example.
-```
-
-```text
-Launch the tiny-lm sweep, monitor it until completion, then summarize the winning params for each phase.
-```
-
-```text
-Check whether run <run_id> is still active and show me the phase-level trial counts.
-```
-
-```text
-Read the current winners for <experiment_id> and explain what the next manual experiment should try using only the phasesweep MCP outputs.
-```
+- `List the available phasesweep experiments and validate the tiny LM example.`
+- `Launch the tiny-lm sweep, monitor it until completion, then summarize each phase winner.`
+- `Check whether run <run_id> is still active and show phase-level trial counts.`
+- `Read the current winners for <experiment_id> and suggest a next manual experiment using only MCP outputs.`
 
 ## Troubleshooting
 
 - `action 'launch' is not permitted`: set `allow.launch: true` for that catalog entry and restart the MCP client.
 - `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
+- `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` for hosts that can safely run multiple sweeps.
 - `storage must be persistent`: use a persistent Optuna storage URL such as SQLite on disk; in-memory studies cannot be monitored across processes.
 - The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
 - Relative path rejected at startup: catalog `state_dir` and `config` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be absolute for MCP.
+- Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.

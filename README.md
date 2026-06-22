@@ -52,21 +52,17 @@ phasesweep show-winners examples/experiment.yaml
 phasesweep status examples/experiment.yaml
 ```
 
-The example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`.
-
-For a real-trainer integration example, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8). It uses `decoder-pytorch-template` as a git submodule and shows how an agent drove a tiny Enwik8 decoder training run through PhaseSweep's existing `json_file` override path and MCP tools.
+The bundled example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`. For a real-trainer integration, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8/README.md).
 
 ## Config
 
-Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the metric artifact configured in the extractor, and exit nonzero on failed trials.
+Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the configured metric artifact, and exit nonzero on failed trials.
 
 Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly. Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
 
 ## MCP server (agent integration)
 
-`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents operate by catalog id: list, validate, launch, monitor, cancel, and read winners without receiving config paths, trainer commands, raw logs, storage URLs, or workdirs.
-
-See [MCP agent setup](docs/mcp_setup.md) for install/client config and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
+`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Use [MCP agent setup](docs/mcp_setup.md) for client config and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
 
 ## Docs
 
@@ -75,6 +71,7 @@ See [MCP agent setup](docs/mcp_setup.md) for install/client config and [MCP serv
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the six tools, security model, single-host operation.
 - [MCP agent setup](docs/mcp_setup.md): copy/paste MCP client config, install commands, and agent instructions.
+- [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.
 
 ## License
