@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "vendor" / "decoder-pytorch-template"
+DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "upstream"
 
 
 def _resolve_repo_path(path: str | Path) -> Path:

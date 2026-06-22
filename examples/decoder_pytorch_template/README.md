@@ -1,18 +1,18 @@
 # Decoder PyTorch Template Example
 
-This example drives the real [`decoder-pytorch-template`](https://github.com/pszemraj/decoder-pytorch-template) trainer with PhaseSweep without modifying the trainer repo. The trainer currently accepts a YAML config but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's existing `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three GPU-backed phases tune optimizer scale, regularization, and training stability.
+This example drives the real [`decoder-pytorch-template`](https://github.com/pszemraj/decoder-pytorch-template) trainer with PhaseSweep without modifying the trainer repo. The upstream trainer is checked out as the `upstream/` git submodule. It currently accepts a YAML config but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's existing `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three GPU-backed phases tune optimizer scale, regularization, and training stability.
 
 ## Setup
 
 From the PhaseSweep repo root:
 
 ```bash
-git clone https://github.com/pszemraj/decoder-pytorch-template.git examples/decoder_pytorch_template/vendor/decoder-pytorch-template
+git submodule update --init examples/decoder_pytorch_template/upstream
 conda run -n tr --live-stream python -m pip install -e ".[mcp]"
-conda run -n tr --live-stream python -m pip install -e examples/decoder_pytorch_template/vendor/decoder-pytorch-template
+conda run -n tr --live-stream python -m pip install -e examples/decoder_pytorch_template/upstream
 ```
 
-The `vendor/` checkout is gitignored on purpose. It keeps the example honest while avoiding vendored model code and dataset churn in this repo.
+The submodule pins the external trainer revision used by this example without copying its source into PhaseSweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this PhaseSweep example.
 
 ## CLI Smoke Sweep
 

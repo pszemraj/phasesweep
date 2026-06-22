@@ -1,0 +1,3 @@
+[submodule "examples/decoder_pytorch_template/upstream"]
+	path = examples/decoder_pytorch_template/upstream
+	url = https://github.com/pszemraj/decoder-pytorch-template.git

@@ -5,7 +5,7 @@
 experiment: decoder_template_hparam_smoke_mcp
 storage: sqlite:////tmp/phasesweep-mcp-decoder-template/phases.db
 workdir: /tmp/phasesweep-mcp-decoder-template/runs
-trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/vendor/decoder-pytorch-template --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+trial_command: "python examples/decoder_pytorch_template/run_trial.py --template-root examples/decoder_pytorch_template/upstream --base-config examples/decoder_pytorch_template/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file
 env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID
