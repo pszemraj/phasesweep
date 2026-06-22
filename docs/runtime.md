@@ -49,6 +49,8 @@ Every trial runs in a new process group via `start_new_session=True`. Timeouts a
 
 `timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` and top-level `timeout_seconds_per_run` are hard wallclock caps for the larger execution scope: phasesweep passes the remaining budget into GPU lease acquisition and active trial supervision, so a queued or running trial cannot extend past the phase/run deadline. When a phase or run deadline stops the phase before the requested number of completed evaluations exists, phasesweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
 
+If a wallclock timeout and `max_consecutive_failures` become true in the same phase, timeout handling takes precedence. A phase that has at least one completed feasible trial can therefore persist a timeout-marked partial winner when `allow_incomplete_on_timeout: true`, instead of having that winner masked by the consecutive-failure abort path. Without that opt-in, the same situation fails closed with `TimeoutError`.
+
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
 Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
@@ -82,6 +84,8 @@ A run always takes same-host `flock`s under `PHASESWEEP_LOCK_DIR` when set, othe
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 
 The lock directory must resolve to one path shared by every cooperating phasesweep process on the host. Schedulers that set a per-job `TMPDIR`, containers with private `/tmp`, and systemd `PrivateTmp` units should set `PHASESWEEP_LOCK_DIR` to a host-shared path such as `/var/tmp/phasesweep-locks` or a site-managed node-local equivalent.
+
+Upgrade note: older phasesweep builds used the process temp directory for these locks. Existing stale locks under `/tmp` or a scheduler-provided `TMPDIR` are not consulted after the default moves to `/var/tmp/phasesweep-locks`; set `PHASESWEEP_LOCK_DIR` explicitly during a staged upgrade if you need old and new processes to coordinate.
 
 Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` so `nvidia-smi` indices, lock names, logs, and CUDA ordinals line up unless the operator explicitly set another order. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
 

@@ -46,6 +46,8 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 
 A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
 
+`cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group was confirmed gone or already absent after PID/starttime-aware cleanup. It is not an independent proof that every trainer descendant wrote a graceful terminal status; normal runner shutdown asks the engine to tear down trial groups, and uncertain leftovers are handled by the engine's stale reaper before later launches.
+
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
 When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads.
@@ -102,7 +104,7 @@ than kept in memory - so a server restart re-discovers live runs from their
 handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
-Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts and replaces it with the spawned process identity after `Popen`; if the server dies during launch, a restarted server can still see the attempted run instead of losing the lifecycle record completely.
+Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts and replaces it with the spawned process identity after `Popen`; if the server dies during launch, a restarted server can still see the attempted run instead of losing the lifecycle record completely. If the final spawned-handle save fails after `Popen`, the server terminates the spawned runner and the original `launching` handle remains as a failed tombstone rather than blocking relaunch.
 
 ## Limitations (v1)
 
