@@ -97,6 +97,40 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
         assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
 
 
+def test_run_supervised_terminates_child_when_identity_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata write failure after Popen must not leave the child running."""
+    import phasesweep.runtime.process as process
+
+    real_atomic_write_text = process.atomic_write_text
+
+    def fail_pid_write(path: Path, text: str) -> None:
+        if path.name == "pid":
+            raise OSError("identity disk full")
+        real_atomic_write_text(path, text)
+
+    monkeypatch.setattr("phasesweep.runtime.process.atomic_write_text", fail_pid_write)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            f"{sys.executable} -c 'import time; time.sleep(60)'",
+            env=os.environ.copy(),
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+        )
+
+    assert result.cleanup_confirmed is True
+    assert "failed to persist process identity" in (result.failure_reason or "")
+    with pytest.raises(ProcessLookupError):
+        os.kill(result.pid, 0)
+
+
 def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []
 

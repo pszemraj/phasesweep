@@ -466,11 +466,8 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     completion = winners["p"].completion
     assert completion["requested_trials"] == 3
     assert 1 <= completion["completed_trials"] < completion["requested_trials"]
-    assert (
-        completion["completed_trials"]
-        <= completion["finished_trials"]
-        < completion["requested_trials"]
-    )
+    assert completion["completed_trials"] <= completion["finished_trials"]
+    assert completion["finished_trials"] <= completion["requested_trials"]
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"

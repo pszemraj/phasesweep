@@ -276,6 +276,25 @@ def test_kill_stale_group_refuses_pgid_fallback_on_pid_reuse(
     assert calls == [], "no kill signal should have been issued"
 
 
+def test_kill_stale_group_refuses_pgid_fallback_when_group_leader_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dead root PID + reused PGID leader should fail closed."""
+    calls: list[int] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: False)
+    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 999)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
+    )
+
+    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
+
+    assert sent is False, "must refuse reused PGID fallback"
+    assert calls == [], "no kill signal should have been issued"
+
+
 def test_kill_stale_group_uses_pgid_when_pid_dead(monkeypatch: pytest.MonkeyPatch) -> None:
     """PID gone, no starttime check possible — PGID fallback is correct here."""
     calls: list[int] = []

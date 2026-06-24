@@ -241,7 +241,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     def fake_run_config(config_obj: Experiment, *, from_phase: str | None, dry_run: bool) -> None:
         calls.append((config_obj.experiment, from_phase, dry_run))
 
-    monkeypatch.setattr("phasesweep.mcp.runner.run_config", fake_run_config)
+    monkeypatch.setattr("phasesweep.engine.run_config", fake_run_config)
 
     assert (
         runner_main(
@@ -549,3 +549,40 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
+
+
+def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-uncertain"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.save(handle)
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: False)
+
+    result = app.cancel(run_id)
+
+    assert result == {"run_id": run_id, "state": "running", "cleanup_confirmed": False}
+    assert store.cleanup_uncertain_path(run_id).is_file()
+
+    stale_handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(stale_handle)
+
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")

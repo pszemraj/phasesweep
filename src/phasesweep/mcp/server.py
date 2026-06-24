@@ -8,6 +8,7 @@ redacted. serve() loads the catalog, builds the store, and serves over stdio.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import hashlib
 import logging
@@ -619,6 +620,8 @@ class PhaseSweepMCP:
                         )
                     else:
                         if not cleanup_confirmed:
+                            with contextlib.suppress(Exception):
+                                self._runs.mark_cleanup_uncertain(handle)
                             log.error(
                                 "cleanup uncertain after failed handle save for run_id=%s pgid=%d",
                                 handle.run_id,
@@ -695,10 +698,13 @@ class PhaseSweepMCP:
                 pgid=handle.pgid,
             )
             if confirmed:
+                self._runs.clear_cleanup_uncertain(handle)
                 # If escalation to SIGKILL killed the runner before it recorded a
                 # graceful 143, attribute this operator-initiated stop as cancelled
                 # so the state below isn't a misleading 'failed'. No-op otherwise.
                 self._runs.mark_cancelled_if_unrecorded(handle)
+            else:
+                self._runs.mark_cleanup_uncertain(handle)
             after = self._runs.state(handle)
             result = {"run_id": run_id, "state": after, "cleanup_confirmed": confirmed}
         except Exception as exc:

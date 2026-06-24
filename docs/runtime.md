@@ -37,7 +37,7 @@ runs/
   phases.db
 ```
 
-`pid`, `pgid`, and `pid_starttime` are written while a trial is live. They are removed on clean exit and preserved on failure for inspection.
+`pid`, `pgid`, and `pid_starttime` are written atomically while a trial is live. They are removed on clean exit and preserved on failure for inspection. If those identity writes fail after launch, phasesweep terminates the new process group before returning a failed trial result.
 
 ![output layout](images/diagramG_artifacttree.png)
 

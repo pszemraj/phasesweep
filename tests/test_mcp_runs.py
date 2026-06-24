@@ -217,6 +217,24 @@ def test_mark_cancelled_is_noop_when_status_exists(tmp_path: Path) -> None:
     assert store.state(handle) == "succeeded"
 
 
+def test_cleanup_uncertain_marker_keeps_run_live_until_cleared(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    store.save(handle)
+
+    assert store.state(handle) == "failed"
+
+    store.mark_cleanup_uncertain(handle)
+
+    assert store.state(handle) == "running"
+    assert store.live_runs() == [handle]
+
+    store.clear_cleanup_uncertain(handle)
+    store.mark_cancelled_if_unrecorded(handle)
+
+    assert store.state(handle) == "cancelled"
+
+
 def test_state_failed_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())

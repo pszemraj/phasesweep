@@ -16,8 +16,6 @@ import os
 import sys
 from pathlib import Path
 
-from phasesweep.config import load_config
-from phasesweep.engine import run_config
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.runtime.process import read_proc_starttime
 
@@ -113,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
             started_at=args.started_at,
             status_path=args.status_path,
         )
+        from phasesweep.config import load_config
+        from phasesweep.engine import run_config
+
         actual_sha256 = _sha256_file(args.config)
         if actual_sha256 != args.config_sha256:
             raise RuntimeError("config snapshot hash mismatch; refusing to run")

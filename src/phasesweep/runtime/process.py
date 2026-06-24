@@ -25,6 +25,8 @@ from pathlib import Path
 from types import FrameType
 from typing import IO
 
+from phasesweep.runtime.files import atomic_write_text
+
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
@@ -314,30 +316,58 @@ def run_supervised(
     # Correct ordering: block signals -> take lock -> work -> release lock
     # -> unblock signals. Any pending signal is delivered after the lock is
     # released, so the handler can safely acquire it.
-    with _defer_shutdown_signals(), _launch_lock:
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,  # noqa: S602
-            env=env,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    pid_path = trial_dir / "pid"
+    pgid_path = trial_dir / "pgid"
+    starttime_path = trial_dir / "pid_starttime"
+
+    try:
+        with _defer_shutdown_signals(), _launch_lock:
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,  # noqa: S602
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
+
+            # Register in the global child registry immediately so the signal handler
+            # can reach this group even if we haven't written files yet.
+            pgid = _register(proc)
+
+            atomic_write_text(pid_path, f"{proc.pid}\n")
+            atomic_write_text(pgid_path, f"{pgid}\n")
+
+            starttime = read_proc_starttime(proc.pid)
+            if starttime is not None:
+                atomic_write_text(starttime_path, f"{starttime}\n")
+    except Exception as exc:
+        if proc is None:
+            raise
+        target_pgid = pgid if pgid is not None else proc.pid
+        identity_failure_reason = f"failed to persist process identity: {exc}"
+        log.exception(
+            "Trial PID %d (pgid %d) launched but identity persistence failed; terminating group",
+            proc.pid,
+            target_pgid,
+        )
+        cleanup_confirmed = _kill_group(target_pgid, proc)
+        if pgid is not None:
+            _unregister(pgid)
+        duration = time.time() - started
+        return ProcessResult(
+            return_code=proc.returncode if proc.returncode is not None else -9,
+            timed_out=False,
+            pid=proc.pid,
+            duration_seconds=duration,
+            failure_reason=identity_failure_reason,
+            cleanup_confirmed=cleanup_confirmed,
         )
 
-        # Register in the global child registry immediately so the signal handler
-        # can reach this group even if we haven't written files yet.
-        pgid = _register(proc)
-
-        pid_path = trial_dir / "pid"
-        pgid_path = trial_dir / "pgid"
-        starttime_path = trial_dir / "pid_starttime"
-
-        pid_path.write_text(f"{proc.pid}\n")
-        pgid_path.write_text(f"{pgid}\n")
-
-        starttime = read_proc_starttime(proc.pid)
-        if starttime is not None:
-            starttime_path.write_text(f"{starttime}\n")
+    assert proc is not None
+    assert pgid is not None
 
     timed_out = False
     failure_reason: str | None = None
@@ -825,6 +855,19 @@ def kill_stale_group(
                 "PID was reused. Refusing PGID fallback to avoid killing an "
                 "unrelated process group.",
                 pid,
+            )
+            return False
+
+    if target_pgid is None and pgid is not None and saved_starttime is not None:
+        pgid_starttime = read_proc_starttime(pgid)
+        if pgid_starttime is not None and pgid_starttime != saved_starttime:
+            log.warning(
+                "Stored PGID %d is now the PID of a different process "
+                "(starttime %s != saved %s). Refusing PGID fallback to avoid "
+                "killing an unrelated process group.",
+                pgid,
+                pgid_starttime,
+                saved_starttime,
             )
             return False
 

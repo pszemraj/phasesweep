@@ -143,6 +143,14 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.config.yaml"
 
+    def cleanup_uncertain_path(self, run_id: str) -> Path:
+        """Path to the server-owned marker for unconfirmed process cleanup.
+
+        :param str run_id: Run id whose cleanup marker path should be returned.
+        :return Path: Operator-only cleanup uncertainty marker path.
+        """
+        return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
+
     def save(self, handle: RunHandle) -> None:
         """Persist a run handle as JSON under the runs dir.
 
@@ -245,6 +253,8 @@ class RunStore:
         # query is a natural place to clean it up (no signal handler needed).
         if handle.pid is not None:
             reap_child(handle.pid)
+        if self._cleanup_uncertain(handle):
+            return "running"
         status = self._read_status(handle)
         if status is not None:
             rc = status.get("returncode")
@@ -288,6 +298,32 @@ class RunStore:
         with contextlib.suppress(OSError):
             write_status_file(self.status_path(handle.run_id), payload)
 
+    def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
+        """Persist that a cancel attempt could not confirm process-group cleanup.
+
+        A dead root PID normally derives to ``failed`` and frees the MCP
+        concurrency slot. When cancellation could not prove the process group is
+        gone, descendants may still hold resources, so this server-owned marker
+        keeps the run in the live set until a later cleanup attempt succeeds.
+
+        :param RunHandle handle: Run handle whose cleanup is uncertain.
+        """
+        payload = {
+            "run_id": handle.run_id,
+            "pid": handle.pid,
+            "pgid": handle.pgid,
+            "pid_starttime": handle.pid_starttime,
+            "cleanup_confirmed": False,
+        }
+        atomic_write_text(self.cleanup_uncertain_path(handle.run_id), json.dumps(payload, indent=2))
+
+    def clear_cleanup_uncertain(self, handle: RunHandle) -> None:
+        """Clear a previously persisted cleanup uncertainty marker.
+
+        :param RunHandle handle: Run handle whose process group is now confirmed gone.
+        """
+        self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
+
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.
 
@@ -324,3 +360,11 @@ class RunStore:
             return json.loads(path.read_text())
         except json.JSONDecodeError:
             return None
+
+    def _cleanup_uncertain(self, handle: RunHandle) -> bool:
+        """Return whether this run has a server-owned cleanup uncertainty marker.
+
+        :param RunHandle handle: Run handle whose cleanup marker should be checked.
+        :return bool: True when a prior cancel could not confirm cleanup.
+        """
+        return self.cleanup_uncertain_path(handle.run_id).is_file()
