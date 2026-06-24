@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from phasesweep.mcp.server import (
     PhaseSweepMCP,
     _safe_tool,
 )
+from phasesweep.runtime.process import read_proc_starttime
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -215,11 +217,67 @@ def test_launch_passes_config_snapshot_to_runner(
     assert config_arg.read_bytes() == config.read_bytes()
     assert sha_arg == registry.get("srv").config_sha256
     assert config_arg == registry.state_dir / "logs" / f"{result['run_id']}.config.yaml"
+    assert Path(cmd[cmd.index("--state-dir") + 1]) == registry.state_dir
+    assert cmd[cmd.index("--experiment-id") + 1] == "srv"
     assert list(config_arg.parent.glob("*.tmp")) == []
     assert list(config_arg.parent.glob(".*.tmp")) == []
     handle = store.get(result["run_id"])
     assert handle is not None
     assert handle.launch_state == "spawned"
+    assert cmd[cmd.index("--started-at") + 1] == handle.started_at
+
+
+def test_runner_persists_spawned_handle_for_restart_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-recover"
+    started_at = "2026-06-24T00:00:00Z"
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    calls: list[tuple[str, str | None, bool]] = []
+
+    def fake_run_config(config_obj: Experiment, *, from_phase: str | None, dry_run: bool) -> None:
+        calls.append((config_obj.experiment, from_phase, dry_run))
+
+    monkeypatch.setattr("phasesweep.mcp.runner.run_config", fake_run_config)
+
+    assert (
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(store.status_path(run_id)),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                started_at,
+            ]
+        )
+        == 0
+    )
+
+    handle = store.get(run_id)
+    assert handle is not None
+    assert handle.launch_state == "spawned"
+    assert handle.experiment_id == "srv"
+    assert handle.config_sha256 == config_sha256
+    assert handle.pid == os.getpid()
+    assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
+    assert handle.pid_starttime == read_proc_starttime(os.getpid())
+    assert handle.started_at == started_at
+    assert Path(handle.log_path) == store.log_path(run_id)
+    assert Path(handle.status_path) == store.status_path(run_id)
+    assert store.state(handle) == "succeeded"
+    assert calls == [("srv", None, False)]
 
 
 def test_launch_does_not_spawn_when_pending_handle_save_fails(
@@ -444,19 +502,27 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
 
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    status_path = tmp_path / "status.json"
+    store = RunStore(tmp_path / "state")
+    run_id = "r1"
+    status_path = store.status_path(run_id)
 
     with pytest.raises(RuntimeError, match="hash mismatch"):
         runner_main(
             [
                 "--run-id",
-                "r1",
+                run_id,
                 "--config",
                 str(config),
                 "--config-sha256",
                 "0" * 64,
                 "--status-path",
                 str(status_path),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                "2026-06-24T00:00:00Z",
             ]
         )
 

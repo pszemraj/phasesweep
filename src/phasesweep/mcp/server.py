@@ -828,6 +828,12 @@ class PhaseSweepMCP:
             reg.config_sha256,
             "--status-path",
             str(status_path),
+            "--state-dir",
+            str(self._registry.state_dir),
+            "--experiment-id",
+            reg.id,
+            "--started-at",
+            pending.started_at,
         ]
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]

@@ -104,7 +104,7 @@ than kept in memory - so a server restart re-discovers live runs from their
 handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
-Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts and replaces it with the spawned process identity after `Popen`; if the server dies during launch, a restarted server can still see the attempted run instead of losing the lifecycle record completely. If the final spawned-handle save fails after `Popen`, the server terminates the spawned runner and the original `launching` handle remains as a failed tombstone rather than blocking relaunch.
+Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts; after `Popen`, both the server and the runner persist the spawned process identity. The runner writes its own handle before launching training work, so a server restart can still rediscover a surviving runner if the server died after `Popen` but before its own final save. If the server's final spawned-handle save fails, it terminates the spawned runner rather than leaving an untracked sweep behind.
 
 ## Limitations (v1)
 

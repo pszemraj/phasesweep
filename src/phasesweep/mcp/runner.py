@@ -12,12 +12,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import sys
 from pathlib import Path
 
 from phasesweep.config import load_config
 from phasesweep.engine import run_config
-from phasesweep.mcp.runs import write_status_file
+from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
+from phasesweep.runtime.process import read_proc_starttime
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
@@ -42,6 +44,35 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _persist_spawned_handle(
+    *,
+    state_dir: Path,
+    run_id: str,
+    experiment_id: str,
+    config_sha256: str,
+    started_at: str,
+    status_path: Path,
+) -> None:
+    """Persist this runner's process identity before it launches any training work."""
+    store = RunStore(state_dir)
+    pid = os.getpid()
+    pgid = os.getpgrp() if hasattr(os, "getpgrp") else pid
+    store.save(
+        RunHandle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            config_sha256=config_sha256,
+            pid=pid,
+            pgid=pgid,
+            pid_starttime=read_proc_starttime(pid),
+            started_at=started_at,
+            log_path=str(store.log_path(run_id)),
+            status_path=str(status_path),
+            launch_state="spawned",
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json.
 
@@ -53,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True, type=Path)  # snapshot, server-supplied
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--status-path", required=True, type=Path)
+    parser.add_argument("--state-dir", required=True, type=Path)
+    parser.add_argument("--experiment-id", required=True)
+    parser.add_argument("--started-at", required=True)
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
 
@@ -68,6 +102,17 @@ def main(argv: list[str] | None = None) -> int:
 
     status: dict = {"run_id": args.run_id, "returncode": 0, "error_class": None}
     try:
+        # The server also saves this handle after Popen returns. The runner's
+        # self-write closes the restart-recovery window if the server dies
+        # after Popen but before its own spawned-handle save reaches disk.
+        _persist_spawned_handle(
+            state_dir=args.state_dir,
+            run_id=args.run_id,
+            experiment_id=args.experiment_id,
+            config_sha256=args.config_sha256,
+            started_at=args.started_at,
+            status_path=args.status_path,
+        )
         actual_sha256 = _sha256_file(args.config)
         if actual_sha256 != args.config_sha256:
             raise RuntimeError("config snapshot hash mismatch; refusing to run")

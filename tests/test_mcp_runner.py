@@ -18,6 +18,9 @@ import pytest
 
 from phasesweep.config import load_config
 from phasesweep.engine import read_status
+from phasesweep.engine.state import _trial_dir_for
+from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.time import utc_now_iso
 from tests.conftest import REPO
 from tests.mcp_helpers import slow_mcp_config_text
 
@@ -50,27 +53,37 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
             )
         status = read_status(experiment)
         if status["phases"][0]["running"] >= 1:
-            return
+            trial_dir = _trial_dir_for(experiment, "p", 0)
+            if (trial_dir / "pid").is_file() and (trial_dir / "pgid").is_file():
+                return
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
 
 
 def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
-    status_path = tmp_path / "status.json"
-    log_path = tmp_path / "runner.log"
+    store = RunStore(tmp_path / "state")
+    run_id = "r1"
+    status_path = store.status_path(run_id)
+    log_path = store.log_path(run_id)
     cmd = [
         sys.executable,
         "-m",
         "phasesweep.mcp.runner",
         "--run-id",
-        "r1",
+        run_id,
         "--config",
         str(config),
         "--config-sha256",
         hashlib.sha256(config.read_bytes()).hexdigest(),
         "--status-path",
         str(status_path),
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--experiment-id",
+        "cancel_me",
+        "--started-at",
+        utc_now_iso(),
     ]
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(
