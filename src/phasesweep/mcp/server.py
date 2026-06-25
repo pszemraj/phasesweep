@@ -230,7 +230,9 @@ class CancelSweepResult(_ToolPayload):
     state: RunState
     cleanup_confirmed: bool | None = Field(
         default=None,
-        description="Whether the runner process group is gone; null when the run was already terminal.",
+        description=(
+            "Whether runner cleanup was fully confirmed; null when the run was already terminal."
+        ),
     )
 
 
@@ -687,21 +689,21 @@ class PhaseSweepMCP:
                     result_counts={"runs": 1},
                 )
                 return result
-            # SIGTERM -> grace -> SIGKILL on the runner's process group. The runner's
-            # installed shutdown handler tears down the trial process groups and writes
-            # status.json(143). cleanup_confirmed reports the runner group is gone, not
-            # a guarantee about trial descendants (those are handled by the runner's
-            # handler, or by the next launch's stale reaper on a SIGKILL escalation).
-            confirmed = kill_stale_group(
+            # SIGTERM -> grace -> SIGKILL on the runner's process group. A
+            # runner-written status is the evidence that its shutdown handler ran
+            # and cleaned trial process groups. If the server had to force-kill the
+            # runner before that status appeared, the runner PGID may be gone while
+            # child trial PGIDs still live, so keep the run live and fail closed.
+            runner_group_gone = kill_stale_group(
                 handle.pid,
                 handle.pid_starttime,
                 pgid=handle.pgid,
             )
+            runner_recorded_status = self._runs.has_recorded_status(handle)
+            confirmed = runner_group_gone and runner_recorded_status
             if confirmed:
                 self._runs.clear_cleanup_uncertain(handle)
-                # If escalation to SIGKILL killed the runner before it recorded a
-                # graceful 143, attribute this operator-initiated stop as cancelled
-                # so the state below isn't a misleading 'failed'. No-op otherwise.
+                # No-op when the runner already recorded its own terminal status.
                 self._runs.mark_cancelled_if_unrecorded(handle)
             else:
                 self._runs.mark_cleanup_uncertain(handle)

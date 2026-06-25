@@ -298,6 +298,14 @@ class RunStore:
         with contextlib.suppress(OSError):
             write_status_file(self.status_path(handle.run_id), payload)
 
+    def has_recorded_status(self, handle: RunHandle) -> bool:
+        """Return whether the runner wrote a readable terminal status file.
+
+        :param RunHandle handle: Run handle whose status file should be checked.
+        :return bool: ``True`` when a valid runner-written status is present.
+        """
+        return self._read_status(handle) is not None
+
     def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
         """Persist that a cancel attempt could not confirm process-group cleanup.
 

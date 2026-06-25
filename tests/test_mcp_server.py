@@ -586,3 +586,31 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
 
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
+
+
+def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-force-kill"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.save(handle)
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: True)
+
+    result = app.cancel(run_id)
+
+    assert result == {"run_id": run_id, "state": "running", "cleanup_confirmed": False}
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    assert not store.status_path(run_id).exists()
+
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
