@@ -716,6 +716,19 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
+def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool:
+    """Return whether ``pgid`` appears to identify a new group leader.
+
+    A PGID number can later be reused as an ordinary PID in another process
+    group; that does not make ``killpg(pgid, ...)`` unsafe because the process
+    is not a member of the target group. The unsafe case is narrower: a live
+    ``/proc/<pgid>`` entry belongs to process group ``pgid`` but has a different
+    starttime, meaning the saved group ID is now led by an unrelated process.
+    """
+    stat = _read_proc_stat(Path("/proc") / str(pgid))
+    return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime
+
+
 def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
     """Check group liveness using a cached PID set, refreshing only if needed.
 
@@ -800,21 +813,21 @@ def kill_stale_group(
 
     Returns ``True`` only when it is safe to mark the trial ``FAIL``: either
     nothing was alive to clean up, or cleanup ran and the process group is
-    confirmed gone. Returns ``False`` when cleanup is uncertain — PID was
-    reused, permission was denied, or the group survived SIGKILL. Callers
-    must not advance state when this returns ``False`` (review v0.5.7 /
-    blocker 2): a leaked training process can still hold a GPU, scribble
-    over W&B runs, or starve the host scheduler.
+    confirmed gone. Returns ``False`` when cleanup is uncertain — PID/PGID
+    identity was reused unsafely, permission was denied, or the group survived
+    SIGKILL. Callers must not advance state when this returns ``False``
+    (review v0.5.7 / blocker 2): a leaked training process can still hold a
+    GPU, scribble over W&B runs, or starve the host scheduler.
 
     Recovery order (review v0.5.3 / blocker 2):
 
     1. ``pid`` is alive AND saved starttime matches: derive PGID from the live
        PID and kill the group. Starttime check guards against PID reuse.
     2. ``pid`` is alive but starttime mismatches: this is PID reuse by an
-       unrelated process. **Refuse to use the stored PGID** — group leader
-       PID and PGID are typically the same number, so the stored PGID is
-       likely now stamped on the unrelated reused process group too. Killing
-       it would target the wrong group.
+       unrelated process. If the stored PGID proves the old group is gone,
+       cleanup is complete. If the PGID still exists, use it only when the
+       reused PID is not the leader of that group; otherwise fail closed to
+       avoid killing an unrelated process group.
     3. ``pid`` is unrecoverable (dead or never recorded) but ``pgid`` was
        persisted at launch: best-effort PGID kill with a loud warning. The
        root PID may have exited (``shell=True`` shells often do) while
@@ -848,25 +861,46 @@ def kill_stale_group(
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
         elif is_pid_alive(pid) and saved_starttime is not None:
-            # PID reuse detected. Stored PGID is no longer trustworthy because
-            # group leader PID typically equals PGID — refuse to fall through.
-            log.warning(
-                "PID %d is alive but starttime does not match saved value; "
-                "PID was reused. Refusing PGID fallback to avoid killing an "
-                "unrelated process group.",
-                pid,
-            )
-            return False
+            # PID reuse detected. A persisted PGID can still prove cleanup is
+            # complete (group gone) or target original descendants (group alive
+            # but not led by the reused PID). Refuse only when the stored PGID
+            # itself appears to be a reused group leader.
+            if pgid is not None and not _process_group_exists(pgid):
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "PID was reused, but stored process group %d no longer "
+                    "exists.",
+                    pid,
+                    pgid,
+                )
+                return True
+            if pgid is None:
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "PID was reused and no stored PGID is available. Cleanup "
+                    "status is uncertain.",
+                    pid,
+                )
+                return False
+            if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "stored PGID %d is led by a different process. Refusing "
+                    "PGID fallback to avoid killing an unrelated process group.",
+                    pid,
+                    pgid,
+                )
+                return False
 
     if target_pgid is None and pgid is not None and saved_starttime is not None:
-        pgid_starttime = read_proc_starttime(pgid)
-        if pgid_starttime is not None and pgid_starttime != saved_starttime:
+        if not _process_group_exists(pgid):
+            return True
+        if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
             log.warning(
-                "Stored PGID %d is now the PID of a different process "
-                "(starttime %s != saved %s). Refusing PGID fallback to avoid "
-                "killing an unrelated process group.",
+                "Stored PGID %d is now led by a different process. Refusing "
+                "PGID fallback to avoid killing an unrelated process group "
+                "(saved starttime %s).",
                 pgid,
-                pgid_starttime,
                 saved_starttime,
             )
             return False
@@ -876,7 +910,7 @@ def kill_stale_group(
             # No identity at all → nothing alive to clean up.
             return True
         log.warning(
-            "Root PID is gone or unrecoverable; using stored PGID %d for "
+            "Root PID is gone, reused, or unrecoverable; using stored PGID %d for "
             "best-effort cleanup of stale trial process group.",
             pgid,
         )
