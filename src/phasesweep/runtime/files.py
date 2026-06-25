@@ -105,9 +105,17 @@ def lock_dir() -> Path:
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     path = Path(override) if override else _DEFAULT_LOCK_DIR
-    path.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        path.chmod(0o1777)
+    created = False
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+        created = True
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+
+    if override is None or created:
+        with contextlib.suppress(OSError):
+            path.chmod(0o1777)
     return path
 
 

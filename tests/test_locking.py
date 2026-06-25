@@ -44,6 +44,21 @@ def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.M
 
     assert path == override
     assert path.is_dir()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o1777
+
+
+def test_lock_dir_preserves_existing_override_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "operator-managed-locks"
+    override.mkdir()
+    override.chmod(0o750)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+
+    path = runtime_files.lock_dir()
+
+    assert path == override
+    assert stat.S_IMODE(path.stat().st_mode) == 0o750
 
 
 def test_run_lock_collides_for_same_storage_different_workdirs(
