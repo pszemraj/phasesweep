@@ -858,6 +858,7 @@ class PhaseSweepMCP:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # own session/pgid; survives restart; signal as a group
+                cwd=str(reg.cwd),
             )
         return RunHandle(
             run_id=run_id,

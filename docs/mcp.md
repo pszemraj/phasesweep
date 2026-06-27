@@ -14,6 +14,7 @@ Catalog keys:
 - `max_concurrent_runs`: cap on live sweeps across all catalog entries. The default is `1`.
 - `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
 - `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
+- `experiments[].cwd`: optional detached-runner working directory. Relative paths resolve against the catalog file. The default is the registered config file's directory.
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
@@ -25,7 +26,7 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 
-`state_dir` and `config:` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same artifacts and Optuna studies. Relative paths inside `trial_command` are trainer-owned shell behavior; phasesweep does not rewrite commands.
+`state_dir`, `config:`, and `experiments[].cwd` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same artifacts and Optuna studies. The detached runner always starts with the catalog entry's frozen `cwd`, defaulting to the registered config file's directory. Relative paths inside `trial_command` are trainer-owned shell behavior; phasesweep does not parse or rewrite commands, but their base directory is no longer inherited from the MCP server process.
 
 ### Concurrency and single-GPU hosts
 
@@ -46,7 +47,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 
 A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
 
-`cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group is gone and the runner wrote a readable terminal status, which is the evidence that its shutdown handler ran and asked the engine to tear down active trial process groups. If the runner group is gone but no status was recorded, the server treats cleanup as uncertain because force-killing the runner may leave trial process groups alive; it writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. Retry cancellation after inspecting the host; a confirmed retry clears the marker. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
+`cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group is gone and the runner wrote a readable terminal status whose own `cleanup_confirmed` field is `true`. That field is emitted by the engine shutdown handler after it terminates active trial process groups through the same confirmed cleanup path used by stale-trial recovery. If the runner group is gone but no status was recorded, or the status reports unconfirmed trial cleanup, the server writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 

@@ -61,12 +61,14 @@ def _catalog(
     *,
     entry_id: str = "reg_ok",
     allow: dict | None = None,
+    cwd: dict[str, Path] | None = None,
     max_concurrent_runs: int | None = None,
 ) -> Path:
     return write_mcp_catalog(
         tmp_path,
         {entry_id: config},
         allow=allow,
+        cwd=cwd,
         max_concurrent_runs=max_concurrent_runs,
     )
 
@@ -94,6 +96,7 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
 
     reg = registry.get("reg_ok")
     assert reg.config_path == config.resolve()
+    assert reg.cwd == config.resolve().parent
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
     assert not reg.allow_launch
@@ -115,6 +118,14 @@ def test_checked_in_example_catalog_loads() -> None:
     assert reg.allow_from_phase
 
 
+def test_checked_in_tiny_decoder_catalog_pins_repo_cwd() -> None:
+    registry = Registry.load(REPO / "examples" / "tiny_decoder_enwik8" / "catalog.yaml")
+
+    reg = registry.get("tiny-decoder-enwik8-hparams")
+
+    assert reg.cwd == REPO
+
+
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
     _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
     catalog_dir = tmp_path / "catalogs"
@@ -132,6 +143,35 @@ def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> Non
     registry = Registry.load(catalog)
 
     assert registry.state_dir == (catalog_dir / ".mcp").resolve()
+
+
+def test_catalog_cwd_resolves_against_catalog_file(tmp_path: Path) -> None:
+    _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    run_cwd = tmp_path / "run-cwd"
+    run_cwd.mkdir()
+    catalog_dir = tmp_path / "catalogs"
+    catalog_dir.mkdir()
+    catalog = _write(
+        catalog_dir / "catalog.yaml",
+        """\
+        state_dir: .mcp
+        experiments:
+          - id: reg_ok
+            config: ../exp.yaml
+            cwd: ../run-cwd
+        """,
+    )
+
+    reg = Registry.load(catalog).get("reg_ok")
+
+    assert reg.cwd == run_cwd.resolve()
+
+
+def test_catalog_cwd_must_exist(tmp_path: Path) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+
+    with pytest.raises(CatalogError, match="cwd is not an existing directory"):
+        Registry.load(_catalog(tmp_path, config, cwd={"reg_ok": tmp_path / "missing"}))
 
 
 def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:

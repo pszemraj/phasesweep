@@ -340,6 +340,28 @@ def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
     assert store.state(pending) == "failed"
 
 
+def test_launch_spawns_runner_with_registered_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runner_cwd = tmp_path / "runner-cwd"
+    runner_cwd.mkdir()
+    app, _registry, _store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"srv": config},
+            allow=ALLOW_SIDE_EFFECTS,
+            cwd={"srv": runner_cwd},
+        )
+    )
+    captured = patch_popen_capture(monkeypatch)
+
+    app.launch("srv")
+
+    assert captured["cwd"] == str(runner_cwd.resolve())
+
+
 @pytest.mark.parametrize("method_name", ["status", "winners"])
 def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     tmp_path: Path,

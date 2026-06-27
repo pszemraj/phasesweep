@@ -35,7 +35,7 @@ The config uses 1000 training batches per trial. The upstream template does not 
 
 ## MCP Smoke Sweep
 
-Run from the PhaseSweep repo root so the relative `trial_command` in `mcp_experiment.yaml` resolves correctly:
+The catalog pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
 
 ```bash
 conda run -n tr --live-stream phasesweep mcp --catalog examples/tiny_decoder_enwik8/catalog.yaml

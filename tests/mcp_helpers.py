@@ -24,6 +24,7 @@ def write_mcp_catalog(
     entries: Mapping[str, Path],
     *,
     allow: Mapping[str, bool] | None = None,
+    cwd: Mapping[str, Path] | None = None,
     max_concurrent_runs: int | None = None,
     filename: str = "catalog.yaml",
 ) -> Path:
@@ -33,6 +34,8 @@ def write_mcp_catalog(
     lines.append("experiments:")
     for entry_id, config in entries.items():
         lines += [f"  - id: {entry_id}", f"    config: {config}"]
+        if cwd is not None and entry_id in cwd:
+            lines.append(f"    cwd: {cwd[entry_id]}")
         if allow is not None:
             lines.append("    allow:")
             lines.extend(f"      {key}: {str(value).lower()}" for key, value in allow.items())
@@ -46,6 +49,7 @@ def write_mcp_config_catalog(
     configs: Mapping[str, str],
     *,
     allow: Mapping[str, bool] | None = None,
+    cwd: Mapping[str, Path] | None = None,
     max_concurrent_runs: int | None = None,
     filename: str = "catalog.yaml",
 ) -> Path:
@@ -58,6 +62,7 @@ def write_mcp_config_catalog(
         tmp_path,
         entries,
         allow=allow,
+        cwd=cwd,
         max_concurrent_runs=max_concurrent_runs,
         filename=filename,
     )
@@ -229,6 +234,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         assert kwargs.get("start_new_session") is True
         assert stdout is not None and not getattr(stdout, "closed", True)
         captured["cmd"] = cmd
+        captured["cwd"] = kwargs.get("cwd")
         return DummyProc()
 
     monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)

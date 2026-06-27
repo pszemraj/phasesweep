@@ -143,5 +143,5 @@ Cancel only when I ask or when stopping is necessary to prevent an unwanted acti
 - `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` for hosts that can safely run multiple sweeps.
 - `storage must be persistent`: use a persistent Optuna storage URL such as SQLite on disk; in-memory studies cannot be monitored across processes.
 - The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
-- Relative path rejected at startup: catalog `state_dir` and `config` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be absolute for MCP.
+- Relative path rejected at startup: catalog `state_dir`, `config`, and `cwd` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be absolute for MCP.
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.

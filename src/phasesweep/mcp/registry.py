@@ -53,6 +53,10 @@ class _Entry(_CatalogModel):
 
     id: str
     config: Path
+    cwd: Path | None = Field(
+        default=None,
+        description="Directory used as the detached runner working directory.",
+    )
     description: str = ""
     allow: _Allow = Field(default_factory=_Allow)
 
@@ -91,6 +95,7 @@ class RegisteredExperiment:
 
     id: str
     config_path: Path  # absolute, frozen at load
+    cwd: Path  # absolute, frozen at load
     config_sha256: str
     experiment: Experiment
     description: str
@@ -118,6 +123,14 @@ def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
     if expanded.is_absolute():
         return expanded.resolve()
     return (base / expanded).resolve()
+
+
+def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
+    """Resolve an operator path and require that it names an existing directory."""
+    resolved = _resolve_catalog_relative_path(base, path)
+    if not resolved.is_dir():
+        raise CatalogError(f"{label} is not an existing directory: {resolved}")
+    return resolved
 
 
 def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> None:
@@ -204,6 +217,11 @@ class Registry:
             cfg_path = _resolve_catalog_relative_path(base, entry.config)
             if not cfg_path.is_file():
                 raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
+            cwd = _resolve_existing_dir(
+                base,
+                entry.cwd if entry.cwd is not None else cfg_path.parent,
+                label=f"{entry.id!r}: cwd",
+            )
             try:
                 config_bytes = cfg_path.read_bytes()
                 config = load_config_bytes(config_bytes, source=cfg_path)
@@ -224,6 +242,7 @@ class Registry:
             items[entry.id] = RegisteredExperiment(
                 id=entry.id,
                 config_path=cfg_path,
+                cwd=cwd,
                 config_sha256=config_sha256,
                 experiment=config,
                 description=entry.description,
