@@ -20,6 +20,8 @@ conda run -n tr --live-stream python -m pip install -e ".[mcp]"
 
 The submodule pins the external trainer revision used by this example without copying its source into PhaseSweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this PhaseSweep example.
 
+This example is an orchestration smoke test, not a PyTorch training-template recommendation. The pinned upstream trainer still needs its own cleanup for CPU mixed precision defaults and CUDA transfer ergonomics (`pin_memory` and `non_blocking=True` only where they are actually beneficial); track that in the upstream trainer and update the submodule pointer here after it lands.
+
 ## CLI Smoke Sweep
 
 ```bash
