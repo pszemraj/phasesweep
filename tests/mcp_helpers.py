@@ -25,6 +25,7 @@ def write_mcp_catalog(
     *,
     allow: Mapping[str, bool] | None = None,
     cwd: Mapping[str, Path] | None = None,
+    visible_params: Mapping[str, object] | None = None,
     max_concurrent_runs: int | None = None,
     filename: str = "catalog.yaml",
 ) -> Path:
@@ -36,6 +37,13 @@ def write_mcp_catalog(
         lines += [f"  - id: {entry_id}", f"    config: {config}"]
         if cwd is not None and entry_id in cwd:
             lines.append(f"    cwd: {cwd[entry_id]}")
+        if visible_params is not None and entry_id in visible_params:
+            value = visible_params[entry_id]
+            if isinstance(value, list):
+                lines.append("    visible_params:")
+                lines.extend(f"      - {item}" for item in value)
+            else:
+                lines.append(f"    visible_params: {value}")
         if allow is not None:
             lines.append("    allow:")
             lines.extend(f"      {key}: {str(value).lower()}" for key, value in allow.items())
@@ -50,6 +58,7 @@ def write_mcp_config_catalog(
     *,
     allow: Mapping[str, bool] | None = None,
     cwd: Mapping[str, Path] | None = None,
+    visible_params: Mapping[str, object] | None = None,
     max_concurrent_runs: int | None = None,
     filename: str = "catalog.yaml",
 ) -> Path:
@@ -63,6 +72,7 @@ def write_mcp_config_catalog(
         entries,
         allow=allow,
         cwd=cwd,
+        visible_params=visible_params,
         max_concurrent_runs=max_concurrent_runs,
         filename=filename,
     )

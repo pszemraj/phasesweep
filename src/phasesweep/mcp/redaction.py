@@ -8,20 +8,39 @@ redact after the fact.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
 
+VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
-def winners_payload(experiment_id: str, views: list[PhaseWinnerView]) -> dict[str, Any]:
+
+def visible_winner_params(params: dict[str, Any], policy: VisibleParamsPolicy) -> dict[str, Any]:
+    """Filter sampled winner params according to the catalog visibility policy."""
+    if policy == "all":
+        return dict(params)
+    if policy == "none":
+        return {key: "<redacted>" for key in params}
+    visible = set(policy)
+    return {key: value if key in visible else "<redacted>" for key, value in params.items()}
+
+
+def winners_payload(
+    experiment_id: str,
+    views: list[PhaseWinnerView],
+    *,
+    visible_params: VisibleParamsPolicy = "none",
+) -> dict[str, Any]:
     """Build the ``get_winners`` payload from path-free phase-winner views.
 
-    MCP output exposes sampled ``params`` only. ``effective_overrides`` can
-    include config-authored fixed or inherited values, so it is intentionally
-    kept out of agent-visible tool results.
+    MCP output exposes sampled ``params`` only, and values are redacted unless
+    the catalog explicitly allows them. ``effective_overrides`` can include
+    config-authored fixed or inherited values, so it is intentionally kept out
+    of agent-visible tool results.
 
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
+    :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     return {
@@ -31,7 +50,7 @@ def winners_payload(experiment_id: str, views: list[PhaseWinnerView]) -> dict[st
                 "phase": v.phase,
                 "trial_number": v.trial_number,
                 "metric": v.metric,
-                "params": v.params,
+                "params": visible_winner_params(v.params, visible_params),
                 "gates_passed": v.gates_passed,
                 "incomplete": v.incomplete,
             }

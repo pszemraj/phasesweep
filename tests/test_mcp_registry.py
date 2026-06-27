@@ -113,6 +113,7 @@ def test_checked_in_example_catalog_loads() -> None:
     assert Path(reg.experiment.workdir).is_absolute()
     assert reg.experiment.storage == "sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db"
     assert registry.state_dir == Path("/tmp/phasesweep-mcp-tiny-lm/state")
+    assert reg.visible_params == "all"
     assert reg.allow_launch
     assert reg.allow_cancel
     assert reg.allow_from_phase
@@ -124,6 +125,7 @@ def test_checked_in_tiny_decoder_catalog_pins_repo_cwd() -> None:
     reg = registry.get("tiny-decoder-enwik8-hparams")
 
     assert reg.cwd == REPO
+    assert reg.visible_params == "all"
 
 
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
@@ -172,6 +174,38 @@ def test_catalog_cwd_must_exist(tmp_path: Path) -> None:
 
     with pytest.raises(CatalogError, match="cwd is not an existing directory"):
         Registry.load(_catalog(tmp_path, config, cwd={"reg_ok": tmp_path / "missing"}))
+
+
+def test_catalog_visible_params_policy(tmp_path: Path) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+
+    all_policy = Registry.load(
+        write_mcp_catalog(tmp_path, {"reg_ok": config}, visible_params={"reg_ok": "all"})
+    ).get("reg_ok")
+    allowlist_policy = Registry.load(
+        write_mcp_catalog(
+            tmp_path,
+            {"reg_ok": config},
+            visible_params={"reg_ok": ["lr", "dataset"]},
+            filename="allowlist.catalog.yaml",
+        )
+    ).get("reg_ok")
+
+    assert all_policy.visible_params == "all"
+    assert allowlist_policy.visible_params == ["lr", "dataset"]
+
+
+def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+
+    with pytest.raises(CatalogError, match="visible_params"):
+        Registry.load(
+            write_mcp_catalog(
+                tmp_path,
+                {"reg_ok": config},
+                visible_params={"reg_ok": "sometimes"},
+            )
+        )
 
 
 def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:

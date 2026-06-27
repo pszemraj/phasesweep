@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -27,6 +27,8 @@ from phasesweep.runtime.files import (
     storage_backend,
     storage_is_in_memory,
 )
+
+VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
 
 class _CatalogModel(BaseModel):
@@ -59,6 +61,12 @@ class _Entry(_CatalogModel):
     )
     description: str = ""
     allow: _Allow = Field(default_factory=_Allow)
+    visible_params: VisibleParamsPolicy = Field(
+        default="none",
+        description=(
+            "Sampled winner param values exposed to agents: 'none', 'all', or an allowlist."
+        ),
+    )
 
     @field_validator("id")
     @classmethod
@@ -73,6 +81,20 @@ class _Entry(_CatalogModel):
         if not SAFE_NAME_PATTERN.fullmatch(value):
             raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
         return value
+
+    @field_validator("visible_params")
+    @classmethod
+    def _valid_visible_params(cls, value: VisibleParamsPolicy) -> VisibleParamsPolicy:
+        """Validate sampled-parameter visibility policy."""
+        if isinstance(value, str):
+            if value not in {"none", "all"}:
+                raise ValueError("visible_params must be 'none', 'all', or a list of keys")
+            return value
+        normalized = [key.strip() for key in value]
+        bad = [key for key in normalized if not key]
+        if bad:
+            raise ValueError("visible_params keys must be non-empty")
+        return list(dict.fromkeys(normalized))
 
 
 class _Catalog(_CatalogModel):
@@ -102,6 +124,7 @@ class RegisteredExperiment:
     allow_launch: bool
     allow_cancel: bool
     allow_from_phase: bool
+    visible_params: VisibleParamsPolicy
 
     @property
     def phase_names(self) -> list[str]:
@@ -249,6 +272,7 @@ class Registry:
                 allow_launch=entry.allow.launch,
                 allow_cancel=entry.allow.cancel,
                 allow_from_phase=entry.allow.from_phase,
+                visible_params=entry.visible_params,
             )
         return cls(
             state_dir=_resolve_catalog_relative_path(base, catalog.state_dir),

@@ -125,7 +125,7 @@ Use the local phasesweep MCP server only through the exposed catalog.
 Start with phasesweep_list_experiments and phasesweep_validate_config.
 Launch only by catalog experiment id. After launch, poll phasesweep_get_status by run_id until terminal, then call phasesweep_get_winners with the same run_id.
 Do not ask for or infer config paths, storage URLs, workdirs, commands, environment variables, run-control settings, raw datasets, labels, predictions, logs, result files, dashboards, or per-trial histories unless I explicitly ask for separate filesystem or dashboard work.
-Base recommendations on catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective, extractor, command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I ask for config-authoring help.
+Base recommendations on catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted by catalog policy. Treat `<redacted>` sampled param values as intentional, not as missing data. Do not change the objective, extractor, command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I ask for config-authoring help.
 Cancel only when I ask or when stopping is necessary to prevent an unwanted active sweep.
 ```
 

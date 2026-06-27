@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.mcp.redaction import status_payload, winners_payload
+from phasesweep.mcp.redaction import status_payload, visible_winner_params, winners_payload
 from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
@@ -84,3 +84,36 @@ def test_assert_no_sensitive_actually_catches_a_leak() -> None:
     leaky = {"experiment_id": "x", "note": "token=DANGER_TOKEN"}
     with pytest.raises(AssertionError):
         assert_no_sensitive(leaky, ["DANGER_TOKEN"])
+
+
+def test_winner_params_redacted_by_default() -> None:
+    payload = winners_payload(
+        "redact_me",
+        [
+            PhaseWinnerView(
+                "p",
+                0,
+                0.1,
+                {"dataset": "SECRET_DATASET", "lr": 3e-4},
+                {"dataset": "SECRET_DATASET", "lr": 3e-4},
+                None,
+                False,
+            )
+        ],
+    )
+
+    assert payload["phases"][0]["params"] == {
+        "dataset": "<redacted>",
+        "lr": "<redacted>",
+    }
+    assert "SECRET_DATASET" not in str(payload)
+
+
+def test_visible_winner_params_supports_allowlist_and_all() -> None:
+    params = {"dataset": "SECRET_DATASET", "lr": 3e-4}
+
+    assert visible_winner_params(params, ["lr"]) == {
+        "dataset": "<redacted>",
+        "lr": 3e-4,
+    }
+    assert visible_winner_params(params, "all") == params

@@ -106,6 +106,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
             assert isinstance(p["metric"], float)
             assert p["metric"] == p["metric"]  # not NaN
             assert "params" in p
+            assert set(p["params"].values()) == {"<redacted>"}
             assert "effective_overrides" not in p
         # The chained phase reports only its sampled winner params; inherited
         # fixed/effective values stay out of MCP tool output.

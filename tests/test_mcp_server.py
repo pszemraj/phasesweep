@@ -33,8 +33,8 @@ from tests.mcp_helpers import (
     make_run_handle,
     mcp_experiment_config_text,
     patch_popen_capture,
-    write_run_status,
     write_mcp_catalog,
+    write_run_status,
 )
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
@@ -438,6 +438,29 @@ def test_winners_requires_exactly_one_identifier(tmp_path: Path) -> None:
         app.winners(experiment_id="srv", run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
         app.winners(run_id="nope-123")
+
+
+def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    default_app, default_registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    reg = default_registry.get("srv")
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+    )
+
+    assert default_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": "<redacted>"}
+
+    visible_app, _visible_registry, _visible_store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"srv": config},
+            visible_params={"srv": ["lr"]},
+        )
+    )
+
+    assert visible_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": 0.001}
 
 
 def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:

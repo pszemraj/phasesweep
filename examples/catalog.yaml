@@ -9,6 +9,7 @@ max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps
 experiments:
   - id: tiny-lm                 # the only token the agent ever sends
     config: ./mcp_experiment.yaml   # resolved relative to this catalog, frozen at startup
+    visible_params: all         # toy example values are safe to show; production defaults to redacted
     description: "16 MB LM: pick depth, then lr, then regularization"
     allow:
       launch: true              # side effects default false; opt in deliberately

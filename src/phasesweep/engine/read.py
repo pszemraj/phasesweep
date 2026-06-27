@@ -29,9 +29,9 @@ class PhaseWinnerView:
     """A phase winner reduced to the fields a caller may safely see.
 
     Notably absent: any filesystem path, the trial command, the environment,
-    and the storage URL. ``effective_overrides`` is the composed hyperparameter
-    set (inherited + fixed + sampled) - i.e. "the best parameters" - and is the
-    point of this view, not a leak.
+    and the storage URL. ``effective_overrides`` is included for trusted engine
+    and CLI readers that need the composed hyperparameter set; MCP filters it
+    out before returning agent-visible payloads.
     """
 
     phase: str

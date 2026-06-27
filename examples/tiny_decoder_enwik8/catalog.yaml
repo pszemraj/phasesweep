@@ -7,6 +7,7 @@ experiments:
   - id: tiny-decoder-enwik8-hparams
     config: ./mcp_experiment.yaml
     cwd: ../..
+    visible_params: all
     description: "Tiny Enwik8 decoder GPU sweep over LR, weight decay, and gradient clipping"
     allow:
       launch: true

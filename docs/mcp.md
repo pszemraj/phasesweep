@@ -15,6 +15,7 @@ Catalog keys:
 - `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
 - `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
 - `experiments[].cwd`: optional detached-runner working directory. Relative paths resolve against the catalog file. The default is the registered config file's directory.
+- `experiments[].visible_params`: sampled winner parameter values exposed to agents. Use `none` (default), `all`, or a list of allowed parameter keys. Parameter names remain visible; values outside the policy are returned as `<redacted>`.
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
@@ -41,7 +42,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
-| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, sampled params, gate status, and completeness |
+| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, gate status, and completeness |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
@@ -77,9 +78,9 @@ The catalog is the trust boundary. By construction the agent **cannot**:
 - double-launch (rejected by a run-handle check and ultimately the engine's
   same-host lock), delete runs, or corrupt state.
 
-Outbound payloads are built only from path-free typed views. `phasesweep_get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. Sampled `params` are intentionally visible so an agent can compare the winning hyperparameters; do not put secrets, access tokens, private paths, dataset ids, hostnames, or other sensitive values in searchable parameter choices. Keep sensitive values in the trainer environment or fixed config fields that MCP does not expose. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
+Outbound payloads are built only from path-free typed views. `phasesweep_get_winners` returns sampled `params` and omits composed `effective_overrides`, because those can include operator-authored fixed or inherited values such as private dataset ids, paths, or tokens. Sampled param names are visible so an agent can see which hyperparameters won; sampled values default to `<redacted>` unless the catalog entry sets `visible_params: all` or an allowlist such as `visible_params: [lr, weight_decay]`. Keep secrets, access tokens, private paths, dataset ids, hostnames, or other sensitive values out of searchable parameter choices unless you deliberately expose them through that policy. A backstop converts any unexpected error into a generic `"internal error"` rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
 
-`phasesweep_get_winners` intentionally exposes each completed phase winner's objective metric value. It does not expose per-trial metric histories, raw result files, trainer logs, datasets, target/dependent-variable values, validation labels, predictions, W&B dashboards, or rendered commands. If those values should stay out of the agent context, keep them out of sampled parameter values and do not give the same agent separate filesystem or dashboard access to the run artifacts.
+`phasesweep_get_winners` intentionally exposes each completed phase winner's objective metric value. It does not expose per-trial metric histories, raw result files, trainer logs, datasets, target/dependent-variable values, validation labels, predictions, W&B dashboards, or rendered commands. If sampled parameter values should stay out of the agent context, keep `visible_params` at the default `none` and do not give the same agent separate filesystem or dashboard access to the run artifacts.
 
 This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
 

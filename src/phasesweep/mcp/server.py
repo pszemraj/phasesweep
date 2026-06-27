@@ -200,7 +200,10 @@ class WinnerPhasePayload(_ToolPayload):
     trial_number: int = Field(ge=0)
     metric: float
     params: dict[str, Any] = Field(
-        description="Sampled winning hyperparameters only; fixed/inherited overrides are omitted."
+        description=(
+            "Sampled winning hyperparameters only; fixed/inherited overrides are omitted. "
+            "Values may be redacted by catalog visible_params policy."
+        )
     )
     gates_passed: bool | None = Field(
         description="True/false when gates were declared; null when the phase has no gates."
@@ -547,7 +550,12 @@ class PhaseSweepMCP:
                 run_id=run_id,
                 include_run=False,
             )
-            result = winners_payload(target_id, read_winners(experiment))
+            visible_params = self._registry.get(target_id).visible_params
+            result = winners_payload(
+                target_id,
+                read_winners(experiment),
+                visible_params=visible_params,
+            )
         except Exception as exc:
             self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
             raise
@@ -1014,9 +1022,9 @@ Start by calling phasesweep_list_experiments, then call phasesweep_validate_conf
 
 If asked to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when explicitly asked to resume from a phase or when earlier phase winners are already confirmed. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
 
-Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible hyperparameters, not secrets. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
+Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible only when their values are not <redacted>; redacted values are intentionally withheld by catalog policy. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
 
-When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
+When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
 
 Use phasesweep_cancel_sweep only when explicitly asked to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep."""
 
@@ -1098,7 +1106,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetWinnersResult:
-        """Return the winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Provide exactly one of experiment_id or run_id. Read-only.
+        """Return policy-filtered winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Provide exactly one of experiment_id or run_id. Read-only.
 
         :param MaybeExperimentId experiment_id: Optional catalog experiment id whose winners should be read.
         :param MaybeRunId run_id: Optional detached run id whose snapshot should be read.
