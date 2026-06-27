@@ -151,6 +151,14 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
 
+    def cleanup_recovery_path(self, run_id: str) -> Path:
+        """Path to the operator recovery evidence file for a run.
+
+        :param str run_id: Run id whose recovery evidence path should be returned.
+        :return Path: Operator-only cleanup recovery JSON path.
+        """
+        return self._logs_dir / f"{run_id}.cleanup_recovery.json"
+
     def save(self, handle: RunHandle) -> None:
         """Persist a run handle as JSON under the runs dir.
 

@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from click.testing import CliRunner
 
+from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _phase_fingerprint
 from phasesweep.engine.state import _winner_path
@@ -706,3 +708,61 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
 
     assert result == {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
     assert not store.cleanup_uncertain_path(run_id).exists()
+
+
+def test_operator_recovery_clears_no_status_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-operator-recover"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
+
+    runner = CliRunner()
+    dry = runner.invoke(
+        cli_main,
+        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+
+    assert dry.exit_code == 0, dry.output
+    assert "Re-run with --confirm" in dry.output
+    assert store.cleanup_uncertain_path(run_id).is_file()
+
+    confirmed = runner.invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "Cleared cleanup-uncertain marker" in confirmed.output
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["run_id"] == run_id
+    assert recovery["cleanup_confirmed"] is True
+
+    captured = patch_popen_capture(monkeypatch)
+    launched = app.launch("srv")
+    assert launched["state"] == "running"
+    assert captured["cmd"]

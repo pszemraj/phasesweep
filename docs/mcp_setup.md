@@ -141,6 +141,7 @@ Cancel only when I ask or when stopping is necessary to prevent an unwanted acti
 - `action 'launch' is not permitted`: set `allow.launch: true` for that catalog entry and restart the MCP client.
 - `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
 - `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` for hosts that can safely run multiple sweeps.
+- A cancelled run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` and repeat with `--confirm` only if the command reports confirmed cleanup.
 - `storage must be persistent`: use a persistent Optuna storage URL such as SQLite on disk; in-memory studies cannot be monitored across processes.
 - The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
 - Relative path rejected at startup: catalog `state_dir`, `config`, and `cwd` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be absolute for MCP.

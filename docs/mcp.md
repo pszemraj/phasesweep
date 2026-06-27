@@ -49,6 +49,8 @@ A launched sweep runs as a **detached background process** in its own session, s
 
 `cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group is gone and the runner wrote a readable terminal status whose own `cleanup_confirmed` field is `true`. That field is emitted by the engine shutdown handler after it terminates active trial process groups through the same confirmed cleanup path used by stale-trial recovery. If the runner group is gone but no status was recorded, or the status reports unconfirmed trial cleanup, the server writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
 
+Cleanup-uncertain recovery is operator-only. After inspecting the host, run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` to re-check the runner identity and invoke the engine stale-trial reaper against the saved config snapshot. If it reports that cleanup appears confirmed, repeat with `--confirm` to clear the marker. MCP deliberately has no tool for clearing this marker.
+
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
 When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads.
@@ -91,6 +93,7 @@ Run handles and per-run logs live under `state_dir`:
 - `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
 - `state_dir/logs/<run_id>.config.yaml` - the exact config snapshot executed by
   the runner (operator-only; may contain command, storage, env, and overrides).
+- `state_dir/logs/<run_id>.cleanup_recovery.json` - operator recovery evidence written by `phasesweep mcp-recover-run --confirm`.
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 

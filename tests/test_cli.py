@@ -21,11 +21,13 @@ def test_help_output_is_operator_readable() -> None:
     assert result.exit_code == 0
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
     assert "-h, --help" in result.output
-    assert "mcp           Serve the MCP broker." in result.output
-    assert "run           Run configured phases." in result.output
-    assert "show-winners  Print saved phase winners." in result.output
-    assert "status        Print read-only run status." in result.output
-    assert "validate      Validate a config file." in result.output
+    assert "mcp" in result.output and "Serve the MCP broker." in result.output
+    assert "mcp-recover-run" in result.output
+    assert "Recover a cleanup-uncertain MCP run." in result.output
+    assert "run" in result.output and "Run configured phases." in result.output
+    assert "show-winners" in result.output and "Print saved phase winners." in result.output
+    assert "status" in result.output and "Print read-only run status." in result.output
+    assert "validate" in result.output and "Validate a config file." in result.output
     assert "Args:" not in result.output
 
     for command in ("run", "validate", "show-winners", "status"):
@@ -36,6 +38,14 @@ def test_help_output_is_operator_readable() -> None:
         assert "Usage:" in result.output
         assert "CONFIG" in result.output
         assert "-h, --help" in result.output
+
+    recovery_help = runner.invoke(cli_main, ["mcp-recover-run", "--help"], terminal_width=120)
+    assert recovery_help.exit_code == 0
+    assert "Args:" not in recovery_help.output
+    assert "--state-dir" in recovery_help.output
+    assert "--run-id" in recovery_help.output
+    assert "--confirm" in recovery_help.output
+    assert "-h, --help" in recovery_help.output
 
     run_help = runner.invoke(cli_main, ["run", "--help"], terminal_width=120).output
     assert "--from-phase PHASE" in run_help

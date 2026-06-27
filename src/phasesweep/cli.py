@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -10,8 +11,18 @@ import click
 
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import config_status, run_config
+from phasesweep.engine.guards import _reap_stale_trials
+from phasesweep.engine.optuna import _create_phase_study
 from phasesweep.engine.state import _winner_path
-from phasesweep.runtime.process import install_signal_handlers
+from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.files import atomic_write_text
+from phasesweep.runtime.process import (
+    install_signal_handlers,
+    is_pid_zombie,
+    is_same_process,
+    kill_stale_group,
+)
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
@@ -187,6 +198,90 @@ def status(config_path: Path) -> None:
     """Print read-only run status for ``config_path``."""
     config = load_config(config_path)
     click.echo(_format_status(config_status(config)))
+
+
+@main.command(
+    name="mcp-recover-run",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Operator-only recovery for an MCP run with a cleanup-uncertain marker. "
+        "Checks the runner identity and reaps stale trials before clearing the marker."
+    ),
+    short_help="Recover a cleanup-uncertain MCP run.",
+)
+@click.option(
+    "--state-dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="MCP state_dir containing runs/ and logs/.",
+)
+@click.option("--run-id", required=True, help="MCP run id to recover.")
+@click.option(
+    "--confirm",
+    is_flag=True,
+    help="Clear the cleanup-uncertain marker after checks pass.",
+)
+def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
+    """Recover one cleanup-uncertain MCP run after local host inspection."""
+    store = RunStore(state_dir)
+    handle = store.get(run_id)
+    if handle is None:
+        raise click.ClickException(f"unknown run id: {run_id}")
+    if not store.cleanup_uncertain_path(run_id).is_file():
+        click.echo("No cleanup-uncertain marker exists for this run.")
+        return
+
+    if _runner_appears_live(handle.pid, handle.pid_starttime):
+        raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
+    if not kill_stale_group(
+        handle.pid,
+        handle.pid_starttime,
+        pgid=handle.pgid,
+        grace_seconds=30.0,
+    ):
+        raise click.ClickException("runner process-group cleanup is still uncertain")
+
+    snapshot = store.config_snapshot_path(run_id)
+    if not snapshot.is_file():
+        raise click.ClickException(f"run config snapshot is missing: {snapshot}")
+    config = load_config(snapshot)
+    if not isinstance(config, Experiment):
+        raise click.ClickException("run snapshot is not a single experiment")
+
+    reaped = 0
+    try:
+        for phase in config.phases:
+            reaped += _reap_stale_trials(
+                _create_phase_study(config, phase, dry_run=False),
+                config,
+                phase.name,
+            )
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if not confirm:
+        click.echo(
+            f"Cleanup appears confirmed for {run_id}; reaped {reaped} stale trial(s). "
+            "Re-run with --confirm to clear the marker."
+        )
+        return
+
+    payload = {
+        "run_id": run_id,
+        "recovered_at": utc_now_iso(),
+        "cleanup_confirmed": True,
+        "reaped_trials": reaped,
+    }
+    atomic_write_text(store.cleanup_recovery_path(run_id), json.dumps(payload, indent=2) + "\n")
+    store.clear_cleanup_uncertain(handle)
+    click.echo(f"Cleared cleanup-uncertain marker for {run_id}; reaped {reaped} stale trial(s).")
+
+
+def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
+    """Return whether a runner PID still appears to be the same live process."""
+    if pid is None:
+        return False
+    return is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
 
 
 @main.command(
