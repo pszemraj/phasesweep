@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.process import PhaseSweepShutdown, read_proc_starttime
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
@@ -98,7 +98,12 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    status: dict = {"run_id": args.run_id, "returncode": 0, "error_class": None}
+    status: dict = {
+        "run_id": args.run_id,
+        "returncode": 0,
+        "error_class": None,
+        "cleanup_confirmed": True,
+    }
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -120,17 +125,25 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config)
         # run_config installs signal handlers and takes the flock internally.
         run_config(config, from_phase=args.from_phase, dry_run=False)
+    except PhaseSweepShutdown as exc:
+        status["returncode"] = int(exc.code)
+        status["error_class"] = "cancelled"
+        status["cleanup_confirmed"] = exc.report.cleanup_confirmed
+        _write_status(args.status_path, status)
+        raise
     except SystemExit as exc:
         # The engine shutdown handler raises SystemExit(128+signum) on
         # SIGTERM/SIGINT - this is the cancel path.
         code = exc.code if isinstance(exc.code, int) else 1
         status["returncode"] = code
         status["error_class"] = "cancelled" if code in (143, 130) else "exited"
+        status["cleanup_confirmed"] = False
         _write_status(args.status_path, status)
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
+        status["cleanup_confirmed"] = False
         _write_status(args.status_path, status)
         raise
     _write_status(args.status_path, status)

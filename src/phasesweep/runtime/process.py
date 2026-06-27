@@ -56,6 +56,33 @@ _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
 )
 
 
+@dataclass(frozen=True)
+class ShutdownCleanupReport:
+    """Cleanup evidence captured when the orchestrator handles a shutdown signal."""
+
+    signum: int
+    cleanup_confirmed: bool
+    child_pgids: tuple[int, ...]
+
+
+class PhaseSweepShutdown(SystemExit):
+    """SystemExit carrying child process-group cleanup evidence."""
+
+    def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
+        """Create a POSIX-style signaled exit with structured cleanup evidence."""
+        super().__init__(128 + signum)
+        self.signum = signum
+        self.report = report
+
+
+_last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
+
+
+def last_shutdown_cleanup_report() -> ShutdownCleanupReport | None:
+    """Return the most recent shutdown cleanup report in this process, if any."""
+    return _last_shutdown_cleanup_report
+
+
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Kill all tracked child process groups, then exit.
 
@@ -89,28 +116,46 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             ``signaled-exit`` convention).
 
     """
-    import time
+    global _last_shutdown_cleanup_report  # noqa: PLW0603
 
     with _launch_lock, _lock:
-        pgids = list(_active_children)
+        pgids = tuple(_active_children)
 
     log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
-    # Phase 1: SIGTERM all groups.
+    confirmed_by_pgid: dict[int, bool] = {}
     for pgid in pgids:
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pgid, signal.SIGTERM)
+        try:
+            confirmed_by_pgid[pgid] = _terminate_process_group(
+                pgid,
+                grace_seconds=_KILL_GRACE_SECONDS,
+            )
+        except Exception:
+            log.exception("Failed while cleaning child process group %d after signal %d", pgid, signum)
+            confirmed_by_pgid[pgid] = False
 
-    if pgids:
-        time.sleep(0.5)  # Brief grace for clean shutdown.
+    cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
+    report = ShutdownCleanupReport(
+        signum=signum,
+        cleanup_confirmed=cleanup_confirmed,
+        child_pgids=pgids,
+    )
+    _last_shutdown_cleanup_report = report
+    if cleanup_confirmed:
+        log.warning(
+            "Received signal %d; confirmed cleanup for %d child group(s)",
+            signum,
+            len(pgids),
+        )
+    else:
+        uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
+        log.error(
+            "Received signal %d; cleanup is uncertain for child group(s): %s",
+            signum,
+            uncertain,
+        )
 
-    # Phase 2: SIGKILL any survivors from the *same snapshot*.
-    for pgid in pgids:
-        if _process_group_exists(pgid):
-            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.killpg(pgid, signal.SIGKILL)
-
-    raise SystemExit(128 + signum)
+    raise PhaseSweepShutdown(signum, report)
 
 
 def _unblock_shutdown_signals() -> None:

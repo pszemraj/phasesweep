@@ -282,6 +282,14 @@ class RunStore:
         """
         return self._read_status(handle) is not None
 
+    def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
+        """Return the runner-written terminal status payload, if readable.
+
+        :param RunHandle handle: Run handle whose terminal status should be returned.
+        :return dict | None: Decoded status payload, or ``None`` when absent or malformed.
+        """
+        return self._read_status(handle)
+
     def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
         """Persist that a cancel attempt could not confirm process-group cleanup.
 

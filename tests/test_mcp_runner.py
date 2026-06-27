@@ -21,6 +21,7 @@ from phasesweep.engine import read_status
 from phasesweep.engine.state import _trial_dir_for
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.process import _process_group_alive
 from tests.conftest import REPO
 from tests.mcp_helpers import slow_mcp_config_text
 
@@ -43,7 +44,7 @@ def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
     return config
 
 
-def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path) -> None:
+def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path) -> Path:
     experiment = load_config(config)
     deadline = time.time() + 25
     while time.time() < deadline:
@@ -55,7 +56,7 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
         if status["phases"][0]["running"] >= 1:
             trial_dir = _trial_dir_for(experiment, "p", 0)
             if (trial_dir / "pid").is_file() and (trial_dir / "pgid").is_file():
-                return
+                return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
 
@@ -94,7 +95,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
             start_new_session=True,  # runner is its own session/group leader -> pgid == pid
         )
     try:
-        _wait_for_running_trial(config, proc, log_path)
+        trial_dir = _wait_for_running_trial(config, proc, log_path)
+        trial_pgid = int((trial_dir / "pgid").read_text())
 
         # SIGTERM the runner's process group. The trial runs in its OWN session,
         # so this does not reach it directly; the runner's installed shutdown
@@ -113,3 +115,5 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 143
     assert status["error_class"] == "cancelled"
+    assert status["cleanup_confirmed"] is True
+    assert not _process_group_alive(trial_pgid)

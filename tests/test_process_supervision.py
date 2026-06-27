@@ -18,6 +18,7 @@ from phasesweep.engine.guards import _reap_stale_trials
 from phasesweep.engine.state import TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
     _defer_shutdown_signals,
     _shutdown_handler,
     _terminate_process_group,
@@ -272,57 +273,47 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
 def test_shutdown_handler_uses_initial_pgid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SIGKILL phase must still target groups seen during SIGTERM phase.
+    """Shutdown cleanup must target groups seen in the initial snapshot.
 
-    A worker thread can unregister a PGID after the root exits on SIGTERM but
-    before the handler escalates to SIGKILL. Using the initial snapshot
-    prevents that race.
+    A worker thread can unregister a PGID while cleanup is underway. Using the
+    initial snapshot prevents that race from hiding a group from the shutdown
+    report.
     """
-    killed: list[tuple[int, int]] = []
+    terminated: list[int] = []
     active: dict[int, object] = {1234: object()}
 
     monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
 
-    def fake_killpg(pgid: int, sig: int) -> None:
-        killed.append((pgid, sig))
-        # Simulate worker thread unregistering after SIGTERM.
-        if sig == signal.SIGTERM:
-            active.clear()
+    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
+        terminated.append(pgid)
+        active.clear()
+        return True
 
-    monkeypatch.setattr("os.killpg", fake_killpg)
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
 
-    assert (1234, signal.SIGTERM) in killed
-    assert (1234, signal.SIGKILL) in killed, (
-        "SIGKILL must target the initial snapshot even though the registry was cleared"
-    )
+    assert terminated == [1234]
+    assert excinfo.value.report.cleanup_confirmed is True
+    assert excinfo.value.report.child_pgids == (1234,)
 
 
-def test_shutdown_handler_uses_cheap_group_existence_probe(
+def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    killed: list[tuple[int, int]] = []
-
     monkeypatch.setattr("phasesweep.runtime.process._active_children", {1234: object()})
     monkeypatch.setattr(
-        "phasesweep.runtime.process._process_group_alive",
-        lambda pgid: (_ for _ in ()).throw(AssertionError("must not scan /proc")),
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: False,
     )
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
 
-    def fake_killpg(pgid: int, sig: int) -> None:
-        killed.append((pgid, sig))
-
-    monkeypatch.setattr("os.killpg", fake_killpg)
-
-    with pytest.raises(SystemExit):
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
 
-    assert (1234, signal.SIGTERM) in killed
-    assert (1234, signal.SIGKILL) in killed
+    assert int(excinfo.value.code) == 143
+    assert excinfo.value.report.cleanup_confirmed is False
+    assert excinfo.value.report.child_pgids == (1234,)
 
 
 def test_tracked_process_group_alive_uses_cached_members(

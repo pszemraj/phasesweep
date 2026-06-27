@@ -690,17 +690,23 @@ class PhaseSweepMCP:
                 )
                 return result
             # SIGTERM -> grace -> SIGKILL on the runner's process group. A
-            # runner-written status is the evidence that its shutdown handler ran
-            # and cleaned trial process groups. If the server had to force-kill the
-            # runner before that status appeared, the runner PGID may be gone while
-            # child trial PGIDs still live, so keep the run live and fail closed.
+            # runner-written status is useful only when it includes explicit
+            # cleanup evidence from the engine shutdown handler. If the server
+            # had to force-kill the runner first, or the handler reported
+            # uncertainty, child trial PGIDs may still live, so keep the run
+            # counted as live and fail closed.
             runner_group_gone = kill_stale_group(
                 handle.pid,
                 handle.pid_starttime,
                 pgid=handle.pgid,
+                grace_seconds=30.0,
             )
-            runner_recorded_status = self._runs.has_recorded_status(handle)
-            confirmed = runner_group_gone and runner_recorded_status
+            terminal_status = self._runs.recorded_terminal_status(handle)
+            confirmed = (
+                runner_group_gone
+                and terminal_status is not None
+                and terminal_status.get("cleanup_confirmed") is True
+            )
             if confirmed:
                 self._runs.clear_cleanup_uncertain(handle)
             else:
