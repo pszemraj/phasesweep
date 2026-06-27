@@ -227,6 +227,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "n_trials",
         "n_jobs",
         "gpu_ids",
+        "gpu_devices",
         "allow_no_gpu_isolation",
         "max_consecutive_failures",
         "comment",

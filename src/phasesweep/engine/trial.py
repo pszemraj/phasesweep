@@ -112,7 +112,7 @@ def launch_trial(
     trial_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
-    gpu_id: int | None = None,
+    gpu_id: int | str | None = None,
 ) -> ExecutedTrial:
     """Launch the trial subprocess. Call this while holding the GPU lease.
 
@@ -131,7 +131,7 @@ def launch_trial(
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
         timeout_seconds: Wall-clock timeout passed to :func:`run_supervised`,
             or ``None`` for no timeout.
-        gpu_id: GPU index from the pool, or ``None`` for inactive pool;
+        gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
 
     Returns:
@@ -166,7 +166,7 @@ def launch_trial(
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-        log.debug("[%s/trial_%d] GPU assigned: %d", phase_name, trial_id, gpu_id)
+        log.debug("[%s/trial_%d] GPU assigned: %s", phase_name, trial_id, gpu_id)
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 

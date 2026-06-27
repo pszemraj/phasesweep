@@ -213,6 +213,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
                 make_experiment(n_jobs=1),
                 make_experiment(
                     n_jobs=4,
+                    gpu_devices=["GPU-deadbeef"],
                     allow_no_gpu_isolation=True,
                     allow_incomplete_on_timeout=True,
                 ),

@@ -37,7 +37,8 @@ Each phase is one Optuna study in an ordered chain. A phase may inherit winners 
 - `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
 - `n_trials`: trial budget. Increasing it later is a compatible top-up.
 - `n_jobs`: parallel trials inside the phase.
-- `gpu_ids`: explicit CUDA device IDs. When omitted, numeric ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` output is auto-detected, including for `n_jobs == 1`.
+- `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
+- `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
 - `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
 - `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for continuous numeric phases.
 - `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.

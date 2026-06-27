@@ -120,8 +120,12 @@ Experiment:
 
       gpu_ids: "list[int] | None = null"
       # Explicit non-negative CUDA device IDs to lease. When null, phasesweep
-      # auto-detects numeric CUDA_VISIBLE_DEVICES or nvidia-smi output, even
-      # for n_jobs == 1, to avoid double-booking GPUs across local runs.
+      # auto-detects ambient CUDA_VISIBLE_DEVICES tokens or nvidia-smi output,
+      # even for n_jobs == 1, to avoid double-booking GPUs across local runs.
+
+      gpu_devices: "list[str] | None = null"
+      # Explicit CUDA_VISIBLE_DEVICES tokens to lease, such as GPU UUIDs or MIG
+      # instance IDs. Mutually exclusive with gpu_ids.
 
       max_consecutive_failures: "int >= 1 = 5"
       # Abort after this many consecutive failed or infeasible trials. Set high
@@ -272,6 +276,7 @@ Definitions:
     n_trials: "int >= 1 (required)"
     n_jobs: "int >= 1 = 1"
     gpu_ids: "list[int] | None = null"
+    gpu_devices: "list[str] | None = null"
     max_consecutive_failures: "int >= 1 = 5"
     allow_no_gpu_isolation: "bool = false"
     sampler: "Sampler = Sampler(type='tpe', seed=None, n_startup_trials=10)"

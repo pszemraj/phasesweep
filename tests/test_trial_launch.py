@@ -13,7 +13,11 @@ from tests.conftest import make_experiment
 
 
 def _capture_launch_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, experiment_env: dict[str, str] | None = None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    experiment_env: dict[str, str] | None = None,
+    gpu_id: int | str | None = 2,
 ) -> dict[str, str]:
     captured: dict[str, str] = {}
 
@@ -42,7 +46,7 @@ def _capture_launch_env(
         trial_dir=tmp_path / "trial_0",
         overrides={},
         timeout_seconds=None,
-        gpu_id=2,
+        gpu_id=gpu_id,
     )
     return captured
 
@@ -67,3 +71,12 @@ def test_launch_trial_preserves_operator_cuda_device_order(
 
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert env["CUDA_DEVICE_ORDER"] == "FASTEST_FIRST"
+
+
+def test_launch_trial_preserves_opaque_cuda_device_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _capture_launch_env(tmp_path, monkeypatch, gpu_id="MIG-GPU-deadbeef/3/0")
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "MIG-GPU-deadbeef/3/0"
+    assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"

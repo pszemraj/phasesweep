@@ -152,6 +152,7 @@ def _run_phase(
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
         explicit_ids=phase.gpu_ids,
+        explicit_devices=phase.gpu_devices,
         allow_no_gpu=phase.allow_no_gpu_isolation,
     )
 

@@ -1,14 +1,16 @@
-"""GPU pool: hands out GPU indices to parallel trials, prevents double-booking.
+"""GPU pool: hands out CUDA device tokens and prevents double-booking.
 
 Every trial subprocess gets at most one visible CUDA device when phasesweep can
-resolve numeric device IDs. If no GPUs are visible, single-job CPU work remains
+resolve CUDA device tokens. If no GPUs are visible, single-job CPU work remains
 a transparent no-op; parallel CPU work requires an explicit opt-in.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -22,38 +24,63 @@ from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
+_SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+@dataclass(frozen=True)
+class GpuDevice:
+    """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem."""
+
+    visible_token: str
+
+    @property
+    def lock_name(self) -> str:
+        """Return a stable, path-safe lock identifier for this device token."""
+        if self.visible_token.isdigit():
+            return self.visible_token
+        normalized = _SAFE_LOCK_TOKEN.sub("_", self.visible_token).strip("_") or "device"
+        digest = hashlib.sha256(self.visible_token.encode("utf-8")).hexdigest()[:16]
+        return f"{normalized[:48]}_{digest}"
+
 
 @dataclass
 class _HostGpuLease:
-    """Host-wide flock handle for one CUDA device index."""
+    """Host-wide flock handle for one CUDA device token."""
 
-    gpu_id: int
+    device: GpuDevice
     handle: IO[str]
 
 
-def _gpu_lock_path(gpu_id: int) -> Path:
-    """Return the host-wide lock file for a CUDA device index.
+def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
+    """Normalize a CUDA device token into :class:`GpuDevice`."""
+    if isinstance(device, GpuDevice):
+        return device
+    return GpuDevice(str(device))
 
-    :param int gpu_id: CUDA device index.
-    :return Path: Host-wide lock file path for ``gpu_id``.
+
+def _gpu_lock_path(device: GpuDevice | int | str) -> Path:
+    """Return the host-wide lock file for a CUDA device token.
+
+    :param GpuDevice | int | str device: CUDA device token.
+    :return Path: Host-wide lock file path for ``device``.
     """
-    return lock_dir() / f"gpu_{gpu_id}.lock"
+    return lock_dir() / f"gpu_{_coerce_device(device).lock_name}.lock"
 
 
-def _try_host_gpu_lease(gpu_id: int) -> _HostGpuLease | None:
+def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
     """Try to acquire the per-GPU host lock without blocking.
 
-    :param int gpu_id: CUDA device index to lease.
+    :param GpuDevice device: CUDA device token to lease.
     :return _HostGpuLease | None: Acquired lease, or ``None`` if already locked.
     """
-    handle = try_lock_file(_gpu_lock_path(gpu_id))
+    handle = try_lock_file(_gpu_lock_path(device))
     if handle is None:
         return None
     handle.seek(0)
     handle.truncate()
     handle.write(f"{os.getpid()}\n")
     handle.flush()
-    return _HostGpuLease(gpu_id=gpu_id, handle=handle)
+    return _HostGpuLease(device=device, handle=handle)
 
 
 def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
@@ -90,37 +117,39 @@ def _detect_gpu_ids() -> list[int]:
 
 
 class GpuPool:
-    """Thread-safe pool of GPU indices.
+    """Thread-safe pool of CUDA-visible device tokens.
 
     Usage:
         pool = GpuPool.create(n_jobs=4)
-        with pool.acquire() as gpu_id:
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id) if gpu_id is not None else ""
+        with pool.acquire() as gpu_device:
+            env["CUDA_VISIBLE_DEVICES"] = gpu_device if gpu_device is not None else ""
             run_trial(...)
     """
 
-    def __init__(self, gpu_ids: list[int]) -> None:
-        """Build a pool from a fixed list of GPU indices.
+    def __init__(self, devices: list[GpuDevice]) -> None:
+        """Build a pool from a fixed list of CUDA device tokens.
 
         Args:
-            gpu_ids: The GPU indices to manage. If empty, the pool is a
+            devices: The CUDA device tokens to manage. If empty, the pool is a
                 transparent no-op that always yields ``None`` (single-job
                 or CPU-only mode). Prefer :meth:`create` for the normal
                 construction path that handles auto-detection and policy.
 
         """
-        self._gpu_ids = gpu_ids
-        self._available: list[int] = []
+        self._devices = devices
+        self._gpu_ids = [int(device.visible_token) for device in devices if device.visible_token.isdigit()]
+        self._available: list[GpuDevice] = []
         self._condition = threading.Condition()
 
-        if gpu_ids:
-            self._available = list(gpu_ids)
+        if devices:
+            self._available = list(devices)
 
     @classmethod
     def create(
         cls,
         n_jobs: int,
         explicit_ids: list[int] | None = None,
+        explicit_devices: list[str] | None = None,
         allow_no_gpu: bool = False,
     ) -> GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
@@ -128,8 +157,11 @@ class GpuPool:
         Args:
             n_jobs: number of parallel trials.
             explicit_ids: GPU indices from YAML config. If ``None``, auto-detect
-                numeric visible devices even for ``n_jobs == 1`` so independent
+                visible devices even for ``n_jobs == 1`` so independent
                 single-job phasesweep processes do not double-book cuda:0.
+            explicit_devices: Opaque CUDA_VISIBLE_DEVICES tokens from YAML config,
+                such as GPU UUIDs or MIG instance IDs. Mutually exclusive with
+                ``explicit_ids``.
             allow_no_gpu: if ``True``, run without CUDA isolation when no numeric
                 GPU IDs can be resolved. Parallel CPU-only sweeps need this opt-in.
 
@@ -139,74 +171,50 @@ class GpuPool:
 
         Raises:
             RuntimeError: ``explicit_ids`` was provided but empty; or
-                ``CUDA_VISIBLE_DEVICES`` is set to non-numeric IDs without
-                ``allow_no_gpu``; or no GPUs are visible and ``n_jobs > 1``
-                without ``allow_no_gpu``.
+                ``explicit_devices`` was provided but empty; or no GPUs are
+                visible and ``n_jobs > 1`` without ``allow_no_gpu``.
 
         """
+        if explicit_ids is not None and explicit_devices is not None:
+            raise RuntimeError("gpu_ids and gpu_devices are mutually exclusive.")
         # Explicit IDs always win, even at n_jobs==1.
         if explicit_ids is not None:
-            ids = list(dict.fromkeys(explicit_ids))  # dedupe, preserve order
+            ids = list(dict.fromkeys(explicit_ids))
             if not ids:
                 raise RuntimeError("gpu_ids was provided but empty.")
-            if n_jobs > len(ids):
-                log.warning(
-                    "n_jobs=%d but only %d GPU(s) configured (%s). "
-                    "Excess trials will queue for a GPU.",
-                    n_jobs,
-                    len(ids),
-                    ids,
-                )
-            else:
-                log.info("GPU pool: %d GPUs for %d parallel job(s).", len(ids), n_jobs)
-            return cls(gpu_ids=ids)
+            devices = [GpuDevice(str(gpu_id)) for gpu_id in ids]
+            _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
+            return cls(devices=devices)
+        if explicit_devices is not None:
+            devices = _dedupe_devices(explicit_devices)
+            if not devices:
+                raise RuntimeError("gpu_devices was provided but empty.")
+            _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
+            return cls(devices=devices)
 
         user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         if user_cvd is not None:
-            raw = [x.strip() for x in user_cvd.split(",") if x.strip()]
-            if raw and not all(x.isdigit() for x in raw):
-                if allow_no_gpu:
-                    log.warning(
-                        "CUDA_VISIBLE_DEVICES=%r contains non-numeric device identifiers; "
-                        "running without CUDA isolation because allow_no_gpu_isolation=true.",
-                        user_cvd,
-                    )
-                    return cls(gpu_ids=[])
-                raise RuntimeError(
-                    "CUDA_VISIBLE_DEVICES contains non-numeric device identifiers "
-                    f"({user_cvd!r}). Set phase.gpu_ids explicitly with integer indices, "
-                    "or set allow_no_gpu_isolation: true if this run intentionally "
-                    "does not need CUDA isolation."
-                )
-            ids = [int(x) for x in raw]
+            devices = _devices_from_cuda_visible_devices(user_cvd)
         else:
-            ids = _detect_gpu_ids()
-        if not ids:
+            devices = [GpuDevice(str(gpu_id)) for gpu_id in _detect_gpu_ids()]
+        if not devices:
             if n_jobs <= 1:
                 log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
-                return cls(gpu_ids=[])
+                return cls(devices=[])
             if allow_no_gpu:
                 log.warning(
                     "n_jobs=%d, no GPUs detected — running without CUDA_VISIBLE_DEVICES "
                     "isolation (allow_no_gpu_isolation: true).",
                     n_jobs,
                 )
-                return cls(gpu_ids=[])
+                return cls(devices=[])
             raise RuntimeError(
-                f"n_jobs={n_jobs} but no GPUs detected. Set gpu_ids explicitly in "
-                f"the phase config, or set allow_no_gpu_isolation: true if this is "
-                f"an intentional CPU-only parallel sweep."
+                f"n_jobs={n_jobs} but no GPUs detected. Set gpu_ids or gpu_devices "
+                "explicitly in the phase config, or set allow_no_gpu_isolation: true "
+                "if this is an intentional CPU-only parallel sweep."
             )
-        if n_jobs > len(ids):
-            log.warning(
-                "n_jobs=%d but only %d GPU(s) available (%s). Excess trials will queue for a GPU.",
-                n_jobs,
-                len(ids),
-                ids,
-            )
-        else:
-            log.info("GPU pool: %d GPUs for %d parallel jobs.", len(ids), n_jobs)
-        return cls(gpu_ids=ids)
+        _log_pool_size(n_jobs, [device.visible_token for device in devices], "available")
+        return cls(devices=devices)
 
     def _remaining_seconds(self, deadline: float | None) -> float | None:
         """Return seconds until ``deadline``, or raise when it has expired.
@@ -221,7 +229,7 @@ class GpuPool:
             raise TimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
         return remaining
 
-    def _acquire(self, *, deadline: float | None = None) -> tuple[int, _HostGpuLease] | None:
+    def _acquire(self, *, deadline: float | None = None) -> tuple[GpuDevice, _HostGpuLease] | None:
         """Block until a local slot and host-wide GPU lease are available.
 
         Args:
@@ -230,7 +238,7 @@ class GpuPool:
                 instead of extending a phase/run wallclock budget.
 
         Returns:
-            ``(gpu_id, lease)`` or ``None`` if the pool is inactive (no
+            ``(device, lease)`` or ``None`` if the pool is inactive (no
             isolation requested; caller's environment is passed through
             unchanged).
 
@@ -238,7 +246,7 @@ class GpuPool:
             TimeoutError: ``deadline`` expired before a GPU could be leased.
 
         """
-        if not self._gpu_ids:
+        if not self._devices:
             return None
         while True:
             with self._condition:
@@ -248,26 +256,26 @@ class GpuPool:
                 candidates = list(self._available)
                 self._available.clear()
 
-            remaining_ids: list[int] = []
-            for index, gpu_id in enumerate(candidates):
-                lease = _try_host_gpu_lease(gpu_id)
+            remaining_devices: list[GpuDevice] = []
+            for index, device in enumerate(candidates):
+                lease = _try_host_gpu_lease(device)
                 if lease is not None:
-                    remaining_ids.extend(candidates[index + 1 :])
+                    remaining_devices.extend(candidates[index + 1 :])
                     with self._condition:
-                        self._available.extend(remaining_ids)
+                        self._available.extend(remaining_devices)
                         self._condition.notify_all()
-                    log.debug("GPU %d host lease acquired", gpu_id)
-                    return gpu_id, lease
-                remaining_ids.append(gpu_id)
+                    log.debug("GPU %s host lease acquired", device.visible_token)
+                    return device, lease
+                remaining_devices.append(device)
 
             with self._condition:
-                self._available.extend(remaining_ids)
+                self._available.extend(remaining_devices)
                 self._condition.notify_all()
             remaining_seconds = self._remaining_seconds(deadline)
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
-    def _release(self, acquired: tuple[int, _HostGpuLease] | None) -> None:
-        """Return a previously-acquired GPU index to the pool.
+    def _release(self, acquired: tuple[GpuDevice, _HostGpuLease] | None) -> None:
+        """Return a previously-acquired CUDA device token to the pool.
 
         Args:
             acquired: Pair returned by :meth:`_acquire`. ``None`` is a no-op
@@ -276,21 +284,21 @@ class GpuPool:
         """
         if acquired is None:
             return
-        gpu_id, lease = acquired
+        device, lease = acquired
         _release_host_gpu_lease(lease)
         with self._condition:
-            self._available.append(gpu_id)
+            self._available.append(device)
             self._condition.notify()
 
     @contextmanager
-    def acquire(self, *, deadline: float | None = None) -> Generator[int | None, None, None]:
-        """Block until a GPU is available, yield its index, release on exit.
+    def acquire(self, *, deadline: float | None = None) -> Generator[str | None, None, None]:
+        """Block until a GPU is available, yield its CUDA-visible token, release on exit.
 
         Args:
             deadline: Optional ``time.monotonic()`` deadline for the wait.
 
         Yields:
-            The GPU index for this critical section, or ``None`` when the
+            The CUDA_VISIBLE_DEVICES token for this critical section, or ``None`` when the
             pool is inactive.
 
         Raises:
@@ -299,6 +307,43 @@ class GpuPool:
         """
         acquired = self._acquire(deadline=deadline)
         try:
-            yield None if acquired is None else acquired[0]
+            yield None if acquired is None else acquired[0].visible_token
         finally:
             self._release(acquired)
+
+
+def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
+    """Deduplicate non-empty CUDA device tokens while preserving order."""
+    devices: list[GpuDevice] = []
+    seen: set[str] = set()
+    for raw in tokens:
+        token = str(raw).strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        devices.append(GpuDevice(token))
+    return devices
+
+
+def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
+    """Parse CUDA_VISIBLE_DEVICES as opaque tokens."""
+    raw = [token.strip() for token in value.split(",") if token.strip()]
+    if raw == ["-1"]:
+        return []
+    if "-1" in raw:
+        raise RuntimeError("CUDA_VISIBLE_DEVICES=-1 cannot be mixed with visible device tokens.")
+    return _dedupe_devices(raw)
+
+
+def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:
+    """Log whether configured/available CUDA devices cover requested parallelism."""
+    if n_jobs > len(tokens):
+        log.warning(
+            "n_jobs=%d but only %d GPU device(s) %s (%s). Excess trials will queue for a GPU.",
+            n_jobs,
+            len(tokens),
+            source,
+            tokens,
+        )
+    else:
+        log.info("GPU pool: %d GPU device(s) for %d parallel job(s).", len(tokens), n_jobs)

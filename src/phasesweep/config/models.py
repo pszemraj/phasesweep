@@ -132,8 +132,8 @@ class Phase(_Frozen):
         default=1,
         ge=1,
         description=(
-            "Parallel trials within this phase. When gpu_ids is also set, each "
-            "trial gets exclusive access to one GPU via CUDA_VISIBLE_DEVICES."
+            "Parallel trials within this phase. When gpu_ids or gpu_devices is "
+            "also set, each trial gets exclusive access to one CUDA-visible device."
         ),
     )
     gpu_ids: list[int] | None = Field(
@@ -142,6 +142,13 @@ class Phase(_Frozen):
             "Explicit list of CUDA device indices to partition across parallel trials. "
             "When None, phasesweep auto-detects numeric CUDA_VISIBLE_DEVICES or "
             "nvidia-smi output, including for n_jobs == 1."
+        ),
+    )
+    gpu_devices: list[str] | None = Field(
+        default=None,
+        description=(
+            "Explicit CUDA_VISIBLE_DEVICES tokens to partition across parallel trials. "
+            "Use this for GPU UUIDs or MIG instance IDs; mutually exclusive with gpu_ids."
         ),
     )
 
@@ -169,6 +176,28 @@ class Phase(_Frozen):
             )
         return value
 
+    @field_validator("gpu_devices")
+    @classmethod
+    def _gpu_devices_non_empty_tokens(cls, value: list[str] | None) -> list[str] | None:
+        """Normalize and validate explicit CUDA device tokens."""
+        if value is None:
+            return None
+        normalized = [token.strip() for token in value]
+        bad = [token for token in normalized if not token or "," in token or token == "-1"]
+        if bad:
+            raise ValueError(
+                "gpu_devices entries must be non-empty CUDA_VISIBLE_DEVICES tokens "
+                f"without commas or -1; got {bad}."
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_gpu_isolation_config(self) -> Phase:
+        """Reject ambiguous explicit GPU isolation settings."""
+        if self.gpu_ids is not None and self.gpu_devices is not None:
+            raise ValueError("gpu_ids and gpu_devices are mutually exclusive.")
+        return self
+
     max_consecutive_failures: int = Field(
         default=5,
         ge=1,
@@ -182,8 +211,8 @@ class Phase(_Frozen):
         default=False,
         description=(
             "When GPU isolation cannot be established, phasesweep fails by default "
-            "for parallel sweeps and non-numeric CUDA_VISIBLE_DEVICES. Set True for "
-            "intentional CPU-only or externally-isolated runs."
+            "for parallel sweeps. Set True for intentional CPU-only or "
+            "externally-isolated runs."
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)

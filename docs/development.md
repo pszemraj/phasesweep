@@ -53,7 +53,6 @@ Tests are organized by behavior:
 
 ## Tracked TODOs
 
-- TODO(runtime): Support non-numeric CUDA device identifiers such as MIG or GPU UUIDs by widening `gpu_ids` beyond `list[int]`, sanitizing lock names by device token, and preserving the current numeric-index behavior as the default compatibility path.
 - TODO(runtime): Consider a trial bootstrap/exec handshake before claiming hard-crash durability for the `Popen` to identity-file window; normal exceptions and shutdown signals are cleaned up, but SIGKILL or host loss in that narrow interval cannot be repaired by the killed parent process.
 - TODO(mcp): Split `mcp/server.py` into SDK-free application logic, schemas, launch lifecycle, and FastMCP adapter modules after the MCP alpha surface stabilizes; keep the current schema and request-handler tests as the safety net during that refactor.
 - TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
