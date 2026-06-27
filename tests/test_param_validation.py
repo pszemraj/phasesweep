@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import textwrap
+import warnings
 from pathlib import Path
 
 import optuna
 import pytest
+from optuna.exceptions import ExperimentalWarning
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
@@ -53,9 +55,12 @@ def test_tpe_sampler_constant_liar_policy(n_jobs: int, constant_liar: bool) -> N
     """TPE enables constant_liar only for parallel optimization."""
     cfg = Sampler(type="tpe", seed=0)
     space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3])}
-    sampler = _build_sampler(cfg, space, n_jobs=n_jobs)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sampler = _build_sampler(cfg, space, n_jobs=n_jobs)
     assert isinstance(sampler, optuna.samplers.TPESampler)
     assert sampler._constant_liar is constant_liar
+    assert not [warning for warning in caught if issubclass(warning.category, ExperimentalWarning)]
 
 
 def test_param_constructors_reject_invalid_scalar_settings() -> None:

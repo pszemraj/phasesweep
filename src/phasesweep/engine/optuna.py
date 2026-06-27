@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import warnings
 from pathlib import Path
 from typing import Any
 
 import optuna
+from optuna.exceptions import ExperimentalWarning
 
 from phasesweep.config import (
     CategoricalParam,
@@ -43,11 +45,17 @@ def _build_sampler(
 
     """
     if cfg.type == "tpe":
-        return optuna.samplers.TPESampler(
-            seed=cfg.seed,
-            n_startup_trials=cfg.n_startup_trials,
-            constant_liar=(n_jobs > 1),
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=ExperimentalWarning,
+                message=r"Argument ``constant_liar`` is an experimental feature.*",
+            )
+            return optuna.samplers.TPESampler(
+                seed=cfg.seed,
+                n_startup_trials=cfg.n_startup_trials,
+                constant_liar=(n_jobs > 1),
+            )
     if cfg.type == "random":
         return optuna.samplers.RandomSampler(seed=cfg.seed)
     if cfg.type == "grid":
