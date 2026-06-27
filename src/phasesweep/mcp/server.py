@@ -656,10 +656,10 @@ class PhaseSweepMCP:
     def cancel(self, run_id: str) -> dict[str, Any]:
         """Stop a running sweep: SIGTERM -> grace -> SIGKILL the runner's group.
 
-        The terminal state is reported as ``cancelled`` on both the graceful
-        path (the runner's handler writes status.json(143)) and the SIGKILL
-        escalation (the runner is force-killed before it can; this attributes
-        the cause faithfully rather than reporting ``failed``).
+        The terminal state is reported as ``cancelled`` only when the runner
+        records its cancellation status. If the runner group is gone but no
+        status was written, cleanup remains uncertain because trial process
+        groups may still be alive.
 
         :param str run_id: Detached run id to cancel.
         :return dict[str, Any]: Cancellation result containing final state and optional cleanup confirmation.
@@ -703,8 +703,6 @@ class PhaseSweepMCP:
             confirmed = runner_group_gone and runner_recorded_status
             if confirmed:
                 self._runs.clear_cleanup_uncertain(handle)
-                # No-op when the runner already recorded its own terminal status.
-                self._runs.mark_cancelled_if_unrecorded(handle)
             else:
                 self._runs.mark_cleanup_uncertain(handle)
             after = self._runs.state(handle)
