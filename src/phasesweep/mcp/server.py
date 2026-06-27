@@ -964,10 +964,11 @@ def _cancel_annotations() -> Any:
 def _strict_tool_inputs(mcp: Any) -> None:
     """Make FastMCP's generated argument models reject undeclared keys.
 
-    FastMCP does not currently expose a public switch for closed input schemas,
-    so this intentionally patches the generated tool metadata. Keep the version
-    cap and startup verification together with this hook: if SDK internals move,
-    ``_verify_strict_tool_inputs`` must fail before serving permissive tools.
+    ``mcp.server.fastmcp.FastMCP`` 1.27.x does not expose a public switch for
+    closed input schemas, so this intentionally patches the generated tool
+    metadata. Keep the narrow dependency pin and startup verification together
+    with this hook: if SDK internals move, ``_verify_strict_tool_inputs`` must
+    fail before serving permissive tools.
     """
     for tool in mcp._tool_manager.list_tools():
         arg_model = tool.fn_metadata.arg_model
