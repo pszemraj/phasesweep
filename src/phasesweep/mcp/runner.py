@@ -126,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         # run_config installs signal handlers and takes the flock internally.
         run_config(config, from_phase=args.from_phase, dry_run=False)
     except PhaseSweepShutdown as exc:
-        status["returncode"] = int(exc.code)
+        code = exc.code if isinstance(exc.code, int) else 1
+        status["returncode"] = code
         status["error_class"] = "cancelled"
         status["cleanup_confirmed"] = exc.report.cleanup_confirmed
         _write_status(args.status_path, status)
