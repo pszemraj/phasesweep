@@ -131,7 +131,9 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 grace_seconds=_KILL_GRACE_SECONDS,
             )
         except Exception:
-            log.exception("Failed while cleaning child process group %d after signal %d", pgid, signum)
+            log.exception(
+                "Failed while cleaning child process group %d after signal %d", pgid, signum
+            )
             confirmed_by_pgid[pgid] = False
 
     cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)

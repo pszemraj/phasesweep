@@ -137,7 +137,9 @@ class GpuPool:
 
         """
         self._devices = devices
-        self._gpu_ids = [int(device.visible_token) for device in devices if device.visible_token.isdigit()]
+        self._gpu_ids = [
+            int(device.visible_token) for device in devices if device.visible_token.isdigit()
+        ]
         self._available: list[GpuDevice] = []
         self._condition = threading.Condition()
 
