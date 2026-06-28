@@ -371,9 +371,7 @@ class RunStore:
         """
         return self.cleanup_uncertain_path(handle.run_id).is_file()
 
-    def _terminal_cleanup_uncertain(
-        self, handle: RunHandle, status: Mapping[str, object]
-    ) -> bool:
+    def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
         """Return whether a terminal status still needs operator cleanup recovery."""
         return status.get("cleanup_confirmed") is False and not self._cleanup_recovered(handle)
 
