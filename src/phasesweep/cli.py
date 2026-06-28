@@ -209,7 +209,7 @@ def status(config_path: Path) -> None:
         "Operator-only recovery for an MCP run with cleanup uncertainty. "
         "Checks the runner identity and reaps stale trials before clearing uncertainty."
     ),
-    short_help="Recover a cleanup-uncertain MCP run.",
+    short_help="Recover MCP cleanup uncertainty.",
 )
 @click.option(
     "--state-dir",
@@ -221,10 +221,10 @@ def status(config_path: Path) -> None:
 @click.option(
     "--confirm",
     is_flag=True,
-    help="Clear the cleanup-uncertain marker after checks pass.",
+    help="Clear cleanup uncertainty after checks pass.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover one cleanup-uncertain MCP run after local host inspection."""
+    """Recover one MCP run with cleanup uncertainty after local host inspection."""
     store = RunStore(state_dir)
     handle = store.get(run_id)
     if handle is None:

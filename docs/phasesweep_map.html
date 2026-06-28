@@ -754,7 +754,7 @@ Called WITH GPU lease held.
 1. mkdir trial_dir
 2. render_command(trial_command, overrides, fmt, ...)
 3. Write trial_dir/overrides_resolved.json + command.txt
-4. Build env: experiment.env + PHASESWEEP_* + CUDA_VISIBLE_DEVICES=gpu_id
+4. Build env: experiment.env + PHASESWEEP_* + CUDA_VISIBLE_DEVICES=device token
 5. Open stdout.log, stderr.log
 6. Call run_supervised(cmd, env, stdout, stderr, timeout, trial_dir)
 
@@ -1070,7 +1070,7 @@ SHA-256 over _phase_semantic_payload:
   metric, constraints, contracts
   promotion rule (when set)
   phase config MINUS run-control fields:
-    n_trials, n_jobs, gpu_ids, allow_no_gpu_isolation,
+    n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation,
     allow_unbounded_trials, allow_partial_grid,
     allow_seed_search, allow_incomplete_on_timeout,
     max_consecutive_failures, timeout_seconds_per_phase,
@@ -1111,14 +1111,14 @@ before _load_winner on --from-phase resume.</title>
     <g data-tip="GpuPool + study.optimize">
       <title>⑤ GpuPool + study.optimize (engine/phase.py + runtime/gpu.py)
 
-GpuPool.create(n_jobs, gpu_ids, allow_no_gpu):
-  • explicit gpu_ids honored even at n_jobs=1
-  • else read CUDA_VISIBLE_DEVICES env
+GpuPool.create(n_jobs, gpu_ids/gpu_devices, allow_no_gpu):
+  • explicit ids/devices honored even at n_jobs=1
+  • else read CUDA_VISIBLE_DEVICES tokens
   • else nvidia-smi --query-gpu=index
   • empty + n_jobs &gt; 1 + !allow_no_gpu → RuntimeError
 
-Each numeric GPU id takes a per-device host lock:
-  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/gpu_{id}.lock
+Each visible device token takes a per-device host lock:
+  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/gpu_{token}.lock
 This prevents two independent local phasesweep runs from
 double-booking the same physical device even at n_jobs=1.
 
@@ -1253,7 +1253,7 @@ commands.py — render_command, format_hydra,
 files.py    — flock helpers (try_lock_file, unlock_file,
               exclusive_lock), lock_dir, storage_backend,
               canonical_storage_identity
-gpu.py      — GpuPool, _HostGpuLease, _detect_gpu_ids,
+gpu.py      — GpuPool, GpuDevice, _HostGpuLease,
               per-device host lock paths
 process.py  — run_supervised, ProcessResult, install_signal_handlers,
               kill_stale_group, read_proc_starttime, is_same_process,
