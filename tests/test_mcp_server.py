@@ -15,6 +15,7 @@ from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _phase_fingerprint
 from phasesweep.engine.state import _winner_path
+from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import UnknownExperimentError
 from phasesweep.mcp.registry import Registry
@@ -577,6 +578,76 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
     assert status["error_class"] == "RuntimeError"
+    assert status["cleanup_confirmed"] is True
+
+
+def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import phasesweep.engine as engine_module
+
+    config = _config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "r1"
+    status_path = store.status_path(run_id)
+
+    def raise_cleanup_uncertain(*args: object, **kwargs: object) -> None:
+        raise UnsafeProcessCleanupError("trial cleanup uncertain")
+
+    monkeypatch.setattr(engine_module, "run_config", raise_cleanup_uncertain)
+
+    with pytest.raises(UnsafeProcessCleanupError, match="trial cleanup uncertain"):
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config),
+                "--config-sha256",
+                hashlib.sha256(config.read_bytes()).hexdigest(),
+                "--status-path",
+                str(status_path),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                "2026-06-24T00:00:00Z",
+            ]
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["returncode"] == 1
+    assert status["error_class"] == "UnsafeProcessCleanupError"
+    assert status["cleanup_confirmed"] is False
+
+
+def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-terminal-uncertain"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    assert store.state(handle) == "running"
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
 
 
 def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:

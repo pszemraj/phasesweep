@@ -16,6 +16,7 @@ import os
 import sys
 from pathlib import Path
 
+from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.runtime.process import PhaseSweepShutdown, read_proc_starttime
 
@@ -132,19 +133,25 @@ def main(argv: list[str] | None = None) -> int:
         status["cleanup_confirmed"] = exc.report.cleanup_confirmed
         _write_status(args.status_path, status)
         raise
+    except ProcessCleanupUncertainError as exc:
+        status["returncode"] = 1
+        status["error_class"] = type(exc).__name__
+        status["cleanup_confirmed"] = False
+        _write_status(args.status_path, status)
+        raise
     except SystemExit as exc:
         # The engine shutdown handler raises SystemExit(128+signum) on
         # SIGTERM/SIGINT - this is the cancel path.
         code = exc.code if isinstance(exc.code, int) else 1
         status["returncode"] = code
         status["error_class"] = "cancelled" if code in (143, 130) else "exited"
-        status["cleanup_confirmed"] = False
+        status["cleanup_confirmed"] = code not in (143, 130)
         _write_status(args.status_path, status)
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
-        status["cleanup_confirmed"] = False
+        status["cleanup_confirmed"] = True
         _write_status(args.status_path, status)
         raise
     _write_status(args.status_path, status)

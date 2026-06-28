@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -265,6 +265,8 @@ class RunStore:
             return "running"
         status = self._read_status(handle)
         if status is not None:
+            if self._terminal_cleanup_uncertain(handle, status):
+                return "running"
             rc = status.get("returncode")
             if rc == 0:
                 return "succeeded"
@@ -368,3 +370,24 @@ class RunStore:
         :return bool: True when a prior cancel could not confirm cleanup.
         """
         return self.cleanup_uncertain_path(handle.run_id).is_file()
+
+    def _terminal_cleanup_uncertain(
+        self, handle: RunHandle, status: Mapping[str, object]
+    ) -> bool:
+        """Return whether a terminal status still needs operator cleanup recovery."""
+        return status.get("cleanup_confirmed") is False and not self._cleanup_recovered(handle)
+
+    def _cleanup_recovered(self, handle: RunHandle) -> bool:
+        """Return whether operator recovery evidence confirms cleanup for this run."""
+        path = self.cleanup_recovery_path(handle.run_id)
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            payload.get("run_id") == handle.run_id
+            and payload.get("config_sha256") == handle.config_sha256
+            and payload.get("cleanup_confirmed") is True
+        )

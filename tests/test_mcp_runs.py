@@ -181,6 +181,23 @@ def test_state_failed_from_nonzero_status(tmp_path: Path) -> None:
     assert store.state(handle) == "failed"
 
 
+def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    store.save(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=1,
+        error_class="RuntimeError",
+        cleanup_confirmed=True,
+    )
+
+    assert store.state(handle) == "failed"
+    assert store.live_runs() == []
+    assert store.live_run_for("exp") is None
+
+
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1")
@@ -202,6 +219,76 @@ def test_cleanup_uncertain_marker_keeps_run_live_until_cleared(tmp_path: Path) -
     store.clear_cleanup_uncertain(handle)
 
     assert store.state(handle) == "failed"
+
+
+def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        store,
+        run_id="exp-1",
+        experiment_id="exp",
+        config_sha256="a" * 64,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    assert store.state(handle) == "running"
+    assert store.live_runs() == [handle]
+    assert store.live_run_for("exp") == handle
+
+    store.cleanup_recovery_path("exp-1").write_text(
+        json.dumps(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": True,
+            }
+        )
+    )
+
+    assert store.state(handle) == "failed"
+    assert store.live_runs() == []
+    assert store.live_run_for("exp") is None
+
+
+def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        store,
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+    store.cleanup_recovery_path("exp-1").write_text(
+        json.dumps(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "b" * 64,
+                "cleanup_confirmed": True,
+            }
+        )
+    )
+
+    assert store.state(handle) == "running"
 
 
 def test_state_failed_on_pid_reuse_mismatch(tmp_path: Path) -> None:

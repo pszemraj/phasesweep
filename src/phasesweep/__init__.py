@@ -9,6 +9,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Suite, load_config, load_experiment  # noqa: E402
 from phasesweep.engine import (  # noqa: E402
     NoFeasibleTrialError,
+    ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
     Winner,
     config_status,
@@ -20,6 +21,7 @@ from phasesweep.engine import (  # noqa: E402
 __all__ = [
     "Experiment",
     "NoFeasibleTrialError",
+    "ProcessCleanupUncertainError",
     "Config",
     "Suite",
     "UnsafeProcessCleanupError",

@@ -14,11 +14,12 @@ from phasesweep.engine.run import (
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
     "NoFeasibleTrialError",
     "PhaseWinnerView",
+    "ProcessCleanupUncertainError",
     "UnsafeProcessCleanupError",
     "Winner",
     "config_status",

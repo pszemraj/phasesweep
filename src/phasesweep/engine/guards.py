@@ -22,6 +22,7 @@ from phasesweep.engine.state import (
     _suite_dir,
     _trial_dir_for,
 )
+from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     exclusive_lock,
@@ -372,9 +373,7 @@ def _trial_dir_for_reaping(
         RUNNING trial with no persisted directory attr.
 
     Raises:
-        RuntimeError: ``phasesweep_trial_dir`` exists but is not a non-empty
-            string, which indicates storage corruption rather than the known
-            pre-launch crash window.
+        ProcessCleanupUncertainError: ``phasesweep_trial_dir`` exists but is not a non-empty string, so the reaper cannot safely locate the trial identity files.
 
     """
     if TRIAL_DIR_ATTR not in trial.user_attrs:
@@ -392,7 +391,7 @@ def _trial_dir_for_reaping(
 
     stored = trial.user_attrs[TRIAL_DIR_ATTR]
     if not isinstance(stored, str) or not stored:
-        raise RuntimeError(
+        raise ProcessCleanupUncertainError(
             f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
             f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
             "tied to its identity files safely."
@@ -418,8 +417,7 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
     :func:`kill_stale_group` returns ``False`` we cannot prove the leaked
     process group is gone. Marking the trial ``FAIL`` would let new trials
     schedule onto a GPU still held by the leaked process. We raise a
-    ``RuntimeError`` instead so the operator sees a loud failure and can
-    investigate manually. Pre-v0.5.8 we logged the survivor and continued.
+    ``ProcessCleanupUncertainError`` instead so the operator sees a loud failure and can investigate manually. Pre-v0.5.8 we logged the survivor and continued.
 
     Args:
         study: Optuna study for the phase being recovered.
@@ -431,8 +429,8 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
         confirmed AND ``study.tell(...FAIL)`` succeeded).
 
     Raises:
-        RuntimeError: Cleanup of a stale process group could not be confirmed,
-            or ``study.tell`` could not persist the FAIL state.
+        ProcessCleanupUncertainError: Cleanup of a stale process group could not be confirmed.
+        RuntimeError: ``study.tell`` could not persist the FAIL state after cleanup was confirmed.
 
     """
     reaped = 0
@@ -446,7 +444,7 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
         if identity.pid is not None or identity.pgid is not None:
             safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
             if not safe_to_fail:
-                raise RuntimeError(
+                raise ProcessCleanupUncertainError(
                     f"Refusing to mark RUNNING trial {trial.number} as FAIL: "
                     f"stale process cleanup could not prove the process group "
                     f"is gone. trial_dir={trial_dir} pid={identity.pid} "

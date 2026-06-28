@@ -57,7 +57,11 @@ class TrialExecutionError(RuntimeError):
     """
 
 
-class UnsafeProcessCleanupError(RuntimeError):
+class ProcessCleanupUncertainError(RuntimeError):
+    """Base class for failures where a subprocess group may still be alive."""
+
+
+class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
     """Raised when a trial process group may still be alive after cleanup.
 
     This must NOT be included in Optuna's ``catch`` tuple. The correct behavior
