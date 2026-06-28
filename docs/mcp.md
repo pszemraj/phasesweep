@@ -100,6 +100,8 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 
 `audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, safe arguments (`experiment_id`, `run_id`, `from_phase`), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
+Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop. SQLite-backed status uses a read-only direct count path; Journal/RDB-backed status uses Optuna's read path today, so very large external studies should be polled every few seconds until the tracked backend-specific aggregate-count optimization is implemented.
+
 ### Long-running servers
 
 The server is built to stay up across multi-hour sweeps. Detached runners are
