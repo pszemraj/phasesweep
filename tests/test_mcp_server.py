@@ -850,13 +850,115 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     )
 
     assert confirmed.exit_code == 0, confirmed.output
-    assert "Cleared cleanup-uncertain marker" in confirmed.output
+    assert "Cleared cleanup uncertainty" in confirmed.output
     assert not store.cleanup_uncertain_path(run_id).exists()
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["run_id"] == run_id
+    assert recovery["config_sha256"] == reg.config_sha256
     assert recovery["cleanup_confirmed"] is True
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+def test_operator_recovery_clears_terminal_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-terminal-recover"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
+
+    runner = CliRunner()
+    dry = runner.invoke(
+        cli_main,
+        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+
+    assert dry.exit_code == 0, dry.output
+    assert "Re-run with --confirm" in dry.output
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert store.state(handle) == "running"
+
+    confirmed = runner.invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "Cleared cleanup uncertainty" in confirmed.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["run_id"] == run_id
+    assert recovery["config_sha256"] == reg.config_sha256
+    assert recovery["cleanup_confirmed"] is True
+    assert store.state(handle) == "failed"
+
+    captured = patch_popen_capture(monkeypatch)
+    launched = app.launch("srv")
+    assert launched["state"] == "running"
+    assert captured["cmd"]
+
+
+def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-bad-snapshot"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + b"\n# drifted\n")
+    store.mark_cleanup_uncertain(handle)
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "run snapshot hash mismatch" in result.output
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    assert not store.cleanup_recovery_path(run_id).exists()

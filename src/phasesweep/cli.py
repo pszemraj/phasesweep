@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 import click
 
 from phasesweep.config import Experiment, Suite, load_config
+from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
 from phasesweep.engine.guards import _reap_stale_trials
 from phasesweep.engine.optuna import _create_phase_study
@@ -204,8 +206,8 @@ def status(config_path: Path) -> None:
     name="mcp-recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for an MCP run with a cleanup-uncertain marker. "
-        "Checks the runner identity and reaps stale trials before clearing the marker."
+        "Operator-only recovery for an MCP run with cleanup uncertainty. "
+        "Checks the runner identity and reaps stale trials before clearing uncertainty."
     ),
     short_help="Recover a cleanup-uncertain MCP run.",
 )
@@ -227,8 +229,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     handle = store.get(run_id)
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
-    if not store.cleanup_uncertain_path(run_id).is_file():
-        click.echo("No cleanup-uncertain marker exists for this run.")
+    terminal_status = store.recorded_terminal_status(handle)
+    needs_recovery = store.cleanup_uncertain_path(run_id).is_file() or (
+        terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
+    )
+    if not needs_recovery:
+        click.echo("No cleanup uncertainty is recorded for this run.")
         return
 
     if _runner_appears_live(handle.pid, handle.pid_starttime):
@@ -244,7 +250,13 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
         raise click.ClickException(f"run config snapshot is missing: {snapshot}")
-    config = load_config(snapshot)
+    try:
+        snapshot_bytes = snapshot.read_bytes()
+    except OSError as exc:
+        raise click.ClickException(f"cannot read run config snapshot: {snapshot}") from exc
+    if hashlib.sha256(snapshot_bytes).hexdigest() != handle.config_sha256:
+        raise click.ClickException("run snapshot hash mismatch; refusing cleanup recovery")
+    config = load_config_bytes(snapshot_bytes, source=f"run snapshot {run_id}")
     if not isinstance(config, Experiment):
         raise click.ClickException("run snapshot is not a single experiment")
 
@@ -262,19 +274,20 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if not confirm:
         click.echo(
             f"Cleanup appears confirmed for {run_id}; reaped {reaped} stale trial(s). "
-            "Re-run with --confirm to clear the marker."
+            "Re-run with --confirm to clear cleanup uncertainty."
         )
         return
 
     payload = {
         "run_id": run_id,
+        "config_sha256": handle.config_sha256,
         "recovered_at": utc_now_iso(),
         "cleanup_confirmed": True,
         "reaped_trials": reaped,
     }
     atomic_write_text(store.cleanup_recovery_path(run_id), json.dumps(payload, indent=2) + "\n")
     store.clear_cleanup_uncertain(handle)
-    click.echo(f"Cleared cleanup-uncertain marker for {run_id}; reaped {reaped} stale trial(s).")
+    click.echo(f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s).")
 
 
 def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
