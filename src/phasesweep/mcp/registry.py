@@ -172,7 +172,13 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
 
     storage = experiment.storage
     backend = storage_backend(storage)
-    if storage is None or backend not in {"sqlite", "journal"}:
+    if backend not in {"sqlite", "journal"}:
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments currently support only local-node "
+            "SQLite or JournalStorage file-backed Optuna storage; external RDB "
+            "storage is out of scope until multi-host cleanup semantics are supported"
+        )
+    if storage is None:
         return
 
     if backend == "sqlite" and storage_is_in_memory(storage):
@@ -219,8 +225,8 @@ class Registry:
         Raises ``CatalogError`` on any problem so the server refuses to start
         with a bad catalog. Per entry: the config path exists, ``load_config``
         accepts it, it is an :class:`Experiment` (suites are out of scope for
-        v1), and its storage is persistent (in-memory studies cannot be
-        monitored across processes).
+        v1), and its storage is a persistent local SQLite/Journal file (the MCP
+        layer is local-node only in this version).
 
         Args:
             catalog_path: Path to the operator-authored catalog YAML.

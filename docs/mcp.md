@@ -1,6 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
+`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io). The supported mode for this version is local-node control over stdio: the MCP server, detached runner, process cleanup, filesystem locks, and GPU leases all assume one machine. The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
 
 For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 
@@ -19,7 +19,7 @@ Catalog keys:
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
-At startup the server validates each experiment with the same loader the CLI uses, computes a content hash, and refuses invalid configs, suites, in-memory or empty file-backed storage (`null`, `sqlite://`, `sqlite:///:memory:`, `:memory:`, `journal://`, or `journal:///`), and configs that violate [path stability](#paths-and-the-working-directory). The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
+At startup the server validates each experiment with the same loader the CLI uses, computes a content hash, and refuses invalid configs, suites, in-memory or empty file-backed storage (`null`, `sqlite://`, `sqlite:///:memory:`, `:memory:`, `journal://`, or `journal:///`), external RDB storage URLs, and configs that violate [path stability](#paths-and-the-working-directory). The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
 Omitting `allow` leaves an experiment read-only: agents can list, validate, inspect status, and read existing winners, but `phasesweep_launch_sweep`, `phasesweep_cancel_sweep`, and `from_phase` resume are refused until the operator explicitly sets the corresponding flag to `true`.
 
@@ -27,7 +27,7 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 
-`state_dir`, `config:`, and `experiments[].cwd` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and non-empty absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same artifacts and Optuna studies. The detached runner always starts with the catalog entry's frozen `cwd`, defaulting to the registered config file's directory. Relative paths inside `trial_command` are trainer-owned shell behavior; phasesweep does not parse or rewrite commands, but their base directory is no longer inherited from the MCP server process.
+`state_dir`, `config:`, and `experiments[].cwd` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and non-empty absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same local-node artifacts and Optuna studies. External RDB storage is rejected for MCP because the current cleanup, stale-trial reaping, and GPU lock semantics are same-host only. The detached runner always starts with the catalog entry's frozen `cwd`, defaulting to the registered config file's directory. Relative paths inside `trial_command` are trainer-owned shell behavior; phasesweep does not parse or rewrite commands, but their base directory is no longer inherited from the MCP server process.
 
 ### Concurrency and single-GPU hosts
 
@@ -100,7 +100,7 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 
 `audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
-Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop. SQLite-backed status uses a read-only direct count path; Journal/RDB-backed status uses Optuna's read path today, so very large external studies should be polled every few seconds until the tracked backend-specific aggregate-count optimization is implemented.
+Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop. SQLite-backed status uses a read-only direct count path; Journal-backed status uses Optuna's read path today, so large local studies should be polled every few seconds until the tracked aggregate-count optimization is implemented.
 
 ### Long-running servers
 
@@ -116,8 +116,8 @@ Run handles, terminal `status.json` files, and per-run config snapshots are writ
 ## Limitations (v1)
 
 - **Single-experiment configs only.** Suites are rejected at startup.
-- **Persistent storage required.** In-memory studies and empty file-backed storage URLs cannot be monitored across processes, so `storage: null`, SQLite in-memory URL forms, and empty SQLite/Journal file URLs are rejected at startup.
-- **Single host.** The server, runner, and lock assume one host.
+- **Local file-backed storage required.** In-memory studies, empty file-backed storage URLs, and external RDB storage are rejected at startup. Use non-empty absolute SQLite or JournalStorage file URLs for MCP catalogs.
+- **Single local node.** The server, runner, cleanup recovery, stale-trial reaper, and locks assume one host. Remote control planes, multi-host writers, and distributed cleanup are future work, not warnings-only behavior.
 - **Local stdio only.** Remote Streamable HTTP, OAuth, bearer-token auth, and hosted multi-user deployments are out of scope for v1.
 - **No log-access tool.** A redacted, opt-in log view is a possible follow-up,
   but v1 exposes no catalog flag or tool for logs.

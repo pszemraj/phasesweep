@@ -62,7 +62,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 
 ## MCP server (agent integration)
 
-`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Use [MCP agent setup](docs/mcp_setup.md) for client config and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
+`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). The supported MCP mode is local-node control over stdio; remote control planes, hosted multi-user deployments, and multi-host shared studies are out of scope for this version. Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Use [MCP agent setup](docs/mcp_setup.md) for client config and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
 
 ## Docs
 

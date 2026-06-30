@@ -1,6 +1,6 @@
 # MCP agent setup
 
-Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. Tool behavior and security boundaries are in [MCP server](mcp.md).
+Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. This version supports local-node control only: the server, detached runner, cleanup recovery, and GPU/process locks assume one machine. Tool behavior and security boundaries are in [MCP server](mcp.md).
 
 ## Install
 
@@ -142,7 +142,7 @@ Cancel only when I ask or when stopping is necessary to prevent an unwanted acti
 - `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
 - `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` for hosts that can safely run multiple sweeps.
 - A cancelled or failed run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` and repeat with `--confirm` only if the command reports confirmed cleanup.
-- `storage must be persistent` or an empty file-backed storage error: use a persistent Optuna storage URL with a non-empty absolute SQLite/Journal path; in-memory studies and empty file-backed URLs cannot be monitored across processes.
+- `storage must be persistent`, an empty file-backed storage error, or an external RDB storage error: use a persistent Optuna storage URL with a non-empty absolute SQLite/Journal path; MCP catalogs are intentionally local-node only in this version.
 - The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
 - Relative path rejected at startup: catalog `state_dir`, `config`, and `cwd` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be non-empty and absolute for MCP.
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.
