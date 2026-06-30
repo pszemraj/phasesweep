@@ -443,11 +443,10 @@ def _run_phase(
     trials_after = study.get_trials(deepcopy=False)
     finished_after = sum(1 for t in trials_after if t.state.is_finished())
     completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
-    timed_out_incomplete = deadline_exhausted["flag"] or (
-        optimize_deadline is not None
-        and time.monotonic() >= optimize_deadline
-        and completed_after < phase.n_trials
+    timeout_observed = deadline_exhausted["flag"] or (
+        optimize_deadline is not None and time.monotonic() >= optimize_deadline
     )
+    timed_out_incomplete = timeout_observed and finished_after < phase.n_trials
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
         raise TimeoutError(
             f"Phase {phase.name!r} timed out via {timeout_source or 'wallclock'} guard "

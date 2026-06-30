@@ -473,6 +473,46 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     assert completion["timeout_scope"] == "phase"
 
 
+def test_timeout_after_all_terminal_trials_is_complete_enough(tmp_path: Path) -> None:
+    """A timeout guard should not reject a phase once every requested trial is terminal."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+        else:
+            time.sleep(5.0)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout_all_terminal",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                timeout_seconds_per_phase=0.8,
+                search_space={},
+            )
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 2
+    assert completion["completed_trials"] == 1
+    assert completion["finished_trials"] == 2
+    assert completion["incomplete"] is False
+
+
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
     trainer = write_trainer(
         tmp_path,
