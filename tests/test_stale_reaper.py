@@ -24,6 +24,7 @@ from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_dir_for
 from phasesweep.runtime.process import (
     StaleProcessIdentity,
+    _read_proc_stat,
     is_same_process,
     kill_stale_group,
     read_proc_starttime,
@@ -42,6 +43,21 @@ def test_read_proc_starttime_self():
         assert st is not None and st > 0
     else:
         assert st is None
+
+
+def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
+    """``/proc/<pid>/stat`` comm bytes are not guaranteed to be UTF-8."""
+    proc_entry = tmp_path / "123"
+    proc_entry.mkdir()
+    fields = [b"S", b"1", b"4321"] + [b"0"] * 16 + [b"987654"] + [b"0"] * 8
+    (proc_entry / "stat").write_bytes(b"123 (trainer-\xff-worker) " + b" ".join(fields))
+
+    stat = _read_proc_stat(proc_entry)
+
+    assert stat is not None
+    assert stat.state == "S"
+    assert stat.pgrp == 4321
+    assert stat.starttime == 987654
 
 
 def test_is_same_process_rejects_dead_pid():

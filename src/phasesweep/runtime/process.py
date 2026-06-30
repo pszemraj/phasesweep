@@ -489,18 +489,18 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
         unreadable.
     """
     try:
-        text = (proc_entry / "stat").read_text(encoding="utf-8")
+        data = (proc_entry / "stat").read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
         return None
-    rparen = text.rfind(")")
+    rparen = data.rfind(b")")
     if rparen < 0:
         return None
-    rest = text[rparen + 1 :].strip().split()
+    rest = data[rparen + 1 :].strip().split()
     if len(rest) < 20:
         return None
     try:
-        return _ProcStat(state=rest[0], pgrp=int(rest[2]), starttime=int(rest[19]))
-    except ValueError:
+        return _ProcStat(state=rest[0].decode("ascii"), pgrp=int(rest[2]), starttime=int(rest[19]))
+    except (UnicodeDecodeError, ValueError):
         return None
 
 
