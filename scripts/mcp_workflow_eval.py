@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -208,6 +210,25 @@ def happy_path_scenario(root: Path, *, timeout: float) -> ScenarioResult:
                 client.call("cancel", run_id)
 
 
+@contextlib.contextmanager
+def _isolated_runtime_env(root: Path) -> Iterator[None]:
+    """Run eval scenarios with lock and CUDA state rooted in the temp tree."""
+    lock_dir = root / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    keys = ("PHASESWEEP_LOCK_DIR", "CUDA_VISIBLE_DEVICES")
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ["PHASESWEEP_LOCK_DIR"] = str(lock_dir)
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run all MCP workflow eval scenarios and print JSON."""
     parser = argparse.ArgumentParser()
@@ -218,11 +239,12 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="phasesweep-mcp-eval-") as tmp:
         root = Path(tmp)
-        results = [
-            discovery_scenario(root / "discovery"),
-            read_only_safety_scenario(root / "readonly"),
-            happy_path_scenario(root / "happy", timeout=args.timeout),
-        ]
+        with _isolated_runtime_env(root):
+            results = [
+                discovery_scenario(root / "discovery"),
+                read_only_safety_scenario(root / "readonly"),
+                happy_path_scenario(root / "happy", timeout=args.timeout),
+            ]
 
     payload = {
         "success": all(item.success for item in results),
