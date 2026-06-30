@@ -13,8 +13,8 @@ import click
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
-from phasesweep.engine.guards import _reap_stale_trials
-from phasesweep.engine.optuna import _create_phase_study
+from phasesweep.engine.guards import _reap_stale_trials, _recover_cleanup_uncertain_trials
+from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
@@ -230,9 +230,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
-    needs_recovery = store.cleanup_uncertain_path(run_id).is_file() or (
+    terminal_cleanup_uncertain = (
         terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
     )
+    needs_recovery = store.cleanup_uncertain_path(run_id).is_file() or terminal_cleanup_uncertain
     if not needs_recovery:
         click.echo("No cleanup uncertainty is recorded for this run.")
         return
@@ -261,19 +262,33 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         raise click.ClickException("run snapshot is not a single experiment")
 
     reaped = 0
+    cleanup_recovered = 0
+    inspected_studies = 0
     try:
         for phase in config.phases:
-            reaped += _reap_stale_trials(
-                _create_phase_study(config, phase, dry_run=False),
-                config,
-                phase.name,
-            )
+            study = _load_existing_phase_study(config, phase)
+            if study is None:
+                continue
+            inspected_studies += 1
+            reaped += _reap_stale_trials(study, config, phase.name)
+            cleanup_recovered += _recover_cleanup_uncertain_trials(study, config, phase.name)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from None
+    if terminal_cleanup_uncertain and cleanup_recovered == 0:
+        if inspected_studies == 0:
+            detail = "no existing Optuna studies could be loaded from the run snapshot storage"
+        else:
+            detail = "no terminal Optuna trials recorded cleanup uncertainty"
+        raise click.ClickException(
+            "runner status recorded cleanup_confirmed=false, but recovery could not "
+            f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
+            "cleanup uncertainty."
+        )
 
     if not confirm:
         click.echo(
-            f"Cleanup appears confirmed for {run_id}; reaped {reaped} stale trial(s). "
+            f"Cleanup appears confirmed for {run_id}; reaped {reaped} stale trial(s) "
+            f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s). "
             "Re-run with --confirm to clear cleanup uncertainty."
         )
         return
@@ -284,10 +299,14 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         "recovered_at": utc_now_iso(),
         "cleanup_confirmed": True,
         "reaped_trials": reaped,
+        "cleanup_uncertain_trials": cleanup_recovered,
     }
     atomic_write_text(store.cleanup_recovery_path(run_id), json.dumps(payload, indent=2) + "\n")
     store.clear_cleanup_uncertain(handle)
-    click.echo(f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s).")
+    click.echo(
+        f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
+        f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
+    )
 
 
 def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:

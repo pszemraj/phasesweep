@@ -16,6 +16,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.engine.optuna import _create_phase_study
 from phasesweep.engine.state import (
+    CLEANUP_CONFIRMED_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
     _experiment_dir,
@@ -472,6 +473,79 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
         reaped += 1
         log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
     return reaped
+
+
+def _trial_dir_for_cleanup_recovery(
+    trial: optuna.trial.FrozenTrial,
+    study_name: str,
+) -> Path:
+    """Return the persisted trial directory for terminal cleanup recovery.
+
+    :param optuna.trial.FrozenTrial trial: Terminal trial with uncertain cleanup.
+    :param str study_name: Study name for diagnostics.
+    :return Path: Persisted trial directory containing process identity files.
+    :raises ProcessCleanupUncertainError: The trial has no safe persisted trial directory.
+    """
+    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    if not isinstance(stored, str) or not stored:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
+            f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
+            f"{stored!r}. The leaked process group cannot be tied to identity files safely."
+        )
+    return Path(stored)
+
+
+def _recover_cleanup_uncertain_trials(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase_name: str,
+) -> int:
+    """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
+
+    ``UnsafeProcessCleanupError`` can leave an Optuna trial in a terminal FAIL state with
+    ``phasesweep_cleanup_confirmed=false``. The normal stale reaper intentionally visits
+    only RUNNING trials, so operator recovery needs this separate fail-closed inspection
+    before clearing MCP cleanup uncertainty.
+
+    :param optuna.Study study: Existing Optuna study for the phase being recovered.
+    :param Experiment experiment: Parsed experiment, used for diagnostics.
+    :param str phase_name: Name of the phase being recovered.
+    :return int: Number of cleanup-uncertain terminal trials confirmed clean.
+    :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
+    """
+    recovered = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
+            continue
+
+        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+        identity = read_stale_process_identity(trial_dir)
+        if identity.pid is None and identity.pgid is None:
+            raise ProcessCleanupUncertainError(
+                f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
+                f"study {study.study_name}: no persisted process identity was found "
+                f"under trial_dir={trial_dir}. A leaked process group cannot be "
+                "ruled out."
+            )
+        safe_to_clear = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
+        if not safe_to_clear:
+            raise ProcessCleanupUncertainError(
+                f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
+                f"study {study.study_name}: process cleanup could not be confirmed. "
+                f"experiment={experiment.experiment} phase={phase_name} "
+                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
+            )
+        recovered += 1
+        log.warning(
+            "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
+            "(pid=%s pgid=%s)",
+            trial.number,
+            study.study_name,
+            identity.pid,
+            identity.pgid,
+        )
+    return recovered
 
 
 def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:

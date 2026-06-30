@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 
+import optuna
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -15,7 +16,12 @@ from click.testing import CliRunner
 from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _phase_fingerprint
-from phasesweep.engine.state import _winner_path
+from phasesweep.engine.state import (
+    CLEANUP_CONFIRMED_ATTR,
+    TRIAL_DIR_ATTR,
+    _trial_dir_for,
+    _winner_path,
+)
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import UnknownExperimentError
@@ -55,6 +61,27 @@ def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None)
         allow=allow,
         filename="srv.catalog.yaml",
     )
+
+
+def _write_cleanup_uncertain_failed_trial(config: Path) -> Path:
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    phase = exp.phases[0]
+    study = optuna.create_study(
+        study_name=f"{exp.experiment}::{phase.name}",
+        storage=exp.storage,
+        direction="minimize",
+    )
+    trial = study.ask()
+    trial_dir = _trial_dir_for(exp, phase.name, trial.number)
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "pid").write_text("4242\n")
+    (trial_dir / "pgid").write_text("4242\n")
+    (trial_dir / "pid_starttime").write_text("111\n")
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+    return trial_dir
 
 
 def test_safe_tool_returns_safe_mcp_error() -> None:
@@ -951,6 +978,7 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
+    _write_cleanup_uncertain_failed_trial(config)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-terminal-recover"
@@ -972,6 +1000,32 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
         cleanup_confirmed=False,
     )
 
+    runner_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+    trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fake_runner_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float = 30.0,
+    ) -> bool:
+        runner_cleanup_calls.append((pid, saved_starttime, pgid))
+        return True
+
+    def fake_trial_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float = 30.0,
+    ) -> bool:
+        trial_cleanup_calls.append((pid, saved_starttime, pgid))
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
 
@@ -983,6 +1037,7 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
 
     assert dry.exit_code == 0, dry.output
     assert "Re-run with --confirm" in dry.output
+    assert "confirmed 1 cleanup-uncertain trial" in dry.output
     assert not store.cleanup_uncertain_path(run_id).exists()
     assert store.state(handle) == "running"
 
@@ -1004,12 +1059,58 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert recovery["run_id"] == run_id
     assert recovery["config_sha256"] == reg.config_sha256
     assert recovery["cleanup_confirmed"] is True
+    assert recovery["cleanup_uncertain_trials"] == 1
     assert store.state(handle) == "failed"
+    assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
+    assert trial_cleanup_calls == [(4242, 111, 4242), (4242, 111, 4242)]
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-terminal-no-evidence"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "could not confirm any trial-level cleanup evidence" in result.output
+    assert not store.cleanup_recovery_path(run_id).exists()
+    assert store.state(handle) == "running"
 
 
 def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> None:
