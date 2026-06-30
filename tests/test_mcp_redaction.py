@@ -117,3 +117,30 @@ def test_visible_winner_params_supports_allowlist_and_all() -> None:
         "lr": 3e-4,
     }
     assert visible_winner_params(params, "all") == params
+
+
+def test_winners_payload_applies_visible_params_policy() -> None:
+    views = [
+        PhaseWinnerView(
+            "p",
+            0,
+            0.1,
+            {"dataset": "SECRET_DATASET", "lr": 3e-4},
+            {"dataset": "SECRET_DATASET", "lr": 3e-4},
+            None,
+            False,
+        )
+    ]
+
+    assert winners_payload("redact_me", views)["phases"][0]["params"] == {
+        "dataset": "<redacted>",
+        "lr": "<redacted>",
+    }
+    assert winners_payload("redact_me", views, visible_params=["lr"])["phases"][0]["params"] == {
+        "dataset": "<redacted>",
+        "lr": 3e-4,
+    }
+    assert winners_payload("redact_me", views, visible_params="all")["phases"][0]["params"] == {
+        "dataset": "SECRET_DATASET",
+        "lr": 3e-4,
+    }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -181,6 +182,34 @@ def test_state_failed_from_nonzero_status(tmp_path: Path) -> None:
     assert store.state(handle) == "failed"
 
 
+def test_status_read_failures_do_not_break_state_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1")
+    store.save(handle)
+
+    store.status_path("exp-1").write_bytes(b"\xff")
+    assert store.recorded_terminal_status(handle) is None
+    assert store.state(handle) == "running"
+    assert store.live_runs() == [handle]
+
+    store.status_path("exp-1").write_text('{"returncode": 0}', encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def fail_status_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == store.status_path("exp-1"):
+            raise OSError("status file temporarily unreadable")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_status_read)
+
+    assert store.recorded_terminal_status(handle) is None
+    assert store.state(handle) == "running"
+    assert store.live_runs() == [handle]
+
+
 def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
@@ -320,20 +349,18 @@ def test_state_failed_for_zombie_runner_without_status(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux"):
         pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
-    # Spawn a child that exits immediately. As its (unreaping) parent, the pid
-    # lingers as a zombie that os.kill(pid, 0) still reports as alive - exactly
-    # the SIGKILL/OOM case that must report failed, not running, or relaunch
-    # would be blocked forever.
-    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+    # Kill a child that is paused until signalled. As its unreaping parent, the
+    # PID lingers as a zombie that os.kill(pid, 0) still reports as alive -
+    # exactly the SIGKILL/OOM case that must report failed, not running.
+    proc = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
     try:
+        starttime = read_proc_starttime(proc.pid)
+        os.kill(proc.pid, signal.SIGKILL)
         deadline = time.time() + 5
         while time.time() < deadline and not is_pid_zombie(proc.pid):
             time.sleep(0.02)
-        if not is_pid_zombie(proc.pid):
-            pytest.skip("could not observe a zombie (fast reaper?)")
-        handle = make_run_handle(
-            store, run_id="zomb", pid=proc.pid, starttime=read_proc_starttime(proc.pid)
-        )
+        assert is_pid_zombie(proc.pid)
+        handle = make_run_handle(store, run_id="zomb", pid=proc.pid, starttime=starttime)
         assert store.state(handle) == "failed"
         # state() reaped the child, so the zombie is gone, not merely filtered.
         assert not is_pid_zombie(proc.pid)

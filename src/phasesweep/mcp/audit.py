@@ -18,6 +18,14 @@ from uuid import uuid4
 from phasesweep.mcp.time import utc_now_iso
 
 log = logging.getLogger("phasesweep.mcp.audit")
+MAX_AUDIT_STRING_LENGTH = 256
+
+
+def _compact_value(value: Any) -> Any:
+    """Return an audit-safe scalar with bounded string size."""
+    if isinstance(value, str) and len(value) > MAX_AUDIT_STRING_LENGTH:
+        return f"{value[: MAX_AUDIT_STRING_LENGTH - 3]}..."
+    return value
 
 
 def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
@@ -28,7 +36,7 @@ def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
     """
     if values is None:
         return {}
-    return {key: value for key, value in values.items() if value is not None}
+    return {key: _compact_value(value) for key, value in values.items() if value is not None}
 
 
 @dataclass

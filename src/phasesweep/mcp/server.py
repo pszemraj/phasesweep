@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import functools
 import hashlib
+import importlib.util
 import logging
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from phasesweep.mcp.errors import (
     PermissionDeniedError,
     ResumeNotReadyError,
     RunSnapshotUnavailableError,
+    UnknownExperimentError,
     UnknownRunError,
 )
 from phasesweep.mcp.redaction import status_payload, winners_payload
@@ -550,7 +552,15 @@ class PhaseSweepMCP:
                 run_id=run_id,
                 include_run=False,
             )
-            visible_params = self._registry.get(target_id).visible_params
+            try:
+                visible_params = self._registry.get(target_id).visible_params
+            except UnknownExperimentError:
+                if run_id is None:
+                    raise
+                # A run snapshot remains readable after the operator removes
+                # its catalog entry. Without a current visibility policy,
+                # default to the strict redacted posture.
+                visible_params = "none"
             result = winners_payload(
                 target_id,
                 read_winners(experiment),
@@ -614,7 +624,20 @@ class PhaseSweepMCP:
                 handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
                 try:
                     self._runs.save(handle)
-                except Exception:
+                except Exception as save_exc:
+                    marker_written = False
+                    try:
+                        self._runs.mark_cleanup_uncertain(handle)
+                        marker_written = True
+                    except Exception as marker_exc:
+                        log.error(
+                            "cleanup uncertain after failed handle save for run_id=%s pgid=%s, "
+                            "but failed to persist cleanup uncertainty marker; original save error: %r",
+                            handle.run_id,
+                            handle.pgid,
+                            save_exc,
+                            exc_info=(type(marker_exc), marker_exc, marker_exc.__traceback__),
+                        )
                     try:
                         assert handle.pgid is not None
                         cleanup_confirmed = kill_stale_group(
@@ -624,16 +647,18 @@ class PhaseSweepMCP:
                         )
                     except Exception:
                         log.exception(
-                            "failed to terminate unsaved runner run_id=%s pgid=%d",
+                            "failed to terminate unsaved runner run_id=%s pgid=%s",
                             handle.run_id,
                             handle.pgid,
                         )
                     else:
-                        if not cleanup_confirmed:
-                            with contextlib.suppress(Exception):
-                                self._runs.mark_cleanup_uncertain(handle)
+                        if cleanup_confirmed:
+                            if marker_written:
+                                with contextlib.suppress(Exception):
+                                    self._runs.clear_cleanup_uncertain(handle)
+                        else:
                             log.error(
-                                "cleanup uncertain after failed handle save for run_id=%s pgid=%d",
+                                "cleanup uncertain after failed handle save for run_id=%s pgid=%s",
                                 handle.run_id,
                                 handle.pgid,
                             )
@@ -697,6 +722,10 @@ class PhaseSweepMCP:
                     result_counts={"runs": 1},
                 )
                 return result
+            # Keep the run live before signalling. In the force-kill/no-status
+            # case state() could otherwise briefly derive "failed" while trial
+            # descendants still hold resources.
+            self._runs.mark_cleanup_uncertain(handle)
             # SIGTERM -> grace -> SIGKILL on the runner's process group. A
             # runner-written status is useful only when it includes explicit
             # cleanup evidence from the engine shutdown handler. If the server
@@ -717,8 +746,6 @@ class PhaseSweepMCP:
             )
             if confirmed:
                 self._runs.clear_cleanup_uncertain(handle)
-            else:
-                self._runs.mark_cleanup_uncertain(handle)
             after = self._runs.state(handle)
             result = {"run_id": run_id, "state": after, "cleanup_confirmed": confirmed}
         except Exception as exc:
@@ -893,7 +920,7 @@ def _safe_tool(fn: F) -> F:
     ``McpToolError`` -> re-raised as ``ValueError`` with its safe message.
     FastMCP's low-level handler serializes tool exceptions as
     ``CallToolResult(isError=True)``. Anything else -> logged to stderr and
-    replaced with a generic message so an unexpected error (e.g. an OSError
+    replaced with a generic message so an unexpected ``Exception`` (e.g. an OSError
     carrying a path) never reaches the agent. ``functools.wraps`` preserves the
     signature so FastMCP still derives the tool schema.
 
@@ -1195,6 +1222,13 @@ def serve(catalog: Path) -> int:
         format="%(asctime)s %(levelname).1s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if importlib.util.find_spec("mcp") is None:
+        print(
+            "phasesweep mcp: MCP support is not installed; install with `pip install 'phasesweep[mcp]'`.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         registry = Registry.load(catalog)

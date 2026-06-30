@@ -18,7 +18,7 @@ For every field, type, default, enum value, and validation constraint, use [conf
 
 ## Experiment Keys
 
-The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to `[A-Za-z0-9_-]+`.
+The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to ASCII `[A-Za-z0-9_-]+`.
 
 `storage` controls whether a run can resume. `null` is in-memory and non-resumable. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
 
@@ -30,7 +30,7 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-- `name`: required phase name matching `[A-Za-z0-9_-]+`.
+- `name`: required phase name matching ASCII `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.
 - `fixed_overrides`: hard-coded overrides for every trial in the phase.
 - `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.

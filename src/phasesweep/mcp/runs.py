@@ -359,8 +359,8 @@ class RunStore:
         if not path.is_file():
             return None
         try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             return None
 
     def _cleanup_uncertain(self, handle: RunHandle) -> bool:
@@ -381,8 +381,8 @@ class RunStore:
         if not path.is_file():
             return False
         try:
-            payload = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             return False
         return (
             payload.get("run_id") == handle.run_id

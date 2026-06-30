@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -343,6 +344,41 @@ def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
     assert store.state(pending) == "failed"
 
 
+def test_launch_logs_when_cleanup_marker_write_fails_after_final_save_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    original_save = store.save
+    saved: list[RunHandle] = []
+
+    def fail_second_save(handle: RunHandle) -> None:
+        saved.append(handle)
+        if len(saved) == 1:
+            original_save(handle)
+            return
+        raise OSError("runs directory is not writable")
+
+    def fail_marker(_handle: RunHandle) -> None:
+        raise OSError("logs directory is not writable")
+
+    monkeypatch.setattr(store, "save", fail_second_save)
+    monkeypatch.setattr(store, "mark_cleanup_uncertain", fail_marker)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: False)
+    caplog.set_level(logging.ERROR, logger="phasesweep.mcp.server")
+
+    with pytest.raises(OSError, match="runs directory"):
+        app.launch("srv")
+
+    assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
+    assert "failed to persist cleanup uncertainty marker" in caplog.text
+    assert "original save error" in caplog.text
+    assert "cleanup uncertain after failed handle save" in caplog.text
+
+
 def test_launch_spawns_runner_with_registered_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -404,6 +440,39 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     assert [phase["phase"] for phase in by_experiment["phases"]] == ["p"]
     if method_name == "status":
         assert by_experiment["run"]["run_id"] == run_id
+
+
+def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
+    tmp_path: Path,
+) -> None:
+    old_config = _config(tmp_path, name="old")
+    old_exp = load_config(old_config)
+    assert isinstance(old_exp, Experiment)
+    _write_winner_yaml(
+        old_exp,
+        "p",
+        phase_fingerprint=_phase_fingerprint(old_exp, old_exp.phases[0], {}),
+    )
+    other_config = _config(tmp_path, name="other")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
+    )
+    snapshot = old_config.read_bytes()
+    run_id = "old-launched"
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.save(
+        make_run_handle(
+            store,
+            run_id=run_id,
+            experiment_id="old",
+            config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        )
+    )
+
+    result = app.winners(run_id=run_id)
+
+    assert result["experiment_id"] == "old"
+    assert result["phases"][0]["params"] == {"lr": "<redacted>"}
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])
@@ -549,6 +618,16 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     assert captured["cmd"]  # sanity: the launch path really reached Popen
 
 
+def test_audit_log_caps_agent_supplied_string_values(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    audit = AuditLogger(audit_path)
+
+    audit.record(tool=TOOL_LIST_EXPERIMENTS, args={"cursor": "x" * 500}, outcome="success")
+
+    record = json.loads(audit_path.read_text())
+    assert record["args"]["cursor"] == ("x" * 253) + "..."
+
+
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = RunStore(tmp_path / "state")
@@ -686,7 +765,11 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
     )
     store.save(handle)
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: False)
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        assert store.cleanup_uncertain_path(run_id).is_file()
+        return False
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 

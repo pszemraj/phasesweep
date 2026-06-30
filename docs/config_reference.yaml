@@ -22,7 +22,7 @@ Experiment:
   # A single phase-chained sweep. This is the normal root shape when the file
   # does not contain `suite:`.
   experiment: "str (required)"
-  # Safe name used in paths, study names, locks, and run identity.
+  # ASCII safe name used in paths, study names, locks, and run identity.
   # Must be non-empty and match [A-Za-z0-9_-]+.
 
   storage: "str | None = null"
@@ -82,7 +82,7 @@ Experiment:
 
   phases:
     - name: "str (required)"
-      # Safe phase name, non-empty [A-Za-z0-9_-]+. Used in output paths and
+      # ASCII safe phase name, non-empty [A-Za-z0-9_-]+. Used in output paths and
       # Optuna study names.
       comment: "str | None = null"
       # Free-text design note surfaced by validate/show-winners. Excluded from
@@ -189,7 +189,7 @@ Suite:
   # A suite is a group of independent or dependency-ordered studies. Each study
   # compiles to an Experiment named <suite>__<study>.
   suite: "str (required)"
-  # Safe suite name, non-empty [A-Za-z0-9_-]+. Used in output paths, locks, and
+  # ASCII safe suite name, non-empty [A-Za-z0-9_-]+. Used in output paths, locks, and
   # experiment-name prefixes.
 
   defaults:
@@ -209,7 +209,7 @@ Suite:
 
   studies:
     - name: "str (required)"
-      # Safe study name, non-empty [A-Za-z0-9_-]+.
+      # ASCII safe study name, non-empty [A-Za-z0-9_-]+.
       depends_on: "list[str] = []"
       # Prior study names that must complete before this study starts.
       # Dependencies are prior-only; forward references are rejected.
@@ -416,7 +416,7 @@ Definitions:
       # Missing wandb, timeout, or missing keys produce a failed gate result.
 
 Validation:
-  name_syntax: "experiment, suite, study, and phase names are [A-Za-z0-9_-]+"
+  name_syntax: "experiment, suite, study, and phase names are ASCII [A-Za-z0-9_-]+"
   override_key_syntax: "dotted [A-Za-z0-9_-]+ segments; no empty segments or whitespace"
   duplicate_yaml_keys: "rejected by the strict YAML loader"
   unknown_model_keys: "rejected by Pydantic extra='forbid'"

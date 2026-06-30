@@ -54,7 +54,7 @@ Cleanup-uncertain recovery is operator-only. After inspecting the host, run `pha
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
-When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads.
+When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads. If the run's original experiment id is no longer in the active catalog, winner parameter values use the strict `visible_params: none` behavior.
 
 ## Resource and prompt
 
@@ -98,7 +98,7 @@ Run handles and per-run logs live under `state_dir`:
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 
-`audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, safe arguments (`experiment_id`, `run_id`, `from_phase`), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
+`audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
 Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop. SQLite-backed status uses a read-only direct count path; Journal/RDB-backed status uses Optuna's read path today, so very large external studies should be polled every few seconds until the tracked backend-specific aggregate-count optimization is implemented.
 
