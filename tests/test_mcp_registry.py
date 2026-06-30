@@ -225,6 +225,8 @@ def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:
         '"sqlite+pysqlite:///relative.db"',
         '"sqlite:///file:relative.db?mode=rwc&uri=true"',
         '"journal:///relative.journal"',
+        '"journal://"',
+        '"journal:///"',
     ],
 )
 def test_relative_file_storage_rejected_for_mcp(tmp_path: Path, storage: str) -> None:

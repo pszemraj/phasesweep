@@ -175,10 +175,16 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
     if storage is None or backend not in {"sqlite", "journal"}:
         return
 
+    if backend == "sqlite" and storage_is_in_memory(storage):
+        return
     raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
     raw_path = file_url_path(storage) if raw_path is None else raw_path
-    if raw_path in {"", ":memory:"} or raw_path.startswith("file::memory:"):
-        return
+    if raw_path == "":
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments must use a non-empty absolute "
+            f"{backend} storage path; empty file-backed storage URLs cannot be "
+            "monitored across detached processes"
+        )
     if not Path(raw_path).expanduser().is_absolute():
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
