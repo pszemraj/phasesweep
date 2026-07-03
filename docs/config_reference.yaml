@@ -44,7 +44,7 @@ Experiment:
 
   override_format: "Literal['argparse', 'hydra', 'json_file'] = 'argparse'"
   # argparse: {overrides} becomes shell-quoted `--key value` pairs.
-  # hydra: {overrides} becomes shell-quoted `key=value` tokens.
+  # hydra: {overrides} becomes shell-quoted `key=value` tokens with strings quoted for OmegaConf grammar; use json_file for structured values.
   # json_file: {overrides_path} points at <trial_dir>/overrides.json with
   # dotted override keys expanded into nested objects.
   # If a phase has inherited, fixed, contract, or sampled overrides, argparse

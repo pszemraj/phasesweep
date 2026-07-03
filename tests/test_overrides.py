@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+
 import pytest
 from pydantic import ValidationError
 
@@ -21,6 +23,21 @@ def test_hydra_dotted():
 def test_hydra_bool():
     s = format_hydra({"flag": True, "off": False})
     assert s == "flag=true off=false"
+
+
+def test_hydra_quotes_string_values_for_hydra_grammar():
+    s = format_hydra({"optimizer": "adam,w", "tags": ["a,b", "c[d]"], "mode": "true"})
+
+    assert shlex.split(s) == [
+        'optimizer="adam,w"',
+        'tags=["a,b","c[d]"]',
+        'mode="true"',
+    ]
+
+
+def test_hydra_rejects_structured_values():
+    with pytest.raises(TypeError, match="json_file"):
+        format_hydra({"model": {"depth": 2}})
 
 
 def test_argparse():
@@ -57,6 +74,29 @@ def test_render_command_json_file(tmp_path):
 
     data = json.loads((tmp_path / "overrides.json").read_text())
     assert data == {"a": {"b": 1, "c": 2}, "d": "x"}
+
+
+def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        """
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: hydra
+        metric:
+          name: x
+          goal: minimize
+          extractor: { type: json, path: r.json, key: x }
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              model: { depth: 2 }
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="override_format='hydra'.*json_file"):
+        load_experiment(p)
 
 
 # ---- migrated from version-named files ----

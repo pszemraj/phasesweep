@@ -72,10 +72,12 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 | Format      | Template placeholder | Trainer receives                     | Use when                                                         |
 | ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
 | `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
-| `hydra`     | `{overrides}`        | `key=value` tokens                   | Existing Hydra/OmegaConf applications.                           |
-| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
+| `hydra`     | `{overrides}`        | `key=value` tokens                   | Compatibility for existing Hydra/OmegaConf applications.         |
+| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Recommended for structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
 When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
+
+`json_file` is the most robust trainer boundary because it preserves JSON types without relying on a command-line grammar. Hydra compatibility quotes string and list values for OmegaConf override parsing, but complex structured values should use `json_file` rather than Hydra CLI overrides.
 
 ## Trainer Contract
 

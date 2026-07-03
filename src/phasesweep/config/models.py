@@ -714,7 +714,7 @@ def _validate_trial_command_template(
     # which check happens to detect the problem first.
     try:
         fields = _format_field_names(experiment.trial_command)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
@@ -739,7 +739,7 @@ def _validate_trial_command_template(
             f"{{{bad}}}. Supported: {{overrides}}, {{overrides_path}} (json_file "
             f"only), {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
         ) from exc
-    except (ValueError, IndexError) as exc:
+    except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
