@@ -163,8 +163,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     whenever storage is persistent. In-memory storage has no shared backend,
     so the output lock alone suffices.
 
-    Both locks are *same-host advisory only*. Multi-host coordination needs
-    per-trial leases + heartbeats (see ``docs/roadmap.md``).
+    Both locks are *same-host advisory only*; multi-host coordination would need durable per-trial leases and heartbeats rather than just host-local flock files.
 
     Args:
         experiment: Parsed experiment config.
