@@ -50,7 +50,7 @@ A launched sweep runs as a **detached background process** in its own session, s
 
 `cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group is gone and the runner wrote a readable terminal status whose own `cleanup_confirmed` field is `true`. That field is emitted by the engine shutdown handler after it terminates active trial process groups through the same confirmed cleanup path used by stale-trial recovery. If the runner group is gone but no status was recorded, or the status reports unconfirmed trial cleanup, the server writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. A terminal runner failure whose status records `cleanup_confirmed: false` is also counted as live until operator recovery confirms cleanup. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
 
-Cleanup-uncertain recovery is operator-only. After inspecting the host, run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` to verify the saved config snapshot hash, re-check the runner identity, and invoke the engine stale-trial reaper against that snapshot. If it reports that cleanup appears confirmed, repeat with `--confirm` to write recovery evidence and clear the uncertainty. MCP deliberately has no tool for clearing this state.
+Cleanup-uncertain recovery is operator-only. After inspecting the host, run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` to verify the saved config snapshot hash, re-check the runner identity, and inspect the snapshot's phase studies for cleanup evidence. The dry run confirms cleanup for terminal cleanup-uncertain trials and stale `RUNNING` trials without mutating study state. If it reports that cleanup appears confirmed, repeat with `--confirm`; that mode reaps stale `RUNNING` trials, records consumed cleanup evidence in the study so the same trial evidence cannot clear a later run, writes run recovery evidence, and clears the run's cleanup uncertainty. MCP deliberately has no tool for clearing this state.
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
@@ -94,6 +94,7 @@ Run handles and per-run logs live under `state_dir`:
 - `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
 - `state_dir/logs/<run_id>.config.yaml` - the exact config snapshot executed by
   the runner (operator-only; may contain command, storage, env, and overrides).
+- `state_dir/logs/<run_id>.cleanup_uncertain.json` - server-owned marker that keeps a cleanup-uncertain run counted as live.
 - `state_dir/logs/<run_id>.cleanup_recovery.json` - operator recovery evidence written by `phasesweep mcp-recover-run --confirm`.
 
 The engine's own durable `run.log` is under the experiment `workdir`.
