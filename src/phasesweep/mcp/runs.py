@@ -18,13 +18,26 @@ from typing import Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.runtime.files import atomic_write_text, try_lock_file, unlock_file
+from phasesweep.runtime.files import (
+    ensure_private_dir,
+    private_atomic_write_text,
+    try_lock_file,
+    unlock_file,
+)
 from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
 
-__all__ = ["RunHandle", "RunLaunchState", "RunState", "RunStore", "write_status_file"]
+__all__ = [
+    "CleanupUncertainMarker",
+    "ProcessIdentity",
+    "RunHandle",
+    "RunLaunchState",
+    "RunState",
+    "RunStore",
+    "write_status_file",
+]
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -43,7 +56,26 @@ def write_status_file(status_path: Path, payload: dict) -> None:
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict payload: JSON-serializable terminal status payload.
     """
-    atomic_write_text(status_path, json.dumps(payload, indent=2))
+    private_atomic_write_text(status_path, json.dumps(payload, indent=2) + "\n")
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Persisted process identity used for PID-reuse-safe runner cleanup."""
+
+    pid: int | None
+    pgid: int | None
+    pid_starttime: int | None
+
+
+@dataclass(frozen=True)
+class CleanupUncertainMarker:
+    """Validated cleanup-uncertainty marker payload."""
+
+    run_id: str
+    config_sha256: str | None
+    identity: ProcessIdentity
+    cleanup_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,11 +115,12 @@ class RunStore:
 
         :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
         """
+        ensure_private_dir(state_dir)
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
-        self._runs_dir.mkdir(parents=True, exist_ok=True)
-        self._logs_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self._runs_dir)
+        ensure_private_dir(self._logs_dir)
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:
@@ -167,7 +200,7 @@ class RunStore:
         """
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
-        atomic_write_text(target, payload)
+        private_atomic_write_text(target, payload + "\n")
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -261,9 +294,13 @@ class RunStore:
         # query is a natural place to clean it up (no signal handler needed).
         if handle.pid is not None:
             reap_child(handle.pid)
-        if self._cleanup_uncertain(handle):
-            return "running"
         status = self._read_status(handle)
+        if self._cleanup_uncertain(handle):
+            if status is not None and status.get("cleanup_confirmed") is True:
+                with contextlib.suppress(OSError):
+                    self.clear_cleanup_uncertain(handle)
+            else:
+                return "running"
         if status is not None:
             if self._terminal_cleanup_uncertain(handle, status):
                 return "running"
@@ -310,14 +347,28 @@ class RunStore:
 
         :param RunHandle handle: Run handle whose cleanup is uncertain.
         """
+        existing = self._read_cleanup_uncertain_marker(handle)
+        candidate = ProcessIdentity(
+            pid=handle.pid,
+            pgid=handle.pgid,
+            pid_starttime=handle.pid_starttime,
+        )
+        candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
+        identity = (
+            existing.identity if existing is not None and not candidate_has_identity else candidate
+        )
         payload = {
             "run_id": handle.run_id,
-            "pid": handle.pid,
-            "pgid": handle.pgid,
-            "pid_starttime": handle.pid_starttime,
+            "config_sha256": handle.config_sha256,
+            "pid": identity.pid,
+            "pgid": identity.pgid,
+            "pid_starttime": identity.pid_starttime,
             "cleanup_confirmed": False,
         }
-        atomic_write_text(self.cleanup_uncertain_path(handle.run_id), json.dumps(payload, indent=2))
+        private_atomic_write_text(
+            self.cleanup_uncertain_path(handle.run_id),
+            json.dumps(payload, indent=2) + "\n",
+        )
 
     def clear_cleanup_uncertain(self, handle: RunHandle) -> None:
         """Clear a previously persisted cleanup uncertainty marker.
@@ -325,6 +376,31 @@ class RunStore:
         :param RunHandle handle: Run handle whose process group is now confirmed gone.
         """
         self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
+
+    def cleanup_uncertain(self, handle: RunHandle) -> bool:
+        """Return whether a valid cleanup uncertainty marker exists for ``handle``."""
+        return self._cleanup_uncertain(handle)
+
+    def cleanup_identity(self, handle: RunHandle) -> ProcessIdentity:
+        """Return the strongest runner identity available for cleanup.
+
+        If a pending handle was the only handle durably saved, a cleanup marker
+        written from the spawned handle may carry the only usable PID/PGID. Keep
+        that marker identity authoritative when present and valid.
+
+        :param RunHandle handle: Run handle whose runner identity is needed.
+        :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
+        """
+        marker = self._read_cleanup_uncertain_marker(handle)
+        if marker is not None and (
+            marker.identity.pid is not None or marker.identity.pgid is not None
+        ):
+            return marker.identity
+        return ProcessIdentity(
+            pid=handle.pid,
+            pgid=handle.pgid,
+            pid_starttime=handle.pid_starttime,
+        )
 
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.
@@ -359,9 +435,22 @@ class RunStore:
         if not path.is_file():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("run_id") != handle.run_id:
+            return None
+        if type(payload.get("returncode")) is not int:
+            return None
+        cleanup_confirmed = payload.get("cleanup_confirmed")
+        if cleanup_confirmed is not None and type(cleanup_confirmed) is not bool:
+            return None
+        error_class = payload.get("error_class")
+        if error_class is not None and not isinstance(error_class, str):
+            return None
+        return payload
 
     def _cleanup_uncertain(self, handle: RunHandle) -> bool:
         """Return whether this run has a server-owned cleanup uncertainty marker.
@@ -369,7 +458,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose cleanup marker should be checked.
         :return bool: True when a prior cancel could not confirm cleanup.
         """
-        return self.cleanup_uncertain_path(handle.run_id).is_file()
+        return self._read_cleanup_uncertain_marker(handle) is not None
 
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
         """Return whether a terminal status still needs operator cleanup recovery."""
@@ -384,8 +473,57 @@ class RunStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
+        if not isinstance(payload, dict):
+            return False
         return (
             payload.get("run_id") == handle.run_id
             and payload.get("config_sha256") == handle.config_sha256
             and payload.get("cleanup_confirmed") is True
         )
+
+    def _read_cleanup_uncertain_marker(
+        self,
+        handle: RunHandle,
+    ) -> CleanupUncertainMarker | None:
+        """Read and validate this run's cleanup uncertainty marker."""
+        path = self.cleanup_uncertain_path(handle.run_id)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("run_id") != handle.run_id:
+            return None
+        marker_hash = payload.get("config_sha256")
+        if marker_hash is not None and marker_hash != handle.config_sha256:
+            return None
+        if payload.get("cleanup_confirmed") is not False:
+            return None
+
+        pid = payload.get("pid")
+        pgid = payload.get("pgid")
+        pid_starttime = payload.get("pid_starttime")
+        if not _valid_positive_optional_int(pid):
+            return None
+        if not _valid_positive_optional_int(pgid):
+            return None
+        if not _valid_positive_optional_int(pid_starttime):
+            return None
+
+        return CleanupUncertainMarker(
+            run_id=handle.run_id,
+            config_sha256=marker_hash if isinstance(marker_hash, str) else None,
+            identity=ProcessIdentity(
+                pid=pid,
+                pgid=pgid,
+                pid_starttime=pid_starttime,
+            ),
+        )
+
+
+def _valid_positive_optional_int(value: object) -> bool:
+    """Return whether ``value`` is ``None`` or a positive non-bool ``int``."""
+    return value is None or (type(value) is int and value > 0)

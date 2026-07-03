@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 
 import optuna
@@ -82,6 +83,29 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> Path:
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     return trial_dir
+
+
+def _write_stale_running_trial(config: Path) -> int:
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    phase = exp.phases[0]
+    study = optuna.create_study(
+        study_name=f"{exp.experiment}::{phase.name}",
+        storage=exp.storage,
+        direction="minimize",
+    )
+    trial = study.ask()
+    trial_dir = _trial_dir_for(exp, phase.name, trial.number)
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "pid").write_text("4343\n")
+    (trial_dir / "pgid").write_text("4343\n")
+    (trial_dir / "pid_starttime").write_text("222\n")
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    return trial.number
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def test_safe_tool_returns_safe_mcp_error() -> None:
@@ -655,6 +679,36 @@ def test_audit_log_caps_agent_supplied_string_values(tmp_path: Path) -> None:
     assert record["args"]["cursor"] == ("x" * 253) + "..."
 
 
+def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    registry = Registry.load(catalog)
+    store = RunStore(registry.state_dir)
+    audit_path = registry.state_dir / "audit.jsonl"
+    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    captured = patch_popen_capture(monkeypatch)
+
+    old_umask = os.umask(0)
+    try:
+        result = app.launch("srv")
+    finally:
+        os.umask(old_umask)
+
+    run_id = result["run_id"]
+    assert result["state"] == "running"
+    assert captured["cmd"]
+    assert _mode(registry.state_dir) == 0o700
+    assert _mode(registry.state_dir / "runs") == 0o700
+    assert _mode(registry.state_dir / "logs") == 0o700
+    assert _mode(registry.state_dir / "runs" / f"{run_id}.json") == 0o600
+    assert _mode(store.log_path(run_id)) == 0o600
+    assert _mode(store.config_snapshot_path(run_id)) == 0o600
+    assert _mode(audit_path) == 0o600
+
+
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = RunStore(tmp_path / "state")
@@ -1059,10 +1113,103 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert recovery["run_id"] == run_id
     assert recovery["config_sha256"] == reg.config_sha256
     assert recovery["cleanup_confirmed"] is True
-    assert recovery["cleanup_uncertain_trials"] == 1
+    assert recovery["reaped_running_trials"] == 0
+    assert recovery["cleanup_uncertain_terminal_trials"] == 1
     assert store.state(handle) == "failed"
     assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
     assert trial_cleanup_calls == [(4242, 111, 4242), (4242, 111, 4242)]
+
+    captured = patch_popen_capture(monkeypatch)
+    launched = app.launch("srv")
+    assert launched["state"] == "running"
+    assert captured["cmd"]
+
+
+def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    trial_number = _write_stale_running_trial(config)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-running-recover"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    runner_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+    trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fake_runner_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float = 30.0,
+    ) -> bool:
+        runner_cleanup_calls.append((pid, saved_starttime, pgid))
+        return True
+
+    def fake_trial_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float = 30.0,
+    ) -> bool:
+        trial_cleanup_calls.append((pid, saved_starttime, pgid))
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "reaped 1 stale trial" in result.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["run_id"] == run_id
+    assert recovery["config_sha256"] == reg.config_sha256
+    assert recovery["cleanup_confirmed"] is True
+    assert recovery["reaped_running_trials"] == 1
+    assert recovery["cleanup_uncertain_terminal_trials"] == 0
+    assert store.state(handle) == "failed"
+    assert runner_cleanup_calls == [(999999, 111, 999999)]
+    assert trial_cleanup_calls == [(4343, 222, 4343)]
+
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    study = optuna.load_study(study_name="srv::p", storage=exp.storage)
+    trial = study.get_trials(deepcopy=False)[trial_number]
+    assert trial.state == optuna.trial.TrialState.FAIL
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore
+from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import read_proc_starttime
@@ -228,7 +228,8 @@ def make_run_handle(
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
-    store.status_path(run_id).write_text(json.dumps(payload))
+    full_payload = {"run_id": run_id, **payload}
+    write_status_file(store.status_path(run_id), full_payload)
 
 
 def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:

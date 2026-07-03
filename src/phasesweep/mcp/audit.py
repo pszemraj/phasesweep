@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.files import open_private_text
 
 log = logging.getLogger("phasesweep.mcp.audit")
 MAX_AUDIT_STRING_LENGTH = 256
@@ -102,9 +103,8 @@ class AuditLogger:
             event["error"] = error
 
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(event, sort_keys=True, separators=(",", ":"), default=str)
-            with self._lock, self.path.open("a", encoding="utf-8") as fh:
+            with self._lock, open_private_text(self.path, "a") as fh:
                 fh.write(line + "\n")
         except OSError as exc:
             log.warning("failed to write MCP audit record to %s: %s", self.path, exc)

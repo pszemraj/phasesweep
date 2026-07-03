@@ -46,7 +46,7 @@ from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.files import atomic_write_bytes
+from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
 from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
 
 log = logging.getLogger("phasesweep.mcp.server")
@@ -732,10 +732,11 @@ class PhaseSweepMCP:
             # had to force-kill the runner first, or the handler reported
             # uncertainty, child trial PGIDs may still live, so keep the run
             # counted as live and fail closed.
+            identity = self._runs.cleanup_identity(handle)
             runner_group_gone = kill_stale_group(
-                handle.pid,
-                handle.pid_starttime,
-                pgid=handle.pgid,
+                identity.pid,
+                identity.pid_starttime,
+                pgid=identity.pgid,
                 grace_seconds=30.0,
             )
             terminal_status = self._runs.recorded_terminal_status(handle)
@@ -819,7 +820,7 @@ class PhaseSweepMCP:
             raise ConfigChangedError(reg.id)
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
-            atomic_write_bytes(snapshot_path, data)
+            private_atomic_write_bytes(snapshot_path, data)
         except OSError as exc:
             log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
             raise RuntimeError("failed to create run config snapshot") from None
@@ -886,7 +887,7 @@ class PhaseSweepMCP:
             cmd += ["--from-phase", from_phase]
         # Open the log here, hand the fd to the child, then close our copy. The
         # child keeps it. stdin is /dev/null so the runner never blocks on input.
-        with open(log_path, "w") as log_file:
+        with open_private_text(log_path, "w") as log_file:
             proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
                 cmd,
                 stdin=subprocess.DEVNULL,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -16,6 +17,10 @@ import pytest
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.process import is_pid_zombie, read_proc_starttime
 from tests.mcp_helpers import make_run_handle, write_run_status
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def test_save_get_roundtrip(tmp_path: Path) -> None:
@@ -60,6 +65,25 @@ def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path:
     assert json.loads(status_path.read_text())["returncode"] == 0
     assert list(status_path.parent.glob("*.tmp")) == []
     assert list(status_path.parent.glob(".*.tmp")) == []
+
+
+def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> None:
+    old_umask = os.umask(0)
+    try:
+        store = RunStore(tmp_path / "state")
+        handle = make_run_handle(store, run_id="exp-1")
+        store.save(handle)
+        write_status_file(store.status_path("exp-1"), {"run_id": "exp-1", "returncode": 0})
+        store.mark_cleanup_uncertain(handle)
+    finally:
+        os.umask(old_umask)
+
+    assert _mode(tmp_path / "state") == 0o700
+    assert _mode(tmp_path / "state" / "runs") == 0o700
+    assert _mode(tmp_path / "state" / "logs") == 0o700
+    assert _mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
+    assert _mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
+    assert _mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
 
 
 @pytest.mark.parametrize(
@@ -175,6 +199,26 @@ def test_state_cancelled_from_signalled_code(tmp_path: Path, code: int) -> None:
     assert store.state(handle) == "cancelled"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"run_id": "other", "returncode": 0},
+        {"run_id": "exp-1", "returncode": "0"},
+        {"run_id": "exp-1", "returncode": True},
+        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": "yes"},
+        {"run_id": "exp-1", "returncode": 0, "error_class": 3},
+    ],
+)
+def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1")
+    store.status_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert store.recorded_terminal_status(handle) is None
+    assert store.state(handle) == "running"
+
+
 def test_state_failed_from_nonzero_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1")
@@ -248,6 +292,86 @@ def test_cleanup_uncertain_marker_keeps_run_live_until_cleared(tmp_path: Path) -
     store.clear_cleanup_uncertain(handle)
 
     assert store.state(handle) == "failed"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"run_id": "other", "cleanup_confirmed": False},
+        {"run_id": "exp-1", "config_sha256": "b" * 64, "cleanup_confirmed": False},
+        {"run_id": "exp-1", "cleanup_confirmed": True},
+        {"run_id": "exp-1", "cleanup_confirmed": False, "pid": "123"},
+        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 0},
+        {"run_id": "exp-1", "cleanup_confirmed": False, "pid_starttime": True},
+    ],
+)
+def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        store,
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.cleanup_uncertain_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not store.cleanup_uncertain(handle)
+    assert store.state(handle) == "failed"
+
+
+def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    pending = make_run_handle(
+        store,
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        launch_state="launching",
+    )
+    spawned = make_run_handle(
+        store,
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        pid=4242,
+        starttime=111,
+    )
+    store.save(pending)
+
+    store.mark_cleanup_uncertain(spawned)
+    store.mark_cleanup_uncertain(pending)
+
+    marker = json.loads(store.cleanup_uncertain_path("exp-1").read_text())
+    assert marker["pid"] == 4242
+    assert marker["pgid"] == 4242
+    assert marker["pid_starttime"] == 111
+    identity = store.cleanup_identity(pending)
+    assert (identity.pid, identity.pgid, identity.pid_starttime) == (4242, 4242, 111)
+
+
+def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    store.save(handle)
+    store.mark_cleanup_uncertain(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=143,
+        error_class="cancelled",
+        cleanup_confirmed=True,
+    )
+
+    assert store.state(handle) == "cancelled"
+    assert not store.cleanup_uncertain_path("exp-1").exists()
+
+    store.mark_cleanup_uncertain(handle)
+
+    assert store.state(handle) == "cancelled"
+    assert not store.cleanup_uncertain_path("exp-1").exists()
 
 
 def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(

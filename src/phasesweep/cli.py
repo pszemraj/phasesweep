@@ -18,7 +18,7 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.files import atomic_write_text
+from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
     is_pid_zombie,
@@ -233,17 +233,18 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     terminal_cleanup_uncertain = (
         terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
     )
-    needs_recovery = store.cleanup_uncertain_path(run_id).is_file() or terminal_cleanup_uncertain
+    needs_recovery = store.cleanup_uncertain(handle) or terminal_cleanup_uncertain
     if not needs_recovery:
         click.echo("No cleanup uncertainty is recorded for this run.")
         return
 
-    if _runner_appears_live(handle.pid, handle.pid_starttime):
+    identity = store.cleanup_identity(handle)
+    if _runner_appears_live(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
     if not kill_stale_group(
-        handle.pid,
-        handle.pid_starttime,
-        pgid=handle.pgid,
+        identity.pid,
+        identity.pid_starttime,
+        pgid=identity.pgid,
         grace_seconds=30.0,
     ):
         raise click.ClickException("runner process-group cleanup is still uncertain")
@@ -274,11 +275,14 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             cleanup_recovered += _recover_cleanup_uncertain_trials(study, config, phase.name)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from None
-    if terminal_cleanup_uncertain and cleanup_recovered == 0:
+    cleanup_evidence_count = reaped + cleanup_recovered
+    if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
         if inspected_studies == 0:
             detail = "no existing Optuna studies could be loaded from the run snapshot storage"
         else:
-            detail = "no terminal Optuna trials recorded cleanup uncertainty"
+            detail = (
+                "no RUNNING trials were reaped and no terminal trials recorded cleanup uncertainty"
+            )
         raise click.ClickException(
             "runner status recorded cleanup_confirmed=false, but recovery could not "
             f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
@@ -298,10 +302,13 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         "config_sha256": handle.config_sha256,
         "recovered_at": utc_now_iso(),
         "cleanup_confirmed": True,
-        "reaped_trials": reaped,
-        "cleanup_uncertain_trials": cleanup_recovered,
+        "reaped_running_trials": reaped,
+        "cleanup_uncertain_terminal_trials": cleanup_recovered,
     }
-    atomic_write_text(store.cleanup_recovery_path(run_id), json.dumps(payload, indent=2) + "\n")
+    private_atomic_write_text(
+        store.cleanup_recovery_path(run_id),
+        json.dumps(payload, indent=2) + "\n",
+    )
     store.clear_cleanup_uncertain(handle)
     click.echo(
         f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "

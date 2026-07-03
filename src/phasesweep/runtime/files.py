@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -22,6 +23,8 @@ POSIX_RUNTIME_ERROR = (
 )
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
 _DEFAULT_LOCK_DIR = Path("/var/tmp") / "phasesweep-locks"
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 
 
 def require_posix_runtime() -> None:
@@ -178,6 +181,126 @@ def fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def ensure_private_dir(path: Path) -> None:
+    """Create ``path`` and remove group/other access from an existing directory.
+
+    ``mkdir(mode=...)`` is still filtered through the process umask. MCP state
+    directories hold operator-only logs, config snapshots, and status files, so
+    creation and reuse both converge to a private mode and fail if that cannot
+    be enforced.
+
+    :param Path path: Directory that must be accessible only by the owner.
+    :raises PermissionError: If group/other access remains after chmod.
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        path.chmod(mode & ~0o077)
+    final_mode = stat.S_IMODE(path.stat().st_mode)
+    if final_mode & 0o077:
+        raise PermissionError(f"{path} is accessible by group or other users")
+
+
+def open_private_text(path: Path, mode: str = "w") -> IO[str]:
+    """Open a UTF-8 text file with owner-only permissions.
+
+    :param Path path: File to open.
+    :param str mode: Either ``"w"`` or ``"a"``.
+    :return IO[str]: Open text handle.
+    :raises ValueError: If ``mode`` is unsupported.
+    """
+    if mode not in {"w", "a"}:
+        raise ValueError(f"unsupported private text mode: {mode!r}")
+    ensure_private_dir(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if mode == "w" else os.O_APPEND
+    fd = os.open(path, flags, PRIVATE_FILE_MODE)
+    try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        return os.fdopen(fd, mode, encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def private_atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
+    """Atomically replace a private UTF-8 text file.
+
+    :param Path path: Destination path to replace.
+    :param str | None newline: Newline handling passed to ``open``.
+    :return Iterator[IO[str]]: Writable text handle.
+    """
+    ensure_private_dir(path.parent)
+    tmp_path: Path | None = None
+    replaced = False
+    try:
+        fd, name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as handle:
+            tmp_path = Path(name)
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert tmp_path is not None
+        os.replace(tmp_path, path)
+        os.chmod(path, PRIVATE_FILE_MODE)
+        replaced = True
+        fsync_directory(path.parent)
+    finally:
+        if tmp_path is not None and not replaced:
+            tmp_path.unlink(missing_ok=True)
+
+
+def private_atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace a private UTF-8 text file."""
+    with private_atomic_text_writer(path) as handle:
+        handle.write(text)
+
+
+@contextlib.contextmanager
+def private_atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
+    """Atomically replace a private bytes file.
+
+    :param Path path: Destination path to replace.
+    :return Iterator[IO[bytes]]: Writable binary handle.
+    """
+    ensure_private_dir(path.parent)
+    tmp_path: Path | None = None
+    replaced = False
+    try:
+        fd, name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "wb") as handle:
+            tmp_path = Path(name)
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        assert tmp_path is not None
+        os.replace(tmp_path, path)
+        os.chmod(path, PRIVATE_FILE_MODE)
+        replaced = True
+        fsync_directory(path.parent)
+    finally:
+        if tmp_path is not None and not replaced:
+            tmp_path.unlink(missing_ok=True)
+
+
+def private_atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically replace a private bytes file."""
+    with private_atomic_bytes_writer(path) as handle:
+        handle.write(data)
 
 
 @contextlib.contextmanager
