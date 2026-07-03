@@ -19,6 +19,7 @@ from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _phase_fingerprint
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
+    CLEANUP_RECOVERED_TRIALS_ATTR,
     TRIAL_DIR_ATTR,
     _trial_dir_for,
     _winner_path,
@@ -64,7 +65,7 @@ def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None)
     )
 
 
-def _write_cleanup_uncertain_failed_trial(config: Path) -> Path:
+def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
@@ -82,10 +83,14 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> Path:
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-    return trial_dir
+    return trial.number
 
 
-def _write_stale_running_trial(config: Path) -> int:
+def _write_stale_running_trial(
+    config: Path,
+    *,
+    cleanup_confirmed: bool | None = None,
+) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
@@ -101,7 +106,24 @@ def _write_stale_running_trial(config: Path) -> int:
     (trial_dir / "pgid").write_text("4343\n")
     (trial_dir / "pid_starttime").write_text("222\n")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    if cleanup_confirmed is not None:
+        trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, cleanup_confirmed)
     return trial.number
+
+
+def _load_first_phase_study(config: Path) -> optuna.Study:
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    phase = exp.phases[0]
+    return optuna.load_study(
+        study_name=f"{exp.experiment}::{phase.name}",
+        storage=exp.storage,
+    )
+
+
+def _load_phase_trial(config: Path, trial_number: int) -> optuna.trial.FrozenTrial:
+    study = _load_first_phase_study(config)
+    return next(trial for trial in study.get_trials(deepcopy=False) if trial.number == trial_number)
 
 
 def _mode(path: Path) -> int:
@@ -1032,7 +1054,7 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
-    _write_cleanup_uncertain_failed_trial(config)
+    trial_number = _write_cleanup_uncertain_failed_trial(config)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-terminal-recover"
@@ -1094,6 +1116,10 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert "confirmed 1 cleanup-uncertain trial" in dry.output
     assert not store.cleanup_uncertain_path(run_id).exists()
     assert store.state(handle) == "running"
+    trial = _load_phase_trial(config, trial_number)
+    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    study = _load_first_phase_study(config)
+    assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
 
     confirmed = runner.invoke(
         cli_main,
@@ -1118,6 +1144,10 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert store.state(handle) == "failed"
     assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
     assert trial_cleanup_calls == [(4242, 111, 4242), (4242, 111, 4242)]
+    trial = _load_phase_trial(config, trial_number)
+    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    study = _load_first_phase_study(config)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
@@ -1125,12 +1155,100 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_operator_recovery_consumes_terminal_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    trial_number = _write_cleanup_uncertain_failed_trial(config)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+
+    def fake_cleanup(*args: object, **kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_cleanup)
+
+    first_run = "srv-terminal-first"
+    first_handle = make_run_handle(
+        store,
+        run_id=first_run,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(first_handle)
+    store.config_snapshot_path(first_run).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        first_run,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    runner = CliRunner()
+    first = runner.invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            first_run,
+            "--confirm",
+        ],
+    )
+
+    assert first.exit_code == 0, first.output
+    study = _load_first_phase_study(config)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
+
+    second_run = "srv-terminal-second"
+    second_handle = make_run_handle(
+        store,
+        run_id=second_run,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999998,
+        starttime=112,
+    )
+    store.save(second_handle)
+    store.config_snapshot_path(second_run).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        second_run,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    replay = runner.invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            second_run,
+            "--confirm",
+        ],
+    )
+
+    assert replay.exit_code != 0
+    assert "could not confirm any trial-level cleanup evidence" in replay.output
+    assert not store.cleanup_recovery_path(second_run).exists()
+    assert store.state(second_handle) == "running"
+
+
 def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
-    trial_number = _write_stale_running_trial(config)
+    trial_number = _write_stale_running_trial(config, cleanup_confirmed=False)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-running-recover"
@@ -1197,6 +1315,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     study = optuna.load_study(study_name="srv::p", storage=exp.storage)
     trial = study.get_trials(deepcopy=False)[trial_number]
     assert trial.state == optuna.trial.TrialState.RUNNING
+    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
 
     result = runner.invoke(
         cli_main,
@@ -1225,6 +1344,8 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     study = optuna.load_study(study_name="srv::p", storage=exp.storage)
     trial = study.get_trials(deepcopy=False)[trial_number]
     assert trial.state == optuna.trial.TrialState.FAIL
+    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")

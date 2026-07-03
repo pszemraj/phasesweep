@@ -275,11 +275,16 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             if study is None:
                 continue
             inspected_studies += 1
+            cleanup_recovered += _recover_cleanup_uncertain_trials(
+                study,
+                config,
+                phase.name,
+                consume=confirm,
+            )
             if confirm:
                 reaped += _reap_stale_trials(study, config, phase.name)
             else:
                 reaped += _confirm_stale_running_trials(study, config, phase.name)
-            cleanup_recovered += _recover_cleanup_uncertain_trials(study, config, phase.name)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from None
     cleanup_evidence_count = reaped + cleanup_recovered

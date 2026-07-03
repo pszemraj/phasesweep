@@ -17,6 +17,7 @@ from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.engine.optuna import _create_phase_study
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
+    CLEANUP_RECOVERED_TRIALS_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
     _experiment_dir,
@@ -437,6 +438,8 @@ def _confirm_or_reap_stale_trials(
             )
 
         if reap:
+            if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
+                _record_cleanup_recovery(study, trial)
             try:
                 study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
             except Exception as exc:
@@ -508,6 +511,27 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
     return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=True)
 
 
+def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
+    """Return trial numbers already consumed as cleanup recovery evidence."""
+    raw = study.user_attrs.get(CLEANUP_RECOVERED_TRIALS_ATTR)
+    if not isinstance(raw, list):
+        return set()
+    return {value for value in raw if type(value) is int and value >= 0}
+
+
+def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Persist that previously uncertain cleanup evidence has been consumed."""
+    recovered = sorted(_cleanup_recovered_trial_numbers(study) | {trial.number})
+    try:
+        study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cleanup was confirmed for trial {trial.number} in study {study.study_name}, "
+            "but the study-level cleanup recovery ledger could not be updated. "
+            "Refusing to clear MCP cleanup uncertainty without consuming the trial evidence."
+        ) from exc
+
+
 def _trial_dir_for_cleanup_recovery(
     trial: optuna.trial.FrozenTrial,
     study_name: str,
@@ -533,6 +557,8 @@ def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
+    *,
+    consume: bool = True,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
 
@@ -544,11 +570,17 @@ def _recover_cleanup_uncertain_trials(
     :param optuna.Study study: Existing Optuna study for the phase being recovered.
     :param Experiment experiment: Parsed experiment, used for diagnostics.
     :param str phase_name: Name of the phase being recovered.
+    :param bool consume: When true, mark recovered trial evidence as consumed.
     :return int: Number of cleanup-uncertain terminal trials confirmed clean.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
     recovered = 0
+    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
     for trial in study.get_trials(deepcopy=False):
+        if not trial.state.is_finished():
+            continue
+        if trial.number in recovered_trial_numbers:
+            continue
         if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
             continue
 
@@ -569,6 +601,9 @@ def _recover_cleanup_uncertain_trials(
                 f"experiment={experiment.experiment} phase={phase_name} "
                 f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
             )
+        if consume:
+            _record_cleanup_recovery(study, trial)
+            recovered_trial_numbers.add(trial.number)
         recovered += 1
         log.warning(
             "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
