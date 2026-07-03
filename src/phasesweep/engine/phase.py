@@ -481,6 +481,9 @@ def _run_phase(
         optimize_deadline is not None and time.monotonic() >= optimize_deadline
     )
     timed_out_incomplete = timeout_observed and finished_after < phase.n_trials
+    accepted_partial_timeout = (
+        phase.allow_incomplete_on_timeout and timeout_observed and completed_after < phase.n_trials
+    )
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
         raise TimeoutError(
             f"Phase {phase.name!r} timed out via {timeout_source or 'wallclock'} guard "
@@ -499,9 +502,9 @@ def _run_phase(
         "requested_trials": phase.n_trials,
         "finished_trials": finished_after,
         "completed_trials": completed_after,
-        "incomplete": timed_out_incomplete,
-        "reason": "timeout" if timed_out_incomplete else None,
-        "timeout_scope": timeout_source if timed_out_incomplete else None,
+        "incomplete": accepted_partial_timeout,
+        "reason": "timeout" if accepted_partial_timeout else None,
+        "timeout_scope": timeout_source if accepted_partial_timeout else None,
     }
 
     # Build winner with effective_overrides (#9). Stamp it with the phase
