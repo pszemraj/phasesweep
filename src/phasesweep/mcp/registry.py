@@ -162,6 +162,13 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     """
+    storage = experiment.storage
+    if storage is None or storage_is_in_memory(storage):
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments require persistent storage; "
+            "in-memory storage cannot be monitored or resumed across processes"
+        )
+
     workdir = Path(experiment.workdir).expanduser()
     if not workdir.is_absolute():
         raise CatalogError(
@@ -170,7 +177,6 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
             "break restart/recovery semantics"
         )
 
-    storage = experiment.storage
     backend = storage_backend(storage)
     if backend not in {"sqlite", "journal"}:
         raise CatalogError(
@@ -178,11 +184,6 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
             "SQLite or JournalStorage file-backed Optuna storage; external RDB "
             "storage is out of scope until multi-host cleanup semantics are supported"
         )
-    if storage is None:
-        return
-
-    if backend == "sqlite" and storage_is_in_memory(storage):
-        return
     raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
     raw_path = file_url_path(storage) if raw_path is None else raw_path
     if raw_path == "":
