@@ -68,7 +68,7 @@ def poll_wandb_summary(
         try:
             runs = call_with_timeout(
                 lambda: api.runs(path, filters={"display_name": run_name}),
-                timeout=min(poll_seconds, remaining),
+                timeout=remaining,
             )
             if len(runs) >= 1:
                 run = runs[0]
