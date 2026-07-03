@@ -102,6 +102,16 @@ def test_read_status_does_not_create_missing_sqlite_storage(tmp_path: Path) -> N
     assert status["phases"][0]["trials"] == {}
 
 
+def test_read_status_does_not_create_missing_journal_storage(tmp_path: Path) -> None:
+    journal = tmp_path / "missing.journal"
+    exp = _experiment(tmp_path, storage=f"journal:///{journal}")
+
+    status = read_status(exp)
+
+    assert not journal.exists()
+    assert status["phases"][0]["trials"] == {}
+
+
 def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None:
     db = tmp_path / "empty.db"
     db.touch()

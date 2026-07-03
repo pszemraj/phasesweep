@@ -289,8 +289,11 @@ def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     """
     if experiment.storage is None:
         return {}
-    if storage_backend(experiment.storage) == "sqlite":
+    backend = storage_backend(experiment.storage)
+    if backend == "sqlite":
         return _sqlite_trial_counts(experiment, phase)
+    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
+        return {}
     try:
         study = _load_phase_study(experiment, phase)
     except Exception:  # noqa: BLE001
