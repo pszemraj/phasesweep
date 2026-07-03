@@ -97,6 +97,9 @@ class Promotion(_Frozen):
         return self
 
 
+GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
+
+
 class Phase(_Frozen):
     """One stage in a sequential hyperparameter sweep."""
 
@@ -136,6 +139,15 @@ class Phase(_Frozen):
             "also set, each trial gets exclusive access to one CUDA-visible device."
         ),
     )
+    gpu_policy: GpuPolicy = Field(
+        default="single_per_trial",
+        description=(
+            "CUDA visibility policy for trial subprocesses. single_per_trial leases "
+            "one visible CUDA token per trial. whole_node requires n_jobs=1 and "
+            "leases every configured or detected visible token for the trial. none "
+            "disables phasesweep CUDA isolation and GPU host locks."
+        ),
+    )
     gpu_ids: list[int] | None = Field(
         default=None,
         description=(
@@ -167,6 +179,8 @@ class Phase(_Frozen):
         """
         if value is None:
             return None
+        if not value:
+            raise ValueError("gpu_ids must be omitted or contain at least one CUDA device index.")
         bad = [v for v in value if v < 0]
         if bad:
             raise ValueError(
@@ -183,6 +197,10 @@ class Phase(_Frozen):
         if value is None:
             return None
         normalized = [token.strip() for token in value]
+        if not normalized:
+            raise ValueError(
+                "gpu_devices must be omitted or contain at least one CUDA device token."
+            )
         bad = [token for token in normalized if not token or "," in token or token == "-1"]
         if bad:
             raise ValueError(
@@ -196,6 +214,23 @@ class Phase(_Frozen):
         """Reject ambiguous explicit GPU isolation settings."""
         if self.gpu_ids is not None and self.gpu_devices is not None:
             raise ValueError("gpu_ids and gpu_devices are mutually exclusive.")
+        if self.gpu_policy == "whole_node" and self.n_jobs != 1:
+            raise ValueError(
+                "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
+                "the full configured CUDA-visible device set."
+            )
+        if self.gpu_policy == "none":
+            if self.gpu_ids is not None or self.gpu_devices is not None:
+                raise ValueError(
+                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices "
+                    "because phasesweep CUDA isolation and GPU host locks are disabled."
+                )
+            if self.n_jobs > 1 and not self.allow_no_gpu_isolation:
+                raise ValueError(
+                    "gpu_policy='none' with n_jobs > 1 can oversubscribe the host. "
+                    "Set allow_no_gpu_isolation=true only when CPU-only or external "
+                    "isolation is intentional."
+                )
         return self
 
     max_consecutive_failures: int = Field(

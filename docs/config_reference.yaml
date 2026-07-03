@@ -118,6 +118,9 @@ Experiment:
       # Parallel trials within one phase. Parallelism is inside one local
       # orchestrator only. SQLite storage is rejected when n_jobs > 1.
 
+      gpu_policy: "Literal['single_per_trial', 'whole_node', 'none'] = 'single_per_trial'"
+      # single_per_trial leases one CUDA-visible token per trial; whole_node requires n_jobs == 1 and exposes all configured/detected tokens; none disables phasesweep CUDA isolation and GPU locks.
+
       gpu_ids: "list[int] | None = null"
       # Explicit non-negative CUDA device IDs to lease. When null, phasesweep
       # auto-detects ambient CUDA_VISIBLE_DEVICES tokens or nvidia-smi output,
@@ -275,6 +278,7 @@ Definitions:
     search_space: "dict[str, SearchParam] = {}"
     n_trials: "int >= 1 (required)"
     n_jobs: "int >= 1 = 1"
+    gpu_policy: "Literal['single_per_trial', 'whole_node', 'none'] = 'single_per_trial'"
     gpu_ids: "list[int] | None = null"
     gpu_devices: "list[str] | None = null"
     max_consecutive_failures: "int >= 1 = 5"

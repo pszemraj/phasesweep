@@ -37,6 +37,7 @@ Each phase is one Optuna study in an ordered chain. A phase may inherit winners 
 - `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
 - `n_trials`: trial budget. Increasing it later is a compatible top-up.
 - `n_jobs`: parallel trials inside the phase.
+- `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
 - `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
 - `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
 - `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.

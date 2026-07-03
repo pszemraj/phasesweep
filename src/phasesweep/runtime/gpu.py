@@ -18,13 +18,14 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
+GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,15 @@ class _HostGpuLease:
 
     device: GpuDevice
     handle: IO[str]
+
+
+@dataclass
+class _GpuAcquisition:
+    """One local GPU assignment plus the host locks that back it."""
+
+    devices: list[GpuDevice]
+    leases: list[_HostGpuLease]
+    visible_devices: str
 
 
 def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
@@ -126,7 +136,7 @@ class GpuPool:
             run_trial(...)
     """
 
-    def __init__(self, devices: list[GpuDevice]) -> None:
+    def __init__(self, devices: list[GpuDevice], *, whole_node: bool = False) -> None:
         """Build a pool from a fixed list of CUDA device tokens.
 
         Args:
@@ -137,6 +147,8 @@ class GpuPool:
 
         """
         self._devices = devices
+        self._whole_node = whole_node
+        self._whole_node_in_use = False
         self._gpu_ids = [
             int(device.visible_token) for device in devices if device.visible_token.isdigit()
         ]
@@ -153,6 +165,7 @@ class GpuPool:
         explicit_ids: list[int] | None = None,
         explicit_devices: list[str] | None = None,
         allow_no_gpu: bool = False,
+        policy: GpuPolicy = "single_per_trial",
     ) -> GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
 
@@ -166,6 +179,10 @@ class GpuPool:
                 ``explicit_ids``.
             allow_no_gpu: if ``True``, run without CUDA isolation when no numeric
                 GPU IDs can be resolved. Parallel CPU-only sweeps need this opt-in.
+            policy: CUDA visibility policy. ``single_per_trial`` leases one
+                token per trial. ``whole_node`` leases all tokens for one trial
+                and exposes them comma-joined. ``none`` disables CUDA isolation
+                and GPU locks.
 
         Returns:
             A configured :class:`GpuPool`. The pool is "active" (hands out
@@ -177,6 +194,22 @@ class GpuPool:
                 visible and ``n_jobs > 1`` without ``allow_no_gpu``.
 
         """
+        if policy not in {"single_per_trial", "whole_node", "none"}:
+            raise RuntimeError(f"unknown gpu_policy: {policy!r}")
+        if policy == "whole_node" and n_jobs != 1:
+            raise RuntimeError("gpu_policy='whole_node' requires n_jobs=1.")
+        if policy == "none":
+            if explicit_ids is not None or explicit_devices is not None:
+                raise RuntimeError(
+                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices."
+                )
+            if n_jobs > 1 and not allow_no_gpu:
+                raise RuntimeError(
+                    "gpu_policy='none' with n_jobs > 1 requires allow_no_gpu_isolation."
+                )
+            log.info("GPU isolation disabled by gpu_policy='none'.")
+            return cls(devices=[])
+
         if explicit_ids is not None and explicit_devices is not None:
             raise RuntimeError("gpu_ids and gpu_devices are mutually exclusive.")
         # Explicit IDs always win, even at n_jobs==1.
@@ -186,13 +219,13 @@ class GpuPool:
                 raise RuntimeError("gpu_ids was provided but empty.")
             devices = [GpuDevice(str(gpu_id)) for gpu_id in ids]
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
-            return cls(devices=devices)
+            return cls(devices=devices, whole_node=policy == "whole_node")
         if explicit_devices is not None:
             devices = _dedupe_devices(explicit_devices)
             if not devices:
                 raise RuntimeError("gpu_devices was provided but empty.")
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
-            return cls(devices=devices)
+            return cls(devices=devices, whole_node=policy == "whole_node")
 
         user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         if user_cvd is not None:
@@ -216,7 +249,7 @@ class GpuPool:
                 "if this is an intentional CPU-only parallel sweep."
             )
         _log_pool_size(n_jobs, [device.visible_token for device in devices], "available")
-        return cls(devices=devices)
+        return cls(devices=devices, whole_node=policy == "whole_node")
 
     def _remaining_seconds(self, deadline: float | None) -> float | None:
         """Return seconds until ``deadline``, or raise when it has expired.
@@ -231,7 +264,7 @@ class GpuPool:
             raise TimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
         return remaining
 
-    def _acquire(self, *, deadline: float | None = None) -> tuple[GpuDevice, _HostGpuLease] | None:
+    def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
         """Block until a local slot and host-wide GPU lease are available.
 
         Args:
@@ -240,9 +273,7 @@ class GpuPool:
                 instead of extending a phase/run wallclock budget.
 
         Returns:
-            ``(device, lease)`` or ``None`` if the pool is inactive (no
-            isolation requested; caller's environment is passed through
-            unchanged).
+            A one-device acquisition, or ``None`` if the pool is inactive.
 
         Raises:
             TimeoutError: ``deadline`` expired before a GPU could be leased.
@@ -267,7 +298,11 @@ class GpuPool:
                         self._available.extend(remaining_devices)
                         self._condition.notify_all()
                     log.debug("GPU %s host lease acquired", device.visible_token)
-                    return device, lease
+                    return _GpuAcquisition(
+                        devices=[device],
+                        leases=[lease],
+                        visible_devices=device.visible_token,
+                    )
                 remaining_devices.append(device)
 
             with self._condition:
@@ -276,18 +311,66 @@ class GpuPool:
             remaining_seconds = self._remaining_seconds(deadline)
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
-    def _release(self, acquired: tuple[GpuDevice, _HostGpuLease] | None) -> None:
+    def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
+        """Acquire every configured device token as one assignment."""
+        if not self._devices:
+            return None
+        while True:
+            with self._condition:
+                while self._whole_node_in_use:
+                    wait_seconds = self._remaining_seconds(deadline)
+                    self._condition.wait(timeout=wait_seconds)
+                self._whole_node_in_use = True
+
+            leases: list[_HostGpuLease] = []
+            try:
+                for device in self._devices:
+                    lease = _try_host_gpu_lease(device)
+                    if lease is None:
+                        raise TimeoutError
+                    leases.append(lease)
+            except TimeoutError:
+                for lease in leases:
+                    _release_host_gpu_lease(lease)
+                with self._condition:
+                    self._whole_node_in_use = False
+                    self._condition.notify_all()
+                remaining_seconds = self._remaining_seconds(deadline)
+                time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
+                continue
+
+            visible_devices = ",".join(device.visible_token for device in self._devices)
+            log.debug("Whole-node GPU host leases acquired: %s", visible_devices)
+            return _GpuAcquisition(
+                devices=list(self._devices),
+                leases=leases,
+                visible_devices=visible_devices,
+            )
+
+    def _acquire(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
+        """Acquire a GPU assignment according to the configured policy."""
+        if self._whole_node:
+            return self._acquire_whole_node(deadline=deadline)
+        return self._acquire_single(deadline=deadline)
+
+    def _release(self, acquired: _GpuAcquisition | None) -> None:
         """Return a previously-acquired CUDA device token to the pool.
 
         Args:
-            acquired: Pair returned by :meth:`_acquire`. ``None`` is a no-op
+            acquired: Assignment returned by :meth:`_acquire`. ``None`` is a no-op
                 (inactive pool).
 
         """
         if acquired is None:
             return
-        device, lease = acquired
-        _release_host_gpu_lease(lease)
+        for lease in acquired.leases:
+            _release_host_gpu_lease(lease)
+        if self._whole_node:
+            with self._condition:
+                self._whole_node_in_use = False
+                self._condition.notify_all()
+            return
+        device = acquired.devices[0]
         with self._condition:
             self._available.append(device)
             self._condition.notify()
@@ -309,7 +392,7 @@ class GpuPool:
         """
         acquired = self._acquire(deadline=deadline)
         try:
-            yield None if acquired is None else acquired[0].visible_token
+            yield None if acquired is None else acquired.visible_devices
         finally:
             self._release(acquired)
 

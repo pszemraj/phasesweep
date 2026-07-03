@@ -237,6 +237,14 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             ),
             False,
         ),
+        (
+            "gpu_policy",
+            lambda: (
+                make_experiment(gpu_policy="single_per_trial"),
+                make_experiment(gpu_policy="whole_node"),
+            ),
+            False,
+        ),
     ]
 
     for case, build_pair, expected_equal in cases:
