@@ -852,6 +852,66 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
         app.cancel(run_id)
 
 
+def test_cancel_decataloged_run_uses_launch_time_permission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_config = _config(tmp_path, name="old")
+    old_snapshot = old_config.read_bytes()
+    other_config = _config(tmp_path, name="other")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
+    )
+    run_id = "old-running"
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id="old",
+        config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
+        allow_cancel=True,
+    )
+    store.save(handle)
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        write_run_status(
+            store,
+            run_id,
+            returncode=143,
+            error_class="cancelled",
+            cleanup_confirmed=True,
+        )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+
+    result = app.cancel(run_id)
+
+    assert result == {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
+    assert not store.cleanup_uncertain_path(run_id).exists()
+
+
+def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: Path) -> None:
+    old_config = _config(tmp_path, name="old")
+    old_snapshot = old_config.read_bytes()
+    other_config = _config(tmp_path, name="other")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
+    )
+    run_id = "old-no-cancel"
+    store.save(
+        make_run_handle(
+            store,
+            run_id=run_id,
+            experiment_id="old",
+            config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
+            allow_cancel=False,
+        )
+    )
+
+    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
+        app.cancel(run_id)
+
+
 def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

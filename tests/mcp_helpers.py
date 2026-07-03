@@ -197,6 +197,7 @@ def make_run_handle(
     pid: int | None = None,
     starttime: int | None = None,
     launch_state: RunLaunchState = "spawned",
+    allow_cancel: bool = False,
 ) -> RunHandle:
     if launch_state == "launching":
         return RunHandle(
@@ -210,6 +211,7 @@ def make_run_handle(
             log_path=str(store.log_path(run_id)),
             status_path=str(store.status_path(run_id)),
             launch_state=launch_state,
+            allow_cancel=allow_cancel,
         )
     process_id = os.getpid() if pid is None else pid
     return RunHandle(
@@ -223,6 +225,7 @@ def make_run_handle(
         log_path=str(store.log_path(run_id)),
         status_path=str(store.status_path(run_id)),
         launch_state=launch_state,
+        allow_cancel=allow_cancel,
     )
 
 

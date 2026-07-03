@@ -54,7 +54,7 @@ Cleanup-uncertain recovery is operator-only. After inspecting the host, run `pha
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
-When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads. If the run's original experiment id is no longer in the active catalog, winner parameter values use the strict `visible_params: none` behavior.
+When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads. If the run's original experiment id is no longer in the active catalog, winner parameter values use the strict `visible_params: none` behavior. `phasesweep_cancel_sweep` also accepts a decataloged run id only when that run handle recorded `allow.cancel: true` at launch; old handles and runs launched without cancel permission fail closed.
 
 ## Resource and prompt
 

@@ -51,6 +51,7 @@ def _persist_spawned_handle(
     config_sha256: str,
     started_at: str,
     status_path: Path,
+    allow_cancel: bool,
 ) -> None:
     """Persist this runner's process identity before it launches any training work."""
     store = RunStore(state_dir)
@@ -68,6 +69,7 @@ def _persist_spawned_handle(
             log_path=str(store.log_path(run_id)),
             status_path=str(status_path),
             launch_state="spawned",
+            allow_cancel=allow_cancel,
         )
     )
 
@@ -86,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--started-at", required=True)
+    parser.add_argument("--allow-cancel", action="store_true")
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
 
@@ -116,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             config_sha256=args.config_sha256,
             started_at=args.started_at,
             status_path=args.status_path,
+            allow_cancel=args.allow_cancel,
         )
         from phasesweep.config import load_config
         from phasesweep.engine import run_config

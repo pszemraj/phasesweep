@@ -706,8 +706,7 @@ class PhaseSweepMCP:
             if handle is None:
                 raise UnknownRunError(run_id)
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
-            reg = self._registry.get(handle.experiment_id)
-            if not reg.allow_cancel:
+            if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
             before = self._runs.state(handle)
             state_before = {"run_state": before}
@@ -844,6 +843,7 @@ class PhaseSweepMCP:
             log_path=str(self._runs.log_path(run_id)),
             status_path=str(self._runs.status_path(run_id)),
             launch_state="launching",
+            allow_cancel=reg.allow_cancel,
         )
 
     def _spawn(
@@ -883,6 +883,8 @@ class PhaseSweepMCP:
             "--started-at",
             pending.started_at,
         ]
+        if reg.allow_cancel:
+            cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
         # Open the log here, hand the fd to the child, then close our copy. The
@@ -909,7 +911,15 @@ class PhaseSweepMCP:
             log_path=str(log_path),
             status_path=str(status_path),
             launch_state="spawned",
+            allow_cancel=reg.allow_cancel,
         )
+
+    def _cancel_allowed(self, handle: RunHandle) -> bool:
+        """Return whether MCP cancellation is permitted for this persisted run."""
+        try:
+            return self._registry.get(handle.experiment_id).allow_cancel
+        except UnknownExperimentError:
+            return handle.allow_cancel
 
 
 F = TypeVar("F", bound=Callable[..., Any])

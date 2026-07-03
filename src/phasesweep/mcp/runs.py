@@ -96,6 +96,7 @@ class RunHandle:
     log_path: str  # server-internal; never returned to the agent
     status_path: str  # server-internal
     launch_state: RunLaunchState = "spawned"
+    allow_cancel: bool = False
 
     @classmethod
     def from_json(cls, data: dict) -> RunHandle:
@@ -104,7 +105,13 @@ class RunHandle:
         :param dict data: JSON-decoded run handle payload.
         :return RunHandle: Reconstructed immutable run handle.
         """
-        return cls(**{**data, "launch_state": data.get("launch_state", "spawned")})
+        return cls(
+            **{
+                **data,
+                "launch_state": data.get("launch_state", "spawned"),
+                "allow_cancel": data.get("allow_cancel", False),
+            }
+        )
 
 
 class RunStore:
@@ -248,6 +255,8 @@ class RunStore:
         if handle.run_id != expected_run_id:
             return None
         if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
+            return None
+        if type(handle.allow_cancel) is not bool:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None
