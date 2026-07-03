@@ -63,9 +63,11 @@ def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> N
     with lock_path.open("w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
-        with pytest.raises(TimeoutError, match="Wallclock deadline"):
-            with pool.acquire(deadline=time.monotonic() + 0.02):
-                pass
+        with (
+            pytest.raises(TimeoutError, match="Wallclock deadline"),
+            pool.acquire(deadline=time.monotonic() + 0.02),
+        ):
+            pass
         fcntl.flock(held, fcntl.LOCK_UN)
 
 

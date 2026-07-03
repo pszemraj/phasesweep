@@ -144,6 +144,8 @@ class GpuPool:
                 transparent no-op that always yields ``None`` (single-job
                 or CPU-only mode). Prefer :meth:`create` for the normal
                 construction path that handles auto-detection and policy.
+            whole_node: Whether each acquisition leases all devices as one
+                comma-joined CUDA_VISIBLE_DEVICES assignment.
 
         """
         self._devices = devices
