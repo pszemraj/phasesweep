@@ -7,12 +7,13 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
-from phasesweep.config.search import _placeholder_value_for
+from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.guards import (
     _phase_fingerprint,
     _reap_stale_trials,
@@ -46,6 +47,33 @@ from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
 
 log = logging.getLogger("phasesweep.engine.phase")
+
+
+@dataclass
+class CsvSnapshotThrottle:
+    """Debounce expensive full ``trials.csv`` snapshots during a phase."""
+
+    min_trials: int = 10
+    min_seconds: float = 30.0
+    last_finished: int = 0
+    last_write_at: float = 0.0
+
+    def should_write(self, finished: int, now: float) -> bool:
+        """Return whether another full CSV snapshot should be written."""
+        return (
+            finished - self.last_finished >= self.min_trials
+            or now - self.last_write_at >= self.min_seconds
+        )
+
+    def mark_written(self, finished: int, now: float) -> None:
+        """Record a successful snapshot write."""
+        self.last_finished = finished
+        self.last_write_at = now
+
+
+def _finished_trial_count(study: optuna.Study) -> int:
+    """Return the number of terminal trials in ``study``."""
+    return sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
 
 
 def _composed_overrides(
@@ -152,7 +180,9 @@ def _run_phase(
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
         explicit_ids=phase.gpu_ids,
+        explicit_devices=phase.gpu_devices,
         allow_no_gpu=phase.allow_no_gpu_isolation,
+        policy=phase.gpu_policy,
     )
 
     _failure_lock = threading.Lock()
@@ -171,6 +201,8 @@ def _run_phase(
     # returns. See review v0.5.11.
     _hard_abort_lock = threading.Lock()
     hard_abort: dict[str, str | None] = {"message": None}
+    deadline_exhausted = {"flag": False}
+    csv_throttle = CsvSnapshotThrottle()
 
     def _record_hard_abort(message: str) -> None:
         """Record a safety-critical phase abort.
@@ -243,58 +275,78 @@ def _run_phase(
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
 
         # GPU lease covers only subprocess lifetime, not extraction (#2).
-        with gpu_pool.acquire() as gpu_id:
-            # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
-            # extended in v0.5.11 for hard_abort). Without this, queued
-            # objective threads that passed the outer check before a peer
-            # flipped the flag would still launch trials after the abort
-            # fires — defeating max_consecutive_failures whenever n_jobs
-            # exceeds the GPU-pool size, and defeating unsafe-cleanup abort
-            # whenever any sibling thread is between launch_trial() return
-            # and the cleanup_confirmed check.
-            _raise_if_hard_aborted()
-            if abort["flag"]:
-                raise optuna.TrialPruned("phase aborted")
+        try:
+            with gpu_pool.acquire(deadline=optimize_deadline) as gpu_id:
+                # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
+                # extended in v0.5.11 for hard_abort). Without this, queued
+                # objective threads that passed the outer check before a peer
+                # flipped the flag would still launch trials after the abort
+                # fires — defeating max_consecutive_failures whenever n_jobs
+                # exceeds the GPU-pool size, and defeating unsafe-cleanup abort
+                # whenever any sibling thread is between launch_trial() return
+                # and the cleanup_confirmed check.
+                _raise_if_hard_aborted()
+                if abort["flag"]:
+                    raise optuna.TrialPruned("phase aborted")
 
-            executed = launch_trial(
-                experiment=experiment,
-                phase_name=phase.name,
-                trial_id=trial.number,
-                trial_dir=trial_dir,
-                overrides=overrides,
-                timeout_seconds=phase.timeout_seconds_per_trial,
-                gpu_id=gpu_id,
-            )
+                timeout_seconds = phase.timeout_seconds_per_trial
+                timeout_capped_by_wallclock = False
+                if optimize_deadline is not None:
+                    remaining_wallclock = optimize_deadline - time.monotonic()
+                    if remaining_wallclock <= 0.0:
+                        deadline_exhausted["flag"] = True
+                        raise TrialExecutionError(
+                            f"{timeout_source or 'wallclock'} deadline reached before trial launch."
+                        )
+                    if timeout_seconds is None or remaining_wallclock < timeout_seconds:
+                        timeout_seconds = remaining_wallclock
+                        timeout_capped_by_wallclock = True
 
-            # CRITICAL: this check must happen INSIDE the GPU lease (review
-            # v0.5.11 / blocker 3). Releasing the lease before observing
-            # ``cleanup_confirmed=False`` lets a queued worker acquire the
-            # GPU and launch a new trial onto the still-leaked process
-            # group. ``_record_hard_abort`` flips the soft abort flag while
-            # we still hold the lease, so the next thread to enter sees the
-            # flag and prunes before launch.
-            if not executed.process.cleanup_confirmed:
-                message = (
-                    f"Trial {trial.number} cleanup could not be confirmed. "
-                    f"trial_dir={trial_dir} pid={executed.process.pid}. "
-                    f"reason={executed.process.failure_reason or 'process cleanup could not be confirmed'}. "
-                    "Refusing to launch additional trials because a leaked "
-                    "process group may still hold GPU/CPU resources."
+                executed = launch_trial(
+                    experiment=experiment,
+                    phase_name=phase.name,
+                    trial_id=trial.number,
+                    trial_dir=trial_dir,
+                    overrides=overrides,
+                    timeout_seconds=timeout_seconds,
+                    gpu_id=gpu_id,
                 )
-                _record_hard_abort(message)
+                if timeout_capped_by_wallclock and executed.process.timed_out:
+                    deadline_exhausted["flag"] = True
 
-                # Best-effort forensic attrs. A storage write failure here
-                # must not mask the safety-critical state: ``hard_abort``
-                # is already recorded and ``_raise_if_hard_aborted`` will
-                # fire after ``study.optimize`` returns regardless.
-                with contextlib.suppress(Exception):
-                    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-                    trial.set_user_attr(
-                        FAILURE_REASON_ATTR,
-                        executed.process.failure_reason or "process cleanup could not be confirmed",
+                # CRITICAL: this check must happen INSIDE the GPU lease (review
+                # v0.5.11 / blocker 3). Releasing the lease before observing
+                # ``cleanup_confirmed=False`` lets a queued worker acquire the
+                # GPU and launch a new trial onto the still-leaked process
+                # group. ``_record_hard_abort`` flips the soft abort flag while
+                # we still hold the lease, so the next thread to enter sees the
+                # flag and prunes before launch.
+                if not executed.process.cleanup_confirmed:
+                    message = (
+                        f"Trial {trial.number} cleanup could not be confirmed. "
+                        f"trial_dir={trial_dir} pid={executed.process.pid}. "
+                        f"reason={executed.process.failure_reason or 'process cleanup could not be confirmed'}. "
+                        "Refusing to launch additional trials because a leaked "
+                        "process group may still hold GPU/CPU resources."
                     )
+                    _record_hard_abort(message)
 
-                raise UnsafeProcessCleanupError(message)
+                    # Best-effort forensic attrs. A storage write failure here
+                    # must not mask the safety-critical state: ``hard_abort``
+                    # is already recorded and ``_raise_if_hard_aborted`` will
+                    # fire after ``study.optimize`` returns regardless.
+                    with contextlib.suppress(Exception):
+                        trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+                        trial.set_user_attr(
+                            FAILURE_REASON_ATTR,
+                            executed.process.failure_reason
+                            or "process cleanup could not be confirmed",
+                        )
+
+                    raise UnsafeProcessCleanupError(message)
+        except TimeoutError as exc:
+            deadline_exhausted["flag"] = True
+            raise TrialExecutionError(str(exc)) from exc
 
         # Extraction happens outside GPU lease.
         result = extract_trial_result(
@@ -364,8 +416,12 @@ def _run_phase(
                 )
             abort["flag"] = True
             study.stop()
-        with contextlib.suppress(Exception):
-            _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+        finished = _finished_trial_count(study)
+        now = time.monotonic()
+        if csv_throttle.should_write(finished, now):
+            with contextlib.suppress(Exception):
+                _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+                csv_throttle.mark_written(finished, now)
 
     timeout_source: str | None = None
     optimize_deadline: float | None = None
@@ -418,32 +474,37 @@ def _run_phase(
     # Review v0.5.11 / v0.5.12.
     _raise_if_hard_aborted()
 
-    if abort["flag"]:
+    trials_after = study.get_trials(deepcopy=False)
+    finished_after = sum(1 for t in trials_after if t.state.is_finished())
+    completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
+    timeout_observed = deadline_exhausted["flag"] or (
+        optimize_deadline is not None and time.monotonic() >= optimize_deadline
+    )
+    timed_out_incomplete = timeout_observed and finished_after < phase.n_trials
+    accepted_partial_timeout = (
+        phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
+    )
+    if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
+        raise TimeoutError(
+            f"Phase {phase.name!r} timed out via {timeout_source or 'wallclock'} guard "
+            f"after {completed_after}/{phase.n_trials} completed evaluations "
+            f"({finished_after} terminal trials). Refusing to select a winner "
+            "from an incomplete phase; set allow_incomplete_on_timeout: true "
+            "only when a partial decision is intentional."
+        )
+    if abort["flag"] and not timed_out_incomplete:
         raise NoFeasibleTrialError(
             f"Phase {phase.name!r} aborted after "
             f"{phase.max_consecutive_failures} consecutive failures. "
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
-
-    finished_after = sum(1 for t in study.get_trials(deepcopy=False) if t.state.is_finished())
-    timed_out_incomplete = (
-        optimize_deadline is not None
-        and time.monotonic() >= optimize_deadline
-        and finished_after < phase.n_trials
-    )
-    if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
-        raise TimeoutError(
-            f"Phase {phase.name!r} timed out via {timeout_source or 'wallclock'} guard "
-            f"after {finished_after}/{phase.n_trials} trials finished. Refusing to "
-            "select a winner from an incomplete phase; set allow_incomplete_on_timeout: "
-            "true only when a partial decision is intentional."
-        )
     completion = {
         "requested_trials": phase.n_trials,
         "finished_trials": finished_after,
-        "incomplete": timed_out_incomplete,
-        "reason": "timeout" if timed_out_incomplete else None,
-        "timeout_scope": timeout_source if timed_out_incomplete else None,
+        "completed_trials": completed_after,
+        "incomplete": accepted_partial_timeout,
+        "reason": "timeout" if accepted_partial_timeout else None,
+        "timeout_scope": timeout_source if accepted_partial_timeout else None,
     }
 
     # Build winner with effective_overrides (#9). Stamp it with the phase
@@ -510,23 +571,6 @@ def _dry_run_phase(
     return _placeholder_winner(experiment, phase, inherited_winners)
 
 
-def _midpoint_params(phase: Phase) -> dict[str, Any]:
-    """Synthesize midpoint values for each search-space param (dry-run placeholder).
-
-    Delegates per-param logic to ``config._placeholder_value_for`` to avoid
-    maintaining two copies of the isinstance dispatch.
-
-    Args:
-        phase: The phase whose ``search_space`` to summarise.
-
-    Returns:
-        Dict mapping each search-space key to a deterministic placeholder
-        value (interval midpoint for numeric, first choice for categorical).
-
-    """
-    return {name: _placeholder_value_for(p) for name, p in phase.search_space.items()}
-
-
 def _placeholder_winner(
     experiment: Experiment,
     phase: Phase,
@@ -547,7 +591,7 @@ def _placeholder_winner(
         accidental use in non-dry contexts surfaces obviously.
 
     """
-    placeholder_params = _midpoint_params(phase)
+    placeholder_params = _placeholder_values_for(phase.search_space)
     effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,
@@ -559,6 +603,7 @@ def _placeholder_winner(
         completion={
             "requested_trials": phase.n_trials,
             "finished_trials": 0,
+            "completed_trials": 0,
             "incomplete": True,
             "reason": "dry_run",
             "timeout_scope": None,

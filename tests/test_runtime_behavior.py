@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import shutil
+import time
 from pathlib import Path
 
 import optuna
@@ -11,9 +11,22 @@ import pytest
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
+from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import _load_winner
-from tests.conftest import REPO, write_trainer, write_yaml
+from tests.conftest import copy_fake_train, write_trainer, write_yaml
+
+
+def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
+    throttle = CsvSnapshotThrottle(min_trials=10, min_seconds=30.0)
+
+    assert throttle.should_write(finished=1, now=100.0)
+    throttle.mark_written(finished=1, now=100.0)
+    assert not throttle.should_write(finished=9, now=120.0)
+    assert throttle.should_write(finished=11, now=120.0)
+    throttle.mark_written(finished=11, now=120.0)
+    assert not throttle.should_write(finished=12, now=149.9)
+    assert throttle.should_write(finished=12, now=150.0)
 
 
 def _sleeping_score_experiment(
@@ -61,16 +74,14 @@ def test_parallel_trials_e2e(tmp_path):
     - concurrent subprocess execution
     - no database-locked errors
     """
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    trainer = copy_fake_train(tmp_path)
 
     journal_path = tmp_path / "phases.journal"
     yaml_text = f"""
 experiment: parallel_test
 storage: journal:///{journal_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
@@ -425,37 +436,164 @@ def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout",
+        timeout_seconds_per_phase=0.2,
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"timed out via phase guard .*Refusing to select a winner",
+    ):
+        run_experiment(exp)
+
+
+def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
+    """A phase wallclock timeout is a hard subprocess deadline, not only an Optuna scheduler timeout."""
+    exp = _sleeping_score_experiment(
+        tmp_path,
+        experiment="phase_timeout_hard",
         timeout_seconds_per_phase=0.05,
     )
 
-    with pytest.raises(TimeoutError, match="1/3 trials finished"):
+    started = time.monotonic()
+    with pytest.raises(
+        TimeoutError,
+        match=r"timed out via phase guard .*Refusing to select a winner",
+    ):
         run_experiment(exp)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert not (tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json").exists()
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_allowed",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
         allow_incomplete_on_timeout=True,
     )
 
     winners = run_experiment(exp)
 
-    assert winners["p"].completion == {
-        "requested_trials": 3,
-        "finished_trials": 1,
-        "incomplete": True,
-        "reason": "timeout",
-        "timeout_scope": "phase",
-    }
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 3
+    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert completion["completed_trials"] <= completion["finished_trials"]
+    assert completion["finished_trials"] <= completion["requested_trials"]
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+    assert completion["timeout_scope"] == "phase"
+
+
+@pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
+def test_timeout_after_all_terminal_trials_is_complete_enough(
+    tmp_path: Path,
+    allow_incomplete_on_timeout: bool,
+) -> None:
+    """A timeout guard should not reject a phase once every requested trial is terminal."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+        else:
+            time.sleep(5.0)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout_all_terminal",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                timeout_seconds_per_phase=0.8,
+                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
+                search_space={},
+            )
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 2
+    assert completion["completed_trials"] == 1
+    assert completion["finished_trials"] == 2
+    assert completion["incomplete"] is False
+
+    current = exp.model_copy(
+        update={
+            "phases": [
+                exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False}),
+            ],
+        }
+    )
+    loaded = _load_winner(current, current.phases[0], {})
+    assert loaded.completion["incomplete"] is False
+
+
+def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+        else:
+            time.sleep(1.0)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_timeout_allowed_abort_counter",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                max_consecutive_failures=1,
+                timeout_seconds_per_phase=0.5,
+                allow_incomplete_on_timeout=True,
+                search_space={},
+            )
+        ],
+    )
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].trial_number == 0
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 3
+    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert (
+        completion["completed_trials"]
+        <= completion["finished_trials"]
+        < completion["requested_trials"]
+    )
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+    assert completion["timeout_scope"] == "phase"
 
 
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
     accepted = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
         allow_incomplete_on_timeout=True,
     )
     run_experiment(accepted)
@@ -463,7 +601,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     current = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.05,
+        timeout_seconds_per_phase=0.2,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
         _load_winner(current, current.phases[0], {})
@@ -473,7 +611,7 @@ def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="run_timeout",
-        timeout_seconds_per_run=0.05,
+        timeout_seconds_per_run=0.2,
     )
 
     with pytest.raises(TimeoutError, match="run guard"):

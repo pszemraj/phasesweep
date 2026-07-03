@@ -7,12 +7,10 @@ import logging
 import time
 from typing import Any
 
-import yaml
-
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import _experiment_lock, _reap_skipped_phase, _suite_lock
-from phasesweep.engine.optuna import _phase_trial_counts
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.read import _phase_status_payloads
 from phasesweep.engine.selection import (
     _apply_promotion,
     _apply_study_promotion,
@@ -31,6 +29,7 @@ from phasesweep.engine.state import (
     _suite_summary_path,
     _summary_path,
     _winner_path,
+    _write_yaml_atomic,
 )
 from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import install_signal_handlers
@@ -236,7 +235,7 @@ def _run_experiment_inner(
         "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
     }
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _write_yaml_atomic(summary_path, summary)
     log.info("Wrote %s", summary_path)
 
     return winners
@@ -248,23 +247,11 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload including phase winner paths and trial counts.
     """
-    phases: list[dict[str, Any]] = []
-    for phase in experiment.phases:
-        winner_path = _winner_path(experiment, phase.name)
-        counts = _phase_trial_counts(experiment, phase)
-        phases.append(
-            {
-                "name": phase.name,
-                "winner": str(winner_path) if winner_path.is_file() else None,
-                "trials": counts,
-                "running": counts.get("RUNNING", 0),
-            }
-        )
     return {
         "kind": "experiment",
         "experiment": experiment.experiment,
         "workdir": str(_experiment_dir(experiment)),
-        "phases": phases,
+        "phases": _phase_status_payloads(experiment, include_winner_path=True),
     }
 
 
@@ -323,5 +310,5 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 for study_name, study_winners in results.items()
             ],
         }
-        _suite_summary_path(suite).write_text(yaml.safe_dump(summary, sort_keys=False))
+        _write_yaml_atomic(_suite_summary_path(suite), summary)
     return results

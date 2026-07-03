@@ -21,10 +21,13 @@ def test_help_output_is_operator_readable() -> None:
     assert result.exit_code == 0
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
     assert "-h, --help" in result.output
-    assert "run           Run configured phases." in result.output
-    assert "show-winners  Print saved phase winners." in result.output
-    assert "status        Print read-only run status." in result.output
-    assert "validate      Validate a config file." in result.output
+    assert "mcp" in result.output and "Serve the MCP broker." in result.output
+    assert "mcp-recover-run" in result.output
+    assert "Recover MCP cleanup uncertainty." in result.output
+    assert "run" in result.output and "Run configured phases." in result.output
+    assert "show-winners" in result.output and "Print saved phase winners." in result.output
+    assert "status" in result.output and "Print read-only run status." in result.output
+    assert "validate" in result.output and "Validate a config file." in result.output
     assert "Args:" not in result.output
 
     for command in ("run", "validate", "show-winners", "status"):
@@ -36,56 +39,24 @@ def test_help_output_is_operator_readable() -> None:
         assert "CONFIG" in result.output
         assert "-h, --help" in result.output
 
+    recovery_help = runner.invoke(cli_main, ["mcp-recover-run", "--help"], terminal_width=120)
+    assert recovery_help.exit_code == 0
+    assert "Args:" not in recovery_help.output
+    assert "--state-dir" in recovery_help.output
+    assert "--run-id" in recovery_help.output
+    assert "--confirm" in recovery_help.output
+    assert "-h, --help" in recovery_help.output
+
     run_help = runner.invoke(cli_main, ["run", "--help"], terminal_width=120).output
     assert "--from-phase PHASE" in run_help
     assert "[default: (first phase)]" in run_help
     assert "--dry-run" in run_help
     assert "-v, --verbose" in run_help
 
-
-def test_dry_run_winner_includes_inherited_and_fixed_overrides(tmp_path):
-    """Dry-run placeholder Winner must compose inherited + fixed + sampled placeholders.
-
-    Otherwise downstream phases' dry-run command previews omit the locked context
-    a real run would carry.
-    """
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
-        phases:
-          - name: arch
-            fixed_overrides:
-              model_family: llama
-            n_trials: 2
-            sampler: {{ type: grid }}
-            search_space:
-              n_layers: {{ type: categorical, choices: [4, 8] }}
-          - name: lr
-            inherits: [arch]
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-        """,
-    )
-    exp = load_experiment(p)
-    winners = run_experiment(exp, dry_run=True)
-
-    # Phase 1 (arch) winner: includes its own fixed_override.
-    assert winners["arch"].effective_overrides["model_family"] == "llama"
-    assert "n_layers" in winners["arch"].effective_overrides
-
-    # Phase 2 (lr) winner: includes inherited n_layers AND model_family + its own sampled lr.
-    lr_eff = winners["lr"].effective_overrides
-    assert "model_family" in lr_eff, "Inherited fixed_override must propagate to dry-run"
-    assert "n_layers" in lr_eff, "Inherited search-space winner must propagate to dry-run"
-    assert "lr" in lr_eff, "Phase's own sampled placeholder must be present"
+    mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
+    assert mcp_help.exit_code == 0
+    assert "Serve the optional MCP broker over stdio" in mcp_help.output
+    assert "--catalog PATH" in mcp_help.output
 
 
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:

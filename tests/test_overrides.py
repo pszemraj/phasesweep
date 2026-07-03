@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import shutil
+import shlex
 
 import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.runtime.commands import format_argparse, format_hydra, render_command
-from tests.conftest import REPO, write_yaml
+from tests.conftest import copy_fake_train, write_yaml
 
 
 def test_hydra_basic():
@@ -23,6 +23,21 @@ def test_hydra_dotted():
 def test_hydra_bool():
     s = format_hydra({"flag": True, "off": False})
     assert s == "flag=true off=false"
+
+
+def test_hydra_quotes_string_values_for_hydra_grammar():
+    s = format_hydra({"optimizer": "adam,w", "tags": ["a,b", "c[d]"], "mode": "true"})
+
+    assert shlex.split(s) == [
+        'optimizer="adam,w"',
+        'tags=["a,b","c[d]"]',
+        'mode="true"',
+    ]
+
+
+def test_hydra_rejects_structured_values():
+    with pytest.raises(TypeError, match="json_file"):
+        format_hydra({"model": {"depth": 2}})
 
 
 def test_argparse():
@@ -61,21 +76,42 @@ def test_render_command_json_file(tmp_path):
     assert data == {"a": {"b": 1, "c": 2}, "d": "x"}
 
 
+def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        """
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: hydra
+        metric:
+          name: x
+          goal: minimize
+          extractor: { type: json, path: r.json, key: x }
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              model: { depth: 2 }
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="override_format='hydra'.*json_file"):
+        load_experiment(p)
+
+
 # ---- migrated from version-named files ----
 
 
 def test_effective_overrides_include_fixed(tmp_path):
     """Winner's effective_overrides must include parent's fixed_overrides, not just sampled params."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
     yaml_text = f"""
 experiment: eff_override_test
 storage: sqlite:///{db_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize

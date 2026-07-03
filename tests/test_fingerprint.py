@@ -20,8 +20,8 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.engine.guards import _phase_fingerprint
-from phasesweep.engine.state import Winner, _phase_dir, _winner_path
-from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer, write_yaml
+from phasesweep.engine.state import Winner, _load_winner, _phase_dir, _save_winner, _winner_path
+from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
 def _two_phase_experiment(
@@ -64,16 +64,16 @@ def _two_phase_experiment(
 
 def test_fingerprint_mismatch_raises(tmp_path):
     """Changing phase config and re-running should fail, not silently mix results."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    from tests.conftest import copy_fake_train
+
+    trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
     base_yaml = f"""
 experiment: fp_test
 storage: sqlite:///{db_path}
 workdir: {tmp_path / "runs"}
-trial_command: "python {examples_dst / "fake_train.py"} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
@@ -171,6 +171,10 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
     winners = run_experiment(exp, from_phase="lr", dry_run=True)
     assert winners["arch"].effective_overrides.get("model_family") == "llama"
     assert "n_layers" in winners["arch"].effective_overrides
+    lr_eff = winners["lr"].effective_overrides
+    assert lr_eff["model_family"] == "llama"
+    assert "n_layers" in lr_eff
+    assert "lr" in lr_eff
 
 
 def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
@@ -209,6 +213,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
                 make_experiment(n_jobs=1),
                 make_experiment(
                     n_jobs=4,
+                    gpu_devices=["GPU-deadbeef"],
                     allow_no_gpu_isolation=True,
                     allow_incomplete_on_timeout=True,
                 ),
@@ -229,6 +234,14 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             lambda: (
                 make_experiment(timeout_seconds_per_trial=60.0),
                 make_experiment(timeout_seconds_per_trial=3600.0),
+            ),
+            False,
+        ),
+        (
+            "gpu_policy",
+            lambda: (
+                make_experiment(gpu_policy="single_per_trial"),
+                make_experiment(gpu_policy="whole_node"),
             ),
             False,
         ),
@@ -412,6 +425,72 @@ def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path)
 
         with pytest.raises(RuntimeError, match=match):
             run_experiment(exp, from_phase="lr")
+
+
+def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"trial_number": 0, "metric": {"objective":')
+
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+        _load_winner(exp, exp.phases[0], {})
+
+
+def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
+                "completion": {"incomplete": False},
+            },
+            sort_keys=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+        _load_winner(exp, exp.phases[0], {})
+
+
+def test_save_winner_replace_failure_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs")
+    phase = exp.phases[0]
+    fingerprint = _phase_fingerprint(exp, phase, {})
+    original = Winner(
+        trial_number=0,
+        params={"x": 0},
+        effective_overrides={"x": 0},
+        metric=1.0,
+        phase_fingerprint=fingerprint,
+    )
+    replacement = Winner(
+        trial_number=1,
+        params={"x": 1},
+        effective_overrides={"x": 1},
+        metric=0.5,
+        phase_fingerprint=fingerprint,
+    )
+
+    _save_winner(exp, phase.name, original)
+    path = _winner_path(exp, phase.name)
+    before = path.read_text()
+
+    def fail_replace(_src: Path | str, _dst: Path | str) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("phasesweep.runtime.files.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _save_winner(exp, phase.name, replacement)
+
+    assert path.read_text() == before
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
 def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:

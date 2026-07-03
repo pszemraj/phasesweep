@@ -25,6 +25,8 @@ from pathlib import Path
 from types import FrameType
 from typing import IO
 
+from phasesweep.runtime.files import atomic_write_text
+
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
@@ -54,7 +56,34 @@ _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
 )
 
 
-def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
+@dataclass(frozen=True)
+class ShutdownCleanupReport:
+    """Cleanup evidence captured when the orchestrator handles a shutdown signal."""
+
+    signum: int
+    cleanup_confirmed: bool
+    child_pgids: tuple[int, ...]
+
+
+class PhaseSweepShutdown(SystemExit):
+    """SystemExit carrying child process-group cleanup evidence."""
+
+    def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
+        """Create a POSIX-style signaled exit with structured cleanup evidence."""
+        super().__init__(128 + signum)
+        self.signum = signum
+        self.report = report
+
+
+_last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
+
+
+def last_shutdown_cleanup_report() -> ShutdownCleanupReport | None:
+    """Return the most recent shutdown cleanup report in this process, if any."""
+    return _last_shutdown_cleanup_report
+
+
+def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Kill all tracked child process groups, then exit.
 
     CRITICAL: we must NOT call proc.wait() here because the main thread may
@@ -79,7 +108,7 @@ def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
     Args:
         signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
             ``SIGHUP`` where available).
-        frame: The interrupted stack frame at signal-delivery time; unused
+        _frame: The interrupted stack frame at signal-delivery time; unused
             but required by the ``signal.signal`` handler protocol.
 
     Raises:
@@ -87,28 +116,48 @@ def _shutdown_handler(signum: int, frame: FrameType | None) -> None:
             ``signaled-exit`` convention).
 
     """
-    import time
+    global _last_shutdown_cleanup_report  # noqa: PLW0603
 
     with _launch_lock, _lock:
-        pgids = list(_active_children)
+        pgids = tuple(_active_children)
 
     log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
-    # Phase 1: SIGTERM all groups.
+    confirmed_by_pgid: dict[int, bool] = {}
     for pgid in pgids:
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pgid, signal.SIGTERM)
+        try:
+            confirmed_by_pgid[pgid] = _terminate_process_group(
+                pgid,
+                grace_seconds=_KILL_GRACE_SECONDS,
+            )
+        except Exception:
+            log.exception(
+                "Failed while cleaning child process group %d after signal %d", pgid, signum
+            )
+            confirmed_by_pgid[pgid] = False
 
-    if pgids:
-        time.sleep(0.5)  # Brief grace for clean shutdown.
+    cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
+    report = ShutdownCleanupReport(
+        signum=signum,
+        cleanup_confirmed=cleanup_confirmed,
+        child_pgids=pgids,
+    )
+    _last_shutdown_cleanup_report = report
+    if cleanup_confirmed:
+        log.warning(
+            "Received signal %d; confirmed cleanup for %d child group(s)",
+            signum,
+            len(pgids),
+        )
+    else:
+        uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
+        log.error(
+            "Received signal %d; cleanup is uncertain for child group(s): %s",
+            signum,
+            uncertain,
+        )
 
-    # Phase 2: SIGKILL any survivors from the *same snapshot*.
-    for pgid in pgids:
-        if _process_group_alive(pgid):
-            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.killpg(pgid, signal.SIGKILL)
-
-    raise SystemExit(128 + signum)
+    raise PhaseSweepShutdown(signum, report)
 
 
 def _unblock_shutdown_signals() -> None:
@@ -314,30 +363,58 @@ def run_supervised(
     # Correct ordering: block signals -> take lock -> work -> release lock
     # -> unblock signals. Any pending signal is delivered after the lock is
     # released, so the handler can safely acquire it.
-    with _defer_shutdown_signals(), _launch_lock:
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,  # noqa: S602
-            env=env,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    pid_path = trial_dir / "pid"
+    pgid_path = trial_dir / "pgid"
+    starttime_path = trial_dir / "pid_starttime"
+
+    try:
+        with _defer_shutdown_signals(), _launch_lock:
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,  # noqa: S602
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
+
+            # Register in the global child registry immediately so the signal handler
+            # can reach this group even if we haven't written files yet.
+            pgid = _register(proc)
+
+            atomic_write_text(pid_path, f"{proc.pid}\n")
+            atomic_write_text(pgid_path, f"{pgid}\n")
+
+            starttime = read_proc_starttime(proc.pid)
+            if starttime is not None:
+                atomic_write_text(starttime_path, f"{starttime}\n")
+    except Exception as exc:
+        if proc is None:
+            raise
+        target_pgid = pgid if pgid is not None else proc.pid
+        identity_failure_reason = f"failed to persist process identity: {exc}"
+        log.exception(
+            "Trial PID %d (pgid %d) launched but identity persistence failed; terminating group",
+            proc.pid,
+            target_pgid,
+        )
+        cleanup_confirmed = _kill_group(target_pgid, proc)
+        if pgid is not None:
+            _unregister(pgid)
+        duration = time.time() - started
+        return ProcessResult(
+            return_code=proc.returncode if proc.returncode is not None else -9,
+            timed_out=False,
+            pid=proc.pid,
+            duration_seconds=duration,
+            failure_reason=identity_failure_reason,
+            cleanup_confirmed=cleanup_confirmed,
         )
 
-        # Register in the global child registry immediately so the signal handler
-        # can reach this group even if we haven't written files yet.
-        pgid = _register(proc)
-
-        pid_path = trial_dir / "pid"
-        pgid_path = trial_dir / "pgid"
-        starttime_path = trial_dir / "pid_starttime"
-
-        pid_path.write_text(f"{proc.pid}\n")
-        pgid_path.write_text(f"{pgid}\n")
-
-        starttime = read_proc_starttime(proc.pid)
-        if starttime is not None:
-            starttime_path.write_text(f"{starttime}\n")
+    assert proc is not None
+    assert pgid is not None
 
     timed_out = False
     failure_reason: str | None = None
@@ -395,6 +472,38 @@ def run_supervised(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _ProcStat:
+    """Parsed fields from one Linux ``/proc/<pid>/stat`` record."""
+
+    state: str
+    pgrp: int
+    starttime: int
+
+
+def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
+    """Parse the proc stat fields phasesweep uses for liveness checks.
+
+    :param Path proc_entry: ``/proc/<pid>`` directory to inspect.
+    :return _ProcStat | None: Parsed state, process group, and starttime, or ``None`` when
+        unreadable.
+    """
+    try:
+        data = (proc_entry / "stat").read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    rest = data[rparen + 1 :].strip().split()
+    if len(rest) < 20:
+        return None
+    try:
+        return _ProcStat(state=rest[0].decode("ascii"), pgrp=int(rest[2]), starttime=int(rest[19]))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
 def read_proc_starttime(pid: int) -> int | None:
     """Read the start time of a process from /proc/<pid>/stat.
 
@@ -410,21 +519,8 @@ def read_proc_starttime(pid: int) -> int | None:
         ``None`` on non-Linux systems and when the proc entry is unreadable.
 
     """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            data = f.read()
-        # Field 22 (1-indexed) is starttime in clock ticks.
-        # The comm field (field 2) can contain spaces and parens, so find
-        # the last ')' to skip past it safely.
-        rparen = data.rfind(b")")
-        if rparen == -1:
-            return None
-        fields = data[rparen + 2 :].split()
-        # After comm, field 3 = state, field 4 = ppid, ... field 22 = starttime.
-        # That's index 19 in the post-comm split (fields 3..N map to indices 0..N-3).
-        return int(fields[19])
-    except (FileNotFoundError, ValueError, IndexError, OSError):
-        return None
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    return None if stat is None else stat.starttime
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -474,6 +570,55 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
         # Can't read /proc — non-Linux or proc vanished. Fall back.
         return True
     return current_starttime == saved_starttime
+
+
+def is_pid_zombie(pid: int) -> bool:
+    """Return whether ``pid`` is a zombie (exited but not yet reaped by its parent).
+
+    A zombie still answers ``kill(pid, 0)`` because it occupies the PID table,
+    so :func:`is_pid_alive` and :func:`is_same_process` both report it as alive.
+    For a liveness decision it is effectively dead — it holds no resources and
+    is doing no work. This reads ``/proc/<pid>/stat`` (state is the first field
+    after the ``)`` that closes ``comm``) and returns ``True`` only for state
+    ``Z``. On non-Linux (no ``/proc``) it returns ``False``, preserving the
+    legacy alive-only semantics used elsewhere.
+
+    Args:
+        pid: Process ID to probe.
+
+    Returns:
+        ``True`` if the process exists and is a zombie; ``False`` if it is live,
+        gone, or undeterminable (non-Linux).
+
+    """
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    return stat is not None and stat.state == "Z"
+
+
+def reap_child(pid: int) -> bool:
+    """Best-effort non-blocking reap of one exited child.
+
+    A long-lived parent (the MCP server) that spawns detached runners and never
+    waits on them accumulates a zombie per runner as each one exits. Call this
+    for a known runner pid to reap it if it has already exited; it is a no-op if
+    the process is still running, was never our child, or has already been reaped.
+    This runs on status-read paths, so it must stay strictly non-blocking. A
+    single ``waitpid(WNOHANG)`` reduces zombie buildup; it does not guarantee
+    that a child exiting immediately after this call is reaped before the next
+    status scan.
+
+    Args:
+        pid: PID of a runner this process spawned.
+
+    Returns:
+        ``True`` when this call reaped ``pid``; ``False`` otherwise.
+
+    """
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        return False
+    return waited == pid
 
 
 @dataclass
@@ -559,9 +704,10 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
         log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
         return False
 
+    member_pids = set(_group_member_pids(pgid))
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _process_group_alive(pgid):
+        if not _tracked_process_group_alive(pgid, member_pids):
             return True
         time.sleep(0.1)
 
@@ -578,7 +724,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     # "marked FAIL" state means cleanup completed, not requested.
     kill_deadline = time.monotonic() + 2.0
     while time.monotonic() < kill_deadline:
-        if not _process_group_alive(pgid):
+        if not _tracked_process_group_alive(pgid, member_pids):
             return True
         time.sleep(0.05)
 
@@ -607,6 +753,15 @@ def _process_group_alive(pgid: int) -> bool:
         (state ``Z``/``X``).
 
     """
+    return _process_group_alive_with_members(pgid, None)
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Return whether the process group has any PID-table entry.
+
+    :param int pgid: Process-group ID to probe.
+    :return bool: ``True`` when the group exists or exists but is not inspectable.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -614,42 +769,93 @@ def _process_group_alive(pgid: int) -> bool:
     except PermissionError:
         # Group exists but is owned by a different user. Treat as alive.
         return True
+    return True
 
-    # killpg(0) succeeded → at least one PID-table entry exists. Filter out
-    # zombies by walking /proc/*/stat and checking which ones are in this PGID.
+
+def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool:
+    """Return whether ``pgid`` appears to identify a new group leader.
+
+    A PGID number can later be reused as an ordinary PID in another process
+    group; that does not make ``killpg(pgid, ...)`` unsafe because the process
+    is not a member of the target group. The unsafe case is narrower: a live
+    ``/proc/<pgid>`` entry belongs to process group ``pgid`` but has a different
+    starttime, meaning the saved group ID is now led by an unrelated process.
+    """
+    stat = _read_proc_stat(Path("/proc") / str(pgid))
+    return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime
+
+
+def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
+    """Check group liveness using a cached PID set, refreshing only if needed.
+
+    :param int pgid: Process-group ID to probe.
+    :param set[int] member_pids: Cached group member PIDs, refreshed in place on apparent
+        death.
+    :return bool: ``True`` when any non-zombie group member still appears live.
+    """
+    return _process_group_alive_with_members(pgid, member_pids)
+
+
+def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
+    """Check group liveness, optionally using and refreshing a cached member set.
+
+    :param int pgid: Process-group ID to probe.
+    :param set[int] | None member_pids: Cached group members, or ``None`` to scan once.
+    :return bool: ``True`` when a non-zombie member of the group is still alive.
+    """
+    if not _process_group_exists(pgid):
+        return False
     proc_root = Path("/proc")
     if not proc_root.exists():
-        # Non-Linux: cannot distinguish zombies. Preserve legacy semantics.
         return True
+    if member_pids is None:
+        return _member_pids_alive(pgid, _group_member_pids(pgid))
+    if _member_pids_alive(pgid, member_pids):
+        return True
+    refreshed = set(_group_member_pids(pgid))
+    member_pids.clear()
+    member_pids.update(refreshed)
+    return _member_pids_alive(pgid, member_pids)
 
-    any_live = False
+
+def _group_member_pids(pgid: int) -> list[int]:
+    """Return current ``/proc`` PIDs that belong to process group ``pgid``.
+
+    :param int pgid: Process-group ID to find under ``/proc``.
+    :return list[int]: PIDs currently reporting membership in ``pgid``.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    member_pids: list[int] = []
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
-        try:
-            with (entry / "stat").open(encoding="utf-8") as fh:
-                text = fh.read()
-        except (FileNotFoundError, PermissionError, OSError):
+        stat = _read_proc_stat(entry)
+        if stat is None:
             continue
-        rparen = text.rfind(")")
-        if rparen < 0:
+        if stat.pgrp == pgid:
+            member_pids.append(int(entry.name))
+    return member_pids
+
+
+def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
+    """Return whether any known member PID is still live and in ``pgid``.
+
+    :param int pgid: Process-group ID each PID must still belong to.
+    :param set[int] | list[int] member_pids: Candidate member PIDs to inspect.
+    :return bool: ``True`` when any candidate is a live, non-zombie member.
+    """
+    for pid in member_pids:
+        stat = _read_proc_stat(Path("/proc") / str(pid))
+        if stat is None:
             continue
-        rest = text[rparen + 1 :].strip().split()
-        if len(rest) < 3:
+        if stat.pgrp != pgid:
             continue
-        # Field 5 of the post-comm split is pgrp (state, ppid, pgrp, ...).
-        state = rest[0]
-        try:
-            entry_pgrp = int(rest[2])
-        except ValueError:
+        if stat.state in {"Z", "X"}:
             continue
-        if entry_pgrp != pgid:
-            continue
-        if state == "Z":
-            continue
-        any_live = True
-        break
-    return any_live
+        return True
+    return False
 
 
 def kill_stale_group(
@@ -663,21 +869,21 @@ def kill_stale_group(
 
     Returns ``True`` only when it is safe to mark the trial ``FAIL``: either
     nothing was alive to clean up, or cleanup ran and the process group is
-    confirmed gone. Returns ``False`` when cleanup is uncertain — PID was
-    reused, permission was denied, or the group survived SIGKILL. Callers
-    must not advance state when this returns ``False`` (review v0.5.7 /
-    blocker 2): a leaked training process can still hold a GPU, scribble
-    over W&B runs, or starve the host scheduler.
+    confirmed gone. Returns ``False`` when cleanup is uncertain — PID/PGID
+    identity was reused unsafely, permission was denied, or the group survived
+    SIGKILL. Callers must not advance state when this returns ``False``
+    (review v0.5.7 / blocker 2): a leaked training process can still hold a
+    GPU, scribble over W&B runs, or starve the host scheduler.
 
     Recovery order (review v0.5.3 / blocker 2):
 
     1. ``pid`` is alive AND saved starttime matches: derive PGID from the live
        PID and kill the group. Starttime check guards against PID reuse.
     2. ``pid`` is alive but starttime mismatches: this is PID reuse by an
-       unrelated process. **Refuse to use the stored PGID** — group leader
-       PID and PGID are typically the same number, so the stored PGID is
-       likely now stamped on the unrelated reused process group too. Killing
-       it would target the wrong group.
+       unrelated process. If the stored PGID proves the old group is gone,
+       cleanup is complete. If the PGID still exists, use it only when the
+       reused PID is not the leader of that group; otherwise fail closed to
+       avoid killing an unrelated process group.
     3. ``pid`` is unrecoverable (dead or never recorded) but ``pgid`` was
        persisted at launch: best-effort PGID kill with a loud warning. The
        root PID may have exited (``shell=True`` shells often do) while
@@ -711,13 +917,47 @@ def kill_stale_group(
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
         elif is_pid_alive(pid) and saved_starttime is not None:
-            # PID reuse detected. Stored PGID is no longer trustworthy because
-            # group leader PID typically equals PGID — refuse to fall through.
+            # PID reuse detected. A persisted PGID can still prove cleanup is
+            # complete (group gone) or target original descendants (group alive
+            # but not led by the reused PID). Refuse only when the stored PGID
+            # itself appears to be a reused group leader.
+            if pgid is not None and not _process_group_exists(pgid):
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "PID was reused, but stored process group %d no longer "
+                    "exists.",
+                    pid,
+                    pgid,
+                )
+                return True
+            if pgid is None:
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "PID was reused and no stored PGID is available. Cleanup "
+                    "status is uncertain.",
+                    pid,
+                )
+                return False
+            if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+                log.warning(
+                    "PID %d is alive but starttime does not match saved value; "
+                    "stored PGID %d is led by a different process. Refusing "
+                    "PGID fallback to avoid killing an unrelated process group.",
+                    pid,
+                    pgid,
+                )
+                return False
+
+    if target_pgid is None and pgid is not None and saved_starttime is not None:
+        if not _process_group_exists(pgid):
+            return True
+        if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
             log.warning(
-                "PID %d is alive but starttime does not match saved value; "
-                "PID was reused. Refusing PGID fallback to avoid killing an "
-                "unrelated process group.",
-                pid,
+                "Stored PGID %d is now led by a different process. Refusing "
+                "PGID fallback to avoid killing an unrelated process group "
+                "(saved starttime %s).",
+                pgid,
+                saved_starttime,
             )
             return False
 
@@ -726,7 +966,7 @@ def kill_stale_group(
             # No identity at all → nothing alive to clean up.
             return True
         log.warning(
-            "Root PID is gone or unrecoverable; using stored PGID %d for "
+            "Root PID is gone, reused, or unrecoverable; using stored PGID %d for "
             "best-effort cleanup of stale trial process group.",
             pgid,
         )
@@ -737,3 +977,23 @@ def kill_stale_group(
 
     log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
     return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)
+
+
+def terminate_group(pgid: int, *, grace_seconds: float = _KILL_GRACE_SECONDS) -> bool:
+    """Public SIGTERM -> grace -> SIGKILL of a process group; confirm it is gone.
+
+    Thin wrapper over the internal escalation used by trial cleanup, exposed so
+    callers outside ``runtime`` (the MCP cancel path) do not reach into a
+    private helper. Same contract: returns ``True`` only when the group is
+    confirmed dead (already gone, died in the SIGTERM grace, or died within 2s
+    of SIGKILL), ``False`` when cleanup is uncertain.
+
+    Args:
+        pgid: Target process-group ID.
+        grace_seconds: Seconds to wait after SIGTERM before escalating.
+
+    Returns:
+        Whether the group is confirmed gone.
+
+    """
+    return _terminate_process_group(pgid, grace_seconds=grace_seconds)

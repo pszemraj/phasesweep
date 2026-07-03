@@ -12,6 +12,8 @@ import optuna
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
 from phasesweep.engine.state import FEASIBLE_ATTR, Winner, constraint_attr
 
+WINNER_TIE_EPS = 1e-12
+
 
 @dataclass
 class SelectedTrial:
@@ -92,37 +94,38 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             "Check stdout/stderr logs in the phase's trial_* directories."
         )
 
-    def key(t: optuna.trial.FrozenTrial) -> tuple[float, int]:
-        """Sort key for ``min(survivors, ...)``.
-
-        Args:
-            t: A survivor trial (already filtered to COMPLETE + finite value).
-
-        Returns:
-            ``(signed_metric, trial_number)``. The sign is flipped for maximize
-            so ``min`` picks the best in both directions. Trial number is the
-            tiebreaker (lower wins).
-
-        """
-        # Survivors all passed `t.value is None or not isfinite` filtering above,
-        # so t.value is a finite float here. The `assert` narrows for mypy.
-        assert t.value is not None
-        v = t.value if minimize else -t.value
-        return (v, t.number)
-
-    best = min(survivors, key=key)
-    assert best.value is not None  # same invariant
+    best_value = (
+        min(_trial_value(t) for t in survivors)
+        if minimize
+        else max(_trial_value(t) for t in survivors)
+    )
+    near_best = [t for t in survivors if abs(_trial_value(t) - best_value) <= WINNER_TIE_EPS]
+    best = min(near_best, key=lambda t: t.number)
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
     }
+    selected_value = best.value
+    assert selected_value is not None  # same invariant
 
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
-        metric=float(best.value),
+        metric=float(selected_value),
         constraints=constraint_vals,
     )
+
+
+def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
+    """Return the non-None metric value for a known survivor trial.
+
+    :param optuna.trial.FrozenTrial trial: Completed feasible trial already filtered by
+        :func:`select_winner`.
+    :return float: Scalar objective value for the trial.
+    """
+    value = trial.value
+    assert value is not None  # survivor invariant from select_winner
+    return value
 
 
 log = logging.getLogger("phasesweep.engine.selection")

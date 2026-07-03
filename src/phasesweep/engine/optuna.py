@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+import warnings
 from pathlib import Path
 from typing import Any
 
 import optuna
+from optuna.exceptions import ExperimentalWarning
 
 from phasesweep.config import (
     CategoricalParam,
@@ -18,7 +21,7 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
-from phasesweep.runtime.files import file_url_path, storage_backend
+from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage_backend
 
 
 def _build_sampler(
@@ -42,11 +45,17 @@ def _build_sampler(
 
     """
     if cfg.type == "tpe":
-        return optuna.samplers.TPESampler(
-            seed=cfg.seed,
-            n_startup_trials=cfg.n_startup_trials,
-            constant_liar=(n_jobs > 1),
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=ExperimentalWarning,
+                message=r"Argument ``constant_liar`` is an experimental feature.*",
+            )
+            return optuna.samplers.TPESampler(
+                seed=cfg.seed,
+                n_startup_trials=cfg.n_startup_trials,
+                constant_liar=(n_jobs > 1),
+            )
     if cfg.type == "random":
         return optuna.samplers.RandomSampler(seed=cfg.seed)
     if cfg.type == "grid":
@@ -184,6 +193,93 @@ def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
     )
 
 
+def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
+    """Return whether a SQLite storage already contains the phase study.
+
+    :param Experiment experiment: Parsed experiment config with SQLite storage.
+    :param Phase phase: Phase whose stable study name should be checked.
+    :return bool: ``True`` only when the backing database is readable and contains the study.
+    """
+    assert experiment.storage is not None
+    uri = sqlite_readonly_uri(experiment.storage)
+    if uri is None:
+        return False
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM studies WHERE study_name = ? LIMIT 1",
+                (_phase_study_name(experiment, phase),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study | None:
+    """Load a phase study only if it already exists.
+
+    Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
+    that can create an empty study and make missing evidence look safe. This helper checks
+    file-backed storage before delegating to Optuna's loader, then treats an absent study as
+    ``None``.
+
+    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param Phase phase: Phase whose stable study name should be loaded.
+    :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
+    """
+    if experiment.storage is None:
+        return None
+    backend = storage_backend(experiment.storage)
+    if backend == "sqlite" and not _sqlite_study_exists(experiment, phase):
+        return None
+    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
+        return None
+    try:
+        return _load_phase_study(experiment, phase)
+    except KeyError:
+        return None
+
+
+def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
+    """Return trial-state counts from a SQLite Optuna DB without creating schema.
+
+    Status polling must be read-only. Passing a fresh SQLite URL through
+    Optuna's storage constructor can create the database/schema and race the
+    runner's first ``create_study`` call. Opening the file in SQLite read-only
+    mode avoids both side effects: a missing, locked, or still-initializing DB
+    simply reports no counts for now.
+
+    :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
+    :param Phase phase: Phase whose stable Optuna study name is counted.
+    :return dict[str, int]: Trial counts keyed by Optuna state name, or an empty dict when the backing DB cannot be read safely.
+    """
+    assert experiment.storage is not None
+    uri = sqlite_readonly_uri(experiment.storage)
+    if uri is None:
+        return {}
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+        try:
+            rows = conn.execute(
+                """
+                SELECT trials.state, COUNT(*)
+                FROM trials
+                JOIN studies ON trials.study_id = studies.study_id
+                WHERE studies.study_name = ?
+                GROUP BY trials.state
+                """,
+                (_phase_study_name(experiment, phase),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {str(state): int(count) for state, count in rows}
+
+
 def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     """Return Optuna trial counts by state without creating a missing study.
 
@@ -192,6 +288,11 @@ def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     :return dict[str, int]: Counts keyed by Optuna trial-state name.
     """
     if experiment.storage is None:
+        return {}
+    backend = storage_backend(experiment.storage)
+    if backend == "sqlite":
+        return _sqlite_trial_counts(experiment, phase)
+    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
         return {}
     try:
         study = _load_phase_study(experiment, phase)

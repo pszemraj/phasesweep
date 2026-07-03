@@ -1,10 +1,9 @@
 # Config Guide
 
-A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer remains responsible for parsing overrides, running the actual experiment, and writing the artifacts that the configured extractors read.
+A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and writes the artifacts that configured extractors read.
 
-This page explains how the parts fit together. For the exhaustive schema dump with every field, type, default, enum value, and point-of-use constraint, use [config_reference.yaml](config_reference.yaml). Treat that file as the implementation reference when reviewing or migrating YAML.
+For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml).
 
-- [Typed Schema Reference](#typed-schema-reference)
 - [Experiment Keys](#experiment-keys)
 - [Phase Keys](#phase-keys)
 - [Search Parameters](#search-parameters)
@@ -17,41 +16,34 @@ This page explains how the parts fit together. For the exhaustive schema dump wi
 - [Suites](#suites)
 - [Validation](#validation)
 
-## Typed Schema Reference
-
-The schema-complete reference lives in [config_reference.yaml](config_reference.yaml). It is intentionally YAML-shaped but not a runnable config: each value is a type signature with the required/default status inline, and the comments document operational consequences such as unsafe storage combinations, placeholder requirements, sampler restrictions, and gate/promotion behavior.
-
-Use this guide when you need the mental model. Use the YAML reference when you need to answer "what keys are legal here?", "what happens if I omit this?", or "which exact enum spelling does the validator accept?"
-
 ## Experiment Keys
 
-The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to `[A-Za-z0-9_-]+`.
+The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to ASCII `[A-Za-z0-9_-]+`.
 
 `storage` controls whether a run can resume. `null` is in-memory and non-resumable. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
 
 `trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. It does not teach your trainer to parse the chosen format; your trainer must already understand `argparse`, `hydra`, or the JSON file path you selected with `override_format`.
 
-`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still a completed evaluation, so it can inform the sampler, but it cannot be selected as the phase winner. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
+`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value, but constraints are selection filters only: current samplers do not receive feasibility guidance, and infeasible trials cannot be selected as the phase winner. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
 
 ## Phase Keys
 
-Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is deliberate: it makes expensive searches inspectable, but it is not a substitute for joint optimization when dimensions interact strongly.
+Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-![dag](/docs/images/diagramA_dag.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
-
-- `name`: required phase name matching `[A-Za-z0-9_-]+`.
+- `name`: required phase name matching ASCII `[A-Za-z0-9_-]+`.
 - `inherits`: prior phase names whose exposed winners become fixed overrides.
 - `fixed_overrides`: hard-coded overrides for every trial in the phase.
 - `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.
 - `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
-- `n_trials`: trial budget. Increasing it later is a compatible top-up.
+- `n_trials`: terminal trial-attempt budget; Optuna `COMPLETE`, `FAIL`, and `PRUNED` trials all consume it. Increasing it later is a compatible top-up.
 - `n_jobs`: parallel trials inside the phase.
-- `gpu_ids`: explicit CUDA device IDs. When omitted, numeric ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` output is auto-detected, including for `n_jobs == 1`.
+- `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
+- `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
+- `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
 - `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
 - `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for continuous numeric phases.
 - `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.
-- `timeout_seconds_per_phase`: phase wallclock guard.
+- `timeout_seconds_per_phase`: hard phase wallclock guard. The budget caps Optuna scheduling, GPU-lease waiting, and active trial subprocess runtime.
 - `allow_incomplete_on_timeout`: select from completed trials after a phase or run timeout. Defaults to fail-closed.
 - `allow_partial_grid`: permit `n_trials` smaller than the grid cardinality.
 - `allow_seed_search`: permit `seed` or `*.seed` in `search_space`.
@@ -80,10 +72,12 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 | Format      | Template placeholder | Trainer receives                     | Use when                                                         |
 | ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
 | `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
-| `hydra`     | `{overrides}`        | `key=value` tokens                   | Existing Hydra/OmegaConf applications.                           |
-| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Trainers that prefer one structured input file or nested config. |
+| `hydra`     | `{overrides}`        | `key=value` tokens                   | Compatibility for existing Hydra/OmegaConf applications.         |
+| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Recommended for structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
 When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
+
+`json_file` is the most robust trainer boundary because it preserves JSON types without relying on a command-line grammar. Hydra compatibility quotes string and list values for OmegaConf override parsing, but complex structured values should use `json_file` rather than Hydra CLI overrides.
 
 ## Trainer Contract
 
@@ -94,12 +88,11 @@ The command in `trial_command` is the training or evaluation program for one tri
 - Exit nonzero when the trial failed and should be recorded as failed.
 - Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
 
-Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials, preserving information for the sampler while keeping those trials out of winner selection.
+Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance.
 
 ## Override Order
 
-![override composition](/docs/images/diagramD_override.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![override composition](images/diagramD_override.png)
 
 Within one trial, later layers override earlier layers:
 
@@ -113,6 +106,8 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 ## Extractors
 
 Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
+
+For agent-facing workflows, keep extractor inputs to scalar summaries. Do not mix validation labels, target/dependent-variable values, prediction dumps, dataset paths, tokens, or full metric histories into the same artifact that stores the objective metric. MCP reads only the configured scalar, but small result artifacts are easier to inspect without leaking data into an agent chat or troubleshooting paste.
 
 JSON extractors read a dotted key from a file under `{trial_dir}`:
 

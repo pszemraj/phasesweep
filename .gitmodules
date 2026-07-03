@@ -1,0 +1,3 @@
+[submodule "examples/tiny_decoder_enwik8/upstream"]
+	path = examples/tiny_decoder_enwik8/upstream
+	url = https://github.com/pszemraj/decoder-pytorch-template.git

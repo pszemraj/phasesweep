@@ -21,7 +21,7 @@ from phasesweep.config.common import (
 from phasesweep.config.search import (
     Sampler,
     SearchParam,
-    _placeholder_value_for,
+    _placeholder_values_for,
     _validate_sampler_search_space,
 )
 from phasesweep.evidence.models import Extractor, Gate
@@ -97,6 +97,9 @@ class Promotion(_Frozen):
         return self
 
 
+GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
+
+
 class Phase(_Frozen):
     """One stage in a sequential hyperparameter sweep."""
 
@@ -132,8 +135,17 @@ class Phase(_Frozen):
         default=1,
         ge=1,
         description=(
-            "Parallel trials within this phase. When gpu_ids is also set, each "
-            "trial gets exclusive access to one GPU via CUDA_VISIBLE_DEVICES."
+            "Parallel trials within this phase. When gpu_ids or gpu_devices is "
+            "also set, each trial gets exclusive access to one CUDA-visible device."
+        ),
+    )
+    gpu_policy: GpuPolicy = Field(
+        default="single_per_trial",
+        description=(
+            "CUDA visibility policy for trial subprocesses. single_per_trial leases "
+            "one visible CUDA token per trial. whole_node requires n_jobs=1 and "
+            "leases every configured or detected visible token for the trial. none "
+            "disables phasesweep CUDA isolation and GPU host locks."
         ),
     )
     gpu_ids: list[int] | None = Field(
@@ -142,6 +154,13 @@ class Phase(_Frozen):
             "Explicit list of CUDA device indices to partition across parallel trials. "
             "When None, phasesweep auto-detects numeric CUDA_VISIBLE_DEVICES or "
             "nvidia-smi output, including for n_jobs == 1."
+        ),
+    )
+    gpu_devices: list[str] | None = Field(
+        default=None,
+        description=(
+            "Explicit CUDA_VISIBLE_DEVICES tokens to partition across parallel trials. "
+            "Use this for GPU UUIDs or MIG instance IDs; mutually exclusive with gpu_ids."
         ),
     )
 
@@ -160,6 +179,8 @@ class Phase(_Frozen):
         """
         if value is None:
             return None
+        if not value:
+            raise ValueError("gpu_ids must be omitted or contain at least one CUDA device index.")
         bad = [v for v in value if v < 0]
         if bad:
             raise ValueError(
@@ -168,6 +189,49 @@ class Phase(_Frozen):
                 "disable GPU isolation.)"
             )
         return value
+
+    @field_validator("gpu_devices")
+    @classmethod
+    def _gpu_devices_non_empty_tokens(cls, value: list[str] | None) -> list[str] | None:
+        """Normalize and validate explicit CUDA device tokens."""
+        if value is None:
+            return None
+        normalized = [token.strip() for token in value]
+        if not normalized:
+            raise ValueError(
+                "gpu_devices must be omitted or contain at least one CUDA device token."
+            )
+        bad = [token for token in normalized if not token or "," in token or token == "-1"]
+        if bad:
+            raise ValueError(
+                "gpu_devices entries must be non-empty CUDA_VISIBLE_DEVICES tokens "
+                f"without commas or -1; got {bad}."
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_gpu_isolation_config(self) -> Phase:
+        """Reject ambiguous explicit GPU isolation settings."""
+        if self.gpu_ids is not None and self.gpu_devices is not None:
+            raise ValueError("gpu_ids and gpu_devices are mutually exclusive.")
+        if self.gpu_policy == "whole_node" and self.n_jobs != 1:
+            raise ValueError(
+                "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
+                "the full configured CUDA-visible device set."
+            )
+        if self.gpu_policy == "none":
+            if self.gpu_ids is not None or self.gpu_devices is not None:
+                raise ValueError(
+                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices "
+                    "because phasesweep CUDA isolation and GPU host locks are disabled."
+                )
+            if self.n_jobs > 1 and not self.allow_no_gpu_isolation:
+                raise ValueError(
+                    "gpu_policy='none' with n_jobs > 1 can oversubscribe the host. "
+                    "Set allow_no_gpu_isolation=true only when CPU-only or external "
+                    "isolation is intentional."
+                )
+        return self
 
     max_consecutive_failures: int = Field(
         default=5,
@@ -182,8 +246,8 @@ class Phase(_Frozen):
         default=False,
         description=(
             "When GPU isolation cannot be established, phasesweep fails by default "
-            "for parallel sweeps and non-numeric CUDA_VISIBLE_DEVICES. Set True for "
-            "intentional CPU-only or externally-isolated runs."
+            "for parallel sweeps. Set True for intentional CPU-only or "
+            "externally-isolated runs."
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
@@ -346,8 +410,8 @@ class Experiment(_Frozen):
         """Experiment name is used as a filesystem path component (lock files, study names).
 
         Same constraint as phase names: ``[A-Za-z0-9_-]`` only. Without this,
-        names like ``../../etc/evil`` could escape the lock-file path under
-        ``$TMPDIR/phasesweep-locks/`` and the experiment::phase study name.
+        names like ``../../etc/evil`` could escape the configured lock-file
+        directory and the experiment::phase study name.
 
         Returns:
             The validated experiment name, unchanged. Raises ``ValueError``
@@ -390,6 +454,11 @@ class Experiment(_Frozen):
                         f"Phase {phase.name!r} inherits from {parent!r}, "
                         f"which is not a prior phase."
                     )
+            if phase.promotion is not None and phase.promotion.min_delta_vs not in seen:
+                raise ValueError(
+                    f"Phase {phase.name!r} promotion references "
+                    f"{phase.promotion.min_delta_vs!r}, which is not a prior phase."
+                )
 
             # Local same-phase collision (blocker 5): sampling a key that the
             # same phase also lists as fixed silently lets sampled win — that's
@@ -633,8 +702,7 @@ def _validate_trial_command_template(
     for contract_name in phase.contracts:
         overrides.update(experiment.contracts[contract_name].fixed_overrides)
     overrides.update(phase.fixed_overrides)
-    for name, param in phase.search_space.items():
-        overrides[name] = _placeholder_value_for(param)
+    overrides.update(_placeholder_values_for(phase.search_space))
 
     has_overrides = bool(overrides)
 
@@ -646,7 +714,7 @@ def _validate_trial_command_template(
     # which check happens to detect the problem first.
     try:
         fields = _format_field_names(experiment.trial_command)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
@@ -671,7 +739,7 @@ def _validate_trial_command_template(
             f"{{{bad}}}. Supported: {{overrides}}, {{overrides_path}} (json_file "
             f"only), {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
         ) from exc
-    except (ValueError, IndexError) as exc:
+    except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
@@ -773,6 +841,7 @@ class Suite(_Frozen):
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
+        phases_by_study: dict[str, set[str]] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
@@ -782,13 +851,20 @@ class Suite(_Frozen):
                         f"Study {study.name!r} depends_on {dep!r}, which is not a prior study."
                     )
             if study.promotion is not None:
-                baseline_study = study.promotion.min_delta_vs.split(".", 1)[0]
+                selector = study.promotion.min_delta_vs
+                baseline_study, _, baseline_phase = selector.partition(".")
                 if baseline_study not in seen:
                     raise ValueError(
                         f"Study {study.name!r} promotion references {baseline_study!r}, "
                         "which is not a prior study."
                     )
+                if baseline_phase and baseline_phase not in phases_by_study[baseline_study]:
+                    raise ValueError(
+                        f"Study {study.name!r} promotion references missing baseline phase "
+                        f"{selector!r}."
+                    )
             seen.add(study.name)
+            phases_by_study[study.name] = {phase.name for phase in study.phases}
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:

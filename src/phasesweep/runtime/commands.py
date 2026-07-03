@@ -31,6 +31,24 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
+def _stringify_hydra(value: Any) -> str:
+    """Render a value for Hydra/OmegaConf override grammar."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stringify_hydra(v) for v in value) + "]"
+    raise TypeError(
+        "override_format='hydra' supports scalar values and lists only; "
+        f"got {type(value).__name__}. Use override_format='json_file' for structured values."
+    )
+
+
 def format_hydra(overrides: dict[str, Any]) -> str:
     """Hydra-style: ``key=value``, each token unconditionally quoted.
 
@@ -43,7 +61,7 @@ def format_hydra(overrides: dict[str, Any]) -> str:
     """
     parts: list[str] = []
     for k, v in overrides.items():
-        parts.append(shlex.quote(f"{k}={_stringify(v)}"))
+        parts.append(shlex.quote(f"{k}={_stringify_hydra(v)}"))
     return " ".join(parts)
 
 

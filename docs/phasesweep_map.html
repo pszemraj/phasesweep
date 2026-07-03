@@ -346,7 +346,7 @@ PID + start-time check, then PGID fallback.</title>
     <!-- objective() body -->
     <g data-tip="objective() body">
       <title>Inside objective(trial):
-1. _composed_overrides(phase, sampled, parents)
+1. _composed_overrides(experiment, phase, sampled, parents)
 2. Persist trial_dir as user_attr
 3. with gpu_pool.acquire():
 4.    launch_trial() → run_supervised()
@@ -700,7 +700,7 @@ on_fail dispatch:
   "stop"              → raise RuntimeError; halt the phase chain
 
 The decision (action + improvement + gates_passed + audit metadata)
-is persisted to promotion_decision.json regardless of outcome.</title>
+is persisted to promotion.yaml regardless of outcome.</title>
       <rect class="box box-indigo" x="820" y="310" width="170" height="40" rx="3"/>
       <text class="t-indigo" x="905" y="334" font-size="11" text-anchor="middle">_apply_promotion</text>
     </g>
@@ -733,7 +733,7 @@ resume, after verifying the phase fingerprint.</title>
 
 1. if abort["flag"]: raise TrialPruned
 2. sampled = {name: _suggest(trial, name, p) for ...}
-3. overrides = _composed_overrides(phase, sampled, parents)
+3. overrides = _composed_overrides(experiment, phase, sampled, parents)
 4. trial.set_user_attr("phasesweep_trial_dir", str(trial_dir))
 5. with gpu_pool.acquire() as gpu_id:
 6.    if abort["flag"]: raise TrialPruned ← re-check inside lease
@@ -754,7 +754,7 @@ Called WITH GPU lease held.
 1. mkdir trial_dir
 2. render_command(trial_command, overrides, fmt, ...)
 3. Write trial_dir/overrides_resolved.json + command.txt
-4. Build env: experiment.env + PHASESWEEP_* + CUDA_VISIBLE_DEVICES=gpu_id
+4. Build env: experiment.env + PHASESWEEP_* + CUDA_VISIBLE_DEVICES=device token
 5. Open stdout.log, stderr.log
 6. Call run_supervised(cmd, env, stdout, stderr, timeout, trial_dir)
 
@@ -904,9 +904,9 @@ Each trial gets a fresh sampled dict.</title>
 
     <!-- composed -->
     <g data-tip="_composed_overrides">
-      <title>_composed_overrides(phase, sampled, parents) → engine/phase.py:51
+      <title>_composed_overrides(experiment, phase, sampled, parents) → engine/phase.py:51
 
-def _composed_overrides(phase, sampled, parents):
+def _composed_overrides(experiment, phase, sampled, parents):
     out = {}
     for parent in phase.inherits:
         out.update(parents[parent].effective_overrides)
@@ -978,7 +978,7 @@ Format: hydra (key=value), argparse (--key value),
       <title>_suite_lock(suite) → engine/guards.py:201
 
 fcntl.flock on:
-  $TMPDIR/phasesweep-locks/{suite}__suite__{hash}.lock
+  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/{suite}__suite__{hash}.lock
 
 Hash key: suite output directory.
 Held for the entire run_suite() call so cross-study
@@ -1013,10 +1013,10 @@ Why both: two configs can disagree on storage but share
 output paths (or vice versa); either case can corrupt
 --from-phase reuse and trial logs.
 
-Both held under $TMPDIR/phasesweep-locks/.
+Both held under PHASESWEEP_LOCK_DIR, or /var/tmp/phasesweep-locks by default.
 Acquired in deterministic path order. Held for the entire
 phase chain. Same-host advisory only — multi-host needs
-per-trial leases + heartbeats (TODO.md).</title>
+per-trial leases + heartbeats (runtime/process.py).</title>
       <rect class="box box-copper" x="80" y="142" width="500" height="42" rx="3"/>
       <text class="t-copper" x="100" y="160" font-size="11" font-weight="700">① _experiment_lock</text>
       <text class="t-dim" x="100" y="178" font-size="10">= output lock + storage lock (when persistent) · key = path digests</text>
@@ -1070,7 +1070,7 @@ SHA-256 over _phase_semantic_payload:
   metric, constraints, contracts
   promotion rule (when set)
   phase config MINUS run-control fields:
-    n_trials, n_jobs, gpu_ids, allow_no_gpu_isolation,
+    n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation,
     allow_unbounded_trials, allow_partial_grid,
     allow_seed_search, allow_incomplete_on_timeout,
     max_consecutive_failures, timeout_seconds_per_phase,
@@ -1111,14 +1111,14 @@ before _load_winner on --from-phase resume.</title>
     <g data-tip="GpuPool + study.optimize">
       <title>⑤ GpuPool + study.optimize (engine/phase.py + runtime/gpu.py)
 
-GpuPool.create(n_jobs, gpu_ids, allow_no_gpu):
-  • explicit gpu_ids honored even at n_jobs=1
-  • else read CUDA_VISIBLE_DEVICES env
+GpuPool.create(n_jobs, gpu_ids/gpu_devices, allow_no_gpu):
+  • explicit ids/devices honored even at n_jobs=1
+  • else read CUDA_VISIBLE_DEVICES tokens
   • else nvidia-smi --query-gpu=index
   • empty + n_jobs &gt; 1 + !allow_no_gpu → RuntimeError
 
-Each numeric GPU id takes a per-device host lock:
-  $TMPDIR/phasesweep-locks/gpu_{id}.lock
+Each visible device token takes a per-device host lock:
+  ${PHASESWEEP_LOCK_DIR:-/var/tmp/phasesweep-locks}/gpu_{token}.lock
 This prevents two independent local phasesweep runs from
 double-booking the same physical device even at n_jobs=1.
 
@@ -1253,7 +1253,7 @@ commands.py — render_command, format_hydra,
 files.py    — flock helpers (try_lock_file, unlock_file,
               exclusive_lock), lock_dir, storage_backend,
               canonical_storage_identity
-gpu.py      — GpuPool, _HostGpuLease, _detect_gpu_ids,
+gpu.py      — GpuPool, GpuDevice, _HostGpuLease,
               per-device host lock paths
 process.py  — run_supervised, ProcessResult, install_signal_handlers,
               kill_stale_group, read_proc_starttime, is_same_process,
@@ -1272,8 +1272,8 @@ Pure platform layer — testable in isolation.</title>
       <title>_metadata.py · 11 LOC
 __version__ resolved via importlib.metadata.version("phasesweep").
 Source of truth for the version is the package install metadata —
-which once setuptools-scm is wired up will come from git tags
-(currently hardcoded in pyproject.toml; see TODO).
+from setuptools-scm metadata generated from git tags
+(pyproject.toml declares the version as dynamic).
 
 Imported transitively by guards.py to fold into phase fingerprints.</title>
       <ellipse class="box box-dim" cx="100" cy="320" rx="74" ry="18"/>
@@ -1347,7 +1347,7 @@ Contains:
             exposed_source: candidate|baseline}, ...]
 
 The promotion_decisions list mirrors what's in each phase's
-promotion_decision.json, hoisted to one file.</title>
+promotion.yaml, hoisted to one file.</title>
       <rect class="box box-teal" x="160" y="20" width="140" height="32" rx="3"/>
       <text class="t-teal" x="230" y="40" font-size="11" font-weight="700" text-anchor="middle">summary.yaml</text>
     </g>
@@ -1392,7 +1392,7 @@ derived from this URL (after canonicalization).</title>
 
 One directory per declared phase. Contains:
   winner.yaml             ← present only after a successful winner
-  promotion_decision.json ← present only when phase.promotion is set
+  promotion.yaml ← present only when phase.promotion is set
   trials.csv              ← Optuna trial state snapshot
   trial_NNNNN/            ← one directory per trial</title>
       <rect class="box box-copper" x="60" y="100" width="100" height="32" rx="3"/>
@@ -1419,8 +1419,8 @@ failed promotion (the file is unlinked in that case).</title>
       <text class="t-teal" x="280" y="118" font-size="11" text-anchor="middle">winner.yaml</text>
     </g>
 
-    <g data-tip="promotion_decision.json">
-      <title>promotion_decision.json
+    <g data-tip="promotion.yaml">
+      <title>promotion.yaml
 
 Written when phase.promotion is set, regardless of
 outcome. Persists the audit trail:
@@ -1433,7 +1433,7 @@ outcome. Persists the audit trail:
 
 Hoisted into summary.yaml's promotion_decisions list at end-of-run.</title>
       <rect class="box box-indigo" x="200" y="138" width="220" height="28" rx="3"/>
-      <text class="t-indigo" x="310" y="156" font-size="11" text-anchor="middle">promotion_decision.json</text>
+      <text class="t-indigo" x="310" y="156" font-size="11" text-anchor="middle">promotion.yaml</text>
     </g>
 
     <g data-tip="trials.csv">
@@ -1536,7 +1536,7 @@ json_scalar_bound), as well as constraint extractors.</title>
 
     <!-- locks -->
     <g data-tip="locks outside workdir">
-      <title>$TMPDIR/phasesweep-locks/ — same-host advisory only
+      <title>PHASESWEEP_LOCK_DIR or /var/tmp/phasesweep-locks/ — same-host advisory only
 
 Lives OUTSIDE workdir so that two configs which differ
 only in workdir but share storage still collide on the
@@ -1551,7 +1551,7 @@ Files:
 Acquired non-blocking. Failure raises RuntimeError with
 the lock path printed (helpful when debugging stuck runs).</title>
       <rect class="box box-olive edge-dashed" x="60" y="420" width="520" height="60" rx="3"/>
-      <text class="t-olive" x="80" y="442" font-size="11" font-weight="700">$TMPDIR/phasesweep-locks/  ← outside workdir</text>
+      <text class="t-olive" x="80" y="442" font-size="11" font-weight="700">host lock dir (default /var/tmp/phasesweep-locks)  ← outside workdir</text>
       <text class="t-dim" x="80" y="460" font-size="10">{exp}__output__*.lock · {exp}__storage__*.lock</text>
       <text class="t-dim" x="80" y="476" font-size="10">{suite}__suite__*.lock · gpu_{id}.lock</text>
     </g>

@@ -1,0 +1,54 @@
+# MCP-safe variant of the toy example. It uses absolute scratch paths because MCP servers must survive restarts and launches from arbitrary working directories.
+
+experiment: tiny_lm_16mb_mcp
+storage: sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db
+workdir: /tmp/phasesweep-mcp-tiny-lm/runs
+trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
+override_format: argparse
+
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json
+    path: result.json
+    key: eval_loss
+
+constraints:
+  - name: param_bytes
+    extractor:
+      type: json
+      path: result.json
+      key: param_bytes
+    max: 16777216
+
+phases:
+  - name: depth
+    comment: "Settle on a network depth before tuning anything else."
+    n_trials: 4
+    sampler:
+      type: grid
+    search_space:
+      n_layers: { type: categorical, choices: [4, 8, 12, 16] }
+
+  - name: lr
+    comment: "With depth locked, find the learning rate."
+    inherits: [depth]
+    n_trials: 12
+    sampler:
+      type: tpe
+      seed: 0
+      n_startup_trials: 4
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+
+  - name: regularization
+    comment: "Last, jointly tune weight_decay and dropout because they interact."
+    inherits: [lr]
+    n_trials: 16
+    sampler:
+      type: cmaes
+      seed: 1
+    search_space:
+      weight_decay: { type: float, low: 0.0, high: 0.3 }
+      dropout: { type: float, low: 0.0, high: 0.3 }

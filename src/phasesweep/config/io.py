@@ -84,6 +84,23 @@ _StrictMappingLoader.add_constructor(
 )
 
 
+def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any]:
+    """Load YAML text as a strict mapping.
+
+    :param str text: YAML text to parse.
+    :param str | Path source: Human-readable source label for errors.
+    :raises ValueError: If parsing fails or the top level is not a mapping.
+    :return dict[str, Any]: Parsed top-level YAML mapping.
+    """
+    try:
+        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
+    except yaml.constructor.ConstructorError as exc:
+        raise ValueError(f"{source}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: top level must be a mapping.")
+    return data
+
+
 def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
     """Load a YAML file as a strict mapping.
 
@@ -91,14 +108,29 @@ def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
     :raises ValueError: If parsing fails or the top level is not a mapping.
     :return dict[str, Any]: Parsed top-level YAML mapping.
     """
-    text = Path(path).read_text()
+    path_obj = Path(path)
+    return _load_yaml_mapping_from_text(path_obj.read_text(), path_obj)
+
+
+def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
+    """Parse and validate a config from an already-read byte snapshot.
+
+    Args:
+        data: UTF-8 YAML bytes.
+        source: Human-readable source label used in validation errors.
+
+    Returns:
+        :class:`Experiment` or :class:`Suite` parsed from exactly ``data``.
+
+    """
     try:
-        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
-    except yaml.constructor.ConstructorError as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: top level must be a mapping.")
-    return data
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{source}: config must be UTF-8 text: {exc}") from exc
+    parsed = _load_yaml_mapping_from_text(text, source)
+    if "suite" in parsed:
+        return Suite.model_validate(parsed)
+    return Experiment.model_validate(parsed)
 
 
 def load_config(path: str | Path) -> Config:

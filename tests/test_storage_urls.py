@@ -45,13 +45,19 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert result is None, case
 
 
-def test_validate_rejects_sqlite_with_parallel_n_jobs(tmp_path: Path) -> None:
-    """Old auto-remap is gone; SQLite + n_jobs>1 must fail loudly at config-load."""
-    p = write_yaml(
+def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path:
+    parallel = (
+        f"""
+            n_jobs: {n_jobs}
+            allow_no_gpu_isolation: true"""
+        if n_jobs > 1
+        else ""
+    )
+    return write_yaml(
         tmp_path,
         f"""
         experiment: t
-        storage: sqlite:///{tmp_path}/phases.db
+        storage: {storage}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
         metric:
@@ -60,63 +66,36 @@ def test_validate_rejects_sqlite_with_parallel_n_jobs(tmp_path: Path) -> None:
           extractor: {{ type: json, path: r.json, key: x }}
         phases:
           - name: p
-            n_trials: 1
-            n_jobs: 4
-            allow_no_gpu_isolation: true
+            n_trials: 1{parallel}
             search_space:
               x: {{ type: int, low: 0, high: 10 }}
         """,
     )
-    with pytest.raises(ValidationError, match="SQLite serializes writers"):
+
+
+@pytest.mark.parametrize(
+    ("storage_template", "n_jobs", "raises"),
+    [
+        ("sqlite:///{tmp}/phases.db", 4, True),
+        ("sqlite:///{tmp}/phases.db", 1, False),
+        ("journal:///{tmp}/phases.journal", 4, False),
+    ],
+    ids=["sqlite_parallel_rejected", "sqlite_single_ok", "journal_parallel_ok"],
+)
+def test_validate_storage_parallel_policy(
+    tmp_path: Path, storage_template: str, n_jobs: int, raises: bool
+) -> None:
+    """SQLite is sequential-only; explicit journal storage supports parallel sweeps."""
+    p = _storage_policy_config(
+        tmp_path,
+        storage=storage_template.format(tmp=tmp_path),
+        n_jobs=n_jobs,
+    )
+    if raises:
+        with pytest.raises(ValidationError, match="SQLite serializes writers"):
+            load_experiment(p)
+    else:
         load_experiment(p)
-
-
-def test_validate_accepts_sqlite_with_single_job(tmp_path: Path) -> None:
-    """Sequential SQLite is fine; only n_jobs > 1 is rejected."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        storage: sqlite:///{tmp_path}/phases.db
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
-        phases:
-          - name: p
-            n_trials: 1
-            search_space:
-              x: {{ type: int, low: 0, high: 10 }}
-        """,
-    )
-    load_experiment(p)  # must not raise
-
-
-def test_validate_accepts_journal_with_parallel(tmp_path: Path) -> None:
-    """Explicit journal:/// is the right scheme for parallel sweeps."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        storage: journal:///{tmp_path}/phases.journal
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
-        phases:
-          - name: p
-            n_trials: 1
-            n_jobs: 4
-            allow_no_gpu_isolation: true
-            search_space:
-              x: {{ type: int, low: 0, high: 10 }}
-        """,
-    )
-    load_experiment(p)
 
 
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
@@ -194,11 +173,14 @@ def test_file_url_path_preserves_absolute_paths() -> None:
     destroyed the leading ``/`` on absolute paths."""
     cases = [
         ("sqlite:///relative.db", "relative.db"),
+        ("sqlite:///relative.db?timeout=30", "relative.db"),
         ("sqlite:////tmp/absolute.db", "/tmp/absolute.db"),
+        ("sqlite:////tmp/absolute.db?timeout=30#frag", "/tmp/absolute.db"),
         ("sqlite+pysqlite:///relative.db", "relative.db"),
         ("sqlite+pysqlite:////tmp/x.db", "/tmp/x.db"),
         ("sqlite://", ""),
         ("sqlite:///:memory:", ":memory:"),
+        ("sqlite:///:memory:?cache=shared", ":memory:"),
         ("journal:///relative.journal", "relative.journal"),
         ("journal:////tmp/abs.journal", "/tmp/abs.journal"),
     ]
@@ -243,3 +225,18 @@ def test_plain_and_driver_sqlite_absolute_urls_collide(tmp_path: Path) -> None:
     assert identity is not None
     assert identity.startswith("sqlite:///")
     assert identity == canonical_storage_identity(driver)
+
+
+def test_sqlite_uri_file_storage_identity_resolves_actual_path(tmp_path: Path) -> None:
+    """SQLite URI filenames should lock the real DB, not a cwd-relative ``file:`` path."""
+    db = tmp_path / "uri.db"
+    uri_storage = f"sqlite:///file:{db}?mode=rwc&cache=shared&uri=true"
+    plain_storage = f"sqlite:///{db}"
+
+    assert canonical_storage_identity(uri_storage) == canonical_storage_identity(plain_storage)
+
+
+def test_sqlite_uri_memory_storage_identity_is_in_memory() -> None:
+    storage = "sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"
+
+    assert canonical_storage_identity(storage) == "sqlite:///:memory:"

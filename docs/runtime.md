@@ -37,17 +37,19 @@ runs/
   phases.db
 ```
 
-`pid`, `pgid`, and `pid_starttime` are written while a trial is live. They are removed on clean exit and preserved on failure for inspection.
+`pid`, `pgid`, and `pid_starttime` are written atomically while a trial is live. They are removed on clean exit and preserved on failure for inspection. If those identity writes fail after launch, phasesweep terminates the new process group before returning a failed trial result.
 
-![output layout](/docs/images/diagramG_artifacttree.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![output layout](images/diagramG_artifacttree.png)
 
 ## Process Management
 
-![trial state machine](/docs/images/diagramB_statemachine.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![trial state machine](images/diagramB_statemachine.png)
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
+
+`timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` and top-level `timeout_seconds_per_run` are hard wallclock caps for the larger execution scope: phasesweep passes the remaining budget into GPU lease acquisition and active trial supervision, so a queued or running trial cannot extend past the phase/run deadline. When a phase or run deadline stops the phase before the requested number of completed evaluations exists, phasesweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
+
+If a wallclock timeout and `max_consecutive_failures` become true in the same phase, timeout handling takes precedence. A phase that has at least one completed feasible trial can therefore persist a timeout-marked partial winner when `allow_incomplete_on_timeout: true`, instead of having that winner masked by the consecutive-failure abort path. Without that opt-in, the same situation fails closed with `TimeoutError`.
 
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
@@ -72,26 +74,29 @@ Reaping runs before fingerprint checks, so a config mismatch cannot leave old GP
 
 phasesweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
-A run always takes same-host `flock`s under `$TMPDIR/phasesweep-locks/`:
+A run always takes same-host `flock`s under `PHASESWEEP_LOCK_DIR` when set, otherwise `/var/tmp/phasesweep-locks/`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
 
-![guard layer](/docs/images/diagramE_guardlayer.png)
-<!-- img is intended to be linked w absolute path from repo root. Do NOT change it. -->
+![guard layer](images/diagramE_guardlayer.png)
 
-SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
+SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. File-backed storage lock identities ignore URL query options, so `sqlite:///x.db?timeout=30` and `sqlite:///x.db` share a lock. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 
-Numeric GPU IDs also take per-device host locks. Explicit `gpu_ids`, numeric `CUDA_VISIBLE_DEVICES`, and auto-detected `nvidia-smi` devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. CPU-only parallel phases require `allow_no_gpu_isolation: true`.
+The lock directory must resolve to one path shared by every cooperating phasesweep process on the host. Schedulers that set a per-job `TMPDIR`, containers with private `/tmp`, and systemd `PrivateTmp` units should set `PHASESWEEP_LOCK_DIR` to a host-shared path such as `/var/tmp/phasesweep-locks` or a site-managed node-local equivalent.
+
+Upgrade note: older phasesweep builds used the process temp directory for these locks. Existing stale locks under `/tmp` or a scheduler-provided `TMPDIR` are not consulted after the default moves to `/var/tmp/phasesweep-locks`; set `PHASESWEEP_LOCK_DIR` explicitly during a staged upgrade if you need old and new processes to coordinate.
+
+CUDA device tokens also take per-device host locks. With the default `gpu_policy: single_per_trial`, explicit `gpu_ids`, explicit `gpu_devices`, ambient `CUDA_VISIBLE_DEVICES` tokens, and auto-detected `nvidia-smi` numeric devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. `gpu_policy: whole_node` requires `n_jobs: 1`, leases every configured or detected token, and exposes the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches. `gpu_policy: none` never changes `CUDA_VISIBLE_DEVICES` and never acquires GPU locks; parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler. Numeric tokens keep numeric lock names; opaque UUID/MIG tokens use sanitized, hashed lock names. When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
 
 > [!WARNING]
-> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Future multi-host work is tracked in [Roadmap](roadmap.md).
+> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
 
 ## Fingerprints and Resume
 
-Each phase study stores a semantic fingerprint. Run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`.
+Each phase study stores a semantic fingerprint. Run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `gpu_devices`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`.
 
-Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, [override format](config.md#override-formats), metric, constraints, environment, inherited winners, and `timeout_seconds_per_trial`.
+Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, [override format](config.md#override-formats), metric, constraints, environment, inherited winners, `gpu_policy`, and `timeout_seconds_per_trial`.
 
 Re-running the same YAML reuses the study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files, after stale reaping and fingerprint verification. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 

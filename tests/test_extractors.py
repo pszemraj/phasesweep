@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 
 import pytest
@@ -174,3 +175,30 @@ def test_wandb_extractor_timeout(fake_wandb, tmp_path):
     with pytest.raises(ExtractorError, match="not found or metric"):
         ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
         run_extractor(ctx, cfg)
+
+
+def test_wandb_extractor_stuck_api_call_does_not_spawn_repeated_threads(fake_wandb, tmp_path):
+    calls = 0
+
+    def stuck_runs(path: str, name: str) -> list[_FakeRun]:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.2)
+        return []
+
+    fake_wandb(stuck_runs)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        run_name_template="{experiment}-{phase}-{trial_id}",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=0.05,
+    )
+
+    with pytest.raises(ExtractorError, match="not found or metric"):
+        ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
+        run_extractor(ctx, cfg)
+
+    assert calls == 1

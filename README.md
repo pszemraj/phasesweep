@@ -14,7 +14,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 - A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](docs/config.md#override-formats)**[^2]
 - GPU optional: CUDA devices are auto-detected for same-host lease management
 
-[^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`. If you're mad about this, you should be using [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) anyway
+[^1]: Windows is unsupported; process cleanup and host locks rely on POSIX process groups and `flock`. Use WSL for Windows-hosted development.
 [^2]: phasesweep orchestrates sweeps but never trains anything itself; your trainer must handle both of these.
 
 ## Install
@@ -22,11 +22,13 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 phasesweep is currently installed from Git:
 
 ```bash
-pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
 # weights-and-biases integration is optional:
-pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+# MCP server, to drive sweeps from an AI agent:
+python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 # all dev dependencies:
-pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 For local development from a checkout:
@@ -35,7 +37,7 @@ For local development from a checkout:
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
 # activate venv of your choice, then:
-pip install -e ".[dev,wandb]"
+python -m pip install -e ".[dev,wandb]"
 ```
 
 ## Quickstart
@@ -50,54 +52,27 @@ phasesweep show-winners examples/experiment.yaml
 phasesweep status examples/experiment.yaml
 ```
 
-The example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`.
+The bundled example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`. For a real-trainer integration, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8/README.md).
 
-## Config Sketch
+## Config
 
-Adapt this shape to your own trainer.
+Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the configured metric artifact, and exit nonzero on failed trials.
 
-> [!IMPORTANT]
-> The script in `trial_command` must parse the override format you choose. The default is `argparse`, where `{overrides}` renders flags such as `--n_layers 8 --lr 0.0003`; see [supported override formats](docs/config.md#override-formats).
+Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly. Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
 
-```yaml
-experiment: tiny_lm_16mb
-storage: sqlite:///./runs/phases.db
-workdir: ./runs
-trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
+## MCP server (agent integration)
 
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: { type: json, path: result.json, key: eval_loss }
-
-phases:
-  - name: depth
-    n_trials: 4
-    sampler: { type: grid }
-    search_space:
-      n_layers: { type: categorical, choices: [4, 8, 12, 16] }
-
-  - name: lr
-    inherits: [depth]
-    n_trials: 12
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-```
-
-## Runtime Boundaries
-
-- Bring your own trainer; see the [trainer contract](docs/config.md#trainer-contract).
-- Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly.
-- Use one orchestrator per experiment on one host. Same-host conflicts are rejected with advisory locks.
-- SQLite is for sequential `n_jobs == 1` studies. See [runtime behavior](docs/runtime.md#concurrency-model) for parallel storage and locking details.
+`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). The supported MCP mode is local-node control over stdio; remote control planes, hosted multi-user deployments, and multi-host shared studies are out of scope for this version. Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Use [MCP agent setup](docs/mcp_setup.md) for client config and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
 
 ## Docs
 
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
+- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the six tools, security model, single-host operation.
+- [MCP agent setup](docs/mcp_setup.md): copy/paste MCP client config, install commands, and agent instructions.
+- [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.
-- [Roadmap](docs/roadmap.md): future work outside the current single-host design.
 
 ## License
 

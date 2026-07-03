@@ -18,9 +18,12 @@ from phasesweep.engine.guards import _reap_stale_trials
 from phasesweep.engine.state import TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
     _defer_shutdown_signals,
     _shutdown_handler,
     _terminate_process_group,
+    _tracked_process_group_alive,
+    reap_child,
     run_supervised,
 )
 from tests.conftest import make_experiment
@@ -40,6 +43,16 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
         "phasesweep.runtime.process._terminate_process_group",
         terminate_then_report_uncertain,
     )
+
+
+def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    installed = {"called": False}
+
+    def fake_install() -> None:
+        installed["called"] = True
+
+    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    return installed
 
 
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
@@ -83,6 +96,67 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
     assert result.return_code == 0
     for name in ("pid", "pgid", "pid_starttime"):
         assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
+
+
+def test_run_supervised_terminates_child_when_identity_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata write failure after Popen must not leave the child running."""
+    import phasesweep.runtime.process as process
+
+    real_atomic_write_text = process.atomic_write_text
+
+    def fail_pid_write(path: Path, text: str) -> None:
+        if path.name == "pid":
+            raise OSError("identity disk full")
+        real_atomic_write_text(path, text)
+
+    monkeypatch.setattr("phasesweep.runtime.process.atomic_write_text", fail_pid_write)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            f"{sys.executable} -c 'import time; time.sleep(60)'",
+            env=os.environ.copy(),
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+        )
+
+    assert result.cleanup_confirmed is True
+    assert "failed to persist process identity" in (result.failure_reason or "")
+    with pytest.raises(ProcessLookupError):
+        os.kill(result.pid, 0)
+
+
+def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_waitpid(pid: int, flags: int) -> tuple[int, int]:
+        calls.append((pid, flags))
+        return (0, 0)
+
+    def fail_if_proc_polled(pid: int) -> bool:
+        raise AssertionError(f"reap_child should not poll /proc for pid {pid}")
+
+    monkeypatch.setattr("phasesweep.runtime.process.os.waitpid", fake_waitpid)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_zombie", fail_if_proc_polled)
+
+    assert reap_child(12345) is False
+
+    assert calls == [(12345, os.WNOHANG)]
+
+
+def test_reap_child_reports_when_it_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "phasesweep.runtime.process.os.waitpid",
+        lambda pid, flags: (pid, 0),
+    )
+
+    assert reap_child(12345) is True
 
 
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
@@ -208,33 +282,87 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
 def test_shutdown_handler_uses_initial_pgid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SIGKILL phase must still target groups seen during SIGTERM phase.
+    """Shutdown cleanup must target groups seen in the initial snapshot.
 
-    A worker thread can unregister a PGID after the root exits on SIGTERM but
-    before the handler escalates to SIGKILL. Using the initial snapshot
-    prevents that race.
+    A worker thread can unregister a PGID while cleanup is underway. Using the
+    initial snapshot prevents that race from hiding a group from the shutdown
+    report.
     """
-    killed: list[tuple[int, int]] = []
+    terminated: list[int] = []
     active: dict[int, object] = {1234: object()}
 
     monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
 
-    def fake_killpg(pgid: int, sig: int) -> None:
-        killed.append((pgid, sig))
-        # Simulate worker thread unregistering after SIGTERM.
-        if sig == signal.SIGTERM:
-            active.clear()
+    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
+        terminated.append(pgid)
+        active.clear()
+        return True
 
-    monkeypatch.setattr("os.killpg", fake_killpg)
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
 
-    assert (1234, signal.SIGTERM) in killed
-    assert (1234, signal.SIGKILL) in killed, (
-        "SIGKILL must target the initial snapshot even though the registry was cleared"
+    assert terminated == [1234]
+    assert excinfo.value.report.cleanup_confirmed is True
+    assert excinfo.value.report.child_pgids == (1234,)
+
+
+def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("phasesweep.runtime.process._active_children", {1234: object()})
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: False,
     )
+
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
+        _shutdown_handler(signal.SIGTERM, None)
+
+    assert int(excinfo.value.code) == 143
+    assert excinfo.value.report.cleanup_confirmed is False
+    assert excinfo.value.report.child_pgids == (1234,)
+
+
+def test_tracked_process_group_alive_uses_cached_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._group_member_pids",
+        lambda pgid: (_ for _ in ()).throw(AssertionError("must not rescan /proc")),
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: True)
+
+    assert _tracked_process_group_alive(1234, {11}) is True
+
+
+def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member_sets: list[set[int]] = []
+    scans: list[int] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+
+    def fake_group_member_pids(pgid: int) -> list[int]:
+        scans.append(pgid)
+        return [22]
+
+    def fake_member_pids_alive(pgid: int, pids: set[int] | list[int]) -> bool:
+        member_sets.append(set(pids))
+        return 22 in pids
+
+    monkeypatch.setattr("phasesweep.runtime.process._group_member_pids", fake_group_member_pids)
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", fake_member_pids_alive)
+
+    member_pids = {11}
+
+    assert _tracked_process_group_alive(1234, member_pids) is True
+    assert member_pids == {22}
+    assert scans == [1234]
+    assert member_sets == [{11}, {22}]
 
 
 def test_terminate_process_group_reports_cleanup_status(
@@ -247,7 +375,10 @@ def test_terminate_process_group_reports_cleanup_status(
             calls.append((pgid, sig))
 
         mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
-        mp.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
+        mp.setattr(
+            "phasesweep.runtime.process._tracked_process_group_alive",
+            lambda pgid, member_pids: True,
+        )
 
     def already_gone(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
         def raise_lookup(pgid: int, sig: int) -> None:
@@ -318,12 +449,7 @@ def test_public_run_experiment_installs_signal_handlers(
 ) -> None:
     """Library callers using ``run_experiment`` directly get the same cleanup
     contract as CLI callers."""
-    installed = {"called": False}
-
-    def fake_install() -> None:
-        installed["called"] = True
-
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    installed = _install_signal_probe(monkeypatch)
 
     # Minimal trial_command that writes the metric file the JsonExtractor expects.
     # Avoid {} literals in the script so the override-template parser doesn't
@@ -345,12 +471,7 @@ def test_dry_run_does_not_install_signal_handlers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dry-run launches no children, so it must not perturb the signal mask."""
-    installed = {"called": False}
-
-    def fake_install() -> None:
-        installed["called"] = True
-
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    installed = _install_signal_probe(monkeypatch)
 
     exp = make_experiment(workdir=tmp_path / "runs")
     run_experiment(exp, dry_run=True)

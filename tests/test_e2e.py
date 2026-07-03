@@ -15,6 +15,7 @@ from pathlib import Path
 import yaml
 
 from phasesweep import load_experiment, run_experiment
+from tests.conftest import copy_fake_train
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"
@@ -22,15 +23,13 @@ EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"
 
 def _prep(tmp_path: Path) -> Path:
     """Copy example yaml into tmp, rewrite paths to be tmp-local, return new yaml path."""
-    examples_dst = tmp_path / "examples"
-    examples_dst.mkdir(parents=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", examples_dst / "fake_train.py")
+    trainer = copy_fake_train(tmp_path)
 
     text = EXAMPLE_YAML.read_text()
     runs_dir = tmp_path / "runs"
     text = text.replace("./runs/phases.db", str(runs_dir / "phases.db"))
     text = text.replace("./runs", str(runs_dir))
-    text = text.replace("examples/fake_train.py", str((examples_dst / "fake_train.py").resolve()))
+    text = text.replace("examples/fake_train.py", str(trainer.resolve()))
     yaml_path = tmp_path / "experiment.yaml"
     yaml_path.write_text(text)
     return yaml_path

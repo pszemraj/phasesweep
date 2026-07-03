@@ -1,16 +1,17 @@
 """Shared test fixtures and helpers for phasesweep tests.
 
 One experiment factory to replace the 5+ near-identical _minimal_experiment /
-_exp / _make_exp helpers scattered across test files. Tests that need
-specialized construction (e.g. template validation, selector constraints) keep
-their local helpers — this covers the >80% common case.
+_exp / _make_exp helpers scattered across test files. Tests that need specialized construction can pass explicit phases or phase keyword overrides.
 """
 
 from __future__ import annotations
 
+import shutil
 import textwrap
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from phasesweep.config import (
     Constraint,
@@ -25,6 +26,19 @@ from phasesweep.evidence import TrialContext
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-wide test locks inside each test's temp directory."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "phasesweep-locks"))
+
+
+def copy_fake_train(tmp_path: Path) -> Path:
+    trainer = tmp_path / "examples" / "fake_train.py"
+    trainer.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "examples" / "fake_train.py", trainer)
+    return trainer
 
 
 def make_experiment(

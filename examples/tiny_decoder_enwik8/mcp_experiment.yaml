@@ -1,0 +1,46 @@
+# MCP-safe variant of the tiny Enwik8 decoder smoke sweep.
+#
+# MCP requires absolute workdir and storage paths so detached runs survive restarts and arbitrary client working directories. The catalog pins cwd to the repository root because the trainer command below is intentionally repo-relative.
+
+experiment: tiny_decoder_enwik8_hparam_smoke_mcp
+storage: sqlite:////tmp/phasesweep-mcp-tiny-decoder-enwik8/phases.db
+workdir: /tmp/phasesweep-mcp-tiny-decoder-enwik8/runs
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+override_format: json_file
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+
+metric:
+  name: val_loss
+  goal: minimize
+  extractor:
+    type: json
+    path: result.json
+    key: val_loss
+
+phases:
+  - name: optimizer_scale
+    comment: "First choose learning rate, the dominant optimizer-scale decision, while keeping the decoder architecture fixed."
+    n_trials: 3
+    sampler:
+      type: grid
+    search_space:
+      learning_rate: { type: categorical, choices: [0.0003, 0.001, 0.003] }
+
+  - name: weight_decay
+    comment: "With optimizer scale locked, tune Adam weight decay as the regularization pass."
+    inherits: [optimizer_scale]
+    n_trials: 3
+    sampler:
+      type: grid
+    search_space:
+      weight_decay: { type: categorical, choices: [0.0, 0.0001, 0.001] }
+
+  - name: clip_norm
+    comment: "With scale and regularization locked, tune gradient clipping as the final stability/control pass."
+    inherits: [weight_decay]
+    n_trials: 3
+    sampler:
+      type: grid
+    search_space:
+      grad_clip_norm: { type: categorical, choices: [0.5, 1.0, 2.0] }

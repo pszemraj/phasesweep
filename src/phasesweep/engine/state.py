@@ -15,6 +15,7 @@ import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.runtime.files import atomic_text_writer
 
 
 @dataclass
@@ -50,6 +51,7 @@ RETURN_CODE_ATTR = "phasesweep_return_code"
 DURATION_ATTR = "phasesweep_duration_s"
 OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
+CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
 CONSTRAINT_PREFIX = "constraint:"
 
@@ -159,6 +161,16 @@ def _suite_log_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "run.log"
 
 
+def _write_yaml_atomic(path: Path, payload: Any) -> None:
+    """Atomically write a YAML document to ``path``.
+
+    :param Path path: Destination YAML path to replace.
+    :param Any payload: YAML-serializable value to write.
+    """
+    with atomic_text_writer(path) as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
     """Attach a durable file handler for phasesweep logs.
@@ -221,7 +233,7 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         *[f"user_attr:{n}" for n in attr_names],
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
+    with atomic_text_writer(path, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for t in trials:
@@ -308,7 +320,7 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
-    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+    _write_yaml_atomic(path, payload)
 
 
 def _save_promotion_decision(
@@ -323,8 +335,7 @@ def _save_promotion_decision(
     :param dict[str, Any] decision: Promotion decision payload to persist.
     """
     path = _promotion_decision_path(experiment, phase_name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(decision, sort_keys=False))
+    _write_yaml_atomic(path, decision)
 
 
 def _load_winner(
@@ -363,7 +374,17 @@ def _load_winner(
     if not path.is_file():
         raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
 
-    data = yaml.safe_load(path.read_text())
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: top level must be a mapping."
+        )
 
     from phasesweep.engine.guards import _phase_fingerprint
 
@@ -387,7 +408,12 @@ def _load_winner(
             f"experiment name, or restore the matching config before resuming."
         )
 
-    completion = data["completion"]
+    completion = data.get("completion")
+    if not isinstance(completion, dict):
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase "
+            f"{phase.name!r}: missing mapping field 'completion'."
+        )
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
         raise RuntimeError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
@@ -395,14 +421,19 @@ def _load_winner(
             "sets allow_incomplete_on_timeout: true."
         )
 
-    return Winner(
-        trial_number=int(data["trial_number"]),
-        params=dict(data["params"]),
-        effective_overrides=dict(data["effective_overrides"]),
-        metric=float(data["metric"][experiment.metric.name]),
-        constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
-        gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
-        completion=dict(completion),
-        promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
-        phase_fingerprint=str(stored_fp),
-    )
+    try:
+        return Winner(
+            trial_number=int(data["trial_number"]),
+            params=dict(data["params"]),
+            effective_overrides=dict(data["effective_overrides"]),
+            metric=float(data["metric"][experiment.metric.name]),
+            constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
+            gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
+            completion=dict(completion),
+            promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
+            phase_fingerprint=str(stored_fp),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
+        ) from exc
