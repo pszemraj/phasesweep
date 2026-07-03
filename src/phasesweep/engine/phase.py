@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import optuna
@@ -46,6 +47,33 @@ from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
 
 log = logging.getLogger("phasesweep.engine.phase")
+
+
+@dataclass
+class CsvSnapshotThrottle:
+    """Debounce expensive full ``trials.csv`` snapshots during a phase."""
+
+    min_trials: int = 10
+    min_seconds: float = 30.0
+    last_finished: int = 0
+    last_write_at: float = 0.0
+
+    def should_write(self, finished: int, now: float) -> bool:
+        """Return whether another full CSV snapshot should be written."""
+        return (
+            finished - self.last_finished >= self.min_trials
+            or now - self.last_write_at >= self.min_seconds
+        )
+
+    def mark_written(self, finished: int, now: float) -> None:
+        """Record a successful snapshot write."""
+        self.last_finished = finished
+        self.last_write_at = now
+
+
+def _finished_trial_count(study: optuna.Study) -> int:
+    """Return the number of terminal trials in ``study``."""
+    return sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
 
 
 def _composed_overrides(
@@ -174,6 +202,7 @@ def _run_phase(
     _hard_abort_lock = threading.Lock()
     hard_abort: dict[str, str | None] = {"message": None}
     deadline_exhausted = {"flag": False}
+    csv_throttle = CsvSnapshotThrottle()
 
     def _record_hard_abort(message: str) -> None:
         """Record a safety-critical phase abort.
@@ -387,8 +416,12 @@ def _run_phase(
                 )
             abort["flag"] = True
             study.stop()
-        with contextlib.suppress(Exception):
-            _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+        finished = _finished_trial_count(study)
+        now = time.monotonic()
+        if csv_throttle.should_write(finished, now):
+            with contextlib.suppress(Exception):
+                _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+                csv_throttle.mark_written(finished, now)
 
     timeout_source: str | None = None
     optimize_deadline: float | None = None

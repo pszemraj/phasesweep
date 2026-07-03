@@ -11,9 +11,22 @@ import pytest
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
+from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import _load_winner
 from tests.conftest import copy_fake_train, write_trainer, write_yaml
+
+
+def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
+    throttle = CsvSnapshotThrottle(min_trials=10, min_seconds=30.0)
+
+    assert throttle.should_write(finished=1, now=100.0)
+    throttle.mark_written(finished=1, now=100.0)
+    assert not throttle.should_write(finished=9, now=120.0)
+    assert throttle.should_write(finished=11, now=120.0)
+    throttle.mark_written(finished=11, now=120.0)
+    assert not throttle.should_write(finished=12, now=149.9)
+    assert throttle.should_write(finished=12, now=150.0)
 
 
 def _sleeping_score_experiment(
