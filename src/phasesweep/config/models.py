@@ -419,6 +419,11 @@ class Experiment(_Frozen):
                         f"Phase {phase.name!r} inherits from {parent!r}, "
                         f"which is not a prior phase."
                     )
+            if phase.promotion is not None and phase.promotion.min_delta_vs not in seen:
+                raise ValueError(
+                    f"Phase {phase.name!r} promotion references "
+                    f"{phase.promotion.min_delta_vs!r}, which is not a prior phase."
+                )
 
             # Local same-phase collision (blocker 5): sampling a key that the
             # same phase also lists as fixed silently lets sampled win — that's
@@ -801,6 +806,7 @@ class Suite(_Frozen):
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
+        phases_by_study: dict[str, set[str]] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
@@ -810,13 +816,20 @@ class Suite(_Frozen):
                         f"Study {study.name!r} depends_on {dep!r}, which is not a prior study."
                     )
             if study.promotion is not None:
-                baseline_study = study.promotion.min_delta_vs.split(".", 1)[0]
+                selector = study.promotion.min_delta_vs
+                baseline_study, _, baseline_phase = selector.partition(".")
                 if baseline_study not in seen:
                     raise ValueError(
                         f"Study {study.name!r} promotion references {baseline_study!r}, "
                         "which is not a prior study."
                     )
+                if baseline_phase and baseline_phase not in phases_by_study[baseline_study]:
+                    raise ValueError(
+                        f"Study {study.name!r} promotion references missing baseline phase "
+                        f"{selector!r}."
+                    )
             seen.add(study.name)
+            phases_by_study[study.name] = {phase.name for phase in study.phases}
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:

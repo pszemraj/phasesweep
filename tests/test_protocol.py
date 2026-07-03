@@ -170,6 +170,36 @@ def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     assert winners["candidate"].gates[0]["passed"] is False
 
 
+def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: bad_promo
+        storage: journal:///{tmp_path}/study.journal
+        workdir: {tmp_path}/runs
+        trial_command: "python train.py {{overrides}}"
+        metric:
+          name: objective
+          goal: minimize
+          extractor: {{ type: json, path: metrics.json, key: objective }}
+        phases:
+          - name: baseline
+            n_trials: 1
+            fixed_overrides:
+              model.depth: 2
+          - name: candidate
+            n_trials: 1
+            fixed_overrides:
+              model.width: 128
+            promotion:
+              min_delta_vs: typo
+        """,
+    )
+
+    with pytest.raises(ValueError, match="promotion references 'typo'.*prior phase"):
+        load_config(p)
+
+
 def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     """Suite-level promotion compares final study winners across studies."""
     trainer = _write_score_trainer(tmp_path)
@@ -209,6 +239,36 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     winners = run_config(config)
 
     assert winners["candidate"]["eval"].metric == winners["baseline"]["eval"].metric
+
+
+def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:
+    p = write_yaml(
+        tmp_path,
+        f"""
+        suite: bad_suite_promo
+        defaults:
+          workdir: {tmp_path}/runs
+          trial_command: "echo {{overrides}}"
+          metric:
+            name: x
+            goal: minimize
+            extractor: {{ type: json, path: r.json, key: x }}
+        studies:
+          - name: baseline
+            phases:
+              - name: eval
+                n_trials: 1
+          - name: candidate
+            promotion:
+              min_delta_vs: baseline.typo
+            phases:
+              - name: eval
+                n_trials: 1
+        """,
+    )
+
+    with pytest.raises(ValueError, match="promotion references missing baseline phase"):
+        load_config(p)
 
 
 def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
