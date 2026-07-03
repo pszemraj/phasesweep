@@ -13,7 +13,11 @@ import click
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
-from phasesweep.engine.guards import _reap_stale_trials, _recover_cleanup_uncertain_trials
+from phasesweep.engine.guards import (
+    _confirm_stale_running_trials,
+    _reap_stale_trials,
+    _recover_cleanup_uncertain_trials,
+)
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunStore
@@ -207,7 +211,7 @@ def status(config_path: Path) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Operator-only recovery for an MCP run with cleanup uncertainty. "
-        "Checks the runner identity and reaps stale trials before clearing uncertainty."
+        "Checks runner and trial cleanup; --confirm reaps stale trials before clearing uncertainty."
     ),
     short_help="Recover MCP cleanup uncertainty.",
 )
@@ -271,7 +275,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             if study is None:
                 continue
             inspected_studies += 1
-            reaped += _reap_stale_trials(study, config, phase.name)
+            if confirm:
+                reaped += _reap_stale_trials(study, config, phase.name)
+            else:
+                reaped += _confirm_stale_running_trials(study, config, phase.name)
             cleanup_recovered += _recover_cleanup_uncertain_trials(study, config, phase.name)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from None
@@ -291,7 +298,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
     if not confirm:
         click.echo(
-            f"Cleanup appears confirmed for {run_id}; reaped {reaped} stale trial(s) "
+            f"Cleanup appears confirmed for {run_id}; would reap {reaped} stale trial(s) "
             f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s). "
             "Re-run with --confirm to clear cleanup uncertainty."
         )

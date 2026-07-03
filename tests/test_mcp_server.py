@@ -1181,7 +1181,24 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
 
-    result = CliRunner().invoke(
+    runner = CliRunner()
+    dry = runner.invoke(
+        cli_main,
+        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+
+    assert dry.exit_code == 0, dry.output
+    assert "would reap 1 stale trial" in dry.output
+    assert not store.cleanup_recovery_path(run_id).exists()
+    assert store.state(handle) == "running"
+
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
+    study = optuna.load_study(study_name="srv::p", storage=exp.storage)
+    trial = study.get_trials(deepcopy=False)[trial_number]
+    assert trial.state == optuna.trial.TrialState.RUNNING
+
+    result = runner.invoke(
         cli_main,
         [
             "mcp-recover-run",
@@ -1202,11 +1219,9 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     assert recovery["reaped_running_trials"] == 1
     assert recovery["cleanup_uncertain_terminal_trials"] == 0
     assert store.state(handle) == "failed"
-    assert runner_cleanup_calls == [(999999, 111, 999999)]
-    assert trial_cleanup_calls == [(4343, 222, 4343)]
+    assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
+    assert trial_cleanup_calls == [(4343, 222, 4343), (4343, 222, 4343)]
 
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
     study = optuna.load_study(study_name="srv::p", storage=exp.storage)
     trial = study.get_trials(deepcopy=False)[trial_number]
     assert trial.state == optuna.trial.TrialState.FAIL

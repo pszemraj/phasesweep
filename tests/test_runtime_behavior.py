@@ -486,7 +486,11 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     assert completion["timeout_scope"] == "phase"
 
 
-def test_timeout_after_all_terminal_trials_is_complete_enough(tmp_path: Path) -> None:
+@pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
+def test_timeout_after_all_terminal_trials_is_complete_enough(
+    tmp_path: Path,
+    allow_incomplete_on_timeout: bool,
+) -> None:
     """A timeout guard should not reject a phase once every requested trial is terminal."""
     trainer = write_trainer(
         tmp_path,
@@ -512,6 +516,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(tmp_path: Path) ->
                 name="p",
                 n_trials=2,
                 timeout_seconds_per_phase=0.8,
+                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
                 search_space={},
             )
         ],
@@ -524,6 +529,16 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(tmp_path: Path) ->
     assert completion["completed_trials"] == 1
     assert completion["finished_trials"] == 2
     assert completion["incomplete"] is False
+
+    current = exp.model_copy(
+        update={
+            "phases": [
+                exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False}),
+            ],
+        }
+    )
+    loaded = _load_winner(current, current.phases[0], {})
+    assert loaded.completion["incomplete"] is False
 
 
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:

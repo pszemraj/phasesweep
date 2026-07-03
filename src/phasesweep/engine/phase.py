@@ -482,7 +482,7 @@ def _run_phase(
     )
     timed_out_incomplete = timeout_observed and finished_after < phase.n_trials
     accepted_partial_timeout = (
-        phase.allow_incomplete_on_timeout and timeout_observed and completed_after < phase.n_trials
+        phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
         raise TimeoutError(

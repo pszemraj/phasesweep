@@ -400,6 +400,77 @@ def _trial_dir_for_reaping(
     return Path(stored)
 
 
+def _confirm_or_reap_stale_trials(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    reap: bool,
+) -> int:
+    """Confirm cleanup for RUNNING trials and optionally mark them failed."""
+    count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+
+        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+
+        identity = read_stale_process_identity(trial_dir)
+        if identity.pid is not None or identity.pgid is not None:
+            safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
+            if not safe_to_fail:
+                action = "mark RUNNING trial" if reap else "confirm cleanup for RUNNING trial"
+                raise ProcessCleanupUncertainError(
+                    f"Refusing to {action} {trial.number}: stale process cleanup "
+                    f"could not prove the process group is gone. trial_dir={trial_dir} "
+                    f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
+                    "process may still be holding GPU memory. Investigate "
+                    f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
+                    f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
+                    "phasesweep."
+                )
+            log.warning(
+                "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
+                trial.number,
+                identity.pid,
+                identity.pgid,
+            )
+
+        if reap:
+            try:
+                study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Stale process cleanup completed for RUNNING trial {trial.number}, "
+                    f"but Optuna state could not be updated to FAIL. Refusing to continue "
+                    f"with an inconsistent study. trial_dir={trial_dir}"
+                ) from exc
+
+            log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
+        else:
+            log.warning(
+                "Confirmed cleanup for stale RUNNING trial %d in study %s",
+                trial.number,
+                study.study_name,
+            )
+        count += 1
+    return count
+
+
+def _confirm_stale_running_trials(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase_name: str,
+) -> int:
+    """Confirm cleanup evidence for RUNNING trials without changing Optuna state.
+
+    Used by ``mcp-recover-run`` preflight mode. The follow-up ``--confirm`` call
+    must still find the same RUNNING trials so it can reap them and persist
+    recovery evidence atomically with clearing MCP cleanup uncertainty.
+    """
+    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=False)
+
+
 def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: str) -> int:
     """Mark RUNNING trials as FAIL on startup, killing orphaned process groups.
 
@@ -434,45 +505,7 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
         RuntimeError: ``study.tell`` could not persist the FAIL state after cleanup was confirmed.
 
     """
-    reaped = 0
-    for trial in study.get_trials(deepcopy=False):
-        if trial.state != optuna.trial.TrialState.RUNNING:
-            continue
-
-        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
-
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is not None or identity.pgid is not None:
-            safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
-            if not safe_to_fail:
-                raise ProcessCleanupUncertainError(
-                    f"Refusing to mark RUNNING trial {trial.number} as FAIL: "
-                    f"stale process cleanup could not prove the process group "
-                    f"is gone. trial_dir={trial_dir} pid={identity.pid} "
-                    f"pgid={identity.pgid}. A leaked training process may still "
-                    "be holding GPU memory. Investigate (e.g. `ps -o pid,pgid,cmd "
-                    f"-p {identity.pid}` and `kill -9 -- -{identity.pgid}` if "
-                    "appropriate), then re-run phasesweep."
-                )
-            log.warning(
-                "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
-                trial.number,
-                identity.pid,
-                identity.pgid,
-            )
-
-        try:
-            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Stale process cleanup completed for RUNNING trial {trial.number}, "
-                f"but Optuna state could not be updated to FAIL. Refusing to continue "
-                f"with an inconsistent study. trial_dir={trial_dir}"
-            ) from exc
-
-        reaped += 1
-        log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
-    return reaped
+    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=True)
 
 
 def _trial_dir_for_cleanup_recovery(
