@@ -35,7 +35,7 @@ Each phase is one Optuna study in an ordered chain. A phase may inherit winners 
 - `fixed_overrides`: hard-coded overrides for every trial in the phase.
 - `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.
 - `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
-- `n_trials`: trial budget. Increasing it later is a compatible top-up.
+- `n_trials`: terminal trial-attempt budget; Optuna `COMPLETE`, `FAIL`, and `PRUNED` trials all consume it. Increasing it later is a compatible top-up.
 - `n_jobs`: parallel trials inside the phase.
 - `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
 - `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.

@@ -111,8 +111,7 @@ Experiment:
       # should be explicit.
 
       n_trials: "int >= 1 (required)"
-      # Trial budget for this phase. Re-running a compatible config can top up
-      # the study when n_trials increases.
+      # Terminal trial-attempt budget for this phase; COMPLETE, FAIL, and PRUNED trials all consume it. Re-running a compatible config can top up the study when n_trials increases.
 
       n_jobs: "int >= 1 = 1"
       # Parallel trials within one phase. Parallelism is inside one local
