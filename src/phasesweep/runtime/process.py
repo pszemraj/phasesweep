@@ -595,21 +595,30 @@ def is_pid_zombie(pid: int) -> bool:
     return stat is not None and stat.state == "Z"
 
 
-def reap_child(pid: int) -> None:
-    """Best-effort non-blocking reap of an exited child to prevent zombie buildup.
+def reap_child(pid: int) -> bool:
+    """Best-effort non-blocking reap of one exited child.
 
     A long-lived parent (the MCP server) that spawns detached runners and never
     waits on them accumulates a zombie per runner as each one exits. Call this
     for a known runner pid to reap it if it has already exited; it is a no-op if
     the process is still running, was never our child, or has already been reaped.
-    This runs on status-read paths, so it must stay strictly non-blocking.
+    This runs on status-read paths, so it must stay strictly non-blocking. A
+    single ``waitpid(WNOHANG)`` reduces zombie buildup; it does not guarantee
+    that a child exiting immediately after this call is reaped before the next
+    status scan.
 
     Args:
         pid: PID of a runner this process spawned.
 
+    Returns:
+        ``True`` when this call reaped ``pid``; ``False`` otherwise.
+
     """
-    with contextlib.suppress(OSError):
-        os.waitpid(pid, os.WNOHANG)
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        return False
+    return waited == pid
 
 
 @dataclass

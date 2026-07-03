@@ -145,9 +145,18 @@ def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr("phasesweep.runtime.process.os.waitpid", fake_waitpid)
     monkeypatch.setattr("phasesweep.runtime.process.is_pid_zombie", fail_if_proc_polled)
 
-    reap_child(12345)
+    assert reap_child(12345) is False
 
     assert calls == [(12345, os.WNOHANG)]
+
+
+def test_reap_child_reports_when_it_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "phasesweep.runtime.process.os.waitpid",
+        lambda pid, flags: (pid, 0),
+    )
+
+    assert reap_child(12345) is True
 
 
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
