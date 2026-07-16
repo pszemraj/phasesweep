@@ -71,9 +71,9 @@ def _last_metric(metrics_path: Path) -> dict[str, Any]:
 
 
 def _write_result(
-    trial_dir: Path, config: Mapping[str, Any], metric_record: Mapping[str, Any]
+    trial_dir: Path, overrides: Mapping[str, Any], metric_record: Mapping[str, Any]
 ) -> None:
-    """Write PhaseSweep's scalar result artifact."""
+    """Write PhaseSweep's scalar result artifact plus the trial's overrides."""
     val_loss = metric_record.get("val_loss")
     if not isinstance(val_loss, int | float):
         raise ValueError(f"Last metric record is missing numeric val_loss: {metric_record!r}")
@@ -81,11 +81,7 @@ def _write_result(
     result = {
         "val_loss": float(val_loss),
         "step": metric_record.get("step"),
-        "depth": config.get("depth"),
-        "dim": config.get("dim"),
-        "grad_clip_norm": config.get("grad_clip_norm"),
-        "learning_rate": config.get("learning_rate"),
-        "weight_decay": config.get("weight_decay"),
+        "overrides": dict(overrides),
     }
     (trial_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
@@ -143,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _run_template(template_root, generated_config)
     metric_record = _last_metric(trainer_run_dir / "metrics.jsonl")
-    _write_result(trial_dir, composed, metric_record)
+    _write_result(trial_dir, overrides, metric_record)
     return 0
 
 
