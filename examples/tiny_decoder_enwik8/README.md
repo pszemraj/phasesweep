@@ -33,7 +33,7 @@ conda run -n tr --live-stream phasesweep run examples/tiny_decoder_enwik8/experi
 conda run -n tr --live-stream phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-The real run launches 9 trials (3 phases x 3 trials, 1000 batches each) and finishes in a few minutes on a modern CUDA GPU — roughly 10-15 s per trial. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
+The real run launches 9 trials (3 phases x 3 trials, 1000 batches each) and finishes in a few minutes on a modern CUDA GPU - roughly 10-15 s per trial. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
 
 The phase order is deliberate: pick `learning_rate` first because it is the highest-leverage optimizer scale decision, tune `weight_decay` after the update scale is fixed, then tune `grad_clip_norm` last as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
 
@@ -63,6 +63,6 @@ weight_decay: weight_decay=0.0, val_loss=2.140831208229065
 clip_norm: grad_clip_norm=0.5, val_loss=2.096618318557739
 ```
 
-"Same phase winners" here means the CLI and MCP runs agreed on the same machine. On different hardware, expect val_loss in the same ~2.1 range but not necessarily the same winning values — a run on a later-generation GPU picked `grad_clip_norm=1.0` for the last phase.
+"Same phase winners" here means the CLI and MCP runs agreed on the same machine. On different hardware, expect val_loss in the same ~2.1 range but not necessarily the same winning values - a run on a later-generation GPU picked `grad_clip_norm=1.0` for the last phase.
 
 The MCP path used catalog id `tiny-decoder-enwik8-hparams`: list experiments, validate the phase structure, launch the sweep, poll status by `run_id`, and read winners by that same `run_id`. The run completed all three phases with 3 complete trials each.
