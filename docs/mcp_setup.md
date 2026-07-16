@@ -1,6 +1,6 @@
 # MCP agent setup
 
-This page takes you from a fresh environment to an agent that can launch, monitor, and summarize phasesweep runs — in five steps: install the extra, write a catalog, connect your client, verify, and instruct the agent. The agent operates by catalog id only; it never sees or supplies a `trial_command`, `env`, `storage`, or `workdir`. This version is local-node only: the server, detached runner, cleanup recovery, and GPU/process locks assume one machine. Tool behavior, catalog rules, and the security model are in [MCP server](mcp.md).
+This page takes you from a fresh environment to an agent that can launch, monitor, and summarize phasesweep runs - in five steps: install the extra, write a catalog, connect your client, verify, and instruct the agent. The agent operates by catalog id only; it never sees or supplies a `trial_command`, `env`, `storage`, or `workdir`. This version is local-node only: the server, detached runner, cleanup recovery, and GPU/process locks assume one machine. Tool behavior, catalog rules, and the security model are in [MCP server](mcp.md).
 
 ## 1. Install
 
@@ -16,13 +16,13 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep install` (step 3) resolves it for you, so you only need the path for manual setup — in that case, find it now (`phasesweep-mcp` and `phasesweep mcp` start the same server; client configs use the dedicated executable):
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp` start the same server; client configs use the dedicated executable):
 
 ```bash
 which phasesweep-mcp
 ```
 
-If you prefer not to install into a persistent environment, every client below can instead launch through `uvx` (shown once in [Any stdio client](#any-stdio-client)); note the first launch downloads and builds the package, so allow for a slow cold start.
+If you prefer not to install into a persistent environment, every client below can instead launch through `uvx` (shown once in step 3's Manual setup section, under "Any stdio client"); note the first launch downloads and builds the package, so allow for a slow cold start.
 
 ## 2. Create a catalog
 
@@ -32,7 +32,7 @@ The server refuses to start without a catalog: a fixed allowlist mapping stable 
 phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated, read-only `catalog.yaml`, validated with the exact server startup rules first: it prints the same per-entry report as `mcp-check` either way, and on failure writes nothing. Each entry's `id` is derived from the experiment filename stem (`experiment.yaml` → `id: experiment`, unsafe characters become `-`); rename it freely in the scaffolded file. Fill in each `description`, then deliberately enable `allow` flags and `visible_params` as needed. The equivalent hand-written catalog:
+This writes an annotated, read-only `catalog.yaml`, validated with the exact server startup rules first: it prints the same per-entry report as `mcp-check` either way, and on failure writes nothing. Each entry's `id` is derived from the experiment filename stem, so `experiment.yaml` scaffolds as `id: experiment` (unsafe characters become `-`); rename it freely in the scaffolded file. Fill in each `description`, then deliberately enable `allow` flags and `visible_params` as needed. The equivalent hand-written catalog:
 
 ```yaml
 # catalog.yaml
@@ -57,27 +57,27 @@ Confirm the catalog loads before touching any client config:
 phasesweep mcp-check --catalog /abs/path/to/catalog.yaml
 ```
 
-`mcp-check` runs the exact validation the server applies at startup and prints one `ok` / `FAIL` line per experiment — the offending rule and a suggested fix on failures, the enabled actions on successes. It exits 0 when every entry loads and 2 otherwise. Fix and re-run until green; a green report means the server will boot with this catalog.
+`mcp-check` runs the exact validation the server applies at startup and prints one `ok` / `FAIL` line per experiment - the offending rule and a suggested fix on failures, the enabled actions on successes. It exits 0 when every entry loads and 2 otherwise. Fix and re-run until green; a green report means the server will boot with this catalog.
 
 ## 3. Connect your client
 
-One command writes both integrations for your coding agents — the MCP server entry, project-scoped wherever the client supports it, and the step-5 agent instructions as a marker-fenced block:
+One command writes both integrations for your coding agents - the MCP server entry, project-scoped wherever the client supports it, and the step-5 agent instructions as a marker-fenced block:
 
 ```bash
 phasesweep install                        # interactive: confirm each detected agent, review the plan, apply
 phasesweep install --agent claude --yes   # unattended; repeat --agent for more
 ```
 
-`install` validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, then reports one `created` / `updated` / `unchanged` line per edit. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`. A config that is not strict JSON (comments, JSON5) is never modified — the report says `skipped` and prints the exact snippet to merge manually. `--type mcp|instructions` installs one integration only; `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project — use `--catalog PATH` for any other name or location. `phasesweep uninstall` removes exactly what install wrote: the server entry by name, the instructions block by its markers, and any file that becomes empty.
+`install` validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, then reports one `created` / `updated` / `unchanged` line per edit. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`. A config that is not strict JSON (comments, JSON5) is never modified - the report says `skipped` and prints the exact snippet to merge manually. `--type mcp|instructions` installs one integration only; `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project - use `--catalog PATH` for any other name or location. `phasesweep uninstall` removes exactly what install wrote: the server entry by name, the instructions block by its markers, and any file that becomes empty.
 
-Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` — Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
+Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
 
 Restart the client after any config change.
 
 <details>
 <summary>Manual setup (any client)</summary>
 
-Every client gets the same server: command `phasesweep-mcp`, args `--catalog /abs/path/to/catalog.yaml`. Use the absolute executable path from step 1 and an absolute catalog path throughout. Prefer project scope where the client supports it — a catalog belongs to one project, and a user-global entry would let an agent in any repo control this project's sweeps.
+Every client gets the same server: command `phasesweep-mcp`, args `--catalog /abs/path/to/catalog.yaml`. Use the absolute executable path from step 1 and an absolute catalog path throughout. Prefer project scope where the client supports it - a catalog belongs to one project, and a user-global entry would let an agent in any repo control this project's sweeps.
 
 <details>
 <summary>Claude Code</summary>
@@ -106,7 +106,7 @@ This writes `.mcp.json` in the project. Equivalent manual entry:
 <details>
 <summary>Claude Desktop</summary>
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows; note phasesweep itself requires Linux/macOS or WSL on the host running the server):
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `~/.config/Claude/claude_desktop_config.json` (Linux beta), or `%APPDATA%\Claude\claude_desktop_config.json` (Windows; note phasesweep itself requires Linux/macOS or WSL on the host running the server):
 
 ```json
 {
@@ -155,12 +155,13 @@ Add to `.cursor/mcp.json` in the project (preferred) or `~/.cursor/mcp.json`:
 <details>
 <summary>VS Code</summary>
 
-Add to `.vscode/mcp.json` in the project (note the key is `servers`, not `mcpServers`):
+Add to `.vscode/mcp.json` in the project (note the key is `servers`, not `mcpServers`, and `"type": "stdio"` is required):
 
 ```json
 {
   "servers": {
     "phasesweep": {
+      "type": "stdio",
       "command": "/abs/path/to/venv/bin/phasesweep-mcp",
       "args": ["--catalog", "/abs/path/to/catalog.yaml"]
     }
@@ -173,7 +174,7 @@ Add to `.vscode/mcp.json` in the project (note the key is `servers`, not `mcpSer
 <details>
 <summary>Gemini CLI</summary>
 
-Add to `~/.gemini/settings.json`:
+Add to `.gemini/settings.json` in the project (or `~/.gemini/settings.json` for user scope):
 
 ```json
 {
@@ -191,14 +192,15 @@ Add to `~/.gemini/settings.json`:
 <details>
 <summary>OpenCode</summary>
 
-Add to `~/.config/opencode/opencode.jsonc` (note `type: local` and the command as a single array):
+Add to `opencode.json` in the project root (or `~/.config/opencode/opencode.jsonc` for user scope; note `type: local` and the command as a single array):
 
 ```json
 {
   "mcp": {
     "phasesweep": {
       "type": "local",
-      "command": ["/abs/path/to/venv/bin/phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"]
+      "command": ["/abs/path/to/venv/bin/phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"],
+      "enabled": true
     }
   }
 }
@@ -248,8 +250,6 @@ Or as a module, when only the interpreter path is convenient:
 }
 ```
 
-`phasesweep mcp --catalog ...` is also equivalent to `phasesweep-mcp --catalog ...` anywhere above.
-
 </details>
 
 </details>
@@ -262,23 +262,23 @@ Restart the client, then ask the agent:
 List the available phasesweep experiments.
 ```
 
-A working setup returns your catalog entries with ids, descriptions, phase names, and the metric — and nothing path-shaped. If the tool is missing or the call fails, see [Troubleshooting](#troubleshooting).
+A working setup returns your catalog entries with ids, descriptions, phase names, and the metric - and nothing path-shaped. If the tool is missing or the call fails, see [Troubleshooting](#troubleshooting).
 
 ## 5. Instruct the agent
 
 If step 3's `phasesweep install` ran with instructions enabled (the default), this step is already done: the exact text below now sits between `<!-- PHASESWEEP_START -->` markers in each agent's project instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `.github/copilot-instructions.md`).
 
-Otherwise: if your client supports MCP prompts (Claude Code and Claude Desktop do), load the `phasesweep_run_and_monitor` prompt — it serves the exact text below, and nothing needs pasting. If your client supports MCP resources, `phasesweep://catalog` exposes the first catalog page; agents should still call `phasesweep_list_experiments` for pagination. As a last resort, paste this into the agent's project instructions or into chat before asking it to run a sweep. This is the same text the server ships as its MCP prompt (the packaged `agent_prompt.md`); a drift test keeps the block below in sync with the shipped file, so copying from this page is safe.
+Otherwise: if your client supports MCP prompts (Claude Code and Claude Desktop do), load the `phasesweep_run_and_monitor` prompt - it serves the exact text below, and nothing needs pasting. If your client supports MCP resources, `phasesweep://catalog` exposes the first catalog page; agents should still call `phasesweep_list_experiments` for pagination. As a last resort, paste this into the agent's project instructions or into chat before asking it to run a sweep. This is the same text the server ships as its MCP prompt (the packaged `agent_prompt.md`); a drift test keeps the block below in sync with the shipped file, so copying from this page is safe.
 
 ```text
-You have access to a phasesweep MCP server. It runs phase-chained hyperparameter sweeps from a human-curated catalog of experiments: each phase's winning hyperparameters lock in as fixed overrides for every phase downstream. You operate entirely by catalog experiment id. No tool accepts a config path, trainer command, or file, and the catalog is the sole authority for paths, commands, environment, storage, and working directories — never ask the user for those or try to infer them.
+You have access to a phasesweep MCP server. It runs phase-chained hyperparameter sweeps from a human-curated catalog of experiments: each phase's winning hyperparameters lock in as fixed overrides for every phase downstream. You operate entirely by catalog experiment id. No tool accepts a config path, trainer command, or file, and the catalog is the sole authority for paths, commands, environment, storage, and working directories - never ask the user for those or try to infer them.
 
 ## Workflow
 
 1. Call phasesweep_list_experiments to see what exists: ids, descriptions, phase names, and the metric with its goal. If next_cursor is non-null, call again with that cursor to page.
 2. Call phasesweep_validate_config with the experiment_id you plan to run. It confirms the config loads and returns each phase's name, trial count, sampler, inherited phases, and search-space keys. Do this before every launch.
-3. Call phasesweep_launch_sweep with that experiment_id. It returns {run_id, state}; the sweep runs as a detached background process that survives your tool call and even a server restart. Save the run_id — it is your handle for everything after this point. Pass from_phase only when the user explicitly asks to resume from a phase, or when earlier phase winners are already confirmed complete.
-4. Monitor with phasesweep_await_run using the run_id — not the experiment id, so catalog edits after launch cannot redirect your monitoring. It blocks until the run reaches a terminal state (succeeded, failed, or cancelled), a phase gains a winner, or its timeout elapses; call it again until the state is terminal, reporting per-phase completed counts as they move. If your client cannot wait on long tool calls, poll phasesweep_get_status instead and wait poll_after_seconds between calls.
+3. Call phasesweep_launch_sweep with that experiment_id. It returns {run_id, state}; the sweep runs as a detached background process that survives your tool call and even a server restart. Save the run_id - it is your handle for everything after this point. Pass from_phase only when the user explicitly asks to resume from a phase, or when earlier phase winners are already confirmed complete.
+4. Monitor with phasesweep_await_run using the run_id - not the experiment id, so catalog edits after launch cannot redirect your monitoring. It blocks until the run reaches a terminal state (succeeded, failed, or cancelled), a phase gains a winner, or its timeout elapses; call it again until the state is terminal, reporting per-phase completed counts as they move. If your client cannot wait on long tool calls, poll phasesweep_get_status instead and wait poll_after_seconds between calls.
 5. On a terminal state, call phasesweep_get_winners with the same run_id and summarize each phase: winning trial number, metric value, sampled params, gate status, and whether every phase completed.
 
 When the user asks for a recommended next experiment, base it only on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted.
