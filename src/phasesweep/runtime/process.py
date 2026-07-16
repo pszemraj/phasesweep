@@ -69,13 +69,37 @@ class PhaseSweepShutdown(SystemExit):
     """SystemExit carrying child process-group cleanup evidence."""
 
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
-        """Create a POSIX-style signaled exit with structured cleanup evidence."""
+        """Create a POSIX-style signaled exit with structured cleanup evidence.
+
+        Args:
+            signum: Shutdown signal that triggered the exit; the exit code is
+                ``128 + signum`` per the POSIX signaled-exit convention.
+            report: Cleanup evidence captured by the shutdown handler for the
+                child process groups it terminated.
+
+        """
         super().__init__(128 + signum)
         self.signum = signum
         self.report = report
 
 
 _last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
+
+# Python-level shutdown deferral. Kernel signal masks are per-thread, but
+# CPython runs Python signal handlers only in the main thread — and it does so
+# whenever ANY thread's C-level handler tripped the pending flag, regardless of
+# the main thread's kernel mask. Library thread pools (e.g. BLAS workers pulled
+# in via numpy/optuna) keep shutdown signals unblocked, so a signal sent while
+# the main thread is inside a ``_defer_shutdown_signals()`` window can still
+# execute ``_shutdown_handler`` in the main thread mid-critical-section, where
+# re-acquiring ``_launch_lock``/``_lock`` self-deadlocks. These state variables
+# extend the deferral to the Python level: while the main thread is inside a
+# window, the handler records the signal and returns; the outermost window exit
+# services it. Both are touched only from the main thread (window bookkeeping
+# by construction, the handler by CPython's main-thread guarantee), so no lock
+# is needed.
+_deferred_shutdown_signum: int | None = None
+_main_thread_defer_depth = 0
 
 
 def last_shutdown_cleanup_report() -> ShutdownCleanupReport | None:
@@ -101,9 +125,14 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
     The handler also acquires ``_launch_lock`` before snapshotting (review
     v0.5.7 / blocker 3) so a child that was just ``Popen()``-ed but not yet
-    ``_register()``-ed cannot escape the snapshot. The launch path holds
-    ``_launch_lock`` across both calls; this handler will block until the
-    launch site releases it, then see the new PGID in ``_active_children``.
+    ``_register()``-ed cannot escape the snapshot. When the launcher is a
+    worker thread, this handler (main thread) blocks until the launch site
+    releases the lock, then sees the new PGID in ``_active_children``. When
+    the launcher IS the main thread, blocking on the lock would self-deadlock:
+    kernel masking cannot prevent that (a signal delivered to any unblocked
+    library thread still runs this handler in the main thread), so if a
+    main-thread ``_defer_shutdown_signals()`` window is open the handler
+    records the signal and returns; the window exit re-invokes it.
 
     Args:
         signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
@@ -112,11 +141,21 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             but required by the ``signal.signal`` handler protocol.
 
     Raises:
-        SystemExit: Always, with exit code ``128 + signum`` (POSIX
-            ``signaled-exit`` convention).
+        SystemExit: With exit code ``128 + signum`` (POSIX ``signaled-exit``
+            convention) — always, except when deferred mid-critical-section
+            as described above.
 
     """
-    global _last_shutdown_cleanup_report  # noqa: PLW0603
+    global _last_shutdown_cleanup_report, _deferred_shutdown_signum  # noqa: PLW0603
+
+    if _main_thread_defer_depth > 0:
+        # The main thread is inside a launch/unregister critical section and
+        # may already hold the locks below. Record and return; the outermost
+        # window exit services the shutdown.
+        _deferred_shutdown_signum = signum
+        return
+    # Any recorded-but-unserviced signal is superseded by this invocation.
+    _deferred_shutdown_signum = None
 
     with _launch_lock, _lock:
         pgids = tuple(_active_children)
@@ -193,34 +232,70 @@ def install_signal_handlers() -> None:
 
 @contextlib.contextmanager
 def _defer_shutdown_signals() -> Iterator[None]:
-    """Temporarily block shutdown signals in the calling thread.
+    """Defer shutdown handling while the calling thread is in a critical section.
 
     Used to keep the ``Popen() -> _register()`` window atomic from the
     perspective of the signal handler (review v0.5.7 / blocker 3). CPython
-    delivers signals to the main thread, so when ``n_jobs == 1`` the same
-    thread is both the launcher and the handler target — taking
-    ``_launch_lock`` from the handler would deadlock against the launcher's
-    own lock acquisition. Blocking the signal at the kernel level instead
-    queues it until the launcher exits the critical section.
+    runs Python signal handlers in the main thread, so when the launcher is
+    the main thread, taking ``_launch_lock`` from the handler would deadlock
+    against the launcher's own lock acquisition. Two layers close that:
 
-    For worker threads (``n_jobs > 1``) the handler still runs on the main
-    thread, so the signal-mask state of the worker is irrelevant. The
-    ``_launch_lock`` acquired by the launcher closes the race in that case.
+    1. Kernel mask: the calling thread blocks shutdown signals, so a signal
+       aimed at it queues until the critical section ends.
+    2. Python-level deferral (main thread only): the kernel mask is per-thread
+       and cannot stop a signal delivered to some other unblocked thread (e.g.
+       a BLAS pool worker) from tripping CPython's pending flag — the Python
+       handler then runs in the main thread mid-window anyway. While a
+       main-thread window is open, ``_shutdown_handler`` records the signal
+       and returns; the outermost window exit re-invokes it after the kernel
+       mask is restored.
 
-    No-op on platforms without ``signal.pthread_sigmask`` (Windows).
+    For worker-thread launchers (``n_jobs > 1``) the handler still runs on the
+    main thread, which is NOT inside the window, so it simply blocks on
+    ``_launch_lock`` until the worker finishes registration — the designed
+    behavior, with no self-deadlock possible.
+
+    Kernel masking is skipped on platforms without ``signal.pthread_sigmask``
+    (Windows); the Python-level deferral still applies.
 
     Yields:
         ``None``. Use as ``with _defer_shutdown_signals(): ...``.
 
     """
+    global _main_thread_defer_depth  # noqa: PLW0603
+    is_main = threading.current_thread() is threading.main_thread()
+    old_mask = None
     if hasattr(signal, "pthread_sigmask"):
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
-        try:
-            yield
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-    else:
+    if is_main:
+        _main_thread_defer_depth += 1
+    try:
         yield
+    finally:
+        if is_main:
+            _main_thread_defer_depth -= 1
+        if old_mask is not None:
+            # Restoring the mask delivers any kernel-queued signal right here;
+            # its handler runs normally (depth is already back to zero) and
+            # clears any deferred marker before raising.
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
+            _service_deferred_shutdown()
+
+
+def _service_deferred_shutdown() -> None:
+    """Run the shutdown handler for a signal recorded mid-critical-section.
+
+    Raises:
+        PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup
+            evidence for the recorded signal.
+
+    """
+    global _deferred_shutdown_signum  # noqa: PLW0603
+    signum = _deferred_shutdown_signum
+    _deferred_shutdown_signum = None
+    if signum is not None:
+        _shutdown_handler(signum, None)
 
 
 def _register(proc: subprocess.Popen) -> int:
@@ -780,6 +855,11 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
     is not a member of the target group. The unsafe case is narrower: a live
     ``/proc/<pgid>`` entry belongs to process group ``pgid`` but has a different
     starttime, meaning the saved group ID is now led by an unrelated process.
+
+    :param int pgid: Stored process-group ID whose leader identity is checked.
+    :param int saved_starttime: Starttime recorded for the original group leader.
+    :return bool: ``True`` when ``/proc/<pgid>`` is a group leader of ``pgid``
+        whose starttime differs from the saved value.
     """
     stat = _read_proc_stat(Path("/proc") / str(pgid))
     return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime

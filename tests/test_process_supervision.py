@@ -610,6 +610,70 @@ print("post-context", flush=True)
         assert proc.returncode == 128 + signal.SIGTERM, case
 
 
+def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocking() -> None:
+    """A signal tripped by a non-main thread mid-window must defer, not deadlock.
+
+    Kernel masking in ``_defer_shutdown_signals`` only covers the main thread.
+    Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
+    unblocked, so a process-directed SIGTERM sent during the masked launch
+    window is delivered to one of them — and CPython then runs the Python
+    handler in the main thread anyway, mid-critical-section. Pre-fix the
+    handler re-acquired ``_launch_lock`` held by that same thread and hung
+    until the MCP server's 30s grace SIGKILLed the runner with no status.json
+    written (the flaky-cancel e2e failures). The handler must record the signal
+    and let the window exit service it.
+    """
+    code = r"""
+import os, signal, threading, time
+import phasesweep.runtime.process as proc_mod
+from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
+
+install_signal_handlers()
+
+# Stand-in for a BLAS pool worker: SIGTERM stays unblocked here, so the kernel
+# delivers the process-directed signal to this thread while the main thread is
+# masked inside the launch window.
+ready = threading.Event()
+def helper():
+    ready.set()
+    threading.Event().wait(30)
+threading.Thread(target=helper, daemon=True).start()
+assert ready.wait(5)
+
+with _defer_shutdown_signals(), _launch_lock:
+    os.kill(os.getpid(), signal.SIGTERM)
+    deadline = time.time() + 5
+    while proc_mod._deferred_shutdown_signum is None and time.time() < deadline:
+        time.sleep(0.005)
+    print("recorded-mid-window" if proc_mod._deferred_shutdown_signum is not None
+          else "never-recorded", flush=True)
+print("post-context", flush=True)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        timeout=15.0,
+        check=False,
+    )
+    assert "recorded-mid-window" in proc.stdout, proc.stdout + proc.stderr
+    assert "post-context" not in proc.stdout  # window exit must raise the shutdown
+    assert proc.returncode == 128 + signal.SIGTERM
+
+
+def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
+    """A shutdown recorded mid-window fires only when the outermost window exits."""
+    inner_exited = False
+    with pytest.raises(PhaseSweepShutdown) as excinfo, _defer_shutdown_signals():
+        with _defer_shutdown_signals():
+            # Emulates CPython invoking the handler in the main thread
+            # after a worker-thread delivery: it must record and return.
+            _shutdown_handler(signal.SIGTERM, None)
+        inner_exited = True
+    assert inner_exited, "inner window exit must not service the deferred shutdown"
+    assert excinfo.value.code == 128 + signal.SIGTERM
+
+
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
