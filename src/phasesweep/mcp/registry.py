@@ -10,6 +10,7 @@ fails server startup.
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -181,6 +182,9 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
     resolved = _resolve_catalog_relative_path(base, path)
     try:
         RunStore(resolved)
+        for directory in (resolved, resolved / "runs", resolved / "logs"):
+            with tempfile.NamedTemporaryFile(dir=directory):
+                pass
     except OSError as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",

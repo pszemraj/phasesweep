@@ -126,6 +126,22 @@ def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_pat
         Registry.load(catalog)
 
 
+def test_check_catalog_rejects_existing_read_only_state_directory(tmp_path: Path) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
+    )
+    check_catalog(catalog)
+    logs_dir = tmp_path / "state" / "logs"
+    logs_dir.chmod(0o500)
+
+    try:
+        with pytest.raises(CatalogError, match="state_dir is not usable"):
+            check_catalog(catalog)
+    finally:
+        logs_dir.chmod(0o700)
+
+
 def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     runner = CliRunner()
     good = write_mcp_config_catalog(
