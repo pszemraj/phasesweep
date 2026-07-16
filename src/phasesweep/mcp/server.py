@@ -86,9 +86,9 @@ AWAIT_RECHECK_SECONDS = 5.0
 # to the next tool in the workflow by literal name.
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the human-curated experiments this server can run: ids, descriptions, "
-    "phase names, and the optimization metric. Start here. If next_cursor is "
-    f"non-null, call again with it. Then call {TOOL_VALIDATE_CONFIG} on the id "
-    "you plan to use."
+    "phase names, and the optimization metric. Read-only. Start here. If "
+    "next_cursor is non-null, call again with it. Then call "
+    f"{TOOL_VALIDATE_CONFIG} on the id you plan to use."
 )
 DESCRIPTION_VALIDATE_CONFIG = (
     "Inspect an experiment before launching it: per-phase names, trial counts, "
@@ -99,21 +99,25 @@ DESCRIPTION_LAUNCH_SWEEP = (
     "Start an experiment's sweep as a detached background run that survives this "
     f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
     f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
-    "only to resume when earlier phase winners already exist."
+    "only to resume when earlier phase winners already exist. A refusal such as "
+    "\"action 'launch' is not permitted\" or a concurrency limit is deliberate "
+    "catalog policy: report it to the user; do not retry or work around it."
 )
 DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
     "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
-    "Read-only. While running, wait poll_after_seconds before calling again; when "
-    f"terminal, call {TOOL_GET_WINNERS} with the same run_id."
+    f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
+    "instead, wait poll_after_seconds between calls. When terminal, call "
+    f"{TOOL_GET_WINNERS} with the same run_id."
 )
 DESCRIPTION_GET_WINNERS = (
     "The end of the workflow: per completed phase, the winning trial number, "
     "metric value, policy-filtered sampled params, gate status, and completeness. "
-    "Values shown as <redacted> are intentional catalog policy, not errors. "
-    "Provide exactly one of experiment_id or run_id (prefer the launched run_id). "
-    "Read-only."
+    "Phases that completed still report winners when the run later failed or was "
+    "cancelled. Values shown as <redacted> are intentional catalog policy, not "
+    "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
+    "run_id). Read-only."
 )
 DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "
@@ -124,10 +128,10 @@ DESCRIPTION_AWAIT_RUN = (
     "Wait for a launched run to change. Blocks up to timeout_seconds (default "
     f"{AWAIT_DEFAULT_TIMEOUT_SECONDS}, max {AWAIT_MAX_TIMEOUT_SECONDS}) and returns "
     "early when the run reaches a terminal state or a phase gains a winner; "
-    "otherwise returns the current status at timeout. Returns the same payload as "
+    "otherwise returns the current status at timeout — if the state is still "
+    "running, call again with the same run_id. Returns the same payload as "
     f"{TOOL_GET_STATUS} plus changed and reason (terminal / phase_completed / "
-    f"timeout). Read-only. Prefer this over polling {TOOL_GET_STATUS} in a loop; "
-    "for long sweeps call it repeatedly."
+    f"timeout). Read-only. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
 
 ExperimentId = Annotated[
