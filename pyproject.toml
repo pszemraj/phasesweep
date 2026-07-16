@@ -65,6 +65,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"phasesweep.mcp" = ["agent_prompt.md"]
 
 [tool.ruff]
 line-length = 100

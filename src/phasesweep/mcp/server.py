@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import functools
 import hashlib
+import importlib.resources
 import importlib.util
 import logging
 import subprocess
@@ -1049,22 +1050,21 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
             raise RuntimeError(f"MCP tool {tool_name!r} lost its exactly-one-of schema")
 
 
+@functools.cache
 def _run_and_monitor_prompt_text() -> str:
     """Return the reusable agent workflow prompt served over MCP.
 
+    The text is packaged data (``agent_prompt.md``) so the served prompt, the
+    setup docs, and the installer-injected instructions share one source.
+
     :return str: Safe run-and-monitor instructions for MCP clients that support prompts.
     """
-    return """You have access to a local phasesweep MCP server. Use it to operate only the human-curated experiment catalog exposed by the server.
-
-Start by calling phasesweep_list_experiments, then call phasesweep_validate_config for the experiment id you plan to use. Do not ask for config paths, storage URLs, workdirs, commands, environment variables, or run-control settings; the catalog is the authority for those.
-
-If asked to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when explicitly asked to resume from a phase or when earlier phase winners are already confirmed. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
-
-Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible only when their values are not <redacted>; redacted values are intentionally withheld by catalog policy. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
-
-When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
-
-Use phasesweep_cancel_sweep only when explicitly asked to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep."""
+    return (
+        importlib.resources.files("phasesweep.mcp")
+        .joinpath("agent_prompt.md")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
 
 
 def build_server(app: PhaseSweepMCP) -> Any:

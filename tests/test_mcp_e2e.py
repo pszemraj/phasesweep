@@ -319,7 +319,7 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
     assert "phasesweep_launch_sweep" in str(prompt)
-    assert "target/dependent-variable columns" in str(prompt)
+    assert "target or label columns" in str(prompt)
 
 
 def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
