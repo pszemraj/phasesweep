@@ -16,7 +16,15 @@ VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
 
 def visible_winner_params(params: dict[str, Any], policy: VisibleParamsPolicy) -> dict[str, Any]:
-    """Filter sampled winner params according to the catalog visibility policy."""
+    """Filter sampled winner params according to the catalog visibility policy.
+
+    :param dict[str, Any] params: Sampled winner params keyed by parameter name.
+    :param VisibleParamsPolicy policy: Catalog ``visible_params`` setting: ``"all"``
+        exposes every value, ``"none"`` redacts every value, and a list of keys
+        exposes only those keys and redacts the rest.
+    :return dict[str, Any]: ``params`` with each value either kept as-is or
+        replaced with the ``"<redacted>"`` sentinel per ``policy``.
+    """
     if policy == "all":
         return dict(params)
     if policy == "none":

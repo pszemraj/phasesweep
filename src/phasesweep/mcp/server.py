@@ -960,7 +960,13 @@ class PhaseSweepMCP:
         )
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether MCP cancellation is permitted for this persisted run."""
+        """Return whether MCP cancellation is permitted for this persisted run.
+
+        :param RunHandle handle: Persisted run whose cancel permission is checked.
+        :return bool: Current catalog ``allow.cancel`` for the experiment, falling
+            back to the permission frozen on the handle when the experiment has
+            since left the catalog.
+        """
         try:
             return self._registry.get(handle.experiment_id).allow_cancel
         except UnknownExperimentError:

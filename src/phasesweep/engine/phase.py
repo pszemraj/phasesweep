@@ -59,20 +59,48 @@ class CsvSnapshotThrottle:
     last_write_at: float = 0.0
 
     def should_write(self, finished: int, now: float) -> bool:
-        """Return whether another full CSV snapshot should be written."""
+        """Return whether another full CSV snapshot should be written.
+
+        Args:
+            finished: Number of terminal trials completed so far in the phase.
+            now: Current ``time.monotonic()`` timestamp, in seconds.
+
+        Returns:
+            True if at least ``min_trials`` more trials have finished, or at
+            least ``min_seconds`` have elapsed, since the last recorded
+            snapshot.
+
+        """
         return (
             finished - self.last_finished >= self.min_trials
             or now - self.last_write_at >= self.min_seconds
         )
 
     def mark_written(self, finished: int, now: float) -> None:
-        """Record a successful snapshot write."""
+        """Record a successful snapshot write.
+
+        Args:
+            finished: Number of terminal trials completed at write time;
+                stored as the new baseline for the next ``should_write`` check.
+            now: ``time.monotonic()`` timestamp of the write, in seconds;
+                stored as the new baseline for the next ``should_write`` check.
+
+        """
         self.last_finished = finished
         self.last_write_at = now
 
 
 def _finished_trial_count(study: optuna.Study) -> int:
-    """Return the number of terminal trials in ``study``."""
+    """Return the number of terminal trials in ``study``.
+
+    Args:
+        study: Optuna study whose trials are counted.
+
+    Returns:
+        Count of trials whose state is finished (``COMPLETE``, ``FAIL``, or
+        ``PRUNED``); ``RUNNING`` and ``WAITING`` trials are excluded.
+
+    """
     return sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
 
 

@@ -62,7 +62,12 @@ class _GpuAcquisition:
 
 
 def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
-    """Normalize a CUDA device token into :class:`GpuDevice`."""
+    """Normalize a CUDA device token into :class:`GpuDevice`.
+
+    :param GpuDevice | int | str device: CUDA device token; a :class:`GpuDevice`
+        is passed through unchanged, an ``int``/``str`` is wrapped.
+    :return GpuDevice: The normalized device token.
+    """
     if isinstance(device, GpuDevice):
         return device
     return GpuDevice(str(device))
@@ -314,7 +319,28 @@ class GpuPool:
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire every configured device token as one assignment."""
+        """Acquire every configured device token as one assignment.
+
+        Blocks until no other trial holds the whole-node slot, then leases the
+        host-wide lock for every device in ``self._devices``. If any device's
+        lock is already held elsewhere, leases acquired so far are released
+        and the whole attempt retries after a short backoff.
+
+        Args:
+            deadline: Optional ``time.monotonic()`` deadline. When set, waiting
+                for the whole-node slot or a device lock fails with
+                ``TimeoutError`` instead of blocking indefinitely.
+
+        Returns:
+            An acquisition covering every configured device, comma-joined into
+            one CUDA_VISIBLE_DEVICES assignment, or ``None`` if the pool is
+            inactive.
+
+        Raises:
+            TimeoutError: ``deadline`` expired before all device locks could be
+                leased.
+
+        """
         if not self._devices:
             return None
         while True:
@@ -350,7 +376,23 @@ class GpuPool:
             )
 
     def _acquire(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire a GPU assignment according to the configured policy."""
+        """Acquire a GPU assignment according to the configured policy.
+
+        Dispatches to :meth:`_acquire_whole_node` when the pool was built with
+        ``whole_node=True``, otherwise to :meth:`_acquire_single`.
+
+        Args:
+            deadline: Optional ``time.monotonic()`` deadline forwarded to the
+                selected acquisition method.
+
+        Returns:
+            The acquisition produced by the selected strategy, or ``None`` if
+            the pool is inactive.
+
+        Raises:
+            TimeoutError: ``deadline`` expired before a GPU could be leased.
+
+        """
         if self._whole_node:
             return self._acquire_whole_node(deadline=deadline)
         return self._acquire_single(deadline=deadline)
@@ -400,7 +442,12 @@ class GpuPool:
 
 
 def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
-    """Deduplicate non-empty CUDA device tokens while preserving order."""
+    """Deduplicate non-empty CUDA device tokens while preserving order.
+
+    :param list[str] tokens: Raw device tokens (numeric indices, GPU UUIDs, or
+        MIG instance IDs). Empty/whitespace-only tokens are dropped.
+    :return list[GpuDevice]: Order-preserving, duplicate-free device tokens.
+    """
     devices: list[GpuDevice] = []
     seen: set[str] = set()
     for raw in tokens:
@@ -413,7 +460,13 @@ def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
 
 
 def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
-    """Parse CUDA_VISIBLE_DEVICES as opaque tokens."""
+    """Parse CUDA_VISIBLE_DEVICES as opaque tokens.
+
+    :param str value: Raw ``CUDA_VISIBLE_DEVICES`` value: comma-separated tokens
+        that may be numeric indices, GPU UUIDs, or MIG instance IDs.
+    :return list[GpuDevice]: Deduplicated device tokens in the given order, or an
+        empty list when ``value`` is exactly ``"-1"`` (CUDA's no-GPUs-visible sentinel).
+    """
     raw = [token.strip() for token in value.split(",") if token.strip()]
     if raw == ["-1"]:
         return []
@@ -423,7 +476,14 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:
-    """Log whether configured/available CUDA devices cover requested parallelism."""
+    """Log whether configured/available CUDA devices cover requested parallelism.
+
+    :param int n_jobs: Number of parallel trials the pool must support.
+    :param list[str] tokens: CUDA-visible device tokens the pool was built from.
+    :param str source: Human-readable origin of ``tokens`` for the log message,
+        e.g. ``"configured"`` (explicit gpu_ids/gpu_devices) or ``"available"``
+        (auto-detected).
+    """
     if n_jobs > len(tokens):
         log.warning(
             "n_jobs=%d but only %d GPU device(s) %s (%s). Excess trials will queue for a GPU.",

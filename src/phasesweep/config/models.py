@@ -193,7 +193,19 @@ class Phase(_Frozen):
     @field_validator("gpu_devices")
     @classmethod
     def _gpu_devices_non_empty_tokens(cls, value: list[str] | None) -> list[str] | None:
-        """Normalize and validate explicit CUDA device tokens."""
+        """Normalize and validate explicit CUDA device tokens.
+
+        Args:
+            value: The candidate ``gpu_devices`` list of CUDA_VISIBLE_DEVICES
+                tokens, or ``None``.
+
+        Returns:
+            The same list with each token stripped of surrounding whitespace,
+            or ``None`` if ``value`` was ``None``. Raises ``ValueError`` if the
+            list is empty after stripping, or if any token is empty, contains
+            a comma, or is ``"-1"``.
+
+        """
         if value is None:
             return None
         normalized = [token.strip() for token in value]

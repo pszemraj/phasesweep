@@ -230,7 +230,15 @@ def status(config_path: Path) -> None:
     help="Clear cleanup uncertainty after checks pass.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover one MCP run with cleanup uncertainty after local host inspection."""
+    """Recover one MCP run with cleanup uncertainty after local host inspection.
+
+    :param Path state_dir: MCP ``state_dir`` containing the run's ``runs/`` and
+        ``logs/`` subdirectories.
+    :param str run_id: Identifier of the MCP run to recover.
+    :param bool confirm: If True, reap stale RUNNING trials, persist cleanup
+        recovery evidence, and clear cleanup uncertainty. If False, only report
+        what a subsequent ``--confirm`` run would do.
+    """
     store = RunStore(state_dir)
     handle = store.get(run_id)
     if handle is None:
@@ -331,7 +339,16 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
 
 def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
-    """Return whether a runner PID still appears to be the same live process."""
+    """Return whether a runner PID still appears to be the same live process.
+
+    :param int | None pid: Runner process id recorded for the run, or ``None``
+        if no PID was recorded.
+    :param int | None saved_starttime: Process start time recorded alongside
+        ``pid`` when the run began, used to detect PID reuse by an unrelated
+        process.
+    :return bool: True if ``pid`` is set, still refers to the same process
+        (matching recorded start time), and is not a zombie.
+    """
     if pid is None:
         return False
     return is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)

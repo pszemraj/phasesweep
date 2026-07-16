@@ -407,7 +407,32 @@ def _confirm_or_reap_stale_trials(
     *,
     reap: bool,
 ) -> int:
-    """Confirm cleanup for RUNNING trials and optionally mark them failed."""
+    """Confirm cleanup for RUNNING trials and optionally mark them failed.
+
+    Args:
+        study: Optuna study whose RUNNING trials are inspected for stale
+            process cleanup.
+        experiment: Parsed experiment used to resolve each trial's directory
+            when its ``phasesweep_trial_dir`` user attribute is missing.
+        phase_name: Name of the phase being recovered, used to resolve the
+            fallback trial directory.
+        reap: If True, mark each RUNNING trial with confirmed-clean stale
+            processes as FAIL (recording cleanup recovery evidence first if
+            the trial was previously cleanup-uncertain). If False, only
+            confirm the stale processes are gone without changing Optuna
+            trial state.
+
+    Returns:
+        The number of RUNNING trials whose stale-process cleanup was
+        confirmed (and, when ``reap`` is True, successfully marked FAIL).
+
+    Raises:
+        ProcessCleanupUncertainError: A RUNNING trial's stale process group
+            could not be proven gone.
+        RuntimeError: ``study.tell`` could not persist the FAIL state after
+            cleanup was confirmed for a reaped trial.
+
+    """
     count = 0
     for trial in study.get_trials(deepcopy=False):
         if trial.state != optuna.trial.TrialState.RUNNING:
@@ -469,6 +494,19 @@ def _confirm_stale_running_trials(
     Used by ``mcp-recover-run`` preflight mode. The follow-up ``--confirm`` call
     must still find the same RUNNING trials so it can reap them and persist
     recovery evidence atomically with clearing MCP cleanup uncertainty.
+
+    Args:
+        study: Optuna study whose RUNNING trials are inspected for stale
+            process cleanup.
+        experiment: Parsed experiment used to resolve each trial's directory
+            when its ``phasesweep_trial_dir`` user attribute is missing.
+        phase_name: Name of the phase being recovered, used to resolve the
+            fallback trial directory.
+
+    Returns:
+        The number of RUNNING trials whose stale-process cleanup was
+        confirmed.
+
     """
     return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=False)
 
@@ -511,7 +549,17 @@ def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: 
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
-    """Return trial numbers already consumed as cleanup recovery evidence."""
+    """Return trial numbers already consumed as cleanup recovery evidence.
+
+    Args:
+        study: Optuna study to read the cleanup-recovery ledger from.
+
+    Returns:
+        The set of non-negative trial numbers recorded in the study's
+        ``CLEANUP_RECOVERED_TRIALS_ATTR`` user attribute, or an empty set if
+        the attribute is absent or not a list.
+
+    """
     raw = study.user_attrs.get(CLEANUP_RECOVERED_TRIALS_ATTR)
     if not isinstance(raw, list):
         return set()
@@ -519,7 +567,18 @@ def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
 
 
 def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Persist that previously uncertain cleanup evidence has been consumed."""
+    """Persist that previously uncertain cleanup evidence has been consumed.
+
+    Args:
+        study: Optuna study whose cleanup-recovery ledger user attribute is
+            updated.
+        trial: Trial whose number is added to the recovered-trials ledger.
+
+    Raises:
+        RuntimeError: The study-level cleanup-recovery ledger could not be
+            persisted.
+
+    """
     recovered = sorted(_cleanup_recovered_trial_numbers(study) | {trial.number})
     try:
         study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
