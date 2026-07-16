@@ -117,3 +117,74 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     assert status["error_class"] == "cancelled"
     assert status["cleanup_confirmed"] is True
     assert not _process_group_alive(trial_pgid)
+
+
+def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: Path) -> None:
+    """A cancel arriving before any trial starts must still write status.json.
+
+    The runner installs shutdown handlers before persisting its handle, so once
+    the handle file exists a SIGTERM is guaranteed to be caught — even while the
+    config is still loading. Without the early install, a cancel in that window
+    killed the runner with the default disposition, no status was recorded, and
+    the run derived "running" behind its cleanup-uncertainty marker forever.
+    """
+    config = _slow_config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "r2"
+    status_path = store.status_path(run_id)
+    log_path = store.log_path(run_id)
+    cmd = [
+        sys.executable,
+        "-m",
+        "phasesweep.mcp.runner",
+        "--run-id",
+        run_id,
+        "--config",
+        str(config),
+        "--config-sha256",
+        hashlib.sha256(config.read_bytes()).hexdigest(),
+        "--status-path",
+        str(status_path),
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--experiment-id",
+        "cancel_me",
+        "--started-at",
+        utc_now_iso(),
+    ]
+    handle_path = tmp_path / "state" / "runs" / f"{run_id}.json"
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        # The self-persisted handle is written after handler installation, so
+        # its appearance proves SIGTERM will be caught from here on.
+        deadline = time.time() + 25
+        while not handle_path.is_file():
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"runner exited early ({proc.returncode}); log:\n{log_path.read_text()}"
+                )
+            if time.time() > deadline:
+                raise AssertionError(f"handle never appeared; log:\n{log_path.read_text()}")
+            time.sleep(0.02)
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+    assert proc.returncode == 143, (
+        f"expected 143, got {proc.returncode}; log:\n{log_path.read_text()}"
+    )
+    status = json.loads(status_path.read_text())
+    assert status["returncode"] == 143
+    assert status["error_class"] == "cancelled"
+    assert status["cleanup_confirmed"] is True

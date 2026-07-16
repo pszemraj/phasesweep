@@ -18,7 +18,11 @@ from pathlib import Path
 
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.runtime.process import PhaseSweepShutdown, read_proc_starttime
+from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    install_signal_handlers,
+    read_proc_starttime,
+)
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
@@ -53,7 +57,16 @@ def _persist_spawned_handle(
     status_path: Path,
     allow_cancel: bool,
 ) -> None:
-    """Persist this runner's process identity before it launches any training work."""
+    """Persist this runner's process identity before it launches any training work.
+
+    :param Path state_dir: Server state dir whose ``runs/`` receives the handle.
+    :param str run_id: Run id minted by the launching server.
+    :param str experiment_id: Catalog id this run belongs to.
+    :param str config_sha256: Hash of the config snapshot this runner executes.
+    :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
+    :param Path status_path: Terminal ``status.json`` path this runner will write.
+    :param bool allow_cancel: Cancel permission frozen at launch time.
+    """
     store = RunStore(state_dir)
     pid = os.getpid()
     pgid = os.getpgrp() if hasattr(os, "getpgrp") else pid
@@ -101,6 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname).1s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # Install shutdown handlers before any other work (run_config re-invokes
+    # this; it is idempotent). A cancel can arrive while this runner is still
+    # loading config or persisting its handle; without handlers the default
+    # SIGTERM disposition kills the process before status.json is written and
+    # the run derives "running" behind its cleanup-uncertainty marker forever.
+    install_signal_handlers()
 
     status: dict = {
         "run_id": args.run_id,
