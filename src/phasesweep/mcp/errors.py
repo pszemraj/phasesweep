@@ -15,6 +15,15 @@ from __future__ import annotations
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Fatal at startup, operator-facing."""
 
+    def __init__(self, message: str, *, suggestion: str | None = None) -> None:
+        """Create an operator-facing catalog error.
+
+        :param str message: Failure description; may reference paths.
+        :param str | None suggestion: Optional concrete fix, surfaced by ``phasesweep mcp-check``.
+        """
+        super().__init__(message)
+        self.suggestion = suggestion
+
 
 class McpToolError(Exception):
     """Base for agent-facing tool failures. Carries a redacted message."""

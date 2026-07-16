@@ -20,6 +20,8 @@ from phasesweep.engine.guards import (
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
+from phasesweep.mcp.errors import CatalogError
+from phasesweep.mcp.registry import check_catalog
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import private_atomic_write_text
@@ -367,6 +369,54 @@ def mcp(ctx: click.Context, catalog: Path) -> None:
                 "MCP support is not installed; install with `pip install 'phasesweep[mcp]'`."
             ) from None
         raise
+
+
+@main.command(
+    name="mcp-check",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Validate an MCP catalog with the exact rules the server applies at startup and "
+        "print a per-experiment ok/FAIL report, without starting anything. Exit code 0 "
+        "when every entry loads, 2 otherwise."
+    ),
+    short_help="Preflight an MCP catalog.",
+)
+@click.option(
+    "--catalog",
+    required=True,
+    metavar="PATH",
+    type=CONFIG_PATH,
+    help="MCP catalog that maps agent-visible experiment ids to config files.",
+)
+@click.pass_context
+def mcp_check(ctx: click.Context, catalog: Path) -> None:
+    """Preflight an MCP catalog for the operator.
+
+    Shares the per-entry validation code path with ``Registry.load`` but
+    collects every entry's verdict instead of failing fast, so a broken
+    catalog is diagnosed here rather than inside an MCP client restart.
+    Operator-facing: output may include paths.
+
+    :param click.Context ctx: Active Click context used for the exit code.
+    :param Path catalog: Operator-authored MCP catalog to validate.
+    """
+    try:
+        report = check_catalog(catalog)
+    except CatalogError as exc:
+        click.echo(f"phasesweep mcp-check: {exc}", err=True)
+        ctx.exit(2)
+    width = max(len(entry.experiment_id) for entry in report.entries)
+    for entry in report.entries:
+        if entry.ok:
+            actions = f"({', '.join(entry.actions)})" if entry.actions else "(read-only)"
+            click.echo(f"{entry.experiment_id:<{width}}  ok    {actions}")
+            continue
+        message = (entry.error or "").removeprefix(f"{entry.experiment_id!r}: ")
+        click.echo(f"{entry.experiment_id:<{width}}  FAIL  {message}")
+        if entry.suggestion:
+            click.echo(f"{'':<{width}}        fix: {entry.suggestion}")
+    if not report.ok:
+        ctx.exit(2)
 
 
 def _format_status(status_obj: dict) -> str:

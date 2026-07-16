@@ -58,6 +58,12 @@ def test_help_output_is_operator_readable() -> None:
     assert "Serve the optional MCP broker over stdio" in mcp_help.output
     assert "--catalog PATH" in mcp_help.output
 
+    check_help = runner.invoke(cli_main, ["mcp-check", "--help"], terminal_width=120)
+    assert check_help.exit_code == 0
+    assert "Args:" not in check_help.output
+    assert "per-experiment ok/FAIL report" in check_help.output
+    assert "--catalog PATH" in check_help.output
+
 
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:
     """``phasesweep validate`` surfaces phase comments so the operator sees
