@@ -18,6 +18,7 @@ from pathlib import Path
 
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
+from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -26,14 +27,14 @@ from phasesweep.runtime.process import (
 
 
 def _write_status(status_path: Path, payload: dict) -> None:
-    """Best-effort write of the runner terminal status file.
+    """Best-effort write of the runner terminal status file, stamped with an end time.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
     """
     # Best-effort: a failed status write must not mask the real exit cause.
     try:
-        write_status_file(status_path, payload)
+        write_status_file(status_path, {**payload, "ended_at": utc_now_iso()})
     except OSError:
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
 

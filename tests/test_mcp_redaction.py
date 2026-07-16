@@ -69,6 +69,8 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         reg.id,
         {"metric": {"name": "loss", "goal": "minimize"}, "phases": [], "summary_present": False},
         None,
+        elapsed_seconds=None,
+        poll_after_seconds=30,
     )
 
     assert_no_sensitive(winners, sensitive)

@@ -71,16 +71,24 @@ def status_payload(
     experiment_id: str,
     status: dict[str, Any],
     run: dict[str, Any] | None,
+    *,
+    elapsed_seconds: int | None,
+    poll_after_seconds: int,
 ) -> dict[str, Any]:
     """Build the ``get_status`` payload from the path-free read_status dict.
 
     ``status`` is the read_status output (already path-free). ``run`` is the
     process-level state for a specific run_id, or None for an experiment-level
-    query with no recorded runs.
+    query with no recorded runs. Timing fields are counts of seconds computed
+    by the server - durations only, never timestamps of operator activity or
+    anything path-shaped.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
     :param dict[str, Any] | None run: Optional path-free detached-run state.
+    :param int | None elapsed_seconds: Seconds since launch (running) or total
+        run duration (terminal); ``None`` without an associated run.
+    :param int poll_after_seconds: Suggested wait before the next status call.
     :return dict[str, Any]: MCP-safe status payload.
     """
     return {
@@ -89,4 +97,6 @@ def status_payload(
         "phases": status["phases"],
         "summary_present": status["summary_present"],
         "run": run,
+        "elapsed_seconds": elapsed_seconds,
+        "poll_after_seconds": poll_after_seconds,
     }

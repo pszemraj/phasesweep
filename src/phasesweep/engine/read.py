@@ -13,6 +13,7 @@ re-verify phase fingerprints: that check belongs to the resume path in
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -20,7 +21,7 @@ from typing import Any
 import yaml
 
 from phasesweep.config import Experiment
-from phasesweep.engine.optuna import _phase_trial_counts
+from phasesweep.engine.optuna import _phase_trial_counts, phase_completed_trial_durations
 from phasesweep.engine.state import _summary_path, _winner_path
 
 
@@ -56,7 +57,12 @@ def _phase_status_payloads(
     for phase in experiment.phases:
         winner_path = _winner_path(experiment, phase.name)
         counts = _phase_trial_counts(experiment, phase)
-        payload: dict[str, Any] = {"trials": counts, "running": counts.get("RUNNING", 0)}
+        payload: dict[str, Any] = {
+            "trials": counts,
+            "running": counts.get("RUNNING", 0),
+            "n_trials": phase.n_trials,
+            "completed": counts.get("COMPLETE", 0),
+        }
         if include_winner_path:
             payload.update(
                 {"name": phase.name, "winner": str(winner_path) if winner_path.is_file() else None}
@@ -151,19 +157,29 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
     study that does not exist yet, never creates one as a side effect, and
     swallows transient backend errors (e.g. a momentary SQLite lock while the
     runner writes) by returning ``{}`` for that phase rather than raising.
+    ``median_trial_seconds`` follows the same permissive contract: it is the
+    median wall duration of COMPLETE trials across all phases, or ``None``
+    while nothing has finished — callers use it to size their poll interval.
 
     Args:
         experiment: Parsed experiment config whose phases are inspected.
 
     Returns:
         A path-free mapping with the experiment name, metric descriptor, a
-        per-phase list of trial counts plus winner presence, and whether the
-        experiment summary has been written.
+        per-phase list of trial counts plus winner presence, the median
+        completed-trial duration, and whether the experiment summary has been
+        written.
 
     """
+    durations = [
+        seconds
+        for phase in experiment.phases
+        for seconds in phase_completed_trial_durations(experiment, phase)
+    ]
     return {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
         "phases": _phase_status_payloads(experiment, include_winner_path=False),
         "summary_present": _summary_path(experiment).is_file(),
+        "median_trial_seconds": statistics.median(durations) if durations else None,
     }

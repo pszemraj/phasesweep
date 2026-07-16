@@ -17,6 +17,7 @@ import logging
 import subprocess
 import sys
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -63,6 +64,13 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
+# Adaptive poll-interval bounds for get_status: the suggested wait tracks the
+# median completed-trial duration so agents polling minute-long trials back
+# off, clamped so pathological durations can neither hammer the storage nor
+# park the agent for an hour.
+POLL_DEFAULT_SECONDS = 30
+POLL_MIN_SECONDS = 15
+POLL_MAX_SECONDS = 600
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -223,6 +231,8 @@ class PhaseStatusPayload(_ToolPayload):
     phase: PhaseName
     trials: dict[str, int] = Field(description="Optuna trial counts by state.")
     running: int = Field(ge=0, description="Number of currently running trials.")
+    n_trials: int = Field(ge=0, description="Configured trial budget for this phase.")
+    completed: int = Field(ge=0, description="Trials completed so far in this phase.")
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
 
 
@@ -234,6 +244,20 @@ class GetStatusResult(_ToolPayload):
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload | None
+    elapsed_seconds: int | None = Field(
+        description=(
+            "Seconds since launch while running; total run duration once terminal; "
+            "null when no run is associated with this query."
+        )
+    )
+    poll_after_seconds: int = Field(
+        ge=POLL_MIN_SECONDS,
+        le=POLL_MAX_SECONDS,
+        description=(
+            "Suggested seconds to wait before the next phasesweep_get_status call, "
+            "sized from the median completed-trial duration."
+        ),
+    )
 
 
 class WinnerPhasePayload(_ToolPayload):
@@ -301,6 +325,69 @@ def _cursor_offset(cursor: str | None) -> int:
             "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
         )
     return offset
+
+
+def _parse_utc_iso(value: object) -> datetime | None:
+    """Parse a persisted ISO-8601 timestamp, tolerating malformed values.
+
+    :param object value: Raw timestamp field from a handle or status payload.
+    :return datetime | None: Timezone-aware datetime, or ``None`` when the
+        value is missing, malformed, or naive.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
+    """Compute wall seconds for a run: launch-to-now while running, total when terminal.
+
+    Terminal runs prefer the runner-stamped ``ended_at`` in status.json and
+    fall back to the status file's mtime (runs recorded before the stamp
+    existed). A terminal run with no readable status at all - e.g. SIGKILLed
+    before writing one - reports ``None`` rather than a guess.
+
+    :param RunStore store: Run store used to read the terminal status.
+    :param RunHandle handle: Persisted run whose duration is measured.
+    :param str state: Derived run state for ``handle``.
+    :return int | None: Non-negative whole seconds, or ``None`` when the
+        endpoints cannot be established.
+    """
+    started = _parse_utc_iso(handle.started_at)
+    if started is None:
+        return None
+    ended: datetime | None
+    if state == "running":
+        ended = datetime.now(timezone.utc)
+    else:
+        status = store.recorded_terminal_status(handle)
+        ended = _parse_utc_iso(status.get("ended_at")) if status is not None else None
+        if ended is None and status is not None:
+            try:
+                mtime = store.status_path(handle.run_id).stat().st_mtime
+            except OSError:
+                return None
+            ended = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    if ended is None:
+        return None
+    return max(0, round((ended - started).total_seconds()))
+
+
+def _poll_after_seconds(median_trial_seconds: float | None) -> int:
+    """Suggest a status poll interval from the median completed-trial duration.
+
+    :param float | None median_trial_seconds: Median COMPLETE-trial wall
+        duration, or ``None`` while nothing has finished.
+    :return int: Whole seconds clamped to the poll bounds; the default when no
+        trial has completed yet.
+    """
+    if median_trial_seconds is None:
+        return POLL_DEFAULT_SECONDS
+    return int(min(POLL_MAX_SECONDS, max(POLL_MIN_SECONDS, round(median_trial_seconds))))
 
 
 class PhaseSweepMCP:
@@ -482,7 +569,19 @@ class PhaseSweepMCP:
             )
             if run is not None:
                 state_after = {"run_state": run["state"]}
-            result = status_payload(target_id, read_status(experiment), run)
+            status = read_status(experiment)
+            elapsed_seconds = None
+            if run is not None:
+                handle = self._runs.get(run["run_id"])
+                if handle is not None:
+                    elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+            result = status_payload(
+                target_id,
+                status,
+                run,
+                elapsed_seconds=elapsed_seconds,
+                poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
+            )
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise

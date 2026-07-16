@@ -463,6 +463,9 @@ class RunStore:
         error_class = payload.get("error_class")
         if error_class is not None and not isinstance(error_class, str):
             return None
+        ended_at = payload.get("ended_at")
+        if ended_at is not None and not isinstance(ended_at, str):
+            return None
         return payload
 
     def _cleanup_uncertain(self, handle: RunHandle) -> bool:

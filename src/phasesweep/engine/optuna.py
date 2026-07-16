@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -302,3 +303,84 @@ def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     for trial in study.get_trials(deepcopy=False):
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
     return counts
+
+
+def _sqlite_completed_trial_durations(experiment: Experiment, phase: Phase) -> list[float]:
+    """Return COMPLETE-trial wall durations from a SQLite Optuna DB, read-only.
+
+    Same discipline as ``_sqlite_trial_counts``: open the file in SQLite
+    read-only mode so a status poll can never create schema or race the
+    runner's first write; a missing, locked, or still-initializing DB simply
+    reports no durations for now. Rows with missing or unparseable timestamps
+    are skipped rather than raising.
+
+    :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
+    :param Phase phase: Phase whose stable Optuna study name is inspected.
+    :return list[float]: Wall-clock seconds per COMPLETE trial, or an empty
+        list when the backing DB cannot be read safely.
+    """
+    assert experiment.storage is not None
+    uri = sqlite_readonly_uri(experiment.storage)
+    if uri is None:
+        return []
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+        try:
+            rows = conn.execute(
+                """
+                SELECT trials.datetime_start, trials.datetime_complete
+                FROM trials
+                JOIN studies ON trials.study_id = studies.study_id
+                WHERE studies.study_name = ? AND trials.state = 'COMPLETE'
+                """,
+                (_phase_study_name(experiment, phase),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    durations: list[float] = []
+    for start_raw, complete_raw in rows:
+        if not isinstance(start_raw, str) or not isinstance(complete_raw, str):
+            continue
+        try:
+            seconds = (
+                datetime.fromisoformat(complete_raw) - datetime.fromisoformat(start_raw)
+            ).total_seconds()
+        except ValueError:
+            continue
+        if seconds >= 0:
+            durations.append(seconds)
+    return durations
+
+
+def phase_completed_trial_durations(experiment: Experiment, phase: Phase) -> list[float]:
+    """Return wall durations of COMPLETE trials without creating a missing study.
+
+    Read-only companion to ``_phase_trial_counts`` used to derive an adaptive
+    status poll interval: SQLite storages are queried directly in read-only
+    mode; journal storages reuse the loaded study's ``FrozenTrial.duration``.
+
+    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param Phase phase: Phase whose existing study is inspected.
+    :return list[float]: Wall-clock seconds per COMPLETE trial; empty when the
+        study does not exist yet or the backend cannot be read safely.
+    """
+    if experiment.storage is None:
+        return []
+    backend = storage_backend(experiment.storage)
+    if backend == "sqlite":
+        return _sqlite_completed_trial_durations(experiment, phase)
+    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
+        return []
+    try:
+        study = _load_phase_study(experiment, phase)
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        trial.duration.total_seconds()
+        for trial in study.get_trials(deepcopy=False)
+        if trial.state == optuna.trial.TrialState.COMPLETE
+        and trial.duration is not None
+        and trial.duration.total_seconds() >= 0
+    ]

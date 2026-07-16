@@ -41,7 +41,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | --- | --- | --- | --- |
 | `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
-| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase trial counts + winner presence, and the run process state |
+| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds` |
 | `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, gate status, and completeness |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
@@ -101,7 +101,7 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 
 `audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
-Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop. SQLite-backed status uses a read-only direct count path; Journal-backed status uses Optuna's read path today, so large local studies should be polled every few seconds until the tracked aggregate-count optimization is implemented.
+Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop; each result carries a `poll_after_seconds` suggestion sized from the median completed-trial duration (30s until anything finishes, clamped to 15-600s). SQLite-backed status uses a read-only direct count path; Journal-backed status uses Optuna's read path today, so large local studies should be polled every few seconds until the tracked aggregate-count optimization is implemented.
 
 ### Long-running servers
 
