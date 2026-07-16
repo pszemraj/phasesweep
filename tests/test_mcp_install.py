@@ -143,6 +143,15 @@ def test_marked_block_replaces_in_place(tmp_path):
     )
 
 
+def test_marked_block_refuses_unmatched_marker(tmp_path):
+    path = tmp_path / "AGENTS.md"
+    original = f"before\n{MARKDOWN_START}\nunterminated\n"
+    path.write_text(original)
+
+    assert replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "error"
+    assert path.read_text() == original
+
+
 # --- targets ---
 
 
@@ -190,6 +199,13 @@ def test_entry_styles_and_codex_toml(tmp_path):
     assert opencode["type"] == "local"
     parsed = tomllib.loads(codex_toml_content("/bin/x", catalog))
     assert parsed["mcp_servers"]["phasesweep"]["args"] == ["--catalog", "/proj/catalog.yaml"]
+
+    unicode_catalog = Path("/proj/🧪/catalog.yaml")
+    unicode_parsed = tomllib.loads(codex_toml_content("/tools/🚀/phasesweep-mcp", unicode_catalog))
+    assert unicode_parsed["mcp_servers"]["phasesweep"] == {
+        "command": "/tools/🚀/phasesweep-mcp",
+        "args": ["--catalog", str(unicode_catalog)],
+    }
 
 
 # --- installer orchestration ---
@@ -264,6 +280,65 @@ def test_installer_skips_unmanaged_codex_table(fake_home, tmp_path, capsys):
     # Uninstall never touches unmanaged tables either.
     assert installer.run("uninstall", project, None, ["codex"], "mcp", yes=True) == 0
     assert codex_config.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        '[mcp_servers."phasesweep"]\ncommand = "custom"\n',
+        'mcp_servers = { phasesweep = { command = "custom" } }\n',
+        'mcp_servers.phasesweep.command = "custom"\n',
+    ],
+)
+def test_installer_detects_unmanaged_codex_table_semantically(
+    fake_home, tmp_path, capsys, original
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    codex_config = fake_home / ".codex" / "config.toml"
+    codex_config.parent.mkdir()
+    codex_config.write_text(original)
+
+    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+
+    assert code == 1
+    assert "unmanaged" in capsys.readouterr().out
+    assert codex_config.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        "theme = [\n",
+        'mcp_servers = { other = { command = "x" } }\n',
+    ],
+)
+def test_installer_refuses_invalid_codex_toml_merge(fake_home, tmp_path, capsys, original):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    codex_config = fake_home / ".codex" / "config.toml"
+    codex_config.parent.mkdir()
+    codex_config.write_text(original)
+
+    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+
+    assert code == 1
+    assert "invalid TOML" in capsys.readouterr().out
+    assert codex_config.read_text() == original
+
+
+def test_installer_writes_unicode_codex_catalog_path(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj-🧪"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+
+    assert code == 0, capsys.readouterr().out
+    parsed = tomllib.loads((fake_home / ".codex" / "config.toml").read_text())
+    assert parsed["mcp_servers"]["phasesweep"]["args"] == ["--catalog", str(catalog)]
 
 
 # --- CLI flow ---

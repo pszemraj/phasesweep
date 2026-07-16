@@ -21,6 +21,11 @@ from typing import Literal
 
 import click
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from phasesweep.mcp.install.edits import (
     Action,
     manual_json_snippet,
@@ -28,6 +33,7 @@ from phasesweep.mcp.install.edits import (
     remove_json_member,
     remove_marked,
     replace_or_append_marked,
+    updated_marked_text,
 )
 from phasesweep.mcp.install.targets import (
     MARKDOWN_END,
@@ -111,19 +117,42 @@ def _apply_mcp(target: AgentTarget, mode: Mode, command: str, catalog: Path | No
         if catalog is None:
             raise ValueError("installing an MCP entry requires a catalog path")
         existing = spec.path.read_text(encoding="utf-8") if spec.path.exists() else ""
-        if _CODEX_TABLE_HEADER in existing and TOML_START not in existing:
+        content = codex_toml_content(command, catalog)
+        if TOML_START not in existing:
+            try:
+                parsed = tomllib.loads(existing)
+            except tomllib.TOMLDecodeError as exc:
+                return StepResult(
+                    "mcp",
+                    spec.path,
+                    "skipped",
+                    note=f"config contains invalid TOML ({exc}); merge this manually:\n{content}",
+                )
+            servers = parsed.get("mcp_servers")
+            if isinstance(servers, dict) and SERVER_NAME in servers:
+                return StepResult(
+                    "mcp",
+                    spec.path,
+                    "skipped",
+                    note=(
+                        f"an unmanaged {_CODEX_TABLE_HEADER} table already exists; "
+                        f"update it manually to:\n{content}"
+                    ),
+                )
+        try:
+            candidate = updated_marked_text(existing, content, start=TOML_START, end=TOML_END)
+            tomllib.loads(candidate)
+        except ValueError as exc:
             return StepResult(
                 "mcp",
                 spec.path,
                 "skipped",
                 note=(
-                    f"an unmanaged {_CODEX_TABLE_HEADER} table already exists; "
-                    "update it manually to:\n" + codex_toml_content(command, catalog)
+                    f"automatic merge would produce invalid TOML ({exc}); "
+                    f"merge this manually:\n{content}"
                 ),
             )
-        action = replace_or_append_marked(
-            spec.path, codex_toml_content(command, catalog), start=TOML_START, end=TOML_END
-        )
+        action = replace_or_append_marked(spec.path, content, start=TOML_START, end=TOML_END)
         return StepResult("mcp", spec.path, action)
 
     if mode == "uninstall":

@@ -157,6 +157,27 @@ def render_marked_block(content: str, *, start: str, end: str) -> str:
     return f"{start}\n{content.strip()}\n{end}\n"
 
 
+def updated_marked_text(existing: str, content: str, *, start: str, end: str) -> str:
+    """Return ``existing`` with one marker-fenced block replaced or appended.
+
+    :param str existing: Existing file text.
+    :param str content: Block body to place between the markers.
+    :param str start: Start marker line.
+    :param str end: End marker line.
+    :return str: Complete updated file text.
+    :raises ValueError: If the existing text has an unmatched marker.
+    """
+    block = render_marked_block(content, start=start, end=end)
+    start_idx = existing.find(start)
+    end_idx = existing.find(end)
+    if (start_idx == -1) != (end_idx == -1) or (start_idx != -1 and end_idx <= start_idx):
+        raise ValueError("existing marker block is incomplete or out of order")
+    if start_idx != -1:
+        return existing[:start_idx] + block.rstrip("\n") + existing[end_idx + len(end) :]
+    separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+    return existing + separator + block
+
+
 def replace_or_append_marked(path: Path, content: str, *, start: str, end: str) -> Action:
     """Install a marker-fenced block into a text file, idempotently.
 
@@ -169,22 +190,16 @@ def replace_or_append_marked(path: Path, content: str, *, start: str, end: str) 
     :param str end: End marker line.
     :return Action: ``created``/``updated``/``unchanged``.
     """
-    block = render_marked_block(content, start=start, end=end)
     existed = path.exists()
     existing = path.read_text(encoding="utf-8") if existed else ""
-
-    start_idx = existing.find(start)
-    end_idx = existing.find(end)
-    if start_idx != -1 and end_idx > start_idx:
-        updated = existing[:start_idx] + block.rstrip("\n") + existing[end_idx + len(end) :]
-        if updated == existing:
-            return "unchanged"
-        path.write_text(updated, encoding="utf-8")
-        return "updated"
-
-    separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+    try:
+        updated = updated_marked_text(existing, content, start=start, end=end)
+    except ValueError:
+        return "error"
+    if updated == existing:
+        return "unchanged"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(existing + separator + block, encoding="utf-8")
+    path.write_text(updated, encoding="utf-8")
     return "created" if not existed else "updated"
 
 

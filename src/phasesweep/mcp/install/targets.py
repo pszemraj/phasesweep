@@ -113,11 +113,13 @@ def codex_toml_content(command: str, catalog: Path) -> str:
     :param Path catalog: Absolute catalog path passed as ``--catalog``.
     :return str: TOML table text placed between the installer markers.
     """
-    # json.dumps produces valid TOML basic strings for paths.
+    # JSON and TOML basic strings share escaping for valid Unicode. Keeping
+    # non-ASCII characters literal avoids JSON's non-BMP UTF-16 surrogate pairs,
+    # which TOML rejects because each \u escape must be a Unicode scalar value.
     return (
         f"[mcp_servers.{SERVER_NAME}]\n"
-        f"command = {json.dumps(command)}\n"
-        f'args = ["--catalog", {json.dumps(str(catalog))}]'
+        f"command = {json.dumps(command, ensure_ascii=False)}\n"
+        f'args = ["--catalog", {json.dumps(str(catalog), ensure_ascii=False)}]'
     )
 
 
