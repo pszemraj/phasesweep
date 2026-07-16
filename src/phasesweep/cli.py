@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import sys
@@ -614,6 +615,13 @@ def install(
     project = project_dir.resolve()
     catalog_path: Path | None = None
     if integration != "instructions":
+        if importlib.util.find_spec("mcp") is None:
+            click.echo(
+                "phasesweep install: MCP support is not installed; install with "
+                "`pip install 'phasesweep[mcp]'`; no client config was touched.",
+                err=True,
+            )
+            ctx.exit(2)
         catalog_path = (catalog if catalog is not None else project / "catalog.yaml").resolve()
         if not catalog_path.exists() and not _offer_catalog_scaffold(catalog_path, yes):
             ctx.exit(2)

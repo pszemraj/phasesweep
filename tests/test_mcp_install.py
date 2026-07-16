@@ -320,16 +320,47 @@ def test_cli_install_offers_catalog_scaffold_interactively(fake_home, tmp_path, 
     assert "phasesweep" in json.loads((project / ".mcp.json").read_text())["mcpServers"]
 
 
-def test_cli_install_instructions_only_needs_no_catalog(fake_home, tmp_path, monkeypatch):
+def test_cli_install_instructions_only_needs_no_catalog_or_sdk(fake_home, tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.chdir(project)
+    monkeypatch.setattr("phasesweep.cli.importlib.util.find_spec", lambda _name: None)
     result = CliRunner().invoke(
         cli_main, ["install", "--agent", "claude", "--type", "instructions", "--yes"]
     )
     assert result.exit_code == 0, result.output
     assert MARKDOWN_START in (project / "CLAUDE.md").read_text()
     assert not (project / ".mcp.json").exists()
+
+
+@pytest.mark.parametrize("integration", ["mcp", "all"])
+def test_cli_install_requires_mcp_sdk_before_client_edits(
+    fake_home, tmp_path, monkeypatch, integration
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    monkeypatch.setattr("phasesweep.cli.importlib.util.find_spec", lambda _name: None)
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "install",
+            "--catalog",
+            str(catalog),
+            "--agent",
+            "claude",
+            "--type",
+            integration,
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "pip install 'phasesweep[mcp]'" in result.output
+    assert "no client config was touched" in result.output
+    assert not (project / ".mcp.json").exists()
+    assert not (project / "CLAUDE.md").exists()
 
 
 def test_cli_interactive_selection_among_detected_agents(fake_home, tmp_path, monkeypatch):
