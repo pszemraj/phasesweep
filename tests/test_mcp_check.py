@@ -38,6 +38,8 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert report.ok
     assert [entry.experiment_id for entry in report.entries] == ["alpha", "beta"]
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
+    assert (tmp_path / "state" / "runs").is_dir()
+    assert (tmp_path / "state" / "logs").is_dir()
     # The shared code path means a green report implies a bootable server.
     Registry.load(catalog)
 
@@ -103,6 +105,24 @@ def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
     catalog.write_text("experiments: []\n")
     with pytest.raises(CatalogError, match="catalog"):
         check_catalog(catalog)
+
+
+@pytest.mark.parametrize("blocked_path", ["state", "state/runs", "state/logs"])
+def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_path: str) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
+    )
+    blocked = tmp_path / blocked_path
+    blocked.parent.mkdir(parents=True, exist_ok=True)
+    blocked.write_text("not a directory\n")
+
+    with pytest.raises(CatalogError, match="state_dir is not usable") as exc_info:
+        check_catalog(catalog)
+
+    assert "writable directory path" in (exc_info.value.suggestion or "")
+    with pytest.raises(CatalogError, match="state_dir is not usable"):
+        Registry.load(catalog)
 
 
 def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:

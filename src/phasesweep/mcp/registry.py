@@ -21,6 +21,7 @@ from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
     file_url_path,
     sqlite_uri_filename_path,
@@ -166,6 +167,25 @@ def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
     resolved = _resolve_catalog_relative_path(base, path)
     if not resolved.is_dir():
         raise CatalogError(f"{label} is not an existing directory: {resolved}")
+    return resolved
+
+
+def _prepare_state_dir(base: Path, path: Path) -> Path:
+    """Resolve and initialize the run-store directories used at server startup.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored ``state_dir`` path.
+    :return Path: Absolute initialized state directory.
+    :raises CatalogError: If the run store cannot create or secure its directories.
+    """
+    resolved = _resolve_catalog_relative_path(base, path)
+    try:
+        RunStore(resolved)
+    except OSError as exc:
+        raise CatalogError(
+            f"state_dir is not usable: {resolved}: {exc}",
+            suggestion="set state_dir to a writable directory path (not a file)",
+        ) from exc
     return resolved
 
 
@@ -373,6 +393,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
             if allowed
         )
         entries.append(CatalogCheckEntry(entry.id, actions=actions))
+    _prepare_state_dir(base, catalog.state_dir)
     return CatalogCheckReport(entries=tuple(entries))
 
 
@@ -419,7 +440,7 @@ class Registry:
                 raise CatalogError(f"duplicate catalog id {entry.id!r}")
             items[entry.id] = _load_entry(base, entry)
         return cls(
-            state_dir=_resolve_catalog_relative_path(base, catalog.state_dir),
+            state_dir=_prepare_state_dir(base, catalog.state_dir),
             items=items,
             max_concurrent_runs=catalog.max_concurrent_runs,
         )

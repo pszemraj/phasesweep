@@ -57,7 +57,7 @@ Confirm the catalog loads before touching any client config:
 phasesweep mcp-check --catalog /abs/path/to/catalog.yaml
 ```
 
-`mcp-check` runs the exact validation the server applies at startup and prints one `ok` / `FAIL` line per experiment - the offending rule and a suggested fix on failures, the enabled actions on successes. It exits 0 when every entry loads and 2 otherwise. Fix and re-run until green; a green report means the server will boot with this catalog.
+`mcp-check` runs the exact validation the server applies at startup, including creating and securing the `state_dir`, `runs`, and `logs` directories, and prints one `ok` / `FAIL` line per experiment - the offending rule and a suggested fix on failures, the enabled actions on successes. It exits 0 when every entry loads and the state path is usable, and 2 otherwise. Fix and re-run until green; a green report means the server will boot with this catalog.
 
 ## 3. Connect your client
 
