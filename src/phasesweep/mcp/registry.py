@@ -393,8 +393,10 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
             if allowed
         )
         entries.append(CatalogCheckEntry(entry.id, actions=actions))
-    _prepare_state_dir(base, catalog.state_dir)
-    return CatalogCheckReport(entries=tuple(entries))
+    report = CatalogCheckReport(entries=tuple(entries))
+    if report.ok:
+        _prepare_state_dir(base, catalog.state_dir)
+    return report
 
 
 class Registry:

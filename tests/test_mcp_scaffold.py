@@ -103,6 +103,7 @@ def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
     assert "nothing was written" in result.output
     assert not output.exists()
     assert not output.with_name(output.name + ".tmp").exists()
+    assert not (tmp_path / "runs").exists()
 
 
 def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:

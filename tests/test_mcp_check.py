@@ -70,6 +70,7 @@ def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
     assert "set workdir to an absolute path" in (verdicts["bad-workdir"].suggestion or "")
     assert "absolute sqlite storage path" in (verdicts["bad-storage"].error or "")
     assert "use an absolute path" in (verdicts["bad-storage"].suggestion or "")
+    assert not (tmp_path / "state").exists()
     # Registry.load stays fail-fast on the same catalog.
     with pytest.raises(CatalogError, match="absolute workdir"):
         Registry.load(catalog)
