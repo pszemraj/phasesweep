@@ -62,7 +62,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 
 ## MCP server (agent integration)
 
-`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). The supported MCP mode is local-node control over stdio; remote control planes, hosted multi-user deployments, and multi-host shared studies are out of scope for this version. Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Use [MCP agent setup](docs/mcp_setup.md) to go from a fresh environment to a working agent in five steps, and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
+`phasesweep-mcp` and `phasesweep mcp` expose reviewed experiments over the [Model Context Protocol](https://modelcontextprotocol.io). The supported MCP mode is local-node control over stdio; remote control planes, hosted multi-user deployments, and multi-host shared studies are out of scope for this version. Agents operate by catalog id instead of receiving config paths, trainer commands, raw logs, storage URLs, or workdirs. Setup is two commands — `phasesweep init-catalog` scaffolds the experiment allowlist, `phasesweep install` wires the server into your coding agents' configs (Claude Code, Codex, Cursor, VS Code, Gemini CLI, opencode, Claude Desktop). Use [MCP agent setup](docs/mcp_setup.md) for the full five-step walkthrough, and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
 
 ## Docs
 
@@ -70,7 +70,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the seven tools, security model, single-host operation.
-- [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - write a catalog, preflight it with `mcp-check`, connect your client, verify, instruct the agent.
+- [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - scaffold a catalog, preflight it with `mcp-check`, connect your clients with `phasesweep install`, verify, instruct the agent.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.
 
