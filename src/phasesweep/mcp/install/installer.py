@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import importlib.resources
+import os
 import shutil
 import sys
 from collections.abc import Sequence
@@ -88,13 +89,23 @@ def instructions_text() -> str:
 def resolve_server_command() -> str:
     """Resolve the ``phasesweep-mcp`` executable clients should launch.
 
-    :return str: Absolute path from ``PATH`` when available, otherwise the
-        script directory of the running interpreter (venv/conda layout).
+    Prefer the script beside the running interpreter so ``conda run`` and
+    explicit environment executables cannot be redirected by an unrelated
+    ``PATH`` entry.
+
+    :return str: Absolute path to an executable ``phasesweep-mcp`` script.
+    :raises FileNotFoundError: If neither the active environment nor ``PATH``
+        contains a launchable script.
     """
+    sibling = Path(sys.executable).parent / "phasesweep-mcp"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling.resolve())
     found = shutil.which("phasesweep-mcp")
     if found:
-        return found
-    return str(Path(sys.executable).parent / "phasesweep-mcp")
+        return str(Path(found).resolve())
+    raise FileNotFoundError(
+        "cannot find an executable phasesweep-mcp in the active Python environment or PATH"
+    )
 
 
 def _apply_mcp(target: AgentTarget, mode: Mode, command: str, catalog: Path | None) -> StepResult:
@@ -306,7 +317,13 @@ def run(
         click.echo("cancelled; nothing was changed.")
         return 2
 
-    command = resolve_server_command()
+    command = ""
+    if mode == "install" and "mcp" in integrations:
+        try:
+            command = resolve_server_command()
+        except FileNotFoundError as exc:
+            click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+            return 1
     attention = 0
     for target in targets:
         click.echo(f"  {target.display_name}")

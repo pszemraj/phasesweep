@@ -187,6 +187,26 @@ def test_detection_uses_binary_or_config_dir(fake_home, tmp_path):
     assert [t.id for t in agent_targets(project) if t.is_detected()] == ["cursor"]
 
 
+def test_server_command_prefers_running_python_environment(tmp_path, monkeypatch):
+    env_bin = tmp_path / "env" / "bin"
+    env_bin.mkdir(parents=True)
+    command = env_bin / "phasesweep-mcp"
+    command.write_text("#!/bin/sh\n")
+    command.chmod(0o755)
+    monkeypatch.setattr(installer.sys, "executable", str(env_bin / "python"))
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: "/other/bin/phasesweep-mcp")
+
+    assert installer.resolve_server_command() == str(command.resolve())
+
+
+def test_server_command_refuses_missing_executable(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer.sys, "executable", str(tmp_path / "env" / "bin" / "python"))
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+
+    with pytest.raises(FileNotFoundError, match="cannot find an executable"):
+        installer.resolve_server_command()
+
+
 def test_entry_styles_and_codex_toml(tmp_path):
     catalog = Path("/proj/catalog.yaml")
     assert mcp_entry("stdio", "/bin/x", catalog) == {
@@ -248,6 +268,26 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     leftovers = [p for p in project.rglob("*") if p.is_file() and p.name != "catalog.yaml"]
     assert leftovers == []
     assert not codex_config.exists()
+
+
+def test_installer_refuses_missing_server_command_before_edits(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def missing_server_command():
+        raise FileNotFoundError("missing executable")
+
+    monkeypatch.setattr(installer, "resolve_server_command", missing_server_command)
+
+    code = installer.run("install", project, catalog, ["claude"], "all", yes=True)
+
+    assert code == 1
+    assert "no client config was touched" in capsys.readouterr().err
+    assert not (project / ".mcp.json").exists()
+    assert not (project / "CLAUDE.md").exists()
 
 
 def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, capsys):
