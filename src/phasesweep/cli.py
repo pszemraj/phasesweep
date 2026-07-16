@@ -21,6 +21,8 @@ from phasesweep.engine.guards import (
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import CatalogError
+from phasesweep.mcp.install import installer as mcp_installer
+from phasesweep.mcp.install.targets import AGENT_IDS
 from phasesweep.mcp.registry import CatalogCheckReport, check_catalog
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.scaffold import scaffold_catalog_text
@@ -496,13 +498,33 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
             err=True,
         )
         ctx.exit(2)
+    if not _scaffold_validated_catalog(output, from_configs):
+        ctx.exit(2)
+    click.echo(
+        "next: fill in each description, decide allow/visible_params, then connect "
+        f"your MCP client (docs/mcp_setup.md) with --catalog {output.resolve()}"
+    )
+
+
+def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) -> bool:
+    """Render, validate, and atomically write a scaffolded catalog.
+
+    The annotated catalog is rendered to a same-directory temp file (so
+    relative ``config:`` paths resolve exactly as they will from the final
+    file), validated with ``check_catalog``, and renamed into place only when
+    every entry loads. Operator-facing: output may include paths.
+
+    :param Path output: Catalog destination.
+    :param tuple[Path, ...] from_configs: Experiment configs to catalog.
+    :return bool: True when the catalog was written; False after printing why not.
+    """
     try:
         text = scaffold_catalog_text(output, from_configs)
     except CatalogError as exc:
         click.echo(f"phasesweep init-catalog: {exc}", err=True)
         if exc.suggestion:
             click.echo(f"fix: {exc.suggestion}", err=True)
-        ctx.exit(2)
+        return False
     output.parent.mkdir(parents=True, exist_ok=True)
     staged = output.with_name(output.name + ".tmp")
     staged.write_text(text, encoding="utf-8")
@@ -511,7 +533,7 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     except CatalogError as exc:
         staged.unlink(missing_ok=True)
         click.echo(f"phasesweep init-catalog: {exc}", err=True)
-        ctx.exit(2)
+        return False
     _echo_catalog_report(report)
     if not report.ok:
         staged.unlink(missing_ok=True)
@@ -519,12 +541,198 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
             "phasesweep init-catalog: fix the configs above and re-run; nothing was written.",
             err=True,
         )
-        ctx.exit(2)
+        return False
     staged.replace(output)
     click.echo(f"wrote {output}")
-    click.echo(
-        "next: fill in each description, decide allow/visible_params, then connect "
-        f"your MCP client (docs/mcp_setup.md) with --catalog {output.resolve()}"
+    return True
+
+
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Wire the phasesweep MCP server into coding-agent configs: an MCP server entry plus a "
+        "marker-fenced instructions block per agent, project-scoped wherever the client "
+        "supports it. The catalog is validated with the exact server startup rules before any "
+        "client config is touched. Without --agent, choose interactively among detected agents."
+    ),
+    short_help="Connect coding agents to the MCP server.",
+)
+@click.option(
+    "--catalog",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    metavar="PATH",
+    show_default="<project>/catalog.yaml",
+    help="MCP catalog the installed server entry will serve.",
+)
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    type=click.Choice(AGENT_IDS),
+    help="Agent to configure unattended; repeat for more.",
+)
+@click.option(
+    "--type",
+    "integration",
+    type=click.Choice(["mcp", "instructions", "all"]),
+    default="all",
+    show_default=True,
+    help="Integration to write: the MCP server entry, the instructions block, or both.",
+)
+@click.option(
+    "--project",
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("."),
+    show_default="current directory",
+    help="Project root for project-scoped client files.",
+)
+@click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
+@click.pass_context
+def install(
+    ctx: click.Context,
+    catalog: Path | None,
+    agents: tuple[str, ...],
+    integration: str,
+    project_dir: Path,
+    yes: bool,
+) -> None:
+    """Install phasesweep MCP and instructions integrations for coding agents.
+
+    Validates (or interactively scaffolds) the catalog first, then delegates
+    the plan-then-apply flow to :mod:`phasesweep.mcp.install.installer`.
+    Operator-facing: output may include paths.
+
+    :param click.Context ctx: Active Click context used for the exit code.
+    :param Path | None catalog: Catalog path; defaults to ``<project>/catalog.yaml``.
+    :param tuple[str, ...] agents: Explicit agent ids for unattended runs.
+    :param str integration: ``mcp``, ``instructions``, or ``all``.
+    :param Path project_dir: Project root for project-scoped client files.
+    :param bool yes: Skip every confirmation prompt.
+    """
+    project = project_dir.resolve()
+    catalog_path: Path | None = None
+    if integration != "instructions":
+        catalog_path = (catalog if catalog is not None else project / "catalog.yaml").resolve()
+        if not catalog_path.exists() and not _offer_catalog_scaffold(catalog_path, yes):
+            ctx.exit(2)
+        try:
+            report = check_catalog(catalog_path)
+        except CatalogError as exc:
+            click.echo(f"phasesweep install: {exc}", err=True)
+            ctx.exit(2)
+        if not report.ok:
+            _echo_catalog_report(report)
+            click.echo(
+                "phasesweep install: fix the catalog (see report above); "
+                "no client config was touched.",
+                err=True,
+            )
+            ctx.exit(2)
+    ctx.exit(
+        mcp_installer.run(
+            "install",
+            project,
+            catalog_path,
+            list(agents) or None,
+            integration,  # type: ignore[arg-type]
+            yes,
+        )
+    )
+
+
+def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
+    """Offer to scaffold a missing catalog before installing.
+
+    Unattended runs fail with the exact command to run instead; interactive
+    runs prompt for one experiment config and scaffold from it.
+
+    :param Path catalog_path: Missing catalog destination.
+    :param bool yes: Whether the run is unattended.
+    :return bool: True when a validated catalog now exists at ``catalog_path``.
+    """
+    suggestion = f"phasesweep init-catalog --from <experiment.yaml> -o {catalog_path}"
+    if yes:
+        click.echo(
+            f"phasesweep install: no catalog at {catalog_path}. Scaffold one first:\n  {suggestion}",
+            err=True,
+        )
+        return False
+    click.echo(f"no catalog at {catalog_path}.")
+    raw = click.prompt(
+        "experiment config to scaffold it from (blank to abort)",
+        default="",
+        show_default=False,
+    ).strip()
+    if not raw:
+        click.echo(f"aborted; scaffold a catalog with: {suggestion}", err=True)
+        return False
+    config = Path(raw)
+    if not config.is_file():
+        click.echo(f"phasesweep install: no such config file: {config}", err=True)
+        return False
+    return _scaffold_validated_catalog(catalog_path, (config,))
+
+
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Remove what `phasesweep install` wrote: the phasesweep MCP server entry (by name) and "
+        "the marker-fenced instructions block, per selected agent. Files the installer created "
+        "are deleted when they become empty."
+    ),
+    short_help="Disconnect coding agents.",
+)
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    type=click.Choice(AGENT_IDS),
+    help="Agent to clean up unattended; repeat for more.",
+)
+@click.option(
+    "--type",
+    "integration",
+    type=click.Choice(["mcp", "instructions", "all"]),
+    default="all",
+    show_default=True,
+    help="Integration to remove.",
+)
+@click.option(
+    "--project",
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("."),
+    show_default="current directory",
+    help="Project root for project-scoped client files.",
+)
+@click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
+@click.pass_context
+def uninstall(
+    ctx: click.Context,
+    agents: tuple[str, ...],
+    integration: str,
+    project_dir: Path,
+    yes: bool,
+) -> None:
+    """Remove installed phasesweep integrations from coding agents.
+
+    :param click.Context ctx: Active Click context used for the exit code.
+    :param tuple[str, ...] agents: Explicit agent ids for unattended runs.
+    :param str integration: ``mcp``, ``instructions``, or ``all``.
+    :param Path project_dir: Project root for project-scoped client files.
+    :param bool yes: Skip every confirmation prompt.
+    """
+    ctx.exit(
+        mcp_installer.run(
+            "uninstall",
+            project_dir.resolve(),
+            None,
+            list(agents) or None,
+            integration,  # type: ignore[arg-type]
+            yes,
+        )
     )
 
 
