@@ -14,6 +14,8 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
+import yaml
+
 from phasesweep.mcp.errors import CatalogError
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
@@ -52,6 +54,15 @@ def _catalog_relative_config(config: Path, catalog_dir: Path) -> str:
     return f"./{relative}"
 
 
+def _yaml_path_scalar(path: str | Path) -> str:
+    """Render a filesystem path as one YAML-safe double-quoted scalar.
+
+    :param str | Path path: Path value to serialize.
+    :return str: YAML scalar that round-trips punctuation and line breaks.
+    """
+    return yaml.safe_dump(str(path), default_style='"', allow_unicode=True).strip()
+
+
 def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     """Render an annotated catalog for ``configs``, addressed from ``output``.
 
@@ -73,10 +84,11 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
                 suggestion="rename one file, or edit the generated id afterwards",
             )
         seen[experiment_id] = config
+        config_path = _yaml_path_scalar(_catalog_relative_config(config, catalog_dir))
         entries.append(
             f"""\
   - id: {experiment_id}          # the only token the agent ever sends
-    config: {_catalog_relative_config(config, catalog_dir)}   # resolved relative to this catalog file
+    config: {config_path}   # resolved relative to this catalog file
     description: "TODO: one line the agent sees in phasesweep_list_experiments"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
     # Side effects default to false. Uncomment deliberately to let the agent act:
@@ -89,13 +101,13 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     state_dir = catalog_dir / "runs" / ".mcp"
     header = f"""\
 # MCP catalog scaffolded by `phasesweep init-catalog`. Start the server with:
-#   phasesweep mcp --catalog {output.name}
+#   phasesweep mcp --catalog /absolute/path/to/catalog.yaml
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which
 # experiments exist by editing this file (same trust as the experiment YAML).
 
-state_dir: {state_dir}   # run handles, logs, audit.jsonl (operator-owned)
+state_dir: {_yaml_path_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane
 experiments:
 """

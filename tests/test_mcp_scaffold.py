@@ -46,8 +46,8 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     assert f"wrote {output}" in result.output
 
     text = output.read_text()
-    assert f"state_dir: {tmp_path}/runs/.mcp" in text
-    assert "config: ./srv.yaml" in text
+    assert f'state_dir: "{tmp_path}/runs/.mcp"' in text
+    assert 'config: "./srv.yaml"' in text
     assert "visible_params: none" in text
     assert "\n    allow:" not in text  # side effects stay commented out
 
@@ -57,6 +57,34 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     assert entry.allow_launch is False
     assert entry.allow_cancel is False
     assert entry.visible_params == "none"
+
+
+@pytest.mark.parametrize("filename", ["model # 1.yaml", "model: 1.yaml", "model\n1.yaml"])
+def test_init_catalog_quotes_config_paths(tmp_path: Path, filename: str) -> None:
+    config = _write_config(tmp_path, filename)
+    output = tmp_path / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 0, result.output
+    entry = Registry.load(output).get(derive_experiment_id(config))
+    assert entry.config_path == config.resolve()
+
+
+def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> None:
+    config = _write_config(tmp_path, "srv.yaml")
+    catalog_dir = tmp_path / "project # one"
+    catalog_dir.mkdir()
+    output = catalog_dir / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Registry.load(output).state_dir == (catalog_dir / "runs" / ".mcp").resolve()
 
 
 def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
