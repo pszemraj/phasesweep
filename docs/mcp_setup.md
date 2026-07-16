@@ -16,7 +16,7 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep install` (step 3) resolves it for you; for manual setup, find it now:
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep install` (step 3) resolves it for you, so you only need the path for manual setup — in that case, find it now (`phasesweep-mcp` and `phasesweep mcp` start the same server; client configs use the dedicated executable):
 
 ```bash
 which phasesweep-mcp
@@ -32,7 +32,7 @@ The server refuses to start without a catalog: a fixed allowlist mapping stable 
 phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated, read-only `catalog.yaml` (validated with the exact server startup rules first — on failure it prints the per-entry report and writes nothing). Fill in each `description`, then deliberately enable `allow` flags and `visible_params` as needed. The equivalent hand-written catalog:
+This writes an annotated, read-only `catalog.yaml`, validated with the exact server startup rules first: it prints the same per-entry report as `mcp-check` either way, and on failure writes nothing. Each entry's `id` is derived from the experiment filename stem (`experiment.yaml` → `id: experiment`, unsafe characters become `-`); rename it freely in the scaffolded file. Fill in each `description`, then deliberately enable `allow` flags and `visible_params` as needed. The equivalent hand-written catalog:
 
 ```yaml
 # catalog.yaml
@@ -68,7 +68,7 @@ phasesweep install                        # interactive: confirm each detected a
 phasesweep install --agent claude --yes   # unattended; repeat --agent for more
 ```
 
-`install` validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, then reports one `created` / `updated` / `unchanged` line per edit. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`. A config that is not strict JSON (comments, JSON5) is never modified — the report says `skipped` and prints the exact snippet to merge manually. `--type mcp|instructions` installs one integration only; `--project DIR` targets another project root; `--catalog PATH` picks a catalog not named `./catalog.yaml`. `phasesweep uninstall` removes exactly what install wrote: the server entry by name, the instructions block by its markers, and any file that becomes empty.
+`install` validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, then reports one `created` / `updated` / `unchanged` line per edit. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`. A config that is not strict JSON (comments, JSON5) is never modified — the report says `skipped` and prints the exact snippet to merge manually. `--type mcp|instructions` installs one integration only; `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project — use `--catalog PATH` for any other name or location. `phasesweep uninstall` removes exactly what install wrote: the server entry by name, the instructions block by its markers, and any file that becomes empty.
 
 Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` — Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
 
@@ -268,7 +268,7 @@ A working setup returns your catalog entries with ids, descriptions, phase names
 
 If step 3's `phasesweep install` ran with instructions enabled (the default), this step is already done: the exact text below now sits between `<!-- PHASESWEEP_START -->` markers in each agent's project instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `.github/copilot-instructions.md`).
 
-Otherwise: if your client supports MCP prompts (Claude Code and Claude Desktop do), load the `phasesweep_run_and_monitor` prompt — it serves the exact text below, and nothing needs pasting. If your client supports MCP resources, `phasesweep://catalog` exposes the first catalog page; agents should still call `phasesweep_list_experiments` for pagination. As a last resort, paste this into the agent's project instructions or into chat before asking it to run a sweep. This is the same text the server ships as its MCP prompt; the packaged copy at `src/phasesweep/mcp/agent_prompt.md` is the source of truth.
+Otherwise: if your client supports MCP prompts (Claude Code and Claude Desktop do), load the `phasesweep_run_and_monitor` prompt — it serves the exact text below, and nothing needs pasting. If your client supports MCP resources, `phasesweep://catalog` exposes the first catalog page; agents should still call `phasesweep_list_experiments` for pagination. As a last resort, paste this into the agent's project instructions or into chat before asking it to run a sweep. This is the same text the server ships as its MCP prompt (the packaged `agent_prompt.md`); a drift test keeps the block below in sync with the shipped file, so copying from this page is safe.
 
 ```text
 You have access to a phasesweep MCP server. It runs phase-chained hyperparameter sweeps from a human-curated catalog of experiments: each phase's winning hyperparameters lock in as fixed overrides for every phase downstream. You operate entirely by catalog experiment id. No tool accepts a config path, trainer command, or file, and the catalog is the sole authority for paths, commands, environment, storage, and working directories — never ask the user for those or try to infer them.
