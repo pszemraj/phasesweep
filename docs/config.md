@@ -83,7 +83,7 @@ When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` 
 
 ## Trainer Contract
 
-The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trainer must:
+The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process inherits phasesweep's own working directory - the directory `phasesweep run` was invoked from, or the catalog's pinned `cwd` for MCP-launched runs - so relative paths in `trial_command` resolve against that directory. The trainer must:
 
 - Parse the selected [override format](#override-formats).
 - Write the metric artifact under `{trial_dir}` so the configured extractor can read it.
