@@ -6,7 +6,7 @@ For install commands, client config, and pasteable agent instructions, use [MCP 
 
 ## The catalog
 
-The server starts from a catalog: a fixed allowlist mapping opaque ids to local config paths plus per-experiment permissions. The agent only ever sends an id; it cannot enumerate the filesystem, pass a path, or author a config. Author the catalog with the same trust and review process as the experiment YAML. The server never writes it.
+The server starts from a catalog: a fixed allowlist mapping opaque ids to local config paths plus per-experiment permissions. The agent only ever sends an id; it cannot enumerate the filesystem, pass a path, or author a config. Author the catalog with the same trust and review process as the experiment YAML. The server never writes it. `phasesweep init-catalog --from experiment.yaml` scaffolds an annotated, read-only starting point (validated with the exact startup rules before anything is written); `phasesweep mcp-check --catalog PATH` re-validates after any edit.
 
 Catalog keys:
 
@@ -15,7 +15,7 @@ Catalog keys:
 - `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
 - `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
 - `experiments[].cwd`: optional detached-runner working directory. Relative paths resolve against the catalog file. The default is the registered config file's directory.
-- `experiments[].visible_params`: sampled winner parameter values exposed to agents. Use `none` (default), `all`, or a list of allowed parameter keys. Parameter names remain visible; values outside the policy are returned as `<redacted>`.
+- `experiments[].visible_params`: sampled winner parameter values exposed to agents. Use `none` (default), `all`, or a list of allowed parameter keys. Parameter names remain visible; values outside the policy are returned as `<redacted>`, and each winner phase carries a `params_redacted` boolean so agents can report withheld values without string-matching the sentinel.
 - `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
 - `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
 
@@ -43,7 +43,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds` |
 | `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (default 120, max 600) | read (blocks) | the `phasesweep_get_status` payload plus `changed` and `reason` (`terminal` / `phase_completed` / `timeout`) |
-| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, gate status, and completeness |
+| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, a `params_redacted` flag, gate status, and completeness |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 

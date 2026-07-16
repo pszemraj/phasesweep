@@ -21,8 +21,9 @@ from phasesweep.engine.guards import (
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import CatalogError
-from phasesweep.mcp.registry import check_catalog
+from phasesweep.mcp.registry import CatalogCheckReport, check_catalog
 from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import (
@@ -422,6 +423,18 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     except CatalogError as exc:
         click.echo(f"phasesweep mcp-check: {exc}", err=True)
         ctx.exit(2)
+    _echo_catalog_report(report)
+    if not report.ok:
+        ctx.exit(2)
+
+
+def _echo_catalog_report(report: CatalogCheckReport) -> None:
+    """Print a per-experiment ok/FAIL table for an MCP catalog check.
+
+    Operator-facing: messages and suggestions may include paths.
+
+    :param CatalogCheckReport report: Collected per-entry catalog verdicts.
+    """
     width = max(len(entry.experiment_id) for entry in report.entries)
     for entry in report.entries:
         if entry.ok:
@@ -432,8 +445,87 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
         click.echo(f"{entry.experiment_id:<{width}}  FAIL  {message}")
         if entry.suggestion:
             click.echo(f"{'':<{width}}        fix: {entry.suggestion}")
-    if not report.ok:
+
+
+@main.command(
+    name="init-catalog",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Write an annotated MCP catalog for existing experiment configs: absolute "
+        "state_dir next to the catalog, one read-only entry per --from config "
+        "(visible_params: none, no allow block). The result is validated with the "
+        "exact server startup rules first; on failure the mcp-check report is "
+        "printed and nothing is written."
+    ),
+    short_help="Scaffold an MCP catalog.",
+)
+@click.option(
+    "--from",
+    "from_configs",
+    multiple=True,
+    required=True,
+    metavar="PATH",
+    type=CONFIG_PATH,
+    help="Experiment config to catalog; repeat for more entries.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("catalog.yaml"),
+    show_default=True,
+    help="Catalog file to write; an existing file is never overwritten.",
+)
+@click.pass_context
+def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Path) -> None:
+    """Scaffold and validate an MCP catalog for the operator.
+
+    Renders the annotated catalog to a same-directory temp file (so relative
+    ``config:`` paths resolve exactly as they will from the final file), runs
+    ``check_catalog`` on it, and only renames it into place when every entry
+    loads. Operator-facing: output may include paths.
+
+    :param click.Context ctx: Active Click context used for the exit code.
+    :param tuple[Path, ...] from_configs: Experiment configs to catalog.
+    :param Path output: Catalog destination; must not already exist.
+    """
+    if output.exists():
+        click.echo(
+            f"phasesweep init-catalog: {output} already exists; refusing to overwrite. "
+            "Pass -o to choose another name.",
+            err=True,
+        )
         ctx.exit(2)
+    try:
+        text = scaffold_catalog_text(output, from_configs)
+    except CatalogError as exc:
+        click.echo(f"phasesweep init-catalog: {exc}", err=True)
+        if exc.suggestion:
+            click.echo(f"fix: {exc.suggestion}", err=True)
+        ctx.exit(2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staged = output.with_name(output.name + ".tmp")
+    staged.write_text(text, encoding="utf-8")
+    try:
+        report = check_catalog(staged)
+    except CatalogError as exc:
+        staged.unlink(missing_ok=True)
+        click.echo(f"phasesweep init-catalog: {exc}", err=True)
+        ctx.exit(2)
+    _echo_catalog_report(report)
+    if not report.ok:
+        staged.unlink(missing_ok=True)
+        click.echo(
+            "phasesweep init-catalog: fix the configs above and re-run; nothing was written.",
+            err=True,
+        )
+        ctx.exit(2)
+    staged.replace(output)
+    click.echo(f"wrote {output}")
+    click.echo(
+        "next: fill in each description, decide allow/visible_params, then connect "
+        f"your MCP client (docs/mcp_setup.md) with --catalog {output.resolve()}"
+    )
 
 
 def _format_status(status_obj: dict) -> str:

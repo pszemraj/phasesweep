@@ -108,7 +108,28 @@ def test_winner_params_redacted_by_default() -> None:
         "dataset": "<redacted>",
         "lr": "<redacted>",
     }
+    assert payload["phases"][0]["params_redacted"] is True
     assert "SECRET_DATASET" not in str(payload)
+
+
+def test_params_redacted_flag_follows_policy() -> None:
+    """The boolean is computed from the policy, so agents need not string-match."""
+
+    def flag(params: dict[str, object], policy: object) -> bool:
+        payload = winners_payload(
+            "x",
+            [PhaseWinnerView("p", 0, 0.1, dict(params), dict(params), None, False)],
+            visible_params=policy,  # type: ignore[arg-type]
+        )
+        return payload["phases"][0]["params_redacted"]
+
+    assert flag({"lr": 3e-4, "depth": 6}, "all") is False
+    assert flag({"lr": 3e-4, "depth": 6}, "none") is True
+    assert flag({}, "none") is False  # nothing withheld when nothing was sampled
+    assert flag({"lr": 3e-4, "depth": 6}, ["lr"]) is True
+    assert flag({"lr": 3e-4}, ["lr", "depth"]) is False
+    # A literal sentinel VALUE with an open policy must not read as redaction.
+    assert flag({"note": "<redacted>"}, "all") is False
 
 
 def test_visible_winner_params_supports_allowlist_and_all() -> None:

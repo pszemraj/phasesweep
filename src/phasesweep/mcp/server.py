@@ -316,6 +316,12 @@ class WinnerPhasePayload(_ToolPayload):
             "Values may be redacted by catalog visible_params policy."
         )
     )
+    params_redacted: bool = Field(
+        description=(
+            "True when any param value was withheld by catalog visible_params policy - "
+            "deliberate, not missing data."
+        )
+    )
     gates_passed: bool | None = Field(
         description="True/false when gates were declared; null when the phase has no gates."
     )

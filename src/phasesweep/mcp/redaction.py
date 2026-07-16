@@ -33,6 +33,24 @@ def visible_winner_params(params: dict[str, Any], policy: VisibleParamsPolicy) -
     return {key: value if key in visible else "<redacted>" for key, value in params.items()}
 
 
+def params_redacted(params: dict[str, Any], policy: VisibleParamsPolicy) -> bool:
+    """Return whether the visibility policy withholds any of ``params``.
+
+    Computed from the policy, not by scanning for the sentinel string, so a
+    literal ``"<redacted>"`` param value can never masquerade as policy.
+
+    :param dict[str, Any] params: Sampled winner params keyed by parameter name.
+    :param VisibleParamsPolicy policy: Catalog ``visible_params`` setting.
+    :return bool: ``True`` when at least one value is replaced by the sentinel.
+    """
+    if policy == "all":
+        return False
+    if policy == "none":
+        return bool(params)
+    visible = set(policy)
+    return any(key not in visible for key in params)
+
+
 def winners_payload(
     experiment_id: str,
     views: list[PhaseWinnerView],
@@ -59,6 +77,7 @@ def winners_payload(
                 "trial_number": v.trial_number,
                 "metric": v.metric,
                 "params": visible_winner_params(v.params, visible_params),
+                "params_redacted": params_redacted(v.params, visible_params),
                 "gates_passed": v.gates_passed,
                 "incomplete": v.incomplete,
             }

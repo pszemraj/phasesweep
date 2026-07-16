@@ -64,6 +64,13 @@ def test_help_output_is_operator_readable() -> None:
     assert "per-experiment ok/FAIL report" in check_help.output
     assert "--catalog PATH" in check_help.output
 
+    init_help = runner.invoke(cli_main, ["init-catalog", "--help"], terminal_width=120)
+    assert init_help.exit_code == 0
+    assert "Args:" not in init_help.output
+    assert "annotated MCP catalog" in init_help.output
+    assert "--from PATH" in init_help.output
+    assert "nothing is written" in init_help.output
+
 
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:
     """``phasesweep validate`` surfaces phase comments so the operator sees

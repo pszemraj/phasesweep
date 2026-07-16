@@ -26,7 +26,13 @@ If you prefer not to install into a persistent environment, every client below c
 
 ## 2. Create a catalog
 
-The server refuses to start without a catalog: a fixed allowlist mapping stable ids to reviewed experiment configs, plus per-experiment permissions. Write one next to your project:
+The server refuses to start without a catalog: a fixed allowlist mapping stable ids to reviewed experiment configs, plus per-experiment permissions. Scaffold one next to your project:
+
+```bash
+phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
+```
+
+This writes an annotated, read-only `catalog.yaml` (validated with the exact server startup rules first — on failure it prints the per-entry report and writes nothing). Fill in each `description`, then deliberately enable `allow` flags and `visible_params` as needed. The equivalent hand-written catalog:
 
 ```yaml
 # catalog.yaml
