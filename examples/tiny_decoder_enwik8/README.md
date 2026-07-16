@@ -37,7 +37,7 @@ The real run launches 9 trials (3 phases x 3 trials, 1000 batches each) and fini
 
 The phase order is deliberate: pick `learning_rate` first because it is the highest-leverage optimizer scale decision, tune `weight_decay` after the update scale is fixed, then tune `grad_clip_norm` last as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
 
-The config uses 1000 training batches per trial. The upstream template does not currently expose warmup ratio or grouped-query attention controls, so this example sticks to trainer hyperparameters it supports.
+The config uses 1000 training batches per trial. The upstream template does not currently expose warmup ratio or grouped-query attention controls, so this example sticks to trainer hyperparameters it supports. One more upstream quirk to know before sweeping shape keys: the SwiGLU feedforward rounds its hidden width up to a multiple of 256, so at `dim: 128` every `ffn_dim_multiplier` value up to 2.0 builds the same 256-wide FFN and sweeping the knob changes nothing until the requested width crosses a rounding step.
 
 ## MCP Smoke Sweep
 

@@ -33,7 +33,7 @@ The remaining top-level keys: `workdir` (default `./runs`) is the output root la
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
 - `name`: required phase name matching ASCII `[A-Za-z0-9_-]+`.
-- `inherits`: prior phase names whose exposed winners become fixed overrides.
+- `inherits`: prior phase names whose exposed winners become fixed overrides. Inheritance is transitive through each winner's `effective_overrides`: inheriting a phase also carries everything that phase itself inherited, so a linear chain only names its immediate predecessor.
 - `fixed_overrides`: hard-coded overrides for every trial in the phase.
 - `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.
 - `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
@@ -90,7 +90,7 @@ The command in `trial_command` is the training or evaluation program for one tri
 - Exit nonzero when the trial failed and should be recorded as failed.
 - Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
 
-Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance.
+Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; exact metric ties (within 1e-12) resolve to the lowest trial number. When a swept key turns out to have no effect on the metric, the promoted value is therefore just the first-evaluated choice, not evidence of a preference.
 
 ## Override Order
 
