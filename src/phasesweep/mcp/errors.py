@@ -71,7 +71,12 @@ class PermissionDeniedError(McpToolError):
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
         """
-        super().__init__(f"action {action!r} is not permitted for experiment {experiment_id!r}")
+        super().__init__(
+            f"action {action!r} is not permitted for experiment {experiment_id!r}; "
+            "this is deliberate catalog policy. Report it to the user - only the "
+            f"operator can enable it (allow.{action}: true) and restart the server. "
+            "Do not retry."
+        )
 
 
 class ConfigChangedError(McpToolError):
@@ -84,7 +89,7 @@ class ConfigChangedError(McpToolError):
         """
         super().__init__(
             f"cataloged config for experiment {experiment_id!r} changed since server startup; "
-            "restart the server to reload and validate it"
+            "the operator must restart the MCP server to reload and validate it. Do not retry."
         )
 
 
@@ -127,8 +132,9 @@ class ConcurrencyLimitError(McpToolError):
         :param int limit: Configured maximum number of concurrent runs.
         """
         super().__init__(
-            f"server is already running {running} sweep(s) (limit {limit}); "
-            "wait for one to finish or cancel it"
+            f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
+            "sweep(s) are active. Wait for one to finish, or ask the user whether to "
+            "cancel one. Do not retry immediately."
         )
 
 

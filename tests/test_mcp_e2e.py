@@ -186,7 +186,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
     try:
         assert wait_for_mcp_running_trial(app, run_a, timeout=30) == "running"
         # A *different* experiment cannot start while one sweep is live (single-GPU cap).
-        with pytest.raises(Exception, match="limit 1"):
+        with pytest.raises(Exception, match="max_concurrent_runs=1"):
             app.launch("slowb")
         # Freeing the slot lets the other experiment launch.
         assert app.cancel(run_a)["state"] == "cancelled"

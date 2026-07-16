@@ -64,6 +64,46 @@ PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
 
+# Agent-facing tool descriptions. Descriptions are the one instruction channel
+# present on every call even when the user loads no prompt, so each one chains
+# to the next tool in the workflow by literal name.
+DESCRIPTION_LIST_EXPERIMENTS = (
+    "List the human-curated experiments this server can run: ids, descriptions, "
+    "phase names, and the optimization metric. Start here. If next_cursor is "
+    f"non-null, call again with it. Then call {TOOL_VALIDATE_CONFIG} on the id "
+    "you plan to use."
+)
+DESCRIPTION_VALIDATE_CONFIG = (
+    "Inspect an experiment before launching it: per-phase names, trial counts, "
+    "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
+    f"Call this before every {TOOL_LAUNCH_SWEEP}."
+)
+DESCRIPTION_LAUNCH_SWEEP = (
+    "Start an experiment's sweep as a detached background run that survives this "
+    f"session. Returns a run_id: save it, then poll {TOOL_GET_STATUS} with it "
+    "until the state is terminal. Pass from_phase only to resume when earlier "
+    "phase winners already exist."
+)
+DESCRIPTION_GET_STATUS = (
+    "Per-phase trial progress and the run process state (running / succeeded / "
+    "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
+    "launch, always use the run_id so catalog edits cannot redirect monitoring. "
+    "Read-only. While running, wait poll_after_seconds before calling again; when "
+    f"terminal, call {TOOL_GET_WINNERS} with the same run_id."
+)
+DESCRIPTION_GET_WINNERS = (
+    "The end of the workflow: per completed phase, the winning trial number, "
+    "metric value, policy-filtered sampled params, gate status, and completeness. "
+    "Values shown as <redacted> are intentional catalog policy, not errors. "
+    "Provide exactly one of experiment_id or run_id (prefer the launched run_id). "
+    "Read-only."
+)
+DESCRIPTION_CANCEL_SWEEP = (
+    "Stop a launched run by run_id. Use only when the user asks or to prevent an "
+    "unwanted active sweep. If cleanup_confirmed is false, report it to the user; "
+    "recovery is operator-only and no MCP tool can clear it."
+)
+
 ExperimentId = Annotated[
     str,
     Field(
@@ -471,7 +511,11 @@ class PhaseSweepMCP:
             parsed experiment, optional run payload, and audit-safe resolved ids.
         """
         if (experiment_id is None) == (run_id is None):
-            raise McpToolError("provide exactly one of experiment_id or run_id")
+            provided = "neither" if experiment_id is None else "both"
+            raise McpToolError(
+                f"provide exactly one of experiment_id or run_id; you provided {provided}. "
+                "After a launch, prefer the run_id."
+            )
         if run_id is not None:
             handle = self._runs.get(run_id)
             if handle is None:
@@ -1082,6 +1126,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_LIST_EXPERIMENTS,
+        description=DESCRIPTION_LIST_EXPERIMENTS,
         annotations=_read_annotations("List Experiments"),
         structured_output=True,
     )
@@ -1102,6 +1147,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_VALIDATE_CONFIG,
+        description=DESCRIPTION_VALIDATE_CONFIG,
         annotations=_read_annotations("Validate Config"),
         structured_output=True,
     )
@@ -1116,6 +1162,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_GET_STATUS,
+        description=DESCRIPTION_GET_STATUS,
         annotations=_read_annotations("Get Status"),
         structured_output=True,
     )
@@ -1136,6 +1183,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_GET_WINNERS,
+        description=DESCRIPTION_GET_WINNERS,
         annotations=_read_annotations("Get Winners"),
         structured_output=True,
     )
@@ -1156,6 +1204,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_LAUNCH_SWEEP,
+        description=DESCRIPTION_LAUNCH_SWEEP,
         annotations=_launch_annotations(),
         structured_output=True,
     )
@@ -1174,6 +1223,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_CANCEL_SWEEP,
+        description=DESCRIPTION_CANCEL_SWEEP,
         annotations=_cancel_annotations(),
         structured_output=True,
     )
