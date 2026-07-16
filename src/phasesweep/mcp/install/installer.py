@@ -25,7 +25,7 @@ import click
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 from phasesweep.mcp.install.edits import (
     Action,
