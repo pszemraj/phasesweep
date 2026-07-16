@@ -275,6 +275,7 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
+    assert server._tool_manager.get_tool(TOOL_AWAIT_RUN).is_async is True
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent

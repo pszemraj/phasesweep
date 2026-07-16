@@ -8,16 +8,18 @@ redacted. serve() loads the catalog, builds the store, and serves over stdio.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import functools
 import hashlib
 import importlib.resources
 import importlib.util
+import inspect
 import logging
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
@@ -489,8 +491,8 @@ class PhaseSweepMCP:
         self._registry = registry
         self._runs = runs
         self._audit = audit
-        # await_run's recheck pause; tests replace it to make waits instant.
-        self._sleep: Callable[[float], None] = time.sleep
+        # await_run's nonblocking recheck pause; tests replace it to make waits instant.
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     def _audit_success(
         self,
@@ -680,12 +682,12 @@ class PhaseSweepMCP:
         )
         return result
 
-    def await_run(
+    async def await_run(
         self,
         run_id: str,
         timeout_seconds: int = AWAIT_DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Block until a launched run changes, then return its full status.
+        """Wait until a launched run changes, then return its full status.
 
         A bounded sleep-and-recheck loop over the same reads ``status`` does:
         no new state, no side effects. Returns early when the run reaches a
@@ -726,7 +728,9 @@ class PhaseSweepMCP:
                 elif time.monotonic() >= deadline:
                     reason = "timeout"
                 else:
-                    self._sleep(min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic())))
+                    await self._sleep(
+                        min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
+                    )
                     continue
                 break
             elapsed_seconds = None
@@ -1248,10 +1252,29 @@ def _safe_tool(fn: F) -> F:
     :param F fn: Tool implementation to wrap.
     :return F: Wrapped function that raises only safe tool errors.
     """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            """Invoke an async tool and redact any exception.
+
+            :param Any args: Positional arguments passed through to the wrapped tool.
+            :param Any kwargs: Keyword arguments passed through to the wrapped tool.
+            :return Any: Awaited tool result.
+            """
+            try:
+                return await fn(*args, **kwargs)
+            except McpToolError as exc:
+                raise ValueError(exc.safe_message) from None
+            except Exception:
+                log.exception("unhandled error in tool %s", fn.__name__)
+                raise ValueError("internal error") from None
+
+        return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        """Invoke the wrapped tool and redact any exception.
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        """Invoke a synchronous tool and redact any exception.
 
         :param Any args: Positional arguments passed through to the wrapped tool.
         :param Any kwargs: Keyword arguments passed through to the wrapped tool.
@@ -1265,7 +1288,7 @@ def _safe_tool(fn: F) -> F:
             log.exception("unhandled error in tool %s", fn.__name__)
             raise ValueError("internal error") from None
 
-    return wrapper  # type: ignore[return-value]
+    return sync_wrapper  # type: ignore[return-value]
 
 
 def _read_annotations(title: str) -> Any:
@@ -1453,7 +1476,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def await_run(
+    async def await_run(
         run_id: RunId,
         timeout_seconds: AwaitTimeoutSeconds = AWAIT_DEFAULT_TIMEOUT_SECONDS,
     ) -> AwaitRunResult:
@@ -1463,7 +1486,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current status.
         :return AwaitRunResult: Structured status payload plus changed and reason.
         """
-        return AwaitRunResult.model_validate(app.await_run(run_id, timeout_seconds=timeout_seconds))
+        return AwaitRunResult.model_validate(
+            await app.await_run(run_id, timeout_seconds=timeout_seconds)
+        )
 
     @mcp.tool(
         name=TOOL_GET_WINNERS,

@@ -4,6 +4,7 @@ await_run wait loop built on top of them."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from pathlib import Path
@@ -212,7 +213,7 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch, app: PhaseSweepMCP) -> dict[str
     """Replace await_run's deadline clock and recheck sleep with a manual clock."""
     clock = {"now": 0.0, "sleeps": 0.0}
 
-    def advance(seconds: float) -> None:
+    async def advance(seconds: float) -> None:
         clock["now"] += seconds
         clock["sleeps"] += seconds
 
@@ -228,7 +229,7 @@ def test_await_run_returns_immediately_on_terminal(
     write_run_status(store, "r1", returncode=0, error_class=None, cleanup_confirmed=True)
     clock = _fake_clock(monkeypatch, app)
 
-    result = app.await_run("r1")
+    result = asyncio.run(app.await_run("r1"))
     assert result["reason"] == "terminal"
     assert result["changed"] is False  # already terminal when the wait began
     assert result["run"]["state"] == "succeeded"
@@ -243,7 +244,7 @@ def test_await_run_times_out_with_unchanged_status(
     app, _registry, _store = _app_with_run(tmp_path)
     clock = _fake_clock(monkeypatch, app)
 
-    result = app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS)
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
     assert result["reason"] == "timeout"
     assert result["changed"] is False
     assert result["run"]["state"] == "running"
@@ -254,7 +255,7 @@ def test_await_run_clamps_timeout_to_cap(tmp_path: Path, monkeypatch: pytest.Mon
     app, _registry, _store = _app_with_run(tmp_path)
     clock = _fake_clock(monkeypatch, app)
 
-    result = app.await_run("r1", timeout_seconds=10_000)
+    result = asyncio.run(app.await_run("r1", timeout_seconds=10_000))
     assert result["reason"] == "timeout"
     assert clock["sleeps"] == pytest.approx(AWAIT_MAX_TIMEOUT_SECONDS)
 
@@ -266,7 +267,7 @@ def test_await_run_returns_when_phase_gains_winner(
     experiment = registry.get("srv").experiment
     clock = {"now": 0.0}
 
-    def sleep_then_write_winner(seconds: float) -> None:
+    async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
         winner = _winner_path(experiment, experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +276,7 @@ def test_await_run_returns_when_phase_gains_winner(
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
     app._sleep = sleep_then_write_winner
 
-    result = app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS)
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
     assert result["reason"] == "phase_completed"
     assert result["changed"] is True
     assert result["run"]["state"] == "running"
@@ -289,4 +290,24 @@ def test_await_run_unknown_run_id(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
     app, _registry, _store = make_mcp_app(catalog)
     with pytest.raises(Exception, match="unknown run id"):
-        app.await_run("missing")
+        asyncio.run(app.await_run("missing"))
+
+
+def test_await_run_is_cancellable_during_recheck_pause(tmp_path: Path) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+
+    async def exercise() -> None:
+        entered_sleep = asyncio.Event()
+
+        async def wait_forever(_seconds: float) -> None:
+            entered_sleep.set()
+            await asyncio.Event().wait()
+
+        app._sleep = wait_forever
+        task = asyncio.create_task(app.await_run("r1"))
+        await entered_sleep.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
