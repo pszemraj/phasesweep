@@ -11,9 +11,12 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.server import (
+    AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    AWAIT_MAX_TIMEOUT_SECONDS,
     CATALOG_RESOURCE_URI,
     DEFAULT_LIST_LIMIT,
     PROMPT_RUN_AND_MONITOR,
+    TOOL_AWAIT_RUN,
     TOOL_CANCEL_SWEEP,
     TOOL_GET_STATUS,
     TOOL_GET_WINNERS,
@@ -250,7 +253,7 @@ def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
     assert app.status(experiment_id="e2e_lm")["run"] is None
 
 
-def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
+def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
     import asyncio
 
@@ -264,6 +267,7 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
         TOOL_LIST_EXPERIMENTS,
         TOOL_VALIDATE_CONFIG,
         TOOL_GET_STATUS,
+        TOOL_AWAIT_RUN,
         TOOL_GET_WINNERS,
         TOOL_LAUNCH_SWEEP,
         TOOL_CANCEL_SWEEP,
@@ -290,6 +294,11 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
     assert schemas[TOOL_GET_WINNERS].get("required") is None  # both optional
     assert "oneOf" in schemas[TOOL_GET_WINNERS]
     assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
+    assert schemas[TOOL_AWAIT_RUN]["required"] == ["run_id"]
+    assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
+    timeout_schema = schemas[TOOL_AWAIT_RUN]["properties"]["timeout_seconds"]
+    assert timeout_schema["default"] == AWAIT_DEFAULT_TIMEOUT_SECONDS
+    assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
     assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
@@ -298,11 +307,15 @@ def test_fastmcp_registers_six_tools(tmp_path: Path) -> None:
 
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
+    assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
     assert annotations[TOOL_LAUNCH_SWEEP].readOnlyHint is False
     assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is False
     assert annotations[TOOL_CANCEL_SWEEP].destructiveHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
+    assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
+    assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
+    assert "poll_after_seconds" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]

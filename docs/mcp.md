@@ -1,6 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io). The supported mode for this version is local-node control over stdio: the MCP server, detached runner, process cleanup, filesystem locks, and GPU leases all assume one machine. The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of six tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
+`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io). The supported mode for this version is local-node control over stdio: the MCP server, detached runner, process cleanup, filesystem locks, and GPU leases all assume one machine. The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and calls one of seven tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
 
 For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 
@@ -35,18 +35,19 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 The cap counts MCP-launched runs recorded in `state_dir`; it does not count a concurrent CLI `phasesweep run` on the same host. CLI and MCP runs are still coordinated by the runtime locks described in [runtime behavior](runtime.md#concurrency-model).
 
-## The six tools
+## The seven tools
 
 | Tool | Inputs | Effect | Returns |
 | --- | --- | --- | --- |
 | `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds` |
+| `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (default 120, max 600) | read (blocks) | the `phasesweep_get_status` payload plus `changed` and `reason` (`terminal` / `phase_completed` / `timeout`) |
 | `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, gate status, and completeness |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
-A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
+A launched sweep runs as a **detached background process** in its own session, so it survives the agent's tool call, survives a server restart, and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `phasesweep_await_run` is the preferred monitor: one call blocks server-side until the run reaches a terminal state or a phase gains a winner (or the timeout elapses with the current status), so a short sweep becomes launch, await, winners — three calls instead of dozens of polls; for long sweeps agents call it repeatedly. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
 
 `cleanup_confirmed` on `phasesweep_cancel_sweep` means the MCP runner process group is gone and the runner wrote a readable terminal status whose own `cleanup_confirmed` field is `true`. That field is emitted by the engine shutdown handler after it terminates active trial process groups through the same confirmed cleanup path used by stale-trial recovery. If the runner group is gone but no status was recorded, or the status reports unconfirmed trial cleanup, the server writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. A terminal runner failure whose status records `cleanup_confirmed: false` is also counted as live until operator recovery confirms cleanup. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
 
@@ -60,7 +61,7 @@ When a `run_id` is supplied, status and winners are read from that run's saved c
 
 Clients that support MCP resources can attach `phasesweep://catalog`. It returns the first catalog page as compact JSON using the same path-free payload as `phasesweep_list_experiments`. Agents should still call `phasesweep_list_experiments` when they need pagination or autonomous discovery.
 
-Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, poll by `run_id`, summarize winners with that same `run_id`, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
+Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, await or poll by `run_id`, summarize winners with that same `run_id`, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
 
 ## Security model
 
@@ -101,7 +102,7 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 
 `audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
-Poll `phasesweep_get_status` at a normal agent cadence rather than in a tight loop; each result carries a `poll_after_seconds` suggestion sized from the median completed-trial duration (30s until anything finishes, clamped to 15-600s). SQLite-backed status uses a read-only direct count path; Journal-backed status uses Optuna's read path today, so large local studies should be polled every few seconds until the tracked aggregate-count optimization is implemented.
+Prefer `phasesweep_await_run` over polling; when polling `phasesweep_get_status`, use a normal agent cadence rather than a tight loop — each result carries a `poll_after_seconds` suggestion sized from the median completed-trial duration (30s until anything finishes, clamped to 15-600s). SQLite-backed status uses a read-only direct count path; Journal-backed status uses Optuna's read path today, so large local studies should be polled every few seconds until the tracked aggregate-count optimization is implemented.
 
 ### Long-running servers
 

@@ -69,7 +69,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
-- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the six tools, security model, single-host operation.
+- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the seven tools, security model, single-host operation.
 - [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - write a catalog, preflight it with `mcp-check`, connect your client, verify, instruct the agent.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.

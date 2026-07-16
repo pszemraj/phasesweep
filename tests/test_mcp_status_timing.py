@@ -1,8 +1,10 @@
-"""Status timing surfaces: per-phase progress counts, elapsed time, and the
-adaptive poll interval derived from completed-trial durations."""
+"""Status timing surfaces: per-phase progress counts, elapsed time, the
+adaptive poll interval derived from completed-trial durations, and the
+await_run wait loop built on top of them."""
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 
@@ -11,16 +13,27 @@ import pytest
 
 from phasesweep.config import load_config
 from phasesweep.engine.optuna import _phase_study_name, phase_completed_trial_durations
+from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
+    AWAIT_MAX_TIMEOUT_SECONDS,
+    AWAIT_MIN_TIMEOUT_SECONDS,
+    AWAIT_RECHECK_SECONDS,
     POLL_DEFAULT_SECONDS,
     POLL_MAX_SECONDS,
     POLL_MIN_SECONDS,
+    PhaseSweepMCP,
     _poll_after_seconds,
     _run_elapsed_seconds,
 )
 from phasesweep.mcp.time import utc_now_iso
-from tests.mcp_helpers import make_mcp_app, mcp_experiment_config_text, write_mcp_config_catalog
+from tests.mcp_helpers import (
+    make_mcp_app,
+    make_run_handle,
+    mcp_experiment_config_text,
+    write_mcp_config_catalog,
+    write_run_status,
+)
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None):
@@ -176,3 +189,104 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
 @pytest.mark.parametrize("median", [None, 0.1, 3600.0])
 def test_poll_bounds_hold_for_all_medians(median: float | None) -> None:
     assert POLL_MIN_SECONDS <= _poll_after_seconds(median) <= POLL_MAX_SECONDS
+
+
+def _app_with_run(tmp_path: Path, run_id: str = "r1"):
+    """App plus a fabricated live run resolvable by run_id (snapshot + handle)."""
+    config_text = mcp_experiment_config_text(tmp_path)
+    catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
+    app, registry, store = make_mcp_app(catalog)
+    data = (tmp_path / "srv.yaml").read_bytes()
+    handle = make_run_handle(
+        store,
+        run_id=run_id,
+        experiment_id="srv",
+        config_sha256=hashlib.sha256(data).hexdigest(),
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(data)
+    return app, registry, store
+
+
+def _fake_clock(monkeypatch: pytest.MonkeyPatch, app: PhaseSweepMCP) -> dict[str, float]:
+    """Replace await_run's deadline clock and recheck sleep with a manual clock."""
+    clock = {"now": 0.0, "sleeps": 0.0}
+
+    def advance(seconds: float) -> None:
+        clock["now"] += seconds
+        clock["sleeps"] += seconds
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    app._sleep = advance
+    return clock
+
+
+def test_await_run_returns_immediately_on_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, store = _app_with_run(tmp_path)
+    write_run_status(store, "r1", returncode=0, error_class=None, cleanup_confirmed=True)
+    clock = _fake_clock(monkeypatch, app)
+
+    result = app.await_run("r1")
+    assert result["reason"] == "terminal"
+    assert result["changed"] is False  # already terminal when the wait began
+    assert result["run"]["state"] == "succeeded"
+    assert clock["sleeps"] == 0.0  # no recheck pause was needed
+    assert result["poll_after_seconds"] == POLL_DEFAULT_SECONDS
+    assert isinstance(result["elapsed_seconds"], int)
+
+
+def test_await_run_times_out_with_unchanged_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = _fake_clock(monkeypatch, app)
+
+    result = app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS)
+    assert result["reason"] == "timeout"
+    assert result["changed"] is False
+    assert result["run"]["state"] == "running"
+    assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
+
+
+def test_await_run_clamps_timeout_to_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = _fake_clock(monkeypatch, app)
+
+    result = app.await_run("r1", timeout_seconds=10_000)
+    assert result["reason"] == "timeout"
+    assert clock["sleeps"] == pytest.approx(AWAIT_MAX_TIMEOUT_SECONDS)
+
+
+def test_await_run_returns_when_phase_gains_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, registry, _store = _app_with_run(tmp_path)
+    experiment = registry.get("srv").experiment
+    clock = {"now": 0.0}
+
+    def sleep_then_write_winner(seconds: float) -> None:
+        clock["now"] += seconds
+        winner = _winner_path(experiment, experiment.phases[0].name)
+        winner.parent.mkdir(parents=True, exist_ok=True)
+        winner.write_text("{}\n")
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    app._sleep = sleep_then_write_winner
+
+    result = app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS)
+    assert result["reason"] == "phase_completed"
+    assert result["changed"] is True
+    assert result["run"]["state"] == "running"
+    assert result["phases"][0]["winner_present"] is True
+    # The winner appeared after one recheck pause, well before the timeout.
+    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
+
+
+def test_await_run_unknown_run_id(tmp_path: Path) -> None:
+    config_text = mcp_experiment_config_text(tmp_path)
+    catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
+    app, _registry, _store = make_mcp_app(catalog)
+    with pytest.raises(Exception, match="unknown run id"):
+        app.await_run("missing")

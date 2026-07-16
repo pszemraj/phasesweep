@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ TOOL_GET_STATUS = "phasesweep_get_status"
 TOOL_GET_WINNERS = "phasesweep_get_winners"
 TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
 TOOL_CANCEL_SWEEP = "phasesweep_cancel_sweep"
+TOOL_AWAIT_RUN = "phasesweep_await_run"
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
@@ -71,6 +73,13 @@ MAX_LIST_LIMIT = 100
 POLL_DEFAULT_SECONDS = 30
 POLL_MIN_SECONDS = 15
 POLL_MAX_SECONDS = 600
+# await_run blocks server-side so one call replaces dozens of polls; the cap
+# keeps a response inside common client tool timeouts, and the recheck interval
+# bounds how stale a change notification can be.
+AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
+AWAIT_MIN_TIMEOUT_SECONDS = 5
+AWAIT_MAX_TIMEOUT_SECONDS = 600
+AWAIT_RECHECK_SECONDS = 5.0
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -88,9 +97,9 @@ DESCRIPTION_VALIDATE_CONFIG = (
 )
 DESCRIPTION_LAUNCH_SWEEP = (
     "Start an experiment's sweep as a detached background run that survives this "
-    f"session. Returns a run_id: save it, then poll {TOOL_GET_STATUS} with it "
-    "until the state is terminal. Pass from_phase only to resume when earlier "
-    "phase winners already exist."
+    f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
+    f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
+    "only to resume when earlier phase winners already exist."
 )
 DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
@@ -110,6 +119,15 @@ DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "
     "unwanted active sweep. If cleanup_confirmed is false, report it to the user; "
     "recovery is operator-only and no MCP tool can clear it."
+)
+DESCRIPTION_AWAIT_RUN = (
+    "Wait for a launched run to change. Blocks up to timeout_seconds (default "
+    f"{AWAIT_DEFAULT_TIMEOUT_SECONDS}, max {AWAIT_MAX_TIMEOUT_SECONDS}) and returns "
+    "early when the run reaches a terminal state or a phase gains a winner; "
+    "otherwise returns the current status at timeout. Returns the same payload as "
+    f"{TOOL_GET_STATUS} plus changed and reason (terminal / phase_completed / "
+    f"timeout). Read-only. Prefer this over polling {TOOL_GET_STATUS} in a loop; "
+    "for long sweeps call it repeatedly."
 )
 
 ExperimentId = Annotated[
@@ -162,6 +180,16 @@ MaybeCursor = Annotated[
     str | None,
     Field(
         description="Opaque pagination cursor returned by a previous phasesweep_list_experiments call.",
+    ),
+]
+AwaitTimeoutSeconds = Annotated[
+    int,
+    Field(
+        description=(
+            "Seconds to block waiting for the run to change before returning its current status."
+        ),
+        ge=AWAIT_MIN_TIMEOUT_SECONDS,
+        le=AWAIT_MAX_TIMEOUT_SECONDS,
     ),
 ]
 
@@ -257,6 +285,22 @@ class GetStatusResult(_ToolPayload):
             "Suggested seconds to wait before the next phasesweep_get_status call, "
             "sized from the median completed-trial duration."
         ),
+    )
+
+
+class AwaitRunResult(GetStatusResult):
+    """Structured output for await_run: get_status plus what ended the wait."""
+
+    changed: bool = Field(
+        description=(
+            "Whether run state, phase progress, or winner presence changed during the wait."
+        )
+    )
+    reason: Literal["terminal", "phase_completed", "timeout"] = Field(
+        description=(
+            "Why the wait returned: the run reached a terminal state, a phase gained a "
+            "winner, or the timeout elapsed with no change."
+        )
     )
 
 
@@ -390,6 +434,36 @@ def _poll_after_seconds(median_trial_seconds: float | None) -> int:
     return int(min(POLL_MAX_SECONDS, max(POLL_MIN_SECONDS, round(median_trial_seconds))))
 
 
+def _await_snapshot(state: str, status: dict[str, Any]) -> tuple[Any, ...]:
+    """Reduce a status read to the comparable facts await_run watches.
+
+    :param str state: Derived run state at read time.
+    :param dict[str, Any] status: Path-free ``read_status`` payload.
+    :return tuple[Any, ...]: Hashable snapshot of run state and per-phase
+        winner presence and completed-trial counts.
+    """
+    return (
+        state,
+        tuple(
+            (phase["phase"], phase["winner_present"], phase["completed"])
+            for phase in status["phases"]
+        ),
+    )
+
+
+def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -> bool:
+    """Return whether any phase gained a winner between two await snapshots.
+
+    :param tuple[Any, ...] baseline: Snapshot taken when the wait began.
+    :param tuple[Any, ...] snapshot: Snapshot from the latest recheck.
+    :return bool: ``True`` when a phase's winner artifact appeared mid-wait.
+    """
+    had_winner = {phase: winner for phase, winner, _completed in baseline[1]}
+    return any(
+        winner and not had_winner.get(phase, False) for phase, winner, _completed in snapshot[1]
+    )
+
+
 class PhaseSweepMCP:
     """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
 
@@ -405,6 +479,8 @@ class PhaseSweepMCP:
         self._registry = registry
         self._runs = runs
         self._audit = audit
+        # await_run's recheck pause; tests replace it to make waits instant.
+        self._sleep: Callable[[float], None] = time.sleep
 
     def _audit_success(
         self,
@@ -591,6 +667,80 @@ class PhaseSweepMCP:
             resolved=resolved,
             state_after=state_after or None,
             result_counts={"phases": len(result["phases"]), "running_runs": int(run is not None)},
+        )
+        return result
+
+    def await_run(
+        self,
+        run_id: str,
+        timeout_seconds: int = AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Block until a launched run changes, then return its full status.
+
+        A bounded sleep-and-recheck loop over the same reads ``status`` does:
+        no new state, no side effects. Returns early when the run reaches a
+        terminal state or a phase gains a winner; otherwise returns the
+        current status when the (clamped) timeout elapses. Each recheck
+        re-resolves the run from disk, so a server restart mid-wait is
+        invisible to the caller.
+
+        :param str run_id: Detached run id to wait on.
+        :param int timeout_seconds: Requested wait, clamped to
+            [``AWAIT_MIN_TIMEOUT_SECONDS``, ``AWAIT_MAX_TIMEOUT_SECONDS``].
+        :return dict[str, Any]: ``status`` payload plus ``changed`` and
+            ``reason`` (``terminal`` / ``phase_completed`` / ``timeout``).
+        """
+        args = {"run_id": run_id, "timeout_seconds": timeout_seconds}
+        resolved: dict[str, Any] = {}
+        try:
+            timeout = min(
+                AWAIT_MAX_TIMEOUT_SECONDS, max(AWAIT_MIN_TIMEOUT_SECONDS, int(timeout_seconds))
+            )
+            deadline = time.monotonic() + timeout
+            baseline: tuple[Any, ...] | None = None
+            while True:
+                target_id, experiment, run, resolved = self._resolve_read_target(
+                    experiment_id=None,
+                    run_id=run_id,
+                    include_run=True,
+                )
+                assert run is not None  # the run_id path always includes run state
+                status = read_status(experiment)
+                snapshot = _await_snapshot(run["state"], status)
+                if baseline is None:
+                    baseline = snapshot
+                if run["state"] in ("succeeded", "failed", "cancelled"):
+                    reason = "terminal"
+                elif _phase_gained_winner(baseline, snapshot):
+                    reason = "phase_completed"
+                elif time.monotonic() >= deadline:
+                    reason = "timeout"
+                else:
+                    self._sleep(min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic())))
+                    continue
+                break
+            elapsed_seconds = None
+            handle = self._runs.get(run_id)
+            if handle is not None:
+                elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+            result = status_payload(
+                target_id,
+                status,
+                run,
+                elapsed_seconds=elapsed_seconds,
+                poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
+            )
+            result["changed"] = snapshot != baseline
+            result["reason"] = reason
+        except Exception as exc:
+            self._audit_error(TOOL_AWAIT_RUN, args, exc, resolved=resolved)
+            raise
+        self._audit_success(
+            TOOL_AWAIT_RUN,
+            args,
+            resolved=resolved,
+            state_after={"run_state": run["state"], "await_reason": reason},
+            result_counts={"phases": len(result["phases"])},
         )
         return result
 
@@ -1287,6 +1437,25 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     @mcp.tool(
+        name=TOOL_AWAIT_RUN,
+        description=DESCRIPTION_AWAIT_RUN,
+        annotations=_read_annotations("Await Run"),
+        structured_output=True,
+    )
+    @_safe_tool
+    def await_run(
+        run_id: RunId,
+        timeout_seconds: AwaitTimeoutSeconds = AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    ) -> AwaitRunResult:
+        """Block until a launched run changes or the timeout elapses, then return its status. Read-only.
+
+        :param RunId run_id: Detached run id to wait on.
+        :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current status.
+        :return AwaitRunResult: Structured status payload plus changed and reason.
+        """
+        return AwaitRunResult.model_validate(app.await_run(run_id, timeout_seconds=timeout_seconds))
+
+    @mcp.tool(
         name=TOOL_GET_WINNERS,
         description=DESCRIPTION_GET_WINNERS,
         annotations=_read_annotations("Get Winners"),
@@ -1376,7 +1545,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the six tools over stdio.
+    """Load the catalog, build the run store, and serve the seven tools over stdio.
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means catalog load failure.
