@@ -175,23 +175,11 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = code
         status["error_class"] = "cancelled"
         status["cleanup_confirmed"] = exc.report.cleanup_confirmed
-        _write_status(
-            args.status_path,
-            status,
-            config_path=args.config,
-            config_sha256=args.config_sha256,
-        )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = False
-        _write_status(
-            args.status_path,
-            status,
-            config_path=args.config,
-            config_sha256=args.config_sha256,
-        )
         raise
     except SystemExit as exc:
         # The engine shutdown handler raises SystemExit(128+signum) on
@@ -200,30 +188,19 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = code
         status["error_class"] = "cancelled" if code in (143, 130) else "exited"
         status["cleanup_confirmed"] = code not in (143, 130)
-        _write_status(
-            args.status_path,
-            status,
-            config_path=args.config,
-            config_sha256=args.config_sha256,
-        )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = True
+        raise
+    finally:
         _write_status(
             args.status_path,
             status,
             config_path=args.config,
             config_sha256=args.config_sha256,
         )
-        raise
-    _write_status(
-        args.status_path,
-        status,
-        config_path=args.config,
-        config_sha256=args.config_sha256,
-    )
     return 0
 
 
