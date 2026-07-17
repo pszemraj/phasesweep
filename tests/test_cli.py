@@ -6,6 +6,7 @@ import logging
 import textwrap
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
@@ -71,6 +72,45 @@ def test_help_output_is_operator_readable() -> None:
     assert "annotated MCP catalog" in init_help.output
     assert "--from PATH" in init_help.output
     assert "nothing is written" in init_help.output
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "expected_events"),
+    [(False, ["signals", "load", "run"]), (True, ["load", "run"])],
+)
+def test_run_installs_signal_handlers_before_config_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    expected_events: list[str],
+) -> None:
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    events: list[str] = []
+    config = object()
+
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: events.append("signals"))
+
+    def fake_load_config(_path: Path) -> object:
+        events.append("load")
+        return config
+
+    def fake_run_config(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
+        assert loaded is config
+        assert from_phase is None
+        assert dry_run == (expected_events == ["load", "run"])
+        events.append("run")
+
+    monkeypatch.setattr("phasesweep.cli.load_config", fake_load_config)
+    monkeypatch.setattr("phasesweep.cli.run_config", fake_run_config)
+    args = ["run", str(config_path)]
+    if dry_run:
+        args.append("--dry-run")
+
+    result = CliRunner().invoke(cli_main, args)
+
+    assert result.exit_code == 0, result.output
+    assert events == expected_events
 
 
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:
