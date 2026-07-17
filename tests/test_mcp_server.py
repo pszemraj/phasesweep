@@ -37,6 +37,7 @@ from phasesweep.mcp.server import (
     PhaseSweepMCP,
     _safe_tool,
 )
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.process import read_proc_starttime
 from tests.mcp_helpers import (
     make_mcp_app,
@@ -1324,13 +1325,17 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     )
     store.save(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    exp = load_config(config)
+    assert isinstance(exp, Experiment)
     write_run_status(
         store,
         run_id,
         returncode=1,
         error_class="UnsafeProcessCleanupError",
         cleanup_confirmed=False,
+        result_snapshot=capture_result_snapshot(exp, cleanup_confirmed=False),
     )
+    assert app.status(run_id=run_id)["phases"][0]["running"] == 1
 
     runner_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
@@ -1372,8 +1377,6 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     assert not store.cleanup_recovery_path(run_id).exists()
     assert store.state(handle) == "running"
 
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
     study = optuna.load_study(study_name="srv::p", storage=exp.storage)
     trial = study.get_trials(deepcopy=False)[trial_number]
     assert trial.state == optuna.trial.TrialState.RUNNING
@@ -1400,6 +1403,9 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     assert recovery["reaped_running_trials"] == 1
     assert recovery["cleanup_uncertain_terminal_trials"] == 0
     assert store.state(handle) == "failed"
+    recovered_status = app.status(run_id=run_id)
+    assert recovered_status["phases"][0]["trials"] == {"FAIL": 1}
+    assert recovered_status["phases"][0]["running"] == 0
     assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
     assert trial_cleanup_calls == [(4343, 222, 4343), (4343, 222, 4343)]
 

@@ -25,8 +25,9 @@ from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import AGENT_IDS
 from phasesweep.mcp.registry import CatalogCheckReport, check_catalog
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import (
@@ -320,6 +321,14 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             "Re-run with --confirm to clear cleanup uncertainty."
         )
         return
+
+    if terminal_cleanup_uncertain:
+        assert terminal_status is not None
+        terminal_status["result_snapshot"] = capture_result_snapshot(
+            config,
+            cleanup_confirmed=True,
+        )
+        write_status_file(store.status_path(run_id), terminal_status)
 
     payload = {
         "run_id": run_id,
