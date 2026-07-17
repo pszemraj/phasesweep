@@ -73,6 +73,21 @@ def test_init_catalog_quotes_config_paths(tmp_path: Path, filename: str) -> None
     assert entry.config_path == config.resolve()
 
 
+@pytest.mark.parametrize("filename", ["null.yaml", "true.yaml", "123.yaml"])
+def test_init_catalog_quotes_implicit_yaml_scalar_ids(tmp_path: Path, filename: str) -> None:
+    config = _write_config(tmp_path, filename)
+    output = tmp_path / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 0, result.output
+    experiment_id = config.stem
+    assert f'- id: "{experiment_id}"' in output.read_text()
+    assert Registry.load(output).get(experiment_id).id == experiment_id
+
+
 def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     catalog_dir = tmp_path / "project # one"

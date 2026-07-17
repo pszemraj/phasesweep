@@ -54,13 +54,13 @@ def _catalog_relative_config(config: Path, catalog_dir: Path) -> str:
     return f"./{relative}"
 
 
-def _yaml_path_scalar(path: str | Path) -> str:
-    """Render a filesystem path as one YAML-safe double-quoted scalar.
+def _yaml_string_scalar(value: str | Path) -> str:
+    """Render a string value as one YAML-safe double-quoted scalar.
 
-    :param str | Path path: Path value to serialize.
+    :param str | Path value: String-like value to serialize.
     :return str: YAML scalar that round-trips punctuation and line breaks.
     """
-    return yaml.safe_dump(str(path), default_style='"', allow_unicode=True).strip()
+    return yaml.safe_dump(str(value), default_style='"', allow_unicode=True).strip()
 
 
 def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
@@ -84,10 +84,11 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
                 suggestion="rename one file, or edit the generated id afterwards",
             )
         seen[experiment_id] = config
-        config_path = _yaml_path_scalar(_catalog_relative_config(config, catalog_dir))
+        experiment_id_scalar = _yaml_string_scalar(experiment_id)
+        config_path = _yaml_string_scalar(_catalog_relative_config(config, catalog_dir))
         entries.append(
             f"""\
-  - id: {experiment_id}          # the only token the agent ever sends
+  - id: {experiment_id_scalar}          # the only token the agent ever sends
     config: {config_path}   # resolved relative to this catalog file
     description: "TODO: one line the agent sees in phasesweep_list_experiments"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
@@ -107,7 +108,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
 # config, or reach trial_command / env / storage / workdir. You curate which
 # experiments exist by editing this file (same trust as the experiment YAML).
 
-state_dir: {_yaml_path_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
+state_dir: {_yaml_string_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane
 experiments:
 """
