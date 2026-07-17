@@ -76,13 +76,16 @@ def test_help_output_is_operator_readable() -> None:
 
 
 @pytest.mark.parametrize(
-    ("dry_run", "expected_events"),
-    [(False, ["signals", "load", "run"]), (True, ["load", "run"])],
+    ("expected_dry_run", "expected_events"),
+    [
+        (False, ["signals", "load", "run"]),
+        (True, ["signals", "load", "run"]),
+    ],
 )
 def test_run_installs_signal_handlers_before_config_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    dry_run: bool,
+    expected_dry_run: bool,
     expected_events: list[str],
 ) -> None:
     config_path = tmp_path / "experiment.yaml"
@@ -99,13 +102,13 @@ def test_run_installs_signal_handlers_before_config_load(
     def fake_run_config(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
         assert loaded is config
         assert from_phase is None
-        assert dry_run == (expected_events == ["load", "run"])
+        assert dry_run is expected_dry_run
         events.append("run")
 
     monkeypatch.setattr("phasesweep.cli.load_config", fake_load_config)
     monkeypatch.setattr("phasesweep.cli.run_config", fake_run_config)
     args = ["run", str(config_path)]
-    if dry_run:
+    if expected_dry_run:
         args.append("--dry-run")
 
     result = CliRunner().invoke(cli_main, args)

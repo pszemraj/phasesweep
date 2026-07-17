@@ -112,11 +112,10 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     """
     _configure_logging(verbose)
-    if not dry_run:
-        # Install before config parsing so CLI SIGINT/SIGTERM behavior and
-        # exit codes remain structured throughout startup. run_experiment()
-        # repeats this idempotently for direct library callers.
-        install_signal_handlers()
+    # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
+    # codes remain structured throughout startup, including dry-run previews.
+    # run_experiment() repeats this idempotently for direct library callers.
+    install_signal_handlers()
     config = load_config(config_path)
     if from_phase is not None:
         if isinstance(config, Suite):
