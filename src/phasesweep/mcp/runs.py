@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -80,11 +80,7 @@ class CleanupUncertainMarker:
 
 @dataclass(frozen=True)
 class RunHandle:
-    """Immutable, on-disk identity of one detached sweep.
-
-    ``log_path`` and ``status_path`` are server-internal and never returned to
-    the agent.
-    """
+    """Immutable, on-disk identity of one detached sweep."""
 
     run_id: str
     experiment_id: str
@@ -93,8 +89,6 @@ class RunHandle:
     pgid: int | None
     pid_starttime: int | None  # /proc start time for PID-reuse-safe liveness; None off-Linux
     started_at: str  # ISO-8601 UTC
-    log_path: str  # server-internal; never returned to the agent
-    status_path: str  # server-internal
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
 
@@ -276,11 +270,7 @@ class RunStore:
                 type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
             ):
                 return None
-        return replace(
-            handle,
-            log_path=str(self.log_path(handle.run_id)),
-            status_path=str(self.status_path(handle.run_id)),
-        )
+        return handle
 
     def state(self, handle: RunHandle) -> RunState:
         """Derive the current state from status.json and a live PID check.

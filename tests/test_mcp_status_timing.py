@@ -104,7 +104,7 @@ def test_poll_after_seconds_clamps_median() -> None:
     assert _poll_after_seconds(10_000.0) == POLL_MAX_SECONDS
 
 
-def _handle(store: RunStore, run_id: str, *, started_at: str) -> RunHandle:
+def _handle(run_id: str, *, started_at: str) -> RunHandle:
     return RunHandle(
         run_id=run_id,
         experiment_id="srv",
@@ -113,14 +113,12 @@ def _handle(store: RunStore, run_id: str, *, started_at: str) -> RunHandle:
         pgid=1,
         pid_starttime=None,
         started_at=started_at,
-        log_path=str(store.log_path(run_id)),
-        status_path=str(store.status_path(run_id)),
     )
 
 
 def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = _handle(store, "r1", started_at=utc_now_iso())
+    handle = _handle("r1", started_at=utc_now_iso())
     elapsed = _run_elapsed_seconds(store, handle, "running")
     assert elapsed is not None
     assert 0 <= elapsed <= 5
@@ -128,7 +126,7 @@ def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
 
 def test_elapsed_seconds_terminal_prefers_runner_stamp(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = _handle(store, "r1", started_at="2026-07-16T00:00:00+00:00")
+    handle = _handle("r1", started_at="2026-07-16T00:00:00+00:00")
     write_status_file(
         store.status_path("r1"),
         {
@@ -146,7 +144,7 @@ def test_elapsed_seconds_terminal_falls_back_to_status_mtime(tmp_path: Path) -> 
     # Runs recorded before the ended_at stamp existed still report a duration.
     store = RunStore(tmp_path / "state")
     started = utc_now_iso()
-    handle = _handle(store, "r1", started_at=started)
+    handle = _handle("r1", started_at=started)
     write_status_file(
         store.status_path("r1"),
         {"run_id": "r1", "returncode": 0, "error_class": None, "cleanup_confirmed": True},
@@ -160,10 +158,10 @@ def test_elapsed_seconds_none_without_status_or_valid_start(tmp_path: Path) -> N
     store = RunStore(tmp_path / "state")
     # Terminal with no status.json at all (e.g. SIGKILL before any write).
     assert _run_elapsed_seconds(
-        store, _handle(store, "r1", started_at=utc_now_iso()), "failed"
+        store, _handle("r1", started_at=utc_now_iso()), "failed"
     ) is (None)
     # Malformed launch timestamp.
-    assert _run_elapsed_seconds(store, _handle(store, "r2", started_at="bogus"), "running") is None
+    assert _run_elapsed_seconds(store, _handle("r2", started_at="bogus"), "running") is None
 
 
 def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:

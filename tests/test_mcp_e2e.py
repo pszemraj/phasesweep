@@ -98,7 +98,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
             state = awaited["run"]["state"]
             if state in {"succeeded", "failed", "cancelled"}:
                 break
-        log = Path(store.get(run_id).log_path).read_text()
+        log = store.log_path(run_id).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
         winners = app.winners(run_id=run_id)

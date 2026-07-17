@@ -352,8 +352,6 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
     assert handle.pid_starttime == read_proc_starttime(os.getpid())
     assert handle.started_at == started_at
-    assert Path(handle.log_path) == store.log_path(run_id)
-    assert Path(handle.status_path) == store.status_path(run_id)
     assert store.state(handle) == "succeeded"
     assert calls == [("srv", None, False)]
     terminal = store.recorded_terminal_status(handle)

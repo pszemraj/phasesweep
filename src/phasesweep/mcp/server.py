@@ -1174,8 +1174,6 @@ class PhaseSweepMCP:
             pgid=None,
             pid_starttime=None,
             started_at=utc_now_iso(),
-            log_path=str(self._runs.log_path(run_id)),
-            status_path=str(self._runs.status_path(run_id)),
             launch_state="launching",
             allow_cancel=reg.allow_cancel,
         )
@@ -1242,8 +1240,6 @@ class PhaseSweepMCP:
             pgid=proc.pid,
             pid_starttime=read_proc_starttime(proc.pid),
             started_at=pending.started_at,
-            log_path=str(log_path),
-            status_path=str(status_path),
             launch_state="spawned",
             allow_cancel=reg.allow_cancel,
         )

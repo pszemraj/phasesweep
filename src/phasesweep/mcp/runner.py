@@ -79,7 +79,6 @@ def _persist_spawned_handle(
     experiment_id: str,
     config_sha256: str,
     started_at: str,
-    status_path: Path,
     allow_cancel: bool,
 ) -> None:
     """Persist this runner's process identity before it launches any training work.
@@ -89,7 +88,6 @@ def _persist_spawned_handle(
     :param str experiment_id: Catalog id this run belongs to.
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
-    :param Path status_path: Terminal ``status.json`` path this runner will write.
     :param bool allow_cancel: Cancel permission frozen at launch time.
     """
     store = RunStore(state_dir)
@@ -104,8 +102,6 @@ def _persist_spawned_handle(
             pgid=pgid,
             pid_starttime=read_proc_starttime(pid),
             started_at=started_at,
-            log_path=str(store.log_path(run_id)),
-            status_path=str(status_path),
             launch_state="spawned",
             allow_cancel=allow_cancel,
         )
@@ -163,7 +159,6 @@ def main(argv: list[str] | None = None) -> int:
             experiment_id=args.experiment_id,
             config_sha256=args.config_sha256,
             started_at=args.started_at,
-            status_path=args.status_path,
             allow_cancel=args.allow_cancel,
         )
         from phasesweep.config import load_config

@@ -131,21 +131,14 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     assert store.list_handles() == []
 
 
-def test_loaded_handle_paths_are_derived_from_store(tmp_path: Path) -> None:
+def test_persisted_handle_omits_derived_store_paths(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1")
-    payload = asdict(handle)
-    payload["log_path"] = str(tmp_path / "outside.log")
-    payload["status_path"] = str(tmp_path / "outside.status.json")
-    (tmp_path / "outside.status.json").write_text('{"run_id": "exp-1", "returncode": 0}')
-    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+    store.save(handle)
 
-    loaded = store.get("exp-1")
-
-    assert loaded is not None
-    assert loaded.log_path == str(store.log_path("exp-1"))
-    assert loaded.status_path == str(store.status_path("exp-1"))
-    assert store.state(loaded) == "running"
+    payload = json.loads((tmp_path / "state" / "runs" / "exp-1.json").read_text())
+    assert "log_path" not in payload
+    assert "status_path" not in payload
 
 
 @pytest.mark.parametrize(

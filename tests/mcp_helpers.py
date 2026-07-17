@@ -191,8 +191,6 @@ def make_run_handle(
             pgid=None,
             pid_starttime=None,
             started_at=utc_now_iso(),
-            log_path=str(store.log_path(run_id)),
-            status_path=str(store.status_path(run_id)),
             launch_state=launch_state,
             allow_cancel=allow_cancel,
         )
@@ -205,8 +203,6 @@ def make_run_handle(
         pgid=process_id,
         pid_starttime=read_proc_starttime(process_id) if starttime is None else starttime,
         started_at=utc_now_iso(),
-        log_path=str(store.log_path(run_id)),
-        status_path=str(store.status_path(run_id)),
         launch_state=launch_state,
         allow_cancel=allow_cancel,
     )
