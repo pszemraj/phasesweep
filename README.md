@@ -2,17 +2,17 @@
 
 > Orchestration layer for YAML-driven, phase-chained hyperparameter sweeps over your own training scripts
 
-Your trainer runs the experiments. `phasesweep` decides what to try next. Define phased Optuna sweeps in YAML; each phase's winner locks in as a fixed override for every phase downstream.
+Your trainer runs the experiments. `phasesweep` decides what to try next. Define phased Optuna sweeps in YAML; a phase can inherit earlier winners as fixed overrides.
 
-Use `phasesweep` when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. Use one phase with the full search space when dimensions strongly interact.
+Use `phasesweep` when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. The [config guide](docs/config.md#phase-keys) explains the tradeoff and inheritance model.
 
 ![dag diagram](docs/images/diagramA_dag.png)
 
 ## Requirements
 
 - Python 3.10+; real runs need a [supported POSIX platform](docs/runtime.md#platform-support)
-- A trainer command that **writes a metric artifact** and **accepts at least one [supported override format](docs/config.md#override-formats)**
-- GPU optional: CUDA devices are auto-detected for same-host lease management
+- A trainer command that follows the [trainer contract](docs/config.md#trainer-contract)
+- GPU optional; see [GPU concurrency and isolation](docs/runtime.md#concurrency-model)
 
 ## Install
 

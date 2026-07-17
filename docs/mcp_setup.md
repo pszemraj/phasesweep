@@ -32,7 +32,7 @@ Scaffold a catalog next to your project:
 phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated `catalog.yaml` only after every entry passes the server's startup checks. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for every field and validation rule. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
+This writes an annotated `catalog.yaml` only after every entry passes the server's startup checks. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
 
 Confirm the catalog loads before touching any client config:
 
@@ -44,14 +44,18 @@ Fix every reported failure before connecting a client. The command exits 0 only 
 
 ## 3. Connect your client
 
-One command writes both integrations for your coding agents - the MCP server entry, project-scoped wherever the client supports it, and the step-5 agent instructions as a marker-fenced block:
+One command writes the MCP server entry and, where the client supports project instructions, the step-5 agent instructions as a marker-fenced block. Project scope is used wherever the client supports it.
 
 ```bash
 phasesweep install                        # interactive: confirm each detected agent, review the plan, apply
 phasesweep install --agent claude --yes   # unattended; repeat --agent for more
 ```
 
-`install` first confirms the MCP SDK from step 1 is available, then validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, and reports one `created` / `updated` / `unchanged` line per edit. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`. A config that is not strict JSON (comments, JSON5) is never modified - the report says `skipped` and prints the exact snippet to merge manually. Codex TOML receives the same fail-safe treatment: invalid TOML, an existing unmanaged `mcp_servers.phasesweep` entry, or a merge that would not parse is left untouched with a manual snippet. `--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project - use `--catalog PATH` for any other name or location. `phasesweep uninstall` removes exactly what install wrote: the server entry by name, the instructions block by its markers, and any file that becomes empty.
+`install` first confirms the MCP SDK from step 1 is available, then validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, and reports an outcome for each edit. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`.
+
+Automatic edits are limited to regular files at the expected target. Project-scoped paths must remain inside the project after symlink resolution, and direct symlink targets are refused. Successful writes use an atomic replacement in the target directory and preserve an existing file's permissions. Strict JSON configs may update or remove a `phasesweep` entry only when its shape is recognizable as installer-generated; a different pre-existing entry is reported as a conflict and left untouched. Commented JSON/JSON5, malformed containers, invalid TOML, and unmanaged Codex tables are also left untouched with a manual snippet where applicable.
+
+`--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project, so use `--catalog PATH` for any other name or location. `phasesweep uninstall` removes only recognizable generated-shape JSON entries and marker-owned TOML or instruction blocks, then deletes a file if that removal leaves it empty. Unmanaged same-name entries remain untouched and are reported for operator attention.
 
 Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
 
@@ -124,12 +128,14 @@ OpenCode uses a command array in `opencode.json`:
 }
 ```
 
-Any stdio client can also launch through `uvx` without a persistent install. Replace the standard entry's command and args with:
+Any stdio client can also launch through `uvx` without a persistent install. For clients with separate `command` and `args` fields, replace the standard entry with:
 
 ```json
 "command": "uvx",
 "args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"]
 ```
+
+For Codex, use the same values as TOML `command` and `args`; for OpenCode, combine them into its `command` array.
 
 Or launch the module through a known interpreter:
 

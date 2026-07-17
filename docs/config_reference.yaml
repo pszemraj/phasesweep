@@ -16,7 +16,8 @@ Experiment:
   # Must be non-empty and match [A-Za-z0-9_-]+.
 
   storage: "str | None = null"
-  # Optuna storage URL. null is in-memory and cannot resume.
+  # Optuna storage URL. null starts a fresh in-memory study on each invocation;
+  # --from-phase can still load completed earlier winner.yaml files.
   # sqlite:///path.db is durable only for n_jobs == 1; parallel SQLite is
   # rejected because writer contention can deadlock or corrupt run semantics.
   # journal:///path.journal is the intended same-host parallel storage.
@@ -24,6 +25,8 @@ Experiment:
 
   workdir: "str = './runs'"
   # Output root. Experiment artifacts live under <workdir>/<experiment>/.
+  # Relative workdir, trial-command paths, and three-slash SQLite/Journal paths
+  # resolve from the invocation cwd. Four slashes denote an absolute POSIX URL.
 
   trial_command: "str (required)"
   # Shell command template for one trial. Supported placeholders:
@@ -111,13 +114,14 @@ Experiment:
       # single_per_trial leases one CUDA-visible token per trial; whole_node requires n_jobs == 1 and exposes all configured/detected tokens; none disables phasesweep CUDA isolation and GPU locks.
 
       gpu_ids: "list[int] | None = null"
-      # Explicit non-negative CUDA device IDs to lease. When null, phasesweep
+      # Explicit nonempty list of non-negative CUDA device IDs to lease. When null, phasesweep
       # auto-detects ambient CUDA_VISIBLE_DEVICES tokens or nvidia-smi output,
       # even for n_jobs == 1, to avoid double-booking GPUs across local runs.
 
       gpu_devices: "list[str] | None = null"
-      # Explicit CUDA_VISIBLE_DEVICES tokens to lease, such as GPU UUIDs or MIG
-      # instance IDs. Mutually exclusive with gpu_ids.
+      # Explicit nonempty CUDA_VISIBLE_DEVICES token list, such as GPU UUIDs or
+      # MIG instance IDs. Tokens are stripped and cannot be empty, contain a
+      # comma, or equal -1. Mutually exclusive with gpu_ids.
 
       max_consecutive_failures: "int >= 1 = 5"
       # Abort after this many consecutive failed or infeasible trials. Set high
@@ -239,8 +243,10 @@ Definitions:
     # true: failed gates block promotion and normally fail the trial. false:
     # gate results are advisory and the metric delta decides promotion.
     on_fail: "Literal['stop', 'skip', 'continue_baseline'] = 'stop'"
-    # stop: abort on insufficient delta. skip: stop exposing this branch.
-    # continue_baseline: expose a clone of the baseline winner downstream.
+    # Phase: stop raises; skip ends remaining phases with a partial summary;
+    # continue_baseline exposes a clone of the baseline winner.
+    # Suite: stop raises; skip omits the study until a dependency requires it;
+    # continue_baseline substitutes the baseline for the final study winner.
 
   Sampler:
     type: "Literal['tpe', 'random', 'grid', 'cmaes'] = 'tpe'"

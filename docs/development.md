@@ -1,6 +1,6 @@
 # Development
 
-## Quality Gates
+## Quality gates
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -12,7 +12,7 @@ pytest
 
 Run `pytest` by itself, with no concurrent `ruff`, `mypy`, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise.
 
-## Package Map
+## Package map
 
 ![module dependency graph](images/diagramF_moduledeps.png)
 
@@ -31,7 +31,7 @@ The control flow of a typical run is as follows:
 
 ![control flow](images/diagramC_controlflow.png)
 
-## Test Map
+## Test map
 
 Tests are organized by behavior:
 
@@ -43,6 +43,7 @@ Tests are organized by behavior:
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`: timeout policy, contracts, evidence gates, promotion, suites, and read-only engine views.
 - `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
+- `tests/test_public_metadata.py`: package entry points, classifiers, and the shipped `py.typed` marker.
 - `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`: focused unit surfaces.
 
 ## Tracked TODOs

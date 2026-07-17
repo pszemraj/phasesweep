@@ -1,13 +1,10 @@
-# Runtime Behavior
+# Runtime behavior
 
-## Platform Support
+## Platform support
 
-Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep
-uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host
-locks. Config validation and `--dry-run` do not launch subprocesses and do not
-take those locks, but real runs fail early on unsupported platforms.
+Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host locks. Config validation and `--dry-run` do not launch subprocesses and do not take those locks, but real runs fail early on unsupported platforms.
 
-## Output Layout
+## Output layout
 
 A completed run writes one namespace per experiment:
 
@@ -30,17 +27,17 @@ runs/
   phases.db
 ```
 
-`pid`, `pgid`, and `pid_starttime` are written atomically while a trial is live. They are removed on clean exit and preserved on failure for inspection. If those identity writes fail after launch, phasesweep terminates the new process group before returning a failed trial result.
+`pid` and `pgid` are written atomically while a trial is live. On Linux, phasesweep also writes `/proc` start time to `pid_starttime` when it is readable. Identity files are removed on clean exit and preserved on failure for inspection. If an identity write fails after launch, phasesweep terminates the new process group before returning a failed trial result.
 
 ![output layout](images/diagramG_artifacttree.png)
 
-## Process Management
+## Process management
 
 ![trial state machine](images/diagramB_statemachine.png)
 
 Every trial runs in a new process group via `start_new_session=True`. Timeouts and shutdown signals target the whole group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
 
-`timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` and top-level `timeout_seconds_per_run` are hard wallclock caps for the larger execution scope: phasesweep passes the remaining budget into GPU lease acquisition and active trial supervision, so a queued or running trial cannot extend past the phase/run deadline. When a phase or run deadline stops the phase before the requested number of completed evaluations exists, phasesweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
+`timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` bounds each Optuna optimize invocation, including a later top-up, while top-level `timeout_seconds_per_run` bounds the current whole-experiment invocation. phasesweep passes the remaining budget into GPU lease acquisition and active trial supervision, so the deadline stops new work and begins process-group termination; the SIGTERM/SIGKILL cleanup grace can finish after that deadline. When a phase or run deadline stops the phase before the requested number of terminal trial attempts exists, phasesweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
 
 If a wallclock timeout and `max_consecutive_failures` become true in the same phase, timeout handling takes precedence. A phase that has at least one completed feasible trial can therefore persist a timeout-marked partial winner when `allow_incomplete_on_timeout: true`, instead of having that winner masked by the consecutive-failure abort path. Without that opt-in, the same situation fails closed with `TimeoutError`.
 
@@ -50,20 +47,18 @@ Launch uses signal deferral around the `Popen()` to registry window. A shutdown 
 
 If cleanup cannot prove the process group is gone, phasesweep fails closed with `UnsafeProcessCleanupError`. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
 
-## Stale Trial Reaping
+## Stale trial reaping
 
 On startup and before skipped phases in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
 
-1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the
-   canonical trial directory when a crash left a pre-launch `RUNNING` trial
-   before that attr was written.
-2. Match PID plus process start time to avoid PID-reuse kills.
+1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
+2. On Linux, match PID plus process start time to avoid PID-reuse kills. When `/proc` start time is unavailable, use the live PID as a best-effort identity check.
 3. Fall back to PGID cleanup when the root PID is gone but descendants remain.
 4. Mark the trial `FAIL` only after cleanup is confirmed.
 
 Reaping runs before fingerprint checks, so a config mismatch cannot leave old GPU-holding processes alive.
 
-## Concurrency Model
+## Concurrency model
 
 phasesweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
@@ -85,12 +80,12 @@ CUDA device tokens also take per-device host locks. With the default `gpu_policy
 > [!WARNING]
 > Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
 
-## Fingerprints and Resume
+## Fingerprints and resume
 
-Each phase study stores a semantic fingerprint. Run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `gpu_devices`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`.
+Each phase study stores a semantic fingerprint. Phase run-control fields are excluded: `n_trials`, `n_jobs`, `gpu_ids`, `gpu_devices`, `max_consecutive_failures`, `allow_no_gpu_isolation`, `allow_unbounded_trials`, `timeout_seconds_per_phase`, `allow_incomplete_on_timeout`, `allow_partial_grid`, `allow_seed_search`, and `comment`. Top-level experiment name, storage, workdir, and `timeout_seconds_per_run` are also outside the fingerprint; experiment name and storage select the study identity instead.
 
-Semantic fields are included: search space, sampler, fixed overrides, contracts, gates, promotion, trial command, [override format](config.md#override-formats), metric, constraints, environment, inherited winners, `gpu_policy`, and `timeout_seconds_per_trial`.
+The payload includes the phasesweep package version; trial command; [override format](config.md#override-formats); environment; metric and constraints; contracts applied by the phase; every remaining phase field, including its name and inheritance declaration; and each inherited winner's effective overrides.
 
-Re-running the same YAML reuses the study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files, after stale reaping and fingerprint verification. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
+With persistent storage, re-running the same YAML reuses a study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files after stale reaping and fingerprint verification, even when storage is in-memory. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 
 `--dry-run` renders one example command per phase without launching subprocesses, writing preview files, creating run directories, touching storage, or taking the run lock.

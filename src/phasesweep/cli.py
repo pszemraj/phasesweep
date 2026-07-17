@@ -693,9 +693,9 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
 @main.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Remove what `phasesweep install` wrote: the phasesweep MCP server entry (by name) and "
-        "the marker-fenced instructions block, per selected agent. Files the installer created "
-        "are deleted when they become empty."
+        "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "
+        "entries and marker-fenced TOML or instruction blocks, per selected agent. Unmanaged "
+        "same-name entries stay untouched. Files are deleted when removal leaves them empty."
     ),
     short_help="Disconnect coding agents.",
 )

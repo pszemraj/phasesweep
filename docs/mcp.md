@@ -44,7 +44,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds`; terminal run-id reads use a frozen result snapshot when one was recorded |
 | `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (5-600; default 120) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`terminal` / `phase_completed` / `timeout`) |
 | `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, a `params_redacted` flag, gate status, and completeness; terminal run-id reads use a frozen result snapshot when one was recorded |
-| `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
+| `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, experiment_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
 A launched sweep runs as a detached background process in its own session, so it survives the agent's tool call and a server restart and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `phasesweep_await_run` waits without preventing cancellation or other MCP calls. The packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md#workflow) define the call sequence. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
@@ -98,7 +98,7 @@ Run handles and per-run logs live under `state_dir`:
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 
-`audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
+`audit.jsonl` contains one JSON object per tool call with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, `timeout_seconds`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. It does not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
 When a client polls `phasesweep_get_status` instead of waiting on `phasesweep_await_run`, each result carries a `poll_after_seconds` suggestion sized from the median completed-trial duration (30s until anything finishes, clamped to 15-600s) - follow it rather than a tight loop. SQLite-backed status uses a read-only direct count path. Journal-backed status goes through Optuna's full read path today, so keep polling sparse on very large Journal-backed studies until the tracked aggregate-count optimization lands.
 
