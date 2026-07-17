@@ -71,7 +71,8 @@ def test_help_output_is_operator_readable() -> None:
     assert "Args:" not in init_help.output
     assert "annotated MCP catalog" in init_help.output
     assert "--from PATH" in init_help.output
-    assert "nothing is written" in init_help.output
+    assert "may provision state directories" in init_help.output
+    assert "catalog destination is not written" in " ".join(init_help.output.split())
 
 
 @pytest.mark.parametrize(

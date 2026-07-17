@@ -115,7 +115,7 @@ def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "FAIL" in result.output
-    assert "nothing was written" in result.output
+    assert "catalog destination was not written" in result.output
     assert not output.exists()
     assert not output.with_name(output.name + ".tmp").exists()
     assert not (tmp_path / "runs").exists()

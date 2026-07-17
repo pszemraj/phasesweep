@@ -464,8 +464,9 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
         "Write an annotated MCP catalog for existing experiment configs: absolute "
         "state_dir next to the catalog, one read-only entry per --from config "
         "(visible_params: none, no allow block). The result is validated with the "
-        "exact server startup rules first; on failure the mcp-check report is "
-        "printed and nothing is written."
+        "exact server startup rules first, which may provision state directories. "
+        "On failure the mcp-check report is printed and the catalog destination "
+        "is not written."
     ),
     short_help="Scaffold an MCP catalog.",
 )
@@ -546,7 +547,8 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
     if not report.ok:
         staged.unlink(missing_ok=True)
         click.echo(
-            "phasesweep init-catalog: fix the configs above and re-run; nothing was written.",
+            "phasesweep init-catalog: fix the configs above and re-run; "
+            "the catalog destination was not written.",
             err=True,
         )
         return False
