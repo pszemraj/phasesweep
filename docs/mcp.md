@@ -41,9 +41,9 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | --- | --- | --- | --- |
 | `phasesweep_list_experiments` | optional `limit`, `cursor` | read | catalog ids, description, phase names, metric name + goal, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | per-phase name, `n_trials`, sampler, inherited phases, search-space *keys* (not ranges) |
-| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds` |
+| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | per-phase progress (`n_trials`, `completed`, state counts) + winner presence, the run process state, `elapsed_seconds`, and a suggested `poll_after_seconds`; terminal run-id reads are frozen at that run's exit |
 | `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (default 120, max 600) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`terminal` / `phase_completed` / `timeout`) |
-| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, a `params_redacted` flag, gate status, and completeness |
+| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | per-phase trial number, metric, policy-filtered sampled params, a `params_redacted` flag, gate status, and completeness; terminal run-id reads are frozen at that run's exit |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed}` |
 
@@ -55,7 +55,7 @@ Cleanup-uncertain recovery is operator-only. After inspecting the host, run `pha
 
 `phasesweep_list_experiments` defaults to 50 entries and caps `limit` at 100. If `next_cursor` is non-null, call it again with that cursor to fetch the next page.
 
-When a `run_id` is supplied, status and winners are read from that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring or winner reads. If the run's original experiment id is no longer in the active catalog, winner parameter values use the strict `visible_params: none` behavior. `phasesweep_cancel_sweep` also accepts a decataloged run id only when that run handle recorded `allow.cancel: true` at launch; old handles and runs launched without cancel permission fail closed.
+When a `run_id` is supplied, live status is read through that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring. When the run terminates, the runner records a validated, path-free snapshot of its phase counts and sampled winners; later resumes may update the experiment's shared Optuna studies, but they cannot rewrite the old run id's status or winners. Runs created before terminal snapshots were introduced fall back to the live shared-study view. If the run's original experiment id is no longer in the active catalog, winner parameter values use the strict `visible_params: none` behavior. `phasesweep_cancel_sweep` also accepts a decataloged run id only when that run handle recorded `allow.cancel: true` at launch; old handles and runs launched without cancel permission fail closed.
 
 ## Resource and prompt
 
@@ -92,7 +92,7 @@ Run handles and per-run logs live under `state_dir`:
 - `state_dir/audit.jsonl` - structured MCP tool-call audit records.
 - `state_dir/runs/<run_id>.json` - the run handle.
 - `state_dir/logs/<run_id>.log` - captured runner stdout/stderr (operator-only).
-- `state_dir/logs/<run_id>.status.json` - the recorded terminal cause.
+- `state_dir/logs/<run_id>.status.json` - the recorded terminal cause plus the path-free status/winner snapshot used for stable run-id reads.
 - `state_dir/logs/<run_id>.config.yaml` - the exact config snapshot executed by
   the runner (operator-only; may contain command, storage, env, and overrides).
 - `state_dir/logs/<run_id>.cleanup_uncertain.json` - server-owned marker that keeps a cleanup-uncertain run counted as live.

@@ -116,6 +116,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     assert status["returncode"] == 143
     assert status["error_class"] == "cancelled"
     assert status["cleanup_confirmed"] is True
+    assert status["result_snapshot"]["status"]["phases"][0]["trials"]["FAIL"] == 1
+    assert status["result_snapshot"]["winners"] == []
     assert not _process_group_alive(trial_pgid)
 
 

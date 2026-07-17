@@ -50,6 +50,7 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
+from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
 from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
@@ -109,6 +110,8 @@ DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
     "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
+    "A terminal run_id returns the phase counts frozen when that run ended; an "
+    "experiment_id returns the current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
     "instead, wait poll_after_seconds between calls. When terminal, call "
     f"{TOOL_GET_WINNERS} with the same run_id."
@@ -119,7 +122,8 @@ DESCRIPTION_GET_WINNERS = (
     "Phases that completed still report winners when the run later failed or was "
     "cancelled. Values shown as <redacted> are intentional catalog policy, not "
     "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
-    "run_id). Read-only."
+    "run_id); terminal run-id winners stay frozen if the experiment is later "
+    "resumed. Read-only."
 )
 DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "
@@ -639,8 +643,9 @@ class PhaseSweepMCP:
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
         """Per-phase trial counts and winner presence plus the run process state.
 
-        Provide either ``experiment_id`` (reports the live run, if any) or
-        ``run_id`` (reports that specific run). Raises if neither is given.
+        Provide either ``experiment_id`` (reports the current shared studies and
+        live run, if any) or ``run_id`` (reports that specific run, using its
+        frozen result snapshot once terminal). Raises if neither is given.
 
         :param str | None experiment_id: Optional catalog id for experiment-level status.
         :param str | None run_id: Optional detached run id for run-specific status.
@@ -657,7 +662,8 @@ class PhaseSweepMCP:
             )
             if run is not None:
                 state_after = {"run_state": run["state"]}
-            status = read_status(experiment)
+            snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
+            status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
             elapsed_seconds = None
             if run is not None:
                 handle = self._runs.get(run["run_id"])
@@ -717,7 +723,12 @@ class PhaseSweepMCP:
                     include_run=True,
                 )
                 assert run is not None  # the run_id path always includes run state
-                status = read_status(experiment)
+                terminal_snapshot = self._terminal_result_snapshot(run_id)
+                status = (
+                    terminal_snapshot.status_payload()
+                    if terminal_snapshot is not None
+                    else read_status(experiment)
+                )
                 snapshot = _await_snapshot(run["state"], status)
                 if baseline is None:
                     baseline = snapshot
@@ -845,8 +856,9 @@ class PhaseSweepMCP:
         """Return the winning hyperparameters per completed phase.
 
         Provide ``experiment_id`` for the current cataloged experiment, or ``run_id``
-        to read winners from the immutable config snapshot that run was launched
-        with. Run-specific reads must not drift when the cataloged config changes.
+        to read winners from the immutable config and terminal result snapshots
+        that run recorded. Run-specific reads must not drift when the cataloged
+        config changes or a later run resumes the shared studies.
 
         :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
         :param str | None run_id: Optional detached run id whose snapshot should be read.
@@ -869,11 +881,11 @@ class PhaseSweepMCP:
                 # its catalog entry. Without a current visibility policy,
                 # default to the strict redacted posture.
                 visible_params = "none"
-            result = winners_payload(
-                target_id,
-                read_winners(experiment),
-                visible_params=visible_params,
+            snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
+            winner_views = (
+                snapshot.winner_views() if snapshot is not None else read_winners(experiment)
             )
+            result = winners_payload(target_id, winner_views, visible_params=visible_params)
         except Exception as exc:
             self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
             raise
@@ -884,6 +896,20 @@ class PhaseSweepMCP:
             result_counts={"phases": len(result["phases"])},
         )
         return result
+
+    def _terminal_result_snapshot(self, run_id: str) -> RunResultSnapshot | None:
+        """Return a run's frozen terminal result view when the runner recorded one.
+
+        :param str run_id: Persisted run id whose terminal status should be inspected.
+        :return RunResultSnapshot | None: Validated result snapshot, or None for live/legacy runs.
+        """
+        handle = self._runs.get(run_id)
+        if handle is None:
+            return None
+        terminal_status = self._runs.recorded_terminal_status(handle)
+        if terminal_status is None:
+            return None
+        return parse_result_snapshot(terminal_status)
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> dict[str, Any]:
         """Start the sweep as a detached background run; return its run_id.

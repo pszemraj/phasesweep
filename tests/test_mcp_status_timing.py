@@ -11,6 +11,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep.config import load_config
 from phasesweep.engine.optuna import _phase_study_name, phase_completed_trial_durations
@@ -185,6 +186,65 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
     (phase,) = status["phases"]
     assert phase["completed"] == 3
     assert POLL_MIN_SECONDS <= status["poll_after_seconds"] <= POLL_MAX_SECONDS
+
+
+def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
+    app, registry, store = _app_with_run(tmp_path)
+    experiment = registry.get("srv").experiment
+    winner_path = _winner_path(experiment, "p")
+    winner_path.parent.mkdir(parents=True, exist_ok=True)
+    winner_path.write_text(
+        yaml.safe_dump(
+            {
+                "trial_number": 9,
+                "metric": {"loss": 9.9},
+                "params": {"lr": 0.009},
+                "effective_overrides": {"lr": 0.009},
+            }
+        )
+    )
+    write_run_status(
+        store,
+        "r1",
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot={
+            "status": {
+                "metric": {"name": "loss", "goal": "minimize"},
+                "phases": [
+                    {
+                        "phase": "p",
+                        "trials": {"COMPLETE": 2, "FAIL": 1},
+                        "running": 0,
+                        "n_trials": 3,
+                        "completed": 2,
+                        "winner_present": True,
+                    }
+                ],
+                "summary_present": False,
+                "median_trial_seconds": 17.0,
+            },
+            "winners": [
+                {
+                    "phase": "p",
+                    "trial_number": 1,
+                    "metric": 0.25,
+                    "params": {"lr": 0.00025},
+                    "gates_passed": None,
+                    "incomplete": False,
+                }
+            ],
+        },
+    )
+
+    run_status = app.status(run_id="r1")
+    assert run_status["phases"][0]["trials"] == {"COMPLETE": 2, "FAIL": 1}
+    assert run_status["poll_after_seconds"] == 17
+    assert app.winners(run_id="r1")["phases"][0]["metric"] == 0.25
+
+    # Experiment-id reads remain the current shared-storage view.
+    assert app.winners(experiment_id="srv")["phases"][0]["metric"] == 9.9
 
 
 @pytest.mark.parametrize("median", [None, 0.1, 3600.0])

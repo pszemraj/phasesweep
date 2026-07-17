@@ -356,6 +356,10 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert Path(handle.status_path) == store.status_path(run_id)
     assert store.state(handle) == "succeeded"
     assert calls == [("srv", None, False)]
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
+    assert terminal["result_snapshot"]["winners"] == []
 
 
 def test_launch_does_not_spawn_when_pending_handle_save_fails(

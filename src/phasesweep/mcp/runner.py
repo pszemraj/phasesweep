@@ -18,6 +18,7 @@ from pathlib import Path
 
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -26,15 +27,38 @@ from phasesweep.runtime.process import (
 )
 
 
-def _write_status(status_path: Path, payload: dict) -> None:
+def _write_status(
+    status_path: Path,
+    payload: dict,
+    *,
+    config_path: Path,
+    config_sha256: str,
+) -> None:
     """Best-effort write of the runner terminal status file, stamped with an end time.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
+    :param Path config_path: Exact per-run config snapshot that was executed.
+    :param str config_sha256: Expected hash for the per-run config snapshot.
     """
     # Best-effort: a failed status write must not mask the real exit cause.
     try:
-        write_status_file(status_path, {**payload, "ended_at": utc_now_iso()})
+        terminal = dict(payload)
+        try:
+            from phasesweep.config import Experiment, load_config
+
+            if _sha256_file(config_path) == config_sha256:
+                config = load_config(config_path)
+                if isinstance(config, Experiment):
+                    terminal["result_snapshot"] = capture_result_snapshot(
+                        config,
+                        cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
+                    )
+        except Exception:  # noqa: BLE001 - terminal cause still must be recorded
+            logging.getLogger("phasesweep.mcp.runner").exception(
+                "failed to capture terminal result snapshot"
+            )
+        write_status_file(status_path, {**terminal, "ended_at": utc_now_iso()})
     except OSError:
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
 
@@ -156,13 +180,23 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = code
         status["error_class"] = "cancelled"
         status["cleanup_confirmed"] = exc.report.cleanup_confirmed
-        _write_status(args.status_path, status)
+        _write_status(
+            args.status_path,
+            status,
+            config_path=args.config,
+            config_sha256=args.config_sha256,
+        )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = False
-        _write_status(args.status_path, status)
+        _write_status(
+            args.status_path,
+            status,
+            config_path=args.config,
+            config_sha256=args.config_sha256,
+        )
         raise
     except SystemExit as exc:
         # The engine shutdown handler raises SystemExit(128+signum) on
@@ -171,15 +205,30 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = code
         status["error_class"] = "cancelled" if code in (143, 130) else "exited"
         status["cleanup_confirmed"] = code not in (143, 130)
-        _write_status(args.status_path, status)
+        _write_status(
+            args.status_path,
+            status,
+            config_path=args.config,
+            config_sha256=args.config_sha256,
+        )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = True
-        _write_status(args.status_path, status)
+        _write_status(
+            args.status_path,
+            status,
+            config_path=args.config,
+            config_sha256=args.config_sha256,
+        )
         raise
-    _write_status(args.status_path, status)
+    _write_status(
+        args.status_path,
+        status,
+        config_path=args.config,
+        config_sha256=args.config_sha256,
+    )
     return 0
 
 
