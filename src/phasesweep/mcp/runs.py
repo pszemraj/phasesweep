@@ -30,7 +30,6 @@ RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
 
 __all__ = [
-    "CleanupUncertainMarker",
     "ProcessIdentity",
     "RunHandle",
     "RunLaunchState",
@@ -66,16 +65,6 @@ class ProcessIdentity:
     pid: int | None
     pgid: int | None
     pid_starttime: int | None
-
-
-@dataclass(frozen=True)
-class CleanupUncertainMarker:
-    """Validated cleanup-uncertainty marker payload."""
-
-    run_id: str
-    config_sha256: str | None
-    identity: ProcessIdentity
-    cleanup_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -294,7 +283,7 @@ class RunStore:
         if handle.pid is not None:
             reap_child(handle.pid)
         status = self._read_status(handle)
-        if self._cleanup_uncertain(handle):
+        if self.cleanup_uncertain(handle):
             if status is not None and status.get("cleanup_confirmed") is True:
                 with contextlib.suppress(OSError):
                     self.clear_cleanup_uncertain(handle)
@@ -320,14 +309,6 @@ class RunStore:
             return "running"
         return "failed"
 
-    def has_recorded_status(self, handle: RunHandle) -> bool:
-        """Return whether the runner wrote a readable terminal status file.
-
-        :param RunHandle handle: Run handle whose status file should be checked.
-        :return bool: ``True`` when a valid runner-written status is present.
-        """
-        return self._read_status(handle) is not None
-
     def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
         """Return the runner-written terminal status payload, if readable.
 
@@ -346,16 +327,14 @@ class RunStore:
 
         :param RunHandle handle: Run handle whose cleanup is uncertain.
         """
-        existing = self._read_cleanup_uncertain_marker(handle)
+        existing = self._read_cleanup_identity(handle)
         candidate = ProcessIdentity(
             pid=handle.pid,
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
         )
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
-        identity = (
-            existing.identity if existing is not None and not candidate_has_identity else candidate
-        )
+        identity = existing if existing is not None and not candidate_has_identity else candidate
         payload = {
             "run_id": handle.run_id,
             "config_sha256": handle.config_sha256,
@@ -382,7 +361,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose cleanup marker should be checked.
         :return bool: ``True`` when a prior cancel could not confirm cleanup.
         """
-        return self._cleanup_uncertain(handle)
+        return self._read_cleanup_identity(handle) is not None
 
     def cleanup_identity(self, handle: RunHandle) -> ProcessIdentity:
         """Return the strongest runner identity available for cleanup.
@@ -394,11 +373,11 @@ class RunStore:
         :param RunHandle handle: Run handle whose runner identity is needed.
         :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
         """
-        marker = self._read_cleanup_uncertain_marker(handle)
-        if marker is not None and (
-            marker.identity.pid is not None or marker.identity.pgid is not None
+        marker_identity = self._read_cleanup_identity(handle)
+        if marker_identity is not None and (
+            marker_identity.pid is not None or marker_identity.pgid is not None
         ):
-            return marker.identity
+            return marker_identity
         return ProcessIdentity(
             pid=handle.pid,
             pgid=handle.pgid,
@@ -458,14 +437,6 @@ class RunStore:
             return None
         return payload
 
-    def _cleanup_uncertain(self, handle: RunHandle) -> bool:
-        """Return whether this run has a server-owned cleanup uncertainty marker.
-
-        :param RunHandle handle: Run handle whose cleanup marker should be checked.
-        :return bool: True when a prior cancel could not confirm cleanup.
-        """
-        return self._read_cleanup_uncertain_marker(handle) is not None
-
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
         """Return whether a terminal status still needs operator cleanup recovery.
 
@@ -498,14 +469,14 @@ class RunStore:
             and payload.get("cleanup_confirmed") is True
         )
 
-    def _read_cleanup_uncertain_marker(
+    def _read_cleanup_identity(
         self,
         handle: RunHandle,
-    ) -> CleanupUncertainMarker | None:
+    ) -> ProcessIdentity | None:
         """Read and validate this run's cleanup uncertainty marker.
 
         :param RunHandle handle: Run handle whose marker file should be read.
-        :return CleanupUncertainMarker | None: Validated marker payload, or ``None``
+        :return ProcessIdentity | None: Validated marker identity, or ``None``
             when the marker is absent, malformed, or belongs to a different
             run/config snapshot.
         """
@@ -536,14 +507,10 @@ class RunStore:
         if not _valid_positive_optional_int(pid_starttime):
             return None
 
-        return CleanupUncertainMarker(
-            run_id=handle.run_id,
-            config_sha256=marker_hash if isinstance(marker_hash, str) else None,
-            identity=ProcessIdentity(
-                pid=pid,
-                pgid=pgid,
-                pid_starttime=pid_starttime,
-            ),
+        return ProcessIdentity(
+            pid=pid,
+            pgid=pgid,
+            pid_starttime=pid_starttime,
         )
 
 
