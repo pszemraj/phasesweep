@@ -148,7 +148,7 @@ Restart the client, then ask the agent:
 List the available phasesweep experiments.
 ```
 
-A working setup returns your catalog entries with ids, descriptions, phase names, and the metric - and nothing path-shaped. If the tool is missing or the call fails, see [Troubleshooting](#troubleshooting).
+A working setup returns catalog ids, operator-authored descriptions, phase names, and the metric without dedicated config-path, command, storage, environment, or workdir fields. If the tool is missing or the call fails, see [Troubleshooting](#troubleshooting).
 
 ## 5. Instruct the agent
 

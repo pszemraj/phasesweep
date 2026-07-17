@@ -299,8 +299,8 @@ Definitions:
     # grid: exhaustive GridSampler over concrete values; log-scale params are
     # rejected, float params require step, and full matrix coverage is required
     # unless phase.allow_partial_grid is true.
-    # cmaes: continuous numeric search with cmaes>=0.10. Categorical params are
-    # rejected at config load. Good fit for later continuous tuning phases.
+    # cmaes: float and integer search with cmaes>=0.10. Categorical params are
+    # rejected at config load. Good fit for later numeric tuning phases.
     seed: "int | None = null"
     n_startup_trials: "int >= 0 = 10"
 

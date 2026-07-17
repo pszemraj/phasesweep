@@ -42,8 +42,9 @@ Each phase is one Optuna study in an ordered chain. A phase may inherit winners 
 - `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
 - `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
 - `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
+- `allow_no_gpu_isolation`: permit parallel execution when no GPU tokens can be detected or when `gpu_policy: none` delegates isolation to an external scheduler. Leave it `false` unless CPU-only or externally isolated parallel work is intentional.
 - `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
-- `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for continuous numeric phases.
+- `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for numeric phases without categorical parameters.
 - `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.
 - `timeout_seconds_per_phase`: hard phase wallclock guard. The budget caps Optuna scheduling, GPU-lease waiting, and active trial subprocess runtime.
 - `allow_incomplete_on_timeout`: select from completed trials after a phase or run timeout. Defaults to fail-closed.
@@ -64,7 +65,7 @@ search_space:
   activation: { type: categorical, choices: [gelu, relu] }
 ```
 
-Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports continuous numeric spaces only, so categorical parameters are rejected when `sampler.type: cmaes`.
+Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports float and integer parameters, but not categorical parameters.
 
 ## Override Formats
 
