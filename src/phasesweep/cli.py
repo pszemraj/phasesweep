@@ -397,8 +397,9 @@ def mcp(ctx: click.Context, catalog: Path) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Validate an MCP catalog with the exact rules the server applies at startup and "
-        "print a per-experiment ok/FAIL report, without starting anything. Exit code 0 "
-        "when every entry loads, 2 otherwise."
+        "print a per-experiment ok/FAIL report. A successful check provisions the state, "
+        "runs, and logs directories but starts no server or sweep. Exit code 0 when every "
+        "entry loads, 2 otherwise."
     ),
     short_help="Preflight an MCP catalog.",
 )

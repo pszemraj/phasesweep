@@ -40,7 +40,7 @@ Confirm the catalog loads before touching any client config:
 phasesweep mcp-check --catalog /abs/path/to/catalog.yaml
 ```
 
-Fix every reported failure before connecting a client. The command exits 0 only when the catalog and state directory pass the same checks used at server startup.
+Fix every reported failure before connecting a client. The command exits 0 only when the catalog and state directory pass the same checks used at server startup. A successful check provisions the configured state directory and its `runs` and `logs` subdirectories; it does not start the MCP server or a sweep.
 
 ## 3. Connect your client
 

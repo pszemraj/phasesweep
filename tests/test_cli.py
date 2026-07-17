@@ -62,6 +62,7 @@ def test_help_output_is_operator_readable() -> None:
     assert check_help.exit_code == 0
     assert "Args:" not in check_help.output
     assert "per-experiment ok/FAIL report" in check_help.output
+    assert "provisions the state, runs, and logs directories" in check_help.output
     assert "--catalog PATH" in check_help.output
 
     init_help = runner.invoke(cli_main, ["init-catalog", "--help"], terminal_width=120)
