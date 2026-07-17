@@ -357,47 +357,6 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
-@contextlib.contextmanager
-def atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
-    """Write bytes through a same-directory temp file and atomically replace ``path``.
-
-    :param Path path: Destination path to replace when the context exits successfully.
-    :return Iterator[IO[bytes]]: Writable binary file handle for the temporary file.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    replaced = False
-    try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        assert tmp_path is not None
-        os.replace(tmp_path, path)
-        replaced = True
-        fsync_directory(path.parent)
-    finally:
-        if tmp_path is not None and not replaced:
-            tmp_path.unlink(missing_ok=True)
-
-
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically replace ``path`` with bytes.
-
-    :param Path path: Destination path to replace.
-    :param bytes data: Bytes to write.
-    """
-    with atomic_bytes_writer(path) as handle:
-        handle.write(data)
-
-
 def storage_backend(storage: str | None) -> str | None:
     """Return the logical backend name for an Optuna storage URL.
 

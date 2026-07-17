@@ -176,7 +176,11 @@ def test_empty_explicit_gpu_ids_raises():
 def test_explicit_gpu_ids_dedupe_preserves_order():
     """Duplicate IDs in YAML are deduped without reordering."""
     pool = GpuPool.create(n_jobs=2, explicit_ids=[2, 0, 2, 1, 0])
-    assert pool._gpu_ids == [2, 0, 1]
+    acquired = []
+    for _ in range(3):
+        with pool.acquire() as gpu_id:
+            acquired.append(gpu_id)
+    assert acquired == ["2", "0", "1"]
 
 
 def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:

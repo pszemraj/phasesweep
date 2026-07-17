@@ -30,7 +30,6 @@ from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import (
-    install_signal_handlers,
     is_pid_zombie,
     is_same_process,
     kill_stale_group,
@@ -111,7 +110,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     """
     _configure_logging(verbose)
-    install_signal_handlers()
     config = load_config(config_path)
     if from_phase is not None:
         if isinstance(config, Suite):
@@ -157,9 +155,14 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         click.echo(
             f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}{contracts}"
         )
-        if p.comment:
-            for line in p.comment.strip().splitlines():
-                click.echo(f"{indent}    # {line}")
+        _render_phase_comment(p.comment, prefix=f"{indent}    # ")
+
+
+def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
+    """Render a phase comment one line at a time with ``prefix``."""
+    if comment:
+        for line in comment.strip().splitlines():
+            click.echo(f"{prefix}{line}")
 
 
 @main.command(
@@ -186,18 +189,13 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         wpath = _winner_path(experiment, p.name)
         if wpath.is_file():
             click.echo(f"=== {p.name} ===")
-            if p.comment:
-                # Show design-intent before numerical results so the reader
-                # frames "winner trial 7 with metric=0.32" against the original
-                # hypothesis instead of the other way around.
-                for line in p.comment.strip().splitlines():
-                    click.echo(f"# {line}")
+            # Show design-intent before numerical results so the reader frames
+            # them against the original hypothesis instead of the other way around.
+            _render_phase_comment(p.comment, prefix="# ")
             click.echo(wpath.read_text())
         else:
             click.echo(f"=== {p.name} === (no winner yet)")
-            if p.comment:
-                for line in p.comment.strip().splitlines():
-                    click.echo(f"# {line}")
+            _render_phase_comment(p.comment, prefix="# ")
 
 
 @main.command(

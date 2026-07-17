@@ -101,9 +101,7 @@ def run_experiment(
 
     Signal handlers are installed here (review v0.5.7 / blocker 3) so library
     callers using the public API get the same cleanup guarantees as CLI
-    callers. ``install_signal_handlers()`` is idempotent and a no-op when
-    invoked from a non-main thread, so re-installation by the CLI is safe.
-    Skipped on dry-run because no children will launch.
+    callers. Skipped on dry-run because no children will launch.
 
     Args:
         experiment: Parsed experiment config (result of

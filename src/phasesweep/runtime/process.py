@@ -83,8 +83,6 @@ class PhaseSweepShutdown(SystemExit):
         self.report = report
 
 
-_last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
-
 # Python-level shutdown deferral. Kernel signal masks are per-thread, but
 # CPython runs Python signal handlers only in the main thread — and it does so
 # whenever ANY thread's C-level handler tripped the pending flag, regardless of
@@ -100,11 +98,6 @@ _last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
 # is needed.
 _deferred_shutdown_signum: int | None = None
 _main_thread_defer_depth = 0
-
-
-def last_shutdown_cleanup_report() -> ShutdownCleanupReport | None:
-    """Return the most recent shutdown cleanup report in this process, if any."""
-    return _last_shutdown_cleanup_report
 
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
@@ -146,7 +139,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             as described above.
 
     """
-    global _last_shutdown_cleanup_report, _deferred_shutdown_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum  # noqa: PLW0603
 
     if _main_thread_defer_depth > 0:
         # The main thread is inside a launch/unregister critical section and
@@ -181,7 +174,6 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
         cleanup_confirmed=cleanup_confirmed,
         child_pgids=pgids,
     )
-    _last_shutdown_cleanup_report = report
     if cleanup_confirmed:
         log.warning(
             "Received signal %d; confirmed cleanup for %d child group(s)",
@@ -1057,23 +1049,3 @@ def kill_stale_group(
 
     log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
     return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)
-
-
-def terminate_group(pgid: int, *, grace_seconds: float = _KILL_GRACE_SECONDS) -> bool:
-    """Public SIGTERM -> grace -> SIGKILL of a process group; confirm it is gone.
-
-    Thin wrapper over the internal escalation used by trial cleanup, exposed so
-    callers outside ``runtime`` (the MCP cancel path) do not reach into a
-    private helper. Same contract: returns ``True`` only when the group is
-    confirmed dead (already gone, died in the SIGTERM grace, or died within 2s
-    of SIGKILL), ``False`` when cleanup is uncertain.
-
-    Args:
-        pgid: Target process-group ID.
-        grace_seconds: Seconds to wait after SIGTERM before escalating.
-
-    Returns:
-        Whether the group is confirmed gone.
-
-    """
-    return _terminate_process_group(pgid, grace_seconds=grace_seconds)
