@@ -10,8 +10,6 @@ command exit nonzero so scripts notice.
 
 from __future__ import annotations
 
-import functools
-import importlib.resources
 import os
 import shutil
 import sys
@@ -27,6 +25,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
+from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (
     Action,
     manual_json_snippet,
@@ -71,19 +70,6 @@ class StepResult:
         :return bool: True for successful, idempotent, and unsupported steps.
         """
         return self.action is None or self.action in _OK_ACTIONS
-
-
-@functools.cache
-def instructions_text() -> str:
-    """Return the packaged agent instructions installed between markers.
-
-    :return str: Contents of the canonical ``agent_prompt.md`` package data.
-    """
-    return (
-        importlib.resources.files("phasesweep.mcp")
-        .joinpath("agent_prompt.md")
-        .read_text(encoding="utf-8")
-    )
 
 
 def resolve_server_command() -> str:
@@ -204,7 +190,7 @@ def _apply_instructions(target: AgentTarget, mode: Mode) -> StepResult:
             "instructions", path, remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END)
         )
     action = replace_or_append_marked(
-        path, instructions_text(), start=MARKDOWN_START, end=MARKDOWN_END
+        path, agent_prompt_text(), start=MARKDOWN_START, end=MARKDOWN_END
     )
     return StepResult("instructions", path, action)
 

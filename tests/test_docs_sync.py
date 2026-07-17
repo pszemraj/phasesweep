@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from phasesweep.mcp.server import _run_and_monitor_prompt_text
+from phasesweep.mcp import agent_prompt_text
 from tests.conftest import REPO
 
 
@@ -28,4 +28,4 @@ def _normalize(text: str) -> str:
 
 def test_docs_instruction_block_matches_packaged_prompt() -> None:
     """docs/mcp_setup.md and agent_prompt.md can never drift apart."""
-    assert _normalize(_embedded_instruction_block()) == _normalize(_run_and_monitor_prompt_text())
+    assert _normalize(_embedded_instruction_block()) == _normalize(agent_prompt_text(strip=True))

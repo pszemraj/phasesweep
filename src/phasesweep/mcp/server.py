@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import functools
 import hashlib
-import importlib.resources
 import importlib.util
 import inspect
 import logging
@@ -32,6 +31,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
+from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     CatalogError,
@@ -1408,23 +1408,6 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
             raise RuntimeError(f"MCP tool {tool_name!r} lost its exactly-one-of schema")
 
 
-@functools.cache
-def _run_and_monitor_prompt_text() -> str:
-    """Return the reusable agent workflow prompt served over MCP.
-
-    The text is packaged data (``agent_prompt.md``) so the served prompt, the
-    setup docs, and the installer-injected instructions share one source.
-
-    :return str: Safe run-and-monitor instructions for MCP clients that support prompts.
-    """
-    return (
-        importlib.resources.files("phasesweep.mcp")
-        .joinpath("agent_prompt.md")
-        .read_text(encoding="utf-8")
-        .strip()
-    )
-
-
 def build_server(app: PhaseSweepMCP) -> Any:
     """Construct the FastMCP server.
 
@@ -1599,7 +1582,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
         :return str: Prompt text.
         """
-        return _run_and_monitor_prompt_text()
+        return agent_prompt_text(strip=True)
 
     _strict_tool_inputs(mcp)
     return mcp
