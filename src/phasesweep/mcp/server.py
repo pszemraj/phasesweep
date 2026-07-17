@@ -1612,7 +1612,8 @@ def serve(catalog: Path) -> int:
     """Load the catalog, build the run store, and serve the seven tools over stdio.
 
     :param Path catalog: Operator-authored catalog file.
-    :return int: Process exit code, where 2 means catalog load failure.
+    :return int: Process exit code, where 2 means a startup prerequisite or
+        catalog validation failed before the server could run.
     """
     # stdio transport owns stdout for JSON-RPC. All logging goes to stderr.
     logging.basicConfig(
