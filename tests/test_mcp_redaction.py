@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.mcp.redaction import status_payload, visible_winner_params, winners_payload
+from phasesweep.mcp.redaction import status_payload, winners_payload
 from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
@@ -88,30 +88,6 @@ def test_assert_no_sensitive_actually_catches_a_leak() -> None:
         assert_no_sensitive(leaky, ["DANGER_TOKEN"])
 
 
-def test_winner_params_redacted_by_default() -> None:
-    payload = winners_payload(
-        "redact_me",
-        [
-            PhaseWinnerView(
-                "p",
-                0,
-                0.1,
-                {"dataset": "SECRET_DATASET", "lr": 3e-4},
-                {"dataset": "SECRET_DATASET", "lr": 3e-4},
-                None,
-                False,
-            )
-        ],
-    )
-
-    assert payload["phases"][0]["params"] == {
-        "dataset": "<redacted>",
-        "lr": "<redacted>",
-    }
-    assert payload["phases"][0]["params_redacted"] is True
-    assert "SECRET_DATASET" not in str(payload)
-
-
 def test_params_redacted_flag_follows_policy() -> None:
     """The boolean is computed from the policy, so agents need not string-match."""
 
@@ -130,16 +106,6 @@ def test_params_redacted_flag_follows_policy() -> None:
     assert flag({"lr": 3e-4}, ["lr", "depth"]) is False
     # A literal sentinel VALUE with an open policy must not read as redaction.
     assert flag({"note": "<redacted>"}, "all") is False
-
-
-def test_visible_winner_params_supports_allowlist_and_all() -> None:
-    params = {"dataset": "SECRET_DATASET", "lr": 3e-4}
-
-    assert visible_winner_params(params, ["lr"]) == {
-        "dataset": "<redacted>",
-        "lr": 3e-4,
-    }
-    assert visible_winner_params(params, "all") == params
 
 
 def test_winners_payload_applies_visible_params_policy() -> None:

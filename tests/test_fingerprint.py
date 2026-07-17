@@ -531,7 +531,8 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
             ],
         )
 
-    fp_a = _phase_fingerprint(*(lambda e: (e, e.phases[0], {}))(build("First version")))
-    fp_b = _phase_fingerprint(*(lambda e: (e, e.phases[0], {}))(build("Reworded later")))
-    fp_c = _phase_fingerprint(*(lambda e: (e, e.phases[0], {}))(build(None)))
-    assert fp_a == fp_b == fp_c
+    def fingerprint(comment: str | None) -> str:
+        experiment = build(comment)
+        return _phase_fingerprint(experiment, experiment.phases[0], {})
+
+    assert fingerprint("First version") == fingerprint("Reworded later") == fingerprint(None)

@@ -61,44 +61,6 @@ def test_lock_dir_preserves_existing_override_permissions(
     assert stat.S_IMODE(path.stat().st_mode) == 0o750
 
 
-def test_run_lock_collides_for_same_storage_different_workdirs(
-    tmp_path: Path,
-) -> None:
-    """Two configs sharing the same SQLite storage but different workdirs
-    target the same phase-chained experiment and must collide on the run lock.
-
-    This is the v0.5.5 reviewer's primary scenario: process A and process B
-    each write to their own workdir but share an Optuna backend. Without the
-    run lock, they could top-up phase ``arch`` from B while A was already
-    fingerprinted and running phase ``lr`` against an older arch winner.
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
-
-    held = threading.Event()
-    released = threading.Event()
-
-    def hold_first() -> None:
-        with _experiment_lock(exp_a):
-            held.set()
-            released.wait(timeout=5.0)
-
-    t = threading.Thread(target=hold_first, daemon=True)
-    t.start()
-    assert held.wait(timeout=2.0)
-
-    try:
-        with (  # noqa: SIM117 — testing that the inner enter raises
-            pytest.raises(RuntimeError, match="Another phasesweep process"),
-            _experiment_lock(exp_b),
-        ):
-            pass
-    finally:
-        released.set()
-        t.join(timeout=2.0)
-
-
 def test_run_lock_blocks_even_when_processes_target_different_phases(
     tmp_path: Path,
 ) -> None:

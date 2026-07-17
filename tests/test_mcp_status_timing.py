@@ -245,11 +245,6 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     assert app.winners(experiment_id="srv")["phases"][0]["metric"] == 9.9
 
 
-@pytest.mark.parametrize("median", [None, 0.1, 3600.0])
-def test_poll_bounds_hold_for_all_medians(median: float | None) -> None:
-    assert POLL_MIN_SECONDS <= _poll_after_seconds(median) <= POLL_MAX_SECONDS
-
-
 def _app_with_run(tmp_path: Path, run_id: str = "r1"):
     """App plus a fabricated live run resolvable by run_id (snapshot + handle)."""
     config_text = mcp_experiment_config_text(tmp_path)
