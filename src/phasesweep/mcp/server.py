@@ -707,7 +707,11 @@ class PhaseSweepMCP:
                     experiment_id=None,
                     run_id=run_id,
                 )
-                assert run is not None  # the run_id path always includes run state
+                if run is None:
+                    # Keep this invariant active under ``python -O``: an
+                    # await request must never silently degrade into an
+                    # experiment-level status response without run identity.
+                    raise UnknownRunError(run_id)
                 snapshot = _await_snapshot(run["state"], status)
                 if baseline is None:
                     baseline = snapshot
@@ -1559,13 +1563,16 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def cancel_sweep(run_id: RunId) -> CancelSweepResult:
+    async def cancel_sweep(run_id: RunId) -> CancelSweepResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
 
         :param RunId run_id: Detached run id to cancel.
         :return CancelSweepResult: Structured cancellation result.
         """
-        return CancelSweepResult.model_validate(app.cancel(run_id))
+        # MCP 1.27 invokes synchronous tool functions on the event-loop
+        # thread. Cancellation may spend its 30-second grace period waiting
+        # for a process group, so isolate it from concurrent await/status calls.
+        return CancelSweepResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
     @mcp.resource(
         CATALOG_RESOURCE_URI,

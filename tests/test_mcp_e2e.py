@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from phasesweep.mcp.server import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
+    AWAIT_MIN_TIMEOUT_SECONDS,
     CATALOG_RESOURCE_URI,
     DEFAULT_LIST_LIMIT,
     PROMPT_RUN_AND_MONITOR,
@@ -275,6 +277,7 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
     assert server._tool_manager.get_tool(TOOL_AWAIT_RUN).is_async is True
+    assert server._tool_manager.get_tool(TOOL_CANCEL_SWEEP).is_async is True
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
@@ -298,6 +301,7 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
     timeout_schema = schemas[TOOL_AWAIT_RUN]["properties"]["timeout_seconds"]
     assert timeout_schema["default"] == AWAIT_DEFAULT_TIMEOUT_SECONDS
+    assert timeout_schema["minimum"] == AWAIT_MIN_TIMEOUT_SECONDS
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
     assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
@@ -333,6 +337,70 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
     assert "phasesweep_launch_sweep" in str(prompt)
     assert "target or label columns" in str(prompt)
+
+
+def test_fastmcp_cancel_does_not_block_concurrent_await(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real SDK dispatch must keep await responsive during blocking cancellation."""
+    pytest.importorskip("mcp")
+    from mcp import types
+
+    from phasesweep.mcp.server import build_server
+    from phasesweep.mcp.time import utc_now_iso
+
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+    awaited = app.status(experiment_id="e2e_lm")
+    awaited.update(
+        {
+            "run": {"run_id": "r1", "state": "running", "started_at": utc_now_iso()},
+            "elapsed_seconds": 0,
+            "changed": False,
+            "reason": "timeout",
+        }
+    )
+
+    async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
+        del timeout_seconds
+        await asyncio.sleep(0.02)
+        return awaited
+
+    def blocking_cancel(run_id: str) -> dict:
+        time.sleep(0.3)
+        return {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
+
+    monkeypatch.setattr(app, "await_run", quick_await)
+    monkeypatch.setattr(app, "cancel", blocking_cancel)
+    server = build_server(app)
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    await_request = types.CallToolRequest(
+        params=types.CallToolRequestParams(
+            name=TOOL_AWAIT_RUN,
+            arguments={"run_id": "r1", "timeout_seconds": AWAIT_MIN_TIMEOUT_SECONDS},
+        )
+    )
+    cancel_request = types.CallToolRequest(
+        params=types.CallToolRequestParams(
+            name=TOOL_CANCEL_SWEEP,
+            arguments={"run_id": "r1"},
+        )
+    )
+
+    async def dispatch_concurrently() -> tuple[float, object, object]:
+        started = time.perf_counter()
+        await_task = asyncio.create_task(handler(await_request))
+        cancel_task = asyncio.create_task(handler(cancel_request))
+        await_result = await await_task
+        await_elapsed = time.perf_counter() - started
+        cancel_result = await cancel_task
+        return await_elapsed, await_result.root, cancel_result.root
+
+    await_elapsed, await_result, cancel_result = asyncio.run(dispatch_concurrently())
+
+    assert await_elapsed < 0.15
+    assert await_result.isError is False
+    assert cancel_result.isError is False
 
 
 def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:

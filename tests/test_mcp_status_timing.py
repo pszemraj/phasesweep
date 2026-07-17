@@ -302,6 +302,16 @@ def test_await_run_times_out_with_unchanged_status(
     assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
 
 
+def test_await_run_clamps_timeout_to_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = _fake_clock(monkeypatch, app)
+
+    result = asyncio.run(app.await_run("r1", timeout_seconds=1))
+
+    assert result["reason"] == "timeout"
+    assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
+
+
 def test_await_run_clamps_timeout_to_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
     clock = _fake_clock(monkeypatch, app)
@@ -333,6 +343,33 @@ def test_await_run_returns_when_phase_gains_winner(
     assert result["run"]["state"] == "running"
     assert result["phases"][0]["winner_present"] is True
     # The winner appeared after one recheck pause, well before the timeout.
+    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
+
+
+def test_await_run_returns_when_run_fails_mid_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, store = _app_with_run(tmp_path)
+    clock = {"now": 0.0}
+
+    async def sleep_then_fail(seconds: float) -> None:
+        clock["now"] += seconds
+        write_run_status(
+            store,
+            "r1",
+            returncode=1,
+            error_class="RuntimeError",
+            cleanup_confirmed=True,
+        )
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    app._sleep = sleep_then_fail
+
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
+
+    assert result["reason"] == "terminal"
+    assert result["changed"] is True
+    assert result["run"]["state"] == "failed"
     assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
 
 
