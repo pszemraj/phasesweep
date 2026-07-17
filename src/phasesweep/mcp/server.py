@@ -655,27 +655,13 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] = {}
         state_after: dict[str, Any] = {}
         try:
-            target_id, experiment, run, resolved = self._resolve_read_target(
+            target_id, status, run, resolved = self._read_status_target(
                 experiment_id=experiment_id,
                 run_id=run_id,
-                include_run=True,
             )
             if run is not None:
                 state_after = {"run_state": run["state"]}
-            snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
-            status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
-            elapsed_seconds = None
-            if run is not None:
-                handle = self._runs.get(run["run_id"])
-                if handle is not None:
-                    elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
-            result = status_payload(
-                target_id,
-                status,
-                run,
-                elapsed_seconds=elapsed_seconds,
-                poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
-            )
+            result = self._status_result(target_id, status, run)
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise
@@ -717,18 +703,11 @@ class PhaseSweepMCP:
             deadline = time.monotonic() + timeout
             baseline: tuple[Any, ...] | None = None
             while True:
-                target_id, experiment, run, resolved = self._resolve_read_target(
+                target_id, status, run, resolved = self._read_status_target(
                     experiment_id=None,
                     run_id=run_id,
-                    include_run=True,
                 )
                 assert run is not None  # the run_id path always includes run state
-                terminal_snapshot = self._terminal_result_snapshot(run_id)
-                status = (
-                    terminal_snapshot.status_payload()
-                    if terminal_snapshot is not None
-                    else read_status(experiment)
-                )
                 snapshot = _await_snapshot(run["state"], status)
                 if baseline is None:
                     baseline = snapshot
@@ -744,17 +723,7 @@ class PhaseSweepMCP:
                     )
                     continue
                 break
-            elapsed_seconds = None
-            handle = self._runs.get(run_id)
-            if handle is not None:
-                elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
-            result = status_payload(
-                target_id,
-                status,
-                run,
-                elapsed_seconds=elapsed_seconds,
-                poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
-            )
+            result = self._status_result(target_id, status, run)
             result["changed"] = snapshot != baseline
             result["reason"] = reason
         except Exception as exc:
@@ -768,6 +737,54 @@ class PhaseSweepMCP:
             result_counts={"phases": len(result["phases"])},
         )
         return result
+
+    def _read_status_target(
+        self,
+        *,
+        experiment_id: str | None,
+        run_id: str | None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+        """Resolve a status target and read its current or frozen status payload.
+
+        :param str | None experiment_id: Catalog id for a current experiment read.
+        :param str | None run_id: Persisted run id for a run-specific read.
+        :return tuple[str, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+            Target id, status data, optional run state, and audit-safe resolved ids.
+        """
+        target_id, experiment, run, resolved = self._resolve_read_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            include_run=True,
+        )
+        snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
+        status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
+        return target_id, status, run, resolved
+
+    def _status_result(
+        self,
+        target_id: str,
+        status: dict[str, Any],
+        run: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build the common path-free response for status and await_run.
+
+        :param str target_id: Experiment id represented by ``status``.
+        :param dict[str, Any] status: Current or frozen engine status payload.
+        :param dict[str, Any] | None run: Optional derived detached-run state.
+        :return dict[str, Any]: Agent-safe status response with timing guidance.
+        """
+        elapsed_seconds = None
+        if run is not None:
+            handle = self._runs.get(run["run_id"])
+            if handle is not None:
+                elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+        return status_payload(
+            target_id,
+            status,
+            run,
+            elapsed_seconds=elapsed_seconds,
+            poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
+        )
 
     def _resolve_read_target(
         self,
