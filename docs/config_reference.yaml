@@ -1,16 +1,6 @@
-# phasesweep complete config reference.
-#
-# This file is a reference document, not a runnable experiment. Values are
-# schema signatures: type, required/nullability, and default. Comments explain
-# runtime consequences and cross-field constraints at the field they affect.
-#
-# Schema source of truth:
-#   - src/phasesweep/config/models.py
-#   - src/phasesweep/config/search.py
-#   - src/phasesweep/evidence/models.py
-#
-# All models reject unknown keys. Config loading uses a strict YAML loader that
-# rejects duplicate mapping keys before Pydantic validation runs.
+# phasesweep config signatures. This file is illustrative, not runnable.
+# Values show types, required/nullability, and defaults. Unknown object keys and
+# duplicate YAML mapping keys are rejected during config loading.
 
 Root:
   Config: "Experiment | Suite"
@@ -204,6 +194,7 @@ Suite:
     contracts: "dict[str, Contract] = {}"
     env: "dict[str, str] = {}"
     timeout_seconds_per_run: "float >= 0 | None = null"
+    # Metric, Constraint, and Contract shapes are shown under Experiment.
     # Defaults are deep-copied into each study when the study omits that field.
     # study.env merges over defaults.env; study.contracts merges over
     # defaults.contracts. Required experiment fields must be provided either
@@ -236,23 +227,6 @@ Suite:
       # final phase or `study.phase` for an explicit phase.
 
 Definitions:
-  Metric:
-    name: "str = 'objective'"
-    goal: "Literal['minimize', 'maximize'] = 'minimize'"
-    extractor: "Extractor (required)"
-
-  Constraint:
-    name: "str (required)"
-    extractor: "Extractor (required)"
-    max: "float | None = null"
-    min: "float | None = null"
-    # At least one bound must be set. Bounds are inclusive and finite.
-
-  Contract:
-    fixed_overrides: "dict[str, Any] = {}"
-    gates: "list[Gate] = []"
-    # Contract fixed keys are immutable in phases that apply the contract.
-
   Promotion:
     min_delta_vs: "str (required)"
     # Phase promotion: prior phase name. Suite promotion: prior study name or
@@ -267,30 +241,6 @@ Definitions:
     on_fail: "Literal['stop', 'skip', 'continue_baseline'] = 'stop'"
     # stop: abort on insufficient delta. skip: stop exposing this branch.
     # continue_baseline: expose a clone of the baseline winner downstream.
-
-  Phase:
-    name: "str (required)"
-    comment: "str | None = null"
-    inherits: "list[str] = []"
-    fixed_overrides: "dict[str, Any] = {}"
-    contracts: "list[str] = []"
-    search_space: "dict[str, SearchParam] = {}"
-    n_trials: "int >= 1 (required)"
-    n_jobs: "int >= 1 = 1"
-    gpu_policy: "Literal['single_per_trial', 'whole_node', 'none'] = 'single_per_trial'"
-    gpu_ids: "list[int] | None = null"
-    gpu_devices: "list[str] | None = null"
-    max_consecutive_failures: "int >= 1 = 5"
-    allow_no_gpu_isolation: "bool = false"
-    sampler: "Sampler = Sampler(type='tpe', seed=None, n_startup_trials=10)"
-    timeout_seconds_per_trial: "float >= 0 | None = 86400.0"
-    allow_unbounded_trials: "bool = false"
-    timeout_seconds_per_phase: "float >= 0 | None = null"
-    allow_incomplete_on_timeout: "bool = false"
-    allow_partial_grid: "bool = false"
-    allow_seed_search: "bool = false"
-    gates: "list[Gate] = []"
-    promotion: "Promotion | None = null"
 
   Sampler:
     type: "Literal['tpe', 'random', 'grid', 'cmaes'] = 'tpe'"
@@ -417,23 +367,3 @@ Definitions:
       timeout_seconds: "float >= 0 = 120.0"
       # Checks that a completed W&B run summary contains all required keys.
       # Missing wandb, timeout, or missing keys produce a failed gate result.
-
-Validation:
-  name_syntax: "experiment, suite, study, and phase names are ASCII [A-Za-z0-9_-]+"
-  override_key_syntax: "dotted [A-Za-z0-9_-]+ segments; no empty segments or whitespace"
-  duplicate_yaml_keys: "rejected by the strict YAML loader"
-  unknown_model_keys: "rejected by Pydantic extra='forbid'"
-  duplicate_phase_names: "rejected"
-  duplicate_study_names: "rejected"
-  phase_inherits: "must name prior phases only"
-  study_depends_on: "must name prior studies only"
-  fixed_vs_sampled_collision: "same key cannot be fixed and sampled in one phase"
-  dotted_prefix_collision: "`model` and `model.depth` cannot both be overridden in one composed phase"
-  inherited_resample_collision: "inherited locked keys cannot be resampled downstream"
-  contract_collision: "contract fixed keys cannot conflict with each other or local phase keys"
-  metric_constraint_names: "objective and constraint names must be distinct"
-  storage_parallel_policy: "SQLite storage with phase.n_jobs > 1 is rejected"
-  sampler_space_policy: "grid/cmaes constraints are checked at config load"
-  timeout_policy: "trial timeout null requires allow_unbounded_trials=true"
-  seed_search_policy: "`seed` and `*.seed` search keys require allow_seed_search=true"
-  placeholder_policy: "trial_command must include the placeholder required by override_format when overrides exist"

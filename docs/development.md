@@ -1,10 +1,5 @@
 # Development
 
-- [Quality Gates](#quality-gates)
-- [Package Map](#package-map)
-- [Test Map](#test-map)
-- [Tracked TODOs](#tracked-todos)
-
 ## Quality Gates
 
 ```bash

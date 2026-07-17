@@ -48,21 +48,3 @@ conda run -n tr --live-stream phasesweep mcp --catalog examples/tiny_decoder_enw
 ```
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
-
-## One Agent Run
-
-One local validation run produced the following results. These are workflow evidence, not recommended decoder settings. Snapshot: 2026-06-21, upstream submodule `9c90a551ae79061f0ed797e035462539c8a08403` (`v0.0.2`).
-
-The run used an NVIDIA GeForce RTX 4070 Laptop GPU through the `tr` conda environment. PhaseSweep launched 9 trials total: 3 learning-rate trials, then 3 weight-decay trials with the winning learning rate inherited, then 3 gradient-clipping trials with learning rate and weight decay inherited. Each trial trained for 1000 batches from `base.yaml`. Trainer logs for both the CLI and MCP runs reported `Device: cuda` and BF16 mixed precision.
-
-The CLI and MCP runs produced the same phase winners:
-
-```text
-optimizer_scale: learning_rate=0.001, val_loss=2.140831208229065
-weight_decay: weight_decay=0.0, val_loss=2.140831208229065
-clip_norm: grad_clip_norm=0.5, val_loss=2.096618318557739
-```
-
-"Same phase winners" here means the CLI and MCP runs agreed on the same machine. On different hardware, expect val_loss in the same ~2.1 range but not necessarily the same winning values - a run on a later-generation GPU picked `grad_clip_norm=1.0` for the last phase.
-
-The MCP path used catalog id `tiny-decoder-enwik8-hparams`: list experiments, validate the phase structure, launch the sweep, poll status by `run_id`, and read winners by that same `run_id`. The run completed all three phases with 3 complete trials each.

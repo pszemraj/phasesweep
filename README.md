@@ -53,9 +53,9 @@ The bundled example launches a deterministic fake trainer, runs 32 short trials,
 
 ## Config
 
-Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). Your trainer must parse the selected [override format](docs/config.md#override-formats), write the configured metric artifact, and exit nonzero on failed trials.
+Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). The [trainer contract](docs/config.md#trainer-contract) covers override parsing, metric artifacts, and failed-trial exit behavior.
 
-Sequential phases are greedy. They do not replace joint optimization when parameters interact strongly. Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
+Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
 
 ## MCP server (agent integration)
 

@@ -4,18 +4,6 @@ A phasesweep config is the contract between the orchestrator and your trainer. T
 
 For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml).
 
-- [Experiment Keys](#experiment-keys)
-- [Phase Keys](#phase-keys)
-- [Search Parameters](#search-parameters)
-- [Override Formats](#override-formats)
-- [Trainer Contract](#trainer-contract)
-- [Override Order](#override-order)
-- [Extractors](#extractors)
-- [Evidence Gates](#evidence-gates)
-- [Promotion](#promotion)
-- [Suites](#suites)
-- [Validation](#validation)
-
 ## Experiment Keys
 
 The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to ASCII `[A-Za-z0-9_-]+`.
@@ -32,27 +20,7 @@ The remaining top-level keys: `workdir` (default `./runs`) is the output root la
 
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-- `name`: required phase name matching ASCII `[A-Za-z0-9_-]+`.
-- `inherits`: prior phase names whose exposed winners become fixed overrides. Inheritance is transitive through each winner's `effective_overrides`: inheriting a phase also carries everything that phase itself inherited, so a linear chain only names its immediate predecessor.
-- `fixed_overrides`: hard-coded overrides for every trial in the phase.
-- `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.
-- `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
-- `n_trials`: terminal trial-attempt budget; Optuna `COMPLETE`, `FAIL`, and `PRUNED` trials all consume it. Increasing it later is a compatible top-up.
-- `n_jobs`: parallel trials inside the phase.
-- `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
-- `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
-- `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
-- `allow_no_gpu_isolation`: permit parallel execution when no GPU tokens can be detected or when `gpu_policy: none` delegates isolation to an external scheduler. Leave it `false` unless CPU-only or externally isolated parallel work is intentional.
-- `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
-- `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for numeric phases without categorical parameters.
-- `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.
-- `timeout_seconds_per_phase`: hard phase wallclock guard. The budget caps Optuna scheduling, GPU-lease waiting, and active trial subprocess runtime.
-- `allow_incomplete_on_timeout`: select from completed trials after a phase or run timeout. Defaults to fail-closed.
-- `allow_partial_grid`: permit `n_trials` smaller than the grid cardinality.
-- `allow_seed_search`: permit `seed` or `*.seed` in `search_space`.
-- `gates`: evidence checks evaluated after metric and constraint extraction.
-- `promotion`: compare the phase winner against an earlier exposed winner before downstream use.
-- `comment`: design note shown by CLI commands. It is excluded from fingerprints.
+Each phase declares a search space and trial-attempt budget, with optional fixed overrides, inherited winners, contracts, evidence gates, and promotion rules. The [typed config reference](config_reference.yaml) lists the exact phase fields and constraints. GPU allocation, timeouts, cleanup, and study top-ups are covered in [runtime behavior](runtime.md).
 
 ## Search Parameters
 
@@ -110,7 +78,7 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
 
-For agent-facing workflows, keep extractor inputs to scalar summaries. Do not mix validation labels, target/dependent-variable values, prediction dumps, dataset paths, tokens, or full metric histories into the same artifact that stores the objective metric. MCP reads only the configured scalar, but small result artifacts are easier to inspect without leaking data into an agent chat or troubleshooting paste.
+For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
 JSON extractors read a dotted key from a file under `{trial_dir}`:
 
@@ -128,7 +96,7 @@ extractor:
   select: last
 ```
 
-W&B extractors poll a completed run summary. The trainer should use `PHASESWEEP_RUN_NAME` or the same `run_name_template`.
+W&B extractor example:
 
 ```yaml
 extractor:
@@ -195,7 +163,3 @@ studies:
 ```
 
 Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase.
-
-## Validation
-
-Config-load validation rejects graph errors, duplicate YAML keys, unknown object keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, and unknown contracts. Resume checks reject stale studies and incompatible persisted winners.

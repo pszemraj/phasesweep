@@ -1,12 +1,5 @@
 # Runtime Behavior
 
-- [Platform Support](#platform-support)
-- [Output Layout](#output-layout)
-- [Process Management](#process-management)
-- [Stale Trial Reaping](#stale-trial-reaping)
-- [Concurrency Model](#concurrency-model)
-- [Fingerprints and Resume](#fingerprints-and-resume)
-
 ## Platform Support
 
 Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep
