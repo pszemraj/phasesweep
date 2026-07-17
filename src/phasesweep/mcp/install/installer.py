@@ -15,6 +15,7 @@ import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -44,6 +45,7 @@ from phasesweep.mcp.install.targets import (
     AgentTarget,
     agent_targets,
     codex_toml_content,
+    is_managed_mcp_entry,
     mcp_entry,
 )
 
@@ -94,18 +96,46 @@ def resolve_server_command() -> str:
     )
 
 
-def _apply_mcp(target: AgentTarget, mode: Mode, command: str, catalog: Path | None) -> StepResult:
+def _project_path_is_contained(path: Path, project: Path) -> bool:
+    """Return whether resolving ``path`` stays beneath the project root.
+
+    :param Path path: Project-scoped target path.
+    :param Path project: Project root that must contain the resolved target.
+    :return bool: False when a symlinked target or parent escapes the project.
+    """
+    try:
+        path.resolve(strict=False).relative_to(project.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _apply_mcp(
+    target: AgentTarget,
+    mode: Mode,
+    command: str,
+    catalog: Path | None,
+    project: Path,
+) -> StepResult:
     """Apply or remove the MCP server entry for one target.
 
     :param AgentTarget target: Client being configured.
     :param Mode mode: ``install`` or ``uninstall``.
     :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path; required for install.
+    :param Path project: Project root used to contain project-scoped writes.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
     if spec is None:
         return StepResult("mcp", None, None)
+    if spec.scope == "project" and not _project_path_is_contained(spec.path, project):
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note="refusing project config path that resolves outside the project",
+        )
     if spec.format == "toml":
         if mode == "uninstall":
             return StepResult(
@@ -113,7 +143,12 @@ def _apply_mcp(target: AgentTarget, mode: Mode, command: str, catalog: Path | No
             )
         if catalog is None:
             raise ValueError("installing an MCP entry requires a catalog path")
-        existing = spec.path.read_text(encoding="utf-8") if spec.path.exists() else ""
+        if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
+            return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
+        try:
+            existing = spec.path.read_text(encoding="utf-8") if spec.path.exists() else ""
+        except OSError:
+            return StepResult("mcp", spec.path, "error", note="config file could not be read")
         content = codex_toml_content(command, catalog)
         if TOML_START not in existing:
             try:
@@ -153,38 +188,52 @@ def _apply_mcp(target: AgentTarget, mode: Mode, command: str, catalog: Path | No
         return StepResult("mcp", spec.path, action)
 
     if mode == "uninstall":
-        action = remove_json_member(spec.path, spec.key, SERVER_NAME)
-        note = (
-            "config is not strict JSON; remove the entry manually" if action == "skipped" else None
-        )
+        managed = partial(is_managed_mcp_entry, spec.style)
+        action = remove_json_member(spec.path, spec.key, SERVER_NAME, managed=managed)
+        if action == "skipped":
+            note = "config is not strict JSON; remove the entry manually"
+        elif action == "conflict":
+            note = "an unmanaged phasesweep entry exists; it was left untouched"
+        else:
+            note = None
         return StepResult("mcp", spec.path, action, note=note)
     if catalog is None:
         raise ValueError("installing an MCP entry requires a catalog path")
     entry = mcp_entry(spec.style, command, catalog)
-    action = merge_json_member(spec.path, spec.key, SERVER_NAME, entry)
+    managed = partial(is_managed_mcp_entry, spec.style)
+    action = merge_json_member(spec.path, spec.key, SERVER_NAME, entry, managed=managed)
     note = None
-    if action in ("skipped", "error"):
-        reason = (
-            "config is not strict JSON (comments?)"
-            if action == "skipped"
-            else "config shape was unexpected"
-        )
+    if action in ("skipped", "conflict", "error"):
+        if action == "skipped":
+            reason = "config is not strict JSON (comments?)"
+        elif action == "conflict":
+            reason = "an unmanaged phasesweep entry already exists"
+        else:
+            reason = "config path or shape was unexpected"
         note = (
             f"{reason}; merge this manually:\n{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
         )
     return StepResult("mcp", spec.path, action, note=note)
 
 
-def _apply_instructions(target: AgentTarget, mode: Mode) -> StepResult:
+def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepResult:
     """Apply or remove the instructions marker block for one target.
 
     :param AgentTarget target: Client being configured.
     :param Mode mode: ``install`` or ``uninstall``.
+    :param Path project: Project root used to contain project-scoped writes.
     :return StepResult: Edit verdict for the instructions file.
     """
     path = target.instructions_path
     if path is None:
         return StepResult("instructions", None, None)
+    if target.instructions_scope == "project" and not _project_path_is_contained(path, project):
+        return StepResult(
+            "instructions",
+            path,
+            "error",
+            note="refusing instructions path that resolves outside the project",
+        )
     if mode == "uninstall":
         return StepResult(
             "instructions", path, remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END)
@@ -315,9 +364,9 @@ def run(
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog)
+                result = _apply_mcp(target, mode, command, catalog, project)
             else:
-                result = _apply_instructions(target, mode)
+                result = _apply_instructions(target, mode, project)
             if result.action is None:
                 click.echo(f"    {result.integration:<13} not supported")
                 continue

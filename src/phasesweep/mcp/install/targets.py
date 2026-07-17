@@ -106,6 +106,65 @@ def mcp_entry(style: EntryStyle, command: str, catalog: Path) -> dict[str, objec
     return entry
 
 
+def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
+    """Whether a JSON member has exactly the shape this installer writes.
+
+    JSON client formats offer no comments or marker blocks around individual
+    members. Treat only the strict generated shape as managed so install can
+    update its own entry and uninstall cannot delete an unrelated server that
+    happens to use the reserved ``phasesweep`` name.
+
+    :param EntryStyle style: Client entry dialect.
+    :param object value: Existing JSON member value.
+    :return bool: True only for an installer-shaped phasesweep MCP entry.
+    """
+    if not isinstance(value, dict):
+        return False
+    if style == "opencode":
+        if set(value) != {"type", "command", "enabled"}:
+            return False
+        command = value.get("command")
+        return (
+            value.get("type") == "local"
+            and value.get("enabled") is True
+            and isinstance(command, list)
+            and len(command) == 3
+            and _is_phasesweep_command(command[0])
+            and command[1] == "--catalog"
+            and _is_absolute_path(command[2])
+        )
+
+    expected_keys = {"command", "args"}
+    if style == "stdio-typed":
+        expected_keys.add("type")
+        if value.get("type") != "stdio":
+            return False
+    if set(value) != expected_keys:
+        return False
+    args = value.get("args")
+    return (
+        _is_phasesweep_command(value.get("command"))
+        and isinstance(args, list)
+        and len(args) == 2
+        and args[0] == "--catalog"
+        and _is_absolute_path(args[1])
+    )
+
+
+def _is_phasesweep_command(value: object) -> bool:
+    """Return whether ``value`` is an absolute phasesweep MCP executable path."""
+    return (
+        isinstance(value, str)
+        and Path(value).is_absolute()
+        and Path(value).name == "phasesweep-mcp"
+    )
+
+
+def _is_absolute_path(value: object) -> bool:
+    """Return whether ``value`` is a non-empty absolute path string."""
+    return isinstance(value, str) and bool(value) and Path(value).is_absolute()
+
+
 def codex_toml_content(command: str, catalog: Path) -> str:
     """Render the Codex ``config.toml`` table body for the phasesweep server.
 

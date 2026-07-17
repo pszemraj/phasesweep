@@ -14,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 from phasesweep.cli import main as cli_main
+from phasesweep.mcp.install import edits as install_edits
 from phasesweep.mcp.install import installer
 from phasesweep.mcp.install.edits import (
     merge_json_member,
@@ -91,6 +92,15 @@ def test_merge_json_member_errors_on_non_object_shapes(tmp_path):
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
 
 
+def test_merge_json_member_refuses_differing_unmanaged_member(tmp_path):
+    path = tmp_path / "mcp.json"
+    original = '{"mcpServers": {"phasesweep": {"command": "custom"}}}\n'
+    path.write_text(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "conflict"
+    assert path.read_text() == original
+
+
 def test_remove_json_member_prunes_and_unlinks(tmp_path):
     path = tmp_path / "mcp.json"
     merge_json_member(path, "mcpServers", "phasesweep", ENTRY)
@@ -104,6 +114,47 @@ def test_remove_json_member_prunes_and_unlinks(tmp_path):
     assert remove_json_member(tmp_path / "absent.json", "mcpServers", "phasesweep") == "not-found"
 
 
+def test_remove_json_member_errors_on_malformed_container(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"mcpServers": []}\n')
+
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "error"
+
+
+def test_config_edits_refuse_directories_and_symlinks(tmp_path):
+    directory = tmp_path / "config"
+    directory.mkdir()
+    target = tmp_path / "target.json"
+    target.write_text("{}\n")
+    symlink = tmp_path / "linked.json"
+    symlink.symlink_to(target)
+
+    for path in (directory, symlink):
+        assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+        assert remove_json_member(path, "mcpServers", "phasesweep") == "error"
+        assert (
+            replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END)
+            == "error"
+        )
+        assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "error"
+    assert target.read_text() == "{}\n"
+
+
+def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
+    path = tmp_path / "mcp.json"
+    original = '{"mcpServers": {"other": {"command": "x"}}}\n'
+    path.write_text(original)
+
+    def fail_replace(_source, _destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(install_edits.os, "replace", fail_replace)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert path.read_text() == original
+    assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
+
+
 # --- marker-fenced blocks ---
 
 
@@ -111,6 +162,19 @@ def test_marked_block_round_trip_is_byte_identical(tmp_path):
     path = tmp_path / "CLAUDE.md"
     original = "# My project\n\nHouse rules.\n"
     path.write_text(original)
+    assert (
+        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+    )
+    assert path.read_text() == f"{original}\n{MARKDOWN_START}\nbody\n{MARKDOWN_END}\n"
+    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
+    assert path.read_text() == original
+
+
+def test_marked_block_round_trip_preserves_missing_final_newline(tmp_path):
+    path = tmp_path / "CLAUDE.md"
+    original = "# My project"
+    path.write_text(original)
+
     assert (
         replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
     )
@@ -149,6 +213,7 @@ def test_marked_block_refuses_unmatched_marker(tmp_path):
     path.write_text(original)
 
     assert replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "error"
+    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "error"
     assert path.read_text() == original
 
 
@@ -320,6 +385,75 @@ def test_installer_skips_unmanaged_codex_table(fake_home, tmp_path, capsys):
     # Uninstall never touches unmanaged tables either.
     assert installer.run("uninstall", project, None, ["codex"], "mcp", yes=True) == 0
     assert codex_config.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "agent_id",
+    ["claude", "claude-desktop", "cursor", "vscode", "gemini", "opencode"],
+)
+def test_installer_preserves_unmanaged_json_entry(fake_home, tmp_path, capsys, agent_id):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    assert target.mcp is not None
+    target.mcp.path.parent.mkdir(parents=True, exist_ok=True)
+    original_data = {target.mcp.key: {"phasesweep": {"command": "custom-server"}}}
+    target.mcp.path.write_text(json.dumps(original_data, indent=2) + "\n")
+
+    install_code = installer.run("install", project, catalog, [agent_id], "mcp", yes=True)
+    install_output = capsys.readouterr().out
+    assert install_code == 1
+    assert "unmanaged phasesweep entry" in install_output
+    assert json.loads(target.mcp.path.read_text()) == original_data
+
+    uninstall_code = installer.run("uninstall", project, None, [agent_id], "mcp", yes=True)
+    uninstall_output = capsys.readouterr().out
+    assert uninstall_code == 1
+    assert "left untouched" in uninstall_output
+    assert json.loads(target.mcp.path.read_text()) == original_data
+
+
+def test_installer_updates_recognizable_managed_json_entry(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    path = project / ".mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "phasesweep": {
+                        "command": "/old/bin/phasesweep-mcp",
+                        "args": ["--catalog", "/old/catalog.yaml"],
+                    }
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    assert code == 0, capsys.readouterr().out
+    entry = json.loads(path.read_text())["mcpServers"]["phasesweep"]
+    assert entry["args"] == ["--catalog", str(catalog)]
+
+
+def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project / ".cursor").symlink_to(outside, target_is_directory=True)
+
+    code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
+
+    assert code == 1
+    assert "resolves outside the project" in capsys.readouterr().out
+    assert not (outside / "mcp.json").exists()
 
 
 @pytest.mark.parametrize(
