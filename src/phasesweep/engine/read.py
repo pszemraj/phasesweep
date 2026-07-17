@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 from phasesweep.config import Experiment
-from phasesweep.engine.optuna import _phase_trial_counts, phase_completed_trial_durations
+from phasesweep.engine.optuna import _phase_trial_counts, _phase_trial_stats
 from phasesweep.engine.state import _summary_path, _winner_path
 
 
@@ -45,18 +45,26 @@ class PhaseWinnerView:
 
 
 def _phase_status_payloads(
-    experiment: Experiment, *, include_winner_path: bool
+    experiment: Experiment,
+    *,
+    include_winner_path: bool,
+    trial_counts: Mapping[str, dict[str, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
 
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
     :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
+    :param Mapping[str, dict[str, int]] | None trial_counts: Optional pre-read counts keyed by phase name.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
         winner_path = _winner_path(experiment, phase.name)
-        counts = _phase_trial_counts(experiment, phase)
+        counts = (
+            _phase_trial_counts(experiment, phase)
+            if trial_counts is None
+            else trial_counts[phase.name]
+        )
         payload: dict[str, Any] = {
             "trials": counts,
             "running": counts.get("RUNNING", 0),
@@ -171,15 +179,16 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
         written.
 
     """
-    durations = [
-        seconds
-        for phase in experiment.phases
-        for seconds in phase_completed_trial_durations(experiment, phase)
-    ]
+    phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
+    durations = [seconds for stats in phase_stats.values() for seconds in stats.completed_durations]
     return {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
-        "phases": _phase_status_payloads(experiment, include_winner_path=False),
+        "phases": _phase_status_payloads(
+            experiment,
+            include_winner_path=False,
+            trial_counts={name: stats.counts for name, stats in phase_stats.items()},
+        ),
         "summary_present": _summary_path(experiment).is_file(),
         "median_trial_seconds": statistics.median(durations) if durations else None,
     }

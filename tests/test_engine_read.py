@@ -8,6 +8,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.state import _winner_path
@@ -135,6 +136,32 @@ def test_read_status_counts_existing_sqlite_trials_without_optuna_loader(
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+
+def test_read_status_uses_one_sqlite_snapshot_per_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "phases.db"
+    storage = f"sqlite:///{db}"
+    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
+        lambda trial: 1.0, n_trials=1
+    )
+    exp = _experiment(tmp_path, storage=storage)
+    real_connect = engine_optuna.sqlite3.connect
+    connections = 0
+
+    def counting_connect(*args: object, **kwargs: object):
+        nonlocal connections
+        connections += 1
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(engine_optuna.sqlite3, "connect", counting_connect)
+
+    status = read_status(exp)
+
+    assert connections == 1
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+    assert status["median_trial_seconds"] is not None
 
 
 def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:
