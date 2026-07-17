@@ -64,23 +64,7 @@ Sequential phases are greedy. They do not replace joint optimization when parame
 
 `phasesweep-mcp` lets an AI agent operate experiments you have already reviewed. You keep control of the config, trainer command, search space, and permissions in a catalog; the agent sees stable experiment ids and can validate, launch, monitor, cancel when allowed, and summarize winners without receiving paths, commands, raw logs, storage URLs, or workdirs.
 
-If the experiment YAML already exists, the shortest handoff is:
-
-```bash
-phasesweep init-catalog --from ./experiment.yaml
-# Review catalog.yaml: describe the experiment, then enable allow.launch / allow.cancel as needed.
-phasesweep mcp-check --catalog ./catalog.yaml
-phasesweep install
-```
-
-Restart the selected client, then ask naturally:
-
-```text
-List the available phasesweep experiments.
-Validate and launch my-sweep, monitor it until terminal, then summarize every phase winner and any failed trials.
-```
-
-`phasesweep install` also writes the complete run-and-monitor reference into the agent's project instructions, so the user prompt does not need paths, launch commands, or tool choreography. The supported MCP mode is local-node control over stdio; remote control planes, hosted multi-user deployments, and multi-host shared studies are out of scope for this version. Use [MCP agent setup](docs/mcp_setup.md) for the full five-step walkthrough, and [MCP server](docs/mcp.md) for catalog behavior, tools, security boundaries, and run state.
+Follow [MCP agent setup](docs/mcp_setup.md) to install the server, create and preflight a catalog, connect a supported client, and give the agent its operating instructions. See [MCP server](docs/mcp.md) for catalog fields, tool behavior, run state, and security boundaries.
 
 ## Docs
 

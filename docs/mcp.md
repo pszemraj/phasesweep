@@ -61,7 +61,7 @@ When a `run_id` is supplied, live status is read through that run's saved config
 
 Clients that support MCP resources can attach `phasesweep://catalog`. It returns the first catalog page as compact JSON using the same path-free payload as `phasesweep_list_experiments`. Agents should still call `phasesweep_list_experiments` when they need pagination or autonomous discovery.
 
-Clients that support MCP prompts can use `phasesweep_run_and_monitor`. It gives the agent the safe workflow: list, validate, launch only by catalog id, await or poll by `run_id`, summarize winners with that same `run_id`, and avoid raw datasets, labels, predictions, trainer logs, raw result files, dashboards, and per-trial metric histories unless the user explicitly asks for that separate work.
+Clients that support MCP prompts can use `phasesweep_run_and_monitor`, which serves the packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md).
 
 ## Security model
 
@@ -114,14 +114,3 @@ handles. Run artifacts under `state_dir/logs` accumulate one small set per
 launch; prune old ones between campaigns if you launch many sweeps.
 
 Run handles, terminal `status.json` files, and per-run config snapshots are written with atomic replace, so readers do not observe torn JSON or partial snapshots. Launch persists a `launching` handle before the detached runner starts; after `Popen`, both the server and the runner persist the spawned process identity. The runner writes its own handle before launching training work, so a server restart can still rediscover a surviving runner if the server died after `Popen` but before its own final save. If the server's final spawned-handle save fails, it terminates the spawned runner rather than leaving an untracked sweep behind.
-
-## Limitations (v1)
-
-- **Single-experiment configs only.** Suites are rejected at startup.
-- **Local file-backed storage required.** In-memory studies, empty file-backed storage URLs, and external RDB storage are rejected at startup. Use non-empty absolute SQLite or JournalStorage file URLs for MCP catalogs.
-- **Single local node.** The server, runner, cleanup recovery, stale-trial reaper, and locks assume one host. Remote control planes, multi-host writers, and distributed cleanup are future work, not warnings-only behavior.
-- **Local stdio only.** Remote Streamable HTTP, OAuth, bearer-token auth, and hosted multi-user deployments are out of scope for v1.
-- **No log-access tool.** A redacted, opt-in log view is a possible follow-up,
-  but v1 exposes no catalog flag or tool for logs.
-- The only agent-tunable knob is `from_phase`; `n_trials`, timeouts, and all
-  safety waivers stay with the config author.
