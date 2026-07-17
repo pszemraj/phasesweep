@@ -13,10 +13,9 @@ ruff check .
 ruff format --check .
 mypy src/phasesweep
 pytest
-python scripts/mcp_workflow_eval.py
 ```
 
-Run `pytest` by itself, with no concurrent `ruff`, `mypy`, workflow eval, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. The MCP workflow eval prints JSON and exits nonzero if discovery, read-only safety, or launch-monitor-winners flow fails. It roots `PHASESWEEP_LOCK_DIR` under its temporary directory and sets `CUDA_VISIBLE_DEVICES=-1` so the CPU fake-trainer eval is independent of host lock permissions and GPU leases.
+Run `pytest` by itself, with no concurrent `ruff`, `mypy`, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise.
 
 ## Package Map
 

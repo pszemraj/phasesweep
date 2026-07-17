@@ -4,6 +4,7 @@ read winners, and exercise the launch -> cancel -> relaunch cycle.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -30,7 +31,6 @@ from tests.mcp_helpers import (
     make_mcp_app,
     slow_mcp_config_text,
     wait_for_mcp_running_trial,
-    wait_for_mcp_state,
     write_mcp_config_catalog,
 )
 
@@ -93,12 +93,11 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        state = wait_for_mcp_state(
-            app,
-            run_id,
-            want={"succeeded", "failed", "cancelled"},
-            timeout=120,
-        )
+        while True:
+            awaited = asyncio.run(app.await_run(run_id))
+            state = awaited["run"]["state"]
+            if state in {"succeeded", "failed", "cancelled"}:
+                break
         log = Path(store.get(run_id).log_path).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 

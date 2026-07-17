@@ -135,23 +135,6 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     return PhaseSweepMCP(registry, store), registry, store
 
 
-def wait_for_mcp_state(
-    app: PhaseSweepMCP,
-    run_id: str,
-    *,
-    want: set[str],
-    timeout: float,
-) -> str:
-    deadline = time.time() + timeout
-    state = "unknown"
-    while time.time() < deadline:
-        state = app.status(run_id=run_id)["run"]["state"]
-        if state in want:
-            return state
-        time.sleep(0.3)
-    return state
-
-
 def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: float) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
