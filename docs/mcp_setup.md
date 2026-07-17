@@ -22,7 +22,7 @@ Client configs want the executable path absolute, because clients launch servers
 which phasesweep-mcp
 ```
 
-If you prefer not to install into a persistent environment, every client below can instead launch through `uvx`, as shown in step 3's manual setup section. The first launch downloads and builds the package, so allow for a slow cold start.
+If you prefer not to install into a persistent environment, every client below can instead launch through `uvx`, an alias for `uv tool run`. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first, then run `command -v uvx` and use the returned absolute path in the client config because desktop clients may not inherit your shell `PATH`. The first launch downloads and builds the package, so allow for a slow cold start.
 
 ## 2. Create a catalog
 
@@ -32,7 +32,7 @@ Scaffold a catalog next to your project:
 phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated `catalog.yaml` only after every entry passes the server's startup checks. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
+This writes an annotated `catalog.yaml` only after every entry passes the server's startup checks. That validation provisions the configured `state_dir` and its `runs` and `logs` subdirectories immediately. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
 
 Confirm the catalog loads before touching any client config:
 
@@ -131,7 +131,7 @@ OpenCode uses a command array in `opencode.json`:
 Any stdio client can also launch through `uvx` without a persistent install. For clients with separate `command` and `args` fields, replace the standard entry with:
 
 ```json
-"command": "uvx",
+"command": "/abs/path/to/uvx",
 "args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"]
 ```
 

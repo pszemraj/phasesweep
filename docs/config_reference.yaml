@@ -62,7 +62,9 @@ Experiment:
       min: "float | None = null"
       # At least one of min/max is required when a constraint exists. Bounds
       # must be finite and min <= max. Violating finite values mark the trial
-      # COMPLETE but infeasible, so they still inform the sampler but cannot win.
+      # COMPLETE: the raw objective still informs ordinary sampling without
+      # feasibility guidance, but the trial cannot win and counts toward
+      # max_consecutive_failures.
 
   contracts:
     "<contract_name>":
@@ -314,13 +316,15 @@ Definitions:
       project: "str (required)"
       run_name_template: "str = '{experiment}-{phase}-{trial_id}'"
       # Available substitutions: {experiment}, {phase}, {trial_id}, {run_name}.
-      # The trainer should use PHASESWEEP_RUN_NAME or the same template.
+      # PHASESWEEP_RUN_NAME always supplies {run_name}; custom templates do not
+      # change it. Display names must be unique because lookup uses the first match.
       metric_key: "str (required)"
       # Key on wandb.run.summary; selected value must coerce to float.
       poll_seconds: "float > 0 = 2.0"
       timeout_seconds: "float >= 0 = 120.0"
-      # Requires the optional wandb dependency. A missing run or missing metric
-      # before timeout fails the trial.
+      # Requires the optional wandb dependency. Polling accepts finished,
+      # crashed, or failed runs with the metric present in summary; a missing
+      # run or metric before timeout fails the trial.
 
   Gate:
     RequiredFileGate:

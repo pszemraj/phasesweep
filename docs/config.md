@@ -10,13 +10,15 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 `storage` controls whether an interrupted phase can reuse or top up its Optuna study. `null` starts a fresh in-memory study on each invocation; `--from-phase` can still load completed earlier phases from their `winner.yaml` files. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
 
+Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
+
 `trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. It does not teach your trainer to parse the chosen format; your trainer must already understand `argparse`, `hydra`, or the JSON file path you selected with `override_format`.
 
-`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value, but constraints are selection filters only: current samplers do not receive feasibility guidance, and infeasible trials cannot be selected as the phase winner. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
+`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value. Current samplers receive that objective without feasibility guidance; infeasible trials cannot become the phase winner and count toward `max_consecutive_failures`. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
 
 The remaining top-level keys: `workdir` (default `./runs`) is the output root laid out in [runtime behavior](runtime.md#output-layout); `override_format` selects the trainer boundary covered in [override formats](#override-formats); `env` adds environment variables to every trial subprocess (included in semantic fingerprints); `timeout_seconds_per_run` is the whole-experiment wallclock guard described with the other timeouts in [runtime behavior](runtime.md#process-management).
 
-For normal CLI runs, relative `workdir` values, relative paths inside `trial_command`, and file-backed storage paths resolve from the directory where `phasesweep` was invoked, not from the config file's directory. File storage URLs use three slashes for relative paths (`sqlite:///runs.db`, `journal:///runs.journal`) and four for absolute POSIX paths (`sqlite:////tmp/runs.db`). MCP-launched runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
+For normal CLI runs, relative `workdir` values, relative paths inside `trial_command`, and file-backed storage paths resolve from the directory where `phasesweep` was invoked, not from the config file's directory. Invoke a relative-path config from one stable intended directory; changing cwd can silently select a different artifact tree and study. `phasesweep validate` checks the command template but does not require referenced executables or paths to exist. File storage URLs use three slashes for relative paths (`sqlite:///runs.db`, `journal:///runs.journal`) and four for absolute POSIX paths (`sqlite:////tmp/runs.db`). MCP-launched runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
 
 ## Phase keys
 
@@ -50,18 +52,18 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 
 When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
 
-`json_file` is the most robust trainer boundary because it preserves JSON types without relying on a command-line grammar. Hydra compatibility quotes string and list values for OmegaConf override parsing, but complex structured values should use `json_file` rather than Hydra CLI overrides.
+`argparse` renders lowercase booleans, bracketed comma-separated lists, and `None` for null. Hydra renders lowercase booleans and `null`, JSON-quotes strings, recursively renders bracketed lists, and rejects mappings. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values.
 
 ## Trainer contract
 
 The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses the directory `phasesweep run` was invoked from, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Parse the selected [override format](#override-formats).
-- Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or finish the configured W&B run with the metric in its summary.
+- Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
 - Exit nonzero when the trial failed and should be recorded as failed.
 - Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
 
-Every trial receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, and `PHASESWEEP_RUN_NAME`; these values override same-named entries in top-level `env`. GPU assignment can also override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
+The trial environment starts from the phasesweep process environment, then top-level `env` overrides it. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, and `PHASESWEEP_RUN_NAME`, overriding same-named values. GPU assignment can also override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
 
 Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; metric values within an absolute `1e-12` of the best value resolve to the lowest trial number. When a swept key has no measurable effect, the selected value is therefore the lowest-numbered near-best trial's choice, not evidence of a preference.
 
@@ -80,7 +82,7 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll by display name until the first matching run is `finished`, `crashed`, or `failed` and its summary contains the metric. Keep display names unique within the W&B project; persistent storage prevents trial-id reuse during top-ups, while a repeated in-memory experiment can reuse the default names. `PHASESWEEP_RUN_NAME` always uses `<experiment>-<phase>-<trial_id>` and is not changed by a custom extractor template, so use `run_name_template: '{run_name}'` when the trainer uses that environment variable.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
@@ -107,7 +109,7 @@ extractor:
   type: wandb
   entity: my-team
   project: tiny-lm
-  run_name_template: '{experiment}-{phase}-{trial_id}'
+  run_name_template: '{run_name}'
   metric_key: eval/loss
   timeout_seconds: 300
 ```
@@ -166,4 +168,4 @@ studies:
           lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
 ```
 
-Suite-level `run.log` and `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions are recorded in `suite_summary.yaml`, not in a per-study `promotion.yaml`.
+Suite-level `run.log` and `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions are recorded in `suite_summary.yaml`, not in a per-study `promotion.yaml`. The suite summary is written only after the suite loop completes; a stop or missing dependency can leave completed study artifacts without that summary. `--from-phase` is supported only for single-experiment configs, not suites.

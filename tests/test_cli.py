@@ -204,8 +204,8 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert comment_line in result_without.output
 
 
-def test_dry_run_does_not_launch(tmp_path, caplog):
-    """dry-run should log an example command but never call the trial_command."""
+def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
+    """Dry-run should preview one coherent chain without launching anything."""
 
     caplog.set_level(logging.INFO)
     body = f"""
@@ -227,6 +227,10 @@ phases:
     search_space: {{ wd: {{ type: float, low: 0, high: 0.3 }} }}
 """
     exp = load_experiment(write_yaml(tmp_path, body))
+    monkeypatch.setattr(
+        "phasesweep.engine.phase._suggest",
+        lambda _trial, _name, param: param.low,
+    )
     winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"a", "b"}
     # No filesystem artifacts written.
@@ -234,6 +238,8 @@ phases:
     assert not (Path(tmp_path / "runs") / "summary.yaml").exists()
     # An example command was logged
     assert any("DRY RUN example command" in r.message for r in caplog.records)
+    assert winners["a"].params["lr"] == exp.phases[0].search_space["lr"].low
+    assert winners["b"].effective_overrides["lr"] == winners["a"].params["lr"]
 
 
 def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:

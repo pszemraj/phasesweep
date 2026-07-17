@@ -49,6 +49,8 @@ phasesweep show-winners examples/experiment.yaml
 phasesweep status examples/experiment.yaml
 ```
 
+`validate` and `--dry-run` launch no trials; dry-run is an in-memory command-composition preview, not a check that the trainer or evidence pipeline works. See [validation and dry-run](docs/runtime.md#validation-and-dry-run) for the exact boundary. `show-winners` and `status` are read-only inspection commands, normally used after the real run.
+
 The bundled example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`. For a real-trainer integration, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8/README.md).
 
 ## Config

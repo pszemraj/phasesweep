@@ -578,6 +578,7 @@ def _dry_run_phase(
 
     """
     log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
+    sampled: dict[str, Any] | None = None
     if remaining > 0:
         sample_trial = study.ask()
         sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
@@ -596,30 +597,45 @@ def _dry_run_phase(
         )
         log.info("DRY RUN example command:\n  %s", cmd)
 
-    return _placeholder_winner(experiment, phase, inherited_winners)
+    return _placeholder_winner(
+        experiment,
+        phase,
+        inherited_winners,
+        sampled_params=sampled,
+    )
 
 
 def _placeholder_winner(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
+    *,
+    sampled_params: dict[str, Any] | None = None,
 ) -> Winner:
-    """Synthesize a midpoint-valued placeholder winner for dry-run mode.
+    """Synthesize a placeholder winner for dry-run mode.
 
-    Includes inherited effective_overrides so downstream dry-run previews see the
-    same locked context they would at runtime (review item #10).
+    A phase whose command was previewed reuses that command's sampled values so
+    downstream previews inherit one coherent hypothetical chain. A skipped
+    phase without a preview uses deterministic midpoint/first-choice values.
+    Both paths include inherited effective overrides.
 
     Args:
         experiment: Parsed experiment; supplies named contracts.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
+        sampled_params: Values used in the displayed preview command, or
+            ``None`` to synthesize deterministic placeholder values.
 
     Returns:
         A :class:`Winner` with ``trial_number=-1`` and ``metric=NaN`` so any
         accidental use in non-dry contexts surfaces obviously.
 
     """
-    placeholder_params = _placeholder_values_for(phase.search_space)
+    placeholder_params = (
+        _placeholder_values_for(phase.search_space)
+        if sampled_params is None
+        else dict(sampled_params)
+    )
     effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,

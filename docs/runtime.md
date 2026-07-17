@@ -41,6 +41,8 @@ Every trial runs in a new process group via `start_new_session=True`. Timeouts a
 
 If a wallclock timeout and `max_consecutive_failures` become true in the same phase, timeout handling takes precedence. A phase that has at least one completed feasible trial can therefore persist a timeout-marked partial winner when `allow_incomplete_on_timeout: true`, instead of having that winner masked by the consecutive-failure abort path. Without that opt-in, the same situation fails closed with `TimeoutError`.
 
+Metric extraction and evidence gates run after the trainer process and outside the GPU lease. W&B extractors and gates use their own polling timeouts, which are not shortened by a phase or run deadline and can therefore finish after that deadline. `allow_incomplete_on_timeout` applies only when a phase or run deadline leaves the phase short of its terminal-attempt budget; it does not turn an ordinary per-trial timeout into a selectable result.
+
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
 Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
@@ -88,4 +90,8 @@ The payload includes the phasesweep package version; trial command; [override fo
 
 With persistent storage, re-running the same YAML reuses a study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files after stale reaping and fingerprint verification, even when storage is in-memory. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 
-`--dry-run` renders one example command per phase without launching subprocesses, writing preview files, creating run directories, touching storage, or taking the run lock.
+## Validation and dry-run
+
+`phasesweep validate` loads the config and checks schema, graph, sampler/search-space compatibility, override-key composition, and command-template placeholders. It does not check trainer or path existence, parser compatibility, storage connectivity, environment behavior, evidence production, GPU availability, or runtime promotion outcomes.
+
+`phasesweep run --dry-run` additionally renders one valid sampled command per phase using fresh in-memory Optuna studies. The displayed sample becomes the hypothetical winner inherited by downstream preview commands, so one preview forms a coherent chain. Dry-run does not read persistent trial progress, create the referenced trial directories or `overrides.json`, display the final environment, launch subprocesses, extract evidence, evaluate gates or promotion, exercise suite dependencies, write files, touch configured storage, or take runtime locks.
