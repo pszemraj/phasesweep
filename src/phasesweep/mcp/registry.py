@@ -206,7 +206,7 @@ def _require_mcp_stable_paths(
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
         raise CatalogError(
-            f"{experiment_id!r}: MCP experiments require persistent storage; "
+            f"{experiment_id!r}: storage must be persistent; "
             "in-memory storage cannot be monitored or resumed across processes",
             suggestion=_suggest_storage(config_dir),
         )
@@ -307,12 +307,6 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         raise CatalogError(
             f"{entry.id!r}: suite configs are not supported by the MCP layer "
             "in this version; register single-experiment configs"
-        )
-    if storage_is_in_memory(config.storage):
-        raise CatalogError(
-            f"{entry.id!r}: storage must be persistent; in-memory studies "
-            "cannot be monitored across processes",
-            suggestion=_suggest_storage(cfg_path.parent),
         )
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()

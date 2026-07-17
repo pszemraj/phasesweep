@@ -353,7 +353,7 @@ def test_stable_path_helper_independently_rejects_in_memory_storage(tmp_path: Pa
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
 
-    with pytest.raises(CatalogError, match="persistent storage"):
+    with pytest.raises(CatalogError, match="storage must be persistent"):
         _require_mcp_stable_paths("srv", experiment)
 
 

@@ -378,16 +378,9 @@ def mcp(ctx: click.Context, catalog: Path) -> None:
     :param click.Context ctx: Active Click context used to exit with the server return code.
     :param Path catalog: Operator-authored MCP catalog to load.
     """
-    try:
-        from phasesweep.mcp.server import serve
+    from phasesweep.mcp.server import serve
 
-        ctx.exit(serve(catalog))
-    except ModuleNotFoundError as exc:
-        if exc.name == "mcp":
-            raise click.ClickException(
-                "MCP support is not installed; install with `pip install 'phasesweep[mcp]'`."
-            ) from None
-        raise
+    ctx.exit(serve(catalog))
 
 
 @main.command(
