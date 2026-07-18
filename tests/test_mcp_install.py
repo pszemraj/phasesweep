@@ -30,6 +30,7 @@ from phasesweep.mcp.install.targets import (
     codex_toml_content,
     mcp_entry,
 )
+from tests.mcp_helpers import write_mcp_catalog
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "examples" / "mcp_experiment.yaml"
@@ -376,14 +377,8 @@ def test_entry_styles_and_codex_toml(tmp_path):
 
 
 def _write_valid_catalog(project: Path) -> Path:
-    """Scaffold a validated catalog in ``project`` from the repo example config."""
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_main,
-        ["init-catalog", "--from", str(EXAMPLE_CONFIG), "-o", str(project / "catalog.yaml")],
-    )
-    assert result.exit_code == 0, result.output
-    return project / "catalog.yaml"
+    """Write an installer fixture that references the repo example config."""
+    return write_mcp_catalog(project, {"example": EXAMPLE_CONFIG})
 
 
 def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
