@@ -37,6 +37,21 @@ class McpToolError(Exception):
         return str(self)
 
 
+class AuditUnavailableError(McpToolError):
+    """Raised when required pre-action audit evidence cannot be persisted."""
+
+    def __init__(self, action: str) -> None:
+        """Create a fail-closed audit error for a side-effecting action.
+
+        :param str action: Side-effecting action that was refused.
+        """
+        super().__init__(
+            f"{action} refused because the required audit authorization record could not "
+            "be persisted; no action was started. Ask the operator to restore write and "
+            "sync access to state_dir/audit.jsonl. Do not retry until it is fixed."
+        )
+
+
 class UnknownExperimentError(McpToolError):
     """Raised when a tool references an experiment id absent from the catalog."""
 

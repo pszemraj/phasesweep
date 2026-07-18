@@ -772,6 +772,7 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
         TOOL_VALIDATE_CONFIG,
         TOOL_LAUNCH_SWEEP,
         TOOL_LAUNCH_SWEEP,
+        TOOL_LAUNCH_SWEEP,
     ]
     assert {record["session_id"] for record in records}
     assert all(record["actor"] == "local-stdio" for record in records)
@@ -783,7 +784,21 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     assert validate_record["resolved"] == {"experiment_id": "srv"}
     assert validate_record["result_counts"] == {"phases": 1, "search_space_keys": 1}
 
-    launch_record = records[1]
+    authorization_record = records[1]
+    assert authorization_record["outcome"] == "authorized"
+    assert authorization_record["args"] == {"experiment_id": "srv"}
+    assert authorization_record["resolved"] == {
+        "experiment_id": "srv",
+        "run_id": launched["run_id"],
+    }
+    assert authorization_record["state_before"] == {"live_runs": 0}
+    assert authorization_record["authorization"] == {
+        "config_sha256": registry.get("srv").config_sha256,
+        "granted": True,
+        "policy": "catalog.allow.launch",
+    }
+
+    launch_record = records[2]
     assert launch_record["outcome"] == "success"
     assert launch_record["args"] == {"experiment_id": "srv"}
     assert launch_record["resolved"] == {"experiment_id": "srv", "run_id": launched["run_id"]}
@@ -791,7 +806,7 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     assert launch_record["state_after"] == {"live_runs": 1, "run_state": "running"}
     assert launch_record["result_counts"] == {"runs": 1}
 
-    busy_record = records[2]
+    busy_record = records[3]
     assert busy_record["outcome"] == "error"
     assert busy_record["args"] == {"experiment_id": "srv"}
     assert busy_record["resolved"] == {"experiment_id": "srv"}
@@ -813,6 +828,84 @@ def test_audit_log_caps_agent_supplied_string_values(tmp_path: Path) -> None:
 
     record = json.loads(audit_path.read_text())
     assert record["args"]["cursor"] == ("x" * 253) + "..."
+
+
+def test_audit_authorization_is_fsynced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    audit = AuditLogger(audit_path)
+    fsynced: list[int] = []
+    monkeypatch.setattr("phasesweep.mcp.audit.os.fsync", fsynced.append)
+
+    audit.record_authorization(
+        tool=TOOL_LAUNCH_SWEEP,
+        args={"experiment_id": "srv"},
+        resolved={"experiment_id": "srv", "run_id": "srv-1"},
+        state_before={"live_runs": 0},
+        authorization={"policy": "catalog.allow.launch", "granted": True},
+    )
+
+    assert json.loads(audit_path.read_text())["outcome"] == "authorized"
+    assert len(fsynced) == 2  # the new file and its parent directory entry
+
+
+def test_launch_refuses_before_artifacts_when_required_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    store = RunStore(registry.state_dir)
+    audit = AuditLogger(registry.state_dir / "audit.jsonl")
+    app = PhaseSweepMCP(registry, store, audit=audit)
+    captured = patch_popen_capture(monkeypatch)
+
+    def fail_authorization(**_kwargs: object) -> None:
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(audit, "record_authorization", fail_authorization)
+
+    with pytest.raises(Exception, match="no action was started"):
+        app.launch("srv")
+
+    assert store.list_handles() == []
+    assert list((registry.state_dir / "logs").glob("*.config.yaml")) == []
+    assert captured == {}
+
+
+def test_cancel_refuses_before_marker_or_signal_when_required_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    store = RunStore(registry.state_dir)
+    audit = AuditLogger(registry.state_dir / "audit.jsonl")
+    app = PhaseSweepMCP(registry, store, audit=audit)
+    handle = make_run_handle(
+        store,
+        run_id="srv-running",
+        experiment_id="srv",
+        config_sha256=registry.get("srv").config_sha256,
+    )
+    store.save(handle)
+    signalled = False
+
+    def fail_authorization(**_kwargs: object) -> None:
+        raise OSError("unavailable")
+
+    def record_signal(*_args: object, **_kwargs: object) -> bool:
+        nonlocal signalled
+        signalled = True
+        return True
+
+    monkeypatch.setattr(audit, "record_authorization", fail_authorization)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", record_signal)
+
+    with pytest.raises(Exception, match="no action was started"):
+        app.cancel(handle.run_id)
+
+    assert not store.cleanup_uncertain_path(handle.run_id).exists()
+    assert signalled is False
 
 
 def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
@@ -973,7 +1066,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     old_config = _config(tmp_path, name="old")
     old_snapshot = old_config.read_bytes()
     other_config = _config(tmp_path, name="other")
-    app, _registry, store = make_mcp_app(
+    app, registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
     )
     run_id = "old-running"
@@ -1007,6 +1100,15 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         "recovery_required": False,
     }
     assert not store.cleanup_uncertain_path(run_id).exists()
+    records = [
+        json.loads(line) for line in (registry.state_dir / "audit.jsonl").read_text().splitlines()
+    ]
+    authorization = next(record for record in records if record["outcome"] == "authorized")
+    assert authorization["authorization"] == {
+        "config_sha256": handle.config_sha256,
+        "granted": True,
+        "policy": "run_handle.allow_cancel",
+    }
 
 
 def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: Path) -> None:

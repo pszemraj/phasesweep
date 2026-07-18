@@ -35,6 +35,7 @@ from phasesweep.engine.state import Winner, _load_winner
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
+    AuditUnavailableError,
     CatalogError,
     ConcurrencyLimitError,
     ConfigChangedError,
@@ -582,11 +583,11 @@ class PhaseSweepMCP:
 
         :param Registry registry: Validated catalog registry.
         :param RunStore runs: Persistent detached-run store.
-        :param AuditLogger | None audit: Optional structured audit logger.
+        :param AuditLogger | None audit: Optional audit sink override; defaults to state_dir/audit.jsonl.
         """
         self._registry = registry
         self._runs = runs
-        self._audit = audit
+        self._audit = audit or AuditLogger(registry.state_dir / "audit.jsonl")
         # await_run's nonblocking recheck pause; tests replace it to make waits instant.
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
@@ -609,16 +610,15 @@ class PhaseSweepMCP:
         :param dict[str, Any] | None state_after: Safe state summary after the call.
         :param dict[str, int] | None result_counts: Result counts that avoid copying full payloads.
         """
-        if self._audit is not None:
-            self._audit.record(
-                tool=tool,
-                args=args,
-                outcome="success",
-                resolved=resolved,
-                state_before=state_before,
-                state_after=state_after,
-                result_counts=result_counts,
-            )
+        self._audit.record(
+            tool=tool,
+            args=args,
+            outcome="success",
+            resolved=resolved,
+            state_before=state_before,
+            state_after=state_after,
+            result_counts=result_counts,
+        )
 
     def _audit_error(
         self,
@@ -637,8 +637,6 @@ class PhaseSweepMCP:
         :param dict[str, Any] | None resolved: Safe server-resolved identifiers known before failure.
         :param dict[str, Any] | None state_before: Safe state summary before the failure.
         """
-        if self._audit is None:
-            return
         message = exc.safe_message if isinstance(exc, McpToolError) else "internal error"
         self._audit.record(
             tool=tool,
@@ -649,6 +647,36 @@ class PhaseSweepMCP:
             error_type=type(exc).__name__,
             error=message,
         )
+
+    def _audit_authorization(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        resolved: dict[str, Any],
+        state_before: dict[str, Any],
+        authorization: dict[str, Any],
+    ) -> None:
+        """Persist granted authority before a launch or signal can take effect.
+
+        :param str tool: Side-effecting MCP tool name.
+        :param dict[str, Any] args: Safe agent-supplied arguments.
+        :param dict[str, Any] resolved: Server-resolved ids for the operation.
+        :param dict[str, Any] state_before: Safe state summary before the operation.
+        :param dict[str, Any] authorization: Catalog policy and config identity granting authority.
+        :raises AuditUnavailableError: If the durable record cannot be written and synced.
+        """
+        try:
+            self._audit.record_authorization(
+                tool=tool,
+                args=args,
+                resolved=resolved,
+                state_before=state_before,
+                authorization=authorization,
+            )
+        except Exception:
+            log.exception("required MCP audit authorization record failed for %s", tool)
+            raise AuditUnavailableError(tool) from None
 
     def list_experiments(
         self,
@@ -1147,6 +1175,22 @@ class PhaseSweepMCP:
                 if len(live) >= self._registry.max_concurrent_runs:
                     raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
                 run_id = self._runs.new_run_id(reg.id)
+                resolved["run_id"] = run_id
+                self._audit_authorization(
+                    TOOL_LAUNCH_SWEEP,
+                    args,
+                    resolved=resolved,
+                    state_before=state_before,
+                    authorization={
+                        "policy": "catalog.allow.launch",
+                        "granted": True,
+                        "from_phase_policy": (
+                            "catalog.allow.from_phase" if from_phase is not None else None
+                        ),
+                        "from_phase_granted": True if from_phase is not None else None,
+                        "config_sha256": reg.config_sha256,
+                    },
+                )
                 config_snapshot_path = self._snapshot_config(reg, run_id)
                 pending = self._pending_handle(reg, run_id)
                 self._runs.save(pending)
@@ -1235,7 +1279,8 @@ class PhaseSweepMCP:
             if handle is None:
                 raise UnknownRunError(run_id)
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
-            if not self._cancel_allowed(handle):
+            cancel_allowed, permission_source = self._cancel_authority(handle)
+            if not cancel_allowed:
                 raise PermissionDeniedError("cancel", handle.experiment_id)
             before = self._runs.state(handle)
             recovery_required = self._runs.recovery_required(handle)
@@ -1262,6 +1307,17 @@ class PhaseSweepMCP:
                     result_counts={"runs": 1},
                 )
                 return result
+            self._audit_authorization(
+                TOOL_CANCEL_SWEEP,
+                args,
+                resolved=resolved,
+                state_before=state_before,
+                authorization={
+                    "policy": permission_source,
+                    "granted": True,
+                    "config_sha256": handle.config_sha256,
+                },
+            )
             # Keep the run live before signalling. In the force-kill/no-status
             # case state() could otherwise briefly derive "failed" while trial
             # descendants still hold resources.
@@ -1482,18 +1538,20 @@ class PhaseSweepMCP:
             )
         return handle
 
-    def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether MCP cancellation is permitted for this persisted run.
+    def _cancel_authority(self, handle: RunHandle) -> tuple[bool, str]:
+        """Return whether cancellation is permitted and which policy granted it.
 
         :param RunHandle handle: Persisted run whose cancel permission is checked.
-        :return bool: Current catalog ``allow.cancel`` for the experiment, falling
-            back to the permission frozen on the handle when the experiment has
-            since left the catalog.
+        :return tuple[bool, str]: Permission verdict and its current-catalog or
+            launch-handle policy source.
         """
         try:
-            return self._registry.get(handle.experiment_id).allow_cancel
+            return (
+                self._registry.get(handle.experiment_id).allow_cancel,
+                "catalog.allow.cancel",
+            )
         except UnknownExperimentError:
-            return handle.allow_cancel
+            return handle.allow_cancel, "run_handle.allow_cancel"
 
 
 F = TypeVar("F", bound=Callable[..., Any])
