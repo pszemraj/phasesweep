@@ -274,7 +274,6 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
     app, registry, store = make_mcp_app(catalog)
     data = (tmp_path / "srv.yaml").read_bytes()
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id="srv",
         config_sha256=hashlib.sha256(data).hexdigest(),

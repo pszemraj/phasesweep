@@ -548,7 +548,6 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     store.config_snapshot_path(run_id).write_bytes(snapshot)
     store.save(
         make_run_handle(
-            store,
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
@@ -594,7 +593,6 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     store.config_snapshot_path(run_id).write_bytes(snapshot)
     store.save(
         make_run_handle(
-            store,
             run_id=run_id,
             experiment_id="old",
             config_sha256=hashlib.sha256(snapshot).hexdigest(),
@@ -619,7 +617,6 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     store.config_snapshot_path(run_id).write_bytes(snapshot)
     store.save(
         make_run_handle(
-            store,
             run_id=run_id,
             experiment_id=registry.get("srv").id,
             config_sha256=hashlib.sha256(snapshot + b"\n").hexdigest(),
@@ -735,7 +732,6 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
     }
 
     handle = make_run_handle(
-        store,
         run_id="srv-current",
         experiment_id=registry.get("srv").id,
         config_sha256=registry.get("srv").config_sha256,
@@ -882,7 +878,6 @@ def test_cancel_refuses_before_marker_or_signal_when_required_audit_fails(
     audit = AuditLogger(registry.state_dir / "audit.jsonl")
     app = PhaseSweepMCP(registry, store, audit=audit)
     handle = make_run_handle(
-        store,
         run_id="srv-running",
         experiment_id="srv",
         config_sha256=registry.get("srv").config_sha256,
@@ -1018,7 +1013,6 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
     reg = registry.get("srv")
     run_id = "srv-terminal-uncertain"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1048,7 +1042,6 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
     run_id = "srv-denied"
     store.save(
         make_run_handle(
-            store,
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
@@ -1071,7 +1064,6 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     )
     run_id = "old-running"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id="old",
         config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
@@ -1121,7 +1113,6 @@ def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: 
     run_id = "old-no-cancel"
     store.save(
         make_run_handle(
-            store,
             run_id=run_id,
             experiment_id="old",
             config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
@@ -1142,7 +1133,6 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
     reg = registry.get("srv")
     run_id = "srv-uncertain"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1166,7 +1156,6 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
     assert store.cleanup_uncertain_path(run_id).is_file()
 
     stale_handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1188,7 +1177,6 @@ def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
     reg = registry.get("srv")
     run_id = "srv-force-kill"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1221,7 +1209,6 @@ def test_cancel_requires_runner_status_cleanup_confirmation(
     reg = registry.get("srv")
     run_id = "srv-status-uncertain"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1260,7 +1247,6 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
     reg = registry.get("srv")
     run_id = "srv-status-confirmed"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1300,7 +1286,6 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     reg = registry.get("srv")
     run_id = "srv-operator-recover"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1379,7 +1364,6 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     reg = registry.get("srv")
     run_id = "srv-terminal-recover"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1494,7 +1478,6 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
 
     first_run = "srv-terminal-first"
     first_handle = make_run_handle(
-        store,
         run_id=first_run,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1530,7 +1513,6 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
 
     second_run = "srv-terminal-second"
     second_handle = make_run_handle(
-        store,
         run_id=second_run,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1575,7 +1557,6 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     reg = registry.get("srv")
     run_id = "srv-running-recover"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1696,7 +1677,6 @@ def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
     reg = registry.get("srv")
     run_id = "srv-terminal-no-evidence"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
@@ -1737,7 +1717,6 @@ def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> Non
     reg = registry.get("srv")
     run_id = "srv-bad-snapshot"
     handle = make_run_handle(
-        store,
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,

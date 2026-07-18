@@ -172,7 +172,6 @@ def assert_no_sensitive(payload: Any, sensitive: Iterable[str]) -> None:
 
 
 def make_run_handle(
-    store: RunStore,
     *,
     run_id: str,
     experiment_id: str = "exp",

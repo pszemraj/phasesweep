@@ -25,7 +25,7 @@ def _mode(path: Path) -> int:
 
 def test_save_get_roundtrip(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
+    handle = make_run_handle(run_id="exp-1")
     store.save(handle)
     assert store.get("exp-1") == handle
     assert store.get("missing") is None
@@ -33,7 +33,7 @@ def test_save_get_roundtrip(tmp_path: Path) -> None:
 
 def test_launching_handle_roundtrip_is_failed_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1", launch_state="launching")
+    handle = make_run_handle(run_id="exp-1", launch_state="launching")
 
     store.save(handle)
     loaded = store.get("exp-1")
@@ -45,8 +45,8 @@ def test_launching_handle_roundtrip_is_failed_without_status(tmp_path: Path) -> 
 
 def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    first = make_run_handle(store, run_id="exp-1", experiment_id="old")
-    second = make_run_handle(store, run_id="exp-1", experiment_id="new")
+    first = make_run_handle(run_id="exp-1", experiment_id="old")
+    second = make_run_handle(run_id="exp-1", experiment_id="new")
 
     store.save(first)
     store.save(second)
@@ -71,7 +71,7 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     old_umask = os.umask(0)
     try:
         store = RunStore(tmp_path / "state")
-        handle = make_run_handle(store, run_id="exp-1")
+        handle = make_run_handle(run_id="exp-1")
         store.save(handle)
         write_status_file(store.status_path("exp-1"), {"run_id": "exp-1", "returncode": 0})
         store.mark_cleanup_uncertain(handle)
@@ -124,14 +124,14 @@ def test_get_rejects_unsafe_run_id(tmp_path: Path, unsafe: str) -> None:
     # An agent-supplied id must never be interpolated into a path it could use
     # to escape the runs dir; an out-of-shape id reads as a missing handle.
     store = RunStore(tmp_path / "state")
-    store.save(make_run_handle(store, run_id="exp-1"))
+    store.save(make_run_handle(run_id="exp-1"))
     assert store.get(unsafe) is None
 
 
 def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    store.save(make_run_handle(store, run_id="exp-1"))
-    store.save(make_run_handle(store, run_id="exp-2"))
+    store.save(make_run_handle(run_id="exp-1"))
+    store.save(make_run_handle(run_id="exp-2"))
     # A torn/partial handle file must not crash a read.
     (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
     assert {h.run_id for h in store.list_handles()} == {"exp-1", "exp-2"}
@@ -145,7 +145,7 @@ def test_get_skips_malformed_handle(tmp_path: Path) -> None:
 
 def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    payload = asdict(make_run_handle(store, run_id="other"))
+    payload = asdict(make_run_handle(run_id="other"))
     (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
 
     assert store.get("exp-1") is None
@@ -154,7 +154,7 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
 
 def test_persisted_handle_omits_derived_store_paths(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
+    handle = make_run_handle(run_id="exp-1")
     store.save(handle)
 
     payload = json.loads((tmp_path / "state" / "runs" / "exp-1.json").read_text())
@@ -179,7 +179,7 @@ def test_persisted_handle_omits_derived_store_paths(tmp_path: Path) -> None:
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
     store = RunStore(tmp_path / "state")
-    payload = asdict(make_run_handle(store, run_id="exp-1"))
+    payload = asdict(make_run_handle(run_id="exp-1"))
     payload[field] = value
     (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
 
@@ -192,7 +192,7 @@ def test_launching_handle_cannot_have_process_identity(
     tmp_path: Path, field: str, value: object
 ) -> None:
     store = RunStore(tmp_path / "state")
-    payload = asdict(make_run_handle(store, run_id="exp-1", launch_state="launching"))
+    payload = asdict(make_run_handle(run_id="exp-1", launch_state="launching"))
     payload[field] = value
     (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
 
@@ -203,11 +203,11 @@ def test_launching_handle_cannot_have_process_identity(
 def test_latest_run_for_computes_newest_with_stable_tiebreaker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     older = replace(
-        make_run_handle(store, run_id="srv-z", experiment_id="srv"),
+        make_run_handle(run_id="srv-z", experiment_id="srv"),
         started_at="2026-07-17T12:00:00+00:00",
     )
     newer_a = replace(
-        make_run_handle(store, run_id="srv-a", experiment_id="srv"),
+        make_run_handle(run_id="srv-a", experiment_id="srv"),
         started_at="2026-07-17T13:00:00+00:00",
     )
     newer_b = replace(newer_a, run_id="srv-b")
@@ -219,19 +219,26 @@ def test_latest_run_for_computes_newest_with_stable_tiebreaker(tmp_path: Path) -
     assert store.latest_run_for("missing") is None
 
 
-def test_state_succeeded_from_status(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("returncode", "error_class", "expected_state"),
+    [
+        pytest.param(0, None, "succeeded", id="success"),
+        pytest.param(143, "cancelled", "cancelled", id="sigterm"),
+        pytest.param(130, "cancelled", "cancelled", id="sigint"),
+        pytest.param(1, "RuntimeError", "failed", id="failure"),
+    ],
+)
+def test_terminal_status_determines_state(
+    tmp_path: Path,
+    returncode: int,
+    error_class: str | None,
+    expected_state: str,
+) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
-    write_run_status(store, "exp-1", returncode=0, error_class=None)
-    assert store.state(handle) == "succeeded"
+    handle = make_run_handle(run_id="exp-1")
+    write_run_status(store, "exp-1", returncode=returncode, error_class=error_class)
 
-
-@pytest.mark.parametrize("code", [143, 130])
-def test_state_cancelled_from_signalled_code(tmp_path: Path, code: int) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
-    write_run_status(store, "exp-1", returncode=code, error_class="cancelled")
-    assert store.state(handle) == "cancelled"
+    assert store.state(handle) == expected_state
 
 
 @pytest.mark.parametrize(
@@ -247,18 +254,11 @@ def test_state_cancelled_from_signalled_code(tmp_path: Path, code: int) -> None:
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
+    handle = make_run_handle(run_id="exp-1")
     store.status_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
 
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
-
-
-def test_state_failed_from_nonzero_status(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
-    write_run_status(store, "exp-1", returncode=1, error_class="RuntimeError")
-    assert store.state(handle) == "failed"
 
 
 def test_status_read_failures_do_not_break_state_scans(
@@ -266,7 +266,7 @@ def test_status_read_failures_do_not_break_state_scans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
+    handle = make_run_handle(run_id="exp-1")
     store.save(handle)
 
     store.status_path("exp-1").write_bytes(b"\xff")
@@ -291,7 +291,7 @@ def test_status_read_failures_do_not_break_state_scans(
 
 def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
     store.save(handle)
     write_run_status(
         store,
@@ -308,13 +308,13 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1")
+    handle = make_run_handle(run_id="exp-1")
     assert store.state(handle) == "running"
 
 
 def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
     store.save(handle)
 
     assert store.state(handle) == "running"
@@ -350,7 +350,6 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
-        store,
         run_id="exp-1",
         config_sha256="a" * 64,
         pid=999999,
@@ -369,13 +368,11 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
 ) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(
-        store,
         run_id="exp-1",
         config_sha256="a" * 64,
         launch_state="launching",
     )
     spawned = make_run_handle(
-        store,
         run_id="exp-1",
         config_sha256="a" * 64,
         pid=4242,
@@ -396,7 +393,7 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
 
 def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
     store.save(handle)
     store.mark_cleanup_uncertain(handle)
     write_run_status(
@@ -421,7 +418,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 ) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
-        store,
         run_id="exp-1",
         experiment_id="exp",
         config_sha256="a" * 64,
@@ -459,7 +455,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
-        store,
         run_id="exp-1",
         config_sha256="a" * 64,
         pid=999999,
@@ -494,17 +489,15 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     # PID is alive (our own) but the saved starttime does not match, so it is a
     # different process than the one we launched. The runner is gone, but its
     # separately-sessioned descendants are not proven gone, so fail closed.
-    handle = make_run_handle(
-        store, run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999
-    )
+    handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
     assert store.state(handle) == "running"
     assert store.cleanup_uncertain(handle)
 
 
 def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    store.save(make_run_handle(store, run_id="exp-run", experiment_id="exp"))
-    store.save(make_run_handle(store, run_id="exp-done", experiment_id="exp"))
+    store.save(make_run_handle(run_id="exp-run", experiment_id="exp"))
+    store.save(make_run_handle(run_id="exp-done", experiment_id="exp"))
     write_run_status(store, "exp-done", returncode=0)  # terminal: succeeded
 
     live = store.live_run_for("exp")
@@ -528,7 +521,7 @@ def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path
         while time.time() < deadline and not is_pid_zombie(proc.pid):
             time.sleep(0.02)
         assert is_pid_zombie(proc.pid)
-        handle = make_run_handle(store, run_id="zomb", pid=proc.pid, starttime=starttime)
+        handle = make_run_handle(run_id="zomb", pid=proc.pid, starttime=starttime)
         assert store.state(handle) == "running"
         assert store.cleanup_uncertain(handle)
         # state() reaped the child, so the zombie is gone, not merely filtered.

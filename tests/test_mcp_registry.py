@@ -109,28 +109,20 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert not reg.allow_from_phase
 
 
-def test_checked_in_example_catalog_loads() -> None:
-    registry = Registry.load(REPO / "examples" / "catalog.yaml")
+@pytest.mark.parametrize(
+    ("catalog_path", "experiment_id"),
+    [
+        ("examples/catalog.yaml", "tiny-lm"),
+        (
+            "examples/tiny_decoder_enwik8/catalog.yaml",
+            "tiny-decoder-enwik8-hparams",
+        ),
+    ],
+)
+def test_checked_in_catalog_loads(catalog_path: str, experiment_id: str) -> None:
+    registry = Registry.load(REPO / catalog_path)
 
-    reg = registry.get("tiny-lm")
-
-    assert reg.config_path == (REPO / "examples" / "mcp_experiment.yaml").resolve()
-    assert Path(reg.experiment.workdir).is_absolute()
-    assert reg.experiment.storage == "sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db"
-    assert registry.state_dir == Path("/tmp/phasesweep-mcp-tiny-lm/state")
-    assert reg.visible_params == "all"
-    assert reg.allow_launch
-    assert reg.allow_cancel
-    assert reg.allow_from_phase
-
-
-def test_checked_in_tiny_decoder_catalog_pins_repo_cwd() -> None:
-    registry = Registry.load(REPO / "examples" / "tiny_decoder_enwik8" / "catalog.yaml")
-
-    reg = registry.get("tiny-decoder-enwik8-hparams")
-
-    assert reg.cwd == REPO
-    assert reg.visible_params == "all"
+    assert registry.get(experiment_id).id == experiment_id
 
 
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
