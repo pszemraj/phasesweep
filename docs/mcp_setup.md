@@ -167,7 +167,7 @@ A working setup returns catalog ids, operator-authored descriptions, phase names
 
 ## 5. Instruct the agent
 
-If step 3 ran with instructions enabled, the client already received the [agent instructions](../src/phasesweep/mcp/agent_prompt.md) in its project instructions file. Clients with MCP prompt support can load `phasesweep_run_and_monitor` instead. Otherwise, copy the linked instructions into the agent's project instructions or the chat before asking it to run a sweep.
+If step 3 ran with instructions enabled, the client already received the [agent instructions](../src/phasesweep/mcp/agent_prompt.md) in its project instructions file. The server also sends the same workflow in its MCP initialization instructions, and clients with MCP prompt support can load `phasesweep_run_and_monitor`. If the client honors none of those channels, copy the linked instructions into the agent's project instructions or the chat before asking it to run a sweep.
 
 ## Requests that work well
 

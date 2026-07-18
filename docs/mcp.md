@@ -1,6 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` and `phasesweep mcp` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) using the [supported MCP runtime](runtime.md#platform-support). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and uses the server's tools. The server also exposes a read-only catalog resource and one workflow prompt for clients that support them.
+`phasesweep-mcp` and `phasesweep mcp serve` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) using the [supported MCP runtime](runtime.md#platform-support). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and uses the server's tools. The server sends the packaged workflow as initialization instructions and also exposes a read-only catalog resource and workflow prompt for clients that support them.
 
 For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 
@@ -63,6 +63,8 @@ When a `run_id` is supplied, live status is read through that run's saved config
 Clients that support MCP resources can attach `phasesweep://catalog`. It returns the first catalog page as compact JSON using the same path-free payload as `phasesweep_list_experiments`. Agents should still call `phasesweep_list_experiments` when they need pagination or autonomous discovery.
 
 Clients that support MCP prompts can use `phasesweep_run_and_monitor`, which serves the packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md).
+
+The same instructions are included in the MCP initialization handshake, so clients that surface server instructions receive the workflow without loading the optional prompt or a project instructions file.
 
 ## Security model
 

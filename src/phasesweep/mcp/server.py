@@ -1689,7 +1689,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("phasesweep")
+    mcp = FastMCP("phasesweep", instructions=agent_prompt_text(strip=True))
 
     @mcp.tool(
         name=TOOL_LIST_EXPERIMENTS,

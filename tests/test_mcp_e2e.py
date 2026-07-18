@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.server import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
@@ -275,6 +276,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
     server = build_server(app)
+    initialization = server._mcp_server.create_initialization_options()
+    assert initialization.instructions == agent_prompt_text(strip=True)
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
