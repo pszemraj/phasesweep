@@ -104,7 +104,6 @@ def status_payload(
     *,
     result_source: ResultSource,
     elapsed_seconds: int | None,
-    poll_after_seconds: int,
 ) -> dict[str, Any]:
     """Build the ``get_status`` payload from the path-free read_status dict.
 
@@ -121,7 +120,6 @@ def status_payload(
         state or a frozen terminal run snapshot.
     :param int | None elapsed_seconds: Seconds since launch (running) or total
         run duration (terminal); ``None`` without an associated run.
-    :param int poll_after_seconds: Suggested wait before the next status call.
     :return dict[str, Any]: MCP-safe status payload.
     """
     phases = []
@@ -145,5 +143,4 @@ def status_payload(
         "summary_present": status["summary_present"],
         "run": run,
         "elapsed_seconds": elapsed_seconds,
-        "poll_after_seconds": poll_after_seconds,
     }

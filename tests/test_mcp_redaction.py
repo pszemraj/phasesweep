@@ -87,7 +87,6 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         None,
         result_source="current_shared_study",
         elapsed_seconds=None,
-        poll_after_seconds=30,
     )
 
     assert_no_sensitive(winners, sensitive)

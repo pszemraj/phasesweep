@@ -13,7 +13,6 @@ re-verify phase fingerprints: that check belongs to the resume path in
 
 from __future__ import annotations
 
-import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -181,22 +180,17 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
     runner writes) by returning ``{}`` for that phase rather than raising.
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
-    ``median_trial_seconds`` follows the same permissive contract: it is the
-    median wall duration of COMPLETE trials across all phases, or ``None``
-    while nothing has finished — callers use it to size their poll interval.
 
     Args:
         experiment: Parsed experiment config whose phases are inspected.
 
     Returns:
         A path-free mapping with the experiment name, metric descriptor, a
-        per-phase list of trial counts plus winner presence, the median
-        completed-trial duration, and whether the experiment summary has been
-        written.
+        per-phase list of trial counts plus winner presence and whether the
+        experiment summary has been written.
 
     """
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
-    durations = [seconds for stats in phase_stats.values() for seconds in stats.completed_durations]
     return {
         "experiment": experiment.experiment,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
@@ -207,5 +201,4 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
         ),
         "summary_present": _summary_path(experiment).is_file(),
-        "median_trial_seconds": statistics.median(durations) if durations else None,
     }

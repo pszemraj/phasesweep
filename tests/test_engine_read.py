@@ -140,7 +140,6 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     assert connections == 1
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
     assert status["phases"][0]["trial_data_available"] is True
-    assert status["median_trial_seconds"] is not None
 
 
 def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:

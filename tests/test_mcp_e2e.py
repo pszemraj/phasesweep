@@ -338,7 +338,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     output_schemas = {t.name: t.outputSchema for t in tools}
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
-    assert "poll_after_seconds" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]

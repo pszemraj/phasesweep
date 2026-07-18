@@ -44,7 +44,6 @@ class StatusSnapshot(_SnapshotModel):
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
-    median_trial_seconds: float | None = Field(default=None, ge=0)
 
 
 class WinnerSnapshot(_SnapshotModel):
@@ -118,7 +117,6 @@ def capture_result_snapshot(
             metric=status["metric"],
             phases=status["phases"],
             summary_present=status["summary_present"],
-            median_trial_seconds=status["median_trial_seconds"],
         ),
         winners=[
             WinnerSnapshot(

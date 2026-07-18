@@ -6,7 +6,6 @@ import logging
 import sqlite3
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, assert_never
 
@@ -28,10 +27,9 @@ from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage
 
 @dataclass(frozen=True)
 class _PhaseTrialStats:
-    """One read-only storage snapshot for phase counts and durations."""
+    """One read-only storage snapshot for phase counts."""
 
     counts: dict[str, int]
-    completed_durations: list[float]
     available: bool
 
 
@@ -243,7 +241,7 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
 
 
 def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
-    """Return trial-state counts and COMPLETE durations in one SQLite read.
+    """Return trial-state counts in one SQLite read.
 
     Status polling must be read-only. Passing a fresh SQLite URL through
     Optuna's storage constructor can create the database/schema and race the
@@ -253,90 +251,56 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
-    :return _PhaseTrialStats: Counts, wall durations, and an availability flag;
-        data fields are empty and availability false when the DB cannot be read safely.
+    :return _PhaseTrialStats: Counts and an availability flag; counts are empty
+        and availability false when the DB cannot be read safely.
     """
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
     if uri is None:
-        return _PhaseTrialStats({}, [], False)
+        return _PhaseTrialStats({}, False)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
                 """
-                SELECT trials.state, trials.datetime_start, trials.datetime_complete
+                SELECT trials.state, COUNT(*)
                 FROM trials
                 JOIN studies ON trials.study_id = studies.study_id
                 WHERE studies.study_name = ?
+                GROUP BY trials.state
                 """,
                 (_phase_study_name(experiment, phase),),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return _PhaseTrialStats({}, [], False)
-    counts: dict[str, int] = {}
-    durations: list[float] = []
-    for state, start_raw, complete_raw in rows:
-        state_name = str(state)
-        counts[state_name] = counts.get(state_name, 0) + 1
-        if state_name != "COMPLETE":
-            continue
-        duration = _parsed_trial_duration(start_raw, complete_raw)
-        if duration is not None:
-            durations.append(duration)
-    return _PhaseTrialStats(counts, durations, True)
-
-
-def _parsed_trial_duration(start_raw: object, complete_raw: object) -> float | None:
-    """Parse one non-negative SQLite trial duration.
-
-    :param object start_raw: Stored trial start timestamp.
-    :param object complete_raw: Stored trial completion timestamp.
-    :return float | None: Duration in seconds, or ``None`` for unusable rows.
-    """
-    if not isinstance(start_raw, str) or not isinstance(complete_raw, str):
-        return None
-    try:
-        seconds = (
-            datetime.fromisoformat(complete_raw) - datetime.fromisoformat(start_raw)
-        ).total_seconds()
-    except ValueError:
-        return None
-    return seconds if seconds >= 0 else None
+        return _PhaseTrialStats({}, False)
+    return _PhaseTrialStats({str(state): int(count) for state, count in rows}, True)
 
 
 def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
-    """Read counts and COMPLETE durations without creating a missing study.
+    """Read counts without creating a missing study.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.storage is None:
-        return _PhaseTrialStats({}, [], False)
+        return _PhaseTrialStats({}, False)
     backend = storage_backend(experiment.storage)
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase)
     if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return _PhaseTrialStats({}, [], False)
+        return _PhaseTrialStats({}, False)
     try:
         study = _load_phase_study(experiment, phase)
         trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, [], False)
+        return _PhaseTrialStats({}, False)
     counts: dict[str, int] = {}
-    durations: list[float] = []
     for trial in trials:
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
-        if (
-            trial.state == optuna.trial.TrialState.COMPLETE
-            and trial.duration is not None
-            and trial.duration.total_seconds() >= 0
-        ):
-            durations.append(trial.duration.total_seconds())
-    return _PhaseTrialStats(counts, durations, True)
+    return _PhaseTrialStats(counts, True)
 
 
 def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:

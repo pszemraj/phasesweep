@@ -1,6 +1,4 @@
-"""Status timing surfaces: per-phase progress counts, elapsed time, the
-adaptive poll interval derived from completed-trial durations, and the
-await_run wait loop built on top of them."""
+"""Status progress, elapsed time, and the await_run wait loop."""
 
 from __future__ import annotations
 
@@ -14,19 +12,14 @@ import optuna
 import pytest
 import yaml
 
-from phasesweep.config import load_config
-from phasesweep.engine import read_status
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
-    POLL_DEFAULT_SECONDS,
-    POLL_MAX_SECONDS,
-    POLL_MIN_SECONDS,
+    AWAIT_RECHECK_SECONDS,
     PhaseSweepMCP,
-    _poll_after_seconds,
     _run_elapsed_seconds,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -40,16 +33,7 @@ from tests.mcp_helpers import (
 )
 
 
-def _experiment(tmp_path: Path, *, storage: str | None = None):
-    text = mcp_experiment_config_text(tmp_path)
-    if storage is not None:
-        text = text.replace(f"storage: sqlite:///{tmp_path}/srv.db", f"storage: {storage}")
-    config = tmp_path / "exp.yaml"
-    config.write_text(text)
-    return load_config(config)
-
-
-def _complete_trials(experiment, *, n: int, sleep: float = 0.0) -> None:
+def _complete_trials(experiment, *, n: int) -> None:
     study = optuna.create_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
         storage=experiment.storage,
@@ -57,54 +41,7 @@ def _complete_trials(experiment, *, n: int, sleep: float = 0.0) -> None:
     )
     for i in range(n):
         trial = study.ask()
-        if sleep:
-            time.sleep(sleep)
         study.tell(trial, float(i))
-
-
-def test_read_status_completed_trial_durations_sqlite(tmp_path: Path) -> None:
-    experiment = _experiment(tmp_path)
-    phase = experiment.phases[0]
-    assert read_status(experiment)["median_trial_seconds"] is None
-
-    _complete_trials(experiment, n=2, sleep=0.05)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, phase), storage=experiment.storage
-    )
-    study.ask()  # a RUNNING trial must not contribute a duration
-
-    median = read_status(experiment)["median_trial_seconds"]
-    assert median is not None
-    assert median >= 0.05
-
-
-def test_read_status_completed_trial_durations_journal(tmp_path: Path) -> None:
-    experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path}/srv.journal")
-    assert read_status(experiment)["median_trial_seconds"] is None
-
-    from optuna.storages import JournalStorage
-    from optuna.storages.journal import JournalFileBackend
-
-    storage = JournalStorage(JournalFileBackend(str(tmp_path / "srv.journal")))
-    study = optuna.create_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=storage,
-        direction="minimize",
-    )
-    trial = study.ask()
-    time.sleep(0.05)
-    study.tell(trial, 0.1)
-
-    median = read_status(experiment)["median_trial_seconds"]
-    assert median is not None
-    assert median >= 0.05
-
-
-def test_poll_after_seconds_clamps_median() -> None:
-    assert _poll_after_seconds(None) == POLL_DEFAULT_SECONDS
-    assert _poll_after_seconds(2.0) == POLL_MIN_SECONDS
-    assert _poll_after_seconds(90.4) == 90
-    assert _poll_after_seconds(10_000.0) == POLL_MAX_SECONDS
 
 
 def _handle(run_id: str, *, started_at: str) -> RunHandle:
@@ -143,18 +80,14 @@ def test_elapsed_seconds_terminal_prefers_runner_stamp(tmp_path: Path) -> None:
     assert _run_elapsed_seconds(store, handle, "succeeded") == 125
 
 
-def test_elapsed_seconds_terminal_falls_back_to_status_mtime(tmp_path: Path) -> None:
-    # Runs recorded before the ended_at stamp existed still report a duration.
+def test_elapsed_seconds_none_without_terminal_timestamp(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    started = utc_now_iso()
-    handle = _handle("r1", started_at=started)
+    handle = _handle("r1", started_at=utc_now_iso())
     write_status_file(
         store.status_path("r1"),
         {"run_id": "r1", "returncode": 0, "error_class": None, "cleanup_confirmed": True},
     )
-    elapsed = _run_elapsed_seconds(store, handle, "succeeded")
-    assert elapsed is not None
-    assert 0 <= elapsed <= 5
+    assert _run_elapsed_seconds(store, handle, "succeeded") is None
 
 
 def test_elapsed_seconds_none_without_status(tmp_path: Path) -> None:
@@ -163,7 +96,7 @@ def test_elapsed_seconds_none_without_status(tmp_path: Path) -> None:
     assert _run_elapsed_seconds(store, _handle("r1", started_at=utc_now_iso()), "failed") is None
 
 
-def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
+def test_status_reports_progress_fields(tmp_path: Path) -> None:
     config_text = mcp_experiment_config_text(tmp_path)
     catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
     app, _registry, _store = make_mcp_app(catalog)
@@ -171,7 +104,6 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
     status = app.status(experiment_id="srv")
     assert status["run"] is None
     assert status["elapsed_seconds"] is None
-    assert status["poll_after_seconds"] == POLL_DEFAULT_SECONDS
     (phase,) = status["phases"]
     assert phase["n_trials"] == 1
     assert phase["completed"] == 0
@@ -187,16 +119,15 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
     assert phase["trial_data_available"] is False
     assert status["result_source"] == "current_shared_study"
 
-    # Completed trials feed both the per-phase count and the poll suggestion.
+    # Completed trials feed the per-phase progress counts.
     experiment = _registry.get("srv").experiment
-    _complete_trials(experiment, n=3, sleep=0.0)
+    _complete_trials(experiment, n=3)
     status = app.status(experiment_id="srv")
     (phase,) = status["phases"]
     assert phase["completed"] == 3
     assert phase["terminal_trials"] == 3
     assert phase["remaining_trials"] == 0
     assert phase["trial_data_available"] is True
-    assert POLL_MIN_SECONDS <= status["poll_after_seconds"] <= POLL_MAX_SECONDS
 
 
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
@@ -235,7 +166,6 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
                     }
                 ],
                 "summary_present": False,
-                "median_trial_seconds": 17.0,
             },
             "winners": [
                 {
@@ -261,7 +191,6 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     assert run_status["phases"][0]["terminal_trials"] == 3
     assert run_status["phases"][0]["remaining_trials"] == 0
     assert run_status["result_source"] == "frozen_run_snapshot"
-    assert run_status["poll_after_seconds"] == 17
     assert app.winners(run_id="r1")["phases"][0]["metric"] == 0.25
 
     # Experiment-id reads remain the current shared-storage view.
@@ -307,6 +236,7 @@ def test_await_run_returns_immediately_on_terminal(
         returncode=0,
         error_class=None,
         cleanup_confirmed=True,
+        ended_at=utc_now_iso(),
         result_snapshot=capture_result_snapshot(
             registry.get("srv").experiment,
             cleanup_confirmed=True,
@@ -319,7 +249,6 @@ def test_await_run_returns_immediately_on_terminal(
     assert result["changed"] is False  # already terminal when the wait began
     assert result["run"]["state"] == "succeeded"
     assert clock["sleeps"] == 0.0  # no recheck pause was needed
-    assert result["poll_after_seconds"] == POLL_DEFAULT_SECONDS
     assert isinstance(result["elapsed_seconds"], int)
 
 
@@ -377,7 +306,7 @@ def test_await_run_returns_when_phase_gains_winner(
     assert result["run"]["state"] == "running"
     assert result["phases"][0]["winner_present"] is True
     # The winner appeared after one recheck pause, well before the timeout.
-    assert clock["now"] == pytest.approx(POLL_DEFAULT_SECONDS)
+    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
 
 
 def test_await_run_returns_when_run_fails_mid_wait(
@@ -408,7 +337,7 @@ def test_await_run_returns_when_run_fails_mid_wait(
     assert result["reason"] == "terminal"
     assert result["changed"] is True
     assert result["run"]["state"] == "failed"
-    assert clock["now"] == pytest.approx(POLL_DEFAULT_SECONDS)
+    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
 
 
 def test_terminal_run_read_refuses_mutable_fallback_without_snapshot(tmp_path: Path) -> None:

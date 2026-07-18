@@ -75,19 +75,12 @@ PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
 MAX_TOOL_RESULT_BYTES = 64 * 1024
-# Adaptive poll-interval bounds for get_status: the suggested wait tracks the
-# median completed-trial duration so agents polling minute-long trials back
-# off, clamped so pathological durations can neither hammer the storage nor
-# park the agent for an hour.
-POLL_DEFAULT_SECONDS = 30
-POLL_MIN_SECONDS = 15
-POLL_MAX_SECONDS = 600
 # await_run blocks server-side so one call replaces dozens of polls; the cap
-# keeps a response inside common client tool timeouts. Rechecks use the same
-# observed trial-duration guidance returned by get_status.
+# keeps a response inside common client tool timeouts.
 AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
 AWAIT_MIN_TIMEOUT_SECONDS = 5
 AWAIT_MAX_TIMEOUT_SECONDS = 600
+AWAIT_RECHECK_SECONDS = 30
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -128,7 +121,7 @@ DESCRIPTION_GET_STATUS = (
     "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
-    "instead, wait poll_after_seconds between calls. When terminal, call "
+    "instead, wait at least 30 seconds between calls. When terminal, call "
     f"{TOOL_GET_WINNERS} with the same run_id."
 )
 DESCRIPTION_GET_WINNERS = (
@@ -347,14 +340,6 @@ class GetStatusResult(_ToolPayload):
             "null when no run is associated with this query."
         )
     )
-    poll_after_seconds: int = Field(
-        ge=POLL_MIN_SECONDS,
-        le=POLL_MAX_SECONDS,
-        description=(
-            "Suggested seconds to wait before the next phasesweep_get_status call, "
-            "sized from the median completed-trial duration."
-        ),
-    )
 
 
 class AwaitRunResult(GetStatusResult):
@@ -484,10 +469,8 @@ def _bounded_tool_result(tool_name: str, value: Any) -> Any:
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
     """Compute wall seconds for a run: launch-to-now while running, total when terminal.
 
-    Terminal runs prefer the runner-stamped ``ended_at`` in status.json and
-    fall back to the status file's mtime (runs recorded before the stamp
-    existed). A terminal run with no readable status at all - e.g. SIGKILLed
-    before writing one - reports ``None`` rather than a guess.
+    Terminal runs use the runner-stamped ``ended_at`` in status.json. A
+    terminal run with no readable endpoint reports ``None`` rather than a guess.
 
     :param RunStore store: Run store used to read the terminal status.
     :param RunHandle handle: Persisted run whose duration is measured.
@@ -503,28 +486,9 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     else:
         status = store.recorded_terminal_status(handle)
         ended = parse_utc_iso(status.get("ended_at")) if status is not None else None
-        if ended is None and status is not None:
-            try:
-                mtime = store.status_path(handle.run_id).stat().st_mtime
-            except OSError:
-                return None
-            ended = datetime.fromtimestamp(mtime, tz=timezone.utc)
     if ended is None:
         return None
     return max(0, round((ended - started).total_seconds()))
-
-
-def _poll_after_seconds(median_trial_seconds: float | None) -> int:
-    """Suggest a status poll interval from the median completed-trial duration.
-
-    :param float | None median_trial_seconds: Median COMPLETE-trial wall
-        duration, or ``None`` while nothing has finished.
-    :return int: Whole seconds clamped to the poll bounds; the default when no
-        trial has completed yet.
-    """
-    if median_trial_seconds is None:
-        return POLL_DEFAULT_SECONDS
-    return int(min(POLL_MAX_SECONDS, max(POLL_MIN_SECONDS, round(median_trial_seconds))))
 
 
 def _await_snapshot(state: str, status: dict[str, Any]) -> tuple[Any, ...]:
@@ -885,8 +849,9 @@ class PhaseSweepMCP:
                 elif time.monotonic() >= deadline:
                     reason = "timeout"
                 else:
-                    recheck_seconds = _poll_after_seconds(status.get("median_trial_seconds"))
-                    await self._sleep(min(recheck_seconds, max(0.0, deadline - time.monotonic())))
+                    await self._sleep(
+                        min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
+                    )
                     continue
                 break
             result = self._status_result(target_id, status, run, result_source)
@@ -948,7 +913,7 @@ class PhaseSweepMCP:
         :param dict[str, Any] status: Current or frozen engine status payload.
         :param dict[str, Any] | None run: Optional derived detached-run state.
         :param ResultSource result_source: Current shared state or frozen run snapshot.
-        :return dict[str, Any]: Agent-safe status response with timing guidance.
+        :return dict[str, Any]: Agent-safe status response.
         """
         elapsed_seconds = None
         if run is not None:
@@ -961,7 +926,6 @@ class PhaseSweepMCP:
             run,
             result_source=result_source,
             elapsed_seconds=elapsed_seconds,
-            poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
         )
 
     def _resolve_read_target(
