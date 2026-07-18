@@ -34,33 +34,47 @@ def _write_status(
     config_path: Path,
     config_sha256: str,
 ) -> None:
-    """Best-effort write of the runner terminal status file, stamped with an end time.
+    """Persist terminal evidence, then best-effort enrich it with a result snapshot.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
     :param Path config_path: Exact per-run config snapshot that was executed.
     :param str config_sha256: Expected hash for the per-run config snapshot.
     """
-    # Best-effort: a failed status write must not mask the real exit cause.
+    # Persist cleanup evidence before reading storage. Snapshot capture can be
+    # slow on a large or contended study, and the cancelling server may exhaust
+    # its grace period and force-kill this runner while that read is in flight.
+    terminal = {**payload, "ended_at": utc_now_iso()}
     try:
-        terminal = dict(payload)
-        try:
-            from phasesweep.config import Experiment, load_config
-
-            if _sha256_file(config_path) == config_sha256:
-                config = load_config(config_path)
-                if isinstance(config, Experiment):
-                    terminal["result_snapshot"] = capture_result_snapshot(
-                        config,
-                        cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
-                    )
-        except Exception:  # noqa: BLE001 - terminal cause still must be recorded
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to capture terminal result snapshot"
-            )
-        write_status_file(status_path, {**terminal, "ended_at": utc_now_iso()})
+        write_status_file(status_path, terminal)
     except OSError:
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
+        return
+
+    try:
+        from phasesweep.config import Experiment, load_config
+
+        if _sha256_file(config_path) != config_sha256:
+            return
+        config = load_config(config_path)
+        if not isinstance(config, Experiment):
+            return
+        terminal["result_snapshot"] = capture_result_snapshot(
+            config,
+            cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
+        )
+    except Exception:  # noqa: BLE001 - minimal terminal evidence is already durable
+        logging.getLogger("phasesweep.mcp.runner").exception(
+            "failed to capture terminal result snapshot"
+        )
+        return
+
+    try:
+        write_status_file(status_path, terminal)
+    except OSError:
+        logging.getLogger("phasesweep.mcp.runner").exception(
+            "failed to add result snapshot to status.json"
+        )
 
 
 def _sha256_file(path: Path) -> str:

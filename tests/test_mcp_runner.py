@@ -19,6 +19,7 @@ import pytest
 from phasesweep.config import load_config
 from phasesweep.engine import read_status
 from phasesweep.engine.state import _trial_dir_for
+from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import _process_group_alive
@@ -59,6 +60,36 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
                 return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
+
+
+def test_runner_persists_terminal_evidence_before_snapshot_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _slow_config(tmp_path)
+    status_path = tmp_path / "status.json"
+    observed: dict[str, object] = {}
+
+    def fail_snapshot(*_args: object, **_kwargs: object) -> dict[str, object]:
+        observed.update(json.loads(status_path.read_text()))
+        raise RuntimeError("snapshot read stalled")
+
+    monkeypatch.setattr(mcp_runner, "capture_result_snapshot", fail_snapshot)
+    mcp_runner._write_status(
+        status_path,
+        {
+            "run_id": "r0",
+            "returncode": 143,
+            "error_class": "cancelled",
+            "cleanup_confirmed": True,
+        },
+        config_path=config,
+        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    )
+
+    assert observed["error_class"] == "cancelled"
+    assert observed["cleanup_confirmed"] is True
+    assert "ended_at" in observed
+    assert json.loads(status_path.read_text()) == observed
 
 
 def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
