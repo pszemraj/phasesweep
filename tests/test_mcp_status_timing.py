@@ -14,7 +14,8 @@ import pytest
 import yaml
 
 from phasesweep.config import load_config
-from phasesweep.engine.optuna import _phase_study_name, phase_completed_trial_durations
+from phasesweep.engine import read_status
+from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
@@ -60,10 +61,10 @@ def _complete_trials(experiment, *, n: int, sleep: float = 0.0) -> None:
         study.tell(trial, float(i))
 
 
-def test_completed_trial_durations_sqlite(tmp_path: Path) -> None:
+def test_read_status_completed_trial_durations_sqlite(tmp_path: Path) -> None:
     experiment = _experiment(tmp_path)
     phase = experiment.phases[0]
-    assert phase_completed_trial_durations(experiment, phase) == []  # DB absent: no side effects
+    assert read_status(experiment)["median_trial_seconds"] is None
 
     _complete_trials(experiment, n=2, sleep=0.05)
     study = optuna.load_study(
@@ -71,30 +72,31 @@ def test_completed_trial_durations_sqlite(tmp_path: Path) -> None:
     )
     study.ask()  # a RUNNING trial must not contribute a duration
 
-    durations = phase_completed_trial_durations(experiment, phase)
-    assert len(durations) == 2
-    assert all(d >= 0.05 for d in durations)
+    median = read_status(experiment)["median_trial_seconds"]
+    assert median is not None
+    assert median >= 0.05
 
 
-def test_completed_trial_durations_journal(tmp_path: Path) -> None:
+def test_read_status_completed_trial_durations_journal(tmp_path: Path) -> None:
     experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path}/srv.journal")
-    phase = experiment.phases[0]
-    assert phase_completed_trial_durations(experiment, phase) == []
+    assert read_status(experiment)["median_trial_seconds"] is None
 
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend
 
     storage = JournalStorage(JournalFileBackend(str(tmp_path / "srv.journal")))
     study = optuna.create_study(
-        study_name=_phase_study_name(experiment, phase), storage=storage, direction="minimize"
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=storage,
+        direction="minimize",
     )
     trial = study.ask()
     time.sleep(0.05)
     study.tell(trial, 0.1)
 
-    durations = phase_completed_trial_durations(experiment, phase)
-    assert len(durations) == 1
-    assert durations[0] >= 0.05
+    median = read_status(experiment)["median_trial_seconds"]
+    assert median is not None
+    assert median >= 0.05
 
 
 def test_poll_after_seconds_clamps_median() -> None:

@@ -359,18 +359,3 @@ def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
     :return dict[str, int]: Counts keyed by Optuna trial-state name.
     """
     return _phase_trial_stats(experiment, phase).counts
-
-
-def phase_completed_trial_durations(experiment: Experiment, phase: Phase) -> list[float]:
-    """Return wall durations of COMPLETE trials without creating a missing study.
-
-    Read-only companion to ``_phase_trial_counts`` used to derive an adaptive
-    status poll interval: SQLite storages are queried directly in read-only
-    mode; journal storages reuse the loaded study's ``FrozenTrial.duration``.
-
-    :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose existing study is inspected.
-    :return list[float]: Wall-clock seconds per COMPLETE trial; empty when the
-        study does not exist yet or the backend cannot be read safely.
-    """
-    return _phase_trial_stats(experiment, phase).completed_durations
