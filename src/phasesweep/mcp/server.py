@@ -14,6 +14,7 @@ import functools
 import hashlib
 import importlib.util
 import inspect
+import json
 import logging
 import subprocess
 import sys
@@ -43,11 +44,13 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
+    ToolResultTooLargeError,
     UnknownExperimentError,
     UnknownRunError,
 )
-from phasesweep.mcp.redaction import status_payload, winners_payload
+from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
@@ -69,6 +72,7 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
+MAX_TOOL_RESULT_BYTES = 64 * 1024
 # Adaptive poll-interval bounds for get_status: the suggested wait tracks the
 # median completed-trial duration so agents polling minute-long trials back
 # off, clamped so pathological durations can neither hammer the storage nor
@@ -89,12 +93,13 @@ AWAIT_RECHECK_SECONDS = 5.0
 # to the next tool in the workflow by literal name.
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the human-curated experiments this server can run: ids, descriptions, "
-    "phase names, and the optimization metric. Read-only. Start here. If "
+    "phase names, optimization metric, and authorized capabilities. Read-only. Start here. If "
     "next_cursor is non-null, call again with it. Then call "
     f"{TOOL_VALIDATE_CONFIG} on the id you plan to use."
 )
 DESCRIPTION_VALIDATE_CONFIG = (
-    "Inspect an experiment before launching it: per-phase names, trial counts, "
+    "Re-check that the cataloged config has not changed, then inspect it before launching: "
+    "authorized capabilities plus per-phase names, trial counts, "
     "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
     f"Call this before every {TOOL_LAUNCH_SWEEP}."
 )
@@ -110,8 +115,10 @@ DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
     "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
-    "A terminal run_id returns the phase counts frozen when that run ended; an "
-    "experiment_id returns the current shared-study view. "
+    "State counts are dense and terminal_trials/remaining_trials are already computed; "
+    "trial_data_available=false means zero counts are not trustworthy. result_source names "
+    "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
+    "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
     "instead, wait poll_after_seconds between calls. When terminal, call "
     f"{TOOL_GET_WINNERS} with the same run_id."
@@ -122,8 +129,9 @@ DESCRIPTION_GET_WINNERS = (
     "Phases that completed still report winners when the run later failed or was "
     "cancelled. Values shown as <redacted> are intentional catalog policy, not "
     "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
-    "run_id); terminal run-id winners stay frozen if the experiment is later "
-    "resumed. Read-only."
+    "run_id); result_source identifies current versus frozen results, and missing_phases plus "
+    "all_phases_have_winners already compute completeness. Terminal run-id winners stay frozen "
+    "if the experiment is later resumed and never fall back to mutable results. Read-only."
 )
 DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "
@@ -217,6 +225,16 @@ class MetricPayload(_ToolPayload):
     goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
 
 
+class CapabilitiesPayload(_ToolPayload):
+    """Catalog-authorized actions for one experiment."""
+
+    launch: bool = Field(description="Whether the agent may launch this experiment.")
+    cancel: bool = Field(description="Whether the agent may cancel its launched runs.")
+    resume_from_phase: bool = Field(
+        description="Whether launch may use from_phase after earlier winners exist."
+    )
+
+
 class ExperimentSummaryPayload(_ToolPayload):
     """Path-free catalog entry summary."""
 
@@ -224,6 +242,7 @@ class ExperimentSummaryPayload(_ToolPayload):
     description: str = Field(description="Operator-authored catalog description.")
     phases: list[PhaseName] = Field(description="Declared phases, in execution order.")
     metric: MetricPayload
+    capabilities: CapabilitiesPayload
 
 
 class ListExperimentsResult(_ToolPayload):
@@ -252,6 +271,7 @@ class ValidateConfigResult(_ToolPayload):
 
     experiment_id: ExperimentId
     metric: MetricPayload
+    capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
 
 
@@ -267,17 +287,32 @@ class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
     phase: PhaseName
-    trials: dict[str, int] = Field(description="Optuna trial counts by state.")
+    trials: dict[Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"], int] = Field(
+        description="Dense Optuna trial counts; every state key is always present."
+    )
     running: int = Field(ge=0, description="Number of currently running trials.")
     n_trials: int = Field(ge=0, description="Configured trial budget for this phase.")
     completed: int = Field(ge=0, description="Trials completed so far in this phase.")
+    terminal_trials: int = Field(
+        ge=0, description="COMPLETE + PRUNED + FAIL attempts already charged to the budget."
+    )
+    remaining_trials: int = Field(
+        ge=0, description="Configured trial attempts remaining, already computed."
+    )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
+    trial_data_available: bool = Field(
+        description=(
+            "Whether the backing study was readable; false means zero counts are not evidence "
+            "that no trials exist."
+        )
+    )
 
 
 class GetStatusResult(_ToolPayload):
     """Structured output for get_status."""
 
     experiment_id: ExperimentId
+    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
@@ -342,6 +377,13 @@ class GetWinnersResult(_ToolPayload):
     """Structured output for get_winners."""
 
     experiment_id: ExperimentId
+    run_id: RunId | None
+    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    metric: MetricPayload
+    declared_phase_count: int = Field(ge=0)
+    winner_count: int = Field(ge=0)
+    missing_phases: list[PhaseName]
+    all_phases_have_winners: bool
     phases: list[WinnerPhasePayload]
 
 
@@ -385,6 +427,31 @@ def _cursor_offset(cursor: str | None) -> int:
             "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
         )
     return offset
+
+
+def _serialized_result_size(value: Any) -> int:
+    """Return compact UTF-8 JSON size for an MCP payload value.
+
+    :param Any value: JSON-compatible mapping or Pydantic result model.
+    :return int: Serialized payload size in bytes, excluding transport framing.
+    """
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return len(encoded.encode("utf-8"))
+
+
+def _bounded_tool_result(tool_name: str, value: Any) -> Any:
+    """Reject a serialized tool result that exceeds the global byte budget.
+
+    :param str tool_name: MCP tool implementation name used in the safe error.
+    :param Any value: Tool result about to be handed to FastMCP.
+    :return Any: ``value`` unchanged when within the response budget.
+    :raises ToolResultTooLargeError: If the compact JSON payload is oversized.
+    """
+    if _serialized_result_size(value) > MAX_TOOL_RESULT_BYTES:
+        raise ToolResultTooLargeError(tool_name, MAX_TOOL_RESULT_BYTES)
+    return value
 
 
 def _parse_utc_iso(value: object) -> datetime | None:
@@ -579,7 +646,17 @@ class PhaseSweepMCP:
             offset = _cursor_offset(cursor)
             experiments = self._registry.summaries()
             total_count = len(experiments)
-            page = experiments[offset : offset + limit]
+            for experiment in experiments[offset : offset + limit]:
+                candidate = {
+                    "experiments": [*page, experiment],
+                    "total_count": total_count,
+                    "next_cursor": str(offset + len(page) + 1),
+                }
+                if _serialized_result_size(candidate) > MAX_TOOL_RESULT_BYTES:
+                    if not page:
+                        raise ToolResultTooLargeError(TOOL_LIST_EXPERIMENTS, MAX_TOOL_RESULT_BYTES)
+                    break
+                page.append(experiment)
             next_offset = offset + len(page)
             result = {
                 "experiments": page,
@@ -608,6 +685,7 @@ class PhaseSweepMCP:
         try:
             reg = self._registry.get(experiment_id)
             resolved["experiment_id"] = reg.id
+            self._current_config_bytes(reg)
             exp = reg.experiment
             search_space_keys = sum(len(p.search_space) for p in exp.phases)
             phases = [
@@ -624,6 +702,11 @@ class PhaseSweepMCP:
             result = {
                 "experiment_id": reg.id,
                 "metric": {"name": exp.metric.name, "goal": exp.metric.goal},
+                "capabilities": {
+                    "launch": reg.allow_launch,
+                    "cancel": reg.allow_cancel,
+                    "resume_from_phase": reg.allow_from_phase,
+                },
                 "phases": phases,
             }
         except Exception as exc:
@@ -655,13 +738,13 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] = {}
         state_after: dict[str, Any] = {}
         try:
-            target_id, status, run, resolved = self._read_status_target(
+            target_id, status, run, result_source, resolved = self._read_status_target(
                 experiment_id=experiment_id,
                 run_id=run_id,
             )
             if run is not None:
                 state_after = {"run_state": run["state"]}
-            result = self._status_result(target_id, status, run)
+            result = self._status_result(target_id, status, run, result_source)
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise
@@ -703,7 +786,7 @@ class PhaseSweepMCP:
             deadline = time.monotonic() + timeout
             baseline: tuple[Any, ...] | None = None
             while True:
-                target_id, status, run, resolved = self._read_status_target(
+                target_id, status, run, result_source, resolved = self._read_status_target(
                     experiment_id=None,
                     run_id=run_id,
                 )
@@ -727,7 +810,7 @@ class PhaseSweepMCP:
                     )
                     continue
                 break
-            result = self._status_result(target_id, status, run)
+            result = self._status_result(target_id, status, run, result_source)
             result["changed"] = snapshot != baseline
             result["reason"] = reason
         except Exception as exc:
@@ -747,13 +830,19 @@ class PhaseSweepMCP:
         *,
         experiment_id: str | None,
         run_id: str | None,
-    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    ) -> tuple[
+        str,
+        dict[str, Any],
+        dict[str, Any] | None,
+        ResultSource,
+        dict[str, Any],
+    ]:
         """Resolve a status target and read its current or frozen status payload.
 
         :param str | None experiment_id: Catalog id for a current experiment read.
         :param str | None run_id: Persisted run id for a run-specific read.
-        :return tuple[str, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
-            Target id, status data, optional run state, and audit-safe resolved ids.
+        :return tuple: Target id, status data, optional run state, result
+            provenance, and audit-safe resolved ids.
         """
         target_id, experiment, run, resolved = self._resolve_read_target(
             experiment_id=experiment_id,
@@ -762,19 +851,24 @@ class PhaseSweepMCP:
         )
         snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
         status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
-        return target_id, status, run, resolved
+        result_source: ResultSource = (
+            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
+        )
+        return target_id, status, run, result_source, resolved
 
     def _status_result(
         self,
         target_id: str,
         status: dict[str, Any],
         run: dict[str, Any] | None,
+        result_source: ResultSource,
     ) -> dict[str, Any]:
         """Build the common path-free response for status and await_run.
 
         :param str target_id: Experiment id represented by ``status``.
         :param dict[str, Any] status: Current or frozen engine status payload.
         :param dict[str, Any] | None run: Optional derived detached-run state.
+        :param ResultSource result_source: Current shared state or frozen run snapshot.
         :return dict[str, Any]: Agent-safe status response with timing guidance.
         """
         elapsed_seconds = None
@@ -786,6 +880,7 @@ class PhaseSweepMCP:
             target_id,
             status,
             run,
+            result_source=result_source,
             elapsed_seconds=elapsed_seconds,
             poll_after_seconds=_poll_after_seconds(status.get("median_trial_seconds")),
         )
@@ -906,7 +1001,18 @@ class PhaseSweepMCP:
             winner_views = (
                 snapshot.winner_views() if snapshot is not None else read_winners(experiment)
             )
-            result = winners_payload(target_id, winner_views, visible_params=visible_params)
+            result_source: ResultSource = (
+                "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
+            )
+            result = winners_payload(
+                target_id,
+                winner_views,
+                metric={"name": experiment.metric.name, "goal": experiment.metric.goal},
+                declared_phases=[phase.name for phase in experiment.phases],
+                result_source=result_source,
+                run_id=run_id,
+                visible_params=visible_params,
+            )
         except Exception as exc:
             self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
             raise
@@ -919,10 +1025,13 @@ class PhaseSweepMCP:
         return result
 
     def _terminal_result_snapshot(self, run_id: str) -> RunResultSnapshot | None:
-        """Return a run's frozen terminal result view when the runner recorded one.
+        """Return a live run's current view or require its frozen terminal snapshot.
 
         :param str run_id: Persisted run id whose terminal status should be inspected.
-        :return RunResultSnapshot | None: Validated result snapshot, or None for live/legacy runs.
+        :return RunResultSnapshot | None: Validated snapshot, or ``None`` while
+            the runner has not recorded terminal status yet.
+        :raises RunResultSnapshotUnavailableError: Terminal status exists but
+            its immutable result snapshot is absent or invalid.
         """
         handle = self._runs.get(run_id)
         if handle is None:
@@ -930,7 +1039,10 @@ class PhaseSweepMCP:
         terminal_status = self._runs.recorded_terminal_status(handle)
         if terminal_status is None:
             return None
-        return parse_result_snapshot(terminal_status)
+        snapshot = parse_result_snapshot(terminal_status)
+        if snapshot is None:
+            raise RunResultSnapshotUnavailableError(run_id)
+        return snapshot
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> dict[str, Any]:
         """Start the sweep as a detached background run; return its run_id.
@@ -1165,13 +1277,7 @@ class PhaseSweepMCP:
         :param str run_id: Run id whose snapshot path should be used.
         :return Path: Written config snapshot path consumed by the detached runner.
         """
-        try:
-            data = reg.config_path.read_bytes()
-        except OSError as exc:
-            log.info("cannot read cataloged config for experiment=%s: %s", reg.id, exc)
-            raise ConfigChangedError(reg.id) from None
-        if hashlib.sha256(data).hexdigest() != reg.config_sha256:
-            raise ConfigChangedError(reg.id)
+        data = self._current_config_bytes(reg)
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
             private_atomic_write_bytes(snapshot_path, data)
@@ -1179,6 +1285,23 @@ class PhaseSweepMCP:
             log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
             raise RuntimeError("failed to create run config snapshot") from None
         return snapshot_path
+
+    @staticmethod
+    def _current_config_bytes(reg: RegisteredExperiment) -> bytes:
+        """Read a cataloged config only when it still matches startup validation.
+
+        :param RegisteredExperiment reg: Frozen catalog entry to verify.
+        :return bytes: Current config bytes when their SHA-256 matches startup.
+        :raises ConfigChangedError: If the file is unreadable or changed.
+        """
+        try:
+            data = reg.config_path.read_bytes()
+        except OSError as exc:
+            log.info("cannot read cataloged config for experiment=%s: %s", reg.id, exc)
+            raise ConfigChangedError(reg.id) from None
+        if hashlib.sha256(data).hexdigest() != reg.config_sha256:
+            raise ConfigChangedError(reg.id)
+        return data
 
     def _pending_handle(self, reg: RegisteredExperiment, run_id: str) -> RunHandle:
         """Build the pre-spawn handle persisted before ``Popen``.
@@ -1316,12 +1439,15 @@ def _safe_tool(fn: F) -> F:
             :return Any: Awaited tool result.
             """
             try:
-                return await fn(*args, **kwargs)
+                return _bounded_tool_result(fn.__name__, await fn(*args, **kwargs))
             except McpToolError as exc:
                 raise ValueError(exc.safe_message) from None
             except Exception:
                 log.exception("unhandled error in tool %s", fn.__name__)
-                raise ValueError("internal error") from None
+                raise ValueError(
+                    f"internal server error in {fn.__name__}; report it to the operator "
+                    "and do not retry immediately"
+                ) from None
 
         return async_wrapper  # type: ignore[return-value]
 
@@ -1334,12 +1460,15 @@ def _safe_tool(fn: F) -> F:
         :return Any: Wrapped tool result.
         """
         try:
-            return fn(*args, **kwargs)
+            return _bounded_tool_result(fn.__name__, fn(*args, **kwargs))
         except McpToolError as exc:
             raise ValueError(exc.safe_message) from None
         except Exception:
             log.exception("unhandled error in tool %s", fn.__name__)
-            raise ValueError("internal error") from None
+            raise ValueError(
+                f"internal server error in {fn.__name__}; report it to the operator "
+                "and do not retry immediately"
+            ) from None
 
     return sync_wrapper  # type: ignore[return-value]
 

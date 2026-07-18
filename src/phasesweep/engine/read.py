@@ -49,12 +49,16 @@ def _phase_status_payloads(
     *,
     include_winner_path: bool,
     trial_counts: Mapping[str, dict[str, int]] | None = None,
+    trial_data_available: Mapping[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
 
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
     :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
     :param Mapping[str, dict[str, int]] | None trial_counts: Optional pre-read counts keyed by phase name.
+    :param Mapping[str, bool] | None trial_data_available: Optional storage-read
+        availability keyed by phase name. Included only in the path-free status
+        view consumed by MCP.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
@@ -76,7 +80,17 @@ def _phase_status_payloads(
                 {"name": phase.name, "winner": str(winner_path) if winner_path.is_file() else None}
             )
         else:
-            payload.update({"phase": phase.name, "winner_present": winner_path.is_file()})
+            payload.update(
+                {
+                    "phase": phase.name,
+                    "winner_present": winner_path.is_file(),
+                    "trial_data_available": (
+                        trial_data_available[phase.name]
+                        if trial_data_available is not None
+                        else True
+                    ),
+                }
+            )
         phases.append(payload)
     return phases
 
@@ -161,10 +175,12 @@ def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
 def read_status(experiment: Experiment) -> dict[str, Any]:
     """Per-phase trial counts and winner presence, with no paths in the output.
 
-    Trial counts come from ``_phase_trial_counts``, which returns ``{}`` for a
+    Trial counts come from ``_phase_trial_stats``, which returns ``{}`` for a
     study that does not exist yet, never creates one as a side effect, and
     swallows transient backend errors (e.g. a momentary SQLite lock while the
     runner writes) by returning ``{}`` for that phase rather than raising.
+    ``trial_data_available`` distinguishes a successful empty read from missing
+    or unreadable storage so callers never treat ambiguous zeros as evidence.
     ``median_trial_seconds`` follows the same permissive contract: it is the
     median wall duration of COMPLETE trials across all phases, or ``None``
     while nothing has finished — callers use it to size their poll interval.
@@ -188,6 +204,7 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
             experiment,
             include_winner_path=False,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
+            trial_data_available={name: stats.available for name, stats in phase_stats.items()},
         ),
         "summary_present": _summary_path(experiment).is_file(),
         "median_trial_seconds": statistics.median(durations) if durations else None,

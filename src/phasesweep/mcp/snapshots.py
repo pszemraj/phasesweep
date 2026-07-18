@@ -35,6 +35,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     n_trials: NonNegativeInt
     completed: NonNegativeInt
     winner_present: bool
+    trial_data_available: bool
 
 
 class StatusSnapshot(_SnapshotModel):

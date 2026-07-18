@@ -45,7 +45,10 @@ class UnknownExperimentError(McpToolError):
 
         :param str experiment_id: Agent-supplied catalog id that was not registered.
         """
-        super().__init__(f"unknown experiment id {experiment_id!r}")
+        super().__init__(
+            f"unknown experiment id {experiment_id!r}; call "
+            "phasesweep_list_experiments and use an id from its response"
+        )
 
 
 class UnknownRunError(McpToolError):
@@ -56,7 +59,10 @@ class UnknownRunError(McpToolError):
 
         :param str run_id: Agent-supplied run id that did not match a persisted handle.
         """
-        super().__init__(f"unknown run id {run_id!r}")
+        super().__init__(
+            f"unknown run id {run_id!r}; use the exact run_id returned by "
+            "phasesweep_launch_sweep. If it was lost, report that to the user."
+        )
 
 
 class InvalidPhaseError(McpToolError):
@@ -68,7 +74,10 @@ class InvalidPhaseError(McpToolError):
         :param str experiment_id: Catalog id whose phase list was checked.
         :param str phase: Agent-supplied phase name that was not declared.
         """
-        super().__init__(f"phase {phase!r} is not a phase of experiment {experiment_id!r}")
+        super().__init__(
+            f"phase {phase!r} is not a phase of experiment {experiment_id!r}; call "
+            "phasesweep_validate_config and use a phase name from its response"
+        )
 
 
 class PermissionDeniedError(McpToolError):
@@ -112,7 +121,41 @@ class RunSnapshotUnavailableError(McpToolError):
         """
         super().__init__(
             f"saved config snapshot for run {run_id!r} is unavailable or invalid; "
-            "the run cannot be monitored safely"
+            "the run cannot be monitored safely. Report this to the operator; do not "
+            "substitute experiment-level results."
+        )
+
+
+class RunResultSnapshotUnavailableError(McpToolError):
+    """Raised when a terminal run lacks its immutable result snapshot."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create a terminal-result-snapshot tool error.
+
+        :param str run_id: MCP run id whose terminal result snapshot is unusable.
+        """
+        super().__init__(
+            f"terminal result snapshot for run {run_id!r} is unavailable or invalid; "
+            "retry once after a short delay in case finalization is still in progress. "
+            "If the error persists, report it to the operator; do not substitute "
+            "experiment-level results."
+        )
+
+
+class ToolResultTooLargeError(McpToolError):
+    """Raised before an oversized result can reach the MCP client."""
+
+    def __init__(self, tool_name: str, limit_bytes: int) -> None:
+        """Create an actionable bounded-result error.
+
+        :param str tool_name: MCP tool whose result exceeded the byte budget.
+        :param int limit_bytes: Configured serialized result budget.
+        """
+        super().__init__(
+            f"{tool_name} result exceeds the {limit_bytes}-byte response limit. "
+            "For catalog listings, request a smaller limit and continue with next_cursor. "
+            "For other tools, ask the operator to shorten catalog descriptions or reduce "
+            "agent-visible winner parameter values."
         )
 
 
@@ -180,5 +223,6 @@ class ResumeNotReadyError(McpToolError):
         """
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} {reason}"
+            f"earlier phase {missing_phase!r} {reason}. Call phasesweep_get_winners "
+            "for the experiment and resume only after every earlier phase has a winner."
         )

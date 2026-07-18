@@ -84,6 +84,11 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     assert summary["id"] == "reg_ok"
     assert summary["phases"] == ["warmup", "tune"]
     assert summary["metric"] == {"name": "loss", "goal": "minimize"}
+    assert summary["capabilities"] == {
+        "launch": False,
+        "cancel": False,
+        "resume_from_phase": False,
+    }
 
     # The summary must carry no path, command, or storage URL.
     blob = str(summaries)

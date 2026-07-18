@@ -14,6 +14,22 @@ from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
 
+def _winners_payload(
+    experiment_id: str,
+    views: list[PhaseWinnerView],
+    *,
+    visible_params: object = "none",
+) -> dict[str, object]:
+    return winners_payload(
+        experiment_id,
+        views,
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p"],
+        result_source="current_shared_study",
+        visible_params=visible_params,  # type: ignore[arg-type]
+    )
+
+
 def _write_catalog(tmp_path: Path) -> Path:
     # A config whose dangerous fields contain unmistakable sentinels.
     config = tmp_path / "exp.yaml"
@@ -51,7 +67,7 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         "SECRET_ENV_VALUE",
     ]
 
-    winners = winners_payload(
+    winners = _winners_payload(
         reg.id,
         [
             PhaseWinnerView(
@@ -69,6 +85,7 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         reg.id,
         {"metric": {"name": "loss", "goal": "minimize"}, "phases": [], "summary_present": False},
         None,
+        result_source="current_shared_study",
         elapsed_seconds=None,
         poll_after_seconds=30,
     )
@@ -92,10 +109,10 @@ def test_params_redacted_flag_follows_policy() -> None:
     """The boolean is computed from the policy, so agents need not string-match."""
 
     def flag(params: dict[str, object], policy: object) -> bool:
-        payload = winners_payload(
+        payload = _winners_payload(
             "x",
             [PhaseWinnerView("p", 0, 0.1, dict(params), dict(params), None, False)],
-            visible_params=policy,  # type: ignore[arg-type]
+            visible_params=policy,
         )
         return payload["phases"][0]["params_redacted"]
 
@@ -121,15 +138,33 @@ def test_winners_payload_applies_visible_params_policy() -> None:
         )
     ]
 
-    assert winners_payload("redact_me", views)["phases"][0]["params"] == {
+    assert _winners_payload("redact_me", views)["phases"][0]["params"] == {
         "dataset": "<redacted>",
         "lr": "<redacted>",
     }
-    assert winners_payload("redact_me", views, visible_params=["lr"])["phases"][0]["params"] == {
+    assert _winners_payload("redact_me", views, visible_params=["lr"])["phases"][0]["params"] == {
         "dataset": "<redacted>",
         "lr": 3e-4,
     }
-    assert winners_payload("redact_me", views, visible_params="all")["phases"][0]["params"] == {
+    assert _winners_payload("redact_me", views, visible_params="all")["phases"][0]["params"] == {
         "dataset": "SECRET_DATASET",
         "lr": 3e-4,
     }
+
+
+def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
+    payload = winners_payload(
+        "exp",
+        [PhaseWinnerView("p1", 2, 0.1, {}, {}, None, False)],
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p1", "p2"],
+        result_source="frozen_run_snapshot",
+        run_id="exp-run",
+    )
+
+    assert payload["run_id"] == "exp-run"
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["declared_phase_count"] == 2
+    assert payload["winner_count"] == 1
+    assert payload["missing_phases"] == ["p2"]
+    assert payload["all_phases_have_winners"] is False

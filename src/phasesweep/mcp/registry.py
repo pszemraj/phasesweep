@@ -85,7 +85,7 @@ class _Entry(_CatalogModel):
         default=None,
         description="Directory used as the detached runner working directory.",
     )
-    description: str = ""
+    description: str = Field(default="", max_length=500)
     allow: _Allow = Field(default_factory=_Allow)
     visible_params: VisibleParamsPolicy = Field(
         default="none",
@@ -495,6 +495,11 @@ class Registry:
                 "metric": {
                     "name": item.experiment.metric.name,
                     "goal": item.experiment.metric.goal,
+                },
+                "capabilities": {
+                    "launch": item.allow_launch,
+                    "cancel": item.allow_cancel,
+                    "resume_from_phase": item.allow_from_phase,
                 },
             }
             for item in self._items.values()

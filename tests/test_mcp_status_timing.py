@@ -28,6 +28,7 @@ from phasesweep.mcp.server import (
     _poll_after_seconds,
     _run_elapsed_seconds,
 )
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from tests.mcp_helpers import (
     make_mcp_app,
@@ -174,6 +175,17 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
     (phase,) = status["phases"]
     assert phase["n_trials"] == 1
     assert phase["completed"] == 0
+    assert phase["trials"] == {
+        "WAITING": 0,
+        "RUNNING": 0,
+        "COMPLETE": 0,
+        "PRUNED": 0,
+        "FAIL": 0,
+    }
+    assert phase["terminal_trials"] == 0
+    assert phase["remaining_trials"] == 1
+    assert phase["trial_data_available"] is False
+    assert status["result_source"] == "current_shared_study"
 
     # Completed trials feed both the per-phase count and the poll suggestion.
     experiment = _registry.get("srv").experiment
@@ -181,6 +193,9 @@ def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:
     status = app.status(experiment_id="srv")
     (phase,) = status["phases"]
     assert phase["completed"] == 3
+    assert phase["terminal_trials"] == 3
+    assert phase["remaining_trials"] == 0
+    assert phase["trial_data_available"] is True
     assert POLL_MIN_SECONDS <= status["poll_after_seconds"] <= POLL_MAX_SECONDS
 
 
@@ -216,6 +231,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
                         "n_trials": 3,
                         "completed": 2,
                         "winner_present": True,
+                        "trial_data_available": True,
                     }
                 ],
                 "summary_present": False,
@@ -235,7 +251,16 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     )
 
     run_status = app.status(run_id="r1")
-    assert run_status["phases"][0]["trials"] == {"COMPLETE": 2, "FAIL": 1}
+    assert run_status["phases"][0]["trials"] == {
+        "WAITING": 0,
+        "RUNNING": 0,
+        "COMPLETE": 2,
+        "PRUNED": 0,
+        "FAIL": 1,
+    }
+    assert run_status["phases"][0]["terminal_trials"] == 3
+    assert run_status["phases"][0]["remaining_trials"] == 0
+    assert run_status["result_source"] == "frozen_run_snapshot"
     assert run_status["poll_after_seconds"] == 17
     assert app.winners(run_id="r1")["phases"][0]["metric"] == 0.25
 
@@ -276,8 +301,18 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch, app: PhaseSweepMCP) -> dict[str
 def test_await_run_returns_immediately_on_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, _registry, store = _app_with_run(tmp_path)
-    write_run_status(store, "r1", returncode=0, error_class=None, cleanup_confirmed=True)
+    app, registry, store = _app_with_run(tmp_path)
+    write_run_status(
+        store,
+        "r1",
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot=capture_result_snapshot(
+            registry.get("srv").experiment,
+            cleanup_confirmed=True,
+        ),
+    )
     clock = _fake_clock(monkeypatch, app)
 
     result = asyncio.run(app.await_run("r1"))
@@ -349,7 +384,7 @@ def test_await_run_returns_when_phase_gains_winner(
 def test_await_run_returns_when_run_fails_mid_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, _registry, store = _app_with_run(tmp_path)
+    app, registry, store = _app_with_run(tmp_path)
     clock = {"now": 0.0}
 
     async def sleep_then_fail(seconds: float) -> None:
@@ -360,6 +395,10 @@ def test_await_run_returns_when_run_fails_mid_wait(
             returncode=1,
             error_class="RuntimeError",
             cleanup_confirmed=True,
+            result_snapshot=capture_result_snapshot(
+                registry.get("srv").experiment,
+                cleanup_confirmed=True,
+            ),
         )
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
@@ -371,6 +410,16 @@ def test_await_run_returns_when_run_fails_mid_wait(
     assert result["changed"] is True
     assert result["run"]["state"] == "failed"
     assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
+
+
+def test_terminal_run_read_refuses_mutable_fallback_without_snapshot(tmp_path: Path) -> None:
+    app, _registry, store = _app_with_run(tmp_path)
+    write_run_status(store, "r1", returncode=0, error_class=None, cleanup_confirmed=True)
+
+    with pytest.raises(Exception, match="do not substitute experiment-level results"):
+        app.status(run_id="r1")
+    with pytest.raises(Exception, match="do not substitute experiment-level results"):
+        app.winners(run_id="r1")
 
 
 def test_await_run_unknown_run_id(tmp_path: Path) -> None:

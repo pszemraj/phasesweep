@@ -101,6 +101,7 @@ def test_read_status_does_not_create_missing_sqlite_storage(tmp_path: Path) -> N
 
     assert not db.exists()
     assert status["phases"][0]["trials"] == {}
+    assert status["phases"][0]["trial_data_available"] is False
 
 
 def test_read_status_does_not_create_missing_journal_storage(tmp_path: Path) -> None:
@@ -111,6 +112,7 @@ def test_read_status_does_not_create_missing_journal_storage(tmp_path: Path) -> 
 
     assert not journal.exists()
     assert status["phases"][0]["trials"] == {}
+    assert status["phases"][0]["trial_data_available"] is False
 
 
 def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None:
@@ -121,6 +123,7 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {}
+    assert status["phases"][0]["trial_data_available"] is False
 
 
 def test_read_status_counts_existing_sqlite_trials_without_optuna_loader(
@@ -136,6 +139,7 @@ def test_read_status_counts_existing_sqlite_trials_without_optuna_loader(
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+    assert status["phases"][0]["trial_data_available"] is True
 
 
 def test_read_status_uses_one_sqlite_snapshot_per_phase(

@@ -2,17 +2,17 @@ You have access to a phasesweep MCP server. It runs phase-chained hyperparameter
 
 ## Workflow
 
-1. Call `phasesweep_list_experiments` to see what exists: ids, descriptions, phase names, and the metric with its goal. If `next_cursor` is non-null, call again with that cursor to page.
-2. Call `phasesweep_validate_config` with the `experiment_id` you plan to run. It confirms the config loads and returns each phase's name, trial count, sampler, inherited phases, and search-space keys. Do this before every launch.
+1. Call `phasesweep_list_experiments` to see what exists: ids, descriptions, phase names, the metric with its goal, and the catalog-authorized capabilities. If `next_cursor` is non-null, call again with that cursor to page.
+2. Call `phasesweep_validate_config` with the `experiment_id` you plan to run. It verifies that the cataloged config has not changed since server startup and returns capabilities plus each phase's name, trial count, sampler, inherited phases, and search-space keys. Do this before every launch.
 3. Call `phasesweep_launch_sweep` with that `experiment_id`. It returns `{run_id, experiment_id, state}`; the sweep runs as a detached background process that survives your tool call and even a server restart. Save the `run_id` - it is your handle for everything after this point. Pass `from_phase` only when the user explicitly asks to resume from a phase, or when earlier phase winners are already confirmed complete.
-4. Monitor with `phasesweep_await_run` using the `run_id` - not the experiment id, so catalog edits after launch cannot redirect your monitoring. It blocks until the run reaches a terminal state (`succeeded`, `failed`, or `cancelled`), a phase gains a winner, or its timeout elapses; call it again until the state is terminal, reporting per-phase completed counts as they move. If your client cannot wait on long tool calls, poll `phasesweep_get_status` instead and wait `poll_after_seconds` between calls.
-5. On a terminal state, call `phasesweep_get_winners` with the same `run_id` and summarize each phase: winning trial number, metric value, sampled params, gate status, and whether every phase completed. The server uses a frozen terminal result snapshot when one was recorded; hard-killed runs without a valid snapshot can fall back to the current shared-study view.
+4. Monitor with `phasesweep_await_run` using the `run_id` - not the experiment id, so catalog edits after launch cannot redirect your monitoring. It blocks until the run reaches a terminal state (`succeeded`, `failed`, or `cancelled`), a phase gains a winner, or its timeout elapses; call it again until the state is terminal, reporting the already-computed per-phase terminal and remaining counts as they move. If `trial_data_available` is false, say the counts are temporarily unavailable rather than treating zeros as evidence. If your client cannot wait on long tool calls, poll `phasesweep_get_status` instead and wait `poll_after_seconds` between calls.
+5. On a terminal state, call `phasesweep_get_winners` with the same `run_id` and summarize each phase: winning trial number, metric value, sampled params, gate status, `missing_phases`, and `all_phases_have_winners`. A terminal run requires a frozen result snapshot; if it is unavailable, report the safe tool error instead of substituting experiment-level results.
 
 When the user asks for a recommended next experiment, base it only on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted.
 
 ## Failed and interrupted runs
 
-- A `failed` or `cancelled` state is terminal. Report the per-phase `COMPLETE`, `FAIL`, `PRUNED`, and `RUNNING` counts from status plus any winners returned for completed phases. Do not relaunch automatically.
+- A `failed` or `cancelled` state is terminal. Report the dense per-phase state counts, `terminal_trials`, `remaining_trials`, and any winners returned for completed phases. Do not relaunch automatically.
 - The MCP tools do not expose trainer logs or a root-cause traceback. If the status and safe tool error do not explain the failure, tell the user that an operator must inspect the run artifacts.
 - Keep the `run_id` in your working context. There is no run-listing tool in this version; if you lose the id, ask the user or operator for it instead of launching a replacement sweep.
 

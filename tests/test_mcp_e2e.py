@@ -88,7 +88,13 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
     summaries = app.list_experiments()["experiments"]
     assert summaries[0]["id"] == "e2e_lm"
     assert summaries[0]["phases"] == ["depth", "lr"]
+    assert summaries[0]["capabilities"] == {
+        "launch": True,
+        "cancel": True,
+        "resume_from_phase": True,
+    }
     structure = app.validate("e2e_lm")
+    assert structure["capabilities"] == summaries[0]["capabilities"]
     assert [p["name"] for p in structure["phases"]] == ["depth", "lr"]
     assert structure["phases"][0]["sampler"] == "grid"
     assert structure["phases"][1]["search_space"] == ["lr"]  # keys only
@@ -104,6 +110,9 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
         winners = app.winners(run_id=run_id)
+        assert winners["result_source"] == "frozen_run_snapshot"
+        assert winners["all_phases_have_winners"] is True
+        assert winners["missing_phases"] == []
         phases = winners["phases"]
         assert [p["phase"] for p in phases] == ["depth", "lr"]
         for p in phases:

@@ -32,6 +32,7 @@ class _PhaseTrialStats:
 
     counts: dict[str, int]
     completed_durations: list[float]
+    available: bool
 
 
 def _build_sampler(
@@ -264,13 +265,13 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
-    :return _PhaseTrialStats: Counts and wall durations, both empty when the
-        backing DB cannot be read safely.
+    :return _PhaseTrialStats: Counts, wall durations, and an availability flag;
+        data fields are empty and availability false when the DB cannot be read safely.
     """
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
     if uri is None:
-        return _PhaseTrialStats({}, [])
+        return _PhaseTrialStats({}, [], False)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
@@ -286,7 +287,7 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
         finally:
             conn.close()
     except sqlite3.Error:
-        return _PhaseTrialStats({}, [])
+        return _PhaseTrialStats({}, [], False)
     counts: dict[str, int] = {}
     durations: list[float] = []
     for state, start_raw, complete_raw in rows:
@@ -297,7 +298,7 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
         duration = _parsed_trial_duration(start_raw, complete_raw)
         if duration is not None:
             durations.append(duration)
-    return _PhaseTrialStats(counts, durations)
+    return _PhaseTrialStats(counts, durations, True)
 
 
 def _parsed_trial_duration(start_raw: object, complete_raw: object) -> float | None:
@@ -323,20 +324,20 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
-    :return _PhaseTrialStats: One permissive storage snapshot.
+    :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.storage is None:
-        return _PhaseTrialStats({}, [])
+        return _PhaseTrialStats({}, [], False)
     backend = storage_backend(experiment.storage)
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase)
     if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return _PhaseTrialStats({}, [])
+        return _PhaseTrialStats({}, [], False)
     try:
         study = _load_phase_study(experiment, phase)
         trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, [])
+        return _PhaseTrialStats({}, [], False)
     counts: dict[str, int] = {}
     durations: list[float] = []
     for trial in trials:
@@ -347,7 +348,7 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
             and trial.duration.total_seconds() >= 0
         ):
             durations.append(trial.duration.total_seconds())
-    return _PhaseTrialStats(counts, durations)
+    return _PhaseTrialStats(counts, durations, True)
 
 
 def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
