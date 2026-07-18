@@ -222,8 +222,17 @@ def status(config_path: Path) -> None:
     click.echo(_format_status(config_status(config)))
 
 
-@main.command(
-    name="mcp-recover-run",
+@main.group(
+    context_settings=CONTEXT_SETTINGS,
+    help="Manage the optional MCP broker and coding-agent integrations.",
+    short_help="Manage the MCP broker and agent integrations.",
+)
+def mcp() -> None:
+    """Run MCP operator commands."""
+
+
+@mcp.command(
+    name="recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Operator-only recovery for MCP cleanup uncertainty or failed terminal-result "
@@ -471,7 +480,8 @@ def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
     return is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
 
 
-@main.command(
+@mcp.command(
+    name="serve",
     context_settings=CONTEXT_SETTINGS,
     help="Serve the optional MCP broker over stdio using an operator-authored catalog.",
     short_help="Serve the MCP broker.",
@@ -484,7 +494,7 @@ def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
     help="MCP catalog that maps agent-visible experiment ids to config files.",
 )
 @click.pass_context
-def mcp(ctx: click.Context, catalog: Path) -> None:
+def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     """Serve the MCP broker over stdio.
 
     The MCP SDK import stays behind this command so the base CLI still works
@@ -498,8 +508,8 @@ def mcp(ctx: click.Context, catalog: Path) -> None:
     ctx.exit(serve(catalog))
 
 
-@main.command(
-    name="mcp-check",
+@mcp.command(
+    name="check",
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Validate an MCP catalog with the exact rules the server applies at startup and "
@@ -531,7 +541,7 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     try:
         report = check_catalog(catalog)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp-check: {exc}", err=True)
+        click.echo(f"phasesweep mcp check: {exc}", err=True)
         ctx.exit(2)
     _echo_catalog_report(report)
     if not report.ok:
@@ -539,7 +549,7 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     try:
         prepare_catalog_state(catalog)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp-check: {exc}", err=True)
+        click.echo(f"phasesweep mcp check: {exc}", err=True)
         ctx.exit(2)
 
 
@@ -562,7 +572,7 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
             click.echo(f"{'':<{width}}        fix: {entry.suggestion}")
 
 
-@main.command(
+@mcp.command(
     name="init-catalog",
     context_settings=CONTEXT_SETTINGS,
     help=(
@@ -570,7 +580,7 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
         "state_dir next to the catalog, one read-only entry per --from config "
         "(visible_params: none, no allow block). The result is validated with the "
         "exact server startup rules first, which may provision state directories. "
-        "On failure the mcp-check report is printed and the catalog destination "
+        "On failure the mcp check report is printed and the catalog destination "
         "is not written."
     ),
     short_help="Scaffold an MCP catalog.",
@@ -607,7 +617,7 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     """
     if output.exists():
         click.echo(
-            f"phasesweep init-catalog: {output} already exists; refusing to overwrite. "
+            f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
             "Pass -o to choose another name.",
             err=True,
         )
@@ -636,7 +646,7 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
     try:
         text = scaffold_catalog_text(output, from_configs)
     except CatalogError as exc:
-        click.echo(f"phasesweep init-catalog: {exc}", err=True)
+        click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
         if exc.suggestion:
             click.echo(f"fix: {exc.suggestion}", err=True)
         return False
@@ -656,12 +666,12 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
         try:
             report = check_catalog(staged)
         except CatalogError as exc:
-            click.echo(f"phasesweep init-catalog: {exc}", err=True)
+            click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
             return False
         _echo_catalog_report(report)
         if not report.ok:
             click.echo(
-                "phasesweep init-catalog: fix the configs above and re-run; "
+                "phasesweep mcp init-catalog: fix the configs above and re-run; "
                 "the catalog destination was not written.",
                 err=True,
             )
@@ -669,13 +679,13 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
         try:
             prepare_catalog_state(staged)
         except CatalogError as exc:
-            click.echo(f"phasesweep init-catalog: {exc}", err=True)
+            click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
             return False
         try:
             os.link(staged, output)
         except FileExistsError:
             click.echo(
-                f"phasesweep init-catalog: {output} already exists; refusing to overwrite. "
+                f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
                 "Pass -o to choose another name.",
                 err=True,
             )
@@ -687,7 +697,7 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
         staged.unlink(missing_ok=True)
 
 
-@main.command(
+@mcp.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Wire the phasesweep MCP server into coding-agent configs: an MCP server entry plus a "
@@ -768,7 +778,7 @@ def install(
     if integration != "instructions":
         if importlib.util.find_spec("mcp") is None:
             click.echo(
-                "phasesweep install: MCP support is not installed; install with "
+                "phasesweep mcp install: MCP support is not installed; install with "
                 "`pip install 'phasesweep[mcp]'`; no client config was touched.",
                 err=True,
             )
@@ -777,8 +787,8 @@ def install(
         if not catalog_path.exists():
             if dry_run:
                 click.echo(
-                    f"phasesweep install: no catalog at {catalog_path}. Scaffold one first:\n"
-                    f"  phasesweep init-catalog --from <experiment.yaml> -o {catalog_path}; "
+                    f"phasesweep mcp install: no catalog at {catalog_path}. Scaffold one first:\n"
+                    f"  phasesweep mcp init-catalog --from <experiment.yaml> -o {catalog_path}; "
                     "nothing was changed.",
                     err=True,
                 )
@@ -788,12 +798,12 @@ def install(
         try:
             report = check_catalog(catalog_path)
         except CatalogError as exc:
-            click.echo(f"phasesweep install: {exc}", err=True)
+            click.echo(f"phasesweep mcp install: {exc}", err=True)
             ctx.exit(2)
         if not report.ok:
             _echo_catalog_report(report)
             click.echo(
-                "phasesweep install: fix the catalog (see report above); "
+                "phasesweep mcp install: fix the catalog (see report above); "
                 "no client config was touched.",
                 err=True,
             )
@@ -825,19 +835,19 @@ def _prepare_catalog_for_install(catalog_path: Path) -> bool:
     try:
         report = check_catalog(catalog_path)
     except CatalogError as exc:
-        click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+        click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
         return False
     if not report.ok:
         _echo_catalog_report(report)
         click.echo(
-            "phasesweep install: catalog changed after planning; no client config was touched.",
+            "phasesweep mcp install: catalog changed after planning; no client config was touched.",
             err=True,
         )
         return False
     try:
         prepare_catalog_state(catalog_path)
     except CatalogError as exc:
-        click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+        click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
         return False
     return True
 
@@ -852,10 +862,11 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
     :param bool yes: Whether the run is unattended.
     :return bool: True when a validated catalog now exists at ``catalog_path``.
     """
-    suggestion = f"phasesweep init-catalog --from <experiment.yaml> -o {catalog_path}"
+    suggestion = f"phasesweep mcp init-catalog --from <experiment.yaml> -o {catalog_path}"
     if yes:
         click.echo(
-            f"phasesweep install: no catalog at {catalog_path}. Scaffold one first:\n  {suggestion}",
+            f"phasesweep mcp install: no catalog at {catalog_path}. Scaffold one first:\n"
+            f"  {suggestion}",
             err=True,
         )
         return False
@@ -870,12 +881,12 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
         return False
     config = Path(raw)
     if not config.is_file():
-        click.echo(f"phasesweep install: no such config file: {config}", err=True)
+        click.echo(f"phasesweep mcp install: no such config file: {config}", err=True)
         return False
     return _scaffold_validated_catalog(catalog_path, (config,))
 
 
-@main.command(
+@mcp.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "

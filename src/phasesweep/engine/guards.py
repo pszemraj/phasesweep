@@ -476,7 +476,7 @@ def _inspect_stale_running_trials(
 ) -> int:
     """Count stale RUNNING trials without signaling processes or writing state.
 
-    Used by ``mcp-recover-run`` preflight mode. The follow-up ``--confirm`` call
+    Used by ``mcp recover-run`` preflight mode. The follow-up ``--confirm`` call
     must still find the same RUNNING trials so it can reap them and persist
     recovery evidence atomically with clearing MCP cleanup uncertainty.
 

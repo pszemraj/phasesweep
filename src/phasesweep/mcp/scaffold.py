@@ -1,4 +1,4 @@
-"""Catalog scaffolding for ``phasesweep init-catalog``.
+"""Catalog scaffolding for ``phasesweep mcp init-catalog``.
 
 Builds an annotated, immediately-loadable MCP catalog from existing experiment
 configs: absolute ``state_dir`` next to the catalog, one read-only entry per
@@ -101,10 +101,10 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         )
     state_dir = catalog_dir / "runs" / ".mcp"
     header = f"""\
-# MCP catalog scaffolded by `phasesweep init-catalog`. After reviewing the
+# MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the
 # descriptions, paths, visibility, and permissions below, run:
-#   phasesweep mcp-check --catalog /absolute/path/to/catalog.yaml
-#   phasesweep install --catalog /absolute/path/to/catalog.yaml --dry-run
+#   phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
+#   phasesweep mcp install --catalog /absolute/path/to/catalog.yaml --dry-run
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which

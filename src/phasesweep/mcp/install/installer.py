@@ -1,4 +1,4 @@
-"""Plan-then-apply orchestration for ``phasesweep install`` / ``uninstall``.
+"""Plan-then-apply orchestration for ``phasesweep mcp install`` / ``uninstall``.
 
 Selects agent targets (unattended by id, or interactively among detected
 clients), prints exactly what will be written where, and applies the MCP
@@ -498,7 +498,7 @@ def run(
     if mode == "install" and yes and not dry_run and user_scoped_targets and not allow_user_scope:
         names = ", ".join(target.display_name for target in user_scoped_targets)
         click.echo(
-            "phasesweep install: --yes cannot authorize user-scoped MCP config writes "
+            "phasesweep mcp install: --yes cannot authorize user-scoped MCP config writes "
             f"for {names}. Review the plan, then re-run with --allow-user-scope; "
             "no client config was touched.",
             err=True,
@@ -513,7 +513,7 @@ def run(
         try:
             command = resolve_server_command()
         except FileNotFoundError as exc:
-            click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+            click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
             return 1
     if not dry_run and before_apply is not None and not before_apply():
         return 2

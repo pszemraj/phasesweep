@@ -530,7 +530,7 @@ class RunStore:
         """Return whether operator recovery evidence confirms cleanup for this run.
 
         :param RunHandle handle: Run handle whose recovery evidence file should be read.
-        :return bool: ``True`` when a valid ``mcp-recover-run`` evidence file matches
+        :return bool: ``True`` when a valid ``mcp recover-run`` evidence file matches
             this run and confirms cleanup.
         """
         path = self.cleanup_recovery_path(handle.run_id)

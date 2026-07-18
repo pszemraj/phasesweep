@@ -39,8 +39,8 @@ The config uses 1000 training batches per trial. With `validate_every: 100` and 
 The catalog pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
 
 ```bash
-phasesweep mcp-check --catalog examples/tiny_decoder_enwik8/catalog.yaml
-phasesweep mcp --catalog examples/tiny_decoder_enwik8/catalog.yaml
+phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
+phasesweep mcp serve --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.

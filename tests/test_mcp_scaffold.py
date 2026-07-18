@@ -1,5 +1,5 @@
 """Catalog scaffolding: derive_experiment_id, scaffold_catalog_text, and the
-init-catalog CLI command (validate-before-write, refusal paths)."""
+``mcp init-catalog`` CLI command (validate-before-write, refusal paths)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
     assert result.exit_code == 0, result.output
     assert "srv  ok    (read-only)" in result.output
@@ -69,7 +69,7 @@ def test_init_catalog_quotes_config_paths(tmp_path: Path, filename: str) -> None
     output = tmp_path / "catalog.yaml"
 
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
 
     assert result.exit_code == 0, result.output
@@ -83,7 +83,7 @@ def test_init_catalog_quotes_implicit_yaml_scalar_ids(tmp_path: Path, filename: 
     output = tmp_path / "catalog.yaml"
 
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
 
     assert result.exit_code == 0, result.output
@@ -99,7 +99,7 @@ def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> 
     output = catalog_dir / "catalog.yaml"
 
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
 
     assert result.exit_code == 0, result.output
@@ -115,7 +115,7 @@ def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
     )
     output = tmp_path / "catalog.yaml"
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
     assert result.exit_code == 2
     assert "FAIL" in result.output
@@ -130,7 +130,7 @@ def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
     output = tmp_path / "catalog.yaml"
     output.write_text("operator-authored\n")
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
@@ -151,7 +151,7 @@ def test_init_catalog_does_not_replace_destination_created_during_validation(
 
     monkeypatch.setattr(cli_module, "check_catalog", check_after_late_arrival)
     result = CliRunner().invoke(
-        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
 
     assert result.exit_code == 2
@@ -161,7 +161,7 @@ def test_init_catalog_does_not_replace_destination_created_during_validation(
 
 
 def test_init_catalog_requires_at_least_one_config(tmp_path: Path) -> None:
-    result = CliRunner().invoke(cli_main, ["init-catalog", "-o", str(tmp_path / "c.yaml")])
+    result = CliRunner().invoke(cli_main, ["mcp", "init-catalog", "-o", str(tmp_path / "c.yaml")])
     assert result.exit_code != 0
     assert "--from" in result.output
 
@@ -172,7 +172,7 @@ def test_init_catalog_multiple_configs(tmp_path: Path) -> None:
     output = tmp_path / "catalog.yaml"
     result = CliRunner().invoke(
         cli_main,
-        ["init-catalog", "--from", str(alpha), "--from", str(beta), "-o", str(output)],
+        ["mcp", "init-catalog", "--from", str(alpha), "--from", str(beta), "-o", str(output)],
     )
     assert result.exit_code == 0, result.output
     registry = Registry.load(output)

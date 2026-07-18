@@ -1,4 +1,4 @@
-"""Client-config installer for ``phasesweep install`` / ``phasesweep uninstall``.
+"""Client-config installer for ``phasesweep mcp install`` / ``phasesweep mcp uninstall``.
 
 Operator-facing tooling that wires the phasesweep MCP server into coding-agent
 configs (MCP server entries plus marker-fenced instructions blocks). Nothing

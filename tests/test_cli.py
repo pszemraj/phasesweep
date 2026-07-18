@@ -22,9 +22,10 @@ def test_help_output_is_operator_readable() -> None:
     assert result.exit_code == 0
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
     assert "-h, --help" in result.output
-    assert "mcp" in result.output and "Serve the MCP broker." in result.output
-    assert "mcp-recover-run" in result.output
-    assert "Recover MCP cleanup or result finalization." in result.output
+    assert (
+        "mcp" in result.output and "Manage the MCP broker and agent integrations." in result.output
+    )
+    assert "recover-run" not in result.output
     assert "run" in result.output and "Run configured phases." in result.output
     assert "show-winners" in result.output and "Print saved phase winners." in result.output
     assert "status" in result.output and "Print read-only run status." in result.output
@@ -40,7 +41,7 @@ def test_help_output_is_operator_readable() -> None:
         assert "CONFIG" in result.output
         assert "-h, --help" in result.output
 
-    recovery_help = runner.invoke(cli_main, ["mcp-recover-run", "--help"], terminal_width=120)
+    recovery_help = runner.invoke(cli_main, ["mcp", "recover-run", "--help"], terminal_width=120)
     assert recovery_help.exit_code == 0
     assert "Args:" not in recovery_help.output
     assert "--state-dir" in recovery_help.output
@@ -56,17 +57,23 @@ def test_help_output_is_operator_readable() -> None:
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
-    assert "Serve the optional MCP broker over stdio" in mcp_help.output
-    assert "--catalog PATH" in mcp_help.output
+    for command in ("check", "init-catalog", "install", "recover-run", "serve", "uninstall"):
+        assert command in mcp_help.output
+    assert "--catalog PATH" not in mcp_help.output
 
-    check_help = runner.invoke(cli_main, ["mcp-check", "--help"], terminal_width=120)
+    serve_help = runner.invoke(cli_main, ["mcp", "serve", "--help"], terminal_width=120)
+    assert serve_help.exit_code == 0
+    assert "Serve the optional MCP broker over stdio" in serve_help.output
+    assert "--catalog PATH" in serve_help.output
+
+    check_help = runner.invoke(cli_main, ["mcp", "check", "--help"], terminal_width=120)
     assert check_help.exit_code == 0
     assert "Args:" not in check_help.output
     assert "per-experiment ok/FAIL report" in check_help.output
     assert "provisions the state, runs, and logs directories" in check_help.output
     assert "--catalog PATH" in check_help.output
 
-    init_help = runner.invoke(cli_main, ["init-catalog", "--help"], terminal_width=120)
+    init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "Args:" not in init_help.output
     assert "annotated MCP catalog" in init_help.output

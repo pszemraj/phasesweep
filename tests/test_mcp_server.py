@@ -1308,7 +1308,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     runner = CliRunner()
     dry = runner.invoke(
         cli_main,
-        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
 
     assert dry.exit_code == 0, dry.output
@@ -1320,7 +1320,8 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     confirmed = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1352,7 +1353,7 @@ def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Pa
 
     result = CliRunner().invoke(
         cli_main,
-        ["mcp-recover-run", "--state-dir", str(missing), "--run-id", "missing"],
+        ["mcp", "recover-run", "--state-dir", str(missing), "--run-id", "missing"],
     )
 
     assert result.exit_code != 0
@@ -1390,7 +1391,7 @@ def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Pa
     runner = CliRunner()
     preflight = runner.invoke(
         cli_main,
-        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
     assert preflight.exit_code == 0, preflight.output
     assert "would rebuild the terminal result snapshot" in preflight.output
@@ -1399,7 +1400,8 @@ def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Pa
     confirmed = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1474,7 +1476,7 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     runner = CliRunner()
     dry = runner.invoke(
         cli_main,
-        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
 
     assert dry.exit_code == 0, dry.output
@@ -1492,7 +1494,8 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     confirmed = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1560,7 +1563,8 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     first = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1594,7 +1598,8 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     replay = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1671,7 +1676,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     runner = CliRunner()
     dry = runner.invoke(
         cli_main,
-        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
 
     assert dry.exit_code == 0, dry.output
@@ -1689,7 +1694,8 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     result = runner.invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1758,7 +1764,8 @@ def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
     result = CliRunner().invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",
@@ -1792,7 +1799,8 @@ def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> Non
     result = CliRunner().invoke(
         cli_main,
         [
-            "mcp-recover-run",
+            "mcp",
+            "recover-run",
             "--state-dir",
             str(registry.state_dir),
             "--run-id",

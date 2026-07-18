@@ -271,7 +271,7 @@ def _require_mcp_stable_paths(
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     :param Path config_dir: Directory of the experiment config, used to compute
-        concrete fix suggestions for ``phasesweep mcp-check``.
+        concrete fix suggestions for ``phasesweep mcp check``.
     """
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
@@ -320,7 +320,7 @@ def _suggest_storage(config_dir: Path) -> str:
     """Suggest a valid MCP storage URL near the config.
 
     :param Path config_dir: Directory of the experiment config.
-    :return str: Operator-facing suggestion for ``phasesweep mcp-check``.
+    :return str: Operator-facing suggestion for ``phasesweep mcp check``.
     """
     return f"use a persistent local URL, e.g. storage: sqlite:///{config_dir / 'optuna.db'}"
 
@@ -421,7 +421,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate every catalog entry, collecting per-entry verdicts.
 
     Runs the same validation as :meth:`Registry.load` (shared per-entry code
-    path) but does not stop at the first failure, so ``phasesweep mcp-check``
+    path) but does not stop at the first failure, so ``phasesweep mcp check``
     can report a full ok/FAIL table. This check is observational: it validates
     the state layout without creating directories or changing permissions.
     Catalog-level problems (unreadable file, schema errors) still raise

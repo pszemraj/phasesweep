@@ -34,7 +34,7 @@ SERVER_NAME = "phasesweep"
 
 MARKDOWN_START = "<!-- PHASESWEEP_START -->"
 MARKDOWN_END = "<!-- PHASESWEEP_END -->"
-TOML_START = "# PHASESWEEP_START (managed by `phasesweep install`)"
+TOML_START = "# PHASESWEEP_START (managed by `phasesweep mcp install`)"
 TOML_END = "# PHASESWEEP_END"
 
 Scope = Literal["project", "user"]

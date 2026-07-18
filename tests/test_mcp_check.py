@@ -1,4 +1,4 @@
-"""Catalog preflight: check_catalog and the mcp-check CLI command."""
+"""Catalog preflight: check_catalog and the ``mcp check`` CLI command."""
 
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
         allow={"launch": True},
         filename="good.yaml",
     )
-    ok_result = runner.invoke(cli_main, ["mcp-check", "--catalog", str(good)])
+    ok_result = runner.invoke(cli_main, ["mcp", "check", "--catalog", str(good)])
     assert ok_result.exit_code == 0
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
@@ -217,7 +217,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
         },
         filename="bad.yaml",
     )
-    fail_result = runner.invoke(cli_main, ["mcp-check", "--catalog", str(bad)])
+    fail_result = runner.invoke(cli_main, ["mcp", "check", "--catalog", str(bad)])
     assert fail_result.exit_code == 2
     assert "FAIL" in fail_result.output
     assert "fix:" in fail_result.output
@@ -229,5 +229,5 @@ def test_mcp_check_cli_catalog_level_failure_exits_2(tmp_path: Path) -> None:
     runner = CliRunner()
     broken = tmp_path / "broken.yaml"
     broken.write_text("not: [valid catalog\n")
-    result = runner.invoke(cli_main, ["mcp-check", "--catalog", str(broken)])
+    result = runner.invoke(cli_main, ["mcp", "check", "--catalog", str(broken)])
     assert result.exit_code == 2

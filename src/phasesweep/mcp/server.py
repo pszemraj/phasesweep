@@ -294,7 +294,7 @@ class RunPayload(_ToolPayload):
     recovery_required: bool = Field(
         description=(
             "True when cleanup is uncertain and only the operator can run "
-            "phasesweep mcp-recover-run; the run remains state=running until recovery."
+            "phasesweep mcp recover-run; the run remains state=running until recovery."
         )
     )
 

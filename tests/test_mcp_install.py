@@ -665,6 +665,7 @@ def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
     target = next(item for item in agent_targets(project) if item.id == agent_id)
     assert target.mcp is not None
     args = [
+        "mcp",
         "install",
         "--catalog",
         str(catalog),
@@ -700,10 +701,12 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
     (project / "CLAUDE.md").write_text(preexisting_claude_md)
     runner = CliRunner()
 
-    scaffold = runner.invoke(cli_main, ["init-catalog", "--from", str(EXAMPLE_CONFIG)])
+    scaffold = runner.invoke(cli_main, ["mcp", "init-catalog", "--from", str(EXAMPLE_CONFIG)])
     assert scaffold.exit_code == 0, scaffold.output
 
-    install = runner.invoke(cli_main, ["install", "--agent", "claude", "--type", "all", "--yes"])
+    install = runner.invoke(
+        cli_main, ["mcp", "install", "--agent", "claude", "--type", "all", "--yes"]
+    )
     assert install.exit_code == 0, install.output
     assert "restart your mcp client" in install.output.lower()
     entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
@@ -712,7 +715,7 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
     assert claude_md.startswith(preexisting_claude_md)
     assert MARKDOWN_START in claude_md and MARKDOWN_END in claude_md
 
-    uninstall = runner.invoke(cli_main, ["uninstall", "--agent", "claude", "--yes"])
+    uninstall = runner.invoke(cli_main, ["mcp", "uninstall", "--agent", "claude", "--yes"])
     assert uninstall.exit_code == 0, uninstall.output
     assert not (project / ".mcp.json").exists()
     assert (project / "CLAUDE.md").read_text() == preexisting_claude_md
@@ -727,12 +730,12 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
     project.mkdir()
     monkeypatch.chdir(project)
     runner = CliRunner()
-    scaffold = runner.invoke(cli_main, ["init-catalog", "--from", str(EXAMPLE_CONFIG)])
+    scaffold = runner.invoke(cli_main, ["mcp", "init-catalog", "--from", str(EXAMPLE_CONFIG)])
     assert scaffold.exit_code == 0, scaffold.output
 
     preview_install = runner.invoke(
         cli_main,
-        ["install", "--agent", "claude", "--type", "all", "--dry-run"],
+        ["mcp", "install", "--agent", "claude", "--type", "all", "--dry-run"],
     )
     assert preview_install.exit_code == 0, preview_install.output
     assert "would-create" in preview_install.output
@@ -742,7 +745,7 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
 
     install = runner.invoke(
         cli_main,
-        ["install", "--agent", "claude", "--type", "all", "--yes"],
+        ["mcp", "install", "--agent", "claude", "--type", "all", "--yes"],
     )
     assert install.exit_code == 0, install.output
     mcp_before = (project / ".mcp.json").read_bytes()
@@ -750,7 +753,7 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
 
     preview_uninstall = runner.invoke(
         cli_main,
-        ["uninstall", "--agent", "claude", "--type", "all", "--dry-run"],
+        ["mcp", "uninstall", "--agent", "claude", "--type", "all", "--dry-run"],
     )
     assert preview_uninstall.exit_code == 0, preview_uninstall.output
     assert "would-remove" in preview_uninstall.output
@@ -768,6 +771,7 @@ def test_cli_install_planning_does_not_provision_catalog_state(
     catalog = _write_valid_catalog(project)
     state_dir = project / "state"
     args = [
+        "mcp",
         "install",
         "--catalog",
         str(catalog),
@@ -807,7 +811,7 @@ def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(
 
     result = CliRunner().invoke(
         cli_main,
-        ["install", "--agent", "claude", "--dry-run"],
+        ["mcp", "install", "--agent", "claude", "--dry-run"],
     )
 
     assert result.exit_code == 2
@@ -820,7 +824,7 @@ def test_cli_install_requires_catalog_when_unattended(fake_home, tmp_path, monke
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.chdir(project)
-    result = CliRunner().invoke(cli_main, ["install", "--agent", "claude", "--yes"])
+    result = CliRunner().invoke(cli_main, ["mcp", "install", "--agent", "claude", "--yes"])
     assert result.exit_code == 2
     assert "init-catalog" in result.output
     assert not (project / ".mcp.json").exists()
@@ -833,7 +837,7 @@ def test_cli_install_offers_catalog_scaffold_interactively(fake_home, tmp_path, 
     # Prompt answers: config path to scaffold from, then per-plan confirmation.
     result = CliRunner().invoke(
         cli_main,
-        ["install", "--agent", "claude", "--type", "mcp"],
+        ["mcp", "install", "--agent", "claude", "--type", "mcp"],
         input=f"{EXAMPLE_CONFIG}\ny\n",
     )
     assert result.exit_code == 0, result.output
@@ -847,7 +851,8 @@ def test_cli_install_instructions_only_needs_no_catalog_or_sdk(fake_home, tmp_pa
     monkeypatch.chdir(project)
     monkeypatch.setattr("phasesweep.cli.importlib.util.find_spec", lambda _name: None)
     result = CliRunner().invoke(
-        cli_main, ["install", "--agent", "claude", "--type", "instructions", "--yes"]
+        cli_main,
+        ["mcp", "install", "--agent", "claude", "--type", "instructions", "--yes"],
     )
     assert result.exit_code == 0, result.output
     assert MARKDOWN_START in (project / "CLAUDE.md").read_text()
@@ -866,6 +871,7 @@ def test_cli_install_requires_mcp_sdk_before_client_edits(
     result = CliRunner().invoke(
         cli_main,
         [
+            "mcp",
             "install",
             "--catalog",
             str(catalog),
@@ -891,7 +897,7 @@ def test_cli_interactive_selection_among_detected_agents(fake_home, tmp_path, mo
     (fake_home / ".cursor").mkdir()
     _write_valid_catalog(project)
     # Prompt answers: configure Cursor? yes; proceed? yes.
-    result = CliRunner().invoke(cli_main, ["install", "--type", "mcp"], input="y\ny\n")
+    result = CliRunner().invoke(cli_main, ["mcp", "install", "--type", "mcp"], input="y\ny\n")
     assert result.exit_code == 0, result.output
     assert "Cursor" in result.output
     assert (project / ".cursor" / "mcp.json").is_file()
@@ -907,7 +913,7 @@ def test_cli_install_rejects_invalid_catalog_before_touching_configs(
     (project / "catalog.yaml").write_text(
         f"state_dir: {project}/state\nexperiments:\n  - id: broken\n    config: ./experiment.yaml\n"
     )
-    result = CliRunner().invoke(cli_main, ["install", "--agent", "claude", "--yes"])
+    result = CliRunner().invoke(cli_main, ["mcp", "install", "--agent", "claude", "--yes"])
     assert result.exit_code == 2
     assert "no client config was touched" in result.output
     assert not (project / ".mcp.json").exists()
@@ -915,7 +921,7 @@ def test_cli_install_rejects_invalid_catalog_before_touching_configs(
 
 def test_install_help_is_operator_readable():
     runner = CliRunner()
-    install_help = runner.invoke(cli_main, ["install", "--help"], terminal_width=120)
+    install_help = runner.invoke(cli_main, ["mcp", "install", "--help"], terminal_width=120)
     assert install_help.exit_code == 0
     for flag in (
         "--catalog",
@@ -930,7 +936,7 @@ def test_install_help_is_operator_readable():
     assert "claude" in install_help.output and "opencode" in install_help.output
     assert "Args:" not in install_help.output
 
-    uninstall_help = runner.invoke(cli_main, ["uninstall", "--help"], terminal_width=120)
+    uninstall_help = runner.invoke(cli_main, ["mcp", "uninstall", "--help"], terminal_width=120)
     assert uninstall_help.exit_code == 0
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output

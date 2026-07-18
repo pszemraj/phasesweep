@@ -23,7 +23,7 @@ class CatalogError(Exception):
         """Create an operator-facing catalog error.
 
         :param str message: Failure description; may reference paths.
-        :param str | None suggestion: Optional concrete fix, surfaced by ``phasesweep mcp-check``.
+        :param str | None suggestion: Optional concrete fix, surfaced by ``phasesweep mcp check``.
         """
         super().__init__(message)
         self.suggestion = suggestion
@@ -160,7 +160,7 @@ class RunResultSnapshotUnavailableError(McpToolError):
             f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
             "retry once after a short delay in case finalization is still in progress. "
             "If the error persists, the operator can repair it with phasesweep "
-            "mcp-recover-run; do not substitute experiment-level results."
+            "mcp recover-run; do not substitute experiment-level results."
         )
 
 

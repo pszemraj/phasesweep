@@ -1,5 +1,5 @@
 # Example MCP catalog for the tiny Enwik8 decoder smoke sweep. Start it with:
-#   phasesweep mcp --catalog examples/tiny_decoder_enwik8/catalog.yaml
+#   phasesweep mcp serve --catalog examples/tiny_decoder_enwik8/catalog.yaml
 
 state_dir: /tmp/phasesweep-mcp-tiny-decoder-enwik8/state
 max_concurrent_runs: 1
