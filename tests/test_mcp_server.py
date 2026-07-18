@@ -195,8 +195,7 @@ def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
         app.launch("srv", from_phase="missing")
 
 
-def test_resume_requires_prior_winner(tmp_path: Path) -> None:
-    phases = """\
+RESUMABLE_PHASES = """\
   - name: p
     n_trials: 1
     search_space:
@@ -207,7 +206,10 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
     search_space:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
-    config = _config(tmp_path, phases=phases)
+
+
+def test_resume_requires_prior_winner(tmp_path: Path) -> None:
+    config = _config(tmp_path, phases=RESUMABLE_PHASES)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
     with pytest.raises(Exception, match="earlier phase 'p' has no winner yet"):
@@ -238,48 +240,29 @@ def _write_winner_yaml(
     )
 
 
-def test_resume_rejects_stale_winner_before_spawn(tmp_path: Path) -> None:
-    phases = """\
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-  - name: q
-    inherits: [p]
-    n_trials: 1
-    search_space:
-      wd: { type: float, low: 0.0, high: 0.1 }
-"""
-    config = _config(tmp_path, phases=phases)
+@pytest.mark.parametrize(
+    ("fingerprint_override", "incomplete"),
+    [
+        pytest.param("0" * 64, False, id="stale"),
+        pytest.param(None, True, id="incomplete"),
+    ],
+)
+def test_resume_rejects_incompatible_winner_before_spawn(
+    tmp_path: Path,
+    fingerprint_override: str | None,
+    incomplete: bool,
+) -> None:
+    config = _config(tmp_path, phases=RESUMABLE_PHASES)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     exp = load_config(config)
     assert isinstance(exp, Experiment)
-    _write_winner_yaml(exp, "p", phase_fingerprint="0" * 64)
-
-    with pytest.raises(Exception, match="compatible winner"):
-        app.launch("srv", from_phase="q")
-
-    assert store.list_handles() == []
-
-
-def test_resume_rejects_incomplete_winner_before_spawn(tmp_path: Path) -> None:
-    phases = """\
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-  - name: q
-    inherits: [p]
-    n_trials: 1
-    search_space:
-      wd: { type: float, low: 0.0, high: 0.1 }
-"""
-    config = _config(tmp_path, phases=phases)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
-    fp = _phase_fingerprint(exp, exp.phases[0], {})
-    _write_winner_yaml(exp, "p", phase_fingerprint=fp, incomplete=True)
+    phase_fingerprint = fingerprint_override or _phase_fingerprint(exp, exp.phases[0], {})
+    _write_winner_yaml(
+        exp,
+        "p",
+        phase_fingerprint=phase_fingerprint,
+        incomplete=incomplete,
+    )
 
     with pytest.raises(Exception, match="compatible winner"):
         app.launch("srv", from_phase="q")
