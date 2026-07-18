@@ -658,6 +658,11 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
 )
 @click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
 @click.option(
+    "--allow-user-scope",
+    is_flag=True,
+    help="Acknowledge user-scoped MCP config writes when using --yes.",
+)
+@click.option(
     "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
 )
 @click.pass_context
@@ -668,6 +673,7 @@ def install(
     integration: str,
     project_dir: Path,
     yes: bool,
+    allow_user_scope: bool,
     dry_run: bool,
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
@@ -682,6 +688,7 @@ def install(
     :param str integration: ``mcp``, ``instructions``, or ``all``.
     :param Path project_dir: Project root for project-scoped client files.
     :param bool yes: Skip every confirmation prompt.
+    :param bool allow_user_scope: Acknowledge unattended user-scoped MCP config writes.
     :param bool dry_run: Preview installer verdicts without changing client files.
     """
     project = project_dir.resolve()
@@ -728,6 +735,7 @@ def install(
             integration,  # type: ignore[arg-type]
             yes,
             dry_run,
+            allow_user_scope,
         )
     )
 

@@ -464,6 +464,7 @@ def run(
     integration: Literal["mcp", "instructions", "all"],
     yes: bool,
     dry_run: bool = False,
+    allow_user_scope: bool = False,
 ) -> int:
     """Run the installer or uninstaller end to end.
 
@@ -475,6 +476,7 @@ def run(
     :param Literal integration: ``mcp``, ``instructions``, or ``all``.
     :param bool yes: Skip every confirmation prompt.
     :param bool dry_run: Report planned edit verdicts without changing client files.
+    :param bool allow_user_scope: Explicitly authorize unattended user-scoped MCP writes.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
     """
@@ -485,6 +487,20 @@ def run(
         return 2
     integrations = _integrations(integration)
     _print_plan(targets, integrations, mode, dry_run)
+    user_scoped_targets = [
+        target
+        for target in targets
+        if "mcp" in integrations and target.mcp is not None and target.mcp.scope == "user"
+    ]
+    if mode == "install" and yes and not dry_run and user_scoped_targets and not allow_user_scope:
+        names = ", ".join(target.display_name for target in user_scoped_targets)
+        click.echo(
+            "phasesweep install: --yes cannot authorize user-scoped MCP config writes "
+            f"for {names}. Review the plan, then re-run with --allow-user-scope; "
+            "no client config was touched.",
+            err=True,
+        )
+        return 2
     if not dry_run and not yes and not click.confirm("Proceed?", default=True):
         click.echo("cancelled; nothing was changed.")
         return 2

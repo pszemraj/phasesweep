@@ -386,7 +386,15 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     project.mkdir()
     catalog = _write_valid_catalog(project)
 
-    code = installer.run("install", project, catalog, list(AGENT_IDS), "all", yes=True)
+    code = installer.run(
+        "install",
+        project,
+        catalog,
+        list(AGENT_IDS),
+        "all",
+        yes=True,
+        allow_user_scope=True,
+    )
     assert code == 0, capsys.readouterr().out
     entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
     assert entry["args"] == ["--catalog", str(catalog)]
@@ -400,7 +408,18 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
 
     # Second install is a no-op.
     capsys.readouterr()
-    assert installer.run("install", project, catalog, list(AGENT_IDS), "all", yes=True) == 0
+    assert (
+        installer.run(
+            "install",
+            project,
+            catalog,
+            list(AGENT_IDS),
+            "all",
+            yes=True,
+            allow_user_scope=True,
+        )
+        == 0
+    )
     assert "unchanged" in capsys.readouterr().out
 
     assert installer.run("uninstall", project, None, list(AGENT_IDS), "all", yes=True) == 0
@@ -478,7 +497,9 @@ def test_installer_skips_unmanaged_codex_table(fake_home, tmp_path, capsys):
     original = '[mcp_servers.phasesweep]\ncommand = "custom"\n'
     codex_config.write_text(original)
 
-    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+    code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
     assert code == 1
     assert "skipped" in capsys.readouterr().out
     assert codex_config.read_text() == original
@@ -501,7 +522,15 @@ def test_installer_preserves_unmanaged_json_entry(fake_home, tmp_path, capsys, a
     original_data = {target.mcp.key: {"phasesweep": {"command": "custom-server"}}}
     target.mcp.path.write_text(json.dumps(original_data, indent=2) + "\n")
 
-    install_code = installer.run("install", project, catalog, [agent_id], "mcp", yes=True)
+    install_code = installer.run(
+        "install",
+        project,
+        catalog,
+        [agent_id],
+        "mcp",
+        yes=True,
+        allow_user_scope=agent_id == "claude-desktop",
+    )
     install_output = capsys.readouterr().out
     assert install_code == 1
     assert "unmanaged phasesweep entry" in install_output
@@ -574,7 +603,9 @@ def test_installer_detects_unmanaged_codex_table_semantically(
     codex_config.parent.mkdir()
     codex_config.write_text(original)
 
-    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+    code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
 
     assert code == 1
     assert "unmanaged" in capsys.readouterr().out
@@ -596,7 +627,9 @@ def test_installer_refuses_invalid_codex_toml_merge(fake_home, tmp_path, capsys,
     codex_config.parent.mkdir()
     codex_config.write_text(original)
 
-    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+    code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
 
     assert code == 1
     assert "invalid TOML" in capsys.readouterr().out
@@ -608,7 +641,9 @@ def test_installer_writes_unicode_codex_catalog_path(fake_home, tmp_path, capsys
     project.mkdir()
     catalog = _write_valid_catalog(project)
 
-    code = installer.run("install", project, catalog, ["codex"], "mcp", yes=True)
+    code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
 
     assert code == 0, capsys.readouterr().out
     parsed = tomllib.loads((fake_home / ".codex" / "config.toml").read_text())
@@ -616,6 +651,45 @@ def test_installer_writes_unicode_codex_catalog_path(fake_home, tmp_path, capsys
 
 
 # --- CLI flow ---
+
+
+@pytest.mark.parametrize("agent_id", ["codex", "claude-desktop"])
+def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
+    fake_home,
+    tmp_path,
+    agent_id,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    assert target.mcp is not None
+    args = [
+        "install",
+        "--catalog",
+        str(catalog),
+        "--project",
+        str(project),
+        "--agent",
+        agent_id,
+        "--type",
+        "mcp",
+    ]
+    runner = CliRunner()
+
+    preview = runner.invoke(cli_main, [*args, "--dry-run"])
+    assert preview.exit_code == 0, preview.output
+    assert not target.mcp.path.exists()
+
+    refused = runner.invoke(cli_main, [*args, "--yes"])
+    assert refused.exit_code == 2
+    assert "--allow-user-scope" in refused.output
+    assert "no client config was touched" in refused.output
+    assert not target.mcp.path.exists()
+
+    accepted = runner.invoke(cli_main, [*args, "--yes", "--allow-user-scope"])
+    assert accepted.exit_code == 0, accepted.output
+    assert target.mcp.path.is_file()
 
 
 def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
@@ -806,7 +880,15 @@ def test_install_help_is_operator_readable():
     runner = CliRunner()
     install_help = runner.invoke(cli_main, ["install", "--help"], terminal_width=120)
     assert install_help.exit_code == 0
-    for flag in ("--catalog", "--agent", "--type", "--project", "--yes", "--dry-run"):
+    for flag in (
+        "--catalog",
+        "--agent",
+        "--type",
+        "--project",
+        "--yes",
+        "--allow-user-scope",
+        "--dry-run",
+    ):
         assert flag in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
     assert "Args:" not in install_help.output

@@ -57,6 +57,7 @@ One command writes the MCP server entry and, where the client supports project i
 phasesweep install                        # interactive: confirm each detected agent, review the plan, apply
 phasesweep install --agent claude --yes   # unattended; repeat --agent for more
 phasesweep install --agent claude --dry-run  # validate and show planned edits without writing
+phasesweep install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
 ```
 
 `install` first confirms the MCP SDK from step 1 is available, then validates the catalog with the exact server startup rules before touching any client config, prints a plan of every file it will edit, and reports an outcome for each edit. An interactive, non-dry-run install offers to scaffold a missing catalog; unattended and dry-run installs print the exact `init-catalog` command and exit without writing. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`.
@@ -65,7 +66,7 @@ Automatic edits are limited to regular files at the expected target. Project-sco
 
 `--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project, so use `--catalog PATH` for any other name or location. Both `install` and `uninstall` accept `--dry-run` and report `would-create`, `would-update`, or `would-remove` without writing or deleting client files. Install previews still validate an existing catalog; uninstall needs no catalog. `phasesweep uninstall` removes only recognizable generated-shape JSON entries and marker-owned TOML or instruction blocks, then deletes a file if that removal leaves it empty. The shared `AGENTS.md` block records its Codex, Cursor, and opencode owners and remains in place until its last owner is uninstalled. Unmanaged same-name entries remain untouched and are reported for operator attention.
 
-Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
+Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory. Interactive installs require the normal plan confirmation. Unattended `--yes` installs additionally require `--allow-user-scope`; the generic confirmation bypass alone never authorizes a user-scoped write.
 
 Restart the client after any config change.
 
