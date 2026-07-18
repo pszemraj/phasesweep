@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -497,7 +497,6 @@ def run(
     yes: bool,
     dry_run: bool = False,
     allow_user_scope: bool = False,
-    before_apply: Callable[[], bool] | None = None,
 ) -> int:
     """Run the installer or uninstaller end to end.
 
@@ -510,8 +509,6 @@ def run(
     :param bool yes: Skip every confirmation prompt.
     :param bool dry_run: Report planned edit verdicts without changing client files.
     :param bool allow_user_scope: Explicitly authorize unattended user-scoped MCP writes.
-    :param Callable[[], bool] | None before_apply: Optional post-confirmation preparation;
-        client edits proceed only when it returns True.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
     """
@@ -547,8 +544,6 @@ def run(
         except FileNotFoundError as exc:
             click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
             return 1
-    if not dry_run and before_apply is not None and not before_apply():
-        return 2
     attention = 0
     for target in targets:
         click.echo(f"  {target.display_name}")

@@ -206,8 +206,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
     assert "(launch)" in ok_result.output
-    assert (tmp_path / "state" / "runs").is_dir()
-    assert (tmp_path / "state" / "logs").is_dir()
+    assert not (tmp_path / "state").exists()
 
     bad = write_mcp_config_catalog(
         tmp_path,

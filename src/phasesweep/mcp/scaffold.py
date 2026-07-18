@@ -1,11 +1,9 @@
 """Catalog scaffolding for ``phasesweep mcp init-catalog``.
 
-Builds an annotated, immediately-loadable MCP catalog from existing experiment
+Builds an annotated MCP catalog from existing experiment
 configs: absolute ``state_dir`` next to the catalog, one read-only entry per
 config, ``visible_params: none``, and no ``allow`` block - side effects stay a
-deliberate operator edit. Validation (``check_catalog``) happens in the CLI
-before the file reaches its final name; this module only derives ids and
-renders text. Operator-facing: rendered output contains real paths.
+deliberate operator edit. Operator-facing: rendered output contains real paths.
 """
 
 from __future__ import annotations

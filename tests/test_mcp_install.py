@@ -762,7 +762,7 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
     assert (project / "CLAUDE.md").read_bytes() == instructions_before
 
 
-def test_cli_install_planning_does_not_provision_catalog_state(
+def test_cli_install_does_not_provision_catalog_state(
     fake_home,
     tmp_path,
 ):
@@ -796,8 +796,7 @@ def test_cli_install_planning_does_not_provision_catalog_state(
 
     accepted = runner.invoke(cli_main, args, input="y\n")
     assert accepted.exit_code == 0, accepted.output
-    assert (state_dir / "runs").is_dir()
-    assert (state_dir / "logs").is_dir()
+    assert not state_dir.exists()
 
 
 def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(

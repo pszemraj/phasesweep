@@ -460,19 +460,6 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     return report
 
 
-def prepare_catalog_state(catalog_path: Path) -> Path:
-    """Create and secure the run-store directories declared by a catalog.
-
-    Callers must validate the catalog before invoking this mutating step.
-
-    :param Path catalog_path: Path to the operator-authored catalog YAML.
-    :return Path: Absolute initialized state directory.
-    """
-    _require_linux_mcp_host()
-    catalog, base = _parse_catalog(catalog_path)
-    return _prepare_state_dir(base, catalog.state_dir)
-
-
 class Registry:
     """Immutable id -> RegisteredExperiment map plus the server state dir."""
 

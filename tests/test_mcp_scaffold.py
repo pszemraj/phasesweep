@@ -1,5 +1,4 @@
-"""Catalog scaffolding: derive_experiment_id, scaffold_catalog_text, and the
-``mcp init-catalog`` CLI command (validate-before-write, refusal paths)."""
+"""Catalog scaffolding and the ``mcp init-catalog`` CLI command."""
 
 from __future__ import annotations
 
@@ -8,7 +7,6 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-import phasesweep.cli as cli_module
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry
@@ -36,14 +34,13 @@ def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
         scaffold_catalog_text(tmp_path / "catalog.yaml", [first, second])
 
 
-def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None:
+def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
     assert result.exit_code == 0, result.output
-    assert "srv  ok    (read-only)" in result.output
     assert f"wrote {output}" in result.output
 
     text = output.read_text()
@@ -54,7 +51,9 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     assert '# description: "Human-curated one-line purpose shown to the agent"' in text
     assert "\n    allow:" not in text  # side effects stay commented out
 
-    # The scaffold must boot the real server loader as-is, read-only.
+    assert not (tmp_path / "runs" / ".mcp").exists()
+
+    # The scaffold boots the real server loader as-is, read-only.
     registry = Registry.load(output)
     entry = registry.get("srv")
     assert entry.allow_launch is False
@@ -106,7 +105,7 @@ def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> 
     assert Registry.load(output).state_dir == (catalog_dir / "runs" / ".mcp").resolve()
 
 
-def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
+def test_init_catalog_leaves_validation_to_mcp_check(tmp_path: Path) -> None:
     config = tmp_path / "rel.yaml"
     config.write_text(
         mcp_experiment_config_text(tmp_path, name="rel").replace(
@@ -117,12 +116,13 @@ def test_init_catalog_failure_writes_nothing(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
-    assert result.exit_code == 2
-    assert "FAIL" in result.output
-    assert "catalog destination was not written" in result.output
-    assert not output.exists()
-    assert not output.with_name(output.name + ".tmp").exists()
+    assert result.exit_code == 0
+    assert output.exists()
     assert not (tmp_path / "runs").exists()
+
+    checked = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(output)])
+    assert checked.exit_code == 2
+    assert "FAIL" in checked.output
 
 
 def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
@@ -135,29 +135,6 @@ def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "operator-authored\n"
-
-
-def test_init_catalog_does_not_replace_destination_created_during_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = _write_config(tmp_path, "srv.yaml")
-    output = tmp_path / "catalog.yaml"
-    real_check_catalog = cli_module.check_catalog
-
-    def check_after_late_arrival(staged: Path):
-        report = real_check_catalog(staged)
-        output.write_text("created concurrently\n")
-        return report
-
-    monkeypatch.setattr(cli_module, "check_catalog", check_after_late_arrival)
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
-
-    assert result.exit_code == 2
-    assert "refusing to overwrite" in result.output
-    assert output.read_text() == "created concurrently\n"
-    assert list(tmp_path.glob(".catalog.yaml.*.tmp")) == []
 
 
 def test_init_catalog_requires_at_least_one_config(tmp_path: Path) -> None:
