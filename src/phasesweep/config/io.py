@@ -101,17 +101,6 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     return data
 
 
-def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
-    """Load a YAML file as a strict mapping.
-
-    :param str | Path path: Filesystem path to the YAML file.
-    :raises ValueError: If parsing fails or the top level is not a mapping.
-    :return dict[str, Any]: Parsed top-level YAML mapping.
-    """
-    path_obj = Path(path)
-    return _load_yaml_mapping_from_text(path_obj.read_text(), path_obj)
-
-
 def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
     """Parse and validate a config from an already-read byte snapshot.
 
@@ -144,10 +133,8 @@ def load_config(path: str | Path) -> Config:
         :class:`Suite` for configs with a top-level ``suite`` key.
 
     """
-    data = _load_yaml_mapping(path)
-    if "suite" in data:
-        return Suite.model_validate(data)
-    return Experiment.model_validate(data)
+    path_obj = Path(path)
+    return load_config_bytes(path_obj.read_bytes(), source=path_obj)
 
 
 def load_experiment(path: str | Path) -> Experiment:
@@ -170,7 +157,7 @@ def load_experiment(path: str | Path) -> Experiment:
             mapping keys, or any Pydantic / cross-phase validation failure.
 
     """
-    data = _load_yaml_mapping(path)
-    if "suite" in data:
+    config = load_config(path)
+    if isinstance(config, Suite):
         raise ValueError(f"{path}: expected a single experiment config, got a suite config.")
-    return Experiment.model_validate(data)
+    return config
