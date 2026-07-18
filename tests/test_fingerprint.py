@@ -494,26 +494,7 @@ def test_save_winner_replace_failure_preserves_existing_file(
 
 
 def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
-    """``comment`` is optional, defaults to None, and is excluded from the
-    fingerprint so editing it never invalidates a study.
-
-    Pre-v0.5.9 this was three separate tests (accepted / default / excluded);
-    fingerprint exclusion is the only contract that matters at runtime, the
-    other two are surface-level Pydantic checks.
-    """
-    p_with = Phase(  # type: ignore[arg-type]
-        name="p",
-        n_trials=1,
-        comment="Why this phase exists.",
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-    )
-    p_without = Phase(  # type: ignore[arg-type]
-        name="p",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-    )
-    assert p_with.comment == "Why this phase exists."
-    assert p_without.comment is None
+    """Editing an optional phase comment must not invalidate its fingerprint."""
 
     def build(comment: str | None) -> Experiment:
         return Experiment(

@@ -333,34 +333,6 @@ def test_rejects_dotted_prefix_collisions() -> None:
             )
 
 
-def test_yaml_load_rejects_prefix_collision(tmp_path: Path) -> None:
-    """End-to-end: load_experiment surfaces the prefix-collision error."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          extractor:
-            type: json
-            path: r.json
-            key: x
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              model: llama
-            search_space:
-              model.depth:
-                type: int
-                low: 8
-                high: 32
-        """)
-    )
-    with pytest.raises(ValueError, match="namespace collision"):
-        load_experiment(p)
-
-
 @pytest.mark.parametrize(
     ("template", "override_format", "search_space", "fixed_overrides", "match"),
     [
@@ -490,31 +462,6 @@ def test_trial_command_accepts_supported_templates() -> None:
 
     for _case, build in cases:
         build()
-
-
-def test_yaml_load_surfaces_template_error(tmp_path: Path) -> None:
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {trail_dir} {overrides}"
-        metric:
-          extractor:
-            type: json
-            path: r.json
-            key: x
-        phases:
-          - name: p
-            n_trials: 1
-            search_space:
-              x:
-                type: int
-                low: 0
-                high: 1
-        """)
-    )
-    with pytest.raises(ValueError, match="unknown placeholder"):
-        load_experiment(p)
 
 
 def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> None:

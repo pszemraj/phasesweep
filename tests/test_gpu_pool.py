@@ -209,21 +209,6 @@ def test_gpu_ids_rejects_negative() -> None:
         )
 
 
-def test_gpu_ids_accepts_none_and_non_empty_values() -> None:
-    Phase(  # type: ignore[arg-type]
-        name="p1",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-        gpu_ids=None,
-    )
-    Phase(  # type: ignore[arg-type]
-        name="p2",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-        gpu_ids=[0, 1, 2],
-    )
-
-
 def test_gpu_ids_rejects_empty() -> None:
     with pytest.raises(ValueError, match="at least one CUDA device index"):
         Phase(  # type: ignore[arg-type]

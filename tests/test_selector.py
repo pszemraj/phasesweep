@@ -110,26 +110,24 @@ def test_tie_break_lower_trial_number():
     assert w.params == {"x": 1}
 
 
-def test_near_tie_within_eps_prefers_lower_trial_number_minimize():
-    exp = _make_exp()
+@pytest.mark.parametrize(
+    ("goal", "first_delta", "expected_x"),
+    [
+        pytest.param("minimize", WINNER_TIE_EPS / 2, 1, id="minimize-within-epsilon"),
+        pytest.param("minimize", WINNER_TIE_EPS * 2, 2, id="minimize-beyond-epsilon"),
+        pytest.param("maximize", -(WINNER_TIE_EPS / 2), 1, id="maximize-within-epsilon"),
+        pytest.param("maximize", -(WINNER_TIE_EPS * 2), 2, id="maximize-beyond-epsilon"),
+    ],
+)
+def test_metric_tie_epsilon(goal: str, first_delta: float, expected_x: int) -> None:
+    exp = _make_exp(goal=goal)
     study = _make_study()
-    _add_trial(study, 0.1 + (WINNER_TIE_EPS / 2), params={"x": 1})
+    _add_trial(study, 0.1 + first_delta, params={"x": 1})
     _add_trial(study, 0.1, params={"x": 2})
 
-    w = select_winner(study, exp)
+    winner = select_winner(study, exp)
 
-    assert w.params == {"x": 1}
-
-
-def test_metric_difference_beyond_eps_wins_minimize():
-    exp = _make_exp()
-    study = _make_study()
-    _add_trial(study, 0.1 + (WINNER_TIE_EPS * 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 2}
+    assert winner.params == {"x": expected_x}
 
 
 def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
@@ -144,28 +142,6 @@ def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
 
     assert w.trial_number == 1
     assert w.params == {"x": 1}
-
-
-def test_near_tie_within_eps_prefers_lower_trial_number_maximize():
-    exp = _make_exp(goal="maximize")
-    study = _make_study()
-    _add_trial(study, 0.1 - (WINNER_TIE_EPS / 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 1}
-
-
-def test_metric_difference_beyond_eps_wins_maximize():
-    exp = _make_exp(goal="maximize")
-    study = _make_study()
-    _add_trial(study, 0.1 - (WINNER_TIE_EPS * 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 2}
 
 
 def test_rejects_nan_constraint_values_defensively(tmp_path):
