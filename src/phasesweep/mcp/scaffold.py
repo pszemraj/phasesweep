@@ -90,7 +90,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             f"""\
   - id: {experiment_id_scalar}          # the only token the agent ever sends
     config: {config_path}   # resolved relative to this catalog file
-    description: "TODO: one line the agent sees in phasesweep_list_experiments"
+    # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
     # Side effects default to false. Uncomment deliberately to let the agent act:
     # allow:
@@ -101,8 +101,10 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         )
     state_dir = catalog_dir / "runs" / ".mcp"
     header = f"""\
-# MCP catalog scaffolded by `phasesweep init-catalog`. Start the server with:
-#   phasesweep mcp --catalog /absolute/path/to/catalog.yaml
+# MCP catalog scaffolded by `phasesweep init-catalog`. After reviewing the
+# descriptions, paths, visibility, and permissions below, run:
+#   phasesweep mcp-check --catalog /absolute/path/to/catalog.yaml
+#   phasesweep install --catalog /absolute/path/to/catalog.yaml --dry-run
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which

@@ -57,6 +57,7 @@ phasesweep-mcp = "phasesweep.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/phasesweep"
+Documentation = "https://github.com/pszemraj/phasesweep/tree/main/docs"
 Repository = "https://github.com/pszemraj/phasesweep.git"
 Issues = "https://github.com/pszemraj/phasesweep/issues"
 

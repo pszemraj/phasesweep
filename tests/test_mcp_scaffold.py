@@ -50,6 +50,8 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     assert f'state_dir: "{tmp_path}/runs/.mcp"' in text
     assert 'config: "./srv.yaml"' in text
     assert "visible_params: none" in text
+    assert "TODO" not in text
+    assert '# description: "Human-curated one-line purpose shown to the agent"' in text
     assert "\n    allow:" not in text  # side effects stay commented out
 
     # The scaffold must boot the real server loader as-is, read-only.
@@ -58,6 +60,7 @@ def test_init_catalog_writes_validated_read_only_catalog(tmp_path: Path) -> None
     assert entry.allow_launch is False
     assert entry.allow_cancel is False
     assert entry.visible_params == "none"
+    assert entry.description == ""
 
 
 @pytest.mark.parametrize("filename", ["model # 1.yaml", "model: 1.yaml", "model\n1.yaml"])

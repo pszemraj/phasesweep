@@ -73,6 +73,7 @@ Follow [MCP agent setup](docs/mcp_setup.md) to install the server, create and pr
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the eight tools, security model, single-host operation.
 - [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - install the `[mcp]` extra, write and preflight a catalog, connect your clients with `phasesweep install`, verify, instruct the agent.
+- [MCP agent workflow](https://raw.githubusercontent.com/pszemraj/phasesweep/main/src/phasesweep/mcp/agent_prompt.md): machine-fetchable Markdown instructions shipped to supported coding clients.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.
 

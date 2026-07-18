@@ -1,6 +1,13 @@
 # MCP agent setup
 
-Install the extra, create a catalog, connect a client, verify the connection, and give the agent its operating instructions. The broker requires Linux because autonomous cancellation and crash recovery use `/proc` process identities. Tool behavior, catalog rules, and the security model are covered in [MCP server](mcp.md).
+Install the extra, create a catalog, connect a client, verify the connection, and give the agent its operating instructions. Tool behavior, catalog rules, and the security model are covered in [MCP server](mcp.md).
+
+## Prerequisites
+
+- Linux on the machine that runs the MCP server; autonomous cancellation and crash recovery require `/proc` process identities.
+- Python 3.10 or newer.
+- At least one phasesweep experiment config that already passes `phasesweep validate`.
+- A coding client with local stdio MCP support. Local use requires no API key or OAuth credential.
 
 ## 1. Install
 
