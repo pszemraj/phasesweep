@@ -783,10 +783,9 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
 @mcp.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Remove installer-owned phasesweep integration data: JSON entries invoking "
-        "phasesweep-mcp and marker-fenced TOML or instruction blocks, per selected agent. "
-        "Unmanaged same-name entries stay untouched. Files are deleted when removal leaves "
-        "them empty."
+        "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "
+        "entries and marker-fenced TOML or instruction blocks, per selected agent. Unmanaged "
+        "same-name entries stay untouched. Files are deleted when removal leaves them empty."
     ),
     short_help="Disconnect coding agents.",
 )

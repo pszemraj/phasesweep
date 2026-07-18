@@ -99,11 +99,21 @@ def resolve_server_command() -> str:
     )
 
 
+def _project_path_is_contained(path: Path, project: Path) -> bool:
+    """Return whether resolving ``path`` stays beneath the project root."""
+    try:
+        path.resolve(strict=False).relative_to(project.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _apply_mcp(
     target: AgentTarget,
     mode: Mode,
     command: str,
     catalog: Path | None,
+    project: Path,
     dry_run: bool,
 ) -> StepResult:
     """Apply or remove the MCP server entry for one target.
@@ -112,10 +122,18 @@ def _apply_mcp(
     :param Mode mode: ``install`` or ``uninstall``.
     :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path; required for install.
+    :param Path project: Project root that must contain project-scoped writes.
     :param bool dry_run: Compute the edit verdict without changing client files.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
+    if spec.scope == "project" and not _project_path_is_contained(spec.path, project):
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note="refusing project config path that resolves outside the project",
+        )
     if spec.format == "toml":
         if mode == "uninstall":
             return StepResult(
@@ -291,6 +309,13 @@ def _apply_instructions(
     path = target.instructions_path
     if path is None:
         return StepResult("instructions", None, None)
+    if not _project_path_is_contained(path, project):
+        return StepResult(
+            "instructions",
+            path,
+            "error",
+            note="refusing instructions path that resolves outside the project",
+        )
     valid_owner_ids = {
         candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
     }
@@ -515,7 +540,7 @@ def run(
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog, dry_run)
+                result = _apply_mcp(target, mode, command, catalog, project, dry_run)
             else:
                 result = _apply_instructions(target, mode, project, dry_run)
             if result.action is None:

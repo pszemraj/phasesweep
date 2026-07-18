@@ -518,7 +518,14 @@ def test_installer_preserves_unmanaged_json_entry(fake_home, tmp_path, capsys, a
     catalog = _write_valid_catalog(project)
     target = next(item for item in agent_targets(project) if item.id == agent_id)
     target.mcp.path.parent.mkdir(parents=True, exist_ok=True)
-    original_data = {target.mcp.key: {"phasesweep": {"command": "custom-server"}}}
+    unmanaged_entry = {"command": "custom-server"}
+    if agent_id == "claude":
+        unmanaged_entry = {
+            "command": "/manual/bin/phasesweep-mcp",
+            "args": ["--catalog", "relative.yaml"],
+            "env": {"CUSTOM": "1"},
+        }
+    original_data = {target.mcp.key: {"phasesweep": unmanaged_entry}}
     target.mcp.path.write_text(json.dumps(original_data, indent=2) + "\n")
 
     install_code = installer.run(
@@ -569,7 +576,7 @@ def test_installer_updates_recognizable_managed_json_entry(fake_home, tmp_path, 
     assert entry["args"] == ["--catalog", str(catalog)]
 
 
-def test_installer_follows_symlinked_project_config_directory(fake_home, tmp_path, capsys):
+def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
@@ -579,8 +586,9 @@ def test_installer_follows_symlinked_project_config_directory(fake_home, tmp_pat
 
     code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
 
-    assert code == 0, capsys.readouterr().out
-    assert (outside / "mcp.json").is_file()
+    assert code == 1
+    assert "resolves outside the project" in capsys.readouterr().out
+    assert not (outside / "mcp.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -959,5 +967,5 @@ def test_install_help_is_operator_readable():
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
-    assert "JSON entries invoking phasesweep-mcp" in uninstall_help.output
+    assert "generated-shape JSON" in uninstall_help.output
     assert "Unmanaged same-name entries stay untouched" in uninstall_help.output
