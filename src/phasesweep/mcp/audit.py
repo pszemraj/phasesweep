@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,95 +55,6 @@ class AuditLogger:
     session_id: str = field(default_factory=lambda: uuid4().hex)
     _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
 
-    def _event(
-        self,
-        *,
-        tool: str,
-        args: dict[str, Any] | None,
-        outcome: str,
-        resolved: dict[str, Any] | None = None,
-        state_before: dict[str, Any] | None = None,
-        state_after: dict[str, Any] | None = None,
-        result_counts: dict[str, int] | None = None,
-        authorization: dict[str, Any] | None = None,
-        error_type: str | None = None,
-        error: str | None = None,
-    ) -> dict[str, Any]:
-        """Build one bounded audit event without writing it."""
-        event: dict[str, Any] = {
-            "timestamp": utc_now_iso(),
-            "actor": self.actor,
-            "session_id": self.session_id,
-            "transport": "stdio",
-            "tool": tool,
-            "args": _compact_mapping(args),
-            "outcome": outcome,
-        }
-        resolved_values = _compact_mapping(resolved)
-        if resolved_values:
-            event["resolved"] = resolved_values
-        if state_before is not None:
-            event["state_before"] = state_before
-        if state_after is not None:
-            event["state_after"] = state_after
-        if result_counts is not None:
-            event["result_counts"] = result_counts
-        authorization_values = _compact_mapping(authorization)
-        if authorization_values:
-            event["authorization"] = authorization_values
-        if error_type is not None:
-            event["error_type"] = error_type
-        if error is not None:
-            event["error"] = error
-        return event
-
-    def _append(self, event: dict[str, Any], *, durable: bool) -> None:
-        """Append one event, optionally syncing it before returning."""
-        line = json.dumps(event, sort_keys=True, separators=(",", ":"), default=str)
-        with self._lock:
-            created = not self.path.exists()
-            with open_private_text(self.path, "a") as fh:
-                fh.write(line + "\n")
-                if durable:
-                    fh.flush()
-                    os.fsync(fh.fileno())
-            if durable and created:
-                fd = os.open(self.path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-
-    def record_authorization(
-        self,
-        *,
-        tool: str,
-        args: dict[str, Any],
-        resolved: dict[str, Any],
-        state_before: dict[str, Any],
-        authorization: dict[str, Any],
-    ) -> None:
-        """Durably record granted authority before a side effect starts.
-
-        Unlike ordinary outcome logging, this method propagates all write and
-        sync failures. Callers must refuse the side effect when it raises.
-
-        :param str tool: Side-effecting MCP tool name.
-        :param dict[str, Any] args: Agent-supplied safe arguments.
-        :param dict[str, Any] resolved: Server-resolved experiment and run ids.
-        :param dict[str, Any] state_before: Safe state summary before the operation.
-        :param dict[str, Any] authorization: Granted catalog policy and config identity.
-        """
-        event = self._event(
-            tool=tool,
-            args=args,
-            outcome="authorized",
-            resolved=resolved,
-            state_before=state_before,
-            authorization=authorization,
-        )
-        self._append(event, durable=True)
-
     def record(
         self,
         *,
@@ -175,20 +85,32 @@ class AuditLogger:
         :param str | None error_type: Exception class name for failed tool calls.
         :param str | None error: Redacted error message for failed tool calls.
         """
+        event: dict[str, Any] = {
+            "timestamp": utc_now_iso(),
+            "actor": self.actor,
+            "session_id": self.session_id,
+            "transport": "stdio",
+            "tool": tool,
+            "args": _compact_mapping(args),
+            "outcome": outcome,
+        }
+        resolved_values = _compact_mapping(resolved)
+        if resolved_values:
+            event["resolved"] = resolved_values
+        if state_before is not None:
+            event["state_before"] = state_before
+        if state_after is not None:
+            event["state_after"] = state_after
+        if result_counts is not None:
+            event["result_counts"] = result_counts
+        if error_type is not None:
+            event["error_type"] = error_type
+        if error is not None:
+            event["error"] = error
+
         try:
-            self._append(
-                self._event(
-                    tool=tool,
-                    args=args,
-                    outcome=outcome,
-                    resolved=resolved,
-                    state_before=state_before,
-                    state_after=state_after,
-                    result_counts=result_counts,
-                    error_type=error_type,
-                    error=error,
-                ),
-                durable=False,
-            )
-        except (OSError, TypeError, ValueError) as exc:
+            line = json.dumps(event, sort_keys=True, separators=(",", ":"), default=str)
+            with self._lock, open_private_text(self.path, "a") as fh:
+                fh.write(line + "\n")
+        except OSError as exc:
             log.warning("failed to write MCP audit record to %s: %s", self.path, exc)
