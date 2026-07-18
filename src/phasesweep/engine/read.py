@@ -174,10 +174,10 @@ def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
 def read_status(experiment: Experiment) -> dict[str, Any]:
     """Per-phase trial counts and winner presence, with no paths in the output.
 
-    Trial counts come from ``_phase_trial_stats``, which returns ``{}`` for a
-    study that does not exist yet, never creates one as a side effect, and
-    swallows transient backend errors (e.g. a momentary SQLite lock while the
-    runner writes) by returning ``{}`` for that phase rather than raising.
+    Trial counts come from ``_phase_trial_stats``, which reports empty counts
+    for a study that does not exist yet, never creates one as a side effect,
+    and swallows transient backend errors (e.g. a momentary SQLite lock while
+    the runner writes) by reporting empty counts rather than raising.
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
 

@@ -375,5 +375,5 @@ Definitions:
       run_name_template: "str = '{experiment}-{phase}-{trial_id}'"
       poll_seconds: "float > 0 = 2.0"
       timeout_seconds: "float >= 0 = 120.0"
-      # Checks that a completed W&B run summary contains all required keys.
+      # Checks that a terminal W&B run summary contains all required keys.
       # Missing wandb, timeout, or missing keys produce a failed gate result.
