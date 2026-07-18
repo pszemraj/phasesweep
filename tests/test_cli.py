@@ -24,7 +24,7 @@ def test_help_output_is_operator_readable() -> None:
     assert "-h, --help" in result.output
     assert "mcp" in result.output and "Serve the MCP broker." in result.output
     assert "mcp-recover-run" in result.output
-    assert "Recover MCP cleanup uncertainty." in result.output
+    assert "Recover MCP cleanup or result finalization." in result.output
     assert "run" in result.output and "Run configured phases." in result.output
     assert "show-winners" in result.output and "Print saved phase winners." in result.output
     assert "status" in result.output and "Print read-only run status." in result.output
