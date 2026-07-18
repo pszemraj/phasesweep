@@ -8,11 +8,11 @@ For every field, type, default, enum value, and validation constraint, use [conf
 
 The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to ASCII `[A-Za-z0-9_-]+`.
 
-`storage` controls whether an interrupted phase can reuse or top up its Optuna study. `null` starts a fresh in-memory study on each invocation; `--from-phase` can still load completed earlier phases from their `winner.yaml` files. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
+`storage` selects the Optuna backend. `null` creates an in-memory study, `sqlite:///path.db` provides persistence for sequential `n_jobs == 1` studies, `journal:///path.journal` supports same-host parallel work, and an Optuna-supported RDB URL such as `postgresql://...` provides external storage. SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Study reuse, top-ups, and `--from-phase` behavior are covered under [fingerprints and resume](runtime.md#fingerprints-and-resume).
 
 Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
 
-`trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. It does not teach your trainer to parse the chosen format; your trainer must already understand `argparse`, `hydra`, or the JSON file path you selected with `override_format`.
+`trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. The parser boundary is defined under [override formats](#override-formats).
 
 `metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value. Current samplers receive that objective without feasibility guidance; infeasible trials cannot become the phase winner and count toward `max_consecutive_failures`. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
 
@@ -39,6 +39,8 @@ search_space:
 
 Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports float and integer parameters, but not categorical parameters.
 
+Search keys named `seed` or ending in `.seed` are rejected by default because optimizing a randomness source can select noise. Keep seeds fixed for ordinary comparisons, or set `allow_seed_search: true` for an explicit variance audit.
+
 ## Override formats
 
 > [!IMPORTANT]
@@ -52,7 +54,7 @@ Float and integer bounds must be finite. Categorical choices must be Optuna-comp
 
 When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
 
-`argparse` renders lowercase booleans, bracketed comma-separated lists, and `None` for null. Hydra renders lowercase booleans and `null`, JSON-quotes strings, recursively renders bracketed lists, and rejects mappings. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values.
+`argparse` renders lowercase booleans, bracketed comma-separated lists, and `None` for null. Hydra renders lowercase booleans and `null`, JSON-quotes strings, recursively renders bracketed lists, and rejects mappings. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Every value must still be JSON-serializable; validation and dry-run do not write `overrides.json`, so serialization is exercised only by a real trial launch.
 
 ## Trainer contract
 

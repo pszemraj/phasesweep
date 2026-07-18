@@ -35,7 +35,7 @@ Tests are organized by behavior:
 
 - `tests/test_e2e.py`: full sweep and `--from-phase` replay.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`: storage identity, URL parsing, and same-host advisory locks.
-- `tests/test_process_supervision.py`, `tests/test_stale_reaper.py`, `tests/test_trial_launch.py`: subprocess launch and cleanup, signal handling, startup/skipped-phase reaping.
+- `tests/test_process_supervision.py`, `tests/test_stale_reaper.py`, `tests/test_trial_launch.py`: subprocess launch and cleanup, signal handling, reached/skipped-phase reaping.
 - `tests/test_fingerprint.py`: semantic fingerprints, resume verification, run-control exclusions.
 - `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
@@ -52,5 +52,5 @@ Tests are organized by behavior:
 - TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
 - TODO(mcp): Add an aggregated read-only trial-count path for JournalStorage before recommending very frequent `phasesweep_get_status` polling on very large local studies; external RDB-backed studies remain outside the MCP local-node support scope until multi-host cleanup and locking semantics are designed.
 - TODO(runtime): Design an explicit `trial_budget_mode: complete` before promising `n_trials` successful objective evaluations; the current behavior intentionally matches Optuna's terminal-attempt budget, while a completion budget needs repeated optimize scheduling, a total-attempt safety cap, and clear interactions with pruning, infeasible-but-COMPLETE trials, max-consecutive-failure aborts, and wallclock deadlines.
-- TODO(storage): Re-verify the direct SQLite status-query path against Optuna's trial-state schema whenever bumping Optuna beyond the currently tested range.
+- TODO(storage): Re-verify the direct SQLite status-query path against Optuna's trial-state schema on every Optuna version bump; the dependency currently has no upper bound.
 - TODO(example): Update the `examples/tiny_decoder_enwik8/upstream` submodule after the trainer template handles CPU/MPS autocast as fp32/disabled by default, uses CUDA-only `pin_memory`, moves batches with CUDA-only `non_blocking=True`, accumulates RMSNorm reductions in FP32, rejects overlong causal-mask sequence lengths, and unwraps `torch.compile` modules before checkpointing; keep those PyTorch training changes in the upstream trainer repo rather than patching the gitlink contents here.

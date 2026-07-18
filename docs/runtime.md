@@ -4,11 +4,11 @@
 
 Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host locks. Config validation and `--dry-run` do not launch subprocesses and do not take those locks, but real runs fail early on unsupported platforms.
 
-The optional MCP broker has a narrower support boundary: it requires Linux `/proc` process start times to make autonomous cancellation and crash recovery PID-reuse-safe. `phasesweep mcp`, `phasesweep-mcp`, and `phasesweep mcp-check` refuse non-Linux hosts; the core CLI remains available on supported POSIX platforms.
+MCP operations that validate a catalog, start the broker, install an MCP client entry, or recover a run require Linux with readable `/proc` process start times. This makes autonomous cancellation and crash recovery PID-reuse-safe. Instruction-only client installation does not load a catalog and remains available without the MCP runtime. The core CLI remains available on supported POSIX platforms.
 
 ## Output layout
 
-A completed run writes one namespace per experiment:
+The bundled example writes one namespace per experiment:
 
 ```text
 runs/
@@ -31,6 +31,8 @@ runs/
 
 `pid` and `pgid` are written atomically while a trial is live. On Linux, phasesweep also writes `/proc` start time to `pid_starttime` when it is readable. Identity files are removed on clean exit and preserved on failure for inspection. If an identity write fails after launch, phasesweep terminates the new process group before returning a failed trial result.
 
+`json_file` trials additionally receive `overrides.json`, and a phase with a promotion rule writes `promotion.yaml` when that rule is evaluated. Files such as `result.json` are trainer-owned evidence, not fixed phasesweep output.
+
 ## Process management
 
 ![trial state machine](images/diagramB_statemachine.png)
@@ -51,7 +53,7 @@ If cleanup cannot prove the process group is gone, phasesweep fails closed with 
 
 ## Stale trial reaping
 
-On startup and before skipped phases in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
+Before each reached phase begins, and separately before each skipped phase in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
 
 1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
 2. On Linux, match PID plus process start time to avoid PID-reuse kills. When `/proc` start time is unavailable, use the live PID as a best-effort identity check.
@@ -80,7 +82,7 @@ Upgrade note: older phasesweep builds used the process temp directory for these 
 CUDA device tokens also take per-device host locks. With the default `gpu_policy: single_per_trial`, explicit `gpu_ids`, explicit `gpu_devices`, ambient `CUDA_VISIBLE_DEVICES` tokens, and auto-detected `nvidia-smi` numeric devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. `gpu_policy: whole_node` requires `n_jobs: 1`, leases every configured or detected token, and exposes the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches. `gpu_policy: none` never changes `CUDA_VISIBLE_DEVICES` and never acquires GPU locks; parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler. Numeric tokens keep numeric lock names; opaque UUID/MIG tokens use sanitized, hashed lock names. When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
 
 > [!WARNING]
-> Multi-host writers against one shared study are unsupported. The startup reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
+> Multi-host writers against one shared study are unsupported. The stale-trial reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
 
 ## Fingerprints and resume
 

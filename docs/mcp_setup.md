@@ -4,7 +4,7 @@ Install the extra, create a catalog, connect a client, verify the connection, an
 
 ## Prerequisites
 
-- Linux on the machine that runs the MCP server; autonomous cancellation and crash recovery require `/proc` process identities.
+- The MCP [platform requirements](runtime.md#platform-support).
 - Python 3.10 or newer.
 - At least one phasesweep experiment config that already passes `phasesweep validate`.
 - A coding client with local stdio MCP support. Local use requires no API key or OAuth credential.
@@ -39,7 +39,7 @@ Scaffold a catalog next to your project:
 phasesweep init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated `catalog.yaml` only after every entry passes the server's startup checks. That validation provisions the configured `state_dir` and its `runs` and `logs` subdirectories immediately. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
+This stages an annotated `catalog.yaml`, applies the server's startup checks, and publishes it only after every entry passes. Startup validation provisions the configured `state_dir` and its `runs` and `logs` subdirectories immediately. Publication never overwrites an existing or concurrently created destination. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, and enable only the actions and parameter values the agent should receive. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
 
 Confirm the catalog loads before touching any client config:
 
@@ -47,7 +47,7 @@ Confirm the catalog loads before touching any client config:
 phasesweep mcp-check --catalog /abs/path/to/catalog.yaml
 ```
 
-Fix every reported failure before connecting a client. The command exits 0 only when the catalog and state directory pass the same checks used at server startup. A successful check provisions the configured state directory and its `runs` and `logs` subdirectories; it does not start the MCP server or a sweep.
+Fix every reported failure before connecting a client. The command exits 0 only when the catalog and state directory pass the same checks used at server startup; it does not start the MCP server or a sweep.
 
 ## 3. Connect your client
 
@@ -59,11 +59,11 @@ phasesweep install --agent claude --yes   # unattended; repeat --agent for more
 phasesweep install --agent claude --dry-run  # validate and show planned edits without writing
 ```
 
-`install` first confirms the MCP SDK from step 1 is available, then validates the catalog with the exact server startup rules before touching any client config (offering to scaffold one if it is missing), prints a plan of every file it will edit, and reports an outcome for each edit. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`.
+`install` first confirms the MCP SDK from step 1 is available, then validates the catalog with the exact server startup rules before touching any client config, prints a plan of every file it will edit, and reports an outcome for each edit. An interactive, non-dry-run install offers to scaffold a missing catalog; unattended and dry-run installs print the exact `init-catalog` command and exit without writing. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`.
 
 Automatic edits are limited to regular files at the expected target. Project-scoped paths must remain inside the project after symlink resolution, and direct symlink targets are refused. Successful writes use an atomic replacement in the target directory and preserve an existing file's permissions. Strict JSON configs may update or remove a `phasesweep` entry only when its shape is recognizable as installer-generated; a different pre-existing entry is reported as a conflict and left untouched. Commented JSON/JSON5, malformed containers, invalid TOML, and unmanaged Codex tables are also left untouched with a manual snippet where applicable.
 
-`--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project, so use `--catalog PATH` for any other name or location. Both `install` and `uninstall` accept `--dry-run`, which performs validation and reports `would-create`, `would-update`, or `would-remove` without writing or deleting client files. `phasesweep uninstall` removes only recognizable generated-shape JSON entries and marker-owned TOML or instruction blocks, then deletes a file if that removal leaves it empty. The shared `AGENTS.md` block records its Codex, Cursor, and opencode owners and remains in place until its last owner is uninstalled. Unmanaged same-name entries remain untouched and are reported for operator attention.
+`--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project, so use `--catalog PATH` for any other name or location. Both `install` and `uninstall` accept `--dry-run` and report `would-create`, `would-update`, or `would-remove` without writing or deleting client files. Install previews still validate an existing catalog; uninstall needs no catalog. `phasesweep uninstall` removes only recognizable generated-shape JSON entries and marker-owned TOML or instruction blocks, then deletes a file if that removal leaves it empty. The shared `AGENTS.md` block records its Codex, Cursor, and opencode owners and remains in place until its last owner is uninstalled. Unmanaged same-name entries remain untouched and are reported for operator attention.
 
 Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory.
 
@@ -181,5 +181,5 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
 - `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
 - Path or storage rejected at startup: follow the MCP [path and working-directory rules](mcp.md#paths-and-the-working-directory); catalogs support local-node SQLite and Journal storage, not in-memory or external RDB storage.
-- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` and repeat with `--confirm` only if the dry run reports confirmed cleanup.
+- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` to validate the saved identity and list the cleanup it would attempt. Repeat with `--confirm` only after reviewing that preflight; only the confirmed invocation attempts process cleanup and clears recovery state after cleanup is verified.
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.
