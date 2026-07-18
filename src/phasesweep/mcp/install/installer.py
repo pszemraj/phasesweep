@@ -54,6 +54,8 @@ Integration = Literal["mcp", "instructions"]
 
 _OK_ACTIONS: frozenset[str] = frozenset({"created", "updated", "unchanged", "removed", "not-found"})
 _CODEX_TABLE_HEADER = f"[mcp_servers.{SERVER_NAME}]"
+_INSTRUCTION_OWNERS_PREFIX = "<!-- PHASESWEEP_OWNERS: "
+_INSTRUCTION_OWNERS_SUFFIX = " -->"
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,57 @@ def _apply_mcp(
     return StepResult("mcp", spec.path, action, note=note)
 
 
+def _read_instruction_block(path: Path, valid_owner_ids: set[str]) -> tuple[set[str], str] | None:
+    """Read the owner set and prompt body from a managed instructions block.
+
+    :param Path path: Instructions file that may contain the managed block.
+    :param set[str] valid_owner_ids: Agent ids allowed to own this exact path.
+    :return tuple[set[str], str] | None: Owners and body, an empty pair when no
+        block exists, or ``None`` when the file or ownership metadata is unsafe
+        to edit automatically.
+    """
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return None
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return None
+    start_idx = existing.find(MARKDOWN_START)
+    end_idx = existing.find(MARKDOWN_END)
+    if start_idx == -1 and end_idx == -1:
+        return set(), ""
+    if start_idx == -1 or end_idx <= start_idx:
+        return None
+
+    body = existing[start_idx + len(MARKDOWN_START) : end_idx].removeprefix("\n")
+    owner_line, separator, prompt = body.partition("\n")
+    if (
+        not separator
+        or not owner_line.startswith(_INSTRUCTION_OWNERS_PREFIX)
+        or not owner_line.endswith(_INSTRUCTION_OWNERS_SUFFIX)
+    ):
+        return None
+    encoded = owner_line[len(_INSTRUCTION_OWNERS_PREFIX) : -len(_INSTRUCTION_OWNERS_SUFFIX)]
+    owner_ids = encoded.split(",") if encoded else []
+    owners = set(owner_ids)
+    if not owners or len(owners) != len(owner_ids) or not owners <= valid_owner_ids:
+        return None
+    return owners, prompt
+
+
+def _owned_instruction_content(owners: set[str], prompt: str) -> str:
+    """Render ownership metadata followed by the shared agent prompt.
+
+    :param set[str] owners: Agent ids that currently use this instructions block.
+    :param str prompt: Managed phasesweep instructions body.
+    :return str: Complete content to place between the marker fence.
+    """
+    owner_line = (
+        f"{_INSTRUCTION_OWNERS_PREFIX}{','.join(sorted(owners))}{_INSTRUCTION_OWNERS_SUFFIX}"
+    )
+    return f"{owner_line}\n{prompt}"
+
+
 def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepResult:
     """Apply or remove the instructions marker block for one target.
 
@@ -234,12 +287,44 @@ def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepR
             "error",
             note="refusing instructions path that resolves outside the project",
         )
+    valid_owner_ids = {
+        candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
+    }
+    block = _read_instruction_block(path, valid_owner_ids)
+    if block is None:
+        return StepResult(
+            "instructions",
+            path,
+            "error",
+            note="instructions block has missing or invalid ownership metadata",
+        )
+    owners, installed_prompt = block
     if mode == "uninstall":
+        if target.id not in owners:
+            return StepResult("instructions", path, "not-found")
+        owners.remove(target.id)
+        if owners:
+            action = replace_or_append_marked(
+                path,
+                _owned_instruction_content(owners, installed_prompt),
+                start=MARKDOWN_START,
+                end=MARKDOWN_END,
+            )
+            return StepResult(
+                "instructions",
+                path,
+                action,
+                note=f"retained for: {', '.join(sorted(owners))}",
+            )
         return StepResult(
             "instructions", path, remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END)
         )
+    owners.add(target.id)
     action = replace_or_append_marked(
-        path, agent_prompt_text(), start=MARKDOWN_START, end=MARKDOWN_END
+        path,
+        _owned_instruction_content(owners, agent_prompt_text()),
+        start=MARKDOWN_START,
+        end=MARKDOWN_END,
     )
     return StepResult("instructions", path, action)
 

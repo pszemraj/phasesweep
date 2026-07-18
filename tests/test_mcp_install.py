@@ -335,6 +335,32 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     assert not codex_config.exists()
 
 
+def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+    original = "# Project instructions\n"
+    instructions.write_text(original)
+
+    assert (
+        installer.run("install", project, None, ["codex", "cursor"], "instructions", yes=True) == 0
+    )
+    installed = instructions.read_text()
+    assert "<!-- PHASESWEEP_OWNERS: codex,cursor -->" in installed
+    assert not (project / ".cursor" / "mcp.json").exists()
+
+    capsys.readouterr()
+    assert installer.run("uninstall", project, None, ["cursor"], "instructions", yes=True) == 0
+    assert "retained for: codex" in capsys.readouterr().out
+    assert instructions.read_text() == installed.replace(
+        "<!-- PHASESWEEP_OWNERS: codex,cursor -->",
+        "<!-- PHASESWEEP_OWNERS: codex -->",
+    )
+
+    assert installer.run("uninstall", project, None, ["codex"], "instructions", yes=True) == 0
+    assert instructions.read_text() == original
+
+
 def test_installer_refuses_missing_server_command_before_edits(
     fake_home, tmp_path, capsys, monkeypatch
 ):
