@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -31,7 +32,7 @@ from phasesweep.mcp.install.targets import AGENT_IDS
 from phasesweep.mcp.registry import CatalogCheckReport, check_catalog, prepare_catalog_state
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import capture_result_snapshot, parse_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
@@ -225,10 +226,10 @@ def status(config_path: Path) -> None:
     name="mcp-recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for an MCP run with cleanup uncertainty. "
-        "Checks runner and trial cleanup; --confirm reaps stale trials before clearing uncertainty."
+        "Operator-only recovery for MCP cleanup uncertainty or failed terminal-result "
+        "finalization. --confirm performs the reported cleanup and snapshot repair actions."
     ),
-    short_help="Recover MCP cleanup uncertainty.",
+    short_help="Recover MCP cleanup or result finalization.",
 )
 @click.option(
     "--state-dir",
@@ -240,17 +241,17 @@ def status(config_path: Path) -> None:
 @click.option(
     "--confirm",
     is_flag=True,
-    help="Clear cleanup uncertainty after checks pass.",
+    help="Perform the reported cleanup and terminal-result repair actions.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover one MCP run with cleanup uncertainty after local host inspection.
+    """Recover one MCP run's cleanup uncertainty or terminal result snapshot.
 
     :param Path state_dir: MCP ``state_dir`` containing the run's ``runs/`` and
         ``logs/`` subdirectories.
     :param str run_id: Identifier of the MCP run to recover.
-    :param bool confirm: If True, reap stale RUNNING trials, persist cleanup
-        recovery evidence, and clear cleanup uncertainty. If False, only report
-        what a subsequent ``--confirm`` run would do.
+    :param bool confirm: If True, perform required cleanup and terminal-result
+        repair actions. If False, only report what a subsequent ``--confirm``
+        run would do.
     """
     if not sys.platform.startswith("linux"):
         raise click.ClickException(
@@ -274,26 +275,33 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
     )
     runner_without_status = handle.launch_state == "spawned" and terminal_status is None
-    needs_recovery = (
+    cleanup_recovery_needed = (
         store.cleanup_uncertain(handle) or terminal_cleanup_uncertain or runner_without_status
     )
-    if not needs_recovery:
-        click.echo("No cleanup uncertainty is recorded for this run.")
+    snapshot_repair_needed = (
+        terminal_status is not None and parse_result_snapshot(terminal_status) is None
+    )
+    if not cleanup_recovery_needed and not snapshot_repair_needed:
+        click.echo("No cleanup uncertainty or terminal result repair is needed for this run.")
         return
 
     identity = store.cleanup_identity(handle)
-    if identity.pid is not None and identity.pid_starttime is None:
+    if cleanup_recovery_needed and identity.pid is not None and identity.pid_starttime is None:
         raise click.ClickException(
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
     if _runner_appears_live(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
-    if confirm and not kill_stale_group(
-        identity.pid,
-        identity.pid_starttime,
-        pgid=identity.pgid,
-        grace_seconds=30.0,
+    if (
+        cleanup_recovery_needed
+        and confirm
+        and not kill_stale_group(
+            identity.pid,
+            identity.pid_starttime,
+            pgid=identity.pgid,
+            grace_seconds=30.0,
+        )
     ):
         raise click.ClickException("runner process-group cleanup is still uncertain")
 
@@ -305,7 +313,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     except OSError as exc:
         raise click.ClickException(f"cannot read run config snapshot: {snapshot}") from exc
     if hashlib.sha256(snapshot_bytes).hexdigest() != handle.config_sha256:
-        raise click.ClickException("run snapshot hash mismatch; refusing cleanup recovery")
+        raise click.ClickException("run snapshot hash mismatch; refusing recovery")
     config = load_config_bytes(snapshot_bytes, source=f"run snapshot {run_id}")
     if not isinstance(config, Experiment):
         raise click.ClickException("run snapshot is not a single experiment")
@@ -313,24 +321,25 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     reaped = 0
     cleanup_recovered = 0
     inspected_studies = 0
-    try:
-        for phase in config.phases:
-            study = _load_existing_phase_study(config, phase)
-            if study is None:
-                continue
-            inspected_studies += 1
-            if confirm:
-                cleanup_recovered += _recover_cleanup_uncertain_trials(
-                    study,
-                    config,
-                    phase.name,
-                )
-                reaped += _reap_stale_trials(study, config, phase.name)
-            else:
-                cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
-                reaped += _inspect_stale_running_trials(study, config, phase.name)
-    except RuntimeError as exc:
-        raise click.ClickException(str(exc)) from None
+    if cleanup_recovery_needed:
+        try:
+            for phase in config.phases:
+                study = _load_existing_phase_study(config, phase)
+                if study is None:
+                    continue
+                inspected_studies += 1
+                if confirm:
+                    cleanup_recovered += _recover_cleanup_uncertain_trials(
+                        study,
+                        config,
+                        phase.name,
+                    )
+                    reaped += _reap_stale_trials(study, config, phase.name)
+                else:
+                    cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
+                    reaped += _inspect_stale_running_trials(study, config, phase.name)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from None
     cleanup_evidence_count = reaped + cleanup_recovered
     if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
         if inspected_studies == 0:
@@ -346,52 +355,104 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         )
 
     if not confirm:
+        actions = []
+        if cleanup_recovery_needed:
+            actions.append(
+                "attempt runner process-group cleanup, "
+                f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
+                "cleanup-uncertain terminal trial(s)"
+            )
+        if snapshot_repair_needed or terminal_cleanup_uncertain or terminal_status is None:
+            actions.append("rebuild the terminal result snapshot")
         click.echo(
-            f"Recovery preflight for {run_id}: would attempt runner process-group cleanup, "
-            f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
-            "cleanup-uncertain terminal trial(s). Re-run with --confirm to perform "
-            "those actions and clear cleanup uncertainty."
+            f"Recovery preflight for {run_id}: would {' and '.join(actions)}. "
+            "Re-run with --confirm to perform those actions."
         )
         return
 
-    if terminal_cleanup_uncertain:
-        assert terminal_status is not None
-        terminal_status["result_snapshot"] = capture_result_snapshot(
-            config,
-            cleanup_confirmed=True,
-        )
-        write_status_file(store.status_path(run_id), terminal_status)
-    elif terminal_status is None:
+    if terminal_status is None:
         terminal_status = {
             "run_id": run_id,
             "returncode": 1,
             "error_class": "RunnerExitedWithoutStatus",
             "cleanup_confirmed": True,
             "ended_at": utc_now_iso(),
-            "result_snapshot": capture_result_snapshot(
-                config,
-                cleanup_confirmed=True,
-            ),
+            "result_snapshot_state": "pending",
         }
         write_status_file(store.status_path(run_id), terminal_status)
 
-    payload = {
-        "run_id": run_id,
-        "config_sha256": handle.config_sha256,
-        "recovered_at": utc_now_iso(),
-        "cleanup_confirmed": True,
-        "reaped_running_trials": reaped,
-        "cleanup_uncertain_terminal_trials": cleanup_recovered,
-    }
-    private_atomic_write_text(
-        store.cleanup_recovery_path(run_id),
-        json.dumps(payload, indent=2) + "\n",
-    )
-    store.clear_cleanup_uncertain(handle)
-    click.echo(
-        f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
-        f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
-    )
+    if cleanup_recovery_needed:
+        payload = {
+            "run_id": run_id,
+            "config_sha256": handle.config_sha256,
+            "recovered_at": utc_now_iso(),
+            "cleanup_confirmed": True,
+            "reaped_running_trials": reaped,
+            "cleanup_uncertain_terminal_trials": cleanup_recovered,
+        }
+        private_atomic_write_text(
+            store.cleanup_recovery_path(run_id),
+            json.dumps(payload, indent=2) + "\n",
+        )
+        store.clear_cleanup_uncertain(handle)
+        click.echo(
+            f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
+            f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
+        )
+
+    refresh_snapshot = snapshot_repair_needed or terminal_cleanup_uncertain or runner_without_status
+    if refresh_snapshot:
+        _repair_terminal_result_snapshot(
+            store,
+            run_id,
+            terminal_status,
+            config,
+            cleanup_confirmed=(
+                cleanup_recovery_needed or terminal_status.get("cleanup_confirmed") is True
+            ),
+        )
+
+    if refresh_snapshot:
+        click.echo(f"Rebuilt terminal result snapshot for {run_id}.")
+
+
+def _repair_terminal_result_snapshot(
+    store: RunStore,
+    run_id: str,
+    terminal_status: dict,
+    config: Experiment,
+    *,
+    cleanup_confirmed: bool,
+) -> None:
+    """Rebuild and atomically persist one terminal run's immutable results.
+
+    :param RunStore store: Existing run store containing the terminal status.
+    :param str run_id: Run whose terminal snapshot should be rebuilt.
+    :param dict terminal_status: Validated terminal process status to enrich.
+    :param Experiment config: Hash-verified per-run experiment config.
+    :param bool cleanup_confirmed: Whether RUNNING trials are terminal in reality.
+    :raises click.ClickException: If capture or persistence fails.
+    """
+    terminal_status.pop("result_snapshot", None)
+    terminal_status.pop("result_snapshot_error", None)
+    terminal_status["result_snapshot_state"] = "pending"
+    try:
+        write_status_file(store.status_path(run_id), terminal_status)
+        terminal_status["result_snapshot"] = capture_result_snapshot(
+            config,
+            cleanup_confirmed=cleanup_confirmed,
+        )
+        terminal_status["result_snapshot_state"] = "complete"
+        write_status_file(store.status_path(run_id), terminal_status)
+    except Exception as exc:  # noqa: BLE001 - convert operator repair failures to CLI errors
+        terminal_status.pop("result_snapshot", None)
+        terminal_status["result_snapshot_state"] = "failed"
+        terminal_status["result_snapshot_error"] = type(exc).__name__
+        with contextlib.suppress(Exception):
+            write_status_file(store.status_path(run_id), terminal_status)
+        raise click.ClickException(
+            f"failed to rebuild terminal result snapshot for {run_id}: {type(exc).__name__}"
+        ) from None
 
 
 def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:

@@ -250,6 +250,9 @@ def test_terminal_status_determines_state(
         {"run_id": "exp-1", "returncode": True},
         {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": "yes"},
         {"run_id": "exp-1", "returncode": 0, "error_class": 3},
+        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
+        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "complete"},
+        {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
     ],
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:

@@ -500,6 +500,20 @@ class RunStore:
         ended_at = payload.get("ended_at")
         if ended_at is not None and not isinstance(ended_at, str):
             return None
+        result_snapshot_state = payload.get("result_snapshot_state")
+        if result_snapshot_state is not None and result_snapshot_state not in {
+            "pending",
+            "complete",
+            "failed",
+        }:
+            return None
+        if result_snapshot_state == "complete" and not isinstance(
+            payload.get("result_snapshot"), dict
+        ):
+            return None
+        result_snapshot_error = payload.get("result_snapshot_error")
+        if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
+            return None
         return payload
 
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:

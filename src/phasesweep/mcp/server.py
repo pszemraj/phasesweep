@@ -1110,7 +1110,11 @@ class PhaseSweepMCP:
             return None
         snapshot = parse_result_snapshot(terminal_status)
         if snapshot is None:
-            raise RunResultSnapshotUnavailableError(run_id)
+            finalization_state = terminal_status.get("result_snapshot_state")
+            raise RunResultSnapshotUnavailableError(
+                run_id,
+                finalization_state if isinstance(finalization_state, str) else None,
+            )
         return snapshot
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> dict[str, Any]:

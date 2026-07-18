@@ -14,7 +14,9 @@ import hashlib
 import logging
 import os
 import sys
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
@@ -25,6 +27,11 @@ from phasesweep.runtime.process import (
     install_signal_handlers,
     read_proc_starttime,
 )
+
+if TYPE_CHECKING:
+    from phasesweep.config import Experiment
+
+_SNAPSHOT_RETRY_DELAYS_SECONDS = (0.25, 1.0)
 
 
 def _write_status(
@@ -44,10 +51,14 @@ def _write_status(
     # Persist cleanup evidence before reading storage. Snapshot capture can be
     # slow on a large or contended study, and the cancelling server may exhaust
     # its grace period and force-kill this runner while that read is in flight.
-    terminal = {**payload, "ended_at": utc_now_iso()}
+    terminal = {
+        **payload,
+        "ended_at": utc_now_iso(),
+        "result_snapshot_state": "pending",
+    }
     try:
         write_status_file(status_path, terminal)
-    except OSError:
+    except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
         logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
         return
 
@@ -55,26 +66,68 @@ def _write_status(
         from phasesweep.config import Experiment, load_config
 
         if _sha256_file(config_path) != config_sha256:
-            return
+            raise RuntimeError("config snapshot hash mismatch during result finalization")
         config = load_config(config_path)
         if not isinstance(config, Experiment):
-            return
-        terminal["result_snapshot"] = capture_result_snapshot(
+            raise RuntimeError("config snapshot is not an experiment during result finalization")
+        terminal["result_snapshot"] = _capture_result_snapshot_with_retry(
             config,
             cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
         )
-    except Exception:  # noqa: BLE001 - minimal terminal evidence is already durable
+    except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
+        terminal["result_snapshot_state"] = "failed"
+        terminal["result_snapshot_error"] = type(exc).__name__
         logging.getLogger("phasesweep.mcp.runner").exception(
             "failed to capture terminal result snapshot"
         )
-        return
+    else:
+        terminal["result_snapshot_state"] = "complete"
 
     try:
         write_status_file(status_path, terminal)
-    except OSError:
+    except Exception as exc:  # noqa: BLE001 - preserve a serializable failed finalization state
         logging.getLogger("phasesweep.mcp.runner").exception(
-            "failed to add result snapshot to status.json"
+            "failed to finalize result snapshot state in status.json"
         )
+        terminal.pop("result_snapshot", None)
+        terminal["result_snapshot_state"] = "failed"
+        terminal["result_snapshot_error"] = type(exc).__name__
+        try:
+            write_status_file(status_path, terminal)
+        except Exception:  # noqa: BLE001 - no further persistence fallback is available
+            logging.getLogger("phasesweep.mcp.runner").exception(
+                "failed to persist result snapshot finalization failure"
+            )
+
+
+def _capture_result_snapshot_with_retry(
+    config: Experiment,
+    *,
+    cleanup_confirmed: bool,
+) -> dict:
+    """Capture a terminal result snapshot with bounded retries.
+
+    :param Experiment config: Parsed experiment passed to :func:`capture_result_snapshot`.
+    :param bool cleanup_confirmed: Whether trainer process cleanup was confirmed.
+    :return dict: Captured path-free result snapshot.
+    :raises Exception: The final capture error after all attempts fail.
+    """
+    for attempt in range(len(_SNAPSHOT_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return capture_result_snapshot(
+                config,
+                cleanup_confirmed=cleanup_confirmed,
+            )
+        except Exception:  # noqa: BLE001 - retry transient storage/serialization failures
+            if attempt == len(_SNAPSHOT_RETRY_DELAYS_SECONDS):
+                raise
+            delay = _SNAPSHOT_RETRY_DELAYS_SECONDS[attempt]
+            logging.getLogger("phasesweep.mcp.runner").warning(
+                "terminal result snapshot capture failed; retrying in %.2fs",
+                delay,
+                exc_info=True,
+            )
+            time.sleep(delay)
 
 
 def _sha256_file(path: Path) -> str:

@@ -358,6 +358,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert calls == [("srv", None, False)]
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None
+    assert terminal["result_snapshot_state"] == "complete"
     assert terminal["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
     assert terminal["result_snapshot"]["winners"] == []
 
@@ -1335,6 +1336,62 @@ def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Pa
     assert result.exit_code != 0
     assert "Directory" in result.output
     assert not missing.exists()
+
+
+def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-result-repair"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="failed",
+        result_snapshot_error="RuntimeError",
+    )
+
+    with pytest.raises(Exception, match="finalization state: failed"):
+        app.status(run_id=run_id)
+
+    runner = CliRunner()
+    preflight = runner.invoke(
+        cli_main,
+        ["mcp-recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+    assert preflight.exit_code == 0, preflight.output
+    assert "would rebuild the terminal result snapshot" in preflight.output
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "failed"
+
+    confirmed = runner.invoke(
+        cli_main,
+        [
+            "mcp-recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "Rebuilt terminal result snapshot" in confirmed.output
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    assert "result_snapshot_error" not in terminal
+    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
 
 def test_operator_recovery_clears_terminal_cleanup_uncertainty(

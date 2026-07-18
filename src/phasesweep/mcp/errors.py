@@ -145,16 +145,18 @@ class RunSnapshotUnavailableError(McpToolError):
 class RunResultSnapshotUnavailableError(McpToolError):
     """Raised when a terminal run lacks its immutable result snapshot."""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, finalization_state: str | None = None) -> None:
         """Create a terminal-result-snapshot tool error.
 
         :param str run_id: MCP run id whose terminal result snapshot is unusable.
+        :param str | None finalization_state: Persisted snapshot finalization state, if known.
         """
+        state = f" (finalization state: {finalization_state})" if finalization_state else ""
         super().__init__(
-            f"terminal result snapshot for run {run_id!r} is unavailable or invalid; "
+            f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
             "retry once after a short delay in case finalization is still in progress. "
-            "If the error persists, report it to the operator; do not substitute "
-            "experiment-level results."
+            "If the error persists, the operator can repair it with phasesweep "
+            "mcp-recover-run; do not substitute experiment-level results."
         )
 
 

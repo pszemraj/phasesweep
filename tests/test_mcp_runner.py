@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import load_config
+from phasesweep.config import Experiment, load_config
 from phasesweep.engine import read_status
 from phasesweep.engine.state import _trial_dir_for
 from phasesweep.mcp import runner as mcp_runner
@@ -68,12 +68,16 @@ def test_runner_persists_terminal_evidence_before_snapshot_capture(
     config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
     observed: dict[str, object] = {}
+    attempts = 0
 
     def fail_snapshot(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
         observed.update(json.loads(status_path.read_text()))
         raise RuntimeError("snapshot read stalled")
 
     monkeypatch.setattr(mcp_runner, "capture_result_snapshot", fail_snapshot)
+    monkeypatch.setattr(mcp_runner.time, "sleep", lambda _delay: None)
     mcp_runner._write_status(
         status_path,
         {
@@ -89,7 +93,83 @@ def test_runner_persists_terminal_evidence_before_snapshot_capture(
     assert observed["error_class"] == "cancelled"
     assert observed["cleanup_confirmed"] is True
     assert "ended_at" in observed
-    assert json.loads(status_path.read_text()) == observed
+    assert observed["result_snapshot_state"] == "pending"
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "failed"
+    assert final["result_snapshot_error"] == "RuntimeError"
+    assert "result_snapshot" not in final
+    assert attempts == 3
+
+
+def test_runner_retries_terminal_snapshot_capture_to_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _slow_config(tmp_path)
+    status_path = tmp_path / "status.json"
+    real_capture = mcp_runner.capture_result_snapshot
+    attempts = 0
+    delays: list[float] = []
+
+    def transient_snapshot(
+        experiment: Experiment,
+        *,
+        cleanup_confirmed: bool,
+    ) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("storage temporarily busy")
+        return real_capture(experiment, cleanup_confirmed=cleanup_confirmed)
+
+    monkeypatch.setattr(mcp_runner, "capture_result_snapshot", transient_snapshot)
+    monkeypatch.setattr(mcp_runner.time, "sleep", delays.append)
+
+    mcp_runner._write_status(
+        status_path,
+        {
+            "run_id": "r0",
+            "returncode": 0,
+            "error_class": None,
+            "cleanup_confirmed": True,
+        },
+        config_path=config,
+        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    )
+
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "complete"
+    assert final["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
+    assert attempts == 3
+    assert delays == list(mcp_runner._SNAPSHOT_RETRY_DELAYS_SECONDS)
+
+
+def test_runner_records_snapshot_serialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _slow_config(tmp_path)
+    status_path = tmp_path / "status.json"
+    monkeypatch.setattr(
+        mcp_runner,
+        "capture_result_snapshot",
+        lambda *_args, **_kwargs: {"not_json": object()},
+    )
+
+    mcp_runner._write_status(
+        status_path,
+        {
+            "run_id": "r0",
+            "returncode": 0,
+            "error_class": None,
+            "cleanup_confirmed": True,
+        },
+        config_path=config,
+        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    )
+
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "failed"
+    assert final["result_snapshot_error"] == "TypeError"
+    assert "result_snapshot" not in final
 
 
 def test_runner_refuses_to_persist_handle_without_linux_process_identity(
@@ -166,6 +246,7 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     assert status["returncode"] == 143
     assert status["error_class"] == "cancelled"
     assert status["cleanup_confirmed"] is True
+    assert status["result_snapshot_state"] == "complete"
     assert status["result_snapshot"]["status"]["phases"][0]["trials"]["FAIL"] == 1
     assert status["result_snapshot"]["winners"] == []
     assert not _process_group_alive(trial_pgid)
