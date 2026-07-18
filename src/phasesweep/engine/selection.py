@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
-from phasesweep.engine.state import FEASIBLE_ATTR, Winner, constraint_attr
+from phasesweep.engine.state import FEASIBLE_ATTR, GATES_ATTR, Winner, constraint_attr
 
 WINNER_TIE_EPS = 1e-12
 
@@ -26,6 +27,7 @@ class SelectedTrial:
     params: dict[str, Any]
     metric: float
     constraints: dict[str, float] = field(default_factory=dict)
+    gates: list[dict[str, Any]] = field(default_factory=list)
 
 
 class NoFeasibleTrialError(RuntimeError):
@@ -50,7 +52,7 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
-        constraint readings).
+        constraint readings, and persisted evidence-gate results).
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
@@ -107,12 +109,23 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
     }
     selected_value = best.value
     assert selected_value is not None  # same invariant
+    raw_gates = best.user_attrs.get(GATES_ATTR)
+    gates: list[dict[str, Any]] = []
+    if isinstance(raw_gates, str) and raw_gates:
+        try:
+            parsed_gates = json.loads(raw_gates)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed_gates, list):
+                gates = [item for item in parsed_gates if isinstance(item, dict)]
 
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
         metric=float(selected_value),
         constraints=constraint_vals,
+        gates=gates,
     )
 
 

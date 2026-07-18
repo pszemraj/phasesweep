@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,7 +34,6 @@ from phasesweep.engine.state import (
     Winner,
     _phase_dir,
     _trial_dir_for,
-    _trial_gate_payload,
     _write_trials_csv,
     constraint_attr,
 )
@@ -90,18 +90,18 @@ class CsvSnapshotThrottle:
         self.last_write_at = now
 
 
-def _finished_trial_count(study: optuna.Study) -> int:
-    """Return the number of terminal trials in ``study``.
+def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the number of terminal trials in ``trials``.
 
     Args:
-        study: Optuna study whose trials are counted.
+        trials: Optuna trials whose states are counted.
 
     Returns:
         Count of trials whose state is finished (``COMPLETE``, ``FAIL``, or
         ``PRUNED``); ``RUNNING`` and ``WAITING`` trials are excluded.
 
     """
-    return sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    return sum(1 for trial in trials if trial.state.is_finished())
 
 
 def _composed_overrides(
@@ -191,7 +191,7 @@ def _run_phase(
         _reap_stale_trials(study, experiment, phase.name)
         _verify_fingerprint(study, experiment, phase, inherited_winners)
 
-    completed = sum(1 for t in study.get_trials(deepcopy=False) if t.state.is_finished())
+    completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)
     log.info(
         "phase=%s study=%s completed=%d remaining=%d n_jobs=%d",
@@ -444,7 +444,7 @@ def _run_phase(
                 )
             abort["flag"] = True
             study.stop()
-        finished = _finished_trial_count(study)
+        finished = _finished_trial_count(study.get_trials(deepcopy=False))
         now = time.monotonic()
         if csv_throttle.should_write(finished, now):
             with contextlib.suppress(Exception):
@@ -503,7 +503,7 @@ def _run_phase(
     _raise_if_hard_aborted()
 
     trials_after = study.get_trials(deepcopy=False)
-    finished_after = sum(1 for t in trials_after if t.state.is_finished())
+    finished_after = _finished_trial_count(trials_after)
     completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
     timeout_observed = deadline_exhausted["flag"] or (
         optimize_deadline is not None and time.monotonic() >= optimize_deadline
@@ -542,14 +542,13 @@ def _run_phase(
     # _save_winner independent of study state.
     selected = select_winner(study, experiment)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
-    gate_payload = _trial_gate_payload(study, selected.trial_number)
     winner = Winner(
         trial_number=selected.trial_number,
         params=selected.params,
         effective_overrides=effective,
         metric=selected.metric,
         constraints=selected.constraints,
-        gates=gate_payload,
+        gates=selected.gates,
         completion=completion,
         phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
     )

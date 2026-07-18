@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import json
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -250,30 +249,6 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
             for n in attr_names:
                 row[f"user_attr:{n}"] = t.user_attrs.get(n)
             writer.writerow(row)
-
-
-def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
-    """Load persisted gate result payload for a selected trial.
-
-    :param optuna.Study study: Study containing the selected trial.
-    :param int trial_number: Trial number whose gate payload should be loaded.
-    :return list[dict[str, Any]]: Valid gate result dictionaries, or an empty
-        list when missing or malformed.
-    """
-    for trial in study.get_trials(deepcopy=False):
-        if trial.number != trial_number:
-            continue
-        raw = trial.user_attrs.get(GATES_ATTR)
-        if not isinstance(raw, str) or not raw:
-            return []
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(data, list):
-            return []
-        return [item for item in data if isinstance(item, dict)]
-    return []
 
 
 def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> None:
