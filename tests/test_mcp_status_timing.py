@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
 from pathlib import Path
 
@@ -426,6 +427,40 @@ def test_await_run_unknown_run_id(tmp_path: Path) -> None:
     app, _registry, _store = make_mcp_app(catalog)
     with pytest.raises(Exception, match="unknown run id"):
         asyncio.run(app.await_run("missing"))
+
+
+def test_await_run_storage_read_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    target_id, status, run, result_source, resolved = app._read_status_target(
+        experiment_id=None,
+        run_id="r1",
+    )
+    assert run is not None
+    terminal_run = {**run, "state": "failed"}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_read(**_kwargs: object):
+        entered.set()
+        release.wait(timeout=2.0)
+        return target_id, status, terminal_run, result_source, resolved
+
+    monkeypatch.setattr(app, "_read_status_target", blocked_read)
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, release.set)
+        started = time.monotonic()
+
+        result = await app.await_run("r1")
+
+        assert time.monotonic() - started < 1.0
+        assert entered.is_set()
+        assert result["run"]["state"] == "failed"
+
+    asyncio.run(exercise())
 
 
 def test_await_run_is_cancellable_during_recheck_pause(tmp_path: Path) -> None:

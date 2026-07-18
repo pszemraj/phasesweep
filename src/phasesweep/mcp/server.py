@@ -864,7 +864,8 @@ class PhaseSweepMCP:
             deadline = time.monotonic() + timeout
             baseline: tuple[Any, ...] | None = None
             while True:
-                target_id, status, run, result_source, resolved = self._read_status_target(
+                target_id, status, run, result_source, resolved = await asyncio.to_thread(
+                    self._read_status_target,
                     experiment_id=None,
                     run_id=run_id,
                 )
