@@ -13,6 +13,7 @@ import contextlib
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -276,6 +277,12 @@ class RunStore:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None
+        try:
+            started_at = datetime.fromisoformat(handle.started_at)
+        except (TypeError, ValueError):
+            return None
+        if started_at.tzinfo is None:
+            return None
         if handle.launch_state == "launching":
             if (
                 handle.pid is not None
@@ -440,6 +447,27 @@ class RunStore:
                 return handle
         return None
 
+    def latest_run_for(self, experiment_id: str) -> RunHandle | None:
+        """Return the newest persisted handle for an experiment deterministically.
+
+        The result is computed from validated durable launch timestamps, with
+        ``run_id`` as a stable tie-breaker. This intentionally returns one
+        semantic answer rather than a list an agent would need to scan.
+
+        :param str experiment_id: Catalog id whose latest run should be found.
+        :return RunHandle | None: Newest persisted handle, or ``None`` when the
+            experiment has no recorded MCP runs.
+        """
+        matching = [
+            handle for handle in self.list_handles() if handle.experiment_id == experiment_id
+        ]
+        if not matching:
+            return None
+        return max(
+            matching,
+            key=lambda handle: (datetime.fromisoformat(handle.started_at), handle.run_id),
+        )
+
     def live_runs(self) -> list[RunHandle]:
         """Every currently-running handle across all experiments.
 
@@ -449,6 +477,18 @@ class RunStore:
         :return list[RunHandle]: All handles whose derived state is currently ``running``.
         """
         return [handle for handle in self.list_handles() if self.state(handle) == "running"]
+
+    def recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether operator cleanup recovery is required for a run.
+
+        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
+        :return bool: True when a server marker or terminal runner status still
+            records cleanup uncertainty without matching recovery evidence.
+        """
+        if self.cleanup_uncertain(handle):
+            return True
+        status = self._read_status(handle)
+        return status is not None and self._terminal_cleanup_uncertain(handle, status)
 
     def _read_status(self, handle: RunHandle) -> dict | None:
         """Read the runner-written terminal status payload.

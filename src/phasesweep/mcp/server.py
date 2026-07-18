@@ -63,6 +63,7 @@ log = logging.getLogger("phasesweep.mcp.server")
 SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 TOOL_LIST_EXPERIMENTS = "phasesweep_list_experiments"
 TOOL_VALIDATE_CONFIG = "phasesweep_validate_config"
+TOOL_GET_LATEST_RUN = "phasesweep_get_latest_run"
 TOOL_GET_STATUS = "phasesweep_get_status"
 TOOL_GET_WINNERS = "phasesweep_get_winners"
 TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
@@ -81,12 +82,11 @@ POLL_DEFAULT_SECONDS = 30
 POLL_MIN_SECONDS = 15
 POLL_MAX_SECONDS = 600
 # await_run blocks server-side so one call replaces dozens of polls; the cap
-# keeps a response inside common client tool timeouts, and the recheck interval
-# bounds how stale a change notification can be.
+# keeps a response inside common client tool timeouts. Rechecks use the same
+# observed trial-duration guidance returned by get_status.
 AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
 AWAIT_MIN_TIMEOUT_SECONDS = 5
 AWAIT_MAX_TIMEOUT_SECONDS = 600
-AWAIT_RECHECK_SECONDS = 5.0
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -102,6 +102,12 @@ DESCRIPTION_VALIDATE_CONFIG = (
     "authorized capabilities plus per-phase names, trial counts, "
     "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
     f"Call this before every {TOOL_LAUNCH_SWEEP}."
+)
+DESCRIPTION_GET_LATEST_RUN = (
+    "Return the single most recently launched MCP run for one catalog experiment, or "
+    "found=false if none exists. Read-only. Use after reconnecting or when a prior run_id "
+    f"was lost; this computes the newest run so you must not scan or rank a list. Then use "
+    f"the returned run_id with {TOOL_AWAIT_RUN}, {TOOL_GET_STATUS}, or {TOOL_GET_WINNERS}."
 )
 DESCRIPTION_LAUNCH_SWEEP = (
     "Start an experiment's sweep as a detached background run that survives this "
@@ -135,8 +141,9 @@ DESCRIPTION_GET_WINNERS = (
 )
 DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "
-    "unwanted active sweep. If cleanup_confirmed is false, report it to the user; "
-    "recovery is operator-only and no MCP tool can clear it."
+    "unwanted active sweep. If recovery_required is true, report it to the user; "
+    "recovery is operator-only and no MCP tool can clear it. Repeating a cancel "
+    "is safe but does not replace operator recovery."
 )
 DESCRIPTION_AWAIT_RUN = (
     "Wait for a launched run to change. Blocks up to timeout_seconds (default "
@@ -145,7 +152,8 @@ DESCRIPTION_AWAIT_RUN = (
     "otherwise returns the current status at timeout — if the state is still "
     "running, call again with the same run_id. Returns the same payload as "
     f"{TOOL_GET_STATUS} plus changed and reason (terminal / phase_completed / "
-    f"timeout). Read-only. Prefer this over polling {TOOL_GET_STATUS} in a loop."
+    f"timeout). Read-only. Internal rechecks use observed trial duration rather than "
+    f"a tight fixed loop. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
 
 ExperimentId = Annotated[
@@ -281,6 +289,20 @@ class RunPayload(_ToolPayload):
     run_id: RunId
     state: RunState
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
+    recovery_required: bool = Field(
+        description=(
+            "True when cleanup is uncertain and only the operator can run "
+            "phasesweep mcp-recover-run; the run remains state=running until recovery."
+        )
+    )
+
+
+class GetLatestRunResult(_ToolPayload):
+    """Newest durable run handle for one experiment."""
+
+    experiment_id: ExperimentId
+    found: bool = Field(description="Whether any MCP run is recorded for this experiment.")
+    run: RunPayload | None
 
 
 class PhaseStatusPayload(_ToolPayload):
@@ -405,6 +427,9 @@ class CancelSweepResult(_ToolPayload):
         description=(
             "Whether runner cleanup was fully confirmed; null when the run was already terminal."
         ),
+    )
+    recovery_required: bool = Field(
+        description="Whether operator-only cleanup recovery is required after this call."
     )
 
 
@@ -723,6 +748,52 @@ class PhaseSweepMCP:
         )
         return result
 
+    def latest_run(self, experiment_id: str) -> dict[str, Any]:
+        """Return the newest durable MCP run for one catalog experiment.
+
+        :param str experiment_id: Catalog id whose latest run should be resolved.
+        :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
+        """
+        args = {"experiment_id": experiment_id}
+        resolved: dict[str, Any] = {}
+        try:
+            reg = self._registry.get(experiment_id)
+            resolved["experiment_id"] = reg.id
+            handle = self._runs.latest_run_for(reg.id)
+            run = self._run_payload(handle) if handle is not None else None
+            if handle is not None:
+                resolved["run_id"] = handle.run_id
+            result = {
+                "experiment_id": reg.id,
+                "found": run is not None,
+                "run": run,
+            }
+        except Exception as exc:
+            self._audit_error(TOOL_GET_LATEST_RUN, args, exc, resolved=resolved)
+            raise
+        self._audit_success(
+            TOOL_GET_LATEST_RUN,
+            args,
+            resolved=resolved,
+            state_after={"run_state": run["state"]} if run is not None else None,
+            result_counts={"runs": int(run is not None)},
+        )
+        return result
+
+    def _run_payload(self, handle: RunHandle) -> dict[str, Any]:
+        """Build one agent-visible run state with explicit recovery metadata.
+
+        :param RunHandle handle: Persisted run handle to derive.
+        :return dict[str, Any]: Run id, state, launch timestamp, and recovery flag.
+        """
+        state = self._runs.state(handle)
+        return {
+            "run_id": handle.run_id,
+            "state": state,
+            "started_at": handle.started_at,
+            "recovery_required": self._runs.recovery_required(handle),
+        }
+
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
         """Per-phase trial counts and winner presence plus the run process state.
 
@@ -805,9 +876,8 @@ class PhaseSweepMCP:
                 elif time.monotonic() >= deadline:
                     reason = "timeout"
                 else:
-                    await self._sleep(
-                        min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
-                    )
+                    recheck_seconds = _poll_after_seconds(status.get("median_trial_seconds"))
+                    await self._sleep(min(recheck_seconds, max(0.0, deadline - time.monotonic())))
                     continue
                 break
             result = self._status_result(target_id, status, run, result_source)
@@ -914,11 +984,7 @@ class PhaseSweepMCP:
             experiment = self._load_run_experiment(handle)
             run = None
             if include_run:
-                run = {
-                    "run_id": run_id,
-                    "state": self._runs.state(handle),
-                    "started_at": handle.started_at,
-                }
+                run = self._run_payload(handle)
             return handle.experiment_id, experiment, run, resolved
 
         assert experiment_id is not None
@@ -928,11 +994,7 @@ class PhaseSweepMCP:
         if live is not None:
             resolved["run_id"] = live.run_id
         experiment = self._load_run_experiment(live) if live is not None else reg.experiment
-        run = (
-            {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
-            if include_run and live is not None
-            else None
-        )
+        run = self._run_payload(live) if include_run and live is not None else None
         return reg.id, experiment, run, resolved
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
@@ -1176,15 +1238,27 @@ class PhaseSweepMCP:
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
             before = self._runs.state(handle)
-            state_before = {"run_state": before}
+            recovery_required = self._runs.recovery_required(handle)
+            state_before = {
+                "run_state": before,
+                "recovery_required": recovery_required,
+            }
             if before != "running":
-                result = {"run_id": run_id, "state": before}  # already terminal
+                result = {
+                    "run_id": run_id,
+                    "state": before,
+                    "cleanup_confirmed": None,
+                    "recovery_required": recovery_required,
+                }
                 self._audit_success(
                     TOOL_CANCEL_SWEEP,
                     args,
                     resolved=resolved,
                     state_before=state_before,
-                    state_after={"run_state": before},
+                    state_after={
+                        "run_state": before,
+                        "recovery_required": recovery_required,
+                    },
                     result_counts={"runs": 1},
                 )
                 return result
@@ -1214,7 +1288,13 @@ class PhaseSweepMCP:
             if confirmed:
                 self._runs.clear_cleanup_uncertain(handle)
             after = self._runs.state(handle)
-            result = {"run_id": run_id, "state": after, "cleanup_confirmed": confirmed}
+            recovery_required = self._runs.recovery_required(handle)
+            result = {
+                "run_id": run_id,
+                "state": after,
+                "cleanup_confirmed": confirmed,
+                "recovery_required": recovery_required,
+            }
         except Exception as exc:
             self._audit_error(
                 TOOL_CANCEL_SWEEP,
@@ -1229,7 +1309,11 @@ class PhaseSweepMCP:
             args,
             resolved=resolved,
             state_before=state_before,
-            state_after={"run_state": after, "cleanup_confirmed": confirmed},
+            state_after={
+                "run_state": after,
+                "cleanup_confirmed": confirmed,
+                "recovery_required": recovery_required,
+            },
             result_counts={"runs": 1},
         )
         return result
@@ -1500,9 +1584,9 @@ def _launch_annotations() -> Any:
     return ToolAnnotations(
         title="Launch Sweep",
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
-        openWorldHint=False,
+        openWorldHint=True,
     )
 
 
@@ -1517,7 +1601,7 @@ def _cancel_annotations() -> Any:
         title="Cancel Sweep",
         readOnlyHint=False,
         destructiveHint=True,
-        idempotentHint=False,
+        idempotentHint=True,
         openWorldHint=False,
     )
 
@@ -1612,6 +1696,21 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :return ValidateConfigResult: Structured validation payload.
         """
         return ValidateConfigResult.model_validate(app.validate(experiment_id))
+
+    @mcp.tool(
+        name=TOOL_GET_LATEST_RUN,
+        description=DESCRIPTION_GET_LATEST_RUN,
+        annotations=_read_annotations("Get Latest Run"),
+        structured_output=True,
+    )
+    @_safe_tool
+    def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
+        """Return the newest recorded MCP run for one experiment, already selected by launch time.
+
+        :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
+        :return GetLatestRunResult: One computed run handle or ``found=false``.
+        """
+        return GetLatestRunResult.model_validate(app.latest_run(experiment_id))
 
     @mcp.tool(
         name=TOOL_GET_STATUS,
@@ -1748,7 +1847,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the seven tools over stdio.
+    """Load the catalog, build the run store, and serve the eight tools over stdio.
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or

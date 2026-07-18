@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -173,6 +173,8 @@ def test_persisted_handle_omits_derived_store_paths(tmp_path: Path) -> None:
         ("pid_starttime", 0),
         ("pid_starttime", "123"),
         ("launch_state", "bogus"),
+        ("started_at", "not-a-timestamp"),
+        ("started_at", "2026-07-17T12:00:00"),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
@@ -196,6 +198,25 @@ def test_launching_handle_cannot_have_process_identity(
 
     assert store.get("exp-1") is None
     assert store.list_handles() == []
+
+
+def test_latest_run_for_computes_newest_with_stable_tiebreaker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    older = replace(
+        make_run_handle(store, run_id="srv-z", experiment_id="srv"),
+        started_at="2026-07-17T12:00:00+00:00",
+    )
+    newer_a = replace(
+        make_run_handle(store, run_id="srv-a", experiment_id="srv"),
+        started_at="2026-07-17T13:00:00+00:00",
+    )
+    newer_b = replace(newer_a, run_id="srv-b")
+    unrelated = replace(newer_a, run_id="other-a", experiment_id="other")
+    for handle in (newer_b, unrelated, older, newer_a):
+        store.save(handle)
+
+    assert store.latest_run_for("srv") == newer_b
+    assert store.latest_run_for("missing") is None
 
 
 def test_state_succeeded_from_status(tmp_path: Path) -> None:

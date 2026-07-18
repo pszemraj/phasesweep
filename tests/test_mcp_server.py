@@ -724,6 +724,34 @@ def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
         app.validate("srv")
 
 
+def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config))
+
+    assert app.latest_run("srv") == {
+        "experiment_id": "srv",
+        "found": False,
+        "run": None,
+    }
+
+    handle = make_run_handle(
+        store,
+        run_id="srv-current",
+        experiment_id=registry.get("srv").id,
+        config_sha256=registry.get("srv").config_sha256,
+    )
+    store.save(handle)
+
+    result = app.latest_run("srv")
+    assert result["found"] is True
+    assert result["run"] == {
+        "run_id": handle.run_id,
+        "state": "running",
+        "started_at": handle.started_at,
+        "recovery_required": False,
+    }
+
+
 def test_audit_log_records_success_and_error_without_sensitive_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -972,7 +1000,12 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
 
     result = app.cancel(run_id)
 
-    assert result == {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
+    assert result == {
+        "run_id": run_id,
+        "state": "cancelled",
+        "cleanup_confirmed": True,
+        "recovery_required": False,
+    }
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
@@ -1022,7 +1055,12 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
 
     result = app.cancel(run_id)
 
-    assert result == {"run_id": run_id, "state": "running", "cleanup_confirmed": False}
+    assert result == {
+        "run_id": run_id,
+        "state": "running",
+        "cleanup_confirmed": False,
+        "recovery_required": True,
+    }
     assert store.cleanup_uncertain_path(run_id).is_file()
 
     stale_handle = make_run_handle(
@@ -1059,7 +1097,12 @@ def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
 
     result = app.cancel(run_id)
 
-    assert result == {"run_id": run_id, "state": "running", "cleanup_confirmed": False}
+    assert result == {
+        "run_id": run_id,
+        "state": "running",
+        "cleanup_confirmed": False,
+        "recovery_required": True,
+    }
     assert store.cleanup_uncertain_path(run_id).is_file()
     assert not store.status_path(run_id).exists()
 
@@ -1097,7 +1140,12 @@ def test_cancel_requires_runner_status_cleanup_confirmation(
 
     result = app.cancel(run_id)
 
-    assert result == {"run_id": run_id, "state": "running", "cleanup_confirmed": False}
+    assert result == {
+        "run_id": run_id,
+        "state": "running",
+        "cleanup_confirmed": False,
+        "recovery_required": True,
+    }
     assert store.cleanup_uncertain_path(run_id).is_file()
 
 
@@ -1132,7 +1180,12 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
 
     result = app.cancel(run_id)
 
-    assert result == {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
+    assert result == {
+        "run_id": run_id,
+        "state": "cancelled",
+        "cleanup_confirmed": True,
+        "recovery_required": False,
+    }
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 

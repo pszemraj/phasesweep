@@ -61,7 +61,8 @@ class UnknownRunError(McpToolError):
         """
         super().__init__(
             f"unknown run id {run_id!r}; use the exact run_id returned by "
-            "phasesweep_launch_sweep. If it was lost, report that to the user."
+            "phasesweep_launch_sweep. If it was lost, call phasesweep_get_latest_run "
+            "with the experiment id instead of launching a replacement."
         )
 
 

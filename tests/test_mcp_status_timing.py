@@ -20,7 +20,6 @@ from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
-    AWAIT_RECHECK_SECONDS,
     POLL_DEFAULT_SECONDS,
     POLL_MAX_SECONDS,
     POLL_MIN_SECONDS,
@@ -378,7 +377,7 @@ def test_await_run_returns_when_phase_gains_winner(
     assert result["run"]["state"] == "running"
     assert result["phases"][0]["winner_present"] is True
     # The winner appeared after one recheck pause, well before the timeout.
-    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
+    assert clock["now"] == pytest.approx(POLL_DEFAULT_SECONDS)
 
 
 def test_await_run_returns_when_run_fails_mid_wait(
@@ -409,7 +408,7 @@ def test_await_run_returns_when_run_fails_mid_wait(
     assert result["reason"] == "terminal"
     assert result["changed"] is True
     assert result["run"]["state"] == "failed"
-    assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
+    assert clock["now"] == pytest.approx(POLL_DEFAULT_SECONDS)
 
 
 def test_terminal_run_read_refuses_mutable_fallback_without_snapshot(tmp_path: Path) -> None:

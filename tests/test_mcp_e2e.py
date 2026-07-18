@@ -21,6 +21,7 @@ from phasesweep.mcp.server import (
     PROMPT_RUN_AND_MONITOR,
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_SWEEP,
+    TOOL_GET_LATEST_RUN,
     TOOL_GET_STATUS,
     TOOL_GET_WINNERS,
     TOOL_LAUNCH_SWEEP,
@@ -263,7 +264,7 @@ def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
     assert app.status(experiment_id="e2e_lm")["run"] is None
 
 
-def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
+def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
     import asyncio
 
@@ -276,6 +277,7 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
         TOOL_VALIDATE_CONFIG,
+        TOOL_GET_LATEST_RUN,
         TOOL_GET_STATUS,
         TOOL_AWAIT_RUN,
         TOOL_GET_WINNERS,
@@ -313,6 +315,7 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert timeout_schema["minimum"] == AWAIT_MIN_TIMEOUT_SECONDS
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
     assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
+    assert schemas[TOOL_GET_LATEST_RUN]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
     assert schemas[TOOL_LIST_EXPERIMENTS]["properties"]["limit"]["default"] == DEFAULT_LIST_LIMIT
@@ -322,8 +325,10 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
     assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
     assert annotations[TOOL_LAUNCH_SWEEP].readOnlyHint is False
-    assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is False
+    assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is True
+    assert annotations[TOOL_LAUNCH_SWEEP].openWorldHint is True
     assert annotations[TOOL_CANCEL_SWEEP].destructiveHint is True
+    assert annotations[TOOL_CANCEL_SWEEP].idempotentHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
@@ -332,6 +337,8 @@ def test_fastmcp_registers_seven_tools(tmp_path: Path) -> None:
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
+    assert "found" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
+    assert "run" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_WINNERS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_WINNERS])
 
@@ -363,7 +370,12 @@ def test_fastmcp_cancel_does_not_block_concurrent_await(
     awaited = app.status(experiment_id="e2e_lm")
     awaited.update(
         {
-            "run": {"run_id": "r1", "state": "running", "started_at": utc_now_iso()},
+            "run": {
+                "run_id": "r1",
+                "state": "running",
+                "started_at": utc_now_iso(),
+                "recovery_required": False,
+            },
             "elapsed_seconds": 0,
             "changed": False,
             "reason": "timeout",
@@ -377,7 +389,12 @@ def test_fastmcp_cancel_does_not_block_concurrent_await(
 
     def blocking_cancel(run_id: str) -> dict:
         time.sleep(0.3)
-        return {"run_id": run_id, "state": "cancelled", "cleanup_confirmed": True}
+        return {
+            "run_id": run_id,
+            "state": "cancelled",
+            "cleanup_confirmed": True,
+            "recovery_required": False,
+        }
 
     monkeypatch.setattr(app, "await_run", quick_await)
     monkeypatch.setattr(app, "cancel", blocking_cancel)

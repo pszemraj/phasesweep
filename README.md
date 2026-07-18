@@ -71,7 +71,7 @@ Follow [MCP agent setup](docs/mcp_setup.md) to install the server, create and pr
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
 - [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
-- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the seven tools, security model, single-host operation.
+- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, the eight tools, security model, single-host operation.
 - [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - install the `[mcp]` extra, write and preflight a catalog, connect your clients with `phasesweep install`, verify, instruct the agent.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
 - [Development](docs/development.md): test commands and test-suite map.
