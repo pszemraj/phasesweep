@@ -17,7 +17,8 @@ from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
 from phasesweep.engine.guards import (
-    _confirm_stale_running_trials,
+    _inspect_cleanup_uncertain_trials,
+    _inspect_stale_running_trials,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
 )
@@ -37,6 +38,7 @@ from phasesweep.runtime.process import (
     is_pid_zombie,
     is_same_process,
     kill_stale_group,
+    read_proc_starttime,
 )
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -230,7 +232,7 @@ def status(config_path: Path) -> None:
 @click.option(
     "--state-dir",
     required=True,
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="MCP state_dir containing runs/ and logs/.",
 )
 @click.option("--run-id", required=True, help="MCP run id to recover.")
@@ -249,7 +251,20 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         recovery evidence, and clear cleanup uncertainty. If False, only report
         what a subsequent ``--confirm`` run would do.
     """
-    store = RunStore(state_dir)
+    if not sys.platform.startswith("linux"):
+        raise click.ClickException(
+            "MCP recovery is supported only on Linux because safe process cleanup "
+            "requires /proc process identities"
+        )
+    if read_proc_starttime(os.getpid()) is None:
+        raise click.ClickException(
+            "MCP recovery cannot read this process's Linux /proc start time; "
+            "mount /proc with process stat access before retrying"
+        )
+    try:
+        store = RunStore.open_existing(state_dir)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
     handle = store.get(run_id)
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
@@ -257,15 +272,23 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     terminal_cleanup_uncertain = (
         terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
     )
-    needs_recovery = store.cleanup_uncertain(handle) or terminal_cleanup_uncertain
+    runner_without_status = handle.launch_state == "spawned" and terminal_status is None
+    needs_recovery = (
+        store.cleanup_uncertain(handle) or terminal_cleanup_uncertain or runner_without_status
+    )
     if not needs_recovery:
         click.echo("No cleanup uncertainty is recorded for this run.")
         return
 
     identity = store.cleanup_identity(handle)
+    if identity.pid is not None and identity.pid_starttime is None:
+        raise click.ClickException(
+            "runner process identity has no Linux /proc start time; refusing automated "
+            "recovery because PID reuse cannot be ruled out"
+        )
     if _runner_appears_live(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
-    if not kill_stale_group(
+    if confirm and not kill_stale_group(
         identity.pid,
         identity.pid_starttime,
         pgid=identity.pgid,
@@ -295,16 +318,16 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             if study is None:
                 continue
             inspected_studies += 1
-            cleanup_recovered += _recover_cleanup_uncertain_trials(
-                study,
-                config,
-                phase.name,
-                consume=confirm,
-            )
             if confirm:
+                cleanup_recovered += _recover_cleanup_uncertain_trials(
+                    study,
+                    config,
+                    phase.name,
+                )
                 reaped += _reap_stale_trials(study, config, phase.name)
             else:
-                reaped += _confirm_stale_running_trials(study, config, phase.name)
+                cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
+                reaped += _inspect_stale_running_trials(study, config, phase.name)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from None
     cleanup_evidence_count = reaped + cleanup_recovered
@@ -323,9 +346,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
     if not confirm:
         click.echo(
-            f"Cleanup appears confirmed for {run_id}; would reap {reaped} stale trial(s) "
-            f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s). "
-            "Re-run with --confirm to clear cleanup uncertainty."
+            f"Recovery preflight for {run_id}: would attempt runner process-group cleanup, "
+            f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
+            "cleanup-uncertain terminal trial(s). Re-run with --confirm to perform "
+            "those actions and clear cleanup uncertainty."
         )
         return
 
@@ -335,6 +359,19 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             config,
             cleanup_confirmed=True,
         )
+        write_status_file(store.status_path(run_id), terminal_status)
+    elif terminal_status is None:
+        terminal_status = {
+            "run_id": run_id,
+            "returncode": 1,
+            "error_class": "RunnerExitedWithoutStatus",
+            "cleanup_confirmed": True,
+            "ended_at": utc_now_iso(),
+            "result_snapshot": capture_result_snapshot(
+                config,
+                cleanup_confirmed=True,
+            ),
+        }
         write_status_file(store.status_path(run_id), terminal_status)
 
     payload = {

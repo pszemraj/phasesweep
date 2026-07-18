@@ -400,14 +400,12 @@ def _trial_dir_for_reaping(
     return Path(stored)
 
 
-def _confirm_or_reap_stale_trials(
+def _reap_stale_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
-    *,
-    reap: bool,
 ) -> int:
-    """Confirm cleanup for RUNNING trials and optionally mark them failed.
+    """Mark RUNNING trials as FAIL after killing orphaned process groups.
 
     Args:
         study: Optuna study whose RUNNING trials are inspected for stale
@@ -416,15 +414,10 @@ def _confirm_or_reap_stale_trials(
             when its ``phasesweep_trial_dir`` user attribute is missing.
         phase_name: Name of the phase being recovered, used to resolve the
             fallback trial directory.
-        reap: If True, mark each RUNNING trial with confirmed-clean stale
-            processes as FAIL (recording cleanup recovery evidence first if
-            the trial was previously cleanup-uncertain). If False, only
-            confirm the stale processes are gone without changing Optuna
-            trial state.
 
     Returns:
-        The number of RUNNING trials whose stale-process cleanup was
-        confirmed (and, when ``reap`` is True, successfully marked FAIL).
+        The number of RUNNING trials whose stale-process cleanup was confirmed
+        and whose state was persisted as FAIL.
 
     Raises:
         ProcessCleanupUncertainError: A RUNNING trial's stale process group
@@ -444,9 +437,8 @@ def _confirm_or_reap_stale_trials(
         if identity.pid is not None or identity.pgid is not None:
             safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
             if not safe_to_fail:
-                action = "mark RUNNING trial" if reap else "confirm cleanup for RUNNING trial"
                 raise ProcessCleanupUncertainError(
-                    f"Refusing to {action} {trial.number}: stale process cleanup "
+                    f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
                     f"could not prove the process group is gone. trial_dir={trial_dir} "
                     f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
                     "process may still be holding GPU memory. Investigate "
@@ -461,35 +453,28 @@ def _confirm_or_reap_stale_trials(
                 identity.pgid,
             )
 
-        if reap:
-            if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
-                _record_cleanup_recovery(study, trial)
-            try:
-                study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Stale process cleanup completed for RUNNING trial {trial.number}, "
-                    f"but Optuna state could not be updated to FAIL. Refusing to continue "
-                    f"with an inconsistent study. trial_dir={trial_dir}"
-                ) from exc
+        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
+            _record_cleanup_recovery(study, trial)
+        try:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Stale process cleanup completed for RUNNING trial {trial.number}, "
+                f"but Optuna state could not be updated to FAIL. Refusing to continue "
+                f"with an inconsistent study. trial_dir={trial_dir}"
+            ) from exc
 
-            log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
-        else:
-            log.warning(
-                "Confirmed cleanup for stale RUNNING trial %d in study %s",
-                trial.number,
-                study.study_name,
-            )
+        log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
         count += 1
     return count
 
 
-def _confirm_stale_running_trials(
+def _inspect_stale_running_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
 ) -> int:
-    """Confirm cleanup evidence for RUNNING trials without changing Optuna state.
+    """Count stale RUNNING trials without signaling processes or writing state.
 
     Used by ``mcp-recover-run`` preflight mode. The follow-up ``--confirm`` call
     must still find the same RUNNING trials so it can reap them and persist
@@ -504,48 +489,18 @@ def _confirm_stale_running_trials(
             fallback trial directory.
 
     Returns:
-        The number of RUNNING trials whose stale-process cleanup was
-        confirmed.
+        The number of RUNNING trials a confirmed recovery would inspect and
+        mark failed after process cleanup.
 
     """
-    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=False)
-
-
-def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: str) -> int:
-    """Mark RUNNING trials as FAIL on startup, killing orphaned process groups.
-
-    Uses the per-trial identity files left by ``run_supervised`` (review v0.5.2 /
-    blocker 7): pid + starttime for the safe path, pgid as the fallback when the
-    root PID has exited but descendants are still alive.
-
-    The trial directory is normally loaded from the trial's
-    ``phasesweep_trial_dir`` user attribute (review v0.5.3 / blocker 4) so the
-    reaper works correctly even if the user changed ``experiment.workdir`` or
-    invoked phasesweep from a different cwd. If that attr is absent, the trial
-    died before the current launch path could start a subprocess, so the reaper
-    falls back to the canonical trial directory and marks the trial failed.
-
-    **Fail-closed contract** (review v0.5.7 / blocker 2): if
-    :func:`kill_stale_group` returns ``False`` we cannot prove the leaked
-    process group is gone. Marking the trial ``FAIL`` would let new trials
-    schedule onto a GPU still held by the leaked process. We raise a
-    ``ProcessCleanupUncertainError`` instead so the operator sees a loud failure and can investigate manually. Pre-v0.5.8 we logged the survivor and continued.
-
-    Args:
-        study: Optuna study for the phase being recovered.
-        experiment: Parsed experiment.
-        phase_name: Name of the phase being recovered.
-
-    Returns:
-        The number of RUNNING trials successfully reaped (i.e. cleanup
-        confirmed AND ``study.tell(...FAIL)`` succeeded).
-
-    Raises:
-        ProcessCleanupUncertainError: Cleanup of a stale process group could not be confirmed.
-        RuntimeError: ``study.tell`` could not persist the FAIL state after cleanup was confirmed.
-
-    """
-    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=True)
+    count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+        read_stale_process_identity(trial_dir)
+        count += 1
+    return count
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
@@ -615,8 +570,6 @@ def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
-    *,
-    consume: bool = True,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
 
@@ -628,7 +581,6 @@ def _recover_cleanup_uncertain_trials(
     :param optuna.Study study: Existing Optuna study for the phase being recovered.
     :param Experiment experiment: Parsed experiment, used for diagnostics.
     :param str phase_name: Name of the phase being recovered.
-    :param bool consume: When true, mark recovered trial evidence as consumed.
     :return int: Number of cleanup-uncertain terminal trials confirmed clean.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
@@ -659,9 +611,8 @@ def _recover_cleanup_uncertain_trials(
                 f"experiment={experiment.experiment} phase={phase_name} "
                 f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
             )
-        if consume:
-            _record_cleanup_recovery(study, trial)
-            recovered_trial_numbers.add(trial.number)
+        _record_cleanup_recovery(study, trial)
+        recovered_trial_numbers.add(trial.number)
         recovered += 1
         log.warning(
             "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
@@ -672,6 +623,35 @@ def _recover_cleanup_uncertain_trials(
             identity.pgid,
         )
     return recovered
+
+
+def _inspect_cleanup_uncertain_trials(study: optuna.Study) -> int:
+    """Count recoverable terminal cleanup evidence without signals or writes.
+
+    :param optuna.Study study: Existing study inspected by recovery preflight.
+    :return int: Number of unconsumed terminal trials that record cleanup uncertainty.
+    :raises ProcessCleanupUncertainError: A trial lacks the persisted identity
+        required for a safe confirmed recovery.
+    """
+    count = 0
+    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
+    for trial in study.get_trials(deepcopy=False):
+        if not trial.state.is_finished():
+            continue
+        if trial.number in recovered_trial_numbers:
+            continue
+        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
+            continue
+        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+        identity = read_stale_process_identity(trial_dir)
+        if identity.pid is None and identity.pgid is None:
+            raise ProcessCleanupUncertainError(
+                f"Refusing to plan cleanup recovery for trial {trial.number} in "
+                f"study {study.study_name}: no persisted process identity was found "
+                f"under trial_dir={trial_dir}. A leaked process group cannot be ruled out."
+            )
+        count += 1
+    return count
 
 
 def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:

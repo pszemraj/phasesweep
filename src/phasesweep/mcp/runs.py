@@ -105,12 +105,45 @@ class RunStore:
 
         :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
         """
+        self._set_paths(state_dir)
         ensure_private_dir(state_dir)
+        ensure_private_dir(self._runs_dir)
+        ensure_private_dir(self._logs_dir)
+
+    @classmethod
+    def open_existing(cls, state_dir: Path) -> RunStore:
+        """Open an existing run store without creating or chmodding any path.
+
+        This is the operator-recovery entry point. Recovery accepts a path on
+        the command line, so opening it must be observational: a typo must not
+        create a new state tree or change permissions on an unrelated
+        directory.
+
+        :param Path state_dir: Existing MCP state directory containing ``runs/``
+            and ``logs/`` subdirectories.
+        :return RunStore: Store bound to the recognized existing layout.
+        :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
+        """
+        store = cls.__new__(cls)
+        store._set_paths(state_dir)
+        missing = [
+            str(path) for path in (state_dir, store._runs_dir, store._logs_dir) if not path.is_dir()
+        ]
+        if missing:
+            raise ValueError(
+                "not an existing MCP state directory; expected directories are missing: "
+                + ", ".join(missing)
+            )
+        return store
+
+    def _set_paths(self, state_dir: Path) -> None:
+        """Bind store paths without touching the filesystem.
+
+        :param Path state_dir: Root directory for the MCP run store.
+        """
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
-        ensure_private_dir(self._runs_dir)
-        ensure_private_dir(self._logs_dir)
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:
@@ -267,8 +300,10 @@ class RunStore:
         status.json (written by the runner on every exit) is authoritative when
         present: returncode 0 -> succeeded, a signalled code -> cancelled, any
         other -> failed. With no status.json, a live (non-zombie) PID means
-        running; a dead or zombie PID with no status means the process died
-        without recording a cause (e.g. SIGKILL or OOM) and is reported as failed.
+        running. A dead or unverifiable spawned runner with no status cannot
+        prove that its separately-sessioned trial descendants are gone, so it
+        is marked cleanup-uncertain and remains ``running`` until operator
+        recovery records cleanup evidence.
 
         Args:
             handle: The run handle to evaluate.
@@ -300,14 +335,22 @@ class RunStore:
             return "failed"
         if handle.launch_state == "launching" or handle.pid is None:
             return "failed"
+        if handle.pid_starttime is None:
+            if self._cleanup_recovered(handle):
+                return "failed"
+            self.mark_cleanup_uncertain(handle)
+            return "running"
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
-        # kill(pid, 0), so it must be filtered out or a dead run would report
-        # "running" forever and block relaunch.
+        # kill(pid, 0), so filter it out of the genuinely-live path and enter
+        # cleanup-uncertain recovery below.
         if is_same_process(handle.pid, handle.pid_starttime) and not is_pid_zombie(handle.pid):
             return "running"
-        return "failed"
+        if self._cleanup_recovered(handle):
+            return "failed"
+        self.mark_cleanup_uncertain(handle)
+        return "running"
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
         """Return the runner-written terminal status payload, if readable.

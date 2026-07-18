@@ -1251,7 +1251,7 @@ class PhaseSweepMCP:
                 start_new_session=True,  # own session/pgid; survives restart; signal as a group
                 cwd=str(reg.cwd),
             )
-        return RunHandle(
+        handle = RunHandle(
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
@@ -1264,6 +1264,16 @@ class PhaseSweepMCP:
             launch_state="spawned",
             allow_cancel=reg.allow_cancel,
         )
+        if handle.pid_starttime is None:
+            self._runs.mark_cleanup_uncertain(handle)
+            cleanup_confirmed = kill_stale_group(handle.pid, None, pgid=handle.pgid)
+            if cleanup_confirmed:
+                self._runs.clear_cleanup_uncertain(handle)
+            raise RuntimeError(
+                "spawned runner has no Linux /proc start time; refused launch because "
+                "later cancellation could not distinguish PID reuse"
+            )
+        return handle
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Return whether MCP cancellation is permitted for this persisted run.

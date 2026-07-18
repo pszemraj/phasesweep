@@ -10,6 +10,8 @@ fails server startup.
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +31,30 @@ from phasesweep.runtime.files import (
     storage_backend,
     storage_is_in_memory,
 )
+from phasesweep.runtime.process import read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
+
+
+def _require_linux_mcp_host() -> None:
+    """Require Linux process identity semantics for autonomous MCP control.
+
+    :raises CatalogError: If the host cannot provide Linux ``/proc`` process
+        start times used to prevent PID-reuse mistakes during cancellation and
+        crash recovery.
+    """
+    if not sys.platform.startswith("linux"):
+        raise CatalogError(
+            "the phasesweep MCP broker is supported only on Linux because safe "
+            "cancellation and crash recovery require /proc process identities",
+            suggestion="run the MCP broker on Linux; the core phasesweep CLI remains POSIX-oriented",
+        )
+    if read_proc_starttime(os.getpid()) is None:
+        raise CatalogError(
+            "the phasesweep MCP broker cannot read this process's Linux /proc start time, "
+            "which is required for PID-reuse-safe cancellation and crash recovery",
+            suggestion="mount /proc with process stat access for the MCP server process",
+        )
 
 
 class _CatalogModel(BaseModel):
@@ -368,6 +392,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
+    _require_linux_mcp_host()
     catalog, base = _parse_catalog(catalog_path)
     seen: set[str] = set()
     entries: list[CatalogCheckEntry] = []
@@ -433,6 +458,7 @@ class Registry:
             An immutable :class:`Registry`.
 
         """
+        _require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
         items: dict[str, RegisteredExperiment] = {}
         for entry in catalog.experiments:

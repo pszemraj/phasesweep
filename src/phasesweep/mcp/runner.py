@@ -107,6 +107,12 @@ def _persist_spawned_handle(
     store = RunStore(state_dir)
     pid = os.getpid()
     pgid = os.getpgrp() if hasattr(os, "getpgrp") else pid
+    pid_starttime = read_proc_starttime(pid)
+    if pid_starttime is None:
+        raise RuntimeError(
+            "cannot persist a PID-reuse-safe MCP runner handle because Linux "
+            "/proc start time is unavailable"
+        )
     store.save(
         RunHandle(
             run_id=run_id,
@@ -114,7 +120,7 @@ def _persist_spawned_handle(
             config_sha256=config_sha256,
             pid=pid,
             pgid=pgid,
-            pid_starttime=read_proc_starttime(pid),
+            pid_starttime=pid_starttime,
             started_at=started_at,
             launch_state="spawned",
             allow_cancel=allow_cancel,

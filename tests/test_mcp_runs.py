@@ -86,6 +86,27 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     assert _mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
 
 
+def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: Path) -> None:
+    missing = tmp_path / "mistyped-state"
+
+    with pytest.raises(ValueError, match="expected directories are missing"):
+        RunStore.open_existing(missing)
+
+    assert not missing.exists()
+
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    before_modes = {
+        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+    }
+
+    RunStore.open_existing(state_dir)
+
+    assert {
+        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+    } == before_modes
+
+
 @pytest.mark.parametrize(
     "unsafe",
     [
@@ -270,18 +291,24 @@ def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     assert store.state(handle) == "running"
 
 
-def test_cleanup_uncertain_marker_keeps_run_live_until_cleared(tmp_path: Path) -> None:
+def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(store, run_id="exp-1", pid=999999, starttime=111)
     store.save(handle)
 
-    assert store.state(handle) == "failed"
-
-    store.mark_cleanup_uncertain(handle)
-
     assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
     assert store.live_runs() == [handle]
 
+    store.cleanup_recovery_path("exp-1").write_text(
+        json.dumps(
+            {
+                "run_id": "exp-1",
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+            }
+        )
+    )
     store.clear_cleanup_uncertain(handle)
 
     assert store.state(handle) == "failed"
@@ -312,7 +339,8 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
     store.cleanup_uncertain_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
 
     assert not store.cleanup_uncertain(handle)
-    assert store.state(handle) == "failed"
+    assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
 
 
 def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
@@ -437,17 +465,19 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
     assert store.state(handle) == "running"
 
 
-def test_state_failed_on_pid_reuse_mismatch(tmp_path: Path) -> None:
+def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())
     if live_starttime is None:
         pytest.skip("/proc starttime unavailable (non-Linux); no PID-reuse guard")
     # PID is alive (our own) but the saved starttime does not match, so it is a
-    # different process than the one we launched -> not running -> failed.
+    # different process than the one we launched. The runner is gone, but its
+    # separately-sessioned descendants are not proven gone, so fail closed.
     handle = make_run_handle(
         store, run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999
     )
-    assert store.state(handle) == "failed"
+    assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
 
 
 def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
@@ -462,7 +492,7 @@ def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
     assert store.live_run_for("other-experiment") is None
 
 
-def test_state_failed_for_zombie_runner_without_status(tmp_path: Path) -> None:
+def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux"):
         pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
@@ -478,7 +508,8 @@ def test_state_failed_for_zombie_runner_without_status(tmp_path: Path) -> None:
             time.sleep(0.02)
         assert is_pid_zombie(proc.pid)
         handle = make_run_handle(store, run_id="zomb", pid=proc.pid, starttime=starttime)
-        assert store.state(handle) == "failed"
+        assert store.state(handle) == "running"
+        assert store.cleanup_uncertain(handle)
         # state() reaped the child, so the zombie is gone, not merely filtered.
         assert not is_pid_zombie(proc.pid)
     finally:

@@ -92,6 +92,25 @@ def test_runner_persists_terminal_evidence_before_snapshot_capture(
     assert json.loads(status_path.read_text()) == observed
 
 
+def test_runner_refuses_to_persist_handle_without_linux_process_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_runner, "read_proc_starttime", lambda _pid: None)
+
+    with pytest.raises(RuntimeError, match="/proc start time is unavailable"):
+        mcp_runner._persist_spawned_handle(
+            state_dir=tmp_path / "state",
+            run_id="r0",
+            experiment_id="exp",
+            config_sha256="a" * 64,
+            started_at=utc_now_iso(),
+            allow_cancel=True,
+        )
+
+    assert RunStore(tmp_path / "state").get("r0") is None
+
+
 def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     store = RunStore(tmp_path / "state")

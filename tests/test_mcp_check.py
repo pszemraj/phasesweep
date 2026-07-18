@@ -108,6 +108,40 @@ def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
         check_catalog(catalog)
 
 
+def test_mcp_catalog_rejected_off_linux_before_state_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
+    )
+    monkeypatch.setattr("phasesweep.mcp.registry.sys.platform", "darwin")
+
+    with pytest.raises(CatalogError, match="supported only on Linux"):
+        check_catalog(catalog)
+    with pytest.raises(CatalogError, match="supported only on Linux"):
+        Registry.load(catalog)
+
+    assert not (tmp_path / "state").exists()
+
+
+def test_mcp_catalog_rejected_when_proc_identity_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
+    )
+    monkeypatch.setattr("phasesweep.mcp.registry.read_proc_starttime", lambda _pid: None)
+
+    with pytest.raises(CatalogError, match="cannot read this process's Linux /proc start time"):
+        check_catalog(catalog)
+
+    assert not (tmp_path / "state").exists()
+
+
 @pytest.mark.parametrize("blocked_path", ["state", "state/runs", "state/logs"])
 def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_path: str) -> None:
     catalog = write_mcp_config_catalog(

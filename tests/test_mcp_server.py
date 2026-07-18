@@ -380,6 +380,44 @@ def test_launch_does_not_spawn_when_pending_handle_save_fails(
     assert store.list_handles() == []
 
 
+@pytest.mark.parametrize(
+    ("cleanup_confirmed", "expected_state"),
+    [(True, "failed"), (False, "running")],
+)
+def test_launch_refuses_runner_without_linux_process_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_confirmed: bool,
+    expected_state: str,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fake_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, saved_starttime, pgid))
+        return cleanup_confirmed
+
+    monkeypatch.setattr("phasesweep.mcp.server.read_proc_starttime", lambda _pid: None)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_cleanup)
+
+    with pytest.raises(RuntimeError, match="has no Linux /proc start time"):
+        app.launch("srv")
+
+    handles = store.list_handles()
+    assert len(handles) == 1
+    assert handles[0].launch_state == "launching"
+    assert store.state(handles[0]) == expected_state
+    assert bool(store.cleanup_uncertain(handles[0])) is (not cleanup_confirmed)
+    assert cleanup_calls and cleanup_calls[0][1] is None
+
+
 def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1084,7 +1122,9 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
 
     assert dry.exit_code == 0, dry.output
     assert "Re-run with --confirm" in dry.output
+    assert "Recovery preflight" in dry.output
     assert store.cleanup_uncertain_path(run_id).is_file()
+    assert not store.status_path(run_id).exists()
 
     confirmed = runner.invoke(
         cli_main,
@@ -1105,11 +1145,28 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert recovery["run_id"] == run_id
     assert recovery["config_sha256"] == reg.config_sha256
     assert recovery["cleanup_confirmed"] is True
+    terminal_status = json.loads(store.status_path(run_id).read_text())
+    assert terminal_status["error_class"] == "RunnerExitedWithoutStatus"
+    assert terminal_status["cleanup_confirmed"] is True
+    assert terminal_status["result_snapshot"]["status"]["phases"][0]["running"] == 0
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Path) -> None:
+    missing = tmp_path / "mistyped-state"
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp-recover-run", "--state-dir", str(missing), "--run-id", "missing"],
+    )
+
+    assert result.exit_code != 0
+    assert "Directory" in result.output
+    assert not missing.exists()
 
 
 def test_operator_recovery_clears_terminal_cleanup_uncertainty(
@@ -1176,7 +1233,9 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
 
     assert dry.exit_code == 0, dry.output
     assert "Re-run with --confirm" in dry.output
-    assert "confirmed 1 cleanup-uncertain trial" in dry.output
+    assert "recover 1 cleanup-uncertain terminal trial" in dry.output
+    assert runner_cleanup_calls == []
+    assert trial_cleanup_calls == []
     assert not store.cleanup_uncertain_path(run_id).exists()
     assert store.state(handle) == "running"
     trial = _load_phase_trial(config, trial_number)
@@ -1205,8 +1264,8 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert recovery["reaped_running_trials"] == 0
     assert recovery["cleanup_uncertain_terminal_trials"] == 1
     assert store.state(handle) == "failed"
-    assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
-    assert trial_cleanup_calls == [(4242, 111, 4242), (4242, 111, 4242)]
+    assert runner_cleanup_calls == [(999999, 111, 999999)]
+    assert trial_cleanup_calls == [(4242, 111, 4242)]
     trial = _load_phase_trial(config, trial_number)
     assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
     study = _load_first_phase_study(config)
@@ -1373,7 +1432,9 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     )
 
     assert dry.exit_code == 0, dry.output
-    assert "would reap 1 stale trial" in dry.output
+    assert "reap 1 stale trial" in dry.output
+    assert runner_cleanup_calls == []
+    assert trial_cleanup_calls == []
     assert not store.cleanup_recovery_path(run_id).exists()
     assert store.state(handle) == "running"
 
@@ -1406,8 +1467,8 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["phases"][0]["trials"] == {"FAIL": 1}
     assert recovered_status["phases"][0]["running"] == 0
-    assert runner_cleanup_calls == [(999999, 111, 999999), (999999, 111, 999999)]
-    assert trial_cleanup_calls == [(4343, 222, 4343), (4343, 222, 4343)]
+    assert runner_cleanup_calls == [(999999, 111, 999999)]
+    assert trial_cleanup_calls == [(4343, 222, 4343)]
 
     study = optuna.load_study(study_name="srv::p", storage=exp.storage)
     trial = study.get_trials(deepcopy=False)[trial_number]

@@ -11,6 +11,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 ## Requirements
 
 - Python 3.10+; real runs need a [supported POSIX platform](docs/runtime.md#platform-support)
+- The optional MCP broker requires Linux for PID-reuse-safe cancellation and recovery
 - A trainer command that follows the [trainer contract](docs/config.md#trainer-contract)
 - GPU optional; see [GPU concurrency and isolation](docs/runtime.md#concurrency-model)
 

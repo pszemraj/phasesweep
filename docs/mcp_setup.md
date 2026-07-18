@@ -1,6 +1,6 @@
 # MCP agent setup
 
-Install the extra, create a catalog, connect a client, verify the connection, and give the agent its operating instructions. Tool behavior, catalog rules, and the security model are covered in [MCP server](mcp.md).
+Install the extra, create a catalog, connect a client, verify the connection, and give the agent its operating instructions. The broker requires Linux because autonomous cancellation and crash recovery use `/proc` process identities. Tool behavior, catalog rules, and the security model are covered in [MCP server](mcp.md).
 
 ## 1. Install
 
