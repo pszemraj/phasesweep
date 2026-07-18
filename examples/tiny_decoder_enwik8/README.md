@@ -40,6 +40,13 @@ The catalog pins the detached runner `cwd` to the PhaseSweep repo root, so the r
 
 ```bash
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
+phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml --dry-run
+phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml
+```
+
+The installer shows every supported coding client in one menu, preselects detected clients, prints every target path, and asks once before applying. Restart the selected client after installation, then ask it to list the available phasesweep experiments. To exercise the stdio server directly instead of installing a client entry:
+
+```bash
 phasesweep mcp serve --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
