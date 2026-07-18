@@ -260,12 +260,7 @@ def private_atomic_text_writer(path: Path, *, newline: str | None = None) -> Ite
 
 
 def private_atomic_write_text(path: Path, text: str) -> None:
-    """Atomically replace a private UTF-8 text file.
-
-    :param Path path: Destination path to replace; the parent directory is
-        created and locked down to owner-only access if needed.
-    :param str text: Text to write using UTF-8 encoding.
-    """
+    """Atomically replace a private UTF-8 text file."""
     with private_atomic_text_writer(path) as handle:
         handle.write(text)
 
@@ -303,12 +298,7 @@ def private_atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
 
 
 def private_atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically replace a private bytes file.
-
-    :param Path path: Destination path to replace; the parent directory is
-        created and locked down to owner-only access if needed.
-    :param bytes data: Bytes to write.
-    """
+    """Atomically replace a private bytes file."""
     with private_atomic_bytes_writer(path) as handle:
         handle.write(data)
 

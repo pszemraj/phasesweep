@@ -21,15 +21,7 @@ _TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
 def _visible_winner_params(
     params: dict[str, Any], policy: VisibleParamsPolicy
 ) -> tuple[dict[str, Any], bool]:
-    """Filter sampled winner params and report whether any value was withheld.
-
-    :param dict[str, Any] params: Sampled winner params keyed by parameter name.
-    :param VisibleParamsPolicy policy: Catalog ``visible_params`` setting: ``"all"``
-        exposes every value, ``"none"`` redacts every value, and a list of keys
-        exposes only those keys and redacts the rest.
-    :return tuple[dict[str, Any], bool]: Filtered params and whether the policy
-        withheld at least one value.
-    """
+    """Filter sampled winner params and report whether any value was withheld."""
     if policy == "all":
         return dict(params), False
     if policy == "none":

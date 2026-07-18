@@ -59,48 +59,20 @@ class CsvSnapshotThrottle:
     last_write_at: float = 0.0
 
     def should_write(self, finished: int, now: float) -> bool:
-        """Return whether another full CSV snapshot should be written.
-
-        Args:
-            finished: Number of terminal trials completed so far in the phase.
-            now: Current ``time.monotonic()`` timestamp, in seconds.
-
-        Returns:
-            True if at least ``min_trials`` more trials have finished, or at
-            least ``min_seconds`` have elapsed, since the last recorded
-            snapshot.
-
-        """
+        """Return whether another full CSV snapshot should be written."""
         return (
             finished - self.last_finished >= self.min_trials
             or now - self.last_write_at >= self.min_seconds
         )
 
     def mark_written(self, finished: int, now: float) -> None:
-        """Record a successful snapshot write.
-
-        Args:
-            finished: Number of terminal trials completed at write time;
-                stored as the new baseline for the next ``should_write`` check.
-            now: ``time.monotonic()`` timestamp of the write, in seconds;
-                stored as the new baseline for the next ``should_write`` check.
-
-        """
+        """Record a successful snapshot write."""
         self.last_finished = finished
         self.last_write_at = now
 
 
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of terminal trials in ``trials``.
-
-    Args:
-        trials: Optuna trials whose states are counted.
-
-    Returns:
-        Count of trials whose state is finished (``COMPLETE``, ``FAIL``, or
-        ``PRUNED``); ``RUNNING`` and ``WAITING`` trials are excluded.
-
-    """
+    """Return the number of terminal trials in ``trials``."""
     return sum(1 for trial in trials if trial.state.is_finished())
 
 

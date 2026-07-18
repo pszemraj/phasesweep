@@ -32,23 +32,7 @@ def _stringify(value: Any) -> str:
 
 
 def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar.
-
-    Args:
-        value: Any scalar, list, tuple, or ``None`` sampled by Optuna or read
-            from ``fixed_overrides``.
-
-    Returns:
-        A string representation: ``"null"`` for ``None``; ``"true"``/``"false"``
-        for ``bool``; ``str(value)`` for ``int``/``float``; a JSON-quoted
-        string for ``str``; ``"[a,b,c]"`` for list/tuple, recursively
-        rendered.
-
-    Raises:
-        TypeError: If ``value`` is not ``None``, ``bool``, ``int``, ``float``,
-            ``str``, ``list``, or ``tuple``.
-
-    """
+    """Render a value for Hydra/OmegaConf override grammar."""
     if value is None:
         return "null"
     if isinstance(value, bool):
