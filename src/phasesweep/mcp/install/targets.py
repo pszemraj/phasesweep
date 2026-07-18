@@ -73,7 +73,6 @@ class AgentTarget:
     config_dir: Path | None
     mcp: McpSpec | None
     instructions_path: Path | None
-    instructions_scope: Scope = "project"
 
     def is_detected(self) -> bool:
         """Whether the client appears installed on this machine.

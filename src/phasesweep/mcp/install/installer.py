@@ -316,7 +316,7 @@ def _apply_instructions(
     path = target.instructions_path
     if path is None:
         return StepResult("instructions", None, None)
-    if target.instructions_scope == "project" and not _project_path_is_contained(path, project):
+    if not _project_path_is_contained(path, project):
         return StepResult(
             "instructions",
             path,
