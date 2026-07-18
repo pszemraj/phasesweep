@@ -583,13 +583,6 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
     :param Path output: Catalog destination; must not already exist.
     """
-    if output.exists():
-        click.echo(
-            f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
-            "Pass -o to choose another name.",
-            err=True,
-        )
-        ctx.exit(2)
     if not _write_catalog_scaffold(output, from_configs):
         ctx.exit(2)
     click.echo(
@@ -790,9 +783,10 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
 @mcp.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "
-        "entries and marker-fenced TOML or instruction blocks, per selected agent. Unmanaged "
-        "same-name entries stay untouched. Files are deleted when removal leaves them empty."
+        "Remove installer-owned phasesweep integration data: JSON entries invoking "
+        "phasesweep-mcp and marker-fenced TOML or instruction blocks, per selected agent. "
+        "Unmanaged same-name entries stay untouched. Files are deleted when removal leaves "
+        "them empty."
     ),
     short_help="Disconnect coding agents.",
 )

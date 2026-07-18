@@ -959,5 +959,5 @@ def test_install_help_is_operator_readable():
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
-    assert "generated-shape JSON" in uninstall_help.output
+    assert "JSON entries invoking phasesweep-mcp" in uninstall_help.output
     assert "Unmanaged same-name entries stay untouched" in uninstall_help.output
