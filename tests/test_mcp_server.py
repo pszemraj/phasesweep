@@ -26,7 +26,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.mcp.audit import AuditLogger
-from phasesweep.mcp.errors import UnknownExperimentError
+from phasesweep.mcp.errors import ConcurrencyLimitError, UnknownExperimentError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import main as runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore
@@ -139,6 +139,28 @@ def test_safe_tool_returns_safe_mcp_error() -> None:
 
     with pytest.raises(ValueError, match="unknown experiment id 'srv'"):
         boom()
+
+
+def test_concurrency_limit_error_bounds_actionable_run_ids() -> None:
+    run_ids = [
+        "block-alpha",
+        "block-beta",
+        "block-gamma",
+        "block-delta",
+        "block-epsilon",
+        "block-zeta",
+        "block-eta",
+    ]
+
+    message = str(ConcurrencyLimitError(7, 3, run_ids))
+
+    for run_id in run_ids[:5]:
+        assert repr(run_id) in message
+    for run_id in run_ids[5:]:
+        assert repr(run_id) not in message
+    assert "2 more active" in message
+    assert "phasesweep_await_run" in message
+    assert "only after that run is terminal" in message
 
 
 def test_safe_tool_redacts_unexpected_exception() -> None:

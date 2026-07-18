@@ -114,9 +114,10 @@ DESCRIPTION_LAUNCH_SWEEP = (
     "Start an experiment's sweep as a detached background run that survives this "
     f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
     f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
-    "only to resume when earlier phase winners already exist. A refusal such as "
-    "\"action 'launch' is not permitted\" or a concurrency limit is deliberate "
-    "catalog policy: report it to the user; do not retry or work around it."
+    "only to resume when earlier phase winners already exist. A permission refusal is "
+    "deliberate catalog policy: report it to the user and do not retry or work around it. "
+    "A concurrency-limit refusal is transient and names blocking run_ids: wait on one with "
+    f"{TOOL_AWAIT_RUN}, then retry this launch only after that run is terminal."
 )
 DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
@@ -1157,7 +1158,15 @@ class PhaseSweepMCP:
                 if busy is not None:
                     raise ExperimentBusyError(experiment_id, busy.run_id)
                 if len(live) >= self._registry.max_concurrent_runs:
-                    raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
+                    blocking_run_ids = [
+                        handle.run_id
+                        for handle in sorted(live, key=lambda item: (item.started_at, item.run_id))
+                    ]
+                    raise ConcurrencyLimitError(
+                        len(live),
+                        self._registry.max_concurrent_runs,
+                        blocking_run_ids,
+                    )
                 run_id = self._runs.new_run_id(reg.id)
                 resolved["run_id"] = run_id
                 self._audit_authorization(

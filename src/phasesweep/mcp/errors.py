@@ -11,6 +11,10 @@ Two audiences, two trees:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+_MAX_CAPACITY_BLOCKING_RUN_IDS = 5
+
 
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Fatal at startup, operator-facing."""
@@ -195,16 +199,22 @@ class ExperimentBusyError(McpToolError):
 class ConcurrencyLimitError(McpToolError):
     """Raised when launching would exceed the server's max concurrent runs."""
 
-    def __init__(self, running: int, limit: int) -> None:
+    def __init__(self, running: int, limit: int, blocking_run_ids: Sequence[str]) -> None:
         """Create a concurrency-limit tool error.
 
         :param int running: Number of currently live runs.
         :param int limit: Configured maximum number of concurrent runs.
+        :param Sequence[str] blocking_run_ids: Live run ids the agent can await.
         """
+        shown = list(dict.fromkeys(blocking_run_ids))[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
+        blockers = ", ".join(repr(run_id) for run_id in shown)
+        omitted = max(0, running - len(shown))
+        omitted_note = f" ({omitted} more active)" if omitted else ""
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
-            "sweep(s) are active. Wait for one to finish, or ask the user whether to "
-            "cancel one. Do not retry immediately."
+            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. Call "
+            "phasesweep_await_run with one of these run_ids, then retry this launch only "
+            "after that run is terminal. Ask the user before cancelling a blocking run."
         )
 
 
