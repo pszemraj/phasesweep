@@ -896,10 +896,32 @@ def test_cli_interactive_selection_among_detected_agents(fake_home, tmp_path, mo
     monkeypatch.chdir(project)
     (fake_home / ".cursor").mkdir()
     _write_valid_catalog(project)
-    # Prompt answers: configure Cursor? yes; proceed? yes.
-    result = CliRunner().invoke(cli_main, ["mcp", "install", "--type", "mcp"], input="y\ny\n")
+    # Prompt answers: accept the detected default selection; proceed.
+    result = CliRunner().invoke(cli_main, ["mcp", "install", "--type", "mcp"], input="\ny\n")
     assert result.exit_code == 0, result.output
+    assert "Select coding agents" in result.output
+    assert "[x] Cursor" in result.output
+    assert "[ ] Claude Code" in result.output
     assert "Cursor" in result.output
+    assert (project / ".cursor" / "mcp.json").is_file()
+
+
+def test_cli_interactive_selection_can_choose_undetected_agent(fake_home, tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    _write_valid_catalog(project)
+
+    # With no detected clients, Cursor is fourth in the complete supported-client menu.
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp", "install", "--type", "mcp"],
+        input="9\n4\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[ ] Cursor" in result.output
+    assert "invalid selection '9'" in result.output
     assert (project / ".cursor" / "mcp.json").is_file()
 
 

@@ -381,9 +381,9 @@ def _select_targets(
 
     :param Path project: Project root anchoring project-scoped paths.
     :param Sequence[str] | None agent_ids: Explicit target ids, or ``None``
-        to select interactively among detected clients.
-    :param Mode mode: ``install`` or ``uninstall`` (verb used in prompts).
-    :param bool yes: Skip the per-client confirmation prompts.
+        to select interactively from every supported client.
+    :param Mode mode: ``install`` or ``uninstall`` (action shown above the menu).
+    :param bool yes: Select every detected client without prompting.
     :return list[AgentTarget] | None: Selected targets, or ``None`` when
         nothing is selectable.
     """
@@ -391,22 +391,54 @@ def _select_targets(
     if agent_ids is not None:
         by_id = {target.id: target for target in targets}
         return [by_id[agent_id] for agent_id in dict.fromkeys(agent_ids)]
-    detected = [target for target in targets if target.is_detected()]
-    if not detected:
+    detected_by_id = {target.id: target.is_detected() for target in targets}
+    detected = [target for target in targets if detected_by_id[target.id]]
+    if yes:
+        if detected:
+            return detected
         click.echo(
             "no coding agents detected; pass --agent explicitly "
             f"(choices: {', '.join(t.id for t in targets)})",
             err=True,
         )
         return None
-    if yes:
-        return detected
-    verb = "Configure" if mode == "install" else "Remove phasesweep from"
-    chosen = [
-        target
-        for target in detected
-        if click.confirm(f"{verb} {target.display_name}?", default=True)
-    ]
+
+    ordered = sorted(targets, key=lambda target: not detected_by_id[target.id])
+    defaults = [index for index, target in enumerate(ordered, start=1) if detected_by_id[target.id]]
+    default_value = ",".join(str(index) for index in defaults) or "none"
+    action = "install for" if mode == "install" else "uninstall from"
+    click.echo(f"\nSelect coding agents to {action} (detected clients are preselected):")
+    width = max(len(target.display_name) for target in ordered)
+    for index, target in enumerate(ordered, start=1):
+        is_detected = detected_by_id[target.id]
+        marker = "x" if is_detected else " "
+        status = "detected" if is_detected else "not detected"
+        click.echo(f"  {index:>2}. [{marker}] {target.display_name:<{width}}  {status}")
+
+    prompt = "Agent numbers (comma-separated, 'all', or 'none')"
+    chosen: list[AgentTarget] = []
+    while not chosen:
+        raw = click.prompt(prompt, default=default_value).strip().lower()
+        if raw == "none":
+            break
+        if raw == "all":
+            chosen = ordered
+            continue
+        parts = [part.strip() for part in raw.split(",")]
+        if any(not part.isdigit() for part in parts):
+            click.echo(
+                f"invalid selection {raw!r}; enter numbers 1-{len(ordered)}, 'all', or 'none'.",
+                err=True,
+            )
+            continue
+        selected = {int(part) for part in parts}
+        if not selected or min(selected) < 1 or max(selected) > len(ordered):
+            click.echo(
+                f"invalid selection {raw!r}; enter numbers 1-{len(ordered)}, 'all', or 'none'.",
+                err=True,
+            )
+            continue
+        chosen = [target for index, target in enumerate(ordered, start=1) if index in selected]
     if not chosen:
         click.echo("nothing selected.")
         return None

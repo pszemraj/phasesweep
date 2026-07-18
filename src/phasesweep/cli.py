@@ -703,7 +703,8 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
         "Wire the phasesweep MCP server into coding-agent configs: an MCP server entry plus a "
         "marker-fenced instructions block per agent, project-scoped wherever the client "
         "supports it. The catalog is validated with the exact server startup rules before any "
-        "client config is touched. Without --agent, choose interactively among detected agents."
+        "client config is touched. Without --agent, choose from all supported agents in one "
+        "menu, with detected clients preselected."
     ),
     short_help="Connect coding agents to the MCP server.",
 )
@@ -720,7 +721,7 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
     "agents",
     multiple=True,
     type=click.Choice(AGENT_IDS),
-    help="Agent to configure unattended; repeat for more.",
+    help="Agent to configure explicitly; repeat for more.",
 )
 @click.option(
     "--type",
@@ -900,7 +901,7 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
     "agents",
     multiple=True,
     type=click.Choice(AGENT_IDS),
-    help="Agent to clean up unattended; repeat for more.",
+    help="Agent to clean up explicitly; repeat for more.",
 )
 @click.option(
     "--type",
