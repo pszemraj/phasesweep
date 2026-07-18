@@ -112,22 +112,23 @@ def _capture_result_snapshot_with_retry(
     :return dict: Captured path-free result snapshot.
     :raises Exception: The final capture error after all attempts fail.
     """
-    for attempt in range(len(_SNAPSHOT_RETRY_DELAYS_SECONDS) + 1):
+    for delay in _SNAPSHOT_RETRY_DELAYS_SECONDS:
         try:
             return capture_result_snapshot(
                 config,
                 cleanup_confirmed=cleanup_confirmed,
             )
         except Exception:  # noqa: BLE001 - retry transient storage/serialization failures
-            if attempt == len(_SNAPSHOT_RETRY_DELAYS_SECONDS):
-                raise
-            delay = _SNAPSHOT_RETRY_DELAYS_SECONDS[attempt]
             logging.getLogger("phasesweep.mcp.runner").warning(
                 "terminal result snapshot capture failed; retrying in %.2fs",
                 delay,
                 exc_info=True,
             )
             time.sleep(delay)
+    return capture_result_snapshot(
+        config,
+        cleanup_confirmed=cleanup_confirmed,
+    )
 
 
 def _sha256_file(path: Path) -> str:
