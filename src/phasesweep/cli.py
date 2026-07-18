@@ -657,6 +657,9 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
     help="Project root for project-scoped client files.",
 )
 @click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
+@click.option(
+    "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
+)
 @click.pass_context
 def install(
     ctx: click.Context,
@@ -665,6 +668,7 @@ def install(
     integration: str,
     project_dir: Path,
     yes: bool,
+    dry_run: bool,
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
 
@@ -678,6 +682,7 @@ def install(
     :param str integration: ``mcp``, ``instructions``, or ``all``.
     :param Path project_dir: Project root for project-scoped client files.
     :param bool yes: Skip every confirmation prompt.
+    :param bool dry_run: Preview installer verdicts without changing client files.
     """
     project = project_dir.resolve()
     catalog_path: Path | None = None
@@ -690,8 +695,17 @@ def install(
             )
             ctx.exit(2)
         catalog_path = (catalog if catalog is not None else project / "catalog.yaml").resolve()
-        if not catalog_path.exists() and not _offer_catalog_scaffold(catalog_path, yes):
-            ctx.exit(2)
+        if not catalog_path.exists():
+            if dry_run:
+                click.echo(
+                    f"phasesweep install: no catalog at {catalog_path}. Scaffold one first:\n"
+                    f"  phasesweep init-catalog --from <experiment.yaml> -o {catalog_path}; "
+                    "nothing was changed.",
+                    err=True,
+                )
+                ctx.exit(2)
+            if not _offer_catalog_scaffold(catalog_path, yes):
+                ctx.exit(2)
         try:
             report = check_catalog(catalog_path)
         except CatalogError as exc:
@@ -713,6 +727,7 @@ def install(
             list(agents) or None,
             integration,  # type: ignore[arg-type]
             yes,
+            dry_run,
         )
     )
 
@@ -783,6 +798,9 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
     help="Project root for project-scoped client files.",
 )
 @click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
+@click.option(
+    "--dry-run", is_flag=True, help="Preview planned client-file removals without applying them."
+)
 @click.pass_context
 def uninstall(
     ctx: click.Context,
@@ -790,6 +808,7 @@ def uninstall(
     integration: str,
     project_dir: Path,
     yes: bool,
+    dry_run: bool,
 ) -> None:
     """Remove installed phasesweep integrations from coding agents.
 
@@ -798,6 +817,7 @@ def uninstall(
     :param str integration: ``mcp``, ``instructions``, or ``all``.
     :param Path project_dir: Project root for project-scoped client files.
     :param bool yes: Skip every confirmation prompt.
+    :param bool dry_run: Preview uninstaller verdicts without changing client files.
     """
     ctx.exit(
         mcp_installer.run(
@@ -807,6 +827,7 @@ def uninstall(
             list(agents) or None,
             integration,  # type: ignore[arg-type]
             yes,
+            dry_run,
         )
     )
 

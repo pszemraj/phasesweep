@@ -118,6 +118,7 @@ def _apply_mcp(
     command: str,
     catalog: Path | None,
     project: Path,
+    dry_run: bool,
 ) -> StepResult:
     """Apply or remove the MCP server entry for one target.
 
@@ -126,6 +127,7 @@ def _apply_mcp(
     :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path; required for install.
     :param Path project: Project root used to contain project-scoped writes.
+    :param bool dry_run: Compute the edit verdict without changing client files.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
@@ -141,7 +143,14 @@ def _apply_mcp(
     if spec.format == "toml":
         if mode == "uninstall":
             return StepResult(
-                "mcp", spec.path, remove_marked(spec.path, start=TOML_START, end=TOML_END)
+                "mcp",
+                spec.path,
+                remove_marked(
+                    spec.path,
+                    start=TOML_START,
+                    end=TOML_END,
+                    dry_run=dry_run,
+                ),
             )
         if catalog is None:
             raise ValueError("installing an MCP entry requires a catalog path")
@@ -186,12 +195,24 @@ def _apply_mcp(
                     f"merge this manually:\n{content}"
                 ),
             )
-        action = replace_or_append_marked(spec.path, content, start=TOML_START, end=TOML_END)
+        action = replace_or_append_marked(
+            spec.path,
+            content,
+            start=TOML_START,
+            end=TOML_END,
+            dry_run=dry_run,
+        )
         return StepResult("mcp", spec.path, action)
 
     if mode == "uninstall":
         managed = partial(is_managed_mcp_entry, spec.style)
-        action = remove_json_member(spec.path, spec.key, SERVER_NAME, managed=managed)
+        action = remove_json_member(
+            spec.path,
+            spec.key,
+            SERVER_NAME,
+            managed=managed,
+            dry_run=dry_run,
+        )
         if action == "skipped":
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
@@ -203,7 +224,14 @@ def _apply_mcp(
         raise ValueError("installing an MCP entry requires a catalog path")
     entry = mcp_entry(spec.style, command, catalog)
     managed = partial(is_managed_mcp_entry, spec.style)
-    action = merge_json_member(spec.path, spec.key, SERVER_NAME, entry, managed=managed)
+    action = merge_json_member(
+        spec.path,
+        spec.key,
+        SERVER_NAME,
+        entry,
+        managed=managed,
+        dry_run=dry_run,
+    )
     note = None
     if action in ("skipped", "conflict", "error"):
         if action == "skipped":
@@ -269,12 +297,18 @@ def _owned_instruction_content(owners: set[str], prompt: str) -> str:
     return f"{owner_line}\n{prompt}"
 
 
-def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepResult:
+def _apply_instructions(
+    target: AgentTarget,
+    mode: Mode,
+    project: Path,
+    dry_run: bool,
+) -> StepResult:
     """Apply or remove the instructions marker block for one target.
 
     :param AgentTarget target: Client being configured.
     :param Mode mode: ``install`` or ``uninstall``.
     :param Path project: Project root used to contain project-scoped writes.
+    :param bool dry_run: Compute the edit verdict without changing the instructions file.
     :return StepResult: Edit verdict for the instructions file.
     """
     path = target.instructions_path
@@ -309,6 +343,7 @@ def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepR
                 _owned_instruction_content(owners, installed_prompt),
                 start=MARKDOWN_START,
                 end=MARKDOWN_END,
+                dry_run=dry_run,
             )
             return StepResult(
                 "instructions",
@@ -317,7 +352,14 @@ def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepR
                 note=f"retained for: {', '.join(sorted(owners))}",
             )
         return StepResult(
-            "instructions", path, remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END)
+            "instructions",
+            path,
+            remove_marked(
+                path,
+                start=MARKDOWN_START,
+                end=MARKDOWN_END,
+                dry_run=dry_run,
+            ),
         )
     owners.add(target.id)
     action = replace_or_append_marked(
@@ -325,6 +367,7 @@ def _apply_instructions(target: AgentTarget, mode: Mode, project: Path) -> StepR
         _owned_instruction_content(owners, agent_prompt_text()),
         start=MARKDOWN_START,
         end=MARKDOWN_END,
+        dry_run=dry_run,
     )
     return StepResult("instructions", path, action)
 
@@ -380,15 +423,20 @@ def _integrations(integration: Literal["mcp", "instructions", "all"]) -> tuple[I
 
 
 def _print_plan(
-    targets: Sequence[AgentTarget], integrations: tuple[Integration, ...], mode: Mode
+    targets: Sequence[AgentTarget],
+    integrations: tuple[Integration, ...],
+    mode: Mode,
+    dry_run: bool,
 ) -> None:
     """Print what will be written or removed before touching anything.
 
     :param Sequence[AgentTarget] targets: Selected agent targets.
     :param tuple[Integration, ...] integrations: Integrations to apply.
     :param Mode mode: ``install`` or ``uninstall``.
+    :param bool dry_run: Whether this plan will only compute edit verdicts.
     """
-    click.echo(f"\n{'Install' if mode == 'install' else 'Uninstall'} plan:")
+    prefix = "Dry-run " if dry_run else ""
+    click.echo(f"\n{prefix}{'install' if mode == 'install' else 'uninstall'} plan:")
     for target in targets:
         click.echo(f"  {target.display_name}")
         for integration in integrations:
@@ -413,6 +461,7 @@ def run(
     agent_ids: Sequence[str] | None,
     integration: Literal["mcp", "instructions", "all"],
     yes: bool,
+    dry_run: bool = False,
 ) -> int:
     """Run the installer or uninstaller end to end.
 
@@ -423,6 +472,7 @@ def run(
         for interactive selection among detected clients.
     :param Literal integration: ``mcp``, ``instructions``, or ``all``.
     :param bool yes: Skip every confirmation prompt.
+    :param bool dry_run: Report planned edit verdicts without changing client files.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
     """
@@ -432,8 +482,8 @@ def run(
     if targets is None:
         return 2
     integrations = _integrations(integration)
-    _print_plan(targets, integrations, mode)
-    if not yes and not click.confirm("Proceed?", default=True):
+    _print_plan(targets, integrations, mode, dry_run)
+    if not dry_run and not yes and not click.confirm("Proceed?", default=True):
         click.echo("cancelled; nothing was changed.")
         return 2
 
@@ -449,13 +499,20 @@ def run(
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog, project)
+                result = _apply_mcp(target, mode, command, catalog, project, dry_run)
             else:
-                result = _apply_instructions(target, mode, project)
+                result = _apply_instructions(target, mode, project, dry_run)
             if result.action is None:
                 click.echo(f"    {result.integration:<13} not supported")
                 continue
-            click.echo(f"    {result.integration:<13} {result.action:<10} {result.path}")
+            display_action: str = result.action
+            if dry_run:
+                display_action = {
+                    "created": "would-create",
+                    "updated": "would-update",
+                    "removed": "would-remove",
+                }.get(result.action, result.action)
+            click.echo(f"    {result.integration:<13} {display_action:<13} {result.path}")
             if result.note:
                 for line in result.note.splitlines():
                     click.echo(f"      {line}")
@@ -468,6 +525,9 @@ def run(
             err=True,
         )
         return 1
+    if dry_run:
+        click.echo("dry run complete; nothing was changed.")
+        return 0
     if mode == "install":
         click.echo(
             "done. Restart your MCP client, then ask your agent to list phasesweep experiments."

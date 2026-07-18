@@ -136,6 +136,7 @@ def merge_json_member(
     entry: dict[str, object],
     *,
     managed: MemberPredicate | None = None,
+    dry_run: bool = False,
 ) -> Action:
     """Add or update ``container_key.member_key = entry`` in a JSON config file.
 
@@ -150,6 +151,7 @@ def merge_json_member(
     :param dict[str, object] entry: Server entry value to store.
     :param MemberPredicate | None managed: Optional predicate identifying an
         existing member as installer-managed and therefore safe to update.
+    :param bool dry_run: Compute the action without writing the file.
     :return Action: ``created``/``updated``/``unchanged`` on success,
         ``skipped`` when the file is not strict JSON, ``error`` when the
         document or container is not an object, or ``conflict`` when a
@@ -160,6 +162,8 @@ def merge_json_member(
         return "error"
     existed, text = loaded
     if not text.strip():
+        if dry_run:
+            return "updated" if existed else "created"
         written = _atomic_write_text(
             path,
             _dump_json({container_key: {member_key: entry}}, indent="  ", trailing_newline=True),
@@ -181,6 +185,8 @@ def merge_json_member(
     if member_key in container and (managed is None or not managed(current)):
         return "conflict"
     container[member_key] = entry
+    if dry_run:
+        return "updated"
     written = _atomic_write_text(
         path,
         _dump_json(data, indent=_detected_indent(text), trailing_newline=text.endswith("\n")),
@@ -194,6 +200,7 @@ def remove_json_member(
     member_key: str,
     *,
     managed: MemberPredicate | None = None,
+    dry_run: bool = False,
 ) -> Action:
     """Remove ``container_key.member_key`` from a JSON config file.
 
@@ -205,6 +212,7 @@ def remove_json_member(
     :param str member_key: Server name to remove from the container.
     :param MemberPredicate | None managed: Optional predicate the existing
         member must satisfy before removal.
+    :param bool dry_run: Compute the action without writing or unlinking the file.
     :return Action: ``removed`` on success, ``not-found`` when the file or
         member is absent, ``skipped`` when the file is not strict JSON,
         ``error`` when the document or container is not an object, or
@@ -232,6 +240,8 @@ def remove_json_member(
     if managed is not None and not managed(container[member_key]):
         return "conflict"
     del container[member_key]
+    if dry_run:
+        return "removed"
     if not container:
         del data[container_key]
     if not data:
@@ -280,7 +290,14 @@ def updated_marked_text(existing: str, content: str, *, start: str, end: str) ->
     return existing + separator + block
 
 
-def replace_or_append_marked(path: Path, content: str, *, start: str, end: str) -> Action:
+def replace_or_append_marked(
+    path: Path,
+    content: str,
+    *,
+    start: str,
+    end: str,
+    dry_run: bool = False,
+) -> Action:
     """Install a marker-fenced block into a text file, idempotently.
 
     An existing fenced block is replaced in place (bytes outside the markers
@@ -290,6 +307,7 @@ def replace_or_append_marked(path: Path, content: str, *, start: str, end: str) 
     :param str content: Block body to place between the markers.
     :param str start: Start marker line.
     :param str end: End marker line.
+    :param bool dry_run: Compute the action without writing the file.
     :return Action: ``created``/``updated``/``unchanged``.
     """
     loaded = _read_editable_text(path)
@@ -302,12 +320,20 @@ def replace_or_append_marked(path: Path, content: str, *, start: str, end: str) 
         return "error"
     if updated == existing:
         return "unchanged"
+    if dry_run:
+        return "created" if not existed else "updated"
     if not _atomic_write_text(path, updated):
         return "error"
     return "created" if not existed else "updated"
 
 
-def remove_marked(path: Path, *, start: str, end: str) -> Action:
+def remove_marked(
+    path: Path,
+    *,
+    start: str,
+    end: str,
+    dry_run: bool = False,
+) -> Action:
     """Remove a marker-fenced block, undoing :func:`replace_or_append_marked`.
 
     The pre-install bytes come back exactly, including whether the original
@@ -316,6 +342,7 @@ def remove_marked(path: Path, *, start: str, end: str) -> Action:
     :param Path path: Text file to edit.
     :param str start: Start marker line.
     :param str end: End marker line.
+    :param bool dry_run: Compute the action without writing or unlinking the file.
     :return Action: ``removed`` on success, ``not-found`` when the file or a
         well-formed marker pair is absent.
     """
@@ -341,6 +368,8 @@ def remove_marked(path: Path, *, start: str, end: str) -> Action:
         # both newline-terminated and non-newline-terminated originals exactly.
         before = before[:-1]
     remainder = before + existing[cut_end:]
+    if dry_run:
+        return "removed"
     if not remainder.strip():
         try:
             path.unlink()

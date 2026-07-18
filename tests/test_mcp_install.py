@@ -155,6 +155,47 @@ def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
     assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
 
 
+def test_json_edit_dry_run_reports_actions_without_writing(tmp_path):
+    path = tmp_path / "mcp.json"
+
+    assert (
+        merge_json_member(
+            path,
+            "mcpServers",
+            "phasesweep",
+            ENTRY,
+            dry_run=True,
+        )
+        == "created"
+    )
+    assert not path.exists()
+
+    path.write_text('{"mcpServers": {"phasesweep": {"command": "old"}}}\n')
+    original = path.read_text()
+    assert (
+        merge_json_member(
+            path,
+            "mcpServers",
+            "phasesweep",
+            ENTRY,
+            managed=lambda _entry: True,
+            dry_run=True,
+        )
+        == "updated"
+    )
+    assert (
+        remove_json_member(
+            path,
+            "mcpServers",
+            "phasesweep",
+            managed=lambda _entry: True,
+            dry_run=True,
+        )
+        == "removed"
+    )
+    assert path.read_text() == original
+
+
 # --- marker-fenced blocks ---
 
 
@@ -214,6 +255,44 @@ def test_marked_block_refuses_unmatched_marker(tmp_path):
 
     assert replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "error"
     assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "error"
+    assert path.read_text() == original
+
+
+def test_marked_edit_dry_run_reports_actions_without_writing(tmp_path):
+    path = tmp_path / "AGENTS.md"
+    assert (
+        replace_or_append_marked(
+            path,
+            "body",
+            start=MARKDOWN_START,
+            end=MARKDOWN_END,
+            dry_run=True,
+        )
+        == "created"
+    )
+    assert not path.exists()
+
+    path.write_text(f"before\n{MARKDOWN_START}\nold\n{MARKDOWN_END}\n")
+    original = path.read_text()
+    assert (
+        replace_or_append_marked(
+            path,
+            "new",
+            start=MARKDOWN_START,
+            end=MARKDOWN_END,
+            dry_run=True,
+        )
+        == "updated"
+    )
+    assert (
+        remove_marked(
+            path,
+            start=MARKDOWN_START,
+            end=MARKDOWN_END,
+            dry_run=True,
+        )
+        == "removed"
+    )
     assert path.read_text() == original
 
 
@@ -570,6 +649,67 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
     assert (project / "CLAUDE.md").read_text() == preexisting_claude_md
 
 
+def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
+    fake_home,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runner = CliRunner()
+    scaffold = runner.invoke(cli_main, ["init-catalog", "--from", str(EXAMPLE_CONFIG)])
+    assert scaffold.exit_code == 0, scaffold.output
+
+    preview_install = runner.invoke(
+        cli_main,
+        ["install", "--agent", "claude", "--type", "all", "--dry-run"],
+    )
+    assert preview_install.exit_code == 0, preview_install.output
+    assert "would-create" in preview_install.output
+    assert "nothing was changed" in preview_install.output
+    assert not (project / ".mcp.json").exists()
+    assert not (project / "CLAUDE.md").exists()
+
+    install = runner.invoke(
+        cli_main,
+        ["install", "--agent", "claude", "--type", "all", "--yes"],
+    )
+    assert install.exit_code == 0, install.output
+    mcp_before = (project / ".mcp.json").read_bytes()
+    instructions_before = (project / "CLAUDE.md").read_bytes()
+
+    preview_uninstall = runner.invoke(
+        cli_main,
+        ["uninstall", "--agent", "claude", "--type", "all", "--dry-run"],
+    )
+    assert preview_uninstall.exit_code == 0, preview_uninstall.output
+    assert "would-remove" in preview_uninstall.output
+    assert "nothing was changed" in preview_uninstall.output
+    assert (project / ".mcp.json").read_bytes() == mcp_before
+    assert (project / "CLAUDE.md").read_bytes() == instructions_before
+
+
+def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(
+    fake_home,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["install", "--agent", "claude", "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "Scaffold one first" in result.output
+    assert "experiment config to scaffold" not in result.output
+    assert not (project / "catalog.yaml").exists()
+
+
 def test_cli_install_requires_catalog_when_unattended(fake_home, tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
@@ -671,7 +811,7 @@ def test_install_help_is_operator_readable():
     runner = CliRunner()
     install_help = runner.invoke(cli_main, ["install", "--help"], terminal_width=120)
     assert install_help.exit_code == 0
-    for flag in ("--catalog", "--agent", "--type", "--project", "--yes"):
+    for flag in ("--catalog", "--agent", "--type", "--project", "--yes", "--dry-run"):
         assert flag in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
     assert "Args:" not in install_help.output
@@ -679,6 +819,7 @@ def test_install_help_is_operator_readable():
     uninstall_help = runner.invoke(cli_main, ["uninstall", "--help"], terminal_width=120)
     assert uninstall_help.exit_code == 0
     assert "--agent" in uninstall_help.output
+    assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
     assert "generated-shape JSON" in uninstall_help.output
     assert "Unmanaged same-name entries stay untouched" in uninstall_help.output
