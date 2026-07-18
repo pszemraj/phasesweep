@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
@@ -42,8 +42,8 @@ def _build_sampler(
 
     Args:
         cfg: Parsed sampler config (type, seed, startup-trials, etc.).
-        search_space: The phase's search space, used to build the GridSampler
-            grid and to defend against categorical+CmaEs combinations.
+        search_space: The phase's validated search space, used to build the
+            ``GridSampler`` grid.
         n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
             when ``n_jobs > 1``.
 
@@ -51,8 +51,7 @@ def _build_sampler(
         A configured :class:`optuna.samplers.BaseSampler` subclass instance.
 
     Raises:
-        ValueError: Sampler type incompatible with the search space (e.g. log
-            scale on grid int, categorical on cmaes) or an unknown sampler type.
+        ValueError: The validated grid search space cannot be enumerated.
 
     """
     if cfg.type == "tpe":
@@ -72,19 +71,8 @@ def _build_sampler(
     if cfg.type == "grid":
         return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":
-        # Defense in depth. ``_validate_sampler_search_space`` already rejects
-        # categorical-on-cmaes at config-load and import-checks the cmaes
-        # package; we re-check categoricals here because direct callers of
-        # ``_build_sampler`` (tests, future internal use) bypass that path
-        # and Optuna's ``CmaEsSampler`` silently fails every trial with a
-        # categorical param trying to cast strings to float.
-        if any(isinstance(p, CategoricalParam) for p in search_space.values()):
-            raise ValueError(
-                "sampler.type='cmaes' does not support categorical parameters. "
-                "Use sampler.type='tpe' or remove categorical params from this phase."
-            )
         return optuna.samplers.CmaEsSampler(seed=cfg.seed)
-    raise ValueError(f"Unknown sampler {cfg.type!r}")  # pragma: no cover
+    assert_never(cfg.type)
 
 
 def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
@@ -105,7 +93,7 @@ def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
         return trial.suggest_int(name, p.low, p.high, step=p.step, log=p.log)
     if isinstance(p, CategoricalParam):
         return trial.suggest_categorical(name, p.choices)
-    raise ValueError(f"Unhandled param: {p!r}")  # pragma: no cover
+    assert_never(p)
 
 
 log = logging.getLogger("phasesweep.engine.optuna")

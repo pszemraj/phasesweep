@@ -497,8 +497,7 @@ def _inspect_stale_running_trials(
     for trial in study.get_trials(deepcopy=False):
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
-        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
-        read_stale_process_identity(trial_dir)
+        _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
         count += 1
     return count
 

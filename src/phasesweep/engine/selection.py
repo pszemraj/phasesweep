@@ -261,11 +261,6 @@ def _apply_promotion(
     promotion = phase.promotion
     if promotion is None:
         return candidate, None
-    if promotion.min_delta_vs not in winners:
-        raise RuntimeError(
-            f"Phase {phase.name!r} promotion references unknown baseline "
-            f"{promotion.min_delta_vs!r}."
-        )
 
     baseline = winners[promotion.min_delta_vs]
     promoted, improvement, gates_passed, reason = _evaluate_promotion_rule(
