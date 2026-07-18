@@ -6,7 +6,9 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import click
@@ -29,7 +31,7 @@ from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
     is_pid_zombie,
@@ -492,8 +494,8 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
 
     Renders the annotated catalog to a same-directory temp file (so relative
     ``config:`` paths resolve exactly as they will from the final file), runs
-    ``check_catalog`` on it, and only renames it into place when every entry
-    loads. Operator-facing: output may include paths.
+    ``check_catalog`` on it, and publishes it without clobbering a destination
+    only when every entry loads. Operator-facing: output may include paths.
 
     :param click.Context ctx: Active Click context used for the exit code.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
@@ -519,8 +521,9 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
 
     The annotated catalog is rendered to a same-directory temp file (so
     relative ``config:`` paths resolve exactly as they will from the final
-    file), validated with ``check_catalog``, and renamed into place only when
-    every entry loads. Operator-facing: output may include paths.
+    file), validated with ``check_catalog``, and published into place only when
+    every entry loads and the destination is still absent. Operator-facing:
+    output may include paths.
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
@@ -534,26 +537,45 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
             click.echo(f"fix: {exc.suggestion}", err=True)
         return False
     output.parent.mkdir(parents=True, exist_ok=True)
-    staged = output.with_name(output.name + ".tmp")
-    staged.write_text(text, encoding="utf-8")
+    fd, staged_name = tempfile.mkstemp(
+        dir=output.parent,
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    staged = Path(staged_name)
     try:
-        report = check_catalog(staged)
-    except CatalogError as exc:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            report = check_catalog(staged)
+        except CatalogError as exc:
+            click.echo(f"phasesweep init-catalog: {exc}", err=True)
+            return False
+        _echo_catalog_report(report)
+        if not report.ok:
+            click.echo(
+                "phasesweep init-catalog: fix the configs above and re-run; "
+                "the catalog destination was not written.",
+                err=True,
+            )
+            return False
+        try:
+            os.link(staged, output)
+        except FileExistsError:
+            click.echo(
+                f"phasesweep init-catalog: {output} already exists; refusing to overwrite. "
+                "Pass -o to choose another name.",
+                err=True,
+            )
+            return False
+        fsync_directory(output.parent)
+        click.echo(f"wrote {output}")
+        return True
+    finally:
         staged.unlink(missing_ok=True)
-        click.echo(f"phasesweep init-catalog: {exc}", err=True)
-        return False
-    _echo_catalog_report(report)
-    if not report.ok:
-        staged.unlink(missing_ok=True)
-        click.echo(
-            "phasesweep init-catalog: fix the configs above and re-run; "
-            "the catalog destination was not written.",
-            err=True,
-        )
-        return False
-    staged.replace(output)
-    click.echo(f"wrote {output}")
-    return True
 
 
 @main.command(

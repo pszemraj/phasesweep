@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+import phasesweep.cli as cli_module
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry
@@ -131,6 +132,29 @@ def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "operator-authored\n"
+
+
+def test_init_catalog_does_not_replace_destination_created_during_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    real_check_catalog = cli_module.check_catalog
+
+    def check_after_late_arrival(staged: Path):
+        report = real_check_catalog(staged)
+        output.write_text("created concurrently\n")
+        return report
+
+    monkeypatch.setattr(cli_module, "check_catalog", check_after_late_arrival)
+    result = CliRunner().invoke(
+        cli_main, ["init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert "refusing to overwrite" in result.output
+    assert output.read_text() == "created concurrently\n"
+    assert list(tmp_path.glob(".catalog.yaml.*.tmp")) == []
 
 
 def test_init_catalog_requires_at_least_one_config(tmp_path: Path) -> None:
