@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import Experiment, load_config
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.mcp.registry import Registry, _require_mcp_stable_paths
+from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
 
 REPO = Path(__file__).resolve().parents[1]
@@ -351,15 +350,6 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
     with pytest.raises(CatalogError, match="storage"):
         Registry.load(_catalog(tmp_path, config))
-
-
-def test_stable_path_helper_independently_rejects_in_memory_storage(tmp_path: Path) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
-    experiment = load_config(config)
-    assert isinstance(experiment, Experiment)
-
-    with pytest.raises(CatalogError, match="storage must be persistent"):
-        _require_mcp_stable_paths("srv", experiment)
 
 
 @pytest.mark.parametrize(

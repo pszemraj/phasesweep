@@ -235,14 +235,14 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
 
 
 def _require_mcp_stable_paths(
-    experiment_id: str, experiment: Experiment, *, config_dir: Path | None = None
+    experiment_id: str, experiment: Experiment, *, config_dir: Path
 ) -> None:
     """Reject MCP configs whose filesystem targets depend on server CWD.
 
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
-    :param Path | None config_dir: Directory of the experiment config, used only to
-        compute concrete fix suggestions for ``phasesweep mcp-check``.
+    :param Path config_dir: Directory of the experiment config, used to compute
+        concrete fix suggestions for ``phasesweep mcp-check``.
     """
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
@@ -258,11 +258,7 @@ def _require_mcp_stable_paths(
             f"{experiment_id!r}: MCP experiments must use an absolute workdir; "
             "relative workdir values depend on the server launch directory and "
             "break restart/recovery semantics",
-            suggestion=(
-                f"set workdir to an absolute path, e.g. {(config_dir / workdir).resolve()}"
-                if config_dir is not None
-                else None
-            ),
+            suggestion=f"set workdir to an absolute path, e.g. {(config_dir / workdir).resolve()}",
         )
 
     backend = storage_backend(storage)
@@ -287,22 +283,16 @@ def _require_mcp_stable_paths(
             f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
             "storage path; relative storage URLs depend on the server launch "
             "directory and can point at a different Optuna study after restart",
-            suggestion=(
-                f"use an absolute path, e.g. {(config_dir / raw_path).resolve()}"
-                if config_dir is not None
-                else None
-            ),
+            suggestion=f"use an absolute path, e.g. {(config_dir / raw_path).resolve()}",
         )
 
 
-def _suggest_storage(config_dir: Path | None) -> str | None:
-    """Suggest a valid MCP storage URL near the config, or None without a location.
+def _suggest_storage(config_dir: Path) -> str:
+    """Suggest a valid MCP storage URL near the config.
 
-    :param Path | None config_dir: Directory of the experiment config, when known.
-    :return str | None: Operator-facing suggestion for ``phasesweep mcp-check``.
+    :param Path config_dir: Directory of the experiment config.
+    :return str: Operator-facing suggestion for ``phasesweep mcp-check``.
     """
-    if config_dir is None:
-        return None
     return f"use a persistent local URL, e.g. storage: sqlite:///{config_dir / 'optuna.db'}"
 
 
