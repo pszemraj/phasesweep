@@ -93,24 +93,14 @@ def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path, body: str)
     assert read_winners(exp) == []
 
 
-def test_read_status_does_not_create_missing_sqlite_storage(tmp_path: Path) -> None:
-    db = tmp_path / "missing.db"
-    exp = _experiment(tmp_path, storage=f"sqlite:///{db}")
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: str) -> None:
+    path = tmp_path / f"missing.{backend}"
+    exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
 
     status = read_status(exp)
 
-    assert not db.exists()
-    assert status["phases"][0]["trials"] == {}
-    assert status["phases"][0]["trial_data_available"] is False
-
-
-def test_read_status_does_not_create_missing_journal_storage(tmp_path: Path) -> None:
-    journal = tmp_path / "missing.journal"
-    exp = _experiment(tmp_path, storage=f"journal:///{journal}")
-
-    status = read_status(exp)
-
-    assert not journal.exists()
+    assert not path.exists()
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
 
@@ -124,22 +114,6 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
 
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
-
-
-def test_read_status_counts_existing_sqlite_trials_without_optuna_loader(
-    tmp_path: Path,
-) -> None:
-    db = tmp_path / "phases.db"
-    storage = f"sqlite:///{db}"
-    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
-        lambda trial: 1.0, n_trials=1
-    )
-    exp = _experiment(tmp_path, storage=storage)
-
-    status = read_status(exp)
-
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
-    assert status["phases"][0]["trial_data_available"] is True
 
 
 def test_read_status_uses_one_sqlite_snapshot_per_phase(
@@ -165,6 +139,7 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
 
     assert connections == 1
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+    assert status["phases"][0]["trial_data_available"] is True
     assert status["median_trial_seconds"] is not None
 
 

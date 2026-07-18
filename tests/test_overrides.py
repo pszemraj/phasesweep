@@ -10,19 +10,16 @@ from phasesweep.runtime.commands import format_argparse, format_hydra, render_co
 from tests.conftest import copy_fake_train, write_yaml
 
 
-def test_hydra_basic():
-    s = format_hydra({"n_layers": 8, "lr": 3e-4})
-    assert s == "n_layers=8 lr=0.0003"
-
-
-def test_hydra_dotted():
-    s = format_hydra({"model.n_layers": 12})
-    assert s == "model.n_layers=12"
-
-
-def test_hydra_bool():
-    s = format_hydra({"flag": True, "off": False})
-    assert s == "flag=true off=false"
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({"n_layers": 8, "lr": 3e-4}, "n_layers=8 lr=0.0003", id="basic"),
+        pytest.param({"model.n_layers": 12}, "model.n_layers=12", id="dotted-key"),
+        pytest.param({"flag": True, "off": False}, "flag=true off=false", id="booleans"),
+    ],
+)
+def test_hydra_scalar_rendering(overrides: dict[str, object], expected: str) -> None:
+    assert format_hydra(overrides) == expected
 
 
 def test_hydra_quotes_string_values_for_hydra_grammar():

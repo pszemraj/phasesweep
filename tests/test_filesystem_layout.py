@@ -22,20 +22,14 @@ from phasesweep.engine.state import (
 from tests.conftest import make_experiment, write_constant_trainer
 
 
-def test_experiment_dir_is_namespaced_by_experiment_name(tmp_path: Path) -> None:
-    """``<workdir>/<experiment>/...`` is the v0.5.7 output layout."""
+def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> None:
+    """Experiment, phase, and summary artifacts share one namespaced root."""
     exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _experiment_dir(exp) == (tmp_path / "runs" / exp.experiment).resolve()
+    root = (tmp_path / "runs" / exp.experiment).resolve()
 
-
-def test_phase_dir_lives_under_experiment_dir(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _phase_dir(exp, "p") == _experiment_dir(exp) / "p"
-
-
-def test_summary_path_lives_under_experiment_dir(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _summary_path(exp) == _experiment_dir(exp) / "summary.yaml"
+    assert _experiment_dir(exp) == root
+    assert _phase_dir(exp, "p") == root / "p"
+    assert _summary_path(exp) == root / "summary.yaml"
 
 
 def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
