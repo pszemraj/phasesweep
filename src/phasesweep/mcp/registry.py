@@ -166,6 +166,23 @@ class RegisteredExperiment:
         """
         return [phase.name for phase in self.experiment.phases]
 
+    @property
+    def metric_payload(self) -> dict[str, str]:
+        """Return the agent-visible optimization metric descriptor."""
+        return {
+            "name": self.experiment.metric.name,
+            "goal": self.experiment.metric.goal,
+        }
+
+    @property
+    def capabilities(self) -> dict[str, bool]:
+        """Return the agent-visible catalog permissions for this experiment."""
+        return {
+            "launch": self.allow_launch,
+            "cancel": self.allow_cancel,
+            "resume_from_phase": self.allow_from_phase,
+        }
+
 
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
     """Resolve an operator path relative to the catalog file when not absolute.
@@ -492,15 +509,8 @@ class Registry:
                 "id": item.id,
                 "description": item.description,
                 "phases": item.phase_names,
-                "metric": {
-                    "name": item.experiment.metric.name,
-                    "goal": item.experiment.metric.goal,
-                },
-                "capabilities": {
-                    "launch": item.allow_launch,
-                    "cancel": item.allow_cancel,
-                    "resume_from_phase": item.allow_from_phase,
-                },
+                "metric": item.metric_payload,
+                "capabilities": item.capabilities,
             }
             for item in self._items.values()
         ]

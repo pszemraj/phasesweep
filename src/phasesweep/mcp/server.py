@@ -754,12 +754,8 @@ class PhaseSweepMCP:
             # Already validated at startup; report the structure, never the command.
             result = {
                 "experiment_id": reg.id,
-                "metric": {"name": exp.metric.name, "goal": exp.metric.goal},
-                "capabilities": {
-                    "launch": reg.allow_launch,
-                    "cancel": reg.allow_cancel,
-                    "resume_from_phase": reg.allow_from_phase,
-                },
+                "metric": reg.metric_payload,
+                "capabilities": reg.capabilities,
                 "phases": phases,
             }
         except Exception as exc:
@@ -1615,52 +1611,31 @@ def _safe_tool(fn: F) -> F:
     return sync_wrapper  # type: ignore[return-value]
 
 
-def _read_annotations(title: str) -> Any:
-    """Return MCP annotations for read-only, idempotent tools.
+def _tool_annotations(
+    title: str,
+    *,
+    read_only: bool = True,
+    destructive: bool = False,
+    idempotent: bool = True,
+    open_world: bool = False,
+) -> Any:
+    """Return MCP annotations for one tool's side-effect contract.
 
     :param str title: Human-readable tool title.
+    :param bool read_only: Whether the tool leaves server state unchanged.
+    :param bool destructive: Whether the tool can perform destructive side effects.
+    :param bool idempotent: Whether repeated calls have the same side effects.
+    :param bool open_world: Whether the tool interacts beyond the local server boundary.
     :return Any: MCP ``ToolAnnotations`` instance.
     """
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
         title=title,
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    )
-
-
-def _launch_annotations() -> Any:
-    """Return MCP annotations for the side-effecting launch tool.
-
-    :return Any: MCP ``ToolAnnotations`` instance.
-    """
-    from mcp.types import ToolAnnotations
-
-    return ToolAnnotations(
-        title="Launch Sweep",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    )
-
-
-def _cancel_annotations() -> Any:
-    """Return MCP annotations for the process-terminating cancel tool.
-
-    :return Any: MCP ``ToolAnnotations`` instance.
-    """
-    from mcp.types import ToolAnnotations
-
-    return ToolAnnotations(
-        title="Cancel Sweep",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=True,
-        openWorldHint=False,
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=open_world,
     )
 
 
@@ -1722,7 +1697,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_LIST_EXPERIMENTS,
         description=DESCRIPTION_LIST_EXPERIMENTS,
-        annotations=_read_annotations("List Experiments"),
+        annotations=_tool_annotations("List Experiments"),
         structured_output=True,
     )
     @_safe_tool
@@ -1743,7 +1718,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_VALIDATE_CONFIG,
         description=DESCRIPTION_VALIDATE_CONFIG,
-        annotations=_read_annotations("Validate Config"),
+        annotations=_tool_annotations("Validate Config"),
         structured_output=True,
     )
     @_safe_tool
@@ -1758,7 +1733,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_GET_LATEST_RUN,
         description=DESCRIPTION_GET_LATEST_RUN,
-        annotations=_read_annotations("Get Latest Run"),
+        annotations=_tool_annotations("Get Latest Run"),
         structured_output=True,
     )
     @_safe_tool
@@ -1773,7 +1748,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_GET_STATUS,
         description=DESCRIPTION_GET_STATUS,
-        annotations=_read_annotations("Get Status"),
+        annotations=_tool_annotations("Get Status"),
         structured_output=True,
     )
     @_safe_tool
@@ -1794,7 +1769,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_AWAIT_RUN,
         description=DESCRIPTION_AWAIT_RUN,
-        annotations=_read_annotations("Await Run"),
+        annotations=_tool_annotations("Await Run"),
         structured_output=True,
     )
     @_safe_tool
@@ -1815,7 +1790,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_GET_WINNERS,
         description=DESCRIPTION_GET_WINNERS,
-        annotations=_read_annotations("Get Winners"),
+        annotations=_tool_annotations("Get Winners"),
         structured_output=True,
     )
     @_safe_tool
@@ -1836,7 +1811,13 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_LAUNCH_SWEEP,
         description=DESCRIPTION_LAUNCH_SWEEP,
-        annotations=_launch_annotations(),
+        annotations=_tool_annotations(
+            "Launch Sweep",
+            read_only=False,
+            destructive=True,
+            idempotent=False,
+            open_world=True,
+        ),
         structured_output=True,
     )
     @_safe_tool
@@ -1855,7 +1836,11 @@ def build_server(app: PhaseSweepMCP) -> Any:
     @mcp.tool(
         name=TOOL_CANCEL_SWEEP,
         description=DESCRIPTION_CANCEL_SWEEP,
-        annotations=_cancel_annotations(),
+        annotations=_tool_annotations(
+            "Cancel Sweep",
+            read_only=False,
+            destructive=True,
+        ),
         structured_output=True,
     )
     @_safe_tool

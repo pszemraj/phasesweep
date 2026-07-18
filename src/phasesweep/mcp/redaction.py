@@ -18,40 +18,27 @@ ResultSource: TypeAlias = Literal["current_shared_study", "frozen_run_snapshot"]
 _TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
 
 
-def visible_winner_params(params: dict[str, Any], policy: VisibleParamsPolicy) -> dict[str, Any]:
-    """Filter sampled winner params according to the catalog visibility policy.
+def _visible_winner_params(
+    params: dict[str, Any], policy: VisibleParamsPolicy
+) -> tuple[dict[str, Any], bool]:
+    """Filter sampled winner params and report whether any value was withheld.
 
     :param dict[str, Any] params: Sampled winner params keyed by parameter name.
     :param VisibleParamsPolicy policy: Catalog ``visible_params`` setting: ``"all"``
         exposes every value, ``"none"`` redacts every value, and a list of keys
         exposes only those keys and redacts the rest.
-    :return dict[str, Any]: ``params`` with each value either kept as-is or
-        replaced with the ``"<redacted>"`` sentinel per ``policy``.
+    :return tuple[dict[str, Any], bool]: Filtered params and whether the policy
+        withheld at least one value.
     """
     if policy == "all":
-        return dict(params)
+        return dict(params), False
     if policy == "none":
-        return {key: "<redacted>" for key in params}
+        return {key: "<redacted>" for key in params}, bool(params)
     visible = set(policy)
-    return {key: value if key in visible else "<redacted>" for key, value in params.items()}
-
-
-def params_redacted(params: dict[str, Any], policy: VisibleParamsPolicy) -> bool:
-    """Return whether the visibility policy withholds any of ``params``.
-
-    Computed from the policy, not by scanning for the sentinel string, so a
-    literal ``"<redacted>"`` param value can never masquerade as policy.
-
-    :param dict[str, Any] params: Sampled winner params keyed by parameter name.
-    :param VisibleParamsPolicy policy: Catalog ``visible_params`` setting.
-    :return bool: ``True`` when at least one value is replaced by the sentinel.
-    """
-    if policy == "all":
-        return False
-    if policy == "none":
-        return bool(params)
-    visible = set(policy)
-    return any(key not in visible for key in params)
+    return (
+        {key: value if key in visible else "<redacted>" for key, value in params.items()},
+        any(key not in visible for key in params),
+    )
 
 
 def winners_payload(
@@ -83,6 +70,20 @@ def winners_payload(
     """
     winner_phases = {view.phase for view in views}
     missing_phases = [phase for phase in declared_phases if phase not in winner_phases]
+    phases: list[dict[str, Any]] = []
+    for view in views:
+        params, redacted = _visible_winner_params(view.params, visible_params)
+        phases.append(
+            {
+                "phase": view.phase,
+                "trial_number": view.trial_number,
+                "metric": view.metric,
+                "params": params,
+                "params_redacted": redacted,
+                "gates_passed": view.gates_passed,
+                "incomplete": view.incomplete,
+            }
+        )
     return {
         "experiment_id": experiment_id,
         "run_id": run_id,
@@ -92,18 +93,7 @@ def winners_payload(
         "winner_count": len(views),
         "missing_phases": missing_phases,
         "all_phases_have_winners": not missing_phases,
-        "phases": [
-            {
-                "phase": v.phase,
-                "trial_number": v.trial_number,
-                "metric": v.metric,
-                "params": visible_winner_params(v.params, visible_params),
-                "params_redacted": params_redacted(v.params, visible_params),
-                "gates_passed": v.gates_passed,
-                "incomplete": v.incomplete,
-            }
-            for v in views
-        ],
+        "phases": phases,
     }
 
 
