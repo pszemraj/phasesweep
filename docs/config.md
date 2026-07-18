@@ -69,8 +69,6 @@ Metric extractor failures, non-finite metrics, nonzero exits, and missing requir
 
 ## Override order
 
-![override composition](images/diagramD_override.png)
-
 Within one trial, later layers override earlier layers:
 
 1. Inherited winners' `effective_overrides`.

@@ -14,8 +14,6 @@ Run `pytest` by itself, with no concurrent `ruff`, `mypy`, or other validation j
 
 ## Package map
 
-![module dependency graph](images/diagramF_moduledeps.png)
-
 The package is organized by behavior:
 
 - `phasesweep.config`: Pydantic config models and strict YAML loading.

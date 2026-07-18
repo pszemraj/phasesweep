@@ -54,12 +54,6 @@ phasesweep status examples/experiment.yaml
 
 The bundled example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`. For a real-trainer integration, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8/README.md).
 
-## Config
-
-Start from [examples/experiment.yaml](examples/experiment.yaml) or the [config guide](docs/config.md). The [trainer contract](docs/config.md#trainer-contract) covers override parsing, metric artifacts, and failed-trial exit behavior.
-
-Runtime locks and storage behavior are covered in [runtime behavior](docs/runtime.md).
-
 ## MCP server (agent integration)
 
 `phasesweep-mcp` lets an AI agent operate experiments you have already reviewed. You keep control of the config, trainer command, search space, and permissions in a catalog; the agent sees stable experiment ids and can validate, launch, monitor, cancel when allowed, and summarize winners without receiving paths, commands, raw logs, storage URLs, or workdirs.

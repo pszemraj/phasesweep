@@ -31,8 +31,6 @@ runs/
 
 `pid` and `pgid` are written atomically while a trial is live. On Linux, phasesweep also writes `/proc` start time to `pid_starttime` when it is readable. Identity files are removed on clean exit and preserved on failure for inspection. If an identity write fails after launch, phasesweep terminates the new process group before returning a failed trial result.
 
-![output layout](images/diagramG_artifacttree.png)
-
 ## Process management
 
 ![trial state machine](images/diagramB_statemachine.png)
