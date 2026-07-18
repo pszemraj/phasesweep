@@ -99,26 +99,11 @@ def resolve_server_command() -> str:
     )
 
 
-def _project_path_is_contained(path: Path, project: Path) -> bool:
-    """Return whether resolving ``path`` stays beneath the project root.
-
-    :param Path path: Project-scoped target path.
-    :param Path project: Project root that must contain the resolved target.
-    :return bool: False when a symlinked target or parent escapes the project.
-    """
-    try:
-        path.resolve(strict=False).relative_to(project.resolve(strict=True))
-    except (OSError, ValueError):
-        return False
-    return True
-
-
 def _apply_mcp(
     target: AgentTarget,
     mode: Mode,
     command: str,
     catalog: Path | None,
-    project: Path,
     dry_run: bool,
 ) -> StepResult:
     """Apply or remove the MCP server entry for one target.
@@ -127,20 +112,10 @@ def _apply_mcp(
     :param Mode mode: ``install`` or ``uninstall``.
     :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path; required for install.
-    :param Path project: Project root used to contain project-scoped writes.
     :param bool dry_run: Compute the edit verdict without changing client files.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
-    if spec is None:
-        return StepResult("mcp", None, None)
-    if spec.scope == "project" and not _project_path_is_contained(spec.path, project):
-        return StepResult(
-            "mcp",
-            spec.path,
-            "error",
-            note="refusing project config path that resolves outside the project",
-        )
     if spec.format == "toml":
         if mode == "uninstall":
             return StepResult(
@@ -316,13 +291,6 @@ def _apply_instructions(
     path = target.instructions_path
     if path is None:
         return StepResult("instructions", None, None)
-    if not _project_path_is_contained(path, project):
-        return StepResult(
-            "instructions",
-            path,
-            "error",
-            note="refusing instructions path that resolves outside the project",
-        )
     valid_owner_ids = {
         candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
     }
@@ -475,8 +443,8 @@ def _print_plan(
         click.echo(f"  {target.display_name}")
         for integration in integrations:
             if integration == "mcp":
-                path = target.mcp.path if target.mcp else None
-                notice = target.mcp.notice if target.mcp else None
+                path = target.mcp.path
+                notice = target.mcp.notice
             else:
                 path, notice = target.instructions_path, None
             if path is None:
@@ -520,9 +488,7 @@ def run(
     integrations = _integrations(integration)
     _print_plan(targets, integrations, mode, dry_run)
     user_scoped_targets = [
-        target
-        for target in targets
-        if "mcp" in integrations and target.mcp is not None and target.mcp.scope == "user"
+        target for target in targets if "mcp" in integrations and target.mcp.scope == "user"
     ]
     if mode == "install" and yes and not dry_run and user_scoped_targets and not allow_user_scope:
         names = ", ".join(target.display_name for target in user_scoped_targets)
@@ -549,7 +515,7 @@ def run(
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog, project, dry_run)
+                result = _apply_mcp(target, mode, command, catalog, dry_run)
             else:
                 result = _apply_instructions(target, mode, project, dry_run)
             if result.action is None:

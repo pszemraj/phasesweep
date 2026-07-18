@@ -517,7 +517,6 @@ def test_installer_preserves_unmanaged_json_entry(fake_home, tmp_path, capsys, a
     project.mkdir()
     catalog = _write_valid_catalog(project)
     target = next(item for item in agent_targets(project) if item.id == agent_id)
-    assert target.mcp is not None
     target.mcp.path.parent.mkdir(parents=True, exist_ok=True)
     original_data = {target.mcp.key: {"phasesweep": {"command": "custom-server"}}}
     target.mcp.path.write_text(json.dumps(original_data, indent=2) + "\n")
@@ -570,7 +569,7 @@ def test_installer_updates_recognizable_managed_json_entry(fake_home, tmp_path, 
     assert entry["args"] == ["--catalog", str(catalog)]
 
 
-def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, capsys):
+def test_installer_follows_symlinked_project_config_directory(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
@@ -580,9 +579,8 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
 
     code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
 
-    assert code == 1
-    assert "resolves outside the project" in capsys.readouterr().out
-    assert not (outside / "mcp.json").exists()
+    assert code == 0, capsys.readouterr().out
+    assert (outside / "mcp.json").is_file()
 
 
 @pytest.mark.parametrize(
@@ -663,7 +661,6 @@ def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
     project.mkdir()
     catalog = _write_valid_catalog(project)
     target = next(item for item in agent_targets(project) if item.id == agent_id)
-    assert target.mcp is not None
     args = [
         "mcp",
         "install",

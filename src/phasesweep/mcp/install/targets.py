@@ -71,7 +71,7 @@ class AgentTarget:
     display_name: str
     binary: str | None
     config_dir: Path | None
-    mcp: McpSpec | None
+    mcp: McpSpec
     instructions_path: Path | None
 
     def is_detected(self) -> bool:
