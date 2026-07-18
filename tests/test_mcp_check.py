@@ -38,10 +38,11 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert report.ok
     assert [entry.experiment_id for entry in report.entries] == ["alpha", "beta"]
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
-    assert (tmp_path / "state" / "runs").is_dir()
-    assert (tmp_path / "state" / "logs").is_dir()
+    assert not (tmp_path / "state").exists()
     # The shared code path means a green report implies a bootable server.
     Registry.load(catalog)
+    assert (tmp_path / "state" / "runs").is_dir()
+    assert (tmp_path / "state" / "logs").is_dir()
 
 
 def test_check_catalog_read_only_entry_has_no_actions(tmp_path: Path) -> None:
@@ -51,6 +52,22 @@ def test_check_catalog_read_only_entry_has_no_actions(tmp_path: Path) -> None:
     report = check_catalog(catalog)
     assert report.ok
     assert report.entries[0].actions == ()
+
+
+def test_check_catalog_does_not_create_or_chmod_state_layout(tmp_path: Path) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path, {"quiet": mcp_experiment_config_text(tmp_path, name="quiet")}
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o755)
+    mode_before = state_dir.stat().st_mode & 0o777
+
+    report = check_catalog(catalog)
+
+    assert report.ok
+    assert state_dir.stat().st_mode & 0o777 == mode_before
+    assert not (state_dir / "runs").exists()
+    assert not (state_dir / "logs").exists()
 
 
 def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
@@ -165,7 +182,7 @@ def test_check_catalog_rejects_existing_read_only_state_directory(tmp_path: Path
         tmp_path,
         {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
     )
-    check_catalog(catalog)
+    Registry.load(catalog)
     logs_dir = tmp_path / "state" / "logs"
     logs_dir.chmod(0o500)
 
@@ -189,6 +206,8 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
     assert "(launch)" in ok_result.output
+    assert (tmp_path / "state" / "runs").is_dir()
+    assert (tmp_path / "state" / "logs").is_dir()
 
     bad = write_mcp_config_catalog(
         tmp_path,

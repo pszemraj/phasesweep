@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import tempfile
+from functools import partial
 from pathlib import Path
 
 import click
@@ -27,7 +28,7 @@ from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import AGENT_IDS
-from phasesweep.mcp.registry import CatalogCheckReport, check_catalog
+from phasesweep.mcp.registry import CatalogCheckReport, check_catalog, prepare_catalog_state
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -474,6 +475,11 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     _echo_catalog_report(report)
     if not report.ok:
         ctx.exit(2)
+    try:
+        prepare_catalog_state(catalog)
+    except CatalogError as exc:
+        click.echo(f"phasesweep mcp-check: {exc}", err=True)
+        ctx.exit(2)
 
 
 def _echo_catalog_report(report: CatalogCheckReport) -> None:
@@ -598,6 +604,11 @@ def _scaffold_validated_catalog(output: Path, from_configs: tuple[Path, ...]) ->
                 "the catalog destination was not written.",
                 err=True,
             )
+            return False
+        try:
+            prepare_catalog_state(staged)
+        except CatalogError as exc:
+            click.echo(f"phasesweep init-catalog: {exc}", err=True)
             return False
         try:
             os.link(staged, output)
@@ -726,6 +737,9 @@ def install(
                 err=True,
             )
             ctx.exit(2)
+    before_apply = (
+        partial(_prepare_catalog_for_install, catalog_path) if catalog_path is not None else None
+    )
     ctx.exit(
         mcp_installer.run(
             "install",
@@ -736,8 +750,35 @@ def install(
             yes,
             dry_run,
             allow_user_scope,
+            before_apply=before_apply,
         )
     )
+
+
+def _prepare_catalog_for_install(catalog_path: Path) -> bool:
+    """Revalidate and provision catalog state after install confirmation.
+
+    :param Path catalog_path: Catalog whose runtime state should be prepared.
+    :return bool: True when validation and provisioning both succeed.
+    """
+    try:
+        report = check_catalog(catalog_path)
+    except CatalogError as exc:
+        click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+        return False
+    if not report.ok:
+        _echo_catalog_report(report)
+        click.echo(
+            "phasesweep install: catalog changed after planning; no client config was touched.",
+            err=True,
+        )
+        return False
+    try:
+        prepare_catalog_state(catalog_path)
+    except CatalogError as exc:
+        click.echo(f"phasesweep install: {exc}; no client config was touched.", err=True)
+        return False
+    return True
 
 
 def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:

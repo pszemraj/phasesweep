@@ -759,6 +759,43 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
     assert (project / "CLAUDE.md").read_bytes() == instructions_before
 
 
+def test_cli_install_planning_does_not_provision_catalog_state(
+    fake_home,
+    tmp_path,
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    state_dir = project / "state"
+    args = [
+        "install",
+        "--catalog",
+        str(catalog),
+        "--project",
+        str(project),
+        "--agent",
+        "claude",
+        "--type",
+        "mcp",
+    ]
+    runner = CliRunner()
+
+    preview = runner.invoke(cli_main, [*args, "--dry-run"])
+    assert preview.exit_code == 0, preview.output
+    assert "nothing was changed" in preview.output
+    assert not state_dir.exists()
+
+    rejected = runner.invoke(cli_main, args, input="n\n")
+    assert rejected.exit_code == 2, rejected.output
+    assert "cancelled; nothing was changed" in rejected.output
+    assert not state_dir.exists()
+
+    accepted = runner.invoke(cli_main, args, input="y\n")
+    assert accepted.exit_code == 0, accepted.output
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
+
+
 def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(
     fake_home,
     tmp_path,

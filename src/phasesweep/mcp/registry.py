@@ -234,6 +234,35 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
     return resolved
 
 
+def _check_state_dir(base: Path, path: Path) -> Path:
+    """Validate the run-store layout without creating or chmodding any path.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored ``state_dir`` path.
+    :return Path: Absolute validated state directory path.
+    :raises CatalogError: If an existing component has the wrong shape or the
+        nearest existing directory cannot create the missing layout.
+    """
+    resolved = _resolve_catalog_relative_path(base, path)
+    for candidate in (resolved, resolved / "runs", resolved / "logs"):
+        if candidate.exists():
+            if not candidate.is_dir() or not os.access(candidate, os.W_OK | os.X_OK):
+                raise CatalogError(
+                    f"state_dir is not usable: {resolved}",
+                    suggestion="set state_dir to a writable directory path (not a file)",
+                )
+            continue
+        parent = candidate.parent
+        while not parent.exists():
+            parent = parent.parent
+        if not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK):
+            raise CatalogError(
+                f"state_dir is not usable: {resolved}",
+                suggestion="set state_dir to a writable directory path (not a file)",
+            )
+    return resolved
+
+
 def _require_mcp_stable_paths(
     experiment_id: str, experiment: Experiment, *, config_dir: Path
 ) -> None:
@@ -393,8 +422,10 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
 
     Runs the same validation as :meth:`Registry.load` (shared per-entry code
     path) but does not stop at the first failure, so ``phasesweep mcp-check``
-    can report a full ok/FAIL table. Catalog-level problems (unreadable file,
-    schema errors) still raise :class:`CatalogError`.
+    can report a full ok/FAIL table. This check is observational: it validates
+    the state layout without creating directories or changing permissions.
+    Catalog-level problems (unreadable file, schema errors) still raise
+    :class:`CatalogError`.
 
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
@@ -425,8 +456,21 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
         entries.append(CatalogCheckEntry(entry.id, actions=actions))
     report = CatalogCheckReport(entries=tuple(entries))
     if report.ok:
-        _prepare_state_dir(base, catalog.state_dir)
+        _check_state_dir(base, catalog.state_dir)
     return report
+
+
+def prepare_catalog_state(catalog_path: Path) -> Path:
+    """Create and secure the run-store directories declared by a catalog.
+
+    Callers must validate the catalog before invoking this mutating step.
+
+    :param Path catalog_path: Path to the operator-authored catalog YAML.
+    :return Path: Absolute initialized state directory.
+    """
+    _require_linux_mcp_host()
+    catalog, base = _parse_catalog(catalog_path)
+    return _prepare_state_dir(base, catalog.state_dir)
 
 
 class Registry:
