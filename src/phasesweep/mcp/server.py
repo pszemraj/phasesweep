@@ -14,7 +14,6 @@ import functools
 import hashlib
 import importlib.util
 import inspect
-import json
 import logging
 import subprocess
 import sys
@@ -47,7 +46,6 @@ from phasesweep.mcp.errors import (
     ResumeNotReadyError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
-    ToolResultTooLargeError,
     UnknownExperimentError,
     UnknownRunError,
 )
@@ -74,7 +72,6 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
-MAX_TOOL_RESULT_BYTES = 64 * 1024
 # await_run blocks server-side so one call replaces dozens of polls; the cap
 # keeps a response inside common client tool timeouts.
 AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
@@ -441,31 +438,6 @@ def _cursor_offset(cursor: str | None) -> int:
     return offset
 
 
-def _serialized_result_size(value: Any) -> int:
-    """Return compact UTF-8 JSON size for an MCP payload value.
-
-    :param Any value: JSON-compatible mapping or Pydantic result model.
-    :return int: Serialized payload size in bytes, excluding transport framing.
-    """
-    if isinstance(value, BaseModel):
-        value = value.model_dump(mode="json")
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return len(encoded.encode("utf-8"))
-
-
-def _bounded_tool_result(tool_name: str, value: Any) -> Any:
-    """Reject a serialized tool result that exceeds the global byte budget.
-
-    :param str tool_name: MCP tool implementation name used in the safe error.
-    :param Any value: Tool result about to be handed to FastMCP.
-    :return Any: ``value`` unchanged when within the response budget.
-    :raises ToolResultTooLargeError: If the compact JSON payload is oversized.
-    """
-    if _serialized_result_size(value) > MAX_TOOL_RESULT_BYTES:
-        raise ToolResultTooLargeError(tool_name, MAX_TOOL_RESULT_BYTES)
-    return value
-
-
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
     """Compute wall seconds for a run: launch-to-now while running, total when terminal.
 
@@ -647,17 +619,7 @@ class PhaseSweepMCP:
             offset = _cursor_offset(cursor)
             experiments = self._registry.summaries()
             total_count = len(experiments)
-            for experiment in experiments[offset : offset + limit]:
-                candidate = {
-                    "experiments": [*page, experiment],
-                    "total_count": total_count,
-                    "next_cursor": str(offset + len(page) + 1),
-                }
-                if _serialized_result_size(candidate) > MAX_TOOL_RESULT_BYTES:
-                    if not page:
-                        raise ToolResultTooLargeError(TOOL_LIST_EXPERIMENTS, MAX_TOOL_RESULT_BYTES)
-                    break
-                page.append(experiment)
+            page = experiments[offset : offset + limit]
             next_offset = offset + len(page)
             result = {
                 "experiments": page,
@@ -1538,7 +1500,7 @@ def _safe_tool(fn: F) -> F:
             :return Any: Awaited tool result.
             """
             try:
-                return _bounded_tool_result(fn.__name__, await fn(*args, **kwargs))
+                return await fn(*args, **kwargs)
             except McpToolError as exc:
                 raise ValueError(exc.safe_message) from None
             except Exception:
@@ -1559,7 +1521,7 @@ def _safe_tool(fn: F) -> F:
         :return Any: Wrapped tool result.
         """
         try:
-            return _bounded_tool_result(fn.__name__, fn(*args, **kwargs))
+            return fn(*args, **kwargs)
         except McpToolError as exc:
             raise ValueError(exc.safe_message) from None
         except Exception:

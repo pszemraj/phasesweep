@@ -164,23 +164,6 @@ class RunResultSnapshotUnavailableError(McpToolError):
         )
 
 
-class ToolResultTooLargeError(McpToolError):
-    """Raised before an oversized result can reach the MCP client."""
-
-    def __init__(self, tool_name: str, limit_bytes: int) -> None:
-        """Create an actionable bounded-result error.
-
-        :param str tool_name: MCP tool whose result exceeded the byte budget.
-        :param int limit_bytes: Configured serialized result budget.
-        """
-        super().__init__(
-            f"{tool_name} result exceeds the {limit_bytes}-byte response limit. "
-            "For catalog listings, request a smaller limit and continue with next_cursor. "
-            "For other tools, ask the operator to shorten catalog descriptions or reduce "
-            "agent-visible winner parameter values."
-        )
-
-
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 

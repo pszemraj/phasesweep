@@ -36,7 +36,6 @@ from phasesweep.mcp.server import (
     TOOL_VALIDATE_CONFIG,
     PhaseSweepMCP,
     _safe_tool,
-    _serialized_result_size,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.process import read_proc_starttime
@@ -174,21 +173,6 @@ def test_safe_tool_redacts_unexpected_exception() -> None:
         "internal server error in boom; report it to the operator and do not retry immediately"
     )
     assert "SECRET_PATH" not in str(excinfo.value)
-
-
-def test_safe_tool_rejects_oversized_result_with_actionable_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("phasesweep.mcp.server.MAX_TOOL_RESULT_BYTES", 32)
-
-    @_safe_tool
-    def huge() -> dict[str, str]:
-        return {"data": "x" * 100}
-
-    with pytest.raises(ValueError, match="response limit") as exc_info:
-        huge()
-
-    assert "request a smaller limit" in str(exc_info.value)
 
 
 def test_launch_permission_denied_before_spawn(tmp_path: Path) -> None:
@@ -698,24 +682,6 @@ def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:
     assert records[1]["result_counts"] == {"experiments": 1, "total_count": 3}
     assert records[2]["outcome"] == "error"
     assert records[2]["error_type"] == "McpToolError"
-
-
-def test_list_experiments_shortens_page_to_serialized_byte_budget(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    configs = {f"srv{i}": _config(tmp_path, name=f"srv{i}") for i in range(3)}
-    app, _registry, _store = make_mcp_app(write_mcp_catalog(tmp_path, configs))
-    one_entry = app.list_experiments(limit=1)
-    monkeypatch.setattr(
-        "phasesweep.mcp.server.MAX_TOOL_RESULT_BYTES",
-        _serialized_result_size(one_entry),
-    )
-
-    bounded = app.list_experiments(limit=3)
-
-    assert [item["id"] for item in bounded["experiments"]] == ["srv0"]
-    assert bounded["next_cursor"] == "1"
 
 
 def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
