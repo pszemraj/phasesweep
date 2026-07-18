@@ -269,6 +269,24 @@ def render_marked_block(content: str, *, start: str, end: str) -> str:
     return f"{start}\n{content.strip()}\n{end}\n"
 
 
+def _marked_span(existing: str, *, start: str, end: str) -> tuple[int, int] | None:
+    """Locate one well-formed marker pair in ``existing``.
+
+    :param str existing: Text that may contain the marker pair.
+    :param str start: Start marker line.
+    :param str end: End marker line.
+    :return tuple[int, int] | None: Marker indices, or ``None`` when both are absent.
+    :raises ValueError: If exactly one marker exists or the end precedes the start.
+    """
+    start_idx = existing.find(start)
+    end_idx = existing.find(end)
+    if start_idx == -1 and end_idx == -1:
+        return None
+    if start_idx == -1 or end_idx <= start_idx:
+        raise ValueError("existing marker block is incomplete or out of order")
+    return start_idx, end_idx
+
+
 def updated_marked_text(existing: str, content: str, *, start: str, end: str) -> str:
     """Return ``existing`` with one marker-fenced block replaced or appended.
 
@@ -280,11 +298,9 @@ def updated_marked_text(existing: str, content: str, *, start: str, end: str) ->
     :raises ValueError: If the existing text has an unmatched marker.
     """
     block = render_marked_block(content, start=start, end=end)
-    start_idx = existing.find(start)
-    end_idx = existing.find(end)
-    if (start_idx == -1) != (end_idx == -1) or (start_idx != -1 and end_idx <= start_idx):
-        raise ValueError("existing marker block is incomplete or out of order")
-    if start_idx != -1:
+    span = _marked_span(existing, start=start, end=end)
+    if span is not None:
+        start_idx, end_idx = span
         return existing[:start_idx] + block.rstrip("\n") + existing[end_idx + len(end) :]
     separator = "" if not existing else "\n"
     return existing + separator + block
@@ -352,12 +368,13 @@ def remove_marked(
     existed, existing = loaded
     if not existed:
         return "not-found"
-    start_idx = existing.find(start)
-    end_idx = existing.find(end)
-    if start_idx == -1 and end_idx == -1:
-        return "not-found"
-    if start_idx == -1 or end_idx <= start_idx:
+    try:
+        span = _marked_span(existing, start=start, end=end)
+    except ValueError:
         return "error"
+    if span is None:
+        return "not-found"
+    start_idx, end_idx = span
 
     cut_end = end_idx + len(end)
     if existing[cut_end : cut_end + 1] == "\n":

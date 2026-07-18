@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (
     Action,
+    _marked_span,
     manual_json_snippet,
     merge_json_member,
     remove_json_member,
@@ -261,12 +262,13 @@ def _read_instruction_block(path: Path, valid_owner_ids: set[str]) -> tuple[set[
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
     except OSError:
         return None
-    start_idx = existing.find(MARKDOWN_START)
-    end_idx = existing.find(MARKDOWN_END)
-    if start_idx == -1 and end_idx == -1:
-        return set(), ""
-    if start_idx == -1 or end_idx <= start_idx:
+    try:
+        span = _marked_span(existing, start=MARKDOWN_START, end=MARKDOWN_END)
+    except ValueError:
         return None
+    if span is None:
+        return set(), ""
+    start_idx, end_idx = span
 
     body = existing[start_idx + len(MARKDOWN_START) : end_idx].removeprefix("\n")
     owner_line, separator, prompt = body.partition("\n")
