@@ -62,7 +62,7 @@ phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-s
 
 Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same plan and outcomes without writing. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
-Automatic edits are limited to regular files at the expected target; malformed configs, direct file symlinks, and unmanaged `phasesweep` entries are left untouched with a manual snippet. Writes replace only the managed entry or marker block. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
+Automatic edits are limited to regular files at the expected target; malformed configs, direct file symlinks, and same-name entries that invoke something other than `phasesweep-mcp` are left untouched with a manual snippet. Writes replace only the managed entry or marker block. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
 
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
