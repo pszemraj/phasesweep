@@ -29,7 +29,7 @@ Client configs want the executable path absolute, because clients launch servers
 which phasesweep-mcp
 ```
 
-If you prefer not to install into a persistent environment, every client below can instead launch through `uvx`, an alias for `uv tool run`. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first, then run `command -v uvx` and use the returned absolute path in the client config because desktop clients may not inherit your shell `PATH`. The first launch downloads and builds the package, so allow for a slow cold start.
+For manual setup without a persistent install, a client can launch through `uvx` (`uv tool run`). Use `command -v uvx` to get its absolute path; the first launch has a slower download/build cold start.
 
 ## 2. Create a catalog
 
@@ -60,98 +60,34 @@ phasesweep mcp install --agent claude --dry-run  # validate and show planned edi
 phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
 ```
 
-`install` first confirms the MCP SDK from step 1 is available, validates the catalog without changing its state directory, and shows one selector containing every supported client. Detected clients sort first and are preselected; press Enter to accept them, enter a comma-separated set of menu numbers, or use `all` or `none`. Undetected clients remain selectable for advance provisioning. The installer then prints a plan of every client file it will edit and, after confirmation, reports an outcome for each edit. The server creates its private runtime state when it starts. An interactive, non-dry-run install offers to scaffold a missing catalog; unattended and dry-run installs print the exact `init-catalog` command and exit without writing. The server command is the executable beside the Python interpreter running `phasesweep` (the active conda/virtual environment), with `PATH` as a fallback; installation stops before edits if neither is launchable. Supported agents: `claude` (Claude Code), `claude-desktop`, `codex`, `cursor`, `vscode`, `gemini`, `opencode`.
+Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same plan and outcomes without writing. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
-Automatic edits are limited to regular files at the expected target; direct symlink targets are refused. Successful writes use an atomic replacement in the target directory and preserve an existing file's permissions. Strict JSON configs may update or remove a `phasesweep` entry only when its shape is recognizable as installer-generated; a different pre-existing entry is reported as a conflict and left untouched. Commented JSON/JSON5, malformed containers, invalid TOML, and unmanaged Codex tables are also left untouched with a manual snippet where applicable.
+Automatic edits are limited to regular files at the expected target; malformed configs, direct file symlinks, and unmanaged `phasesweep` entries are left untouched with a manual snippet. Writes replace only the managed entry or marker block. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
 
-`--type mcp|instructions` installs one integration only; instructions-only installation does not require the MCP SDK. `--project DIR` targets another project root; the catalog defaults to `./catalog.yaml` in that project, so use `--catalog PATH` for any other name or location. Both `install` and `uninstall` accept `--dry-run` and report `would-create`, `would-update`, or `would-remove` without writing or deleting client files. Install previews still validate an existing catalog; uninstall needs no catalog. `phasesweep mcp uninstall` removes only recognizable generated-shape JSON entries and marker-owned TOML or instruction blocks, then deletes a file if that removal leaves it empty. The shared `AGENTS.md` block records its Codex, Cursor, and opencode owners and remains in place until its last owner is uninstalled. Unmanaged same-name entries remain untouched and are reported for operator attention.
+Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
-Two placements are user-scoped rather than project-scoped, and the plan flags them: Claude Desktop (single user-level config) and Codex (`~/.codex/config.toml` - Codex reads project configs only in trusted projects). A user-scoped entry means that client sees this project's sweeps from every directory. Interactive installs require the normal plan confirmation. Unattended `--yes` installs additionally require `--allow-user-scope`; the generic confirmation bypass alone never authorizes a user-scoped write.
+Claude Desktop and Codex MCP entries are user-scoped, so those clients see the server from every project. The plan flags this. Interactive installs require confirmation; unattended `--yes` installs additionally require `--allow-user-scope`.
 
 Restart the client after any config change.
 
 <details>
 <summary>Manual setup (any client)</summary>
 
-Every client gets the same server: command `phasesweep-mcp`, args `--catalog /abs/path/to/catalog.yaml`. Use the absolute executable path from step 1 and an absolute catalog path throughout. Prefer project scope where the client supports it - a catalog belongs to one project, and a user-global entry would let an agent in any repo control this project's sweeps.
-
-Claude Code can add the entry from the project root:
-
-```bash
-claude mcp add phasesweep --scope project -- /abs/path/to/venv/bin/phasesweep-mcp --catalog /abs/path/to/catalog.yaml
-```
-
-Claude Code, Claude Desktop, Cursor, and Gemini CLI use the same `mcpServers` entry:
+Every stdio client launches the same server. Use absolute paths for both values:
 
 ```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "/abs/path/to/venv/bin/phasesweep-mcp",
-      "args": ["--catalog", "/abs/path/to/catalog.yaml"]
-    }
-  }
-}
+"command": "/abs/path/to/venv/bin/phasesweep-mcp",
+"args": ["--catalog", "/abs/path/to/catalog.yaml"]
 ```
 
-| Client | Config path |
-| --- | --- |
-| Claude Code | `.mcp.json` |
-| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS; `~/.config/Claude/claude_desktop_config.json` on Linux |
-| Cursor | `.cursor/mcp.json` |
-| Gemini CLI | `.gemini/settings.json` |
-
-Codex uses TOML at `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.phasesweep]
-command = "/abs/path/to/venv/bin/phasesweep-mcp"
-args = ["--catalog", "/abs/path/to/catalog.yaml"]
-```
-
-VS Code uses `servers` and requires `type: stdio` in `.vscode/mcp.json`:
-
-```json
-{
-  "servers": {
-    "phasesweep": {
-      "type": "stdio",
-      "command": "/abs/path/to/venv/bin/phasesweep-mcp",
-      "args": ["--catalog", "/abs/path/to/catalog.yaml"]
-    }
-  }
-}
-```
-
-OpenCode uses a command array in `opencode.json`:
-
-```json
-{
-  "mcp": {
-    "phasesweep": {
-      "type": "local",
-      "command": ["/abs/path/to/venv/bin/phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"],
-      "enabled": true
-    }
-  }
-}
-```
-
-Any stdio client can also launch through `uvx` without a persistent install. For clients with separate `command` and `args` fields, replace the standard entry with:
+To launch through `uvx` instead:
 
 ```json
 "command": "/abs/path/to/uvx",
 "args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"]
 ```
 
-For Codex, use the same values as TOML `command` and `args`; for OpenCode, combine them into its `command` array.
-
-Or launch the module through a known interpreter:
-
-```json
-"command": "/abs/path/to/venv/bin/python",
-"args": ["-m", "phasesweep.mcp.server", "--catalog", "/abs/path/to/catalog.yaml"]
-```
+Client schemas and config paths differ. Run `phasesweep mcp install --dry-run` for the exact target, or use the manual snippet printed when an edit is skipped.
 
 </details>
 
