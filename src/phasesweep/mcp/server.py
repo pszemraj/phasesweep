@@ -55,7 +55,7 @@ from phasesweep.mcp.redaction import ResultSource, status_payload, winners_paylo
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
-from phasesweep.mcp.time import utc_now_iso
+from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
 from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
 from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
 
@@ -480,22 +480,6 @@ def _bounded_tool_result(tool_name: str, value: Any) -> Any:
     return value
 
 
-def _parse_utc_iso(value: object) -> datetime | None:
-    """Parse a persisted ISO-8601 timestamp, tolerating malformed values.
-
-    :param object value: Raw timestamp field from a handle or status payload.
-    :return datetime | None: Timezone-aware datetime, or ``None`` when the
-        value is missing, malformed, or naive.
-    """
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
-
-
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
     """Compute wall seconds for a run: launch-to-now while running, total when terminal.
 
@@ -510,15 +494,14 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     :return int | None: Non-negative whole seconds, or ``None`` when the
         endpoints cannot be established.
     """
-    started = _parse_utc_iso(handle.started_at)
-    if started is None:
-        return None
+    started = parse_utc_iso(handle.started_at)
+    assert started is not None
     ended: datetime | None
     if state == "running":
         ended = datetime.now(timezone.utc)
     else:
         status = store.recorded_terminal_status(handle)
-        ended = _parse_utc_iso(status.get("ended_at")) if status is not None else None
+        ended = parse_utc_iso(status.get("ended_at")) if status is not None else None
         if ended is None and status is not None:
             try:
                 mtime = store.status_path(handle.run_id).stat().st_mtime

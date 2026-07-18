@@ -156,12 +156,10 @@ def test_elapsed_seconds_terminal_falls_back_to_status_mtime(tmp_path: Path) -> 
     assert 0 <= elapsed <= 5
 
 
-def test_elapsed_seconds_none_without_status_or_valid_start(tmp_path: Path) -> None:
+def test_elapsed_seconds_none_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     # Terminal with no status.json at all (e.g. SIGKILL before any write).
     assert _run_elapsed_seconds(store, _handle("r1", started_at=utc_now_iso()), "failed") is None
-    # Malformed launch timestamp.
-    assert _run_elapsed_seconds(store, _handle("r2", started_at="bogus"), "running") is None
 
 
 def test_status_reports_progress_and_poll_fields(tmp_path: Path) -> None:

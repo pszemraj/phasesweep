@@ -19,6 +19,7 @@ from typing import Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     ensure_private_dir,
     private_atomic_write_text,
@@ -81,21 +82,6 @@ class RunHandle:
     started_at: str  # ISO-8601 UTC
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
-
-    @classmethod
-    def from_json(cls, data: dict) -> RunHandle:
-        """Rehydrate a handle from its JSON dict (the inverse of ``asdict``).
-
-        :param dict data: JSON-decoded run handle payload.
-        :return RunHandle: Reconstructed immutable run handle.
-        """
-        return cls(
-            **{
-                **data,
-                "launch_state": data.get("launch_state", "spawned"),
-                "allow_cancel": data.get("allow_cancel", False),
-            }
-        )
 
 
 class RunStore:
@@ -266,7 +252,7 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(expected_run_id):
             return None
         try:
-            handle = RunHandle.from_json(json.loads(path.read_text()))
+            handle = RunHandle(**json.loads(path.read_text()))
         except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError):
             return None
         if handle.run_id != expected_run_id:
@@ -277,11 +263,7 @@ class RunStore:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None
-        try:
-            started_at = datetime.fromisoformat(handle.started_at)
-        except (TypeError, ValueError):
-            return None
-        if started_at.tzinfo is None:
+        if parse_utc_iso(handle.started_at) is None:
             return None
         if handle.launch_state == "launching":
             if (
