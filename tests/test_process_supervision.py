@@ -20,9 +20,9 @@ from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     _defer_shutdown_signals,
+    _process_group_alive_with_members,
     _shutdown_handler,
     _terminate_process_group,
-    _tracked_process_group_alive,
     reap_child,
     run_supervised,
 )
@@ -325,7 +325,7 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     assert excinfo.value.report.child_pgids == (1234,)
 
 
-def test_tracked_process_group_alive_uses_cached_members(
+def test_process_group_alive_uses_cached_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
@@ -335,10 +335,10 @@ def test_tracked_process_group_alive_uses_cached_members(
     )
     monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: True)
 
-    assert _tracked_process_group_alive(1234, {11}) is True
+    assert _process_group_alive_with_members(1234, {11}) is True
 
 
-def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
+def test_process_group_alive_refreshes_when_cached_members_are_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     member_sets: list[set[int]] = []
@@ -359,7 +359,7 @@ def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
 
     member_pids = {11}
 
-    assert _tracked_process_group_alive(1234, member_pids) is True
+    assert _process_group_alive_with_members(1234, member_pids) is True
     assert member_pids == {22}
     assert scans == [1234]
     assert member_sets == [{11}, {22}]
@@ -376,7 +376,7 @@ def test_terminate_process_group_reports_cleanup_status(
 
         mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
         mp.setattr(
-            "phasesweep.runtime.process._tracked_process_group_alive",
+            "phasesweep.runtime.process._process_group_alive_with_members",
             lambda pgid, member_pids: True,
         )
 

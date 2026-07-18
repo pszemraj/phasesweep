@@ -199,17 +199,6 @@ def _file_log_handler(path: Path) -> Iterator[None]:
         logger.setLevel(old_level)
 
 
-@contextlib.contextmanager
-def _run_log_handler(experiment: Experiment) -> Iterator[None]:
-    """Attach a durable file handler for one experiment run.
-
-    :param Experiment experiment: Experiment config whose run log is used.
-    :return Iterator[None]: Context manager for the experiment run log handler.
-    """
-    with _file_log_handler(_run_log_path(experiment)):
-        yield
-
-
 def _write_trials_csv(study: optuna.Study, path: Path) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
 

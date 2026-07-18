@@ -21,7 +21,7 @@ from phasesweep.engine.state import (
     _experiment_dir,
     _file_log_handler,
     _load_winner,
-    _run_log_handler,
+    _run_log_path,
     _save_promotion_decision,
     _save_winner,
     _suite_dir,
@@ -136,7 +136,7 @@ def run_experiment(
         return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=True)
 
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
-    with _run_log_handler(experiment), _experiment_lock(experiment):
+    with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=False)
 
 

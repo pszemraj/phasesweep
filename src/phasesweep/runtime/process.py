@@ -774,7 +774,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     member_pids = set(_group_member_pids(pgid))
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _tracked_process_group_alive(pgid, member_pids):
+        if not _process_group_alive_with_members(pgid, member_pids):
             return True
         time.sleep(0.1)
 
@@ -791,7 +791,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     # "marked FAIL" state means cleanup completed, not requested.
     kill_deadline = time.monotonic() + 2.0
     while time.monotonic() < kill_deadline:
-        if not _tracked_process_group_alive(pgid, member_pids):
+        if not _process_group_alive_with_members(pgid, member_pids):
             return True
         time.sleep(0.05)
 
@@ -855,17 +855,6 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
     """
     stat = _read_proc_stat(Path("/proc") / str(pgid))
     return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime
-
-
-def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
-    """Check group liveness using a cached PID set, refreshing only if needed.
-
-    :param int pgid: Process-group ID to probe.
-    :param set[int] member_pids: Cached group member PIDs, refreshed in place on apparent
-        death.
-    :return bool: ``True`` when any non-zombie group member still appears live.
-    """
-    return _process_group_alive_with_members(pgid, member_pids)
 
 
 def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
