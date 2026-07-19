@@ -405,7 +405,13 @@ def _reap_stale_trials(
     experiment: Experiment,
     phase_name: str,
 ) -> int:
-    """Mark RUNNING trials as FAIL after killing orphaned process groups."""
+    """Mark RUNNING trials as FAIL after killing orphaned process groups.
+
+    :param optuna.Study study: Study whose stale RUNNING trials should be reaped.
+    :param Experiment experiment: Experiment used to locate trial directories.
+    :param str phase_name: Name of the phase containing the stale trials.
+    :return int: Number of stale RUNNING trials marked as failed.
+    """
     count = 0
     for trial in study.get_trials(deepcopy=False):
         if trial.state != optuna.trial.TrialState.RUNNING:
@@ -459,6 +465,11 @@ def _inspect_stale_running_trials(
     Used by ``mcp recover-run`` preflight mode. The follow-up ``--confirm`` call
     must still find the same RUNNING trials so it can reap them and persist
     recovery evidence atomically with clearing MCP cleanup uncertainty.
+
+    :param optuna.Study study: Study whose stale RUNNING trials should be inspected.
+    :param Experiment experiment: Experiment used to locate trial directories.
+    :param str phase_name: Name of the phase containing the stale trials.
+    :return int: Number of stale RUNNING trials found.
     """
     count = 0
     for trial in study.get_trials(deepcopy=False):
@@ -470,7 +481,11 @@ def _inspect_stale_running_trials(
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
-    """Return trial numbers already consumed as cleanup recovery evidence."""
+    """Return trial numbers already consumed as cleanup recovery evidence.
+
+    :param optuna.Study study: Study containing the cleanup recovery ledger.
+    :return set[int]: Valid non-negative trial numbers recorded in the ledger.
+    """
     raw = study.user_attrs.get(CLEANUP_RECOVERED_TRIALS_ATTR)
     if not isinstance(raw, list):
         return set()
@@ -478,7 +493,11 @@ def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
 
 
 def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Persist that previously uncertain cleanup evidence has been consumed."""
+    """Persist that previously uncertain cleanup evidence has been consumed.
+
+    :param optuna.Study study: Study whose cleanup recovery ledger should be updated.
+    :param optuna.trial.FrozenTrial trial: Trial whose cleanup evidence was consumed.
+    """
     recovered = sorted(_cleanup_recovered_trial_numbers(study) | {trial.number})
     try:
         study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)

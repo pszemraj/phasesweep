@@ -59,20 +59,33 @@ class CsvSnapshotThrottle:
     last_write_at: float = 0.0
 
     def should_write(self, finished: int, now: float) -> bool:
-        """Return whether another full CSV snapshot should be written."""
+        """Return whether another full CSV snapshot should be written.
+
+        :param int finished: Current number of finished trials.
+        :param float now: Current timestamp in the throttle's clock domain.
+        :return bool: Whether either the trial or elapsed-time threshold was reached.
+        """
         return (
             finished - self.last_finished >= self.min_trials
             or now - self.last_write_at >= self.min_seconds
         )
 
     def mark_written(self, finished: int, now: float) -> None:
-        """Record a successful snapshot write."""
+        """Record a successful snapshot write.
+
+        :param int finished: Number of finished trials included in the snapshot.
+        :param float now: Snapshot timestamp in the throttle's clock domain.
+        """
         self.last_finished = finished
         self.last_write_at = now
 
 
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of terminal trials in ``trials``."""
+    """Return the number of terminal trials in ``trials``.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :return int: Number of trials with a finished state.
+    """
     return sum(1 for trial in trials if trial.state.is_finished())
 
 

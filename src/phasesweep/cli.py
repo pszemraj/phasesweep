@@ -169,7 +169,11 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
 
 
 def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
-    """Render a phase comment one line at a time with ``prefix``."""
+    """Render a phase comment one line at a time with ``prefix``.
+
+    :param str | None comment: Optional phase comment to render.
+    :param str prefix: Prefix to place before each rendered comment line.
+    """
     if comment:
         for line in comment.strip().splitlines():
             click.echo(f"{prefix}{line}")
@@ -251,7 +255,12 @@ def mcp() -> None:
     help="Perform the reported cleanup and terminal-result repair actions.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover one MCP run's cleanup uncertainty or terminal result snapshot."""
+    """Recover one MCP run's cleanup uncertainty or terminal result snapshot.
+
+    :param Path state_dir: MCP state directory containing the run metadata.
+    :param str run_id: Identifier of the run to recover.
+    :param bool confirm: Whether to perform recovery instead of only reporting actions.
+    """
     if not sys.platform.startswith("linux"):
         raise click.ClickException(
             "MCP recovery is supported only on Linux because safe process cleanup "
@@ -455,7 +464,12 @@ def _repair_terminal_result_snapshot(
 
 
 def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
-    """Return whether a runner PID still appears to be the same live process."""
+    """Return whether a runner PID still appears to be the same live process.
+
+    :param int | None pid: Runner process ID, or ``None`` if no runner was recorded.
+    :param int | None saved_starttime: Recorded Linux process start time for identity checks.
+    :return bool: Whether the PID identifies the same live, non-zombie process.
+    """
     if pid is None:
         return False
     return is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
