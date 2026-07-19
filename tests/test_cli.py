@@ -23,7 +23,7 @@ def test_help_output_is_operator_readable() -> None:
     assert "Phase-chained hyperparameter sweeps driven by a YAML file." in result.output
     assert "-h, --help" in result.output
     assert (
-        "mcp" in result.output and "Manage the MCP broker and agent integrations." in result.output
+        "mcp" in result.output and "Manage the MCP server and agent integrations." in result.output
     )
     assert "recover-run" not in result.output
     assert "run" in result.output and "Run configured phases." in result.output
@@ -63,7 +63,7 @@ def test_help_output_is_operator_readable() -> None:
 
     serve_help = runner.invoke(cli_main, ["mcp", "serve", "--help"], terminal_width=120)
     assert serve_help.exit_code == 0
-    assert "Serve the optional MCP broker over stdio" in serve_help.output
+    assert "Serve the optional MCP server over stdio" in serve_help.output
     assert "--catalog PATH" in serve_help.output
 
     check_help = runner.invoke(cli_main, ["mcp", "check", "--help"], terminal_width=120)

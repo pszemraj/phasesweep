@@ -226,8 +226,8 @@ def status(config_path: Path) -> None:
 
 @main.group(
     context_settings=CONTEXT_SETTINGS,
-    help="Manage the optional MCP broker and coding-agent integrations.",
-    short_help="Manage the MCP broker and agent integrations.",
+    help="Manage the optional MCP server and coding-agent integrations.",
+    short_help="Manage the MCP server and agent integrations.",
 )
 def mcp() -> None:
     """Run MCP operator commands."""
@@ -487,8 +487,8 @@ def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
 @mcp.command(
     name="serve",
     context_settings=CONTEXT_SETTINGS,
-    help="Serve the optional MCP broker over stdio using an operator-authored catalog.",
-    short_help="Serve the MCP broker.",
+    help="Serve the optional MCP server over stdio using an operator-authored catalog.",
+    short_help="Serve the MCP server.",
 )
 @click.option(
     "--catalog",
@@ -499,7 +499,7 @@ def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
 )
 @click.pass_context
 def mcp_serve(ctx: click.Context, catalog: Path) -> None:
-    """Serve the MCP broker over stdio.
+    """Serve the MCP server over stdio.
 
     The MCP SDK import stays behind this command so the base CLI still works
     without installing the ``mcp`` optional dependency.

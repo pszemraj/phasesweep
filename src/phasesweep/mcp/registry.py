@@ -45,13 +45,13 @@ def _require_linux_mcp_host() -> None:
     """
     if not sys.platform.startswith("linux"):
         raise CatalogError(
-            "the phasesweep MCP broker is supported only on Linux because safe "
+            "the phasesweep MCP server is supported only on Linux because safe "
             "cancellation and crash recovery require /proc process identities",
-            suggestion="run the MCP broker on Linux; the core phasesweep CLI remains POSIX-oriented",
+            suggestion="run the MCP server on Linux; the core phasesweep CLI remains POSIX-oriented",
         )
     if read_proc_starttime(os.getpid()) is None:
         raise CatalogError(
-            "the phasesweep MCP broker cannot read this process's Linux /proc start time, "
+            "the phasesweep MCP server cannot read this process's Linux /proc start time, "
             "which is required for PID-reuse-safe cancellation and crash recovery",
             suggestion="mount /proc with process stat access for the MCP server process",
         )

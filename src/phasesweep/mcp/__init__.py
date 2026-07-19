@@ -1,4 +1,4 @@
-"""Optional MCP server layer: a capability-narrowed broker over the engine.
+"""Optional MCP server layer: a capability-narrowed interface to the engine.
 
 The agent picks an experiment from a human-curated catalog by id and may only
 launch a sweep, monitor it, and read the winning hyperparameters. It never

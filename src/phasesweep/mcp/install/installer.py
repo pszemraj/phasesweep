@@ -221,6 +221,8 @@ def _apply_mcp(
         return StepResult("mcp", spec.path, action, note=note)
     if catalog is None:
         raise ValueError("installing an MCP entry requires a catalog path")
+    if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
+        return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
     entry = mcp_entry(spec.style, command, catalog)
     managed = partial(is_managed_mcp_entry, spec.style)
     action = merge_json_member(

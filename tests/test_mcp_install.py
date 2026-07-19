@@ -488,6 +488,25 @@ def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, 
     assert "// keep" in (project / "opencode.json").read_text()
 
 
+@pytest.mark.parametrize("path_kind", ["directory", "symlink"])
+def test_installer_reports_non_regular_json_config(fake_home, tmp_path, capsys, path_kind):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    config = project / ".mcp.json"
+    if path_kind == "directory":
+        config.mkdir()
+    else:
+        target = project / "target.json"
+        target.write_text("{}\n")
+        config.symlink_to(target)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    assert code == 1
+    assert "config path is not a regular file" in capsys.readouterr().out
+
+
 def test_installer_skips_unmanaged_codex_table(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
