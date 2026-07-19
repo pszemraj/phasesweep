@@ -732,8 +732,13 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
 
     app.validate("srv")
     launched = app.launch("srv")
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(Exception, match="already has a running sweep") as exc_info:
         app.launch("srv")
+    busy_message = str(exc_info.value)
+    assert launched["run_id"] in busy_message
+    assert "lost the response" in busy_message
+    assert "phasesweep_await_run" in busy_message
+    assert "Cancel it only if the user wants" in busy_message
 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [record["tool"] for record in records] == [

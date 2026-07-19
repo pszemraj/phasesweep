@@ -265,6 +265,24 @@ def test_await_run_times_out_with_unchanged_status(
     assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
 
 
+def test_await_run_returns_immediately_when_recovery_is_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, store = _app_with_run(tmp_path)
+    handle = store.get("r1")
+    assert handle is not None
+    store.mark_cleanup_uncertain(handle)
+    clock = _fake_clock(monkeypatch, app)
+
+    result = asyncio.run(app.await_run("r1"))
+
+    assert result["reason"] == "recovery_required"
+    assert result["changed"] is False
+    assert result["run"]["state"] == "running"
+    assert result["run"]["recovery_required"] is True
+    assert clock["sleeps"] == 0.0
+
+
 def test_await_run_clamps_timeout_to_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
     clock = _fake_clock(monkeypatch, app)

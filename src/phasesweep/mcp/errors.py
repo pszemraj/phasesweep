@@ -160,7 +160,9 @@ class ExperimentBusyError(McpToolError):
         """
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
-            f"(run_id {run_id!r}); cancel it or wait for it to finish"
+            f"(run_id {run_id!r}). If you just launched and lost the response, this is "
+            "likely that run; monitor it with phasesweep_await_run using "
+            f"run_id {run_id!r}. Cancel it only if the user wants to stop it."
         )
 
 

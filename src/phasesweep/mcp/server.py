@@ -91,7 +91,9 @@ DESCRIPTION_VALIDATE_CONFIG = (
     "Re-check that the cataloged config has not changed, then inspect it before launching: "
     "authorized capabilities plus per-phase names, trial counts, "
     "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
-    f"Call this before every {TOOL_LAUNCH_SWEEP}."
+    "Call once while planning an experiment; "
+    f"{TOOL_LAUNCH_SWEEP} independently refuses a changed config, so unchanged "
+    "relaunches do not need another validation call."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the single most recently launched MCP run for one catalog experiment, or "
@@ -103,8 +105,10 @@ DESCRIPTION_LAUNCH_SWEEP = (
     "Start an experiment's sweep as a detached background run that survives this "
     f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
     f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
-    "only to resume when earlier phase winners already exist. A permission refusal is "
-    "deliberate catalog policy: report it to the user and do not retry or work around it. "
+    "only to resume when earlier phase winners already exist. The launch independently "
+    "re-checks config identity and refuses a config changed since server startup. A "
+    "permission refusal is deliberate catalog policy: report it to the user and do not "
+    "retry or work around it. "
     "A concurrency-limit refusal is transient and names blocking run_ids: wait on one with "
     f"{TOOL_AWAIT_RUN}, then retry this launch only after that run is terminal."
 )
@@ -118,7 +122,9 @@ DESCRIPTION_GET_STATUS = (
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
     "instead, wait at least 30 seconds between calls. When terminal, call "
-    f"{TOOL_GET_WINNERS} with the same run_id."
+    f"{TOOL_GET_WINNERS} with the same run_id. If run.recovery_required is true, "
+    "stop monitoring and report it to the user: operator recovery is required, and "
+    "the run will not become terminal on its own."
 )
 DESCRIPTION_GET_WINNERS = (
     "The end of the workflow: per completed phase, the winning trial number, "
@@ -139,11 +145,14 @@ DESCRIPTION_CANCEL_SWEEP = (
 DESCRIPTION_AWAIT_RUN = (
     "Wait for a launched run to change. Blocks up to timeout_seconds (default "
     f"{AWAIT_DEFAULT_TIMEOUT_SECONDS}, max {AWAIT_MAX_TIMEOUT_SECONDS}) and returns "
-    "early when the run reaches a terminal state or a phase gains a winner; "
+    "early when operator recovery is required, the run reaches a terminal state, or a "
+    "phase gains a winner; "
     "otherwise returns the current status at timeout — if the state is still "
     "running, call again with the same run_id. Returns the same payload as "
-    f"{TOOL_GET_STATUS} plus changed and reason (terminal / phase_completed / "
-    f"timeout). Read-only. While waiting, status is rechecked at most once every "
+    f"{TOOL_GET_STATUS} plus changed and reason (recovery_required / terminal / "
+    f"phase_completed / timeout). If reason is recovery_required, stop waiting and "
+    "report it to the user: the run needs operator recovery and will not become terminal "
+    "on its own. Read-only. While waiting, status is rechecked at most once every "
     f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
 
@@ -343,13 +352,14 @@ class AwaitRunResult(GetStatusResult):
 
     changed: bool = Field(
         description=(
-            "Whether run state, phase progress, or winner presence changed during the wait."
+            "Whether run state, recovery requirement, phase progress, or winner presence "
+            "changed during the wait."
         )
     )
-    reason: Literal["terminal", "phase_completed", "timeout"] = Field(
+    reason: Literal["recovery_required", "terminal", "phase_completed", "timeout"] = Field(
         description=(
-            "Why the wait returned: the run reached a terminal state, a phase gained a "
-            "winner, or the timeout elapsed with no change."
+            "Why the wait returned: operator recovery is required, the run reached a "
+            "terminal state, a phase gained a winner, or the timeout elapsed with no change."
         )
     )
 
@@ -462,16 +472,22 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     return max(0, round((ended - started).total_seconds()))
 
 
-def _await_snapshot(state: str, status: dict[str, Any]) -> tuple[Any, ...]:
+def _await_snapshot(
+    state: str,
+    recovery_required: bool,
+    status: dict[str, Any],
+) -> tuple[Any, ...]:
     """Reduce a status read to the comparable facts await_run watches.
 
     :param str state: Derived run state at read time.
+    :param bool recovery_required: Whether the run needs operator recovery.
     :param dict[str, Any] status: Path-free ``read_status`` payload.
-    :return tuple[Any, ...]: Hashable snapshot of run state and per-phase
-        winner presence and completed-trial counts.
+    :return tuple[Any, ...]: Hashable snapshot of run state, recovery requirement,
+        and per-phase winner presence and completed-trial counts.
     """
     return (
         state,
+        recovery_required,
         tuple(
             (phase["phase"], phase["winner_present"], phase["completed"])
             for phase in status["phases"]
@@ -486,9 +502,9 @@ def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -
     :param tuple[Any, ...] snapshot: Snapshot from the latest recheck.
     :return bool: ``True`` when a phase's winner artifact appeared mid-wait.
     """
-    had_winner = {phase: winner for phase, winner, _completed in baseline[1]}
+    had_winner = {phase: winner for phase, winner, _completed in baseline[2]}
     return any(
-        winner and not had_winner.get(phase, False) for phase, winner, _completed in snapshot[1]
+        winner and not had_winner.get(phase, False) for phase, winner, _completed in snapshot[2]
     )
 
 
@@ -749,7 +765,8 @@ class PhaseSweepMCP:
         :param int timeout_seconds: Requested wait, clamped to
             [``AWAIT_MIN_TIMEOUT_SECONDS``, ``AWAIT_MAX_TIMEOUT_SECONDS``].
         :return dict[str, Any]: ``status`` payload plus ``changed`` and
-            ``reason`` (``terminal`` / ``phase_completed`` / ``timeout``).
+            ``reason`` (``recovery_required`` / ``terminal`` /
+            ``phase_completed`` / ``timeout``).
         """
         args = {"run_id": run_id, "timeout_seconds": timeout_seconds}
         resolved: dict[str, Any] = {}
@@ -770,10 +787,16 @@ class PhaseSweepMCP:
                     # await request must never silently degrade into an
                     # experiment-level status response without run identity.
                     raise UnknownRunError(run_id)
-                snapshot = _await_snapshot(run["state"], status)
+                snapshot = _await_snapshot(
+                    run["state"],
+                    run["recovery_required"],
+                    status,
+                )
                 if baseline is None:
                     baseline = snapshot
-                if run["state"] in ("succeeded", "failed", "cancelled"):
+                if run["recovery_required"]:
+                    reason = "recovery_required"
+                elif run["state"] in ("succeeded", "failed", "cancelled"):
                     reason = "terminal"
                 elif _phase_gained_winner(baseline, snapshot):
                     reason = "phase_completed"

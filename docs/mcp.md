@@ -44,7 +44,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_validate_config` | `experiment_id` | read | capabilities and per-phase name, `n_trials`, sampler, inherited phases, and search-space *keys* (not ranges); a changed config is a tool error |
 | `phasesweep_get_latest_run` | `experiment_id` | read | the newest durable run, selected by launch timestamp with a stable tie-breaker, or `found: false` |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | dense state counts, computed terminal/remaining attempts, storage-read availability, winner presence, result provenance, run state, and elapsed time; terminal run-id reads require a frozen snapshot |
-| `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (5-600; default 120) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`terminal` / `phase_completed` / `timeout`) |
+| `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (5-600; default 120) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`recovery_required` / `terminal` / `phase_completed` / `timeout`) |
 | `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | objective metadata, result provenance, declared/winner counts, missing phases, all-phases completeness, and per-winner trial number, metric, policy-filtered sampled params, gate status, and partial-winner status |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, experiment_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed, recovery_required}` |

@@ -278,6 +278,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.instructions == agent_prompt_text(strip=True)
+    assert "unchanged relaunches do not need another validation call" in initialization.instructions
+    assert "reason: recovery_required" in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -294,6 +296,15 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert all(t.outputSchema for t in tools)
     assert server._tool_manager.get_tool(TOOL_AWAIT_RUN).is_async is True
     assert server._tool_manager.get_tool(TOOL_CANCEL_SWEEP).is_async is True
+
+    descriptions = {t.name: t.description for t in tools}
+    assert (
+        "unchanged relaunches do not need another validation call"
+        in descriptions[TOOL_VALIDATE_CONFIG]
+    )
+    assert "independently re-checks config identity" in descriptions[TOOL_LAUNCH_SWEEP]
+    assert "run.recovery_required" in descriptions[TOOL_GET_STATUS]
+    assert "reason is recovery_required" in descriptions[TOOL_AWAIT_RUN]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
@@ -338,6 +349,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     output_schemas = {t.name: t.outputSchema for t in tools}
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
+    assert "recovery_required" in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["enum"]
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
