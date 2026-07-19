@@ -4,7 +4,7 @@
 
 Non-dry-run execution requires a POSIX platform such as Linux or macOS. phasesweep uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host locks. Config validation and `--dry-run` do not launch subprocesses and do not take those locks, but real runs fail early on unsupported platforms.
 
-MCP operations that validate a catalog, start the broker, install an MCP client entry, or recover a run require Linux with readable `/proc` process start times. This makes autonomous cancellation and crash recovery PID-reuse-safe. Instruction-only client installation does not load a catalog and remains available without the MCP runtime. The core CLI remains available on supported POSIX platforms.
+MCP operations that validate a catalog, start the server, install an MCP client entry, or recover a run require Linux with readable `/proc` process start times. This makes autonomous cancellation and crash recovery PID-reuse-safe. Instruction-only client installation does not load a catalog and remains available without the MCP runtime. The core CLI remains available on supported POSIX platforms.
 
 ## Output layout
 
@@ -79,7 +79,13 @@ The lock directory must resolve to one path shared by every cooperating phaseswe
 
 Upgrade note: older phasesweep builds used the process temp directory for these locks. Existing stale locks under `/tmp` or a scheduler-provided `TMPDIR` are not consulted after the default moves to `/var/tmp/phasesweep-locks`; set `PHASESWEEP_LOCK_DIR` explicitly during a staged upgrade if you need old and new processes to coordinate.
 
-CUDA device tokens also take per-device host locks. With the default `gpu_policy: single_per_trial`, explicit `gpu_ids`, explicit `gpu_devices`, ambient `CUDA_VISIBLE_DEVICES` tokens, and auto-detected `nvidia-smi` numeric devices are leased even for `n_jobs == 1`, preventing independent local phasesweep runs from double-booking the same GPU. `gpu_policy: whole_node` requires `n_jobs: 1`, leases every configured or detected token, and exposes the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches. `gpu_policy: none` never changes `CUDA_VISIBLE_DEVICES` and never acquires GPU locks; parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler. Numeric tokens keep numeric lock names; opaque UUID/MIG tokens use sanitized, hashed lock names. When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
+CUDA device tokens also take per-device host locks. The policies are:
+
+- `single_per_trial` (default): lease explicit `gpu_ids`, explicit `gpu_devices`, ambient `CUDA_VISIBLE_DEVICES` tokens, or auto-detected `nvidia-smi` numeric devices, even for `n_jobs == 1`. This prevents independent local phasesweep runs from double-booking the same GPU.
+- `whole_node`: require `n_jobs: 1`, lease every configured or detected token, and expose the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches.
+- `none`: never change `CUDA_VISIBLE_DEVICES` or acquire GPU locks. Parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler.
+
+Numeric tokens keep numeric lock names; opaque UUID/MIG tokens use sanitized, hashed lock names. When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
 
 > [!WARNING]
 > Multi-host writers against one shared study are unsupported. The stale-trial reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
