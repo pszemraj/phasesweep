@@ -472,6 +472,7 @@ def _print_plan(
     for target in targets:
         click.echo(f"  {target.display_name}")
         for integration in integrations:
+            path: Path | None
             if integration == "mcp":
                 path = target.mcp.path
                 notice = target.mcp.notice
