@@ -592,6 +592,7 @@ def test_installer_updates_recognizable_managed_json_entry(fake_home, tmp_path, 
 
     assert code == 0, capsys.readouterr().out
     entry = json.loads(path.read_text())["mcpServers"]["phasesweep"]
+    assert entry["command"] == installer.resolve_server_command()
     assert entry["args"] == ["--catalog", str(catalog)]
 
 
@@ -979,6 +980,8 @@ def test_install_help_is_operator_readable():
     ):
         assert flag in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
+    assert "Strict JSON configs are re-serialized and may be reformatted" in install_help.output
+    assert "bind to the Python environment" in install_help.output
     assert "Args:" not in install_help.output
 
     uninstall_help = runner.invoke(cli_main, ["mcp", "uninstall", "--help"], terminal_width=120)

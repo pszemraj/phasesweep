@@ -649,8 +649,10 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
         "Wire the phasesweep MCP server into coding-agent configs: an MCP server entry plus a "
         "marker-fenced instructions block per agent, project-scoped wherever the client "
         "supports it. The catalog is validated with the exact server startup rules before any "
-        "client config is touched. Without --agent, choose from all supported agents in one "
-        "menu, with detected clients preselected."
+        "client config is touched. Strict JSON configs are re-serialized and may be reformatted. "
+        "Generated entries bind to the Python environment running this command; rerun install "
+        "after replacing that environment. Without --agent, choose from all supported agents in "
+        "one menu, with detected clients preselected."
     ),
     short_help="Connect coding agents to the MCP server.",
 )

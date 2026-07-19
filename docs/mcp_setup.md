@@ -23,7 +23,7 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable):
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry intentionally remains bound to this Python environment. If you move, delete, or recreate it, install PhaseSweep in the replacement environment and rerun the same step-3 install command to update the managed entry.
 
 ```bash
 which phasesweep-mcp
@@ -62,7 +62,7 @@ phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-s
 
 Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same plan and outcomes without writing. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
-Automatic edits are limited to regular files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Malformed configs and same-name entries that do not match the generated shape are left untouched with a manual snippet. Writes replace only the managed entry or marker block. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
+Automatic edits are limited to regular files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Malformed configs and same-name entries that do not match the generated shape are left untouched with a manual snippet. Marker-fenced text edits replace only the managed block. Strict JSON edits change only the managed data, but re-serialize the document; JSON data, key order, detected indentation, final-newline state, and permissions are preserved, while compact or irregular whitespace may be reformatted. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
 
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
@@ -114,7 +114,7 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 
 ## Troubleshooting
 
-- The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda executable in the client config (`which phasesweep-mcp`).
+- The client cannot find `phasesweep-mcp`: a generated entry points to the Python environment that ran the installer. If that environment moved, was deleted, or was recreated, install the MCP extra in its replacement, rerun the same `phasesweep mcp install` command (`--dry-run` previews the repair), and restart the client. For a manual config, update `command` to the new absolute path from `which phasesweep-mcp`.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
 - `concurrency limit reached`: the refusal names up to five blocking run IDs. Await one directly and retry the refused launch after it becomes terminal, ask the user before cancelling it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
 - `terminal result snapshot ... unavailable`: retry once after a short delay. If finalization remains `failed` or `pending`, inspect the host and use `phasesweep mcp recover-run --state-dir <state_dir> --run-id <run_id>` followed by `--confirm` to rebuild the immutable snapshot; run-ID reads never substitute mutable experiment results.

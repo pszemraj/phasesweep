@@ -1,12 +1,14 @@
 """File-edit primitives for installer integrations.
 
-Two edit families with one safety contract - touch only what phasesweep owns,
-and make uninstall the inverse of install:
+Two edit families share one safety contract: modify only installer-managed
+content and refuse same-name conflicts:
 
-- JSON member edits: parse the whole document, change exactly one member under
-  one container key, and re-serialize with the file's own indentation. Files
-  that do not parse as strict JSON (comments, JSON5) are never modified; the
-  caller gets ``"skipped"`` and prints a manual snippet instead.
+- JSON member edits: parse the whole document, change one member under one
+  container key, and re-serialize with the file's detected indentation. This
+  preserves JSON data and key order, but may reformat compact or irregular
+  whitespace. Files that do not parse as strict JSON (comments, JSON5) are
+  never modified; the caller gets ``"skipped"`` and prints a manual snippet
+  instead.
 - Marker-fenced text blocks: replace-or-append a block between start/end
   marker lines, leaving every byte outside the markers alone. Removal restores
   the original file byte-identically (including its final-newline state) and
