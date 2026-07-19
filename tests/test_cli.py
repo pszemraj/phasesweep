@@ -70,7 +70,7 @@ def test_help_output_is_operator_readable() -> None:
     assert check_help.exit_code == 0
     assert "Args:" not in check_help.output
     assert "per-experiment ok/FAIL report" in check_help.output
-    assert "without changing runtime state" in check_help.output
+    assert "provisions and probes" in check_help.output
     assert "--catalog PATH" in check_help.output
 
     init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)

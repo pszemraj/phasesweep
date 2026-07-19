@@ -764,7 +764,7 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
     )
     assert preview_install.exit_code == 0, preview_install.output
     assert "would-create" in preview_install.output
-    assert "nothing was changed" in preview_install.output
+    assert "no client files were changed" in preview_install.output
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
 
@@ -782,12 +782,12 @@ def test_cli_install_and_uninstall_dry_run_never_mutate_client_files(
     )
     assert preview_uninstall.exit_code == 0, preview_uninstall.output
     assert "would-remove" in preview_uninstall.output
-    assert "nothing was changed" in preview_uninstall.output
+    assert "no client files were changed" in preview_uninstall.output
     assert (project / ".mcp.json").read_bytes() == mcp_before
     assert (project / "CLAUDE.md").read_bytes() == instructions_before
 
 
-def test_cli_install_does_not_provision_catalog_state(
+def test_cli_install_provisions_catalog_state_before_client_edits(
     fake_home,
     tmp_path,
 ):
@@ -811,17 +811,20 @@ def test_cli_install_does_not_provision_catalog_state(
 
     preview = runner.invoke(cli_main, [*args, "--dry-run"])
     assert preview.exit_code == 0, preview.output
-    assert "nothing was changed" in preview.output
-    assert not state_dir.exists()
+    assert "no client files were changed" in preview.output
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
 
     rejected = runner.invoke(cli_main, args, input="n\n")
     assert rejected.exit_code == 2, rejected.output
-    assert "cancelled; nothing was changed" in rejected.output
-    assert not state_dir.exists()
+    assert "cancelled; no client files were changed" in rejected.output
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
 
     accepted = runner.invoke(cli_main, args, input="y\n")
     assert accepted.exit_code == 0, accepted.output
-    assert not state_dir.exists()
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
 
 
 def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(

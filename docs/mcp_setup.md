@@ -39,7 +39,7 @@ Scaffold a catalog next to your project:
 phasesweep mcp init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This writes an annotated `catalog.yaml` without overwriting an existing file. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, enable only the actions and parameter values the agent should receive, then run the `phasesweep mcp check` command printed by the scaffold. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
+This stages an annotated `catalog.yaml`, validates it through the server startup path, provisions its private state directories, and publishes it only after validation succeeds without overwriting an existing file. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, enable only the actions and parameter values the agent should receive, then run the `phasesweep mcp check` command printed by the scaffold. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
 
 Confirm the catalog loads before touching any client config:
 
@@ -47,7 +47,7 @@ Confirm the catalog loads before touching any client config:
 phasesweep mcp check --catalog /abs/path/to/catalog.yaml
 ```
 
-Fix every reported failure before connecting a client. The command exits 0 only when the catalog entries satisfy the same schema, config, storage, and path rules used at server startup and the state layout passes a non-mutating usability preflight. It does not create or chmod state directories, start the MCP server, or launch a sweep.
+Fix every reported failure before connecting a client. The command exits 0 only when the catalog entries satisfy the same schema, config, storage, and path rules used at server startup and the configured state, runs, and logs directories have been provisioned and write-probed through the startup path. It does not start the MCP server or launch a sweep.
 
 ## 3. Connect your client
 
@@ -56,11 +56,11 @@ One command writes the MCP server entry and, where the client supports project i
 ```bash
 phasesweep mcp install                        # interactive: select agents, review the plan, apply
 phasesweep mcp install --agent claude --yes   # unattended; repeat --agent for more
-phasesweep mcp install --agent claude --dry-run  # validate and show planned edits without writing
+phasesweep mcp install --agent claude --dry-run  # validate and show planned client-file edits
 phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
 ```
 
-Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same plan and outcomes without writing. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
+Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
 Automatic edits are limited to regular files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Malformed configs and same-name entries that do not match the generated shape are left untouched with a manual snippet. Marker-fenced text edits replace only the managed block. Strict JSON edits change only the managed data, but re-serialize the document; JSON data, key order, detected indentation, final-newline state, and permissions are preserved, while compact or irregular whitespace may be reformatted. `uninstall` removes the same managed content and leaves shared instruction blocks until their last installed agent owner is removed.
 

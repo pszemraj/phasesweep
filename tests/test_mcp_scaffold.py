@@ -51,7 +51,8 @@ def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     assert '# description: "Human-curated one-line purpose shown to the agent"' in text
     assert "\n    allow:" not in text  # side effects stay commented out
 
-    assert not (tmp_path / "runs" / ".mcp").exists()
+    assert (tmp_path / "runs" / ".mcp" / "runs").is_dir()
+    assert (tmp_path / "runs" / ".mcp" / "logs").is_dir()
 
     # The scaffold boots the real server loader as-is, read-only.
     registry = Registry.load(output)
@@ -105,7 +106,7 @@ def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> 
     assert Registry.load(output).state_dir == (catalog_dir / "runs" / ".mcp").resolve()
 
 
-def test_init_catalog_leaves_validation_to_mcp_check(tmp_path: Path) -> None:
+def test_init_catalog_validates_before_publish(tmp_path: Path) -> None:
     config = tmp_path / "rel.yaml"
     config.write_text(
         mcp_experiment_config_text(tmp_path, name="rel").replace(
@@ -116,13 +117,11 @@ def test_init_catalog_leaves_validation_to_mcp_check(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
-    assert result.exit_code == 0
-    assert output.exists()
+    assert result.exit_code == 2
+    assert "absolute workdir" in result.output
+    assert not output.exists()
+    assert not list(tmp_path.glob(".catalog.yaml.*.tmp"))
     assert not (tmp_path / "runs").exists()
-
-    checked = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(output)])
-    assert checked.exit_code == 2
-    assert "FAIL" in checked.output
 
 
 def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
@@ -135,6 +134,29 @@ def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "operator-authored\n"
+
+
+def test_init_catalog_losing_publish_race_preserves_other_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+
+    def lose_publish_race(_source: Path, destination: Path) -> None:
+        destination.write_text("other process\n")
+        raise FileExistsError(destination)
+
+    monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
+
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 2
+    assert "refusing to overwrite" in result.output
+    assert output.read_text() == "other process\n"
+    assert not list(tmp_path.glob(".catalog.yaml.*.tmp"))
 
 
 def test_init_catalog_requires_at_least_one_config(tmp_path: Path) -> None:

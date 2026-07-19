@@ -533,7 +533,7 @@ def run(
         )
         return 2
     if not dry_run and not yes and not click.confirm("Proceed?", default=True):
-        click.echo("cancelled; nothing was changed.")
+        click.echo("cancelled; no client files were changed.")
         return 2
 
     command = ""
@@ -575,7 +575,7 @@ def run(
         )
         return 1
     if dry_run:
-        click.echo("dry run complete; nothing was changed.")
+        click.echo("dry run complete; no client files were changed.")
         return 0
     if mode == "install":
         click.echo(

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import click
@@ -27,12 +28,12 @@ from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import AGENT_IDS
-from phasesweep.mcp.registry import CatalogCheckReport, check_catalog
+from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import capture_result_snapshot, parse_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
     is_pid_zombie,
@@ -517,8 +518,8 @@ def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Validate an MCP catalog with the exact rules the server applies at startup and "
-        "print a per-experiment ok/FAIL report without changing runtime state. Exit code 0 "
-        "when every entry loads, 2 otherwise."
+        "print a per-experiment ok/FAIL report. A successful check provisions and probes "
+        "the configured state directory. Exit code 0 when every entry loads, 2 otherwise."
     ),
     short_help="Preflight an MCP catalog.",
 )
@@ -535,8 +536,9 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
 
     Shares the per-entry validation code path with ``Registry.load`` but
     collects every entry's verdict instead of failing fast, so a broken
-    catalog is diagnosed here rather than inside an MCP client restart.
-    Operator-facing: output may include paths.
+    catalog is diagnosed here rather than inside an MCP client restart. A
+    successful check also provisions the state layout through the exact server
+    startup path. Operator-facing: output may include paths.
 
     :param click.Context ctx: Active Click context used for the exit code.
     :param Path catalog: Operator-authored MCP catalog to validate.
@@ -576,8 +578,9 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     help=(
         "Write an annotated MCP catalog for existing experiment configs: absolute "
         "state_dir next to the catalog, one read-only entry per --from config "
-        "(visible_params: none, no allow block). Existing files are never overwritten; "
-        "edit the result, then validate it with `phasesweep mcp check`."
+        "(visible_params: none, no allow block). The staged catalog is validated with "
+        "the server startup path before it is published. Existing files are never overwritten; "
+        "edit the result, then re-check it with `phasesweep mcp check`."
     ),
     short_help="Scaffold an MCP catalog.",
 )
@@ -615,30 +618,60 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
 
 
 def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> bool:
-    """Render and exclusively create a scaffolded catalog.
+    """Stage, validate, and exclusively publish a scaffolded catalog.
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
     :return bool: True when the catalog was written; False after printing why not.
     """
-    try:
-        text = scaffold_catalog_text(output, from_configs)
-    except CatalogError as exc:
-        click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
-        if exc.suggestion:
-            click.echo(f"fix: {exc.suggestion}", err=True)
-        return False
-    output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with output.open("x", encoding="utf-8") as handle:
-            handle.write(text)
-    except FileExistsError:
+    if os.path.lexists(output):
         click.echo(
             f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
             "Pass -o to choose another name.",
             err=True,
         )
         return False
+
+    staged: Path | None = None
+    try:
+        text = scaffold_catalog_text(output, from_configs)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            staged = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        Registry.load(staged)
+        try:
+            os.link(staged, output)
+        except FileExistsError:
+            click.echo(
+                f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
+                "Pass -o to choose another name.",
+                err=True,
+            )
+            return False
+        fsync_directory(output.parent)
+    except CatalogError as exc:
+        click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
+        if exc.suggestion:
+            click.echo(f"fix: {exc.suggestion}", err=True)
+        return False
+    except OSError as exc:
+        click.echo(f"phasesweep mcp init-catalog: cannot write {output}: {exc}", err=True)
+        return False
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
     click.echo(f"wrote {output}")
     return True
 
