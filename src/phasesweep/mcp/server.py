@@ -143,8 +143,8 @@ DESCRIPTION_AWAIT_RUN = (
     "otherwise returns the current status at timeout — if the state is still "
     "running, call again with the same run_id. Returns the same payload as "
     f"{TOOL_GET_STATUS} plus changed and reason (terminal / phase_completed / "
-    f"timeout). Read-only. Internal rechecks use observed trial duration rather than "
-    f"a tight fixed loop. Prefer this over polling {TOOL_GET_STATUS} in a loop."
+    f"timeout). Read-only. While waiting, status is rechecked at most once every "
+    f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
 
 ExperimentId = Annotated[
