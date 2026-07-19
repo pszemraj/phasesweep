@@ -286,13 +286,15 @@ class RunStore:
     def state(self, handle: RunHandle) -> RunState:
         """Derive the current state from status.json and a live PID check.
 
-        status.json (written by the runner on every exit) is authoritative when
-        present: returncode 0 -> succeeded, a signalled code -> cancelled, any
-        other -> failed. With no status.json, a live (non-zombie) PID means
-        running. A dead or unverifiable spawned runner with no status cannot
-        prove that its separately-sessioned trial descendants are gone, so it
-        is marked cleanup-uncertain and remains ``running`` until operator
-        recovery records cleanup evidence.
+        A finalized status.json (written by the runner on every exit) is
+        authoritative: returncode 0 -> succeeded, a signalled code ->
+        cancelled, any other -> failed. Pending result snapshot capture remains
+        running so another launch cannot mutate shared result storage before
+        the snapshot is frozen. With no status.json, a live (non-zombie) PID
+        means running. A dead or unverifiable spawned runner with no status
+        cannot prove that its separately-sessioned trial descendants are gone,
+        so it is marked cleanup-uncertain and remains ``running`` until
+        operator recovery records cleanup evidence.
 
         Args:
             handle: The run handle to evaluate.
@@ -315,6 +317,8 @@ class RunStore:
                 return "running"
         if status is not None:
             if self._terminal_cleanup_uncertain(handle, status):
+                return "running"
+            if status.get("result_snapshot_state") == "pending":
                 return "running"
             rc = status.get("returncode")
             if rc == 0:

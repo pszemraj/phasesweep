@@ -241,6 +241,43 @@ def test_terminal_status_determines_state(
     assert store.state(handle) == expected_state
 
 
+def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        run_id="exp-1",
+        experiment_id="exp",
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="pending",
+    )
+
+    assert store.state(handle) == "running"
+    assert store.live_runs() == [handle]
+    assert store.live_run_for("exp") == handle
+
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot={},
+    )
+
+    assert store.state(handle) == "succeeded"
+    assert store.live_runs() == []
+    assert store.live_run_for("exp") is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
