@@ -10,14 +10,15 @@ The server starts from a catalog: a fixed allowlist mapping opaque ids to local 
 
 Catalog keys:
 
-- `state_dir`: operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`.
-- `max_concurrent_runs`: cap on live sweeps across all catalog entries. The default is `1`.
-- `experiments[].id`: agent-visible id. It must match `[A-Za-z0-9_-]+`.
-- `experiments[].config`: local experiment YAML path. Relative paths resolve against the catalog file.
-- `experiments[].cwd`: optional detached-runner working directory. Relative paths resolve against the catalog file. The default is the registered config file's directory.
-- `experiments[].visible_params`: sampled winner parameter values exposed to agents. Use `none` (default), `all`, or a list of allowed parameter keys. Parameter names remain visible; values outside the policy are returned as `<redacted>`, and each winner phase carries a `params_redacted` boolean so agents can report withheld values without string-matching the sentinel.
-- `experiments[].description`: optional text shown by `phasesweep_list_experiments` and the catalog resource.
-- `experiments[].allow`: optional side-effect permissions for `launch`, `cancel`, and `from_phase`.
+- `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. Relative paths resolve against the catalog file. Startup creates and private-secures the directory plus `runs/` and `logs/`; `mcp check` only verifies that the layout is or can be usable without writing.
+- `max_concurrent_runs: int = 1` (minimum `1`): live-sweep cap across all catalog entries. Keep `1` on a single-GPU host; raise it only when independent sweeps have separate capacity.
+- `experiments: list` (required; at least one item): allowlisted experiment entries. Entry ids must be unique.
+- `experiments[].id: str` (required): agent-visible id matching nonempty `[A-Za-z0-9_-]+`.
+- `experiments[].config: path` (required): local single-experiment YAML. Relative paths resolve against the catalog file; suites, invalid configs, non-persistent storage, relative workdirs, and non-absolute/non-local storage paths are rejected.
+- `experiments[].cwd: path | null = null`: existing detached-runner working directory. Relative paths resolve against the catalog file; omission/null defaults to the registered config file's directory.
+- `experiments[].visible_params: "none" | "all" | list[str] = "none"`: sampled winner values exposed to agents. List entries are stripped, must be nonempty, and are deduplicated. Parameter names remain visible; withheld values return `<redacted>`, and each winner carries `params_redacted`.
+- `experiments[].description: str = ""` (maximum 500 characters): optional purpose shown by `phasesweep_list_experiments` and the catalog resource.
+- `experiments[].allow: object = {}`: side-effect permissions. `launch: bool = false`, `cancel: bool = false`, and `from_phase: bool = false`; omission leaves the entry read-only.
 
 At startup the server validates each experiment with the same loader the CLI uses, computes a content hash, initializes the private `state_dir/runs` and `state_dir/logs` directories, and refuses an unusable state path, invalid configs, suites, or configs that violate the [storage and path requirements](#paths-and-the-working-directory). The id-to-path mapping is then frozen for the server's lifetime. On launch, the server verifies the config still matches the startup hash and hands the detached runner a per-run snapshot, so later edits to the original file cannot change what the runner executes.
 
