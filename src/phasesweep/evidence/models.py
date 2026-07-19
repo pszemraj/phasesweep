@@ -95,18 +95,11 @@ class LogRegexExtractor(_TrialPathModel):
 
 
 class WandbExtractor(_Frozen):
-    """Extract a scalar from a completed W&B run's summary."""
+    """Extract a scalar from this attempt's finished W&B run summary."""
 
     type: Literal["wandb"]
     entity: str
     project: str
-    run_name_template: str = Field(
-        default="{experiment}-{phase}-{trial_id}",
-        description=(
-            "Template the trial uses to name its W&B run. Available substitutions: "
-            "{experiment}, {phase}, {trial_id}, {run_name}."
-        ),
-    )
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
     poll_seconds: float = Field(default=2.0, gt=0.0)
     timeout_seconds: float = Field(default=120.0, ge=0.0)
@@ -205,13 +198,12 @@ class Sha256Gate(_TrialPathModel):
 
 
 class WandbSummaryRequiredGate(_Frozen):
-    """Require keys to be present in a completed W&B run summary."""
+    """Require keys in this attempt's finished W&B run summary."""
 
     type: Literal["wandb_summary_required"]
     entity: str
     project: str
     keys: list[str] = Field(min_length=1)
-    run_name_template: str = "{experiment}-{phase}-{trial_id}"
     poll_seconds: float = Field(default=2.0, gt=0.0)
     timeout_seconds: float = Field(default=120.0, ge=0.0)
 

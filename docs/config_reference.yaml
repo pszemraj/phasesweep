@@ -150,7 +150,8 @@
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
-# Applied over the parent process environment. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, and `PHASESWEEP_RUN_NAME` for every trial.
+# Applied over the parent process environment. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `WANDB_RUN_ID` for every trial.
+# WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
 
 # SEARCH PARAMETER OBJECTS
@@ -181,7 +182,7 @@
 # type: Literal["json"] (required)
 # path: str (required)
 # key: str (required)
-# The selected JSON value must coerce to a finite float.
+# The selected JSON value must be a finite JSON number; strings and booleans are rejected.
 
 # type: Literal["log_regex"] (required)
 # file: str = "stdout.log"
@@ -194,13 +195,11 @@
 # type: Literal["wandb"] (required)
 # entity: str (required)
 # project: str (required)
-# run_name_template: str = "{experiment}-{phase}-{trial_id}"
-# Supported substitutions are `{experiment}`, `{phase}`, `{trial_id}`, and `{run_name}`. Keep display names unique: lookup uses the first match, and PHASESWEEP_RUN_NAME always supplies `{run_name}` independently of this template.
 # metric_key: str (required)
-# Key in wandb.run.summary; the value must coerce to a finite float.
+# Key in wandb.run.summary; the value must be a finite number, not a string or boolean.
 # poll_seconds: float = 2.0 (> 0)
 # timeout_seconds: float = 120.0 (>= 0)
-# Requires the optional W&B dependency. Polling accepts terminal `finished`, `crashed`, or `failed` runs when the metric exists; absence through timeout fails the trial.
+# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial.
 
 # GATE OBJECTS
 # A gate must use exactly one discriminator shape. All `path` and JSON `key` fields obey the Extractor path/key invariants above.
@@ -240,11 +239,9 @@
 # entity: str (required)
 # project: str (required)
 # keys: list[str] (required; min length 1)
-# run_name_template: str = "{experiment}-{phase}-{trial_id}"
-# Supported substitutions and display-name uniqueness are the same as the W&B extractor.
 # poll_seconds: float = 2.0 (> 0)
 # timeout_seconds: float = 120.0 (>= 0)
-# Requires the optional W&B dependency. Once a matching run is terminal, missing keys fail the gate immediately rather than polling for later summary updates.
+# Requires the optional W&B dependency. Lookup and terminal-state rules are the same as the W&B extractor. Once the attempt's run is finished, missing keys fail the gate immediately rather than polling for later summary updates.
 
 # PROMOTION OBJECT
 

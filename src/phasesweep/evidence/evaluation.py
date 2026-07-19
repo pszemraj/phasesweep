@@ -26,8 +26,8 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.evidence.wandb import (
     WandbPollTimeout,
+    WandbRunTerminalError,
     poll_wandb_summary,
-    render_trial_run_name,
 )
 
 
@@ -52,17 +52,16 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
 
 
 def json_float(value: Any, *, label: str) -> float:
-    """Coerce a JSON value to float with a keyed error message.
+    """Require a JSON number and convert it to float with a keyed error message.
 
     :param Any value: JSON scalar value to coerce.
     :param str label: Human-readable key or metric label for errors.
-    :raises ValueError: If ``value`` cannot be converted to ``float``.
+    :raises ValueError: If ``value`` is not an integer or float, excluding booleans.
     :return float: Coerced numeric value.
     """
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Value at {label!r} is not numeric: {value!r}") from exc
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"Value at {label!r} is not a JSON number: {value!r}")
+    return float(value)
 
 
 class ExtractorError(RuntimeError):
@@ -182,28 +181,27 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
 
 
 def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
-    """Poll the W&B public API for a run by display name and return a summary metric.
+    """Poll the W&B public API for this attempt's run and return a summary metric.
 
     Args:
-        ctx: Trial context. ``experiment``/``phase``/``trial_id``/``run_name``
-            are substituted into ``cfg.run_name_template``.
-        cfg: ``WandbExtractor`` config: entity, project, run-name template,
-            metric key, poll cadence, and timeout.
+        ctx: Trial context containing the immutable attempt id assigned as
+            ``WANDB_RUN_ID`` before subprocess launch.
+        cfg: ``WandbExtractor`` config: entity, project, metric key, poll
+            cadence, and timeout.
 
     Returns:
-        The numeric value of ``cfg.metric_key`` on the finished/crashed/failed run.
+        The numeric value of ``cfg.metric_key`` on the finished run.
 
     Raises:
-        ExtractorError: ``wandb`` not installed, run not found before timeout,
-            or metric key missing on the finished run's summary.
+        ExtractorError: ``wandb`` not installed, the attempt's run failed, the
+            run was not ready before timeout, or the metric was missing or invalid.
 
     """
-    target_name = render_trial_run_name(cfg.run_name_template, ctx)
     try:
         summary = poll_wandb_summary(
             entity=cfg.entity,
             project=cfg.project,
-            run_name=target_name,
+            run_id=ctx.attempt_id,
             poll_seconds=cfg.poll_seconds,
             timeout_seconds=cfg.timeout_seconds,
             required_keys=[cfg.metric_key],
@@ -215,9 +213,14 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
             'python -m pip install "phasesweep[wandb] @ '
             'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
+    except WandbRunTerminalError as exc:
+        raise ExtractorError(
+            f"W&B run {ctx.attempt_id!r} ended in state {exc.state!r}; "
+            "only finished runs provide objective evidence."
+        ) from exc
     except WandbPollTimeout as exc:
         msg = (
-            f"W&B run {target_name!r} not found or metric {cfg.metric_key!r} "
+            f"W&B run {ctx.attempt_id!r} not found or metric {cfg.metric_key!r} "
             f"missing within {cfg.timeout_seconds}s."
         )
         if exc.last_error is not None:
@@ -225,8 +228,8 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
         raise ExtractorError(msg) from exc
 
     try:
-        return float(summary[cfg.metric_key])
-    except (TypeError, ValueError) as exc:
+        return json_float(summary[cfg.metric_key], label=cfg.metric_key)
+    except ValueError as exc:
         raise ExtractorError(
             f"Value at W&B metric {cfg.metric_key!r} is not numeric: {summary[cfg.metric_key]!r}"
         ) from exc
@@ -385,24 +388,29 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
 def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -> GateResult:
     """Check that a finished W&B run summary contains required keys.
 
-    :param TrialContext ctx: Trial context used to render the W&B run name.
+    :param TrialContext ctx: Trial context containing the immutable W&B run id.
     :param WandbSummaryRequiredGate gate: Gate config for W&B lookup and keys.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    target_name = render_trial_run_name(gate.run_name_template, ctx)
     try:
         summary = poll_wandb_summary(
             entity=gate.entity,
             project=gate.project,
-            run_name=target_name,
+            run_id=ctx.attempt_id,
             poll_seconds=gate.poll_seconds,
             timeout_seconds=gate.timeout_seconds,
             wait_for_keys=False,
         )
     except ImportError:
         return GateResult(gate.type, False, "wandb package is not installed")
+    except WandbRunTerminalError as exc:
+        return GateResult(
+            gate.type,
+            False,
+            f"W&B run {ctx.attempt_id!r} ended in state {exc.state!r}",
+        )
     except WandbPollTimeout as exc:
-        detail = f"W&B run {target_name!r} not ready within {gate.timeout_seconds}s"
+        detail = f"W&B run {ctx.attempt_id!r} not ready within {gate.timeout_seconds}s"
         if exc.last_error is not None:
             detail += f"; last error: {exc.last_error}"
         return GateResult(gate.type, False, detail)

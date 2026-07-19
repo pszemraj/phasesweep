@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 import types
+from dataclasses import replace
 
 import pytest
 from pydantic import ValidationError
@@ -14,36 +14,36 @@ from tests.conftest import make_trial_context
 
 
 class _FakeRun:
-    def __init__(self, name: str, state: str, summary: dict):
-        self.display_name = name
+    def __init__(self, state: str, summary: dict):
         self.state = state
         self.summary = summary
 
 
 class _FakeApi:
-    def __init__(self, runs_for_filter):
-        self._runs_for_filter = runs_for_filter
+    def __init__(self, run_for_path):
+        self._run_for_path = run_for_path
 
-    def runs(self, path, filters):
-        name = filters["display_name"]
-        return self._runs_for_filter(path, name)
+    def run(self, path):
+        return self._run_for_path(path)
 
 
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake ``wandb.apis.public.Api`` backed by a supplied runs callable."""
+    """Install a fake ``wandb.apis.public.Api`` backed by a supplied run callable."""
 
-    def install(runs_for_filter):
+    def install(run_for_path):
         wandb_mod = types.ModuleType("wandb")
         apis_mod = types.ModuleType("wandb.apis")
         public_mod = types.ModuleType("wandb.apis.public")
+        timeouts: list[int | None] = []
 
         class Api:
-            def __init__(self):
-                self._inner = _FakeApi(runs_for_filter)
+            def __init__(self, timeout=None):
+                timeouts.append(timeout)
+                self._inner = _FakeApi(run_for_path)
 
-            def runs(self, path, filters):
-                return self._inner.runs(path, filters)
+            def run(self, path):
+                return self._inner.run(path)
 
         public_mod.Api = Api
         wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
@@ -51,6 +51,7 @@ def fake_wandb(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
         monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
         monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+        return timeouts
 
     return install
 
@@ -74,7 +75,19 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
             "non_numeric",
             {"result.json": {"x": "abc"}},
             JsonExtractor(type="json", path="result.json", key="x"),
-            "not numeric",
+            "not a JSON number",
+        ),
+        (
+            "numeric_string",
+            {"result.json": {"x": "1.25"}},
+            JsonExtractor(type="json", path="result.json", key="x"),
+            "not a JSON number",
+        ),
+        (
+            "boolean",
+            {"result.json": {"x": True}},
+            JsonExtractor(type="json", path="result.json", key="x"),
+            "not a JSON number",
         ),
     ]
 
@@ -145,60 +158,88 @@ def test_log_regex_reports_invalid_patterns_or_no_matches(tmp_path):
 
 
 def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
-    fake_wandb(
-        lambda path, name: [_FakeRun(name=name, state="finished", summary={"eval/loss": 0.123})]
-    )
+    paths: list[str] = []
+
+    def finished_run(path: str) -> _FakeRun:
+        paths.append(path)
+        return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    timeouts = fake_wandb(finished_run)
     cfg = WandbExtractor(
         type="wandb",
         entity="me",
         project="proj",
-        run_name_template="{experiment}-{phase}-{trial_id}",
         metric_key="eval/loss",
         poll_seconds=0.01,
         timeout_seconds=1.0,
     )
     ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
     assert run_extractor(ctx, cfg) == pytest.approx(0.123)
+    assert paths == ["me/proj/attempt-test"]
+    assert timeouts == [1]
 
 
 def test_wandb_extractor_timeout(fake_wandb, tmp_path):
-    fake_wandb(lambda path, name: [])
+    def missing_run(_path: str) -> _FakeRun:
+        raise LookupError("not found")
+
+    fake_wandb(missing_run)
     cfg = WandbExtractor(
         type="wandb",
         entity="me",
         project="proj",
-        run_name_template="{experiment}-{phase}-{trial_id}",
         metric_key="eval/loss",
         poll_seconds=0.01,
-        timeout_seconds=0.1,
+        timeout_seconds=0.03,
     )
     with pytest.raises(ExtractorError, match="not found or metric"):
         ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
         run_extractor(ctx, cfg)
 
 
-def test_wandb_extractor_stuck_api_call_does_not_spawn_repeated_threads(fake_wandb, tmp_path):
-    calls = 0
-
-    def stuck_runs(path: str, name: str) -> list[_FakeRun]:
-        nonlocal calls
-        calls += 1
-        time.sleep(0.2)
-        return []
-
-    fake_wandb(stuck_runs)
+@pytest.mark.parametrize("state", ["failed", "crashed", "killed"])
+def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path, state):
+    fake_wandb(lambda _path: _FakeRun(state=state, summary={"eval/loss": 99.0}))
     cfg = WandbExtractor(
         type="wandb",
         entity="me",
         project="proj",
-        run_name_template="{experiment}-{phase}-{trial_id}",
         metric_key="eval/loss",
         poll_seconds=0.01,
-        timeout_seconds=0.05,
+        timeout_seconds=1.0,
     )
 
-    with pytest.raises(ExtractorError, match="not found or metric"):
-        ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
+    with pytest.raises(ExtractorError, match=rf"state '{state}'.*only finished"):
+        ctx = make_trial_context(tmp_path)
         run_extractor(ctx, cfg)
 
-    assert calls == 1
+
+def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wandb, tmp_path):
+    runs = {
+        "old-attempt": _FakeRun(state="failed", summary={"eval/loss": 99.0}),
+        "new-attempt": _FakeRun(state="finished", summary={"eval/loss": 0.1}),
+    }
+    seen: list[str] = []
+
+    def run_for_path(path: str) -> _FakeRun:
+        run_id = path.rsplit("/", 1)[-1]
+        seen.append(run_id)
+        return runs[run_id]
+
+    fake_wandb(run_for_path)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+    ctx = replace(
+        make_trial_context(tmp_path),
+        attempt_id="new-attempt",
+        run_name="reused-display-name",
+    )
+
+    assert run_extractor(ctx, cfg) == pytest.approx(0.1)
+    assert seen == ["new-attempt"]

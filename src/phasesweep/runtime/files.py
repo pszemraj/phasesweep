@@ -4,17 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import os
-import queue
 import stat
 import tempfile
-import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
-from typing import IO, Any, TypeVar
+from typing import IO
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
-
-T = TypeVar("T")
-
 
 POSIX_RUNTIME_ERROR = (
     "phasesweep execution currently requires a POSIX platform. It relies on "
@@ -65,34 +60,6 @@ def _fcntl_available() -> bool:
     except ImportError:
         return False
     return True
-
-
-def call_with_timeout(fn: Callable[[], T], *, timeout: float) -> T:
-    """Run a blocking function in a daemon thread and bound caller wait time.
-
-    :param Callable[[], T] fn: Zero-argument function to execute.
-    :param float timeout: Maximum number of seconds to wait for completion.
-    :raises TimeoutError: If ``fn`` does not complete before ``timeout`` elapses.
-    :return T: Value returned by ``fn``.
-    """
-    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        """Execute ``fn`` and store either its value or raised exception."""
-        try:
-            q.put((True, fn()))
-        except Exception as exc:  # noqa: BLE001
-            q.put((False, exc))
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout=max(0.0, timeout))
-    if thread.is_alive():
-        raise TimeoutError(f"call exceeded {timeout:g}s")
-    ok, value = q.get_nowait()
-    if ok:
-        return value
-    raise value
 
 
 def lock_dir() -> Path:

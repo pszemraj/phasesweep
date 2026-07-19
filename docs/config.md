@@ -56,9 +56,9 @@ The command in `trial_command` is the training or evaluation program for one tri
 - Parse the selected [override format](#override-formats).
 - Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
 - Exit nonzero when the trial failed and should be recorded as failed.
-- Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
+- When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
 
-The trial environment starts from the phasesweep process environment, then top-level `env` overrides it. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, and `PHASESWEEP_RUN_NAME`, overriding same-named values. GPU assignment can also override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
+The trial environment starts from the phasesweep process environment, then top-level `env` overrides it. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, and `PHASESWEEP_ATTEMPT_ID`, overriding same-named values. `WANDB_RUN_ID` is also set to the attempt ID so W&B evidence lookup uses an immutable identity instead of a reusable label. GPU assignment can override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
 
 Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; metric values within an absolute `1e-12` of the best value resolve to the lowest trial number. When a swept key has no measurable effect, the selected value is therefore the lowest-numbered near-best trial's choice, not evidence of a preference.
 
@@ -75,11 +75,11 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll by display name until the first matching run is `finished`, `crashed`, or `failed` and its summary contains the metric. Keep display names unique within the W&B project; persistent storage prevents trial-id reuse during top-ups, while a repeated in-memory experiment can reuse the default names. `PHASESWEEP_RUN_NAME` always uses `<experiment>-<phase>-<trial_id>` and is not changed by a custom extractor template, so use `run_name_template: '{run_name}'` when the trainer uses that environment variable.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. JSON objectives must be numbers; numeric strings and booleans are rejected rather than coerced. W&B extractors query the immutable run ID assigned through `WANDB_RUN_ID`, accept only a `finished` run, and fail immediately when that run is `failed`, `crashed`, or `killed`. Human-readable display names do not participate in evidence correlation.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
-JSON extractors read a dotted key from a file under `{trial_dir}`. Log regex extractors read a captured numeric group named `value`. W&B extractors read a summary key from the first terminal run matching the rendered display name. The [config reference](config_reference.yaml) is the complete contract for each shape.
+JSON extractors read a dotted key from a file under `{trial_dir}`. Log regex extractors read a captured numeric group named `value`. W&B extractors read a summary key from the finished run whose immutable ID matches the current attempt. The [config reference](config_reference.yaml) is the complete contract for each shape.
 
 ## Evidence gates
 
