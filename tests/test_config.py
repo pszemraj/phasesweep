@@ -150,6 +150,32 @@ def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str) -> None:
         load_experiment(write_yaml(tmp_path, body))
 
 
+def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
+    """Explicit keys may override values inherited through a YAML merge key."""
+    body = """
+experiment: t
+storage: ":memory:"
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json, path: r.json, key: loss }
+phases:
+  - &phase_defaults
+    name: baseline
+    n_trials: 1
+  - <<: *phase_defaults
+    name: tuned
+    n_trials: 2
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+
+    assert [(phase.name, phase.n_trials) for phase in exp.phases] == [
+        ("baseline", 1),
+        ("tuned", 2),
+    ]
+
+
 def test_n_jobs_default_is_one(tmp_path):
     body = """
 experiment: t

@@ -3,6 +3,7 @@
 # This is a hand-written per-key contract, not a config template. Every line is commented so the file cannot be mistaken for a runnable experiment or suite.
 # A UTF-8 YAML mapping with a top-level `suite` key is parsed as a Suite; any other top-level mapping is parsed as an Experiment.
 # Unknown keys are rejected in every object. Duplicate YAML mapping keys are rejected at every depth.
+# Standard YAML merge keys are accepted; an explicit key may override the value inherited from an anchor.
 # `required` means the key must be present. Otherwise the displayed `= value` is the default, and `| None` means YAML null is accepted subject to the stated interactions.
 
 # EXPERIMENT ROOT

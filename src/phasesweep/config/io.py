@@ -55,8 +55,10 @@ def _construct_mapping_strict(
             None, None, f"expected a mapping node, found {node.id}", node.start_mark
         )
 
-    mapping: dict[Any, Any] = {}
-    for key_node, value_node in node.value:
+    literal_keys: dict[Any, None] = {}
+    for key_node, _value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
         key = loader.construct_object(key_node, deep=deep)
         try:
             hash(key)
@@ -67,15 +69,16 @@ def _construct_mapping_strict(
                 f"found unhashable key: {exc}",
                 key_node.start_mark,
             ) from None
-        if key in mapping:
+        if key in literal_keys:
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",
                 node.start_mark,
                 f"found duplicate key {key!r}",
                 key_node.start_mark,
             )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        literal_keys[key] = None
+
+    return yaml.constructor.SafeConstructor.construct_mapping(loader, node, deep=deep)
 
 
 _StrictMappingLoader.add_constructor(
