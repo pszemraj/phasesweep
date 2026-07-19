@@ -62,7 +62,11 @@ class _GpuAcquisition:
 
 
 def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
-    """Normalize a CUDA device token into :class:`GpuDevice`."""
+    """Normalize a CUDA device token into :class:`GpuDevice`.
+
+    :param GpuDevice | int | str device: CUDA device token to normalize.
+    :return GpuDevice: Existing device instance or a device wrapping the stringified token.
+    """
     if isinstance(device, GpuDevice):
         return device
     return GpuDevice(str(device))
@@ -311,7 +315,12 @@ class GpuPool:
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire every configured device token as one assignment."""
+        """Acquire every configured device token as one assignment.
+
+        :param float | None deadline: Optional ``time.monotonic()`` deadline for waiting.
+        :raises TimeoutError: If the deadline expires before all devices can be leased.
+        :return _GpuAcquisition | None: Whole-node assignment, or ``None`` if inactive.
+        """
         if not self._devices:
             return None
         while True:
@@ -347,7 +356,12 @@ class GpuPool:
             )
 
     def _acquire(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire a GPU assignment according to the configured policy."""
+        """Acquire a GPU assignment according to the configured policy.
+
+        :param float | None deadline: Optional ``time.monotonic()`` deadline for waiting.
+        :raises TimeoutError: If the deadline expires before an assignment can be leased.
+        :return _GpuAcquisition | None: GPU assignment, or ``None`` if the pool is inactive.
+        """
         if self._whole_node:
             return self._acquire_whole_node(deadline=deadline)
         return self._acquire_single(deadline=deadline)
@@ -397,7 +411,11 @@ class GpuPool:
 
 
 def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
-    """Deduplicate non-empty CUDA device tokens while preserving order."""
+    """Deduplicate non-empty CUDA device tokens while preserving order.
+
+    :param list[str] tokens: CUDA device tokens to normalize and deduplicate.
+    :return list[GpuDevice]: Unique non-empty devices in their original order.
+    """
     devices: list[GpuDevice] = []
     seen: set[str] = set()
     for raw in tokens:
@@ -410,7 +428,12 @@ def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
 
 
 def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
-    """Parse CUDA_VISIBLE_DEVICES as opaque tokens."""
+    """Parse CUDA_VISIBLE_DEVICES as opaque tokens.
+
+    :param str value: Comma-separated CUDA visibility value to parse.
+    :raises RuntimeError: If ``-1`` is mixed with visible device tokens.
+    :return list[GpuDevice]: Parsed, deduplicated devices, or an empty list for ``-1``.
+    """
     raw = [token.strip() for token in value.split(",") if token.strip()]
     if raw == ["-1"]:
         return []
@@ -420,7 +443,12 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:
-    """Log whether configured/available CUDA devices cover requested parallelism."""
+    """Log whether configured/available CUDA devices cover requested parallelism.
+
+    :param int n_jobs: Requested number of parallel jobs.
+    :param list[str] tokens: Configured or detected CUDA device tokens.
+    :param str source: Description of the token source included in warnings.
+    """
     if n_jobs > len(tokens):
         log.warning(
             "n_jobs=%d but only %d GPU device(s) %s (%s). Excess trials will queue for a GPU.",

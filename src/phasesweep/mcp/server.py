@@ -1400,7 +1400,11 @@ class PhaseSweepMCP:
         return handle
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether the current catalog or launch handle permits cancellation."""
+        """Return whether the current catalog or launch handle permits cancellation.
+
+        :param RunHandle handle: Run handle whose cancellation permission should be checked.
+        :return bool: Current catalog permission, or the launch-time permission if unregistered.
+        """
         try:
             return self._registry.get(handle.experiment_id).allow_cancel
         except UnknownExperimentError:

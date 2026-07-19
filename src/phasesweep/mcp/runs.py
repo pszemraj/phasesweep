@@ -388,7 +388,11 @@ class RunStore:
         self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
 
     def cleanup_uncertain(self, handle: RunHandle) -> bool:
-        """Return whether a valid cleanup uncertainty marker exists for ``handle``."""
+        """Return whether a valid cleanup uncertainty marker exists for ``handle``.
+
+        :param RunHandle handle: Run handle whose cleanup marker should be checked.
+        :return bool: Whether a valid cleanup uncertainty marker exists.
+        """
         return self._read_cleanup_identity(handle) is not None
 
     def cleanup_identity(self, handle: RunHandle) -> ProcessIdentity:
@@ -513,11 +517,20 @@ class RunStore:
         return payload
 
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
-        """Return whether a terminal status still needs operator cleanup recovery."""
+        """Return whether a terminal status still needs operator cleanup recovery.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be checked.
+        :param Mapping[str, object] status: Terminal runner status payload.
+        :return bool: Whether cleanup is uncertain and lacks recovery evidence.
+        """
         return status.get("cleanup_confirmed") is False and not self._cleanup_recovered(handle)
 
     def _cleanup_recovered(self, handle: RunHandle) -> bool:
-        """Return whether operator recovery evidence confirms cleanup for this run."""
+        """Return whether operator recovery evidence confirms cleanup for this run.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be checked.
+        :return bool: Whether valid recovery evidence confirms cleanup.
+        """
         path = self.cleanup_recovery_path(handle.run_id)
         if not path.is_file():
             return False
@@ -537,7 +550,11 @@ class RunStore:
         self,
         handle: RunHandle,
     ) -> ProcessIdentity | None:
-        """Read and validate this run's cleanup uncertainty marker."""
+        """Read and validate this run's cleanup uncertainty marker.
+
+        :param RunHandle handle: Run handle whose cleanup marker should be read.
+        :return ProcessIdentity | None: Valid marker identity, or ``None`` if unavailable.
+        """
         path = self.cleanup_uncertain_path(handle.run_id)
         if not path.is_file():
             return None
@@ -573,5 +590,9 @@ class RunStore:
 
 
 def _valid_positive_optional_int(value: object) -> bool:
-    """Return whether ``value`` is ``None`` or a positive non-bool ``int``."""
+    """Return whether ``value`` is ``None`` or a positive non-bool ``int``.
+
+    :param object value: Value to validate.
+    :return bool: Whether the value is ``None`` or a positive non-bool integer.
+    """
     return value is None or (type(value) is int and value > 0)

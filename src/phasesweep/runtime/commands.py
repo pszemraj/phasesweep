@@ -32,7 +32,12 @@ def _stringify(value: Any) -> str:
 
 
 def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar."""
+    """Render a value for Hydra/OmegaConf override grammar.
+
+    :param Any value: Scalar or list-like value to render.
+    :raises TypeError: If the value cannot be represented by the supported grammar.
+    :return str: Hydra-compatible representation of the value.
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):
