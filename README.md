@@ -63,7 +63,7 @@ Follow [MCP agent setup](docs/mcp_setup.md) to install the server, create and pr
 ## Docs
 
 - [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
-- [Typed config reference](docs/config_reference.yaml): schema-complete YAML reference with every field, type, default, enum, and major validation constraint.
+- [Config reference](docs/config_reference.yaml): hand-written, non-runnable per-key contract with every type, default, valid value, constraint, interaction, and lifecycle warning.
 - [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
 - [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, tools, security model, single-host operation.
 - [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - install the `[mcp]` extra, write and preflight a catalog, connect your clients with `phasesweep mcp install`, verify, instruct the agent.

@@ -24,18 +24,11 @@ For normal CLI runs, relative `workdir` values, relative paths inside `trial_com
 
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-Each phase declares a search space and trial-attempt budget, with optional fixed overrides, inherited winners, contracts, evidence gates, and promotion rules. The [typed config reference](config_reference.yaml) lists the exact phase fields and constraints. GPU allocation, timeouts, cleanup, and study top-ups are covered in [runtime behavior](runtime.md).
+Each phase declares a search space and trial-attempt budget, with optional fixed overrides, inherited winners, contracts, evidence gates, and promotion rules. The [config reference](config_reference.yaml) lists the exact phase fields and constraints. GPU allocation, timeouts, cleanup, and study top-ups are covered in [runtime behavior](runtime.md).
 
 ## Search parameters
 
-`search_space` is a mapping from trainer override key to a typed parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing `model` while sampling `model.depth`, because no supported override format can represent that cleanly.
-
-```yaml
-search_space:
-  lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-  depth: { type: int, low: 4, high: 16, step: 4 }
-  activation: { type: categorical, choices: [gelu, relu] }
-```
+`search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
 Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports float and integer parameters, but not categorical parameters.
 
@@ -86,33 +79,7 @@ Extractors turn trial evidence into finite floats. JSON and log extractors read 
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
-JSON extractors read a dotted key from a file under `{trial_dir}`:
-
-```yaml
-extractor: { type: json, path: result.json, key: eval.loss }
-```
-
-Log regex extractors read a captured numeric group named `value`:
-
-```yaml
-extractor:
-  type: log_regex
-  file: stdout.log
-  pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)'
-  select: last
-```
-
-W&B extractor example:
-
-```yaml
-extractor:
-  type: wandb
-  entity: my-team
-  project: tiny-lm
-  run_name_template: '{run_name}'
-  metric_key: eval/loss
-  timeout_seconds: 300
-```
+JSON extractors read a dotted key from a file under `{trial_dir}`. Log regex extractors read a captured numeric group named `value`. W&B extractors read a summary key from the first terminal run matching the rendered display name. The [config reference](config_reference.yaml) is the complete contract for each shape.
 
 ## Evidence gates
 
@@ -124,48 +91,12 @@ Supported gates are `required_file`, `json_equals`, `json_scalar_bound`, `artifa
 
 ## Promotion
 
-Promotion decides whether a phase or suite study winner is exposed downstream. The comparison uses signed improvement: for `minimize`, improvement is `baseline.metric - candidate.metric`; for `maximize`, it is `candidate.metric - baseline.metric`. The candidate promotes when improvement is at least `min_delta` and required gates passed.
-
-```yaml
-promotion:
-  min_delta_vs: baseline
-  min_delta: 0.01
-  requires_gates: true
-  on_fail: stop
-```
+Promotion decides whether a phase or suite study winner is exposed downstream. The comparison uses signed improvement: for `minimize`, improvement is `baseline.metric - candidate.metric`; for `maximize`, it is `candidate.metric - baseline.metric`. The candidate promotes when improvement is at least the configured threshold and required gates passed.
 
 For a phase promotion failure, `stop` raises an error, `skip` ends the remaining phases and permits a partial experiment summary, and `continue_baseline` exposes a clone of the baseline winner. Every evaluated phase promotion writes `<phase>/promotion.yaml`; an exposed candidate or baseline clone is written to `winner.yaml` and included in `summary.yaml`.
 
 ## Suites
 
-Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`.
-
-```yaml
-suite: coreamp_ablation
-defaults:
-  workdir: ./runs
-  trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
-  metric:
-    name: bpb
-    goal: minimize
-    extractor: { type: json, path: result.json, key: eval.bpb }
-
-studies:
-  - name: baseline
-    phases:
-      - name: lr
-        n_trials: 8
-        search_space:
-          lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
-
-  - name: candidate
-    depends_on: [baseline]
-    promotion: { min_delta_vs: baseline, min_delta: 0.01, on_fail: stop }
-    phases:
-      - name: lr
-        n_trials: 8
-        search_space:
-          lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
-```
+Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`. Worked experiment files remain under `examples/`; this guide deliberately does not duplicate them as templates.
 
 Suite-level `run.log` and `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions are recorded in `suite_summary.yaml`, not in a per-study `promotion.yaml`. The suite summary is written only after the suite loop completes; a stop or missing dependency can leave completed study artifacts without that summary. `--from-phase` is supported only for single-experiment configs, not suites.
