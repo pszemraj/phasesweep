@@ -33,6 +33,7 @@ def _sleeping_score_experiment(
     tmp_path: Path,
     *,
     experiment: str,
+    n_trials: int = 3,
     timeout_seconds_per_phase: float | None = None,
     timeout_seconds_per_run: float | None = None,
     allow_incomplete_on_timeout: bool = False,
@@ -58,7 +59,7 @@ def _sleeping_score_experiment(
         phases=[
             Phase(
                 name="p",
-                n_trials=3,
+                n_trials=n_trials,
                 timeout_seconds_per_phase=timeout_seconds_per_phase,
                 allow_incomplete_on_timeout=allow_incomplete_on_timeout,
                 search_space={},
@@ -509,14 +510,15 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_allowed",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=1.0,
         allow_incomplete_on_timeout=True,
     )
 
     winners = run_experiment(exp)
 
     completion = winners["p"].completion
-    assert completion["requested_trials"] == 3
+    assert completion["requested_trials"] == 10
     assert 1 <= completion["completed_trials"] < completion["requested_trials"]
     assert completion["completed_trials"] <= completion["finished_trials"]
     assert completion["finished_trials"] <= completion["requested_trials"]
