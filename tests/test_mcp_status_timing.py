@@ -130,6 +130,24 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     assert phase["trial_data_available"] is True
 
 
+def test_run_status_reuses_resolved_handle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app, _registry, store = _app_with_run(tmp_path)
+    original_get = store.get
+    get_calls = 0
+
+    def counting_get(run_id: str) -> RunHandle | None:
+        nonlocal get_calls
+        get_calls += 1
+        return original_get(run_id)
+
+    monkeypatch.setattr(store, "get", counting_get)
+
+    status = app.status(run_id="r1")
+
+    assert status["run"]["run_id"] == "r1"
+    assert get_calls == 1
+
+
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
@@ -380,11 +398,11 @@ def test_await_run_storage_read_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    target_id, status, run, result_source, resolved = app._read_status_target(
+    target_id, status, run, handle, result_source, resolved = app._read_status_target(
         experiment_id=None,
         run_id="r1",
     )
-    assert run is not None
+    assert run is not None and handle is not None
     terminal_run = {**run, "state": "failed"}
     entered = threading.Event()
     release = threading.Event()
@@ -392,7 +410,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     def blocked_read(**_kwargs: object):
         entered.set()
         release.wait(timeout=2.0)
-        return target_id, status, terminal_run, result_source, resolved
+        return target_id, status, terminal_run, handle, result_source, resolved
 
     monkeypatch.setattr(app, "_read_status_target", blocked_read)
 

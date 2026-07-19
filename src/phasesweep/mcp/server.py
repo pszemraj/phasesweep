@@ -728,13 +728,13 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] = {}
         state_after: dict[str, Any] = {}
         try:
-            target_id, status, run, result_source, resolved = self._read_status_target(
+            target_id, status, run, handle, result_source, resolved = self._read_status_target(
                 experiment_id=experiment_id,
                 run_id=run_id,
             )
             if run is not None:
                 state_after = {"run_state": run["state"]}
-            result = self._status_result(target_id, status, run, result_source)
+            result = self._status_result(target_id, status, run, handle, result_source)
         except Exception as exc:
             self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
             raise
@@ -756,10 +756,11 @@ class PhaseSweepMCP:
 
         A bounded sleep-and-recheck loop over the same reads ``status`` does:
         no new state, no side effects. Returns early when the run reaches a
-        terminal state or a phase gains a winner; otherwise returns the
-        current status when the (clamped) timeout elapses. Each recheck
-        re-resolves the run from disk, so a server restart mid-wait is
-        invisible to the caller.
+        terminal state, operator recovery is required, or a phase gains a
+        winner; otherwise returns the current status when the (clamped)
+        timeout elapses. Each recheck re-resolves the run from disk, so state
+        written while this request is active is observed. After a server
+        restart, a fresh call resumes from the same durable run.
 
         :param str run_id: Detached run id to wait on.
         :param int timeout_seconds: Requested wait, clamped to
@@ -777,7 +778,7 @@ class PhaseSweepMCP:
             deadline = time.monotonic() + timeout
             baseline: tuple[Any, ...] | None = None
             while True:
-                target_id, status, run, result_source, resolved = await asyncio.to_thread(
+                target_id, status, run, handle, result_source, resolved = await asyncio.to_thread(
                     self._read_status_target,
                     experiment_id=None,
                     run_id=run_id,
@@ -808,7 +809,7 @@ class PhaseSweepMCP:
                     )
                     continue
                 break
-            result = self._status_result(target_id, status, run, result_source)
+            result = self._status_result(target_id, status, run, handle, result_source)
             result["changed"] = snapshot != baseline
             result["reason"] = reason
         except Exception as exc:
@@ -832,6 +833,7 @@ class PhaseSweepMCP:
         str,
         dict[str, Any],
         dict[str, Any] | None,
+        RunHandle | None,
         ResultSource,
         dict[str, Any],
     ]:
@@ -839,26 +841,27 @@ class PhaseSweepMCP:
 
         :param str | None experiment_id: Catalog id for a current experiment read.
         :param str | None run_id: Persisted run id for a run-specific read.
-        :return tuple: Target id, status data, optional run state, result
-            provenance, and audit-safe resolved ids.
+        :return tuple: Target id, status data, optional run state and handle,
+            result provenance, and audit-safe resolved ids.
         """
-        target_id, experiment, run, resolved = self._resolve_read_target(
+        target_id, experiment, run, handle, resolved = self._resolve_read_target(
             experiment_id=experiment_id,
             run_id=run_id,
             include_run=True,
         )
-        snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
+        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
         status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
-        return target_id, status, run, result_source, resolved
+        return target_id, status, run, handle, result_source, resolved
 
     def _status_result(
         self,
         target_id: str,
         status: dict[str, Any],
         run: dict[str, Any] | None,
+        handle: RunHandle | None,
         result_source: ResultSource,
     ) -> dict[str, Any]:
         """Build the common path-free response for status and await_run.
@@ -866,14 +869,13 @@ class PhaseSweepMCP:
         :param str target_id: Experiment id represented by ``status``.
         :param dict[str, Any] status: Current or frozen engine status payload.
         :param dict[str, Any] | None run: Optional derived detached-run state.
+        :param RunHandle | None handle: Optional already-resolved detached-run handle.
         :param ResultSource result_source: Current shared state or frozen run snapshot.
         :return dict[str, Any]: Agent-safe status response.
         """
         elapsed_seconds = None
-        if run is not None:
-            handle = self._runs.get(run["run_id"])
-            if handle is not None:
-                elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+        if run is not None and handle is not None:
+            elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
         return status_payload(
             target_id,
             status,
@@ -888,14 +890,14 @@ class PhaseSweepMCP:
         experiment_id: str | None,
         run_id: str | None,
         include_run: bool,
-    ) -> tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]:
+    ) -> tuple[str, Experiment, dict[str, Any] | None, RunHandle | None, dict[str, Any]]:
         """Resolve status/winner reads to the catalog config or immutable run snapshot.
 
         :param str | None experiment_id: Catalog id for current experiment-level reads.
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
-        :return tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]: Target id,
-            parsed experiment, optional run payload, and audit-safe resolved ids.
+        :return tuple: Target id, parsed experiment, optional run payload and
+            handle, and audit-safe resolved ids.
         """
         if (experiment_id is None) == (run_id is None):
             provided = "neither" if experiment_id is None else "both"
@@ -912,7 +914,7 @@ class PhaseSweepMCP:
             run = None
             if include_run:
                 run = self._run_payload(handle)
-            return handle.experiment_id, experiment, run, resolved
+            return handle.experiment_id, experiment, run, handle, resolved
 
         assert experiment_id is not None
         reg = self._registry.get(experiment_id)
@@ -922,7 +924,7 @@ class PhaseSweepMCP:
             resolved["run_id"] = live.run_id
         experiment = self._load_run_experiment(live) if live is not None else reg.experiment
         run = self._run_payload(live) if include_run and live is not None else None
-        return reg.id, experiment, run, resolved
+        return reg.id, experiment, run, live, resolved
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -972,7 +974,7 @@ class PhaseSweepMCP:
         args = {"experiment_id": experiment_id, "run_id": run_id}
         resolved: dict[str, Any] = {}
         try:
-            target_id, experiment, _run, resolved = self._resolve_read_target(
+            target_id, experiment, _run, _handle, resolved = self._resolve_read_target(
                 experiment_id=experiment_id,
                 run_id=run_id,
                 include_run=False,
@@ -986,7 +988,7 @@ class PhaseSweepMCP:
                 # its catalog entry. Without a current visibility policy,
                 # default to the strict redacted posture.
                 visible_params = "none"
-            snapshot = self._terminal_result_snapshot(run_id) if run_id is not None else None
+            snapshot = self._terminal_result_snapshot(_handle) if _handle is not None else None
             winner_views = (
                 snapshot.winner_views() if snapshot is not None else read_winners(experiment)
             )
@@ -1013,18 +1015,15 @@ class PhaseSweepMCP:
         )
         return result
 
-    def _terminal_result_snapshot(self, run_id: str) -> RunResultSnapshot | None:
+    def _terminal_result_snapshot(self, handle: RunHandle) -> RunResultSnapshot | None:
         """Return a live run's current view or require its frozen terminal snapshot.
 
-        :param str run_id: Persisted run id whose terminal status should be inspected.
+        :param RunHandle handle: Resolved run whose terminal status should be inspected.
         :return RunResultSnapshot | None: Validated snapshot, or ``None`` while
             the runner has not recorded terminal status yet.
         :raises RunResultSnapshotUnavailableError: Terminal status exists but
             its immutable result snapshot is absent or invalid.
         """
-        handle = self._runs.get(run_id)
-        if handle is None:
-            return None
         terminal_status = self._runs.recorded_terminal_status(handle)
         if terminal_status is None:
             return None
@@ -1032,7 +1031,7 @@ class PhaseSweepMCP:
         if snapshot is None:
             finalization_state = terminal_status.get("result_snapshot_state")
             raise RunResultSnapshotUnavailableError(
-                run_id,
+                handle.run_id,
                 finalization_state if isinstance(finalization_state, str) else None,
             )
         return snapshot
