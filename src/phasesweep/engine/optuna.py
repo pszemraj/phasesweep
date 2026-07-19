@@ -7,10 +7,11 @@ import sqlite3
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Any
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
+from typing_extensions import assert_never
 
 from phasesweep.config import (
     CategoricalParam,
