@@ -23,7 +23,11 @@ MAX_AUDIT_STRING_LENGTH = 256
 
 
 def _compact_value(value: Any) -> Any:
-    """Return an audit-safe scalar with bounded string size."""
+    """Return an audit-safe scalar with bounded string size.
+
+    :param Any value: Scalar value to compact.
+    :return Any: The original value, or a truncated copy when it is an overlong string.
+    """
     if isinstance(value, str) and len(value) > MAX_AUDIT_STRING_LENGTH:
         return f"{value[: MAX_AUDIT_STRING_LENGTH - 3]}..."
     return value

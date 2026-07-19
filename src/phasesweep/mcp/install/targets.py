@@ -106,7 +106,12 @@ def mcp_entry(style: EntryStyle, command: str, catalog: Path) -> dict[str, objec
 
 
 def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
-    """Whether a JSON member has exactly the shape this installer writes."""
+    """Return whether a JSON member has exactly the shape this installer writes.
+
+    :param EntryStyle style: Client entry dialect expected for the member.
+    :param object value: JSON member value to inspect.
+    :return bool: True when the member is an installer-managed phasesweep entry.
+    """
     if not isinstance(value, dict):
         return False
     if style == "opencode":
@@ -141,7 +146,11 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
 
 
 def _is_phasesweep_command(value: object) -> bool:
-    """Return whether ``value`` is an absolute phasesweep MCP executable path."""
+    """Return whether ``value`` is an absolute phasesweep MCP executable path.
+
+    :param object value: Candidate command value.
+    :return bool: True when the value is an absolute path named ``phasesweep-mcp``.
+    """
     return (
         isinstance(value, str)
         and Path(value).is_absolute()
@@ -150,7 +159,11 @@ def _is_phasesweep_command(value: object) -> bool:
 
 
 def _is_absolute_path(value: object) -> bool:
-    """Return whether ``value`` is a non-empty absolute path string."""
+    """Return whether ``value`` is a non-empty absolute path string.
+
+    :param object value: Candidate path value.
+    :return bool: True when the value is a non-empty absolute path string.
+    """
     return isinstance(value, str) and bool(value) and Path(value).is_absolute()
 
 

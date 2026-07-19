@@ -111,7 +111,11 @@ class _Entry(_CatalogModel):
     @field_validator("visible_params")
     @classmethod
     def _valid_visible_params(cls, value: VisibleParamsPolicy) -> VisibleParamsPolicy:
-        """Validate sampled-parameter visibility policy."""
+        """Validate and normalize a sampled-parameter visibility policy.
+
+        :param VisibleParamsPolicy value: Policy string or parameter-name allowlist.
+        :return VisibleParamsPolicy: A valid policy string or deduplicated, stripped allowlist.
+        """
         if isinstance(value, str):
             if value not in {"none", "all"}:
                 raise ValueError("visible_params must be 'none', 'all', or a list of keys")
@@ -192,7 +196,14 @@ def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
 
 
 def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
-    """Resolve an operator path and require that it names an existing directory."""
+    """Resolve an operator path and require that it names an existing directory.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored directory path.
+    :param str label: Operator-facing name for the path in validation errors.
+    :return Path: Absolute, resolved existing directory path.
+    :raises CatalogError: If the resolved path is not an existing directory.
+    """
     resolved = _resolve_catalog_relative_path(base, path)
     if not resolved.is_dir():
         raise CatalogError(f"{label} is not an existing directory: {resolved}")

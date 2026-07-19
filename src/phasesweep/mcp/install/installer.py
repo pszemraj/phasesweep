@@ -100,7 +100,12 @@ def resolve_server_command() -> str:
 
 
 def _project_path_is_contained(path: Path, project: Path) -> bool:
-    """Return whether resolving ``path`` stays beneath the project root."""
+    """Return whether resolving ``path`` stays beneath the project root.
+
+    :param Path path: Candidate path to resolve.
+    :param Path project: Existing project root that must contain the candidate.
+    :return bool: True when the resolved candidate is the project root or one of its descendants.
+    """
     try:
         path.resolve(strict=False).relative_to(project.resolve(strict=True))
     except (OSError, ValueError):
