@@ -1213,6 +1213,53 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_operator_recovery_finalizes_launching_handle_without_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-launch-failed"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+
+    def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("pre-spawn launch failure must not run process cleanup")
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Rebuilt terminal result snapshot" in result.output
+    assert not store.cleanup_recovery_path(run_id).exists()
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["error_class"] == "RunnerExitedWithoutStatus"
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["result_snapshot_state"] == "complete"
+    assert store.state(handle) == "failed"
+    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+
+
 def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Path) -> None:
     missing = tmp_path / "mistyped-state"
 

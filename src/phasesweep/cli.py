@@ -291,10 +291,11 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         and not cleanup_recovery_required
     )
     runner_without_status = handle.launch_state == "spawned" and terminal_status is None
+    launch_without_status = handle.launch_state == "launching" and terminal_status is None
     cleanup_recovery_needed = cleanup_recovery_required or runner_without_status
     snapshot_repair_needed = (
         terminal_status is not None and parse_result_snapshot(terminal_status) is None
-    )
+    ) or launch_without_status
     if not cleanup_recovery_needed and not snapshot_repair_needed:
         click.echo("No cleanup uncertainty or terminal result repair is needed for this run.")
         return
