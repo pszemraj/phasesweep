@@ -279,13 +279,19 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
+    cleanup_recovery_required = store.recovery_required(handle)
     terminal_cleanup_uncertain = (
-        terminal_status is not None and terminal_status.get("cleanup_confirmed") is False
+        terminal_status is not None
+        and terminal_status.get("cleanup_confirmed") is False
+        and cleanup_recovery_required
+    )
+    cleanup_already_recovered = (
+        terminal_status is not None
+        and terminal_status.get("cleanup_confirmed") is False
+        and not cleanup_recovery_required
     )
     runner_without_status = handle.launch_state == "spawned" and terminal_status is None
-    cleanup_recovery_needed = (
-        store.cleanup_uncertain(handle) or terminal_cleanup_uncertain or runner_without_status
-    )
+    cleanup_recovery_needed = cleanup_recovery_required or runner_without_status
     snapshot_repair_needed = (
         terminal_status is not None and parse_result_snapshot(terminal_status) is None
     )
@@ -416,7 +422,9 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             terminal_status,
             config,
             cleanup_confirmed=(
-                cleanup_recovery_needed or terminal_status.get("cleanup_confirmed") is True
+                cleanup_recovery_needed
+                or cleanup_already_recovered
+                or terminal_status.get("cleanup_confirmed") is True
             ),
         )
 

@@ -1391,6 +1391,87 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _write_cleanup_uncertain_failed_trial(config)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-retry-result-repair"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    runner_cleanup_calls = 0
+    trial_cleanup_calls = 0
+
+    def fake_runner_cleanup(*args: object, **kwargs: object) -> bool:
+        nonlocal runner_cleanup_calls
+        runner_cleanup_calls += 1
+        return True
+
+    def fake_trial_cleanup(*args: object, **kwargs: object) -> bool:
+        nonlocal trial_cleanup_calls
+        trial_cleanup_calls += 1
+        return True
+
+    snapshot_cleanup_flags: list[bool] = []
+
+    def flaky_snapshot(experiment: Experiment, *, cleanup_confirmed: bool) -> dict:
+        snapshot_cleanup_flags.append(cleanup_confirmed)
+        if len(snapshot_cleanup_flags) == 1:
+            raise RuntimeError("snapshot capture failed")
+        return capture_result_snapshot(experiment, cleanup_confirmed=cleanup_confirmed)
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+    monkeypatch.setattr("phasesweep.cli.capture_result_snapshot", flaky_snapshot)
+
+    command = [
+        "mcp",
+        "recover-run",
+        "--state-dir",
+        str(registry.state_dir),
+        "--run-id",
+        run_id,
+        "--confirm",
+    ]
+    runner = CliRunner()
+    first = runner.invoke(cli_main, command)
+
+    assert first.exit_code != 0
+    assert "failed to rebuild terminal result snapshot" in first.output
+    assert store.cleanup_recovery_path(run_id).is_file()
+    assert not store.recovery_required(handle)
+    assert runner_cleanup_calls == 1
+    assert trial_cleanup_calls == 1
+
+    retry = runner.invoke(cli_main, command)
+
+    assert retry.exit_code == 0, retry.output
+    assert "Rebuilt terminal result snapshot" in retry.output
+    assert runner_cleanup_calls == 1
+    assert trial_cleanup_calls == 1
+    assert snapshot_cleanup_flags == [True, True]
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+
+
 def test_operator_recovery_consumes_terminal_cleanup_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
