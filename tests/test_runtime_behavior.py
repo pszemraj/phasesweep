@@ -14,7 +14,7 @@ from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import _load_winner
-from tests.conftest import copy_fake_train, write_trainer, write_yaml
+from tests.conftest import copy_fake_train, make_experiment, write_trainer, write_yaml
 
 
 def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
@@ -143,6 +143,45 @@ phases:
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}, expected FAIL"
         )
+
+
+def test_repeated_in_memory_run_cannot_reuse_stale_trial_or_winner_evidence(
+    tmp_path: Path,
+) -> None:
+    success = write_trainer(
+        tmp_path / "success.py",
+        """
+        import json, pathlib, sys
+        pathlib.Path(sys.argv[1]).write_text(json.dumps({"x": 0.123}))
+        """,
+    )
+    no_result = write_trainer(tmp_path / "no_result.py", "pass")
+    workdir = tmp_path / "runs"
+    first = make_experiment(
+        workdir=workdir,
+        trial_command=f"python {success} {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+
+    winner = run_experiment(first)["p"]
+    assert winner.metric == pytest.approx(0.123)
+    phase_dir = workdir / "t" / "p"
+    first_trial_dir = next(phase_dir.glob("trial_*"))
+    assert (first_trial_dir / "r.json").is_file()
+
+    second = first.model_copy(
+        update={"trial_command": f"python {no_result} {{trial_dir}}/r.json {{overrides}}"}
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(second)
+
+    trial_dirs = sorted(phase_dir.glob("trial_*"))
+    assert len(trial_dirs) == 2
+    assert first_trial_dir in trial_dirs
+    second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
+    assert not (second_trial_dir / "r.json").exists()
+    assert not (phase_dir / "winner.yaml").exists()
+    assert not (workdir / "t" / "summary.yaml").exists()
 
 
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):

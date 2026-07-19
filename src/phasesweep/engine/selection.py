@@ -11,7 +11,14 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
-from phasesweep.engine.state import FEASIBLE_ATTR, GATES_ATTR, Winner, constraint_attr
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FEASIBLE_ATTR,
+    GATES_ATTR,
+    GENERATION_ID_ATTR,
+    Winner,
+    constraint_attr,
+)
 
 WINNER_TIE_EPS = 1e-12
 
@@ -28,6 +35,8 @@ class SelectedTrial:
     metric: float
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
+    generation_id: str = ""
+    attempt_id: str = ""
 
 
 class NoFeasibleTrialError(RuntimeError):
@@ -69,6 +78,12 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         if t.value is None or not math.isfinite(t.value):
             continue
         if not t.user_attrs.get(FEASIBLE_ATTR, False):
+            continue
+        generation_id = t.user_attrs.get(GENERATION_ID_ATTR)
+        attempt_id = t.user_attrs.get(ATTEMPT_ID_ATTR)
+        if not isinstance(generation_id, str) or not generation_id:
+            continue
+        if not isinstance(attempt_id, str) or not attempt_id:
             continue
         # Re-verify constraints from user_attrs in case rules changed or stored
         # values are non-finite (defense in depth — review item #3).
@@ -126,6 +141,8 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         metric=float(selected_value),
         constraints=constraint_vals,
         gates=gates,
+        generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
+        attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
     )
 
 
@@ -179,6 +196,8 @@ def _clone_winner_from_baseline(
         completion=dict(completion or baseline.completion),
         promotion=promotion,
         phase_fingerprint=phase_fingerprint,
+        generation_id=baseline.generation_id,
+        attempt_id=baseline.attempt_id,
     )
 
 
@@ -237,6 +256,8 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
         "constraints": winner.constraints,
         "gates": winner.gates,
         "completion": winner.completion,
+        "generation_id": winner.generation_id,
+        "attempt_id": winner.attempt_id,
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion

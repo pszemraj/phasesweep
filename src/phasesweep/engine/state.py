@@ -41,9 +41,13 @@ class Winner:
     completion: dict[str, Any] = field(default_factory=dict)
     promotion: dict[str, Any] | None = None
     phase_fingerprint: str | None = None
+    generation_id: str | None = None
+    attempt_id: str | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
+GENERATION_ID_ATTR = "phasesweep_generation_id"
+ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 RETURN_CODE_ATTR = "phasesweep_return_code"
@@ -101,15 +105,39 @@ def _run_log_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "run.log"
 
 
-def _trial_dir_for(experiment: Experiment, phase_name: str, trial_number: int) -> Path:
-    """Return the canonical per-trial directory.
+def _trial_dir_for(
+    experiment: Experiment,
+    phase_name: str,
+    trial_number: int,
+    *,
+    generation_id: str | None = None,
+    attempt_id: str | None = None,
+) -> Path:
+    """Return a trial directory, uniquely scoped when execution ids are supplied.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name containing the trial.
     :param int trial_number: Optuna trial number.
+    :param str | None generation_id: Current engine invocation id.
+    :param str | None attempt_id: Current subprocess attempt id.
     :return Path: Directory for the trial artifacts.
     """
-    return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
+    if generation_id is None and attempt_id is None:
+        return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
+    if generation_id is None or attempt_id is None:
+        raise ValueError("generation_id and attempt_id must be supplied together")
+    return _phase_dir(experiment, phase_name) / (
+        f"trial_{trial_number:05d}__generation_{generation_id}__attempt_{attempt_id}"
+    )
+
+
+def _generation_path(experiment: Experiment) -> Path:
+    """Return the current engine generation metadata path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the current generation YAML file.
+    """
+    return _experiment_dir(experiment) / "generation.yaml"
 
 
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
@@ -268,6 +296,11 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
             "phase_fingerprint. This is an internal invariant — please file "
             "a bug."
         )
+    if not winner.generation_id or not winner.attempt_id:
+        raise RuntimeError(
+            f"Refusing to save winner for phase {phase_name!r} without generation and "
+            "attempt identity."
+        )
 
     path = _winner_path(experiment, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,6 +314,8 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         "gates": winner.gates,
         "completion": winner.completion,
         "phase_fingerprint": winner.phase_fingerprint,
+        "generation_id": winner.generation_id,
+        "attempt_id": winner.attempt_id,
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
@@ -384,6 +419,16 @@ def _load_winner(
             f"use it for skipped phase {phase.name!r} unless the current config "
             "sets allow_incomplete_on_timeout: true."
         )
+    generation_id = data.get("generation_id")
+    attempt_id = data.get("attempt_id")
+    if not isinstance(generation_id, str) or not generation_id:
+        raise RuntimeError(
+            f"Winner file {path} has no valid generation_id; refusing unscoped evidence."
+        )
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise RuntimeError(
+            f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
+        )
 
     try:
         return Winner(
@@ -396,6 +441,8 @@ def _load_winner(
             completion=dict(completion),
             promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
             phase_fingerprint=str(stored_fp),
+            generation_id=generation_id,
+            attempt_id=attempt_id,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(

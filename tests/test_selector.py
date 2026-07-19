@@ -12,7 +12,12 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.engine.selection import WINNER_TIE_EPS, NoFeasibleTrialError, select_winner
-from phasesweep.engine.state import FEASIBLE_ATTR, constraint_attr
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FEASIBLE_ATTR,
+    GENERATION_ID_ATTR,
+    constraint_attr,
+)
 from tests.conftest import make_experiment
 
 
@@ -36,7 +41,11 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
     for k, v in (params or {}).items():
         distributions[k] = optuna.distributions.IntDistribution(low=int(v), high=int(v))
         pvals[k] = int(v)
-    user_attrs = {FEASIBLE_ATTR: feasible}
+    user_attrs = {
+        FEASIBLE_ATTR: feasible,
+        GENERATION_ID_ATTR: "generation-test",
+        ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
+    }
     for cn, cv in (constraint_vals or {}).items():
         user_attrs[constraint_attr(cn)] = cv
     trial = optuna.trial.create_trial(
@@ -153,12 +162,16 @@ def test_rejects_nan_constraint_values_defensively(tmp_path):
     # Trial 0: clean, feasible.
     t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     t0.set_user_attr(FEASIBLE_ATTR, True)
+    t0.set_user_attr(GENERATION_ID_ATTR, "generation-test")
+    t0.set_user_attr(ATTEMPT_ID_ATTR, "attempt-0")
     t0.set_user_attr(constraint_attr("size"), 100.0)
     study.tell(t0, 0.5)
 
     # Trial 1: legacy NaN constraint value but mistakenly marked feasible.
     t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     t1.set_user_attr(FEASIBLE_ATTR, True)
+    t1.set_user_attr(GENERATION_ID_ATTR, "generation-test")
+    t1.set_user_attr(ATTEMPT_ID_ATTR, "attempt-1")
     t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric, but invalid.
 

@@ -113,6 +113,8 @@ def launch_trial(
     experiment: Experiment,
     phase_name: str,
     trial_id: int,
+    generation_id: str,
+    attempt_id: str,
     trial_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
@@ -131,6 +133,8 @@ def launch_trial(
             ``override_format``, and ``env``.
         phase_name: Name of the running phase (used in ``run_name`` and logs).
         trial_id: Optuna's numeric trial number.
+        generation_id: Identity of the current engine invocation.
+        attempt_id: Immutable identity of this subprocess attempt.
         trial_dir: Resolved per-trial directory; created if missing.
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
         timeout_seconds: Wall-clock timeout passed to :func:`run_supervised`,
@@ -146,7 +150,7 @@ def launch_trial(
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
 
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}"
+    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     cmd = render_command(
         experiment.trial_command,
         overrides,
@@ -166,6 +170,9 @@ def launch_trial(
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name
     env["PHASESWEEP_RUN_NAME"] = run_name
+    env["PHASESWEEP_GENERATION_ID"] = generation_id
+    env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
+    env["WANDB_RUN_ID"] = attempt_id
 
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -188,6 +195,8 @@ def launch_trial(
         experiment=experiment.experiment,
         phase=phase_name,
         trial_id=trial_id,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
         trial_dir=workdir,
         run_name=run_name,
         return_code=proc_result.return_code,

@@ -163,7 +163,13 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
 
     # Will raise on fingerprint mismatch, but reap must have run first.
     with pytest.raises(RuntimeError, match="different phase config"):
-        _run_phase(exp, exp.phases[0], inherited_winners={}, dry_run=False)
+        _run_phase(
+            exp,
+            exp.phases[0],
+            inherited_winners={},
+            generation_id="generation-test",
+            dry_run=False,
+        )
     assert reap_called["flag"]
     assert fingerprint_called["flag"]
 

@@ -447,6 +447,8 @@ def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None
                 "phase": "p",
                 "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
                 "completion": {"incomplete": False},
+                "generation_id": "generation-test",
+                "attempt_id": "attempt-test",
             },
             sort_keys=False,
         )
@@ -468,6 +470,8 @@ def test_save_winner_replace_failure_preserves_existing_file(
         effective_overrides={"x": 0},
         metric=1.0,
         phase_fingerprint=fingerprint,
+        generation_id="generation-original",
+        attempt_id="attempt-original",
     )
     replacement = Winner(
         trial_number=1,
@@ -475,6 +479,8 @@ def test_save_winner_replace_failure_preserves_existing_file(
         effective_overrides={"x": 1},
         metric=0.5,
         phase_fingerprint=fingerprint,
+        generation_id="generation-replacement",
+        attempt_id="attempt-replacement",
     )
 
     _save_winner(exp, phase.name, original)

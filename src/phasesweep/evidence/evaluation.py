@@ -79,8 +79,10 @@ class TrialContext:
     experiment: str
     phase: str
     trial_id: int
+    generation_id: str
+    attempt_id: str
     trial_dir: Path
-    run_name: str  # "{experiment}-{phase}-{trial_id}"
+    run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
 

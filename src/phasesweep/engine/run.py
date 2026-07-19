@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import _experiment_lock, _reap_skipped_phase, _suite_lock
@@ -20,7 +22,9 @@ from phasesweep.engine.state import (
     Winner,
     _experiment_dir,
     _file_log_handler,
+    _generation_path,
     _load_winner,
+    _promotion_decision_path,
     _run_log_path,
     _save_promotion_decision,
     _save_winner,
@@ -87,6 +91,7 @@ def run_experiment(
     *,
     from_phase: str | None = None,
     dry_run: bool = False,
+    terminal_callback: Callable[[str, BaseException | None], None] | None = None,
 ) -> dict[str, Winner]:
     """Run all phases in order, returning a map of phase name to Winner.
 
@@ -111,6 +116,9 @@ def run_experiment(
             verification). ``None`` runs every phase from scratch.
         dry_run: If ``True``, render and log one example trial command per
             phase but launch no subprocesses; no summary is written.
+        terminal_callback: Optional synchronous callback invoked with the
+            generation id and terminal exception, if any, while the experiment
+            lock is still held.
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
@@ -133,11 +141,38 @@ def run_experiment(
         install_signal_handlers()
 
     if dry_run:
-        return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=True)
+        return _run_experiment_inner(
+            experiment,
+            from_phase=from_phase,
+            dry_run=True,
+            generation_id=None,
+        )
 
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
+    generation_id = uuid4().hex
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
-        return _run_experiment_inner(experiment, from_phase=from_phase, dry_run=False)
+        terminal_error: BaseException | None = None
+        try:
+            _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
+            return _run_experiment_inner(
+                experiment,
+                from_phase=from_phase,
+                dry_run=False,
+                generation_id=generation_id,
+            )
+        except BaseException as exc:
+            terminal_error = exc
+            raise
+        finally:
+            if terminal_callback is not None:
+                try:
+                    terminal_callback(generation_id, terminal_error)
+                except BaseException:
+                    if terminal_error is None:
+                        raise
+                    log.exception(
+                        "terminal callback failed while preserving the engine's original error"
+                    )
 
 
 def _run_experiment_inner(
@@ -145,6 +180,7 @@ def _run_experiment_inner(
     *,
     from_phase: str | None,
     dry_run: bool,
+    generation_id: str | None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
 
@@ -153,6 +189,7 @@ def _run_experiment_inner(
         from_phase: Optional name of the phase to resume from; earlier phases
             are loaded from disk.
         dry_run: If ``True``, no subprocesses launch and no ``summary.yaml`` is written.
+        generation_id: Current invocation identity, or ``None`` for dry-run.
 
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
@@ -196,12 +233,14 @@ def _run_experiment_inner(
             experiment,
             phase,
             inherited,
+            generation_id=generation_id,
             dry_run=dry_run,
             run_deadline=run_deadline,
         )
         if not dry_run:
             promoted, promotion_decision = _apply_promotion(experiment, phase, winner, winners)
             if promotion_decision is not None:
+                promotion_decision["generation_id"] = generation_id
                 promotion_decisions[phase.name] = promotion_decision
                 _save_promotion_decision(experiment, phase.name, promotion_decision)
             if promoted is None:
@@ -229,6 +268,7 @@ def _run_experiment_inner(
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary = {
         "experiment": experiment.experiment,
+        "generation_id": generation_id,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
         "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
@@ -237,6 +277,33 @@ def _run_experiment_inner(
     log.info("Wrote %s", summary_path)
 
     return winners
+
+
+def _prepare_generation(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+    generation_id: str,
+) -> None:
+    """Start a generation without exposing stale mutable result artifacts.
+
+    :param Experiment experiment: Experiment whose current result view is reset.
+    :param str | None from_phase: Optional resume point; prior winners remain available.
+    :param str generation_id: Fresh identity for this engine invocation.
+    """
+    start_index = 0
+    if from_phase is not None:
+        start_index = next(
+            index for index, phase in enumerate(experiment.phases) if phase.name == from_phase
+        )
+    _summary_path(experiment).unlink(missing_ok=True)
+    for phase in experiment.phases[start_index:]:
+        _winner_path(experiment, phase.name).unlink(missing_ok=True)
+        _promotion_decision_path(experiment, phase.name).unlink(missing_ok=True)
+    _write_yaml_atomic(
+        _generation_path(experiment),
+        {"experiment": experiment.experiment, "generation_id": generation_id},
+    )
 
 
 def experiment_status(experiment: Experiment) -> dict[str, Any]:

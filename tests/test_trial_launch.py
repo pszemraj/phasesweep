@@ -43,6 +43,8 @@ def _capture_launch_env(
         experiment=make_experiment(env=experiment_env),
         phase_name="p",
         trial_id=0,
+        generation_id="generation-test",
+        attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
         overrides={},
         timeout_seconds=None,
@@ -88,3 +90,7 @@ def test_launch_trial_cuda_environment(
 
     assert env["CUDA_VISIBLE_DEVICES"] == expected_visible
     assert env["CUDA_DEVICE_ORDER"] == expected_order
+    assert env["PHASESWEEP_GENERATION_ID"] == "generation-test"
+    assert env["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
+    assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
+    assert env["WANDB_RUN_ID"] == "attempt-test"

@@ -14,7 +14,7 @@ The bundled example writes one namespace per experiment:
 runs/
   tiny_lm_16mb/
     depth/
-      trial_00000/
+      trial_00000__generation_<generation-id>__attempt_<attempt-id>/
         command.txt
         overrides_resolved.json
         result.json
@@ -24,10 +24,13 @@ runs/
       winner.yaml
     lr/
     regularization/
+    generation.yaml
     run.log
     summary.yaml
   phases.db
 ```
+
+Every non-dry experiment invocation mints a generation ID, and every subprocess launch mints an attempt ID. Both are stored in Optuna before launch and included in the trial directory name, so a repeated in-memory study cannot read files left by an older trial with the same number. `generation.yaml`, `winner.yaml`, and `summary.yaml` identify the current invocation; a fresh run clears the mutable winner/summary view it is about to replace while retaining the uniquely named trial directories for inspection.
 
 `pid` and `pgid` are written atomically while a trial is live. On Linux, phasesweep also writes `/proc` start time to `pid_starttime` when it is readable. Identity files are removed on clean exit and preserved on failure for inspection. If an identity write fails after launch, phasesweep terminates the new process group before returning a failed trial result.
 

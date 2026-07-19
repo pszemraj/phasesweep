@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import optuna
 
@@ -23,11 +24,13 @@ from phasesweep.engine.guards import (
 from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
+    GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
@@ -138,6 +141,7 @@ def _run_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
+    generation_id: str | None,
     dry_run: bool = False,
     run_deadline: float | None = None,
 ) -> Winner:
@@ -151,6 +155,7 @@ def _run_phase(
         experiment: Parsed experiment config.
         phase: The phase to execute.
         inherited_winners: Winners loaded for phases earlier in the chain.
+        generation_id: Identity of the current engine invocation, or ``None`` for dry-run.
         dry_run: When ``True``, render an example trial command and return a
             placeholder midpoint winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
@@ -267,6 +272,7 @@ def _run_phase(
 
         """
         nonlocal _consecutive_failures
+        assert generation_id is not None
 
         # Hard abort takes priority. For n_jobs=1 this matches the old
         # behavior of relying on exception propagation; for n_jobs>1 this
@@ -284,7 +290,16 @@ def _run_phase(
         # workdir or invoked phasesweep from a different cwd (review v0.5.3 /
         # blocker 4). Setting this attribute is what creates the trial in
         # Optuna storage with a known directory binding.
-        trial_dir = _trial_dir_for(experiment, phase.name, trial.number)
+        attempt_id = uuid4().hex
+        trial_dir = _trial_dir_for(
+            experiment,
+            phase.name,
+            trial.number,
+            generation_id=generation_id,
+            attempt_id=attempt_id,
+        )
+        trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+        trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
 
         # GPU lease covers only subprocess lifetime, not extraction (#2).
@@ -319,6 +334,8 @@ def _run_phase(
                     experiment=experiment,
                     phase_name=phase.name,
                     trial_id=trial.number,
+                    generation_id=generation_id,
+                    attempt_id=attempt_id,
                     trial_dir=trial_dir,
                     overrides=overrides,
                     timeout_seconds=timeout_seconds,
@@ -536,6 +553,8 @@ def _run_phase(
         gates=selected.gates,
         completion=completion,
         phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+        generation_id=selected.generation_id,
+        attempt_id=selected.attempt_id,
     )
     return winner
 
