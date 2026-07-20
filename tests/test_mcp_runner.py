@@ -310,6 +310,11 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         cleanup_confirmed=False,
         generation_id="current-generation",
     )
+    unowned = mcp_runner.finalize_result_snapshot(captured, cleanup_confirmed=True)
+
+    assert unowned == captured
+    assert unowned["status"]["phases"][0]["trials"]["RUNNING"] == 1
+
     finalized = mcp_runner.finalize_result_snapshot(
         captured,
         cleanup_confirmed=True,
