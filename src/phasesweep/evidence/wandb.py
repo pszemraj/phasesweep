@@ -51,15 +51,18 @@ def poll_wandb_summary(
     """
     from wandb.apis.public import Api  # type: ignore[import-not-found]
 
-    # W&B accepts an integer request timeout. The monotonic deadline below
-    # remains the overall polling bound; the native timeout avoids leaving a
-    # daemon thread behind when an API request stalls.
-    api = Api(timeout=max(1, ceil(timeout_seconds)))
     path = f"{entity}/{project}/{run_id}"
     deadline = time.monotonic() + timeout_seconds
     last_err: Exception | None = None
     required = tuple(required_keys)
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        # W&B accepts an integer request timeout. Bound each request by the
+        # remaining monotonic budget so a late poll cannot extend the overall
+        # wait by another full timeout interval.
+        api = Api(timeout=max(1, ceil(remaining)))
         try:
             run = api.run(path)
             if run.state in {"crashed", "failed", "killed"}:
@@ -72,6 +75,6 @@ def poll_wandb_summary(
             raise
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-        remaining = max(0.0, deadline - time.monotonic())
-        time.sleep(min(poll_seconds, remaining))
+        sleep_seconds = max(0.0, deadline - time.monotonic())
+        time.sleep(min(poll_seconds, sleep_seconds))
     raise WandbPollTimeout(run_id, timeout_seconds, last_err)

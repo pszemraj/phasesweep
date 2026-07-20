@@ -331,6 +331,36 @@ def test_wandb_extractor_timeout(fake_wandb, tmp_path):
         run_extractor(ctx, cfg)
 
 
+def test_wandb_request_timeout_shrinks_with_poll_budget(
+    fake_wandb, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"now": 0.0}
+
+    def slow_missing_run(_path: str) -> _FakeRun:
+        clock["now"] += 6.0
+        raise LookupError("not found")
+
+    timeouts = fake_wandb(slow_missing_run)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=1.0,
+        timeout_seconds=10.0,
+    )
+
+    with pytest.raises(ExtractorError, match="not found or metric"):
+        run_extractor(make_trial_context(tmp_path), cfg)
+
+    assert timeouts == [10, 3]
+
+
 @pytest.mark.parametrize("state", ["failed", "crashed", "killed"])
 def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path, state):
     fake_wandb(lambda _path: _FakeRun(state=state, summary={"eval/loss": 99.0}))
