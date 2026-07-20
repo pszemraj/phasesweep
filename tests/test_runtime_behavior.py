@@ -89,6 +89,7 @@ def test_parallel_trials_e2e(tmp_path):
     yaml_text = f"""
 experiment: parallel_test
 storage: journal:///{journal_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
@@ -128,6 +129,7 @@ def test_failed_trials_marked_fail_not_complete(tmp_path):
     yaml_text = f"""
 experiment: fail_state_test
 storage: sqlite:///{db_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "false {{overrides}}"
 metric:
@@ -222,6 +224,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     yaml_text = f"""
 experiment: c2
 storage: sqlite:///{db}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
@@ -305,6 +308,7 @@ def test_non_finite_extracted_value_marks_trial_fail(
     yaml_text = f"""
 experiment: {exp_name}
 storage: sqlite:///{db}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
@@ -441,6 +445,7 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
     body = f"""
 experiment: platform_check
 storage: sqlite:///{tmp_path}/platform.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "echo {{overrides}}"
 metric:
@@ -469,6 +474,7 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     body = f"""
 experiment: failtest
 storage: sqlite:///{tmp_path}/fail.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "false {{overrides}}"
 metric:

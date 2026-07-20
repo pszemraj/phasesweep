@@ -476,6 +476,7 @@ def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> N
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
@@ -610,6 +611,7 @@ def test_inherit_search_space_collision_errors(tmp_path):
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss

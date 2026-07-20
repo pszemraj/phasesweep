@@ -2,6 +2,8 @@
 
 experiment: tiny_lm_16mb_mcp
 storage: sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db
+provenance:
+  revision: "phasesweep-fake-trainer-v1"
 workdir: /tmp/phasesweep-mcp-tiny-lm/runs
 trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
 override_format: argparse

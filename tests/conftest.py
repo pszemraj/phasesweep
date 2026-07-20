@@ -55,6 +55,7 @@ def make_experiment(
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
+    provenance: dict[str, str] | None = None,
     **phase_overrides: Any,
 ) -> Experiment:
     """Build a minimal valid Experiment for testing.
@@ -89,6 +90,9 @@ def make_experiment(
         kwargs["workdir"] = str(workdir)
     if storage is not None:
         kwargs["storage"] = storage
+        kwargs["provenance"] = provenance or {"revision": "test-fixture-v1"}
+    elif provenance is not None:
+        kwargs["provenance"] = provenance
     if constraints is not None:
         kwargs["constraints"] = constraints
     if env is not None:

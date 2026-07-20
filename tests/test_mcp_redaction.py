@@ -37,6 +37,7 @@ def _write_catalog(tmp_path: Path) -> Path:
         f"""\
 experiment: redact_me
 storage: sqlite:///{tmp_path}/SECRET_DB.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/SECRET_WORKDIR
 trial_command: "python /opt/secret/train.py --token DANGER_TOKEN --out {{trial_dir}}/r.json {{overrides}}"
 override_format: argparse

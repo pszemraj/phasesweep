@@ -12,7 +12,6 @@ from typing import Any
 
 import optuna
 
-from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
@@ -243,6 +242,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
+FINGERPRINT_SCHEMA_VERSION = 1
 
 
 def _phase_semantic_payload(
@@ -265,16 +265,16 @@ def _phase_semantic_payload(
             ``effective_overrides`` are part of this phase's identity.
 
     Returns:
-        A JSON-serialisable dict whose contents fully determine trial meaning
-        for the phase. Stable across irrelevant config edits, varies on
-        anything that would change a trial's outcome.
+        A JSON-serialisable dict containing the configured trial semantics and
+        operator-declared external provenance.
 
     """
     phase_dump = phase.model_dump(mode="json")
     semantic_phase = {k: v for k, v in phase_dump.items() if k not in _RUN_CONTROL_KEYS}
     return {
-        "phasesweep_version": __version__,
+        "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         "trial_command": experiment.trial_command,
+        "provenance": dict(sorted(experiment.provenance.items())),
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
         "metric": experiment.metric.model_dump(mode="json"),

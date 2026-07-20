@@ -51,6 +51,7 @@ def _chained_config(tmp_path: Path) -> str:
     return f"""\
 experiment: e2e_lm
 storage: sqlite:///{tmp_path}/phases.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 override_format: argparse

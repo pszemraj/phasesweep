@@ -189,6 +189,7 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         f"""
         experiment: bad_promo
         storage: journal:///{tmp_path}/study.journal
+        provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "python train.py {{overrides}}"
         metric:

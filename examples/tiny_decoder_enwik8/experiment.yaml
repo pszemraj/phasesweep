@@ -4,6 +4,9 @@
 
 experiment: tiny_decoder_enwik8_hparam_smoke
 storage: sqlite:///./examples/tiny_decoder_enwik8/runs/phases.db
+provenance:
+  trainer: "run-trial-v1+decoder-template@9c90a551"
+  data: "enwik8-template-download"
 workdir: ./examples/tiny_decoder_enwik8/runs/trials
 trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import yaml
 
+from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import (
     _experiment_lock,
@@ -464,6 +465,7 @@ def _write_generation_state(
         "state": state,
         "from_phase": from_phase,
         "error_class": error_class,
+        "phasesweep_version": __version__,
     }
     _write_yaml_atomic(_generation_record_path(experiment, generation_id), payload)
     if publish_current:

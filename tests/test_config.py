@@ -16,6 +16,7 @@ def test_inherit_must_be_prior(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {trial_dir}"
 metric:
   name: loss
@@ -41,6 +42,7 @@ def test_constraint_requires_bound(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 metric:
   name: loss
@@ -65,6 +67,7 @@ def test_metric_constraint_name_collision(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
@@ -99,6 +102,7 @@ def test_phase_name_validation(name: str) -> None:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "first {overrides}"
 trial_command: "second {overrides}"
 metric:
@@ -113,6 +117,7 @@ phases:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
@@ -128,6 +133,7 @@ phases:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
@@ -153,6 +159,7 @@ def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 metric:
   name: loss
@@ -178,6 +185,7 @@ def test_n_jobs_default_is_one(tmp_path):
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss

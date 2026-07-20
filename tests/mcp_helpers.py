@@ -91,7 +91,11 @@ def mcp_experiment_config_text(
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
-    storage = f"storage: sqlite:///{tmp_path}/{name}.db\n" if with_storage else ""
+    storage = (
+        f"storage: sqlite:///{tmp_path}/{name}.db\nprovenance: {{revision: test-fixture-v1}}\n"
+        if with_storage
+        else ""
+    )
     return f"""\
 experiment: {name}
 {storage}workdir: {tmp_path}/runs/{name}
@@ -114,6 +118,7 @@ def slow_mcp_config_text(
     return f"""\
 experiment: {name}
 storage: sqlite:///{tmp_path}/{name}.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
 trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
 override_format: argparse

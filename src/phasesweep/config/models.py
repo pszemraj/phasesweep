@@ -385,6 +385,13 @@ class Experiment(_Frozen):
             "{phase}, {run_name}, {overrides_path}."
         )
     )
+    provenance: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Operator-supplied trainer/data/dependency identity included in persistent-study "
+            "fingerprints. Values must change whenever trial meaning changes outside this YAML."
+        ),
+    )
     override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
@@ -392,6 +399,21 @@ class Experiment(_Frozen):
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_persistent_provenance(self) -> Experiment:
+        """Require meaningful external-input identity for persistent study reuse."""
+        invalid = [
+            key for key, value in self.provenance.items() if not key.strip() or not value.strip()
+        ]
+        if invalid:
+            raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
+        if self.storage is not None and not self.provenance:
+            raise ValueError(
+                "Persistent storage requires a nonempty provenance mapping that identifies "
+                "the trainer, data, and dependency revision used by this experiment."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_run_timeout(self) -> Experiment:
@@ -766,6 +788,7 @@ class SuiteDefaults(_Frozen):
     storage: str | None = None
     workdir: str = "./runs"
     trial_command: str | None = None
+    provenance: dict[str, str] = Field(default_factory=dict)
     override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
@@ -782,6 +805,7 @@ class StudySpec(_Frozen):
     storage: str | None = None
     workdir: str | None = None
     trial_command: str | None = None
+    provenance: dict[str, str] | None = None
     override_format: Literal["argparse", "hydra", "json_file"] | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
@@ -896,6 +920,7 @@ class Suite(_Frozen):
             storage=value("storage"),
             workdir=value("workdir", required=True),
             trial_command=value("trial_command", required=True),
+            provenance=value("provenance") or {},
             override_format=value("override_format", required=True),
             metric=value("metric", required=True),
             constraints=value("constraints") or [],

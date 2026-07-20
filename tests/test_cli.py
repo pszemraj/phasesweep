@@ -200,6 +200,7 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
     body = f"""
 experiment: dry
 storage: sqlite:///{tmp_path}/dry.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "false {{overrides}}"
 metric:
@@ -247,6 +248,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         f"""
         experiment: status_test
         storage: sqlite:///{tmp_path}/status.db
+        provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
         metric:

@@ -58,6 +58,7 @@ def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path
         f"""
         experiment: t
         storage: {storage}
+        provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
         metric:
@@ -129,6 +130,7 @@ def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
         Experiment(
             experiment="t",
             storage="sqlite:///test.db",
+            provenance={"revision": "test-fixture-v1"},
             trial_command="echo {overrides}",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")

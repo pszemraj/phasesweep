@@ -174,6 +174,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     exp = Experiment(
         experiment="t",
         storage=storage,
+        provenance={"revision": "test-fixture-v1"},
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
         metric=Metric(
@@ -219,6 +220,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
     experiment = Experiment(
         experiment="cross_phase_orphan",
         storage=storage,
+        provenance={"revision": "test-fixture-v1"},
         workdir=str(tmp_path / "runs"),
         trial_command=f"{sys.executable} {trainer}",
         metric=Metric(

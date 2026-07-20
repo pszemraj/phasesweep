@@ -25,6 +25,10 @@
 # Config loading checks format syntax and supported fields, but not executable/path existence, trainer parser compatibility, evidence production, or JSON serializability.
 # An override-free phase may use a constant command. Any inherited, contract, fixed, or sampled override requires the placeholder selected by override_format.
 
+# provenance: dict[str, str] = {}
+# Operator-declared identities for trainer code, base config, data, dependencies, container, tokenizer, or other inputs outside this YAML. Keys and values must be nonempty.
+# Persistent storage requires at least one entry. The complete mapping is included in semantic fingerprints; update its values whenever an external input changes. PhaseSweep does not inspect imports or hash arbitrary trial_command inputs.
+
 # override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
 # `argparse` requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed. Other values are stringified.
 # `hydra` requires `{overrides}` and emits `key=value`; it accepts scalars/lists and rejects mappings during config preflight.
@@ -279,13 +283,14 @@
 #   storage: str | None = null
 #   workdir: str = "./runs"
 #   trial_command: str | None = null
+#   provenance: dict[str, str] = {}
 #   override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
 #   metric: Metric | None = null
 #   constraints: list[Constraint] = []
 #   contracts: dict[str, Contract] = {}
 #   env: dict[str, str] = {}
 #   timeout_seconds_per_run: float | None = null (>= 0 and finite once compiled)
-# Each resolved value follows the matching Experiment contract. trial_command and metric must be supplied here or by every study; workdir and override_format already have non-null defaults.
+# Each resolved value follows the matching Experiment contract. trial_command and metric must be supplied here or by every study; provenance must resolve nonempty for persistent storage; workdir and override_format already have non-null defaults.
 # timeout_seconds_per_run resets for each compiled study; it is not a suite-wide deadline.
 
 # studies: list[Study] (required; min length 1)
@@ -305,6 +310,9 @@
 
 # trial_command: str | None = null
 # If omitted, inherits defaults.trial_command; explicit null blocks fallback and fails compilation. It must resolve non-null.
+
+# provenance: dict[str, str] | None = null
+# If omitted, inherits defaults.provenance; a non-null mapping replaces the default mapping. The compiled persistent experiment requires at least one entry.
 
 # override_format: Literal["argparse", "hydra", "json_file"] | None = null
 # If omitted, inherits defaults.override_format; explicit null blocks fallback and fails compilation. The resolved value follows the Experiment contract.
