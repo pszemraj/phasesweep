@@ -43,7 +43,7 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
-    cur = json.loads(target.read_text())
+    cur = json.loads(target.read_text(encoding="utf-8"))
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -135,6 +135,12 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
     except JSONDecodeError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
+    except UnicodeError as exc:
+        target = ctx.trial_dir / cfg.path
+        raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
+    except OSError as exc:
+        target = ctx.trial_dir / cfg.path
+        raise ExtractorError(f"Could not read JSON at {target}: {exc}") from exc
     except KeyError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(
@@ -159,12 +165,14 @@ def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> flo
     target = ctx.trial_dir / cfg.path
     try:
         data = json.loads(
-            target.read_text(),
+            target.read_text(encoding="utf-8"),
             parse_constant=_reject_nonstandard_json_constant,
             object_pairs_hook=_reject_duplicate_json_keys,
         )
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON envelope not found: {target}") from exc
+    except UnicodeError as exc:
+        raise ExtractorError(f"JSON envelope at {target} is not valid UTF-8: {exc}") from exc
     except (JSONDecodeError, ValueError) as exc:
         raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
     except OSError as exc:
@@ -260,24 +268,29 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
     # Stream line-by-line to avoid 500 MB RSS on large training logs.
     result: float | None = None
     count = 0
-    with target.open() as fh:
-        for line in fh:
-            m = pattern.search(line)
-            if m is None:
-                continue
-            try:
-                v = float(m.group("value"))
-            except (TypeError, ValueError):
-                continue
-            count += 1
-            if cfg.select == "first":
-                return v
-            if cfg.select == "last":
-                result = v
-            elif cfg.select == "min":
-                result = v if result is None else min(result, v)
-            elif cfg.select == "max":
-                result = v if result is None else max(result, v)
+    try:
+        with target.open(encoding="utf-8") as fh:
+            for line in fh:
+                m = pattern.search(line)
+                if m is None:
+                    continue
+                try:
+                    v = float(m.group("value"))
+                except (TypeError, ValueError):
+                    continue
+                count += 1
+                if cfg.select == "first":
+                    return v
+                if cfg.select == "last":
+                    result = v
+                elif cfg.select == "min":
+                    result = v if result is None else min(result, v)
+                elif cfg.select == "max":
+                    result = v if result is None else max(result, v)
+    except UnicodeError as exc:
+        raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
     if count == 0:
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")

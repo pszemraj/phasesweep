@@ -106,6 +106,45 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
             run_extractor(make_trial_context(case_dir), cfg)
 
 
+def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path):
+    cases = [
+        (
+            "json",
+            "result.json",
+            JsonExtractor(type="json", path="result.json", key="x"),
+            "not valid UTF-8",
+        ),
+        (
+            "log",
+            "stdout.log",
+            LogRegexExtractor(
+                type="log_regex",
+                file="stdout.log",
+                pattern=r"value=(?P<value>[0-9.]+)",
+            ),
+            "not valid UTF-8",
+        ),
+        (
+            "envelope",
+            "result.json",
+            JsonEnvelopeExtractor(
+                type="json_envelope",
+                objective_name="val_loss",
+                split="validation",
+                policy="final_checkpoint",
+            ),
+            "not valid UTF-8",
+        ),
+    ]
+
+    for case, filename, cfg, match in cases:
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        (case_dir / filename).write_bytes(b"\xff\xfe")
+        with pytest.raises(ExtractorError, match=match):
+            run_extractor(make_trial_context(case_dir), cfg)
+
+
 def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
     payload = {
         "schema_version": 1,
