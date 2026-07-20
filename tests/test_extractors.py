@@ -14,6 +14,7 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from phasesweep.evidence import ExtractorError, run_extractor
 from tests.conftest import make_trial_context
@@ -313,22 +314,45 @@ def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
     assert timeouts == [1]
 
 
-def test_wandb_extractor_timeout(fake_wandb, tmp_path):
+def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.MonkeyPatch):
     def missing_run(_path: str) -> _FakeRun:
         raise LookupError("not found")
 
     fake_wandb(missing_run)
+    clock = {"now": 0.0}
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
     cfg = WandbExtractor(
         type="wandb",
         entity="me",
         project="proj",
         metric_key="eval/loss",
         poll_seconds=0.01,
-        timeout_seconds=0.03,
+        timeout_seconds=1.0,
     )
     with pytest.raises(ExtractorError, match="not found or metric"):
         ctx = make_trial_context(tmp_path, experiment="exp", phase="ph", trial_id=7)
         run_extractor(ctx, cfg)
+
+
+@pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
+@pytest.mark.parametrize("timeout_seconds", [0.0, 0.05, 0.999])
+def test_wandb_timeouts_require_whole_second_transport_budget(model, timeout_seconds):
+    common = {
+        "type": "wandb" if model is WandbExtractor else "wandb_summary_required",
+        "entity": "me",
+        "project": "proj",
+        "timeout_seconds": timeout_seconds,
+    }
+    if model is WandbExtractor:
+        common["metric_key"] = "eval/loss"
+    else:
+        common["keys"] = ["eval/loss"]
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        model(**common)
 
 
 def test_wandb_request_timeout_shrinks_with_poll_budget(

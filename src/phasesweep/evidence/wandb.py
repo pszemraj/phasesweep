@@ -42,7 +42,9 @@ def poll_wandb_summary(
     :param str project: W&B project name.
     :param str run_id: Immutable W&B run id assigned to this trial attempt.
     :param float poll_seconds: Delay between polling attempts.
-    :param float timeout_seconds: Maximum time to wait for a ready run.
+    :param float timeout_seconds: Maximum polling budget. W&B request deadlines
+        have whole-second granularity, so an active request may finish less than
+        one second after this budget expires.
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
     :raises WandbRunTerminalError: If the run crashes, fails, or is killed.

@@ -114,7 +114,7 @@ class WandbExtractor(_Frozen):
     project: str
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
     poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=1.0)
 
 
 ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
@@ -218,7 +218,7 @@ class WandbSummaryRequiredGate(_Frozen):
     project: str
     keys: list[str] = Field(min_length=1)
     poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=1.0)
 
 
 Gate = Annotated[

@@ -207,8 +207,8 @@
 # metric_key: str (required)
 # Key in wandb.run.summary; the value must be a finite number, not a string or boolean.
 # poll_seconds: float = 2.0 (> 0)
-# timeout_seconds: float = 120.0 (>= 0)
-# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial.
+# timeout_seconds: float = 120.0 (>= 1)
+# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial. W&B request deadlines use whole seconds, so an active request may finish less than one second after this polling budget expires.
 
 # GATE OBJECTS
 # A gate must use exactly one discriminator shape. All `path` and JSON `key` fields obey the Extractor path/key invariants above.
@@ -249,7 +249,7 @@
 # project: str (required)
 # keys: list[str] (required; min length 1)
 # poll_seconds: float = 2.0 (> 0)
-# timeout_seconds: float = 120.0 (>= 0)
+# timeout_seconds: float = 120.0 (>= 1)
 # Requires the optional W&B dependency. Lookup and terminal-state rules are the same as the W&B extractor. Once the attempt's run is finished, missing keys fail the gate immediately rather than polling for later summary updates.
 
 # PROMOTION OBJECT
