@@ -10,8 +10,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 
 ## Requirements
 
-- Python 3.10+; real runs need a [supported POSIX platform](docs/runtime.md#platform-support)
-- The optional MCP server requires Linux for PID-reuse-safe cancellation and recovery
+- Python 3.10+; see [platform support](docs/runtime.md#platform-support) for real-run and MCP requirements
 - A trainer command that follows the [trainer contract](docs/config.md#trainer-contract)
 - GPU optional; see [GPU concurrency and isolation](docs/runtime.md#concurrency-model)
 
@@ -21,20 +20,16 @@ phasesweep is currently installed from Git:
 
 ```bash
 python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
-# weights-and-biases integration is optional:
-python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
-# MCP server, to drive sweeps from an AI agent:
-python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
-# all dev dependencies:
-python -m pip install "phasesweep[dev,wandb] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
+
+Optional extras are `wandb`, `mcp`, and `dev`; add one or more inside brackets after `phasesweep`. The [MCP setup](docs/mcp_setup.md#1-install) includes its exact install command.
 
 For local development from a checkout:
 
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-# activate venv of your choice, then:
+# activate your Python environment, then:
 python -m pip install -e ".[dev,wandb]"
 ```
 

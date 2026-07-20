@@ -12,7 +12,7 @@
 # Nonempty ASCII `[A-Za-z0-9_-]+`; selects output paths, locks, and `<experiment>::<phase>` Optuna study names.
 
 # storage: str | None = null
-# `null` creates fresh in-memory studies on every invocation. Reusing the same workdir then restarts trial numbers and can overwrite prior trial logs and winners; use persistent storage for resumable work.
+# `null` creates fresh in-memory studies and restarts trial numbers on every invocation. Trial directories remain generation/attempt-scoped, but study state and the current winner/summary view restart; use persistent storage for resumable work.
 # `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs pass through to Optuna. External RDB storage does not make multi-host phasesweep orchestration safe.
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
 

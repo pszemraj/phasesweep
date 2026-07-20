@@ -23,13 +23,11 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry intentionally remains bound to this Python environment. If you move, delete, or recreate it, install PhaseSweep in the replacement environment and rerun the same step-3 install command to update the managed entry.
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry remains bound to this Python environment. If you move, delete, or recreate it, install PhaseSweep in the replacement environment and rerun the same step-3 install command to update the managed entry.
 
 ```bash
 which phasesweep-mcp
 ```
-
-For manual setup without a persistent install, a client can launch through `uvx` (`uv tool run`). Use `command -v uvx` to get its absolute path; the first launch has a slower download/build cold start.
 
 ## 2. Create a catalog
 
@@ -60,9 +58,9 @@ phasesweep mcp install --agent claude --dry-run  # validate and show planned cli
 phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
 ```
 
-Without `--agent`, detected clients sort first and are preselected in one menu; undetected clients remain selectable. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
+Without `--agent`, interactive installs preselect detected clients in one menu while leaving undetected clients selectable; unattended `--yes` installs select every detected client. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
-Automatic edits are limited to regular UTF-8 files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Each file edit is serialized with other PhaseSweep installer processes and refused if the file changes again before replacement. Malformed configs and same-name entries that do not match the generated shape are left untouched with manual guidance. Marker fences are recognized only as exact standalone lines; text outside a managed block retains its original bytes and newline style. Strict JSON edits change only the managed member but re-serialize the document: duplicate keys and non-finite or overflowing numbers are refused; key order, detected indentation, final-newline state, and permissions are retained; compact whitespace and numeric spellings may be normalized, and finite numbers use Python's JSON precision. `uninstall` removes the managed member or block and leaves now-empty files and JSON containers in place because the installer does not persist whole-file creation provenance. Shared instruction blocks remain until their last installed agent owner is removed.
+Automatic edits are limited to regular UTF-8 files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Each file edit is serialized with other PhaseSweep installer processes and refused if the file changes again before replacement. Malformed configs and same-name entries that do not match the generated shape are left untouched with manual guidance. Marker fences are recognized only as exact standalone lines; text outside a managed block retains its original bytes and newline style. Strict JSON edits change only the managed data member, then re-serialize the whole document: duplicate keys, non-finite values, and floating-point values that overflow to infinity are refused; key order, detected indentation, final-newline state, and permissions are retained; compact whitespace and numeric spellings may be normalized, and finite numbers use Python's JSON precision. `uninstall` removes the managed member or block and leaves now-empty files and JSON containers in place because the installer does not persist whole-file creation provenance. Shared instruction blocks remain until their last installed agent owner is removed.
 
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
@@ -76,15 +74,8 @@ Restart the client after any config change.
 Every stdio client launches the same server. Use absolute paths for both values:
 
 ```json
-"command": "/abs/path/to/venv/bin/phasesweep-mcp",
+"command": "/abs/path/to/python-env/bin/phasesweep-mcp",
 "args": ["--catalog", "/abs/path/to/catalog.yaml"]
-```
-
-To launch through `uvx` instead:
-
-```json
-"command": "/abs/path/to/uvx",
-"args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/catalog.yaml"]
 ```
 
 Client schemas and config paths differ. Run `phasesweep mcp install --dry-run` for the exact target, or use the manual snippet printed when an edit is skipped.
@@ -117,7 +108,7 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 - The client cannot find `phasesweep-mcp`: a generated entry points to the Python environment that ran the installer. If that environment moved, was deleted, or was recreated, install the MCP extra in its replacement, rerun the same `phasesweep mcp install` command (`--dry-run` previews the repair), and restart the client. For a manual config, update `command` to the new absolute path from `which phasesweep-mcp`.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
 - `concurrency limit reached`: the refusal names up to five blocking run IDs. Await one directly and retry the refused launch after it becomes terminal, ask the user before cancelling it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
-- `terminal result snapshot ... unavailable`: retry once after a short delay only if finalization is still pending. If it remains unavailable, report it to the operator. `phasesweep mcp recover-run` can finalize an already-captured snapshot after cleanup recovery, but it cannot reconstruct a missing historical snapshot from mutable experiment results.
+- `terminal result snapshot ... unavailable`: follow [run state and recovery](mcp.md#run-state-and-recovery); historical results are never rebuilt from mutable experiment state.
 - Path or storage rejected at startup: follow the MCP [path and working-directory rules](mcp.md#paths-and-the-working-directory); catalogs support local-node SQLite and Journal storage, not in-memory or external RDB storage.
-- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp recover-run --state-dir <state_dir> --run-id <run_id>` to validate the saved identity and list the cleanup it would attempt. Repeat with `--confirm` only after reviewing that preflight; only the confirmed invocation attempts process cleanup and clears recovery state after cleanup is verified.
+- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: follow the operator procedure under [run state and recovery](mcp.md#run-state-and-recovery).
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.

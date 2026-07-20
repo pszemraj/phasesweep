@@ -49,7 +49,9 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, experiment_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed, recovery_required}` |
 
-MCP annotations describe the same contract enforced by the server. Tools marked `read` in the table set `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. Launch sets those hints to `false`, `true`, `false`, and `true`; cancel sets them to `false`, `true`, `true`, and `false`. Permissions, closed input schemas, and safety gates are enforced server-side even when a client ignores the hints.
+MCP annotations mirror the effects in the table. Permissions, closed input schemas, and safety gates are enforced server-side even when a client ignores those hints.
+
+### Run state and recovery
 
 A launched sweep runs as a detached background process in its own session, so it survives the agent's tool call and a server restart and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `phasesweep_await_run` waits without preventing cancellation or other MCP calls. The packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md#workflow) define the call sequence. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
 
@@ -81,7 +83,7 @@ Clients that support MCP resources can attach `phasesweep://catalog`. It returns
 
 Clients that support MCP prompts can use `phasesweep_run_and_monitor`, which serves the packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md).
 
-The same instructions are included in the MCP initialization handshake, so clients that surface server instructions receive the workflow without loading the optional prompt or a project instructions file.
+See [Instruct the agent](mcp_setup.md#5-instruct-the-agent) for initialization instructions, project-file installation, and fallback setup.
 
 ## Security model
 
@@ -102,7 +104,7 @@ This layer narrows the **agent's** authority. It does **not** sandbox the traini
 
 Run handles and per-run logs live under `state_dir`:
 
-- `state_dir/audit.jsonl` - structured MCP tool-call audit records.
+- `state_dir/audit.jsonl` - launch/cancel side-effect audit records.
 - `state_dir/runs/<run_id>.json` - the run handle.
 - `state_dir/logs/<run_id>.log` - captured runner stdout/stderr (operator-only).
 - `state_dir/logs/<run_id>.status.json` - the recorded terminal cause, explicit result-snapshot finalization state, and, when capture succeeds, the path-free status/winner snapshot used for stable run-id reads.
@@ -114,7 +116,7 @@ The engine's own durable `run.log` is under the experiment `workdir`.
 
 `audit.jsonl` contains best-effort append-only records for launch and cancel side effects: timestamp, local stdio actor, server session id, tool name, bounded safe arguments, resolved ids, outcome, safe error details, and state-transition summaries. Read-only catalog, status, await, and winner calls are not logged. Audit records do not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
-When a client polls `phasesweep_get_status` instead of waiting on `phasesweep_await_run`, wait at least 30 seconds between calls. SQLite-backed status uses a read-only direct count path. Journal-backed status goes through Optuna's full read path today, so keep polling sparse on very large Journal-backed studies.
+The packaged [agent workflow](../src/phasesweep/mcp/agent_prompt.md#workflow) defines polling cadence. SQLite-backed status uses a read-only direct count path. Journal-backed status goes through Optuna's full read path today, so avoid frequent polling on very large Journal-backed studies.
 
 ### Long-running servers
 

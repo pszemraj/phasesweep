@@ -12,7 +12,7 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
 
-`trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. The parser boundary is defined under [override formats](#override-formats).
+`trial_command` is the command template for one trial. phasesweep validates the template at config load and shell-quotes rendered override values. The [config reference](config_reference.yaml) defines the supported placeholders; the parser boundary is explained under [override formats](#override-formats).
 
 `metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value. Current samplers receive that objective without feasibility guidance; infeasible trials cannot become the phase winner and count toward `max_consecutive_failures`. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
 
@@ -30,24 +30,20 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 `search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
-Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports float and integer parameters, but not categorical parameters.
-
-Search keys named `seed` or ending in `.seed` are rejected by default because optimizing a randomness source can select noise. Keep seeds fixed for ordinary comparisons, or set `allow_seed_search: true` for an explicit variance audit.
+Use categorical parameters for explicit choices and integer or float parameters for ranges. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
 ## Override formats
 
 > [!IMPORTANT]
 > The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
-| Format      | Template placeholder | Trainer receives                     | Use when                                                         |
-| ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
-| `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
-| `hydra`     | `{overrides}`        | `key=value` tokens                   | Compatibility for existing Hydra/OmegaConf applications.         |
-| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Recommended for structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
+| Format | Use when |
+| --- | --- |
+| `argparse` | New scripts using `argparse`, Click, Typer, or similar parsers. |
+| `hydra` | Existing Hydra/OmegaConf applications. |
+| `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
-When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
-
-`argparse` renders lowercase booleans, bracketed comma-separated lists, and `None` for null. Hydra renders lowercase booleans and `null`, JSON-quotes strings, recursively renders bracketed lists, and rejects mappings. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Every value must still be JSON-serializable; validation and dry-run do not write `overrides.json`, so serialization is exercised only by a real trial launch.
+Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values; serialization is exercised only by a real trial launch because validation and dry-run do not write `overrides.json`.
 
 ## Trainer contract
 
@@ -76,19 +72,17 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Plain `json` objectives must be numbers; numeric strings and booleans are rejected rather than coerced. Use `json_envelope` when the trainer should also prove that the result belongs to the current generation, attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. W&B extractors query the immutable run ID assigned through `WANDB_RUN_ID`, accept only a `finished` run, and fail immediately when that run is `failed`, `crashed`, or `killed`. Human-readable display names do not participate in evidence correlation.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Plain `json` objectives must be numbers; numeric strings and booleans are rejected. Use `json_envelope` to bind a result to the current attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
-JSON extractors read a dotted key from a file under `{trial_dir}`. Log regex extractors read a captured numeric group named `value`. W&B extractors read a summary key from the finished run whose immutable ID matches the current attempt. The [config reference](config_reference.yaml) is the complete contract for each shape.
+The [config reference](config_reference.yaml) defines each extractor shape, including JSON keys, log capture groups, W&B terminal-state handling, and polling timeouts.
 
 ## Evidence gates
 
-Supported gates are `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, and `wandb_summary_required`. Gate failures mark the trial `FAIL` unless promotion has `requires_gates: false`, where they are advisory evidence.
+Evidence gates validate local artifacts or W&B summary values after extraction. Gate failures mark the trial `FAIL` unless promotion has `requires_gates: false`, where they are advisory evidence. The [config reference](config_reference.yaml) defines the available gate shapes.
 
 `json_equals` is type-strict, so `true`, `1`, and `1.0` are distinct. Use `json_scalar_bound` for numeric comparisons where integer and float representations should both pass.
-
-`artifact_size` requires `source: file|directory|json`. File and directory sources measure materialized bytes. JSON source reads an integer byte estimate from `path` plus `key`.
 
 ## Promotion
 
@@ -98,6 +92,6 @@ For a phase promotion failure, `stop` raises an error, `skip` ends the remaining
 
 ## Suites
 
-Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`. Worked experiment files remain under `examples/`; this guide deliberately does not duplicate them as templates.
+Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`. See the [worked configs](../examples/).
 
 Suite-level `run.log` and `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions are recorded in `suite_summary.yaml`, not in a per-study `promotion.yaml`. The suite summary is written only after the suite loop completes; a stop or missing dependency can leave completed study artifacts without that summary. `--from-phase` is supported only for single-experiment configs, not suites.
