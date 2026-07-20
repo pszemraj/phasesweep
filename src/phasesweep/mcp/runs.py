@@ -287,11 +287,12 @@ class RunStore:
         """Derive the current state from status.json and a live PID check.
 
         A finalized status.json (written by the runner on every exit) is
-        authoritative: returncode 0 -> succeeded, a signalled code ->
-        cancelled, any other -> failed. Pending result snapshot capture remains
-        running so another launch cannot mutate shared result storage before
-        the snapshot is frozen. With no status.json, a live (non-zombie) PID
-        means running. A dead or unverifiable spawned runner with no status
+        authoritative: returncode 0 with no explicit snapshot failure ->
+        succeeded, a signalled code -> cancelled, and any other return code or
+        failed result snapshot -> failed. Pending result snapshot capture
+        remains running so another launch cannot mutate shared result storage
+        before the snapshot is frozen. With no status.json, a live
+        (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
         cannot prove that its separately-sessioned trial descendants are gone,
         so it is marked cleanup-uncertain and remains ``running`` until
         operator recovery records cleanup evidence. An unresolved pre-spawn
@@ -325,6 +326,8 @@ class RunStore:
                 return "running"
             rc = status.get("returncode")
             if rc == 0:
+                if status.get("result_snapshot_state") == "failed":
+                    return "failed"
                 return "succeeded"
             if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
                 return "cancelled"

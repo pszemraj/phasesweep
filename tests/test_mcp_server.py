@@ -1375,7 +1375,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "failed"
     assert terminal["result_snapshot_error"] == "InterruptedFinalization"
-    assert store.state(handle) == "succeeded"
+    assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
     with pytest.raises(Exception, match="finalization state: failed"):

@@ -243,6 +243,22 @@ def test_terminal_status_determines_state(
     assert store.state(handle) == expected_state
 
 
+def test_successful_process_with_failed_result_snapshot_is_failed(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1")
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="failed",
+        result_snapshot_error="InterruptedFinalization",
+    )
+
+    assert store.state(handle) == "failed"
+
+
 def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
