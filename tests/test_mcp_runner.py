@@ -16,10 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import Experiment, load_config
+from phasesweep.config import Experiment, Phase, load_config
 from phasesweep.engine import read_status, run_experiment
 from phasesweep.engine.guards import _experiment_lock
-from phasesweep.engine.state import _generation_path, _trial_dir_for
+from phasesweep.engine.state import (
+    _generation_path,
+    _summary_path,
+    _trial_dir_for,
+    _winner_path,
+)
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
@@ -176,6 +181,59 @@ def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> 
             cleanup_confirmed=False,
             generation_id="failed-new-generation",
         )
+
+
+def test_failed_resume_preflight_preserves_current_generation_and_results(
+    tmp_path: Path,
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    phases = [
+        Phase(name="a", n_trials=1, fixed_overrides={"k": 1}, search_space={}),
+        Phase(name="b", n_trials=1, inherits=["a"], search_space={}),
+    ]
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=phases,
+    )
+    run_experiment(experiment)
+
+    protected_paths = [
+        _generation_path(experiment),
+        _summary_path(experiment),
+        *(_winner_path(experiment, phase.name) for phase in phases),
+    ]
+    before = {path: path.read_bytes() for path in protected_paths}
+    changed = experiment.model_copy(
+        update={
+            "phases": [
+                phases[0].model_copy(update={"fixed_overrides": {"k": 2}}),
+                phases[1],
+            ]
+        }
+    )
+    callback_generations: list[str] = []
+
+    def capture_failed_resume(generation_id: str, error: BaseException | None) -> None:
+        assert isinstance(error, RuntimeError)
+        callback_generations.append(generation_id)
+        with pytest.raises(RuntimeError, match="generation marker does not match"):
+            mcp_runner.capture_result_snapshot(
+                changed,
+                cleanup_confirmed=False,
+                generation_id=generation_id,
+            )
+
+    with pytest.raises(RuntimeError, match="different phase config"):
+        run_experiment(
+            changed,
+            from_phase="b",
+            terminal_callback=capture_failed_resume,
+        )
+
+    assert len(callback_generations) == 1
+    assert {path: path.read_bytes() for path in protected_paths} == before
 
 
 def test_runner_records_snapshot_serialization_failure(

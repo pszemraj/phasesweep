@@ -153,12 +153,17 @@ def run_experiment(
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
         try:
+            preloaded_winners = _preflight_skipped_winners(
+                experiment,
+                from_phase=from_phase,
+            )
             _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
             return _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
                 dry_run=False,
                 generation_id=generation_id,
+                preloaded_winners=preloaded_winners,
             )
         except BaseException as exc:
             terminal_error = exc
@@ -181,6 +186,7 @@ def _run_experiment_inner(
     from_phase: str | None,
     dry_run: bool,
     generation_id: str | None,
+    preloaded_winners: dict[str, Winner] | None = None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
 
@@ -190,6 +196,8 @@ def _run_experiment_inner(
             are loaded from disk.
         dry_run: If ``True``, no subprocesses launch and no ``summary.yaml`` is written.
         generation_id: Current invocation identity, or ``None`` for dry-run.
+        preloaded_winners: Strictly validated skipped-phase winners loaded before
+            the current generation was committed.
 
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
@@ -216,16 +224,18 @@ def _run_experiment_inner(
         inherited = {p: winners[p] for p in phase.inherits}
 
         if skip_until and phase.name != from_phase:
-            try:
-                if not dry_run:
-                    _reap_skipped_phase(experiment, phase)
-                winners[phase.name] = _load_winner(experiment, phase, inherited)
-                log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
-            except FileNotFoundError:
-                if not dry_run:
-                    raise
-                winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
-                log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
+            if preloaded_winners is not None:
+                winners[phase.name] = preloaded_winners[phase.name]
+                log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
+            else:
+                try:
+                    winners[phase.name] = _load_winner(experiment, phase, inherited)
+                    log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
+                except FileNotFoundError:
+                    if not dry_run:
+                        raise
+                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
+                    log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue
         skip_until = False
 
@@ -277,6 +287,31 @@ def _run_experiment_inner(
     log.info("Wrote %s", summary_path)
 
     return winners
+
+
+def _preflight_skipped_winners(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+) -> dict[str, Winner]:
+    """Validate skipped winners before committing a new generation.
+
+    :param Experiment experiment: Experiment whose resume prefix is checked.
+    :param str | None from_phase: First phase that the new generation will execute.
+    :return dict[str, Winner]: Compatible skipped winners in declaration order.
+    """
+    if from_phase is None:
+        return {}
+
+    winners: dict[str, Winner] = {}
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            return winners
+        inherited = {parent: winners[parent] for parent in phase.inherits}
+        _reap_skipped_phase(experiment, phase)
+        winners[phase.name] = _load_winner(experiment, phase, inherited)
+
+    raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
 
 
 def _prepare_generation(
