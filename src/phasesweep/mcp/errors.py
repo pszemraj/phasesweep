@@ -143,9 +143,10 @@ class RunResultSnapshotUnavailableError(McpToolError):
         state = f" (finalization state: {finalization_state})" if finalization_state else ""
         super().__init__(
             f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
-            "retry once after a short delay in case finalization is still in progress. "
-            "If the error persists, the operator can repair it with phasesweep "
-            "mcp recover-run; do not substitute experiment-level results."
+            "retry once after a short delay only if finalization is still pending. "
+            "If the error persists, report it to the operator; a missing historical "
+            "snapshot cannot be rebuilt from mutable shared results; do not substitute "
+            "experiment-level results."
         )
 
 

@@ -31,7 +31,7 @@ from phasesweep.mcp.install.targets import AGENT_IDS
 from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.mcp.snapshots import capture_result_snapshot, parse_result_snapshot
+from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
@@ -239,7 +239,7 @@ def mcp() -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Operator-only recovery for MCP cleanup uncertainty or failed terminal-result "
-        "finalization. --confirm performs the reported cleanup and snapshot repair actions."
+        "finalization. --confirm performs the reported cleanup and stored-snapshot actions."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -253,10 +253,10 @@ def mcp() -> None:
 @click.option(
     "--confirm",
     is_flag=True,
-    help="Perform the reported cleanup and terminal-result repair actions.",
+    help="Perform the reported cleanup and stored terminal-result actions.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover one MCP run's cleanup uncertainty or terminal result snapshot.
+    """Recover cleanup uncertainty or finalize an already-captured result snapshot.
 
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
@@ -294,10 +294,23 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     runner_without_status = handle.launch_state == "spawned" and terminal_status is None
     launch_without_status = handle.launch_state == "launching" and terminal_status is None
     cleanup_recovery_needed = cleanup_recovery_required or runner_without_status
-    snapshot_repair_needed = (
-        terminal_status is not None and parse_result_snapshot(terminal_status) is None
-    ) or launch_without_status
-    if not cleanup_recovery_needed and not snapshot_repair_needed:
+    stored_snapshot = (
+        parse_result_snapshot(terminal_status) if terminal_status is not None else None
+    )
+    snapshot_unavailable = (
+        (terminal_status is not None and stored_snapshot is None)
+        or launch_without_status
+        or runner_without_status
+    )
+    snapshot_finalize_needed = stored_snapshot is not None and (
+        terminal_cleanup_uncertain or cleanup_already_recovered
+    )
+    if not cleanup_recovery_needed and snapshot_unavailable and not launch_without_status:
+        raise click.ClickException(
+            "this run has no immutable terminal result snapshot. Historical results cannot "
+            "be rebuilt from the current shared study because later runs may have changed it."
+        )
+    if not cleanup_recovery_needed and not snapshot_finalize_needed and not snapshot_unavailable:
         click.echo("No cleanup uncertainty or terminal result repair is needed for this run.")
         return
 
@@ -378,8 +391,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
                 "cleanup-uncertain terminal trial(s)"
             )
-        if snapshot_repair_needed or terminal_cleanup_uncertain or terminal_status is None:
-            actions.append("rebuild the terminal result snapshot")
+        if snapshot_finalize_needed:
+            actions.append("finalize the stored terminal snapshot with cleanup evidence")
+        elif snapshot_unavailable:
+            actions.append("record that the historical terminal snapshot is unavailable")
         click.echo(
             f"Recovery preflight for {run_id}: would {' and '.join(actions)}. "
             "Re-run with --confirm to perform those actions."
@@ -393,7 +408,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             "error_class": "RunnerExitedWithoutStatus",
             "cleanup_confirmed": True,
             "ended_at": utc_now_iso(),
-            "result_snapshot_state": "pending",
+            "result_snapshot_state": "failed",
+            "result_snapshot_error": "HistoricalSnapshotUnavailable",
         }
         write_status_file(store.status_path(run_id), terminal_status)
 
@@ -416,13 +432,11 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
         )
 
-    refresh_snapshot = snapshot_repair_needed or terminal_cleanup_uncertain or runner_without_status
-    if refresh_snapshot:
-        _repair_terminal_result_snapshot(
+    if snapshot_finalize_needed:
+        _finalize_stored_terminal_result_snapshot(
             store,
             run_id,
             terminal_status,
-            config,
             cleanup_confirmed=(
                 cleanup_recovery_needed
                 or cleanup_already_recovered
@@ -430,46 +444,54 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             ),
         )
 
-    if refresh_snapshot:
-        click.echo(f"Rebuilt terminal result snapshot for {run_id}.")
+        click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
+    elif snapshot_unavailable:
+        click.echo(
+            f"Historical terminal result snapshot for {run_id} is unavailable and was not "
+            "rebuilt from mutable shared state."
+        )
 
 
-def _repair_terminal_result_snapshot(
+def _finalize_stored_terminal_result_snapshot(
     store: RunStore,
     run_id: str,
     terminal_status: dict,
-    config: Experiment,
     *,
     cleanup_confirmed: bool,
 ) -> None:
-    """Rebuild and atomically persist one terminal run's immutable results.
+    """Finalize and persist a snapshot captured before the experiment lock was released.
 
     :param RunStore store: Existing run store containing the terminal status.
-    :param str run_id: Run whose terminal snapshot should be rebuilt.
+    :param str run_id: Run whose stored terminal snapshot should be finalized.
     :param dict terminal_status: Validated terminal process status to enrich.
-    :param Experiment config: Hash-verified per-run experiment config.
     :param bool cleanup_confirmed: Whether RUNNING trials are terminal in reality.
-    :raises click.ClickException: If capture or persistence fails.
+    :raises click.ClickException: If the stored snapshot is unavailable or persistence fails.
     """
-    terminal_status.pop("result_snapshot", None)
+    snapshot = parse_result_snapshot(terminal_status)
+    if snapshot is None:
+        raise click.ClickException(
+            f"run {run_id} has no immutable snapshot to finalize; refusing to read current "
+            "shared state as historical evidence"
+        )
+    raw_snapshot = snapshot.model_dump(mode="json")
     terminal_status.pop("result_snapshot_error", None)
     terminal_status["result_snapshot_state"] = "pending"
     try:
         write_status_file(store.status_path(run_id), terminal_status)
-        terminal_status["result_snapshot"] = capture_result_snapshot(
-            config,
+        terminal_status["result_snapshot"] = finalize_result_snapshot(
+            raw_snapshot,
             cleanup_confirmed=cleanup_confirmed,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
     except Exception as exc:  # noqa: BLE001 - convert operator repair failures to CLI errors
-        terminal_status.pop("result_snapshot", None)
-        terminal_status["result_snapshot_state"] = "failed"
+        terminal_status["result_snapshot"] = raw_snapshot
+        terminal_status["result_snapshot_state"] = "pending"
         terminal_status["result_snapshot_error"] = type(exc).__name__
         with contextlib.suppress(Exception):
             write_status_file(store.status_path(run_id), terminal_status)
         raise click.ClickException(
-            f"failed to rebuild terminal result snapshot for {run_id}: {type(exc).__name__}"
+            f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None
 
 

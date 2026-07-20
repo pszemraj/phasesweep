@@ -14,13 +14,13 @@ import hashlib
 import logging
 import os
 import sys
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+from phasesweep.config import Experiment, load_config
+from phasesweep.engine import run_experiment
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -28,29 +28,23 @@ from phasesweep.runtime.process import (
     read_proc_starttime,
 )
 
-if TYPE_CHECKING:
-    from phasesweep.config import Experiment
-
-_SNAPSHOT_RETRY_DELAYS_SECONDS = (0.25, 1.0)
-
 
 def _write_status(
     status_path: Path,
     payload: dict,
     *,
-    config_path: Path,
-    config_sha256: str,
+    result_snapshot: dict | None,
+    result_snapshot_error: str | None,
 ) -> None:
-    """Persist terminal evidence, then best-effort enrich it with a result snapshot.
+    """Persist terminal evidence and its already-captured result snapshot.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
-    :param Path config_path: Exact per-run config snapshot that was executed.
-    :param str config_sha256: Expected hash for the per-run config snapshot.
+    :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
+    :param str | None result_snapshot_error: Capture error class when no snapshot exists.
     """
-    # Persist cleanup evidence before reading storage. Snapshot capture can be
-    # slow on a large or contended study, and the cancelling server may exhaust
-    # its grace period and force-kill this runner while that read is in flight.
+    # Persist cleanup evidence before serializing the in-memory snapshot. The
+    # status remains pending until the immutable data has reached disk.
     terminal = {
         **payload,
         "ended_at": utc_now_iso(),
@@ -63,22 +57,17 @@ def _write_status(
         return
 
     try:
-        from phasesweep.config import Experiment, load_config
-
-        if _sha256_file(config_path) != config_sha256:
-            raise RuntimeError("config snapshot hash mismatch during result finalization")
-        config = load_config(config_path)
-        if not isinstance(config, Experiment):
-            raise RuntimeError("config snapshot is not an experiment during result finalization")
-        terminal["result_snapshot"] = _capture_result_snapshot_with_retry(
-            config,
+        if result_snapshot is None:
+            raise RuntimeError(result_snapshot_error or "terminal snapshot was not captured")
+        terminal["result_snapshot"] = finalize_result_snapshot(
+            result_snapshot,
             cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
         )
     except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
         terminal["result_snapshot_state"] = "failed"
-        terminal["result_snapshot_error"] = type(exc).__name__
+        terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
         logging.getLogger("phasesweep.mcp.runner").exception(
-            "failed to capture terminal result snapshot"
+            "failed to finalize terminal result snapshot"
         )
     else:
         terminal["result_snapshot_state"] = "complete"
@@ -98,37 +87,6 @@ def _write_status(
             logging.getLogger("phasesweep.mcp.runner").exception(
                 "failed to persist result snapshot finalization failure"
             )
-
-
-def _capture_result_snapshot_with_retry(
-    config: Experiment,
-    *,
-    cleanup_confirmed: bool,
-) -> dict:
-    """Capture a terminal result snapshot with bounded retries.
-
-    :param Experiment config: Parsed experiment passed to :func:`capture_result_snapshot`.
-    :param bool cleanup_confirmed: Whether trainer process cleanup was confirmed.
-    :return dict: Captured path-free result snapshot.
-    :raises Exception: The final capture error after all attempts fail.
-    """
-    for delay in _SNAPSHOT_RETRY_DELAYS_SECONDS:
-        try:
-            return capture_result_snapshot(
-                config,
-                cleanup_confirmed=cleanup_confirmed,
-            )
-        except Exception:  # noqa: BLE001 - retry transient storage/serialization failures
-            logging.getLogger("phasesweep.mcp.runner").warning(
-                "terminal result snapshot capture failed; retrying in %.2fs",
-                delay,
-                exc_info=True,
-            )
-            time.sleep(delay)
-    return capture_result_snapshot(
-        config,
-        cleanup_confirmed=cleanup_confirmed,
-    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -223,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         "error_class": None,
         "cleanup_confirmed": True,
     }
+    result_snapshot: dict | None = None
+    result_snapshot_error: str | None = None
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -235,15 +195,34 @@ def main(argv: list[str] | None = None) -> int:
             started_at=args.started_at,
             allow_cancel=args.allow_cancel,
         )
-        from phasesweep.config import load_config
-        from phasesweep.engine import run_config
-
         actual_sha256 = _sha256_file(args.config)
         if actual_sha256 != args.config_sha256:
             raise RuntimeError("config snapshot hash mismatch; refusing to run")
         config = load_config(args.config)
-        # run_config installs signal handlers and takes the flock internally.
-        run_config(config, from_phase=args.from_phase, dry_run=False)
+        if not isinstance(config, Experiment):
+            raise RuntimeError("MCP runner config snapshot is not a single experiment")
+
+        def capture_terminal(generation_id: str, _error: BaseException | None) -> None:
+            """Capture immutable results while ``run_experiment`` still owns its lock."""
+            nonlocal result_snapshot, result_snapshot_error
+            try:
+                result_snapshot = capture_result_snapshot(
+                    config,
+                    cleanup_confirmed=False,
+                    generation_id=generation_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
+                result_snapshot_error = type(exc).__name__
+                logging.getLogger("phasesweep.mcp.runner").exception(
+                    "failed to capture terminal result snapshot under the experiment lock"
+                )
+
+        run_experiment(
+            config,
+            from_phase=args.from_phase,
+            dry_run=False,
+            terminal_callback=capture_terminal,
+        )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         status["returncode"] = code
@@ -272,8 +251,8 @@ def main(argv: list[str] | None = None) -> int:
         _write_status(
             args.status_path,
             status,
-            config_path=args.config,
-            config_sha256=args.config_sha256,
+            result_snapshot=result_snapshot,
+            result_snapshot_error=result_snapshot_error,
         )
     return 0
 

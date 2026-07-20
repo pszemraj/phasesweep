@@ -21,6 +21,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     TRIAL_DIR_ATTR,
+    _generation_path,
     _trial_dir_for,
     _winner_path,
 )
@@ -37,7 +38,7 @@ from phasesweep.mcp.server import (
     PhaseSweepMCP,
     _safe_tool,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.runtime.process import read_proc_starttime
 from tests.mcp_helpers import (
     make_mcp_app,
@@ -324,10 +325,20 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     calls: list[tuple[str, str | None, bool]] = []
 
-    def fake_run_config(config_obj: Experiment, *, from_phase: str | None, dry_run: bool) -> None:
+    def fake_run_experiment(
+        config_obj: Experiment,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback,
+    ) -> None:
         calls.append((config_obj.experiment, from_phase, dry_run))
+        generation_path = _generation_path(config_obj)
+        generation_path.parent.mkdir(parents=True, exist_ok=True)
+        generation_path.write_text("generation_id: generation-test\n")
+        terminal_callback("generation-test", None)
 
-    monkeypatch.setattr("phasesweep.engine.run_config", fake_run_config)
+    monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", fake_run_experiment)
 
     assert (
         runner_main(
@@ -854,8 +865,6 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import phasesweep.engine as engine_module
-
     config = _config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r1"
@@ -864,7 +873,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     def raise_cleanup_uncertain(*args: object, **kwargs: object) -> None:
         raise UnsafeProcessCleanupError("trial cleanup uncertain")
 
-    monkeypatch.setattr(engine_module, "run_config", raise_cleanup_uncertain)
+    monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", raise_cleanup_uncertain)
 
     with pytest.raises(UnsafeProcessCleanupError, match="trial cleanup uncertain"):
         runner_main(
@@ -1210,7 +1219,10 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     terminal_status = json.loads(store.status_path(run_id).read_text())
     assert terminal_status["error_class"] == "RunnerExitedWithoutStatus"
     assert terminal_status["cleanup_confirmed"] is True
-    assert terminal_status["result_snapshot"]["status"]["phases"][0]["running"] == 0
+    assert terminal_status["result_snapshot_state"] == "failed"
+    assert terminal_status["result_snapshot_error"] == "HistoricalSnapshotUnavailable"
+    with pytest.raises(Exception, match="finalization state: failed"):
+        app.status(run_id=run_id)
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
@@ -1254,15 +1266,18 @@ def test_operator_recovery_finalizes_launching_handle_without_cleanup(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Rebuilt terminal result snapshot" in result.output
+    assert "Historical terminal result snapshot" in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["error_class"] == "RunnerExitedWithoutStatus"
     assert terminal["cleanup_confirmed"] is True
-    assert terminal["result_snapshot_state"] == "complete"
+    assert terminal["result_snapshot_state"] == "failed"
+    assert terminal["result_snapshot_error"] == "HistoricalSnapshotUnavailable"
     assert store.state(handle) == "failed"
-    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
-    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    with pytest.raises(Exception, match="finalization state: failed"):
+        app.status(run_id=run_id)
+    with pytest.raises(Exception, match="finalization state: failed"):
+        app.winners(run_id=run_id)
 
 
 def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Path) -> None:
@@ -1278,7 +1293,7 @@ def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Pa
     assert not missing.exists()
 
 
-def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Path) -> None:
+def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1310,8 +1325,8 @@ def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Pa
         cli_main,
         ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
-    assert preflight.exit_code == 0, preflight.output
-    assert "would rebuild the terminal result snapshot" in preflight.output
+    assert preflight.exit_code != 0
+    assert "cannot be rebuilt from the current shared study" in preflight.output
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "failed"
 
     confirmed = runner.invoke(
@@ -1326,13 +1341,11 @@ def test_operator_recovery_rebuilds_failed_terminal_result_snapshot(tmp_path: Pa
             "--confirm",
         ],
     )
-    assert confirmed.exit_code == 0, confirmed.output
-    assert "Rebuilt terminal result snapshot" in confirmed.output
+    assert confirmed.exit_code != 0
+    assert "cannot be rebuilt from the current shared study" in confirmed.output
     terminal = json.loads(store.status_path(run_id).read_text())
-    assert terminal["result_snapshot_state"] == "complete"
-    assert "result_snapshot_error" not in terminal
-    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
-    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    assert terminal["result_snapshot_state"] == "failed"
+    assert terminal["result_snapshot_error"] == "RuntimeError"
 
 
 def test_operator_recovery_clears_terminal_cleanup_uncertainty(
@@ -1461,12 +1474,16 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     )
     store.save(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
     write_run_status(
         store,
         run_id,
         returncode=1,
         error_class="UnsafeProcessCleanupError",
         cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, cleanup_confirmed=False),
     )
 
     runner_cleanup_calls = 0
@@ -1484,15 +1501,15 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
 
     snapshot_cleanup_flags: list[bool] = []
 
-    def flaky_snapshot(experiment: Experiment, *, cleanup_confirmed: bool) -> dict:
+    def flaky_snapshot(snapshot: dict, *, cleanup_confirmed: bool) -> dict:
         snapshot_cleanup_flags.append(cleanup_confirmed)
         if len(snapshot_cleanup_flags) == 1:
-            raise RuntimeError("snapshot capture failed")
-        return capture_result_snapshot(experiment, cleanup_confirmed=cleanup_confirmed)
+            raise RuntimeError("snapshot finalization failed")
+        return finalize_result_snapshot(snapshot, cleanup_confirmed=cleanup_confirmed)
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
-    monkeypatch.setattr("phasesweep.cli.capture_result_snapshot", flaky_snapshot)
+    monkeypatch.setattr("phasesweep.cli.finalize_result_snapshot", flaky_snapshot)
 
     command = [
         "mcp",
@@ -1507,7 +1524,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     first = runner.invoke(cli_main, command)
 
     assert first.exit_code != 0
-    assert "failed to rebuild terminal result snapshot" in first.output
+    assert "failed to finalize terminal result snapshot" in first.output
     assert store.cleanup_recovery_path(run_id).is_file()
     assert not store.recovery_required(handle)
     assert runner_cleanup_calls == 1
@@ -1516,7 +1533,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     retry = runner.invoke(cli_main, command)
 
     assert retry.exit_code == 0, retry.output
-    assert "Rebuilt terminal result snapshot" in retry.output
+    assert "Finalized stored terminal result snapshot" in retry.output
     assert runner_cleanup_calls == 1
     assert trial_cleanup_calls == 1
     assert snapshot_cleanup_flags == [True, True]

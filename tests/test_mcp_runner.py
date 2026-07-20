@@ -17,13 +17,14 @@ from pathlib import Path
 import pytest
 
 from phasesweep.config import Experiment, load_config
-from phasesweep.engine import read_status
-from phasesweep.engine.state import _trial_dir_for
+from phasesweep.engine import read_status, run_experiment
+from phasesweep.engine.guards import _experiment_lock
+from phasesweep.engine.state import _generation_path, _trial_dir_for
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import _process_group_alive
-from tests.conftest import REPO
+from tests.conftest import REPO, make_experiment, write_constant_trainer
 from tests.mcp_helpers import slow_mcp_config_text
 
 pytestmark = pytest.mark.skipif(
@@ -55,29 +56,25 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
             )
         status = read_status(experiment)
         if status["phases"][0]["running"] >= 1:
-            trial_dir = _trial_dir_for(experiment, "p", 0)
-            if (trial_dir / "pid").is_file() and (trial_dir / "pgid").is_file():
-                return trial_dir
+            phase_dir = _trial_dir_for(experiment, "p", 0).parent
+            for trial_dir in phase_dir.glob("trial_00000__*"):
+                if (trial_dir / "pid").is_file() and (trial_dir / "pgid").is_file():
+                    return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
 
 
-def test_runner_persists_terminal_evidence_before_snapshot_capture(
+def test_runner_persists_terminal_evidence_before_snapshot_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
     observed: dict[str, object] = {}
-    attempts = 0
 
-    def fail_snapshot(*_args: object, **_kwargs: object) -> dict[str, object]:
-        nonlocal attempts
-        attempts += 1
+    def fail_finalization(*_args: object, **_kwargs: object) -> dict[str, object]:
         observed.update(json.loads(status_path.read_text()))
-        raise RuntimeError("snapshot read stalled")
+        raise RuntimeError("snapshot serialization failed")
 
-    monkeypatch.setattr(mcp_runner, "capture_result_snapshot", fail_snapshot)
-    monkeypatch.setattr(mcp_runner.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", fail_finalization)
     mcp_runner._write_status(
         status_path,
         {
@@ -86,8 +83,8 @@ def test_runner_persists_terminal_evidence_before_snapshot_capture(
             "error_class": "cancelled",
             "cleanup_confirmed": True,
         },
-        config_path=config,
-        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+        result_snapshot={},
+        result_snapshot_error=None,
     )
 
     assert observed["error_class"] == "cancelled"
@@ -98,31 +95,14 @@ def test_runner_persists_terminal_evidence_before_snapshot_capture(
     assert final["result_snapshot_state"] == "failed"
     assert final["result_snapshot_error"] == "RuntimeError"
     assert "result_snapshot" not in final
-    assert attempts == 3
 
 
-def test_runner_retries_terminal_snapshot_capture_to_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
-    real_capture = mcp_runner.capture_result_snapshot
-    attempts = 0
-    delays: list[float] = []
-
-    def transient_snapshot(
-        experiment: Experiment,
-        *,
-        cleanup_confirmed: bool,
-    ) -> dict[str, object]:
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise RuntimeError("storage temporarily busy")
-        return real_capture(experiment, cleanup_confirmed=cleanup_confirmed)
-
-    monkeypatch.setattr(mcp_runner, "capture_result_snapshot", transient_snapshot)
-    monkeypatch.setattr(mcp_runner.time, "sleep", delays.append)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    snapshot = mcp_runner.capture_result_snapshot(experiment, cleanup_confirmed=False)
 
     mcp_runner._write_status(
         status_path,
@@ -132,25 +112,79 @@ def test_runner_retries_terminal_snapshot_capture_to_completion(
             "error_class": None,
             "cleanup_confirmed": True,
         },
-        config_path=config,
-        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+        result_snapshot=snapshot,
+        result_snapshot_error=None,
     )
 
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "complete"
     assert final["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
-    assert attempts == 3
-    assert delays == list(mcp_runner._SNAPSHOT_RETRY_DELAYS_SECONDS)
+
+
+def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: Path) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    captured: dict[str, object] = {}
+
+    def capture_locked(generation_id: str, error: BaseException | None) -> None:
+        assert error is None
+        with (
+            pytest.raises(RuntimeError, match="Another phasesweep process"),
+            _experiment_lock(experiment),
+        ):
+            pass
+        captured.update(
+            mcp_runner.capture_result_snapshot(
+                experiment,
+                cleanup_confirmed=False,
+                generation_id=generation_id,
+            )
+        )
+
+    run_experiment(experiment, terminal_callback=capture_locked)
+
+    top_up = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    run_experiment(top_up)
+
+    captured_phase = captured["status"]["phases"][0]  # type: ignore[index]
+    assert captured_phase["n_trials"] == 1
+    assert captured_phase["completed"] == 1
+    current_phase = mcp_runner.capture_result_snapshot(
+        top_up,
+        cleanup_confirmed=True,
+    )["status"]["phases"][0]
+    assert current_phase["n_trials"] == 2
+    assert current_phase["completed"] == 2
+
+
+def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    generation_path = _generation_path(experiment)
+    generation_path.parent.mkdir(parents=True)
+    generation_path.write_text("generation_id: prior-generation\n")
+
+    with pytest.raises(RuntimeError, match="generation marker does not match"):
+        mcp_runner.capture_result_snapshot(
+            experiment,
+            cleanup_confirmed=False,
+            generation_id="failed-new-generation",
+        )
 
 
 def test_runner_records_snapshot_serialization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
     monkeypatch.setattr(
         mcp_runner,
-        "capture_result_snapshot",
+        "finalize_result_snapshot",
         lambda *_args, **_kwargs: {"not_json": object()},
     )
 
@@ -162,8 +196,8 @@ def test_runner_records_snapshot_serialization_failure(
             "error_class": None,
             "cleanup_confirmed": True,
         },
-        config_path=config,
-        config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+        result_snapshot={},
+        result_snapshot_error=None,
     )
 
     final = json.loads(status_path.read_text())

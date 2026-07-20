@@ -21,7 +21,7 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.engine.optuna import _phase_trial_counts, _phase_trial_stats
-from phasesweep.engine.state import _summary_path, _winner_path
+from phasesweep.engine.state import _generation_path, _summary_path, _winner_path
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,8 @@ class PhaseWinnerView:
     effective_overrides: dict[str, Any]
     gates_passed: bool | None  # None when the phase declared no gates
     incomplete: bool  # True when a wallclock timeout produced a partial winner
+    generation_id: str | None = None
+    attempt_id: str | None = None
 
 
 def _phase_status_payloads(
@@ -147,6 +149,16 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
             effective_overrides=dict(effective_overrides),
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
             incomplete=bool(completion.get("incomplete", False)),
+            generation_id=(
+                str(data["generation_id"])
+                if isinstance(data.get("generation_id"), str) and data["generation_id"]
+                else None
+            ),
+            attempt_id=(
+                str(data["attempt_id"])
+                if isinstance(data.get("attempt_id"), str) and data["attempt_id"]
+                else None
+            ),
         )
     except (KeyError, ValueError, TypeError, OSError, yaml.YAMLError):
         # Partially-written or malformed file (or unlinked between the is_file
@@ -191,8 +203,18 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
 
     """
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
+    generation_id: str | None = None
+    try:
+        generation = yaml.safe_load(_generation_path(experiment).read_text())
+        if isinstance(generation, Mapping):
+            raw_generation_id = generation.get("generation_id")
+            if isinstance(raw_generation_id, str) and raw_generation_id:
+                generation_id = raw_generation_id
+    except (OSError, yaml.YAMLError):
+        pass
     return {
         "experiment": experiment.experiment,
+        "generation_id": generation_id,
         "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
         "phases": _phase_status_payloads(
             experiment,
