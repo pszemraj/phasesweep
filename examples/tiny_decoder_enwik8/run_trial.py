@@ -160,7 +160,6 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _write_result(
     trial_dir: Path,
-    overrides: Mapping[str, Any],
     overrides_sha256: str,
     metric_record: Mapping[str, Any],
 ) -> None:
@@ -202,11 +201,9 @@ def _write_result(
             "split": "validation",
             "value": float(val_loss),
         },
-        "overrides": dict(overrides),
         "overrides_sha256": overrides_sha256,
         "schema_version": 1,
         "status": "complete",
-        "val_loss": float(val_loss),
     }
     _atomic_write_json(trial_dir / "result.json", result)
 
@@ -264,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _run_template(template_root, generated_config)
     metric_record = _evaluate_final_checkpoint(template_root, trainer_run_dir)
-    _write_result(trial_dir, overrides, overrides_sha256, metric_record)
+    _write_result(trial_dir, overrides_sha256, metric_record)
     return 0
 
 

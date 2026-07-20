@@ -37,7 +37,7 @@ def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 def copy_fake_train(tmp_path: Path) -> Path:
     trainer = tmp_path / "examples" / "fake_train.py"
     trainer.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", trainer)
+    shutil.copy(REPO / "src" / "phasesweep" / "examples" / "fake_train.py", trainer)
     return trainer
 
 

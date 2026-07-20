@@ -7,7 +7,7 @@
 experiment: tiny_lm_16mb
 storage: sqlite:///./runs/phases.db
 workdir: ./runs
-trial_command: "python examples/fake_train.py --out {trial_dir}/result.json {overrides}"
+trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
 override_format: argparse
 
 metric:

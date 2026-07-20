@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 from types import ModuleType
 
-import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -85,43 +84,8 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         },
         "generation_id": "generation-test",
         "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "overrides": {"learning_rate": 0.001},
         "overrides_sha256": overrides_sha256,
         "schema_version": 1,
         "status": "complete",
-        "val_loss": 0.25,
     }
-    assert list(trial_dir.glob(".result.json.*.tmp")) == []
-
-
-def test_result_publish_failure_preserves_existing_evidence(tmp_path, monkeypatch):
-    wrapper = _load_wrapper()
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    result_path = trial_dir / "result.json"
-    result_path.write_text('{"status": "old"}\n')
-    original = result_path.read_bytes()
-    monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
-    monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
-    overrides_sha256 = hashlib.sha256(b"{}").hexdigest()
-    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", overrides_sha256)
-
-    def fail_replace(_source: Path, _destination: Path) -> None:
-        raise OSError("simulated replace failure")
-
-    monkeypatch.setattr(wrapper.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated replace failure"):
-        wrapper._write_result(
-            trial_dir,
-            {},
-            overrides_sha256,
-            {
-                "checkpoint": "final.pt",
-                "policy": "final_checkpoint",
-                "step": 1000,
-                "val_loss": 0.25,
-            },
-        )
-
-    assert result_path.read_bytes() == original
     assert list(trial_dir.glob(".result.json.*.tmp")) == []

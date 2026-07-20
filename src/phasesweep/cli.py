@@ -878,7 +878,7 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
     help=(
         "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "
         "entries and marker-fenced TOML or instruction blocks, per selected agent. Unmanaged "
-        "same-name entries stay untouched. Files are deleted when removal leaves them empty."
+        "same-name entries stay untouched."
     ),
     short_help="Disconnect coding agents.",
 )
