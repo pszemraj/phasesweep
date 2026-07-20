@@ -23,6 +23,7 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import run_experiment
+from phasesweep.engine.state import Winner
 from phasesweep.evidence.evaluation import evaluate_gates
 from tests.conftest import make_experiment, make_trial_context, write_trainer, write_yaml
 
@@ -299,6 +300,61 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
 
     assert "ablation_a" in winners
     assert not (tmp_path / "runs").exists()
+
+
+def test_failed_suite_rerun_clears_previous_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = write_yaml(
+        tmp_path,
+        f"""
+        suite: stale_suite
+        defaults:
+          workdir: {tmp_path}/runs
+          trial_command: "echo {{overrides}}"
+          metric:
+            name: x
+            goal: minimize
+            extractor: {{ type: json, path: r.json, key: x }}
+        studies:
+          - name: one
+            phases:
+              - name: eval
+                n_trials: 1
+                search_space: {{}}
+        """,
+    )
+    config = load_config(config_path)
+    assert isinstance(config, Suite)
+    winner = Winner(
+        trial_number=0,
+        params={},
+        effective_overrides={},
+        metric=1.0,
+        completion={"incomplete": False},
+        phase_fingerprint="fingerprint",
+        generation_id="generation-one",
+        attempt_id="attempt-one",
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.run.run_experiment",
+        lambda *_args, **_kwargs: {"eval": winner},
+    )
+
+    run_config(config)
+    summary_path = tmp_path / "runs" / "stale_suite" / "suite_summary.yaml"
+    assert summary_path.is_file()
+
+    def fail_rerun(*_args: object, **_kwargs: object) -> dict[str, Winner]:
+        raise RuntimeError("later suite invocation failed")
+
+    monkeypatch.setattr("phasesweep.engine.run.run_experiment", fail_rerun)
+
+    with pytest.raises(RuntimeError, match="later suite invocation failed"):
+        run_config(config)
+
+    assert not summary_path.exists()
 
 
 def test_contract_keys_cannot_be_resampled() -> None:
