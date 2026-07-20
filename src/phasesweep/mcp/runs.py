@@ -26,7 +26,7 @@ from phasesweep.runtime.files import (
     try_lock_file,
     unlock_file,
 )
-from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
+from phasesweep.runtime.process import is_same_live_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
@@ -348,7 +348,7 @@ class RunStore:
         # SIGTERM before the engine installed its handlers) still answers
         # kill(pid, 0), so filter it out of the genuinely-live path and enter
         # cleanup-uncertain recovery below.
-        if is_same_process(handle.pid, handle.pid_starttime) and not is_pid_zombie(handle.pid):
+        if is_same_live_process(handle.pid, handle.pid_starttime):
             return "running"
         if self._cleanup_recovered(handle):
             return "failed"
@@ -531,8 +531,7 @@ class RunStore:
             handle.launch_state == "spawned"
             and handle.pid is not None
             and handle.pid_starttime is not None
-            and is_same_process(handle.pid, handle.pid_starttime)
-            and not is_pid_zombie(handle.pid)
+            and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 
     def _read_status(self, handle: RunHandle) -> dict | None:

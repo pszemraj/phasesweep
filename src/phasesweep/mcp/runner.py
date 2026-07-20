@@ -10,15 +10,14 @@ from the frozen registry; it is never agent input.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import os
 import sys
 from pathlib import Path
 
-from phasesweep.config import Experiment, load_config
 from phasesweep.engine import run_experiment
 from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
@@ -90,15 +89,6 @@ def _write_status(
                 logging.getLogger("phasesweep.mcp.runner").exception(
                     "failed to persist result snapshot finalization failure"
                 )
-
-
-def _sha256_file(path: Path) -> str:
-    """Hash a file with SHA-256.
-
-    :param Path path: File to hash.
-    :return str: Hex-encoded SHA-256 digest.
-    """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _persist_spawned_handle(
@@ -198,12 +188,14 @@ def main(argv: list[str] | None = None) -> int:
             started_at=args.started_at,
             allow_cancel=args.allow_cancel,
         )
-        actual_sha256 = _sha256_file(args.config)
-        if actual_sha256 != args.config_sha256:
-            raise RuntimeError("config snapshot hash mismatch; refusing to run")
-        config = load_config(args.config)
-        if not isinstance(config, Experiment):
-            raise RuntimeError("MCP runner config snapshot is not a single experiment")
+        try:
+            config = load_experiment_snapshot(
+                args.config,
+                args.config_sha256,
+                source=f"run snapshot {args.run_id}",
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
 
         def capture_terminal(generation_id: str, _error: BaseException | None) -> None:
             """Capture immutable results while ``run_experiment`` still owns its lock.
@@ -241,14 +233,6 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = 1
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = False
-        raise
-    except SystemExit as exc:
-        # The engine shutdown handler raises SystemExit(128+signum) on
-        # SIGTERM/SIGINT - this is the cancel path.
-        code = exc.code if isinstance(exc.code, int) else 1
-        status["returncode"] = code
-        status["error_class"] = "cancelled" if code in (143, 130) else "exited"
-        status["cleanup_confirmed"] = code not in (143, 130)
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1

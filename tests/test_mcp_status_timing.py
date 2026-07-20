@@ -19,7 +19,6 @@ from phasesweep.mcp.server import (
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     AWAIT_RECHECK_SECONDS,
-    PhaseSweepMCP,
     _run_elapsed_seconds,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -231,7 +230,7 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
     return app, registry, store
 
 
-def _fake_clock(monkeypatch: pytest.MonkeyPatch, app: PhaseSweepMCP) -> dict[str, float]:
+def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
     """Replace await_run's deadline clock and recheck sleep with a manual clock."""
     clock = {"now": 0.0, "sleeps": 0.0}
 
@@ -240,7 +239,7 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch, app: PhaseSweepMCP) -> dict[str
         clock["sleeps"] += seconds
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    app._sleep = advance
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
     return clock
 
 
@@ -260,7 +259,7 @@ def test_await_run_returns_immediately_on_terminal(
             cleanup_confirmed=True,
         ),
     )
-    clock = _fake_clock(monkeypatch, app)
+    clock = _fake_clock(monkeypatch)
 
     result = asyncio.run(app.await_run("r1"))
     assert result["reason"] == "terminal"
@@ -274,7 +273,7 @@ def test_await_run_times_out_with_unchanged_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch, app)
+    clock = _fake_clock(monkeypatch)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
     assert result["reason"] == "timeout"
@@ -290,7 +289,7 @@ def test_await_run_returns_immediately_when_recovery_is_required(
     handle = store.get("r1")
     assert handle is not None
     store.mark_cleanup_uncertain(handle)
-    clock = _fake_clock(monkeypatch, app)
+    clock = _fake_clock(monkeypatch)
 
     result = asyncio.run(app.await_run("r1"))
 
@@ -303,7 +302,7 @@ def test_await_run_returns_immediately_when_recovery_is_required(
 
 def test_await_run_clamps_timeout_to_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch, app)
+    clock = _fake_clock(monkeypatch)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=1))
 
@@ -313,7 +312,7 @@ def test_await_run_clamps_timeout_to_floor(tmp_path: Path, monkeypatch: pytest.M
 
 def test_await_run_clamps_timeout_to_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch, app)
+    clock = _fake_clock(monkeypatch)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=10_000))
     assert result["reason"] == "timeout"
@@ -334,7 +333,7 @@ def test_await_run_returns_when_phase_gains_winner(
         winner.write_text("{}\n")
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    app._sleep = sleep_then_write_winner
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_write_winner)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
     assert result["reason"] == "phase_completed"
@@ -366,7 +365,7 @@ def test_await_run_returns_when_run_fails_mid_wait(
         )
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    app._sleep = sleep_then_fail
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
 
@@ -428,7 +427,9 @@ def test_await_run_storage_read_does_not_block_event_loop(
     asyncio.run(exercise())
 
 
-def test_await_run_is_cancellable_during_recheck_pause(tmp_path: Path) -> None:
+def test_await_run_is_cancellable_during_recheck_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
 
     async def exercise() -> None:
@@ -438,7 +439,7 @@ def test_await_run_is_cancellable_during_recheck_pause(tmp_path: Path) -> None:
             entered_sleep.set()
             await asyncio.Event().wait()
 
-        app._sleep = wait_forever
+        monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", wait_forever)
         task = asyncio.create_task(app.await_run("r1"))
         await entered_sleep.wait()
         task.cancel()

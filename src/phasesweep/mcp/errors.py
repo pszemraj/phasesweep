@@ -3,8 +3,8 @@
 Two audiences, two trees:
 
 * ``McpToolError`` and subclasses are returned to the (untrusted) agent. Their
-  ``safe_message`` is built only from the experiment id and the kind of failure
-  - never a path, command, env value, or storage URL.
+  messages use only the experiment id and kind of failure - never a path,
+  command, environment value, or storage URL.
 * ``CatalogError`` is raised at startup to the operator who launched the server
   and may reference paths.
 """
@@ -30,15 +30,7 @@ class CatalogError(Exception):
 
 
 class McpToolError(Exception):
-    """Base for agent-facing tool failures. Carries a redacted message."""
-
-    @property
-    def safe_message(self) -> str:
-        """Message safe to return to the agent (no paths/commands/secrets).
-
-        :return str: Redacted message suitable for an MCP tool error.
-        """
-        return str(self)
+    """Base for agent-facing tool failures with redacted messages."""
 
 
 class UnknownExperimentError(McpToolError):

@@ -662,6 +662,16 @@ def is_pid_zombie(pid: int) -> bool:
     return stat is not None and stat.state == "Z"
 
 
+def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
+    """Return whether a PID identifies the same live, non-zombie process.
+
+    :param int | None pid: Process identifier, if one was recorded.
+    :param int | None saved_starttime: Recorded Linux process start time.
+    :return bool: Whether the identity still names a live non-zombie process.
+    """
+    return pid is not None and is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
+
+
 def reap_child(pid: int) -> bool:
     """Best-effort non-blocking reap of one exited child.
 

@@ -18,21 +18,21 @@ import logging
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
+from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import (
     CatalogError,
     ConcurrencyLimitError,
@@ -524,8 +524,6 @@ class PhaseSweepMCP:
         self._registry = registry
         self._runs = runs
         self._audit = audit or AuditLogger(registry.state_dir / "audit.jsonl")
-        # await_run's nonblocking recheck pause; tests replace it to make waits instant.
-        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     def _audit_success(
         self,
@@ -573,7 +571,7 @@ class PhaseSweepMCP:
         :param dict[str, Any] | None resolved: Safe server-resolved identifiers known before failure.
         :param dict[str, Any] | None state_before: Safe state summary before the failure.
         """
-        message = exc.safe_message if isinstance(exc, McpToolError) else "internal error"
+        message = str(exc) if isinstance(exc, McpToolError) else "internal error"
         self._audit.record(
             tool=tool,
             args=args,
@@ -784,11 +782,7 @@ class PhaseSweepMCP:
                     experiment_id=None,
                     run_id=run_id,
                 )
-                if run is None:
-                    # Keep this invariant active under ``python -O``: an
-                    # await request must never silently degrade into an
-                    # experiment-level status response without run identity.
-                    raise UnknownRunError(run_id)
+                run = cast(dict[str, Any], run)
                 snapshot = _await_snapshot(
                     run["state"],
                     run["recovery_required"],
@@ -805,7 +799,7 @@ class PhaseSweepMCP:
                 elif time.monotonic() >= deadline:
                     reason = "timeout"
                 else:
-                    await self._sleep(
+                    await asyncio.sleep(
                         min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
                     )
                     continue
@@ -941,22 +935,14 @@ class PhaseSweepMCP:
         """
         snapshot_path = self._runs.config_snapshot_path(handle.run_id)
         try:
-            data = snapshot_path.read_bytes()
-        except OSError as exc:
-            log.info("cannot read config snapshot for run=%s: %s", handle.run_id, exc)
-            raise RunSnapshotUnavailableError(handle.run_id) from None
-        if hashlib.sha256(data).hexdigest() != handle.config_sha256:
-            log.info("config snapshot hash mismatch for run=%s", handle.run_id)
-            raise RunSnapshotUnavailableError(handle.run_id)
-        try:
-            config = load_config_bytes(data, source=f"run snapshot {handle.run_id}")
-        except (ValueError, yaml.YAMLError) as exc:
+            return load_experiment_snapshot(
+                snapshot_path,
+                handle.config_sha256,
+                source=f"run snapshot {handle.run_id}",
+            )
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)
             raise RunSnapshotUnavailableError(handle.run_id) from None
-        if not isinstance(config, Experiment):
-            log.info("config snapshot for run=%s is not a single experiment", handle.run_id)
-            raise RunSnapshotUnavailableError(handle.run_id)
-        return config
 
     def winners(
         self, experiment_id: str | None = None, *, run_id: str | None = None
@@ -1177,52 +1163,38 @@ class PhaseSweepMCP:
                 # returning would let the launch continue immediately after a
                 # misleading cancellation response from a second server.
                 raise RunLaunchUnsettledError(run_id)
+            after: RunState
             if before != "running":
-                result = {
-                    "run_id": run_id,
-                    "state": before,
-                    "cleanup_confirmed": None,
-                    "recovery_required": recovery_required,
-                }
-                self._audit_success(
-                    TOOL_CANCEL_SWEEP,
-                    args,
-                    resolved=resolved,
-                    state_before=state_before,
-                    state_after={
-                        "run_state": before,
-                        "recovery_required": recovery_required,
-                    },
-                    result_counts={"runs": 1},
+                after = before
+                confirmed: bool | None = None
+            else:
+                # Keep the run live before signalling. In the force-kill/no-status
+                # case state() could otherwise briefly derive "failed" while trial
+                # descendants still hold resources.
+                self._runs.mark_cleanup_uncertain(handle)
+                # SIGTERM -> grace -> SIGKILL on the runner's process group. A
+                # runner-written status is useful only when it includes explicit
+                # cleanup evidence from the engine shutdown handler. If the server
+                # had to force-kill the runner first, or the handler reported
+                # uncertainty, child trial PGIDs may still live, so keep the run
+                # counted as live and fail closed.
+                identity = self._runs.cleanup_identity(handle)
+                runner_group_gone = kill_stale_group(
+                    identity.pid,
+                    identity.pid_starttime,
+                    pgid=identity.pgid,
+                    grace_seconds=30.0,
                 )
-                return result
-            # Keep the run live before signalling. In the force-kill/no-status
-            # case state() could otherwise briefly derive "failed" while trial
-            # descendants still hold resources.
-            self._runs.mark_cleanup_uncertain(handle)
-            # SIGTERM -> grace -> SIGKILL on the runner's process group. A
-            # runner-written status is useful only when it includes explicit
-            # cleanup evidence from the engine shutdown handler. If the server
-            # had to force-kill the runner first, or the handler reported
-            # uncertainty, child trial PGIDs may still live, so keep the run
-            # counted as live and fail closed.
-            identity = self._runs.cleanup_identity(handle)
-            runner_group_gone = kill_stale_group(
-                identity.pid,
-                identity.pid_starttime,
-                pgid=identity.pgid,
-                grace_seconds=30.0,
-            )
-            terminal_status = self._runs.recorded_terminal_status(handle)
-            confirmed = (
-                runner_group_gone
-                and terminal_status is not None
-                and terminal_status.get("cleanup_confirmed") is True
-            )
-            if confirmed:
-                self._runs.clear_cleanup_uncertain(handle)
-            after = self._runs.state(handle)
-            recovery_required = self._runs.recovery_required(handle)
+                terminal_status = self._runs.recorded_terminal_status(handle)
+                confirmed = (
+                    runner_group_gone
+                    and terminal_status is not None
+                    and terminal_status.get("cleanup_confirmed") is True
+                )
+                if confirmed:
+                    self._runs.clear_cleanup_uncertain(handle)
+                after = self._runs.state(handle)
+                recovery_required = self._runs.recovery_required(handle)
             result = {
                 "run_id": run_id,
                 "state": after,
@@ -1238,16 +1210,18 @@ class PhaseSweepMCP:
                 state_before=state_before,
             )
             raise
+        state_after = {
+            "run_state": after,
+            "recovery_required": recovery_required,
+        }
+        if confirmed is not None:
+            state_after["cleanup_confirmed"] = confirmed
         self._audit_success(
             TOOL_CANCEL_SWEEP,
             args,
             resolved=resolved,
             state_before=state_before,
-            state_after={
-                "run_state": after,
-                "cleanup_confirmed": confirmed,
-                "recovery_required": recovery_required,
-            },
+            state_after=state_after,
             result_counts={"runs": 1},
         )
         return result
@@ -1504,6 +1478,22 @@ class PhaseSweepMCP:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def _raise_safe_tool_error(tool_name: str, exc: Exception) -> NoReturn:
+    """Translate one implementation exception into an agent-safe tool error.
+
+    :param str tool_name: Tool function used in the generic error message.
+    :param Exception exc: Exception raised by the implementation.
+    :raises ValueError: Always, with either a domain message or generic text.
+    """
+    if isinstance(exc, McpToolError):
+        raise ValueError(str(exc)) from None
+    log.exception("unhandled error in tool %s", tool_name, exc_info=exc)
+    raise ValueError(
+        f"internal server error in {tool_name}; report it to the operator "
+        "and do not retry immediately"
+    ) from None
+
+
 def _safe_tool(fn: F) -> F:
     """Translate exceptions into redacted tool errors.
 
@@ -1529,14 +1519,8 @@ def _safe_tool(fn: F) -> F:
             """
             try:
                 return await fn(*args, **kwargs)
-            except McpToolError as exc:
-                raise ValueError(exc.safe_message) from None
-            except Exception:
-                log.exception("unhandled error in tool %s", fn.__name__)
-                raise ValueError(
-                    f"internal server error in {fn.__name__}; report it to the operator "
-                    "and do not retry immediately"
-                ) from None
+            except Exception as exc:
+                _raise_safe_tool_error(fn.__name__, exc)
 
         return async_wrapper  # type: ignore[return-value]
 
@@ -1550,14 +1534,8 @@ def _safe_tool(fn: F) -> F:
         """
         try:
             return fn(*args, **kwargs)
-        except McpToolError as exc:
-            raise ValueError(exc.safe_message) from None
-        except Exception:
-            log.exception("unhandled error in tool %s", fn.__name__)
-            raise ValueError(
-                f"internal server error in {fn.__name__}; report it to the operator "
-                "and do not retry immediately"
-            ) from None
+        except Exception as exc:
+            _raise_safe_tool_error(fn.__name__, exc)
 
     return sync_wrapper  # type: ignore[return-value]
 
@@ -1873,16 +1851,7 @@ def serve(catalog: Path) -> int:
         RunStore(registry.state_dir),
         audit=AuditLogger(registry.state_dir / "audit.jsonl"),
     )
-    try:
-        build_server(app).run(transport="stdio")
-    except ModuleNotFoundError as exc:
-        if exc.name == "mcp":
-            print(
-                "phasesweep mcp: MCP support is not installed; install with `pip install 'phasesweep[mcp]'`.",
-                file=sys.stderr,
-            )
-            return 2
-        raise
+    build_server(app).run(transport="stdio")
     return 0
 
 

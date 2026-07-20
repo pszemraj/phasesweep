@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import importlib.util
 import json
 import logging
@@ -15,7 +14,6 @@ from pathlib import Path
 import click
 
 from phasesweep.config import Experiment, Suite, load_config
-from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
 from phasesweep.engine.guards import (
     _experiment_lock,
@@ -26,6 +24,7 @@ from phasesweep.engine.guards import (
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
+from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import agent_ids
@@ -37,8 +36,7 @@ from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
-    is_pid_zombie,
-    is_same_process,
+    is_same_live_process,
     kill_stale_group,
     read_proc_starttime,
 )
@@ -327,20 +325,21 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
-    if _runner_appears_live(identity.pid, identity.pid_starttime):
+    if is_same_live_process(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
         raise click.ClickException(f"run config snapshot is missing: {snapshot}")
     try:
-        snapshot_bytes = snapshot.read_bytes()
+        config = load_experiment_snapshot(
+            snapshot,
+            handle.config_sha256,
+            source=f"run snapshot {run_id}",
+        )
     except OSError as exc:
         raise click.ClickException(f"cannot read run config snapshot: {snapshot}") from exc
-    if hashlib.sha256(snapshot_bytes).hexdigest() != handle.config_sha256:
-        raise click.ClickException("run snapshot hash mismatch; refusing recovery")
-    config = load_config_bytes(snapshot_bytes, source=f"run snapshot {run_id}")
-    if not isinstance(config, Experiment):
-        raise click.ClickException("run snapshot is not a single experiment")
+    except ValueError as exc:
+        raise click.ClickException(f"{exc}; refusing recovery") from None
 
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     try:
@@ -349,7 +348,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             # using this exact output/storage namespace. Re-check runner liveness
             # only after acquiring the lock, then keep it through every signal,
             # study mutation, and recovery-state write.
-            if confirm and _runner_appears_live(identity.pid, identity.pid_starttime):
+            if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
                 raise click.ClickException(
                     "runner still appears live; use phasesweep_cancel_sweep first"
                 )
@@ -519,18 +518,6 @@ def _finalize_stored_terminal_result_snapshot(
         raise click.ClickException(
             f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None
-
-
-def _runner_appears_live(pid: int | None, saved_starttime: int | None) -> bool:
-    """Return whether a runner PID still appears to be the same live process.
-
-    :param int | None pid: Runner process ID, or ``None`` if no runner was recorded.
-    :param int | None saved_starttime: Recorded Linux process start time for identity checks.
-    :return bool: Whether the PID identifies the same live, non-zombie process.
-    """
-    if pid is None:
-        return False
-    return is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
 
 
 @mcp.command(
