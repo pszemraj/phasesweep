@@ -499,8 +499,8 @@ def _preflight_existing_studies(experiment: Experiment) -> dict[str, optuna.Stud
             continue
         studies[phase.name] = study
         try:
-            _validate_study_schema(study)
             _reap_stale_trials(study, experiment, phase.name)
+            _validate_study_schema(study)
         except BaseException as exc:
             errors.append(exc)
     if errors:
@@ -688,5 +688,5 @@ def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
     study = _load_existing_phase_study(experiment, phase)
     if study is None:
         return
-    _validate_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name)
+    _validate_study_schema(study)

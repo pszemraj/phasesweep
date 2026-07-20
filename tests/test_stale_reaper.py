@@ -298,6 +298,56 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
     assert not _generation_path(experiment).exists()
 
 
+def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        experiment="legacy_orphan",
+        storage=storage,
+        workdir=tmp_path / "runs",
+        phases=[Phase(name="p", n_trials=1, search_space={})],
+    )
+    study = optuna.create_study(
+        study_name="legacy_orphan::p",
+        storage=storage,
+        direction="minimize",
+    )
+    trial = study.ask()
+    stale = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    try:
+        starttime = read_proc_starttime(stale.pid)
+        assert starttime is not None
+        trial_dir = _trial_dir_for(
+            experiment,
+            "p",
+            trial.number,
+            generation_id="legacy-generation",
+            attempt_id="legacy-attempt",
+        )
+        trial_dir.mkdir(parents=True)
+        trial.set_user_attr(GENERATION_ID_ATTR, "legacy-generation")
+        trial.set_user_attr(ATTEMPT_ID_ATTR, "legacy-attempt")
+        trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+        (trial_dir / "pid").write_text(f"{stale.pid}\n")
+        (trial_dir / "pgid").write_text(f"{os.getpgid(stale.pid)}\n")
+        (trial_dir / "pid_starttime").write_text(f"{starttime}\n")
+
+        with pytest.raises(RuntimeError, match="unsupported phasesweep storage schema missing"):
+            run_experiment(experiment)
+
+        stale.wait(timeout=5)
+        assert stale.returncode == -signal.SIGTERM
+        recovered = optuna.load_study(study_name="legacy_orphan::p", storage=storage)
+        assert recovered.trials[trial.number].state == optuna.trial.TrialState.FAIL
+    finally:
+        if stale.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(stale.pid, signal.SIGKILL)
+            stale.wait(timeout=5)
+
+
 def test_kill_stale_group_escalates_to_sigkill(tmp_path):
     """A child that ignores SIGTERM must still be killed within the grace window."""
     if not Path("/proc/self/stat").exists():
