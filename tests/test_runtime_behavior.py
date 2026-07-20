@@ -503,7 +503,8 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
-    assert not (tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json").exists()
+    phase_dir = tmp_path / "runs" / "phase_timeout_hard" / "p"
+    assert list(phase_dir.glob("trial_00000__*/r.json")) == []
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
@@ -634,7 +635,8 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     accepted = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=1.0,
         allow_incomplete_on_timeout=True,
     )
     run_experiment(accepted)
@@ -642,7 +644,8 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     current = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=1.0,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
         _load_winner(current, current.phases[0], {})
