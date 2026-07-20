@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -26,8 +29,11 @@ from phasesweep.mcp.install.targets import (
     AGENT_IDS,
     MARKDOWN_END,
     MARKDOWN_START,
+    TOML_END,
+    TOML_START,
     agent_targets,
     codex_toml_content,
+    is_managed_mcp_entry,
     mcp_entry,
 )
 from tests.mcp_helpers import write_mcp_catalog
@@ -85,6 +91,40 @@ def test_merge_json_member_skips_commented_config(tmp_path):
     assert path.read_text() == original
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        b'{"theme":"first","theme":"second","mcpServers":{}}\n',
+        b'{"threshold":1e400,"mcpServers":{}}\n',
+        b'{"threshold":NaN,"mcpServers":{}}\n',
+    ],
+)
+def test_merge_json_member_rejects_ambiguous_or_nonfinite_json(tmp_path, original):
+    path = tmp_path / "mcp.json"
+    path.write_bytes(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "skipped"
+    assert path.read_bytes() == original
+
+
+def test_merge_json_member_refuses_nonfinite_generated_entry(tmp_path):
+    path = tmp_path / "mcp.json"
+    entry = {**ENTRY, "threshold": math.inf}
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", entry) == "error"
+    assert not path.exists()
+
+
+def test_json_edits_refuse_invalid_utf8_without_raising(tmp_path):
+    path = tmp_path / "mcp.json"
+    original = b"\xff\xfe"
+    path.write_bytes(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "error"
+    assert path.read_bytes() == original
+
+
 def test_merge_json_member_errors_on_non_object_shapes(tmp_path):
     path = tmp_path / "mcp.json"
     path.write_text("[1, 2]\n")
@@ -102,15 +142,15 @@ def test_merge_json_member_refuses_differing_unmanaged_member(tmp_path):
     assert path.read_text() == original
 
 
-def test_remove_json_member_prunes_and_unlinks(tmp_path):
+def test_remove_json_member_retains_unowned_container_and_file(tmp_path):
     path = tmp_path / "mcp.json"
     merge_json_member(path, "mcpServers", "phasesweep", ENTRY)
     assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
-    assert not path.exists()
+    assert json.loads(path.read_text()) == {"mcpServers": {}}
 
     path.write_text(json.dumps({"theme": "dark", "mcpServers": {"phasesweep": ENTRY}}, indent=2))
     assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
-    assert json.loads(path.read_text()) == {"theme": "dark"}
+    assert json.loads(path.read_text()) == {"theme": "dark", "mcpServers": {}}
     assert remove_json_member(path, "mcpServers", "phasesweep") == "not-found"
     assert remove_json_member(tmp_path / "absent.json", "mcpServers", "phasesweep") == "not-found"
 
@@ -153,6 +193,24 @@ def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
 
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
     assert path.read_text() == original
+    assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
+
+
+def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatch):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"mcpServers": {"other": {"command": "x"}}}\n')
+    external = '{"changed_by": "another process"}\n'
+    real_mkstemp = install_edits.tempfile.mkstemp
+
+    def change_after_temp_creation(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        path.write_text(external)
+        return fd, name
+
+    monkeypatch.setattr(install_edits.tempfile, "mkstemp", change_after_temp_creation)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert path.read_text() == external
     assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
 
 
@@ -225,13 +283,59 @@ def test_marked_block_round_trip_preserves_missing_final_newline(tmp_path):
     assert path.read_text() == original
 
 
-def test_marked_block_on_fresh_file_unlinks_on_removal(tmp_path):
+@pytest.mark.parametrize("original", [b"before\r\n", b"   \r\n"])
+def test_marked_block_round_trip_preserves_raw_newline_bytes(tmp_path, original):
+    path = tmp_path / "AGENTS.md"
+    path.write_bytes(original)
+
+    assert (
+        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+    )
+    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
+    assert path.read_bytes() == original
+
+
+def test_marked_block_update_and_removal_preserve_existing_crlf_style(tmp_path):
+    path = tmp_path / "AGENTS.md"
+    existing = (
+        b"before\r\n\r\n"
+        + MARKDOWN_START.encode()
+        + b"\r\nold\r\n"
+        + MARKDOWN_END.encode()
+        + b"\r\n"
+    )
+    path.write_bytes(existing)
+
+    assert (
+        replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+    )
+    assert b"\r\nnew\r\n" in path.read_bytes()
+    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
+    assert path.read_bytes() == b"before\r\n"
+
+
+def test_marker_text_must_be_an_exact_standalone_line(tmp_path):
+    path = tmp_path / "AGENTS.md"
+    original = f"mention {MARKDOWN_START} inline and leave it alone\n"
+    path.write_text(original)
+
+    assert (
+        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+    )
+    updated = path.read_text()
+    assert updated.startswith(original)
+    assert updated.count(MARKDOWN_START) == 2
+    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
+    assert path.read_text() == original
+
+
+def test_marked_block_on_fresh_file_remains_empty_on_removal(tmp_path):
     path = tmp_path / "AGENTS.md"
     assert (
         replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "created"
     )
     assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert not path.exists()
+    assert path.read_bytes() == b""
 
 
 def test_marked_block_replaces_in_place(tmp_path):
@@ -344,6 +448,23 @@ def test_server_command_prefers_running_python_environment(tmp_path, monkeypatch
     assert installer.resolve_server_command() == str(command.resolve())
 
 
+def test_server_command_preserves_lexical_symlink_name(tmp_path, monkeypatch):
+    env_bin = tmp_path / "env" / "bin"
+    env_bin.mkdir(parents=True)
+    target = env_bin / "shared-launcher"
+    target.write_text("#!/bin/sh\n")
+    target.chmod(0o755)
+    command = env_bin / "phasesweep-mcp"
+    command.symlink_to(target.name)
+    monkeypatch.setattr(installer.sys, "executable", str(env_bin / "python"))
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+
+    resolved = installer.resolve_server_command()
+
+    assert resolved == str(command.absolute())
+    assert is_managed_mcp_entry("stdio", mcp_entry("stdio", resolved, Path("/p/catalog.yaml")))
+
+
 def test_server_command_refuses_missing_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.sys, "executable", str(tmp_path / "env" / "bin" / "python"))
     monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
@@ -423,9 +544,18 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     assert "unchanged" in capsys.readouterr().out
 
     assert installer.run("uninstall", project, None, list(AGENT_IDS), "all", yes=True) == 0
-    leftovers = [p for p in project.rglob("*") if p.is_file() and p.name != "catalog.yaml"]
-    assert leftovers == []
-    assert not codex_config.exists()
+    for target in agent_targets(project):
+        if target.mcp.format == "toml":
+            assert target.mcp.path.read_bytes() == b""
+        else:
+            data = json.loads(target.mcp.path.read_text())
+            assert "phasesweep" not in data[target.mcp.key]
+    instruction_paths = {
+        target.instructions_path
+        for target in agent_targets(project)
+        if target.instructions_path is not None
+    }
+    assert all(path.read_bytes() == b"" for path in instruction_paths)
 
 
 def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_path, capsys):
@@ -452,6 +582,81 @@ def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_pa
 
     assert installer.run("uninstall", project, None, ["codex"], "instructions", yes=True) == 0
     assert instructions.read_text() == original
+
+
+def test_concurrent_shared_instruction_installs_preserve_both_owners(
+    fake_home, tmp_path, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    targets = {target.id: target for target in agent_targets(project)}
+    first_read = threading.Event()
+    release_first = threading.Event()
+    second_read_while_first_locked = threading.Event()
+    second_lock_attempt = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+    lock_attempts = 0
+    real_read = install_edits._read_editable_text
+    real_flock = install_edits.fcntl.flock
+
+    def controlled_read(path):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            first_read.set()
+            assert release_first.wait(timeout=3)
+        elif not release_first.is_set():
+            second_read_while_first_locked.set()
+        return real_read(path)
+
+    def observed_flock(handle, operation):
+        nonlocal lock_attempts
+        if operation == install_edits.fcntl.LOCK_EX:
+            with call_lock:
+                lock_attempts += 1
+                if lock_attempts == 2:
+                    second_lock_attempt.set()
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(install_edits, "_read_editable_text", controlled_read)
+    monkeypatch.setattr(install_edits.fcntl, "flock", observed_flock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            installer._apply_instructions, targets["cursor"], "install", project, False
+        )
+        assert first_read.wait(timeout=3)
+        second = pool.submit(
+            installer._apply_instructions,
+            targets["opencode"],
+            "install",
+            project,
+            False,
+        )
+        assert second_lock_attempt.wait(timeout=3)
+        assert not second_read_while_first_locked.is_set()
+        release_first.set()
+        assert first.result(timeout=3).action == "created"
+        assert second.result(timeout=3).action == "updated"
+
+    text = (project / "AGENTS.md").read_text()
+    assert "<!-- PHASESWEEP_OWNERS: cursor,opencode -->" in text
+
+
+def test_installer_refuses_invalid_utf8_instructions_without_raising(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+    original = b"\xff\xfe"
+    instructions.write_bytes(original)
+
+    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+
+    assert code == 1
+    assert "readable regular UTF-8" in capsys.readouterr().out
+    assert instructions.read_bytes() == original
 
 
 def test_installer_refuses_missing_server_command_before_edits(
@@ -638,6 +843,48 @@ def test_installer_detects_unmanaged_codex_table_semantically(
     assert codex_config.read_text() == original
 
 
+def test_installer_refuses_toml_markers_inside_string_data(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    codex_config = fake_home / ".codex" / "config.toml"
+    codex_config.parent.mkdir()
+    original = f'note = """\n{TOML_START}\nold\n{TOML_END}\n"""\n'.encode()
+    codex_config.write_bytes(original)
+
+    install_code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
+
+    assert install_code == 1
+    assert "recognizable managed" in capsys.readouterr().out
+    assert codex_config.read_bytes() == original
+    assert "mcp_servers" not in tomllib.loads(codex_config.read_text())
+
+    uninstall_code = installer.run("uninstall", project, None, ["codex"], "mcp", yes=True)
+    assert uninstall_code == 1
+    assert "recognizable managed" in capsys.readouterr().out
+    assert codex_config.read_bytes() == original
+
+
+def test_installer_refuses_invalid_utf8_toml_without_raising(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    codex_config = fake_home / ".codex" / "config.toml"
+    codex_config.parent.mkdir()
+    original = b"\xff\xfe"
+    codex_config.write_bytes(original)
+
+    code = installer.run(
+        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
+    )
+
+    assert code == 1
+    assert "readable regular UTF-8" in capsys.readouterr().out
+    assert codex_config.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "original",
     [
@@ -742,7 +989,7 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
 
     uninstall = runner.invoke(cli_main, ["mcp", "uninstall", "--agent", "claude", "--yes"])
     assert uninstall.exit_code == 0, uninstall.output
-    assert not (project / ".mcp.json").exists()
+    assert json.loads((project / ".mcp.json").read_text()) == {"mcpServers": {}}
     assert (project / "CLAUDE.md").read_text() == preexisting_claude_md
 
 

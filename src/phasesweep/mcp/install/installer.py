@@ -29,12 +29,13 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (
     Action,
+    _atomic_write_text,
+    _locked_editable_text,
     _marked_span,
     manual_json_snippet,
     merge_json_member,
     remove_json_member,
-    remove_marked,
-    replace_or_append_marked,
+    removed_marked_text,
     updated_marked_text,
 )
 from phasesweep.mcp.install.targets import (
@@ -90,10 +91,10 @@ def resolve_server_command() -> str:
     """
     sibling = Path(sys.executable).parent / "phasesweep-mcp"
     if sibling.is_file() and os.access(sibling, os.X_OK):
-        return str(sibling.resolve())
+        return str(sibling.absolute())
     found = shutil.which("phasesweep-mcp")
     if found:
-        return str(Path(found).resolve())
+        return str(Path(found).absolute())
     raise FileNotFoundError(
         "cannot find an executable phasesweep-mcp in the active Python environment or PATH"
     )
@@ -111,6 +112,178 @@ def _project_path_is_contained(path: Path, project: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _toml_mcp_entry(parsed: dict[str, object]) -> object | None:
+    """Return the parsed Codex PhaseSweep table, when present.
+
+    :param dict[str, object] parsed: Parsed complete Codex TOML document.
+    :return object | None: PhaseSweep server table or ``None`` when absent.
+    """
+    servers = parsed.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return None
+    return servers.get(SERVER_NAME)
+
+
+def _apply_toml_mcp(
+    path: Path,
+    mode: Mode,
+    command: str,
+    catalog: Path | None,
+    dry_run: bool,
+) -> StepResult:
+    """Apply one Codex TOML edit as a locked, semantically checked transaction.
+
+    :param Path path: Codex config path.
+    :param Mode mode: ``install`` or ``uninstall``.
+    :param str command: Absolute lexical MCP launcher path.
+    :param Path | None catalog: Absolute catalog path for installs.
+    :param bool dry_run: Compute the verdict without committing the candidate.
+    :return StepResult: Safe edit or manual-attention verdict.
+    """
+    if mode == "install" and catalog is None:
+        raise ValueError("installing an MCP entry requires a catalog path")
+    content = codex_toml_content(command, catalog) if catalog is not None else ""
+
+    with _locked_editable_text(path) as loaded:
+        if loaded is None:
+            guidance = (
+                f"; merge this manually:\n{content}"
+                if mode == "install"
+                else "; remove the managed block manually"
+            )
+            return StepResult(
+                "mcp",
+                path,
+                "error",
+                note=f"config path is not a readable regular UTF-8 file{guidance}",
+            )
+        if mode == "uninstall" and not loaded.existed:
+            return StepResult("mcp", path, "not-found")
+        try:
+            parsed = tomllib.loads(loaded.text)
+        except tomllib.TOMLDecodeError as exc:
+            suffix = f"; merge this manually:\n{content}" if content else ""
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=f"config contains invalid TOML ({exc}){suffix}",
+            )
+        try:
+            span = _marked_span(loaded.text, start=TOML_START, end=TOML_END)
+        except ValueError as exc:
+            suffix = f"; merge this manually:\n{content}" if content else ""
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=f"config contains incomplete or repeated PhaseSweep markers ({exc}){suffix}",
+            )
+
+        current = _toml_mcp_entry(parsed)
+        if mode == "uninstall":
+            if span is None:
+                return StepResult("mcp", path, "not-found")
+            if not is_managed_mcp_entry("stdio", current):
+                return StepResult(
+                    "mcp",
+                    path,
+                    "skipped",
+                    note=(
+                        "PhaseSweep marker lines do not contain a recognizable managed "
+                        f"{_CODEX_TABLE_HEADER} table; config was left untouched"
+                    ),
+                )
+            candidate = removed_marked_text(loaded.text, start=TOML_START, end=TOML_END)
+            if candidate is None:  # guarded by ``span`` above
+                return StepResult("mcp", path, "not-found")
+            try:
+                parsed_candidate = tomllib.loads(candidate)
+            except tomllib.TOMLDecodeError as exc:
+                return StepResult(
+                    "mcp",
+                    path,
+                    "skipped",
+                    note=f"automatic removal would produce invalid TOML ({exc})",
+                )
+            if _toml_mcp_entry(parsed_candidate) is not None:
+                return StepResult(
+                    "mcp",
+                    path,
+                    "skipped",
+                    note="automatic removal did not remove the managed table; config was untouched",
+                )
+            if dry_run:
+                return StepResult("mcp", path, "removed")
+            action: Action = (
+                "removed" if _atomic_write_text(path, candidate, expected=loaded) else "error"
+            )
+            note = None if action == "removed" else "config changed before it could be replaced"
+            return StepResult("mcp", path, action, note=note)
+
+        assert catalog is not None  # narrowed by the install-only guard above
+        expected = mcp_entry("stdio", command, catalog)
+        if span is None and current is not None:
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=(
+                    f"an unmanaged {_CODEX_TABLE_HEADER} table already exists; "
+                    f"update it manually to:\n{content}"
+                ),
+            )
+        if span is not None and not is_managed_mcp_entry("stdio", current):
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=(
+                    "PhaseSweep marker lines do not contain a recognizable managed "
+                    f"{_CODEX_TABLE_HEADER} table; merge this manually:\n{content}"
+                ),
+            )
+        try:
+            candidate = updated_marked_text(
+                loaded.text,
+                content,
+                start=TOML_START,
+                end=TOML_END,
+            )
+            parsed_candidate = tomllib.loads(candidate)
+        except ValueError as exc:
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=(
+                    f"automatic merge would produce invalid TOML ({exc}); "
+                    f"merge this manually:\n{content}"
+                ),
+            )
+        if _toml_mcp_entry(parsed_candidate) != expected:
+            return StepResult(
+                "mcp",
+                path,
+                "skipped",
+                note=(
+                    "automatic merge did not produce the requested managed table; "
+                    f"merge this manually:\n{content}"
+                ),
+            )
+        if candidate == loaded.text:
+            return StepResult("mcp", path, "unchanged")
+        if dry_run:
+            return StepResult("mcp", path, "updated" if loaded.existed else "created")
+        action = (
+            ("updated" if loaded.existed else "created")
+            if _atomic_write_text(path, candidate, expected=loaded)
+            else "error"
+        )
+        note = None if action != "error" else "config changed before it could be replaced"
+        return StepResult("mcp", path, action, note=note)
 
 
 def _apply_mcp(
@@ -140,68 +313,9 @@ def _apply_mcp(
             note="refusing project config path that resolves outside the project",
         )
     if spec.format == "toml":
-        if mode == "uninstall":
-            return StepResult(
-                "mcp",
-                spec.path,
-                remove_marked(
-                    spec.path,
-                    start=TOML_START,
-                    end=TOML_END,
-                    dry_run=dry_run,
-                ),
-            )
-        if catalog is None:
-            raise ValueError("installing an MCP entry requires a catalog path")
         if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-        try:
-            existing = spec.path.read_text(encoding="utf-8") if spec.path.exists() else ""
-        except OSError:
-            return StepResult("mcp", spec.path, "error", note="config file could not be read")
-        content = codex_toml_content(command, catalog)
-        if TOML_START not in existing:
-            try:
-                parsed = tomllib.loads(existing)
-            except tomllib.TOMLDecodeError as exc:
-                return StepResult(
-                    "mcp",
-                    spec.path,
-                    "skipped",
-                    note=f"config contains invalid TOML ({exc}); merge this manually:\n{content}",
-                )
-            servers = parsed.get("mcp_servers")
-            if isinstance(servers, dict) and SERVER_NAME in servers:
-                return StepResult(
-                    "mcp",
-                    spec.path,
-                    "skipped",
-                    note=(
-                        f"an unmanaged {_CODEX_TABLE_HEADER} table already exists; "
-                        f"update it manually to:\n{content}"
-                    ),
-                )
-        try:
-            candidate = updated_marked_text(existing, content, start=TOML_START, end=TOML_END)
-            tomllib.loads(candidate)
-        except ValueError as exc:
-            return StepResult(
-                "mcp",
-                spec.path,
-                "skipped",
-                note=(
-                    f"automatic merge would produce invalid TOML ({exc}); "
-                    f"merge this manually:\n{content}"
-                ),
-            )
-        action = replace_or_append_marked(
-            spec.path,
-            content,
-            start=TOML_START,
-            end=TOML_END,
-            dry_run=dry_run,
-        )
-        return StepResult("mcp", spec.path, action)
+        return _apply_toml_mcp(spec.path, mode, command, catalog, dry_run)
 
     if mode == "uninstall":
         managed = partial(is_managed_mcp_entry, spec.style)
@@ -216,6 +330,8 @@ def _apply_mcp(
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
             note = "an unmanaged phasesweep entry exists; it was left untouched"
+        elif action == "error":
+            note = "config could not be safely read or changed; remove the entry manually"
         else:
             note = None
         return StepResult("mcp", spec.path, action, note=note)
@@ -236,7 +352,7 @@ def _apply_mcp(
     note = None
     if action in ("skipped", "conflict", "error"):
         if action == "skipped":
-            reason = "config is not strict JSON (comments?)"
+            reason = "config is not supported strict JSON (comments, duplicate keys, or numbers?)"
         elif action == "conflict":
             reason = "an unmanaged phasesweep entry already exists"
         else:
@@ -247,21 +363,16 @@ def _apply_mcp(
     return StepResult("mcp", spec.path, action, note=note)
 
 
-def _read_instruction_block(path: Path, valid_owner_ids: set[str]) -> tuple[set[str], str] | None:
-    """Read the owner set and prompt body from a managed instructions block.
+def _read_instruction_block(
+    existing: str, valid_owner_ids: set[str]
+) -> tuple[set[str], str] | None:
+    """Parse the owner set and prompt body from a managed instructions block.
 
-    :param Path path: Instructions file that may contain the managed block.
+    :param str existing: Instructions text from the active locked transaction.
     :param set[str] valid_owner_ids: Agent ids allowed to own this exact path.
     :return tuple[set[str], str] | None: Owners and body, an empty pair when no
-        block exists, or ``None`` when the file or ownership metadata is unsafe
-        to edit automatically.
+        block exists, or ``None`` when ownership metadata is unsafe to edit.
     """
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        return None
-    try:
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return None
     try:
         span = _marked_span(existing, start=MARKDOWN_START, end=MARKDOWN_END)
     except ValueError:
@@ -270,8 +381,13 @@ def _read_instruction_block(path: Path, valid_owner_ids: set[str]) -> tuple[set[
         return set(), ""
     start_idx, end_idx = span
 
-    body = existing[start_idx + len(MARKDOWN_START) : end_idx].removeprefix("\n")
+    body = existing[start_idx + len(MARKDOWN_START) : end_idx]
+    if body.startswith("\r\n"):
+        body = body[2:]
+    elif body.startswith("\n"):
+        body = body[1:]
     owner_line, separator, prompt = body.partition("\n")
+    owner_line = owner_line.removesuffix("\r")
     if (
         not separator
         or not owner_line.startswith(_INSTRUCTION_OWNERS_PREFIX)
@@ -326,52 +442,89 @@ def _apply_instructions(
     valid_owner_ids = {
         candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
     }
-    block = _read_instruction_block(path, valid_owner_ids)
-    if block is None:
-        return StepResult(
-            "instructions",
-            path,
-            "error",
-            note="instructions block has missing or invalid ownership metadata",
-        )
-    owners, installed_prompt = block
-    if mode == "uninstall":
-        if target.id not in owners:
-            return StepResult("instructions", path, "not-found")
-        owners.remove(target.id)
-        if owners:
-            action = replace_or_append_marked(
-                path,
-                _owned_instruction_content(owners, installed_prompt),
-                start=MARKDOWN_START,
-                end=MARKDOWN_END,
-                dry_run=dry_run,
-            )
+    with _locked_editable_text(path) as loaded:
+        if loaded is None:
             return StepResult(
                 "instructions",
                 path,
-                action,
-                note=f"retained for: {', '.join(sorted(owners))}",
+                "error",
+                note="instructions path is not a readable regular UTF-8 file",
             )
-        return StepResult(
-            "instructions",
-            path,
-            remove_marked(
+        block = _read_instruction_block(loaded.text, valid_owner_ids)
+        if block is None:
+            return StepResult(
+                "instructions",
                 path,
+                "error",
+                note="instructions block has missing or invalid ownership metadata",
+            )
+        owners, installed_prompt = block
+        if mode == "uninstall":
+            if target.id not in owners:
+                return StepResult("instructions", path, "not-found")
+            owners.remove(target.id)
+            if owners:
+                candidate = updated_marked_text(
+                    loaded.text,
+                    _owned_instruction_content(owners, installed_prompt),
+                    start=MARKDOWN_START,
+                    end=MARKDOWN_END,
+                )
+                if dry_run:
+                    action: Action = "updated"
+                else:
+                    action = (
+                        "updated"
+                        if _atomic_write_text(path, candidate, expected=loaded)
+                        else "error"
+                    )
+                retained_note = (
+                    f"retained for: {', '.join(sorted(owners))}"
+                    if action != "error"
+                    else "instructions changed before they could be replaced"
+                )
+                return StepResult("instructions", path, action, note=retained_note)
+            removal_candidate = removed_marked_text(
+                loaded.text,
                 start=MARKDOWN_START,
                 end=MARKDOWN_END,
-                dry_run=dry_run,
-            ),
+            )
+            if removal_candidate is None:  # guarded by parsed owner metadata above
+                return StepResult("instructions", path, "not-found")
+            if dry_run:
+                return StepResult("instructions", path, "removed")
+            action = (
+                "removed"
+                if _atomic_write_text(path, removal_candidate, expected=loaded)
+                else "error"
+            )
+            removal_note = None if action == "removed" else "instructions changed before removal"
+            return StepResult("instructions", path, action, note=removal_note)
+
+        owners.add(target.id)
+        candidate = updated_marked_text(
+            loaded.text,
+            _owned_instruction_content(owners, agent_prompt_text()),
+            start=MARKDOWN_START,
+            end=MARKDOWN_END,
         )
-    owners.add(target.id)
-    action = replace_or_append_marked(
-        path,
-        _owned_instruction_content(owners, agent_prompt_text()),
-        start=MARKDOWN_START,
-        end=MARKDOWN_END,
-        dry_run=dry_run,
-    )
-    return StepResult("instructions", path, action)
+        if candidate == loaded.text:
+            return StepResult("instructions", path, "unchanged")
+        if dry_run:
+            return StepResult(
+                "instructions",
+                path,
+                "updated" if loaded.existed else "created",
+            )
+        action = (
+            ("updated" if loaded.existed else "created")
+            if _atomic_write_text(path, candidate, expected=loaded)
+            else "error"
+        )
+        install_note = (
+            None if action != "error" else "instructions changed before they could be replaced"
+        )
+        return StepResult("instructions", path, action, note=install_note)
 
 
 def _select_targets(
