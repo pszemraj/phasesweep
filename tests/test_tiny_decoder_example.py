@@ -6,8 +6,9 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -89,3 +90,38 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "status": "complete",
     }
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
+
+
+def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
+    wrapper = _load_wrapper()
+    observed: list[int] = []
+
+    class FakeModel:
+        def to(self, _device):
+            return self
+
+        def load_state_dict(self, _state):
+            return None
+
+        def eval(self):
+            return None
+
+    fake_torch = SimpleNamespace(
+        load=lambda *_args, **_kwargs: {
+            "config": {"seed": 0, "data_path": "data.bin"},
+            "model": {},
+        },
+        manual_seed=observed.append,
+    )
+    fake_trainer = SimpleNamespace(
+        torch=fake_torch,
+        get_optimal_device=lambda: ("cpu", "cpu", None),
+        Llama=lambda **_kwargs: FakeModel(),
+        load_data=lambda _path: (_ for _ in ()).throw(RuntimeError("evaluation reached data")),
+    )
+    monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
+
+    with pytest.raises(RuntimeError, match="evaluation reached data"):
+        wrapper._evaluate_final_checkpoint(tmp_path, tmp_path)
+
+    assert observed == [0]

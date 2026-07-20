@@ -111,7 +111,7 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    if config.get("seed"):
+    if config.get("seed") is not None:
         torch.manual_seed(config["seed"])
     data_path = Path(config["data_path"])
     if not data_path.is_absolute():
