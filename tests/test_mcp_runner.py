@@ -242,6 +242,17 @@ def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> 
         )
 
 
+def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: Path) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+
+    with pytest.raises(RuntimeError, match="terminal trial data is unavailable.*p"):
+        mcp_runner.capture_result_snapshot(
+            experiment,
+            cleanup_confirmed=False,
+            require_trial_data=True,
+        )
+
+
 def test_failed_resume_preflight_preserves_current_generation_and_results(
     tmp_path: Path,
 ) -> None:

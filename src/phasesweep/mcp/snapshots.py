@@ -99,12 +99,14 @@ def capture_result_snapshot(
     *,
     cleanup_confirmed: bool,
     generation_id: str | None = None,
+    require_trial_data: bool = False,
 ) -> dict[str, Any]:
     """Capture one experiment's current path-free status and sampled winners.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param bool cleanup_confirmed: Whether all trainer process groups are confirmed gone.
     :param str | None generation_id: Engine generation known to own the experiment lock.
+    :param bool require_trial_data: Refuse ambiguous storage reads when the engine succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
     """
     status = read_status(experiment)
@@ -113,6 +115,15 @@ def capture_result_snapshot(
             "current generation marker does not match the locked engine generation; "
             "refusing to freeze stale result artifacts"
         )
+    if require_trial_data:
+        unavailable = [
+            phase["phase"] for phase in status["phases"] if not phase["trial_data_available"]
+        ]
+        if unavailable:
+            raise RuntimeError(
+                "terminal trial data is unavailable for phase(s) "
+                f"{', '.join(unavailable)}; refusing to freeze ambiguous counts"
+            )
     if cleanup_confirmed:
         # A signal can escape Optuna before it changes its RUNNING row to FAIL.
         # Confirmed process cleanup means those trials are terminal in reality;

@@ -217,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     cleanup_confirmed=False,
                     generation_id=generation_id,
+                    require_trial_data=_error is None,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
                 result_snapshot_error = type(exc).__name__
