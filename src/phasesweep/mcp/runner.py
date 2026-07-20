@@ -24,6 +24,7 @@ from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_sn
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
+    _defer_shutdown_signals,
     install_signal_handlers,
     read_proc_starttime,
 )
@@ -43,50 +44,52 @@ def _write_status(
     :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
     :param str | None result_snapshot_error: Capture error class when no snapshot exists.
     """
-    # Persist cleanup evidence before serializing the in-memory snapshot. The
-    # status remains pending until the immutable data has reached disk.
-    terminal = {
-        **payload,
-        "ended_at": utc_now_iso(),
-        "result_snapshot_state": "pending",
-    }
-    try:
-        write_status_file(status_path, terminal)
-    except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
-        logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
-        return
-
-    try:
-        if result_snapshot is None:
-            raise RuntimeError(result_snapshot_error or "terminal snapshot was not captured")
-        terminal["result_snapshot"] = finalize_result_snapshot(
-            result_snapshot,
-            cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
-        )
-    except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
-        terminal["result_snapshot_state"] = "failed"
-        terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
-        logging.getLogger("phasesweep.mcp.runner").exception(
-            "failed to finalize terminal result snapshot"
-        )
-    else:
-        terminal["result_snapshot_state"] = "complete"
-
-    try:
-        write_status_file(status_path, terminal)
-    except Exception as exc:  # noqa: BLE001 - preserve a serializable failed finalization state
-        logging.getLogger("phasesweep.mcp.runner").exception(
-            "failed to finalize result snapshot state in status.json"
-        )
-        terminal.pop("result_snapshot", None)
-        terminal["result_snapshot_state"] = "failed"
-        terminal["result_snapshot_error"] = type(exc).__name__
+    # A catchable shutdown may arrive after the durable pending write. Defer it
+    # until the complete/failed replacement is durable so cancellation cannot
+    # strand an otherwise terminal run in the intermediate state.
+    with _defer_shutdown_signals():
+        terminal = {
+            **payload,
+            "ended_at": utc_now_iso(),
+            "result_snapshot_state": "pending",
+        }
         try:
             write_status_file(status_path, terminal)
-        except Exception:  # noqa: BLE001 - no further persistence fallback is available
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to persist result snapshot finalization failure"
+        except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
+            logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
+            return
+
+        try:
+            if result_snapshot is None:
+                raise RuntimeError(result_snapshot_error or "terminal snapshot was not captured")
+            terminal["result_snapshot"] = finalize_result_snapshot(
+                result_snapshot,
+                cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
             )
+        except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
+            terminal["result_snapshot_state"] = "failed"
+            terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
+            logging.getLogger("phasesweep.mcp.runner").exception(
+                "failed to finalize terminal result snapshot"
+            )
+        else:
+            terminal["result_snapshot_state"] = "complete"
+
+        try:
+            write_status_file(status_path, terminal)
+        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
+            logging.getLogger("phasesweep.mcp.runner").exception(
+                "failed to finalize result snapshot state in status.json"
+            )
+            terminal.pop("result_snapshot", None)
+            terminal["result_snapshot_state"] = "failed"
+            terminal["result_snapshot_error"] = type(exc).__name__
+            try:
+                write_status_file(status_path, terminal)
+            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+                logging.getLogger("phasesweep.mcp.runner").exception(
+                    "failed to persist result snapshot finalization failure"
+                )
 
 
 def _sha256_file(path: Path) -> str:

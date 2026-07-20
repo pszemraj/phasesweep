@@ -281,7 +281,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
-    cleanup_recovery_required = store.recovery_required(handle)
+    cleanup_recovery_required = store.cleanup_recovery_required(handle)
+    snapshot_recovery_required = store.snapshot_recovery_required(handle)
     terminal_cleanup_uncertain = (
         terminal_status is not None
         and terminal_status.get("cleanup_confirmed") is False
@@ -304,9 +305,14 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         or runner_without_status
     )
     snapshot_finalize_needed = stored_snapshot is not None and (
-        terminal_cleanup_uncertain or cleanup_already_recovered
+        terminal_cleanup_uncertain or cleanup_already_recovered or snapshot_recovery_required
     )
-    if not cleanup_recovery_needed and snapshot_unavailable and not launch_without_status:
+    if (
+        not cleanup_recovery_needed
+        and snapshot_unavailable
+        and not launch_without_status
+        and not snapshot_recovery_required
+    ):
         raise click.ClickException(
             "this run has no immutable terminal result snapshot. Historical results cannot "
             "be rebuilt from the current shared study because later runs may have changed it."
@@ -443,6 +449,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
                     f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
                 )
+
+            if snapshot_recovery_required and stored_snapshot is None:
+                assert terminal_status is not None
+                terminal_status["result_snapshot_state"] = "failed"
+                terminal_status["result_snapshot_error"] = "InterruptedFinalization"
+                write_status_file(store.status_path(run_id), terminal_status)
 
             if snapshot_finalize_needed:
                 _finalize_stored_terminal_result_snapshot(

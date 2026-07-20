@@ -1235,9 +1235,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(
-        _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
-    )
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-recovery-lock-contention"
     handle = make_run_handle(
@@ -1278,6 +1276,62 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     assert store.cleanup_uncertain_path(run_id).is_file()
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
+
+
+def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-pending-finalization"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="pending",
+    )
+
+    assert store.state(handle) == "running"
+    assert store.recovery_required(handle)
+    preflight = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+    assert preflight.exit_code == 0, preflight.output
+    assert "historical terminal snapshot is unavailable" in preflight.output
+
+    confirmed = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert confirmed.exit_code == 0, confirmed.output
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "failed"
+    assert terminal["result_snapshot_error"] == "InterruptedFinalization"
+    assert store.state(handle) == "succeeded"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+    with pytest.raises(Exception, match="finalization state: failed"):
+        app.status(run_id=run_id)
 
 
 def test_operator_recovery_finalizes_launching_handle_without_cleanup(

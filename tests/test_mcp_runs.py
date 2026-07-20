@@ -260,6 +260,8 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     )
 
     assert store.state(handle) == "running"
+    assert store.snapshot_recovery_required(handle)
+    assert store.recovery_required(handle)
     assert store.live_runs() == [handle]
     assert store.live_run_for("exp") == handle
 
@@ -274,8 +276,28 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     )
 
     assert store.state(handle) == "succeeded"
+    assert not store.snapshot_recovery_required(handle)
+    assert not store.recovery_required(handle)
     assert store.live_runs() == []
     assert store.live_run_for("exp") is None
+
+
+def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-live", experiment_id="exp")
+    store.save(handle)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="pending",
+    )
+
+    assert store.state(handle) == "running"
+    assert not store.snapshot_recovery_required(handle)
+    assert not store.recovery_required(handle)
 
 
 @pytest.mark.parametrize(

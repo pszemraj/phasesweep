@@ -102,6 +102,65 @@ def test_runner_persists_terminal_evidence_before_snapshot_finalization(
     assert "result_snapshot" not in final
 
 
+def test_runner_defers_shutdown_until_snapshot_finalization_is_durable(tmp_path: Path) -> None:
+    status_path = tmp_path / "status.json"
+    child_code = """
+import sys
+import time
+from pathlib import Path
+
+import phasesweep.mcp.runner as runner
+
+runner.install_signal_handlers()
+
+def slow_finalization(snapshot, *, cleanup_confirmed):
+    time.sleep(0.5)
+    return snapshot
+
+runner.finalize_result_snapshot = slow_finalization
+runner._write_status(
+    Path(sys.argv[1]),
+    {
+        "run_id": "r-signal",
+        "returncode": 0,
+        "error_class": None,
+        "cleanup_confirmed": True,
+    },
+    result_snapshot={"captured": True},
+    result_snapshot_error=None,
+)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(status_path)],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if status_path.is_file():
+                status = json.loads(status_path.read_text())
+                if status.get("result_snapshot_state") == "pending":
+                    break
+            if proc.poll() is not None:
+                raise AssertionError(f"finalizer exited early with {proc.returncode}")
+            time.sleep(0.01)
+        else:
+            raise AssertionError("runner did not persist the pending snapshot state")
+
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+    assert proc.returncode == 143
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "complete"
+    assert final["result_snapshot"] == {"captured": True}
+
+
 def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"

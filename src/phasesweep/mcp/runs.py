@@ -465,7 +465,16 @@ class RunStore:
         return [handle for handle in self.list_handles() if self.state(handle) == "running"]
 
     def recovery_required(self, handle: RunHandle) -> bool:
-        """Return whether operator cleanup recovery is required for a run.
+        """Return whether operator cleanup or snapshot recovery is required.
+
+        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
+        :return bool: True when cleanup remains uncertain or terminal snapshot
+            finalization was interrupted after the runner exited.
+        """
+        return self.cleanup_recovery_required(handle) or self.snapshot_recovery_required(handle)
+
+    def cleanup_recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether process cleanup still requires operator recovery.
 
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
         :return bool: True when a server marker or terminal runner status still
@@ -475,6 +484,40 @@ class RunStore:
             return True
         status = self._read_status(handle)
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
+
+    def snapshot_recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether a dead runner left snapshot finalization pending.
+
+        A live runner may legitimately expose the short durable ``pending``
+        interval between its two atomic status writes. Once its exact process
+        identity is gone, no writer can complete that status and operator
+        recovery must either finalize the embedded snapshot or record it as
+        unavailable.
+
+        :param RunHandle handle: Persisted run whose terminal status is checked.
+        :return bool: True only for an orphaned pending snapshot state.
+        """
+        status = self._read_status(handle)
+        return (
+            status is not None
+            and status.get("result_snapshot_state") == "pending"
+            and not self._runner_is_live(handle)
+        )
+
+    @staticmethod
+    def _runner_is_live(handle: RunHandle) -> bool:
+        """Return whether a spawned handle still identifies a live runner.
+
+        :param RunHandle handle: Persisted runner identity.
+        :return bool: True when PID and starttime still identify a non-zombie process.
+        """
+        return (
+            handle.launch_state == "spawned"
+            and handle.pid is not None
+            and handle.pid_starttime is not None
+            and is_same_process(handle.pid, handle.pid_starttime)
+            and not is_pid_zombie(handle.pid)
+        )
 
     def _read_status(self, handle: RunHandle) -> dict | None:
         """Read the runner-written terminal status payload.
