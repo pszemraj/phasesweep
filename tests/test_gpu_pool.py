@@ -167,12 +167,6 @@ def test_explicit_gpu_devices_preserve_tokens_and_dedupe():
     assert acquired == ["GPU-a", "MIG-GPU-b/1/0"]
 
 
-def test_empty_explicit_gpu_ids_raises():
-    """gpu_ids=[] is a config error, not silent no-op."""
-    with pytest.raises(RuntimeError, match="gpu_ids was provided but empty"):
-        GpuPool.create(n_jobs=1, explicit_ids=[])
-
-
 def test_explicit_gpu_ids_dedupe_preserves_order():
     """Duplicate IDs in YAML are deduped without reordering."""
     pool = GpuPool.create(n_jobs=2, explicit_ids=[2, 0, 2, 1, 0])

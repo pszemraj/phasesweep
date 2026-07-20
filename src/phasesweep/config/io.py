@@ -46,15 +46,9 @@ def _construct_mapping_strict(
         The constructed mapping.
 
     Raises:
-        yaml.constructor.ConstructorError: ``node`` is not a mapping, has an
-            unhashable key, or has a duplicate key.
+        yaml.constructor.ConstructorError: A key is unhashable or duplicated.
 
     """
-    if not isinstance(node, yaml.MappingNode):  # pragma: no cover - safety net
-        raise yaml.constructor.ConstructorError(
-            None, None, f"expected a mapping node, found {node.id}", node.start_mark
-        )
-
     literal_keys: dict[Any, None] = {}
     for key_node, _value_node in node.value:
         if key_node.tag == "tag:yaml.org,2002:merge":

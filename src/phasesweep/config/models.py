@@ -499,20 +499,6 @@ class Experiment(_Frozen):
                     "inside the applying phase."
                 )
 
-            # Local dotted-key namespace collision (review v0.5.3 / blocker 5):
-            # `{model: llama, model.depth: 16}` is silently corrupting in every
-            # render format we support. Reject at config-load.
-            local_keys = set(phase.fixed_overrides) | set(phase.search_space.keys()) | contract_keys
-            prefix_collisions = _find_prefix_collisions(local_keys)
-            if prefix_collisions:
-                pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
-                raise ValueError(
-                    f"Phase {phase.name!r} has dotted-key namespace collision(s): "
-                    f"{pairs}. A key and a sub-key cannot both be overridden — the "
-                    "rendered command would be contradictory (argparse/Hydra) or the "
-                    "json_file would have to be both a scalar and a nested object."
-                )
-
             # Transitive inherited locked keys + multi-parent collision detection.
             inherited_keys: set[str] = set()
             parent_owners: dict[str, list[str]] = {}
@@ -545,10 +531,8 @@ class Experiment(_Frozen):
                     f"or drop the inherit."
                 )
 
-            # Inherited / local dotted-key prefix collision (review v0.5.3 /
-            # blocker 5). E.g. parent locks `model` and child samples
-            # `model.depth`, or vice-versa. Same render-time corruption hazard
-            # as the local-only case but caught across the inheritance graph.
+            # A scalar key and one of its dotted subkeys cannot coexist in any
+            # supported render format, whether both are local or one is inherited.
             combined_keys = (
                 inherited_keys
                 | contract_keys

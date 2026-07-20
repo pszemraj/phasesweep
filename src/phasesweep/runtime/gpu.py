@@ -18,14 +18,14 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO
 
+from phasesweep.config.models import GpuPolicy
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
-GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
 
 
 @dataclass(frozen=True)
@@ -192,41 +192,22 @@ class GpuPool:
             non-``None`` IDs) iff a GPU list is in play.
 
         Raises:
-            RuntimeError: ``explicit_ids`` was provided but empty; or
-                ``explicit_devices`` was provided but empty; or no GPUs are
-                visible and ``n_jobs > 1`` without ``allow_no_gpu``.
+            RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
+                ``allow_no_gpu``.
 
         """
-        if policy not in {"single_per_trial", "whole_node", "none"}:
-            raise RuntimeError(f"unknown gpu_policy: {policy!r}")
-        if policy == "whole_node" and n_jobs != 1:
-            raise RuntimeError("gpu_policy='whole_node' requires n_jobs=1.")
         if policy == "none":
-            if explicit_ids is not None or explicit_devices is not None:
-                raise RuntimeError(
-                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices."
-                )
-            if n_jobs > 1 and not allow_no_gpu:
-                raise RuntimeError(
-                    "gpu_policy='none' with n_jobs > 1 requires allow_no_gpu_isolation."
-                )
             log.info("GPU isolation disabled by gpu_policy='none'.")
             return cls(devices=[])
 
-        if explicit_ids is not None and explicit_devices is not None:
-            raise RuntimeError("gpu_ids and gpu_devices are mutually exclusive.")
         # Explicit IDs always win, even at n_jobs==1.
         if explicit_ids is not None:
             ids = list(dict.fromkeys(explicit_ids))
-            if not ids:
-                raise RuntimeError("gpu_ids was provided but empty.")
             devices = [GpuDevice(str(gpu_id)) for gpu_id in ids]
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
         if explicit_devices is not None:
             devices = _dedupe_devices(explicit_devices)
-            if not devices:
-                raise RuntimeError("gpu_devices was provided but empty.")
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 

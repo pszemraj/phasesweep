@@ -302,13 +302,3 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
     for trial in trials:
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
     return _PhaseTrialStats(counts, True)
-
-
-def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
-    """Return Optuna trial counts by state without creating a missing study.
-
-    :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose existing study is inspected.
-    :return dict[str, int]: Counts keyed by Optuna trial-state name.
-    """
-    return _phase_trial_stats(experiment, phase).counts

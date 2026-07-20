@@ -17,7 +17,6 @@ import optuna
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.guards import (
-    _phase_fingerprint,
     _reap_stale_trials,
     _verify_fingerprint,
 )
@@ -174,12 +173,13 @@ def _run_phase(
     """
     study_name = _phase_study_name(experiment, phase)
     study = _create_phase_study(experiment, phase, dry_run=dry_run)
+    phase_fingerprint: str
 
     if not dry_run:
         # Reap first, fingerprint second (review item #7). A config-mismatch RuntimeError
         # must not leave a previous orchestrator's training process holding GPU memory.
         _reap_stale_trials(study, experiment, phase.name)
-        _verify_fingerprint(study, experiment, phase, inherited_winners)
+        phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
 
     completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)
@@ -537,11 +537,7 @@ def _run_phase(
         "timeout_scope": timeout_source if accepted_partial_timeout else None,
     }
 
-    # Build winner with effective_overrides (#9). Stamp it with the phase
-    # fingerprint so a later --from-phase resume can detect stale parent
-    # config (review v0.5.6 / blocker 3). The fingerprint is the same one
-    # _verify_fingerprint stamps on the Optuna study; recomputing here keeps
-    # _save_winner independent of study state.
+    # Build the winner with the verified phase identity and composed overrides.
     selected = select_winner(study, experiment)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
     winner = Winner(
@@ -552,7 +548,7 @@ def _run_phase(
         constraints=selected.constraints,
         gates=selected.gates,
         completion=completion,
-        phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+        phase_fingerprint=phase_fingerprint,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
     )

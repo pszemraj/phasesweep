@@ -20,7 +20,7 @@ from typing import Any
 import yaml
 
 from phasesweep.config import Experiment
-from phasesweep.engine.optuna import _phase_trial_counts, _phase_trial_stats
+from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import _generation_path, _summary_path, _winner_path
 
 
@@ -66,7 +66,7 @@ def _phase_status_payloads(
     for phase in experiment.phases:
         winner_path = _winner_path(experiment, phase.name)
         counts = (
-            _phase_trial_counts(experiment, phase)
+            _phase_trial_stats(experiment, phase).counts
             if trial_counts is None
             else trial_counts[phase.name]
         )
@@ -108,8 +108,8 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
         winner on disk: never run, still running, selection failed, or the file
         is malformed. A malformed read is treated as "not yet written" -
-        consistent with this module's permissive contract and with
-        ``_phase_trial_counts`` swallowing transient backend errors. The
+            consistent with this module's permissive contract and with
+            ``_phase_trial_stats`` swallowing transient backend errors. The
         strict, fingerprint-verifying read used for ``--from-phase`` resume
         lives in ``engine.state._load_winner`` and is intentionally not
         relaxed here.

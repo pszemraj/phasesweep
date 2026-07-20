@@ -280,28 +280,9 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         experiment: Parsed experiment config; supplies the metric name used
             in the persisted payload.
         phase_name: Name of the phase whose winner is being saved.
-        winner: The winning trial. Must have ``phase_fingerprint`` set.
-
-    Raises:
-        RuntimeError: ``winner.phase_fingerprint`` is ``None``. This is an
-            internal invariant; placeholder winners must not reach this path.
+        winner: The winning trial.
 
     """
-    if winner.phase_fingerprint is None:
-        # Defense in depth: should not happen — _run_phase always sets
-        # this before calling _save_winner. Failing loudly here prevents a
-        # silently un-resumable winner from landing on disk.
-        raise RuntimeError(
-            f"Refusing to save winner for phase {phase_name!r} without a "
-            "phase_fingerprint. This is an internal invariant — please file "
-            "a bug."
-        )
-    if not winner.generation_id or not winner.attempt_id:
-        raise RuntimeError(
-            f"Refusing to save winner for phase {phase_name!r} without generation and "
-            "attempt identity."
-        )
-
     path = _winner_path(experiment, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {

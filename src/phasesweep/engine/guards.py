@@ -320,7 +320,7 @@ def _verify_fingerprint(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-) -> None:
+) -> str:
     """Stamp a fresh study with its fingerprint or fail on mismatch.
 
     Args:
@@ -333,6 +333,9 @@ def _verify_fingerprint(
         RuntimeError: The study already has a fingerprint and it does not
             match the current computed value (incompatible config edit).
 
+    Returns:
+        The verified fingerprint.
+
     """
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
     existing = study.user_attrs.get("phasesweep_fingerprint")
@@ -344,6 +347,7 @@ def _verify_fingerprint(
             f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
             f"old study, or rename the phase."
         )
+    return fp
 
 
 log = logging.getLogger("phasesweep.engine.guards")
