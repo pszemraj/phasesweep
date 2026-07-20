@@ -21,7 +21,12 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.engine.optuna import _phase_trial_stats
-from phasesweep.engine.state import _generation_path, _summary_path, _winner_path
+from phasesweep.engine.state import (
+    _generation_path,
+    _last_successful_generation_id,
+    _published_summary_path,
+    _published_winner_path,
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,7 @@ def _phase_status_payloads(
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
-        winner_path = _winner_path(experiment, phase.name)
+        winner_path = _published_winner_path(experiment, phase.name)
         counts = (
             _phase_trial_stats(experiment, phase).counts
             if trial_counts is None
@@ -115,7 +120,7 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         relaxed here.
 
     """
-    path = _winner_path(experiment, phase_name)
+    path = _published_winner_path(experiment, phase_name)
     if not path.is_file():
         return None
     try:
@@ -212,6 +217,7 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
                 generation_id = raw_generation_id
     except (OSError, yaml.YAMLError):
         pass
+    last_successful_generation_id = _last_successful_generation_id(experiment)
     return {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -222,5 +228,12 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
         ),
-        "summary_present": _summary_path(experiment).is_file(),
+        "summary_present": (
+            _published_summary_path(experiment).is_file()
+            and (
+                generation_id is None
+                or last_successful_generation_id is None
+                or generation_id == last_successful_generation_id
+            )
+        ),
     }

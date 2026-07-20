@@ -22,7 +22,17 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.engine.guards import _phase_fingerprint
-from phasesweep.engine.state import Winner, _load_winner, _phase_dir, _save_winner, _winner_path
+from phasesweep.engine.state import (
+    Winner,
+    _generation_path,
+    _last_successful_generation_path,
+    _load_winner,
+    _phase_dir,
+    _published_winner_path,
+    _save_winner,
+    _summary_path,
+    _winner_path,
+)
 from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
@@ -99,6 +109,39 @@ phases:
     exp2 = load_experiment(yaml_path)
     with pytest.raises(RuntimeError, match="different phase config"):
         run_experiment(exp2)
+
+
+def test_late_child_fingerprint_failure_preserves_last_successful_results(
+    tmp_path: Path,
+) -> None:
+    """A child mismatch after phase one cannot publish a mixed result view."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _two_phase_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    run_experiment(experiment)
+    protected_paths = [
+        _summary_path(experiment),
+        _last_successful_generation_path(experiment),
+        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+    ]
+    before = {path: path.read_bytes() for path in protected_paths}
+    changed_child = experiment.phases[1].model_copy(
+        update={"search_space": {"lr": IntParam(type="int", low=1, high=5)}}
+    )
+    changed = experiment.model_copy(update={"phases": [experiment.phases[0], changed_child]})
+
+    with pytest.raises(RuntimeError, match="different phase config"):
+        run_experiment(changed)
+
+    assert {path: path.read_bytes() for path in protected_paths} == before
+    current = yaml.safe_load(_generation_path(experiment).read_text())
+    assert current["state"] == "failed"
+    assert yaml.safe_load(
+        _last_successful_generation_path(experiment).read_text()
+    ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
 
 
 def test_fingerprint_changes_when_parent_winner_changes():
@@ -455,7 +498,7 @@ def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path)
         exp = _two_phase_experiment(workdir=case_dir / "runs", trainer=trainer)
         run_experiment(exp)
 
-        arch_winner_path = _winner_path(exp, "arch")
+        arch_winner_path = _published_winner_path(exp, "arch")
         data = yaml.safe_load(arch_winner_path.read_text())
         match = mutate(data)
         arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))

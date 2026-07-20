@@ -22,6 +22,7 @@ from phasesweep.engine import read_status, run_experiment
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     _generation_path,
+    _generations_dir,
     _summary_path,
     _trial_dir_for,
     _winner_path,
@@ -280,8 +281,10 @@ def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: P
         )
 
 
-def test_failed_resume_preflight_preserves_current_generation_and_results(
+@pytest.mark.parametrize("from_phase", [None, "b"])
+def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
     tmp_path: Path,
+    from_phase: str | None,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
     phases = [
@@ -302,6 +305,7 @@ def test_failed_resume_preflight_preserves_current_generation_and_results(
         *(_winner_path(experiment, phase.name) for phase in phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
+    generations_before = set(_generations_dir(experiment).iterdir())
     changed = experiment.model_copy(
         update={
             "phases": [
@@ -325,12 +329,15 @@ def test_failed_resume_preflight_preserves_current_generation_and_results(
     with pytest.raises(RuntimeError, match="different phase config"):
         run_experiment(
             changed,
-            from_phase="b",
+            from_phase=from_phase,
             terminal_callback=capture_failed_resume,
         )
 
     assert len(callback_generations) == 1
     assert {path: path.read_bytes() for path in protected_paths} == before
+    failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
+    assert len(failed_generations) == 1
+    assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
 
 
 def test_runner_records_snapshot_serialization_failure(

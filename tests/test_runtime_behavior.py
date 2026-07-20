@@ -13,7 +13,12 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Experiment, LogRegexExtractor, Metric, Phase
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import _load_winner
+from phasesweep.engine.state import (
+    _last_successful_generation_path,
+    _load_winner,
+    _summary_path,
+    _winner_path,
+)
 from tests.conftest import copy_fake_train, make_experiment, write_trainer, write_yaml
 
 
@@ -149,7 +154,7 @@ phases:
         )
 
 
-def test_repeated_in_memory_run_cannot_reuse_stale_trial_or_winner_evidence(
+def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good_results(
     tmp_path: Path,
 ) -> None:
     success = write_trainer(
@@ -173,6 +178,14 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_or_winner_evidence(
     phase_dir = workdir / "t" / "p"
     first_trial_dir = next(phase_dir.glob("trial_*"))
     assert (first_trial_dir / "r.json").is_file()
+    protected = {
+        path: path.read_bytes()
+        for path in (
+            _winner_path(first, "p"),
+            _summary_path(first),
+            _last_successful_generation_path(first),
+        )
+    }
 
     second = first.model_copy(
         update={"trial_command": f"python {no_result} {{trial_dir}}/r.json {{overrides}}"}
@@ -185,8 +198,7 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_or_winner_evidence(
     assert first_trial_dir in trial_dirs
     second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
     assert not (second_trial_dir / "r.json").exists()
-    assert not (phase_dir / "winner.yaml").exists()
-    assert not (workdir / "t" / "summary.yaml").exists()
+    assert {path: path.read_bytes() for path in protected} == protected
 
 
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):

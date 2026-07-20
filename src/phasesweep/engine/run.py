@@ -6,8 +6,11 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+import yaml
 
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.engine.guards import (
@@ -28,6 +31,11 @@ from phasesweep.engine.state import (
     _experiment_dir,
     _file_log_handler,
     _generation_path,
+    _generation_promotion_decision_path,
+    _generation_record_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
     _load_winner,
     _promotion_decision_path,
     _run_log_path,
@@ -160,6 +168,13 @@ def run_experiment(
         existing_studies: dict[str, Any] = {}
         generation_prepared = False
         try:
+            _write_generation_state(
+                experiment,
+                generation_id=generation_id,
+                state="preflighting",
+                from_phase=from_phase,
+                publish_current=False,
+            )
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
                 if from_phase is not None and experiment.timeout_seconds_per_run is not None
@@ -195,6 +210,15 @@ def run_experiment(
                     _preflight_existing_studies(experiment)
                 except BaseException:
                     log.exception("failed to reconcile all existing studies after run termination")
+            with contextlib.suppress(Exception):
+                _write_generation_state(
+                    experiment,
+                    generation_id=generation_id,
+                    state="failed",
+                    from_phase=from_phase,
+                    publish_current=generation_prepared,
+                    error_class=type(exc).__name__,
+                )
             raise
         finally:
             if terminal_callback is not None:
@@ -264,6 +288,22 @@ def _run_experiment_inner(
         if skip_until and phase.name != from_phase:
             if preloaded_winners is not None:
                 winners[phase.name] = preloaded_winners[phase.name]
+                if not dry_run:
+                    assert generation_id is not None
+                    _save_winner(
+                        experiment,
+                        phase.name,
+                        winners[phase.name],
+                        generation_id=generation_id,
+                    )
+                    prior_promotion = _promotion_decision_path(experiment, phase.name)
+                    if prior_promotion.is_file():
+                        _copy_yaml_projection(
+                            prior_promotion,
+                            _generation_promotion_decision_path(
+                                experiment, generation_id, phase.name
+                            ),
+                        )
                 log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             else:
                 try:
@@ -291,15 +331,24 @@ def _run_experiment_inner(
             if promotion_decision is not None:
                 promotion_decision["generation_id"] = generation_id
                 promotion_decisions[phase.name] = promotion_decision
-                _save_promotion_decision(experiment, phase.name, promotion_decision)
+                _save_promotion_decision(
+                    experiment,
+                    phase.name,
+                    promotion_decision,
+                    generation_id=generation_id,
+                )
             if promoted is None:
-                with contextlib.suppress(FileNotFoundError):
-                    _winner_path(experiment, phase.name).unlink()
                 if promotion_decision is not None and promotion_decision["action"] == "stop":
                     raise RuntimeError(str(promotion_decision["message"]))
                 break
             winner = promoted
-            _save_winner(experiment, phase.name, winner)
+            assert generation_id is not None
+            _save_winner(
+                experiment,
+                phase.name,
+                winner,
+                generation_id=generation_id,
+            )
             log.info(
                 "phase=%s WINNER trial=%d metric=%g params=%s",
                 phase.name,
@@ -313,7 +362,8 @@ def _run_experiment_inner(
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 
-    summary_path = _summary_path(experiment)
+    assert generation_id is not None
+    summary_path = _generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary = {
         "experiment": experiment.experiment,
@@ -323,6 +373,7 @@ def _run_experiment_inner(
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
     }
     _write_yaml_atomic(summary_path, summary)
+    _publish_generation(experiment, generation_id, from_phase=from_phase)
     log.info("Wrote %s", summary_path)
 
     return winners
@@ -382,24 +433,94 @@ def _prepare_generation(
     from_phase: str | None,
     generation_id: str,
 ) -> None:
-    """Start a generation without exposing stale mutable result artifacts.
+    """Publish a generation as current after recovery and initial preflight.
 
-    :param Experiment experiment: Experiment whose current result view is reset.
+    :param Experiment experiment: Experiment whose current generation pointer is advanced.
     :param str | None from_phase: Optional resume point; prior winners remain available.
     :param str generation_id: Fresh identity for this engine invocation.
     """
-    start_index = 0
-    if from_phase is not None:
-        start_index = next(
-            index for index, phase in enumerate(experiment.phases) if phase.name == from_phase
+    _write_generation_state(
+        experiment,
+        generation_id=generation_id,
+        state="running",
+        from_phase=from_phase,
+        publish_current=True,
+    )
+
+
+def _write_generation_state(
+    experiment: Experiment,
+    *,
+    generation_id: str,
+    state: str,
+    from_phase: str | None,
+    publish_current: bool,
+    error_class: str | None = None,
+) -> None:
+    """Write one generation lifecycle record and optionally its current pointer."""
+    payload = {
+        "experiment": experiment.experiment,
+        "generation_id": generation_id,
+        "state": state,
+        "from_phase": from_phase,
+        "error_class": error_class,
+    }
+    _write_yaml_atomic(_generation_record_path(experiment, generation_id), payload)
+    if publish_current:
+        _write_yaml_atomic(_generation_path(experiment), payload)
+
+
+def _copy_yaml_projection(source: Path, destination: Path) -> None:
+    """Atomically project one immutable YAML artifact to its compatibility path."""
+    payload = yaml.safe_load(source.read_text())
+    _write_yaml_atomic(destination, payload)
+
+
+def _publish_generation(
+    experiment: Experiment,
+    generation_id: str,
+    *,
+    from_phase: str | None,
+) -> None:
+    """Publish a complete immutable generation as the last successful result."""
+    for phase in experiment.phases:
+        source_winner = _generation_winner_path(experiment, generation_id, phase.name)
+        projected_winner = _winner_path(experiment, phase.name)
+        if source_winner.is_file():
+            _copy_yaml_projection(source_winner, projected_winner)
+        else:
+            projected_winner.unlink(missing_ok=True)
+
+        source_promotion = _generation_promotion_decision_path(
+            experiment, generation_id, phase.name
         )
-    _summary_path(experiment).unlink(missing_ok=True)
-    for phase in experiment.phases[start_index:]:
-        _winner_path(experiment, phase.name).unlink(missing_ok=True)
-        _promotion_decision_path(experiment, phase.name).unlink(missing_ok=True)
+        projected_promotion = _promotion_decision_path(experiment, phase.name)
+        if source_promotion.is_file():
+            _copy_yaml_projection(source_promotion, projected_promotion)
+        else:
+            projected_promotion.unlink(missing_ok=True)
+
+    _copy_yaml_projection(
+        _generation_summary_path(experiment, generation_id),
+        _summary_path(experiment),
+    )
+    _write_generation_state(
+        experiment,
+        generation_id=generation_id,
+        state="complete",
+        from_phase=from_phase,
+        publish_current=False,
+    )
     _write_yaml_atomic(
-        _generation_path(experiment),
+        _last_successful_generation_path(experiment),
         {"experiment": experiment.experiment, "generation_id": generation_id},
+    )
+    _write_generation_state(
+        experiment,
+        generation_id=generation_id,
+        state="complete",
+        from_phase=from_phase,
+        publish_current=True,
     )
 
 

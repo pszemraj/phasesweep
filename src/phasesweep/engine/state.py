@@ -142,6 +142,75 @@ def _generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "generation.yaml"
 
 
+def _generations_dir(experiment: Experiment) -> Path:
+    """Return the immutable generation-record root for an experiment."""
+    return _experiment_dir(experiment) / "generations"
+
+
+def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's immutable artifact namespace."""
+    return _generations_dir(experiment) / generation_id
+
+
+def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's lifecycle record path."""
+    return _generation_dir(experiment, generation_id) / "generation.yaml"
+
+
+def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's summary path."""
+    return _generation_dir(experiment, generation_id) / "summary.yaml"
+
+
+def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
+    """Return one generation's phase-winner path."""
+    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "winner.yaml"
+
+
+def _generation_promotion_decision_path(
+    experiment: Experiment, generation_id: str, phase_name: str
+) -> Path:
+    """Return one generation's phase-promotion path."""
+    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "promotion.yaml"
+
+
+def _last_successful_generation_path(experiment: Experiment) -> Path:
+    """Return the pointer to the last fully published generation."""
+    return _experiment_dir(experiment) / "last_successful_generation.yaml"
+
+
+def _last_successful_generation_id(experiment: Experiment) -> str | None:
+    """Read the last-success pointer, returning ``None`` for legacy layouts."""
+    try:
+        payload = yaml.safe_load(_last_successful_generation_path(experiment).read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    generation_id = payload.get("generation_id")
+    return generation_id if isinstance(generation_id, str) and generation_id else None
+
+
+def _published_winner_path(experiment: Experiment, phase_name: str) -> Path:
+    """Return the authoritative last-success winner, with legacy fallback."""
+    generation_id = _last_successful_generation_id(experiment)
+    if generation_id is not None:
+        path = _generation_winner_path(experiment, generation_id, phase_name)
+        if path.is_file():
+            return path
+    return _winner_path(experiment, phase_name)
+
+
+def _published_summary_path(experiment: Experiment) -> Path:
+    """Return the authoritative last-success summary, with legacy fallback."""
+    generation_id = _last_successful_generation_id(experiment)
+    if generation_id is not None:
+        path = _generation_summary_path(experiment, generation_id)
+        if path.is_file():
+            return path
+    return _summary_path(experiment)
+
+
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
     """Return the path to a phase's persisted winner.
 
@@ -270,7 +339,13 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
             writer.writerow(row)
 
 
-def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> None:
+def _save_winner(
+    experiment: Experiment,
+    phase_name: str,
+    winner: Winner,
+    *,
+    generation_id: str | None = None,
+) -> None:
     """Persist a phase winner.
 
     The phase fingerprint is included so ``_load_winner`` can refuse stale
@@ -283,9 +358,15 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
             in the persisted payload.
         phase_name: Name of the phase whose winner is being saved.
         winner: The winning trial.
+        generation_id: Optional immutable generation namespace. ``None`` writes
+            the compatibility projection.
 
     """
-    path = _winner_path(experiment, phase_name)
+    path = (
+        _winner_path(experiment, phase_name)
+        if generation_id is None
+        else _generation_winner_path(experiment, generation_id, phase_name)
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "phase": phase_name,
@@ -309,14 +390,21 @@ def _save_promotion_decision(
     experiment: Experiment,
     phase_name: str,
     decision: dict[str, Any],
+    *,
+    generation_id: str | None = None,
 ) -> None:
     """Persist a phase promotion decision independently of exposed winner state.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name whose promotion decision is being saved.
     :param dict[str, Any] decision: Promotion decision payload to persist.
+    :param str | None generation_id: Optional immutable generation namespace.
     """
-    path = _promotion_decision_path(experiment, phase_name)
+    path = (
+        _promotion_decision_path(experiment, phase_name)
+        if generation_id is None
+        else _generation_promotion_decision_path(experiment, generation_id, phase_name)
+    )
     _write_yaml_atomic(path, decision)
 
 
@@ -352,7 +440,7 @@ def _load_winner(
             fingerprint disagrees with the freshly computed one.
 
     """
-    path = _winner_path(experiment, phase.name)
+    path = _published_winner_path(experiment, phase.name)
     if not path.is_file():
         raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
 
