@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
@@ -396,6 +398,40 @@ def test_from_phase_accepts_skipped_winner_when_only_n_trials_changed(
 
     assert winners2["arch"].params == winners1["arch"].params
     assert "lr" in winners2
+
+
+def test_from_phase_preflight_consumes_run_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+    )
+    run_experiment(experiment)
+    resumed = experiment.model_copy(update={"timeout_seconds_per_run": 1.0})
+
+    run_module = importlib.import_module("phasesweep.engine.run")
+    clock = {"now": 100.0}
+    original_load_winner = run_module._load_winner
+
+    def delayed_load_winner(*args: object, **kwargs: object) -> Winner:
+        winner = original_load_winner(*args, **kwargs)
+        clock["now"] += 2.0
+        return winner
+
+    monkeypatch.setattr(
+        run_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    monkeypatch.setattr(run_module, "_load_winner", delayed_load_winner)
+
+    with pytest.raises(TimeoutError, match="before phase 'lr' could start"):
+        run_experiment(resumed, from_phase="lr")
 
 
 def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path) -> None:

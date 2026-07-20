@@ -153,9 +153,15 @@ def run_experiment(
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
         try:
+            run_deadline = (
+                time.monotonic() + experiment.timeout_seconds_per_run
+                if from_phase is not None and experiment.timeout_seconds_per_run is not None
+                else None
+            )
             preloaded_winners = _preflight_skipped_winners(
                 experiment,
                 from_phase=from_phase,
+                run_deadline=run_deadline,
             )
             _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
             return _run_experiment_inner(
@@ -164,6 +170,7 @@ def run_experiment(
                 dry_run=False,
                 generation_id=generation_id,
                 preloaded_winners=preloaded_winners,
+                run_deadline=run_deadline,
             )
         except BaseException as exc:
             terminal_error = exc
@@ -187,6 +194,7 @@ def _run_experiment_inner(
     dry_run: bool,
     generation_id: str | None,
     preloaded_winners: dict[str, Winner] | None = None,
+    run_deadline: float | None = None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
 
@@ -198,6 +206,9 @@ def _run_experiment_inner(
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
+        run_deadline: Optional precomputed whole-run monotonic deadline. Resume
+            preflight passes this through so skipped-phase validation consumes
+            the same budget as it did before preflight was separated.
 
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
@@ -206,14 +217,18 @@ def _run_experiment_inner(
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}
-    run_deadline = (
-        None
-        if dry_run or experiment.timeout_seconds_per_run is None
-        else time.monotonic() + experiment.timeout_seconds_per_run
-    )
+    if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
+        run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     for phase in experiment.phases:
-        if run_deadline is not None and time.monotonic() >= run_deadline:
+        using_preloaded_winner = (
+            skip_until and phase.name != from_phase and preloaded_winners is not None
+        )
+        if (
+            not using_preloaded_winner
+            and run_deadline is not None
+            and time.monotonic() >= run_deadline
+        ):
             raise TimeoutError(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start."
             )
@@ -293,11 +308,13 @@ def _preflight_skipped_winners(
     experiment: Experiment,
     *,
     from_phase: str | None,
+    run_deadline: float | None,
 ) -> dict[str, Winner]:
     """Validate skipped winners before committing a new generation.
 
     :param Experiment experiment: Experiment whose resume prefix is checked.
     :param str | None from_phase: First phase that the new generation will execute.
+    :param float | None run_deadline: Whole-run monotonic deadline, when configured.
     :return dict[str, Winner]: Compatible skipped winners in declaration order.
     """
     if from_phase is None:
@@ -305,6 +322,10 @@ def _preflight_skipped_winners(
 
     winners: dict[str, Winner] = {}
     for phase in experiment.phases:
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            raise TimeoutError(
+                f"Run wallclock deadline reached before phase {phase.name!r} could start."
+            )
         if phase.name == from_phase:
             return winners
         inherited = {parent: winners[parent] for parent in phase.inherits}
