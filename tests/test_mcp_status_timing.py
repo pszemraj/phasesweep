@@ -397,7 +397,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    target_id, status, run, handle, result_source, resolved = app._read_status_target(
+    target_id, status, run, handle, result_source = app._read_status_target(
         experiment_id=None,
         run_id="r1",
     )
@@ -409,7 +409,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     def blocked_read(**_kwargs: object):
         entered.set()
         release.wait(timeout=2.0)
-        return target_id, status, terminal_run, handle, result_source, resolved
+        return target_id, status, terminal_run, handle, result_source
 
     monkeypatch.setattr(app, "_read_status_target", blocked_read)
 

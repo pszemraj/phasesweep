@@ -37,8 +37,6 @@ from phasesweep.mcp.runner import main as runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
-    TOOL_LIST_EXPERIMENTS,
-    TOOL_VALIDATE_CONFIG,
     PhaseSweepMCP,
     _safe_tool,
 )
@@ -754,12 +752,11 @@ def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:
     assert visible_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": 0.001}
 
 
-def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:
+def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
     configs = {f"srv{i}": _config(tmp_path, name=f"srv{i}") for i in range(3)}
     registry = Registry.load(write_mcp_catalog(tmp_path, configs))
     store = RunStore(registry.state_dir)
-    audit_path = registry.state_dir / "audit.jsonl"
-    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    app = PhaseSweepMCP(registry, store)
 
     first = app.list_experiments(limit=2)
     assert [item["id"] for item in first["experiments"]] == ["srv0", "srv1"]
@@ -775,15 +772,6 @@ def test_list_experiments_pages_catalog_and_audits(tmp_path: Path) -> None:
         app.list_experiments(cursor="not-a-cursor")
     with pytest.raises(Exception, match="limit must be between"):
         app.list_experiments(limit=0)
-
-    records = [json.loads(line) for line in audit_path.read_text().splitlines()]
-    assert records[0]["tool"] == TOOL_LIST_EXPERIMENTS
-    assert records[0]["args"] == {"limit": 2}
-    assert records[0]["result_counts"] == {"experiments": 2, "total_count": 3}
-    assert records[1]["args"] == {"cursor": "2", "limit": 2}
-    assert records[1]["result_counts"] == {"experiments": 1, "total_count": 3}
-    assert records[2]["outcome"] == "error"
-    assert records[2]["error_type"] == "McpToolError"
 
 
 def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
@@ -822,7 +810,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
     }
 
 
-def test_audit_log_records_success_and_error_without_sensitive_fields(
+def test_audit_log_records_side_effects_without_sensitive_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
@@ -844,7 +832,6 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [record["tool"] for record in records] == [
-        TOOL_VALIDATE_CONFIG,
         TOOL_LAUNCH_SWEEP,
         TOOL_LAUNCH_SWEEP,
     ]
@@ -852,13 +839,7 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     assert all(record["actor"] == "local-stdio" for record in records)
     assert all(record["transport"] == "stdio" for record in records)
 
-    validate_record = records[0]
-    assert validate_record["outcome"] == "success"
-    assert validate_record["args"] == {"experiment_id": "srv"}
-    assert validate_record["resolved"] == {"experiment_id": "srv"}
-    assert validate_record["result_counts"] == {"phases": 1, "search_space_keys": 1}
-
-    launch_record = records[1]
+    launch_record = records[0]
     assert launch_record["outcome"] == "success"
     assert launch_record["args"] == {"experiment_id": "srv"}
     assert launch_record["resolved"] == {"experiment_id": "srv", "run_id": launched["run_id"]}
@@ -866,7 +847,7 @@ def test_audit_log_records_success_and_error_without_sensitive_fields(
     assert launch_record["state_after"] == {"live_runs": 1, "run_state": "running"}
     assert launch_record["result_counts"] == {"runs": 1}
 
-    busy_record = records[2]
+    busy_record = records[1]
     assert busy_record["outcome"] == "error"
     assert busy_record["args"] == {"experiment_id": "srv"}
     assert busy_record["resolved"] == {"experiment_id": "srv"}
@@ -884,7 +865,7 @@ def test_audit_log_caps_agent_supplied_string_values(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
     audit = AuditLogger(audit_path)
 
-    audit.record(tool=TOOL_LIST_EXPERIMENTS, args={"cursor": "x" * 500}, outcome="success")
+    audit.record(tool=TOOL_LAUNCH_SWEEP, args={"cursor": "x" * 500}, outcome="success")
 
     record = json.loads(audit_path.read_text())
     assert record["args"]["cursor"] == ("x" * 253) + "..."

@@ -112,7 +112,7 @@ Run handles and per-run logs live under `state_dir`:
 
 The engine's own durable `run.log` is under the experiment `workdir`.
 
-`audit.jsonl` contains best-effort append-only JSON objects with timestamp, local stdio actor, server session id, tool name, bounded safe arguments (`experiment_id`, `run_id`, `from_phase`, `timeout_seconds`, pagination values), resolved ids, outcome, error type/message for safe tool errors, state transition summaries, and result counts. Audit records do not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
+`audit.jsonl` contains best-effort append-only records for launch and cancel side effects: timestamp, local stdio actor, server session id, tool name, bounded safe arguments, resolved ids, outcome, safe error details, and state-transition summaries. Read-only catalog, status, await, and winner calls are not logged. Audit records do not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
 When a client polls `phasesweep_get_status` instead of waiting on `phasesweep_await_run`, wait at least 30 seconds between calls. SQLite-backed status uses a read-only direct count path. Journal-backed status goes through Optuna's full read path today, so keep polling sparse on very large Journal-backed studies.
 

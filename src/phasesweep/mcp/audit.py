@@ -1,4 +1,4 @@
-"""Structured audit logging for MCP tool calls.
+"""Structured audit logging for state-changing MCP tool calls.
 
 Audit records are operator-facing JSON lines written under ``state_dir``. They
 intentionally log identifiers, counts, outcomes, and state transitions instead
@@ -46,7 +46,7 @@ def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
 
 @dataclass
 class AuditLogger:
-    """Append-only JSONL audit sink for MCP tool calls."""
+    """Append-only JSONL audit sink for MCP side effects."""
 
     path: Path
     actor: str = "local-stdio"

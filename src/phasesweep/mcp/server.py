@@ -535,7 +535,7 @@ class PhaseSweepMCP:
         state_after: dict[str, Any] | None = None,
         result_counts: dict[str, int] | None = None,
     ) -> None:
-        """Record a successful MCP tool call when audit logging is enabled.
+        """Record a successful state-changing tool call.
 
         :param str tool: MCP tool name.
         :param dict[str, Any] | None args: Safe agent-supplied arguments.
@@ -563,7 +563,7 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] | None = None,
         state_before: dict[str, Any] | None = None,
     ) -> None:
-        """Record a failed MCP tool call when audit logging is enabled.
+        """Record a failed state-changing tool call.
 
         :param str tool: MCP tool name.
         :param dict[str, Any] | None args: Safe agent-supplied arguments.
@@ -594,31 +594,18 @@ class PhaseSweepMCP:
         :param str | None cursor: Optional pagination cursor returned by a prior call.
         :return dict[str, Any]: Catalog page safe for the agent.
         """
-        args = {"limit": limit, "cursor": cursor}
-        total_count = 0
-        page: list[dict[str, Any]] = []
-        try:
-            if limit < 1 or limit > MAX_LIST_LIMIT:
-                raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
-            offset = _cursor_offset(cursor)
-            experiments = self._registry.summaries()
-            total_count = len(experiments)
-            page = experiments[offset : offset + limit]
-            next_offset = offset + len(page)
-            result = {
-                "experiments": page,
-                "total_count": total_count,
-                "next_cursor": str(next_offset) if next_offset < total_count else None,
-            }
-        except Exception as exc:
-            self._audit_error(TOOL_LIST_EXPERIMENTS, args, exc)
-            raise
-        self._audit_success(
-            TOOL_LIST_EXPERIMENTS,
-            args,
-            result_counts={"experiments": len(page), "total_count": total_count},
-        )
-        return result
+        if limit < 1 or limit > MAX_LIST_LIMIT:
+            raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+        offset = _cursor_offset(cursor)
+        experiments = self._registry.summaries()
+        total_count = len(experiments)
+        page = experiments[offset : offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "experiments": page,
+            "total_count": total_count,
+            "next_cursor": str(next_offset) if next_offset < total_count else None,
+        }
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
         """Report an experiment's phase structure (never the command/env/storage).
@@ -626,45 +613,25 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog experiment id to inspect.
         :return dict[str, Any]: Path-free validation payload for the agent.
         """
-        args = {"experiment_id": experiment_id}
-        resolved: dict[str, Any] = {}
-        search_space_keys = 0
-        try:
-            reg = self._registry.get(experiment_id)
-            resolved["experiment_id"] = reg.id
-            self._current_config_bytes(reg)
-            exp = reg.experiment
-            search_space_keys = sum(len(p.search_space) for p in exp.phases)
-            phases = [
-                {
-                    "name": p.name,
-                    "n_trials": p.n_trials,
-                    "sampler": p.sampler.type,
-                    "inherits": p.inherits,
-                    "search_space": sorted(p.search_space),  # keys only, not ranges
-                }
-                for p in exp.phases
-            ]
-            # Already validated at startup; report the structure, never the command.
-            result = {
-                "experiment_id": reg.id,
-                "metric": reg.metric_payload,
-                "capabilities": reg.capabilities,
-                "phases": phases,
+        reg = self._registry.get(experiment_id)
+        self._current_config_bytes(reg)
+        exp = reg.experiment
+        phases = [
+            {
+                "name": p.name,
+                "n_trials": p.n_trials,
+                "sampler": p.sampler.type,
+                "inherits": p.inherits,
+                "search_space": sorted(p.search_space),  # keys only, not ranges
             }
-        except Exception as exc:
-            self._audit_error(TOOL_VALIDATE_CONFIG, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_VALIDATE_CONFIG,
-            args,
-            resolved=resolved,
-            result_counts={
-                "phases": len(phases),
-                "search_space_keys": search_space_keys,
-            },
-        )
-        return result
+            for p in exp.phases
+        ]
+        return {
+            "experiment_id": reg.id,
+            "metric": reg.metric_payload,
+            "capabilities": reg.capabilities,
+            "phases": phases,
+        }
 
     def latest_run(self, experiment_id: str) -> dict[str, Any]:
         """Return the newest durable MCP run for one catalog experiment.
@@ -672,31 +639,14 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog id whose latest run should be resolved.
         :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
         """
-        args = {"experiment_id": experiment_id}
-        resolved: dict[str, Any] = {}
-        try:
-            reg = self._registry.get(experiment_id)
-            resolved["experiment_id"] = reg.id
-            handle = self._runs.latest_run_for(reg.id)
-            run = self._run_payload(handle) if handle is not None else None
-            if handle is not None:
-                resolved["run_id"] = handle.run_id
-            result = {
-                "experiment_id": reg.id,
-                "found": run is not None,
-                "run": run,
-            }
-        except Exception as exc:
-            self._audit_error(TOOL_GET_LATEST_RUN, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_GET_LATEST_RUN,
-            args,
-            resolved=resolved,
-            state_after={"run_state": run["state"]} if run is not None else None,
-            result_counts={"runs": int(run is not None)},
-        )
-        return result
+        reg = self._registry.get(experiment_id)
+        handle = self._runs.latest_run_for(reg.id)
+        run = self._run_payload(handle) if handle is not None else None
+        return {
+            "experiment_id": reg.id,
+            "found": run is not None,
+            "run": run,
+        }
 
     def _run_payload(self, handle: RunHandle) -> dict[str, Any]:
         """Build one agent-visible run state with explicit recovery metadata.
@@ -723,28 +673,11 @@ class PhaseSweepMCP:
         :param str | None run_id: Optional detached run id for run-specific status.
         :return dict: Path-free status payload for the agent.
         """
-        args = {"experiment_id": experiment_id, "run_id": run_id}
-        resolved: dict[str, Any] = {}
-        state_after: dict[str, Any] = {}
-        try:
-            target_id, status, run, handle, result_source, resolved = self._read_status_target(
-                experiment_id=experiment_id,
-                run_id=run_id,
-            )
-            if run is not None:
-                state_after = {"run_state": run["state"]}
-            result = self._status_result(target_id, status, run, handle, result_source)
-        except Exception as exc:
-            self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_GET_STATUS,
-            args,
-            resolved=resolved,
-            state_after=state_after or None,
-            result_counts={"phases": len(result["phases"]), "running_runs": int(run is not None)},
+        target_id, status, run, handle, result_source = self._read_status_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
         )
-        return result
+        return self._status_result(target_id, status, run, handle, result_source)
 
     async def await_run(
         self,
@@ -768,55 +701,42 @@ class PhaseSweepMCP:
             ``reason`` (``recovery_required`` / ``terminal`` /
             ``phase_completed`` / ``timeout``).
         """
-        args = {"run_id": run_id, "timeout_seconds": timeout_seconds}
-        resolved: dict[str, Any] = {}
-        try:
-            timeout = min(
-                AWAIT_MAX_TIMEOUT_SECONDS, max(AWAIT_MIN_TIMEOUT_SECONDS, int(timeout_seconds))
-            )
-            deadline = time.monotonic() + timeout
-            baseline: tuple[Any, ...] | None = None
-            while True:
-                target_id, status, run, handle, result_source, resolved = await asyncio.to_thread(
-                    self._read_status_target,
-                    experiment_id=None,
-                    run_id=run_id,
-                )
-                run = cast(dict[str, Any], run)
-                snapshot = _await_snapshot(
-                    run["state"],
-                    run["recovery_required"],
-                    status,
-                )
-                if baseline is None:
-                    baseline = snapshot
-                if run["recovery_required"]:
-                    reason = "recovery_required"
-                elif run["state"] in ("succeeded", "failed", "cancelled"):
-                    reason = "terminal"
-                elif _phase_gained_winner(baseline, snapshot):
-                    reason = "phase_completed"
-                elif time.monotonic() >= deadline:
-                    reason = "timeout"
-                else:
-                    await asyncio.sleep(
-                        min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
-                    )
-                    continue
-                break
-            result = self._status_result(target_id, status, run, handle, result_source)
-            result["changed"] = snapshot != baseline
-            result["reason"] = reason
-        except Exception as exc:
-            self._audit_error(TOOL_AWAIT_RUN, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_AWAIT_RUN,
-            args,
-            resolved=resolved,
-            state_after={"run_state": run["state"], "await_reason": reason},
-            result_counts={"phases": len(result["phases"])},
+        timeout = min(
+            AWAIT_MAX_TIMEOUT_SECONDS, max(AWAIT_MIN_TIMEOUT_SECONDS, int(timeout_seconds))
         )
+        deadline = time.monotonic() + timeout
+        baseline: tuple[Any, ...] | None = None
+        while True:
+            target_id, status, run, handle, result_source = await asyncio.to_thread(
+                self._read_status_target,
+                experiment_id=None,
+                run_id=run_id,
+            )
+            run = cast(dict[str, Any], run)
+            snapshot = _await_snapshot(
+                run["state"],
+                run["recovery_required"],
+                status,
+            )
+            if baseline is None:
+                baseline = snapshot
+            if run["recovery_required"]:
+                reason = "recovery_required"
+            elif run["state"] in ("succeeded", "failed", "cancelled"):
+                reason = "terminal"
+            elif _phase_gained_winner(baseline, snapshot):
+                reason = "phase_completed"
+            elif time.monotonic() >= deadline:
+                reason = "timeout"
+            else:
+                await asyncio.sleep(
+                    min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
+                )
+                continue
+            break
+        result = self._status_result(target_id, status, run, handle, result_source)
+        result["changed"] = snapshot != baseline
+        result["reason"] = reason
         return result
 
     def _read_status_target(
@@ -830,16 +750,15 @@ class PhaseSweepMCP:
         dict[str, Any] | None,
         RunHandle | None,
         ResultSource,
-        dict[str, Any],
     ]:
         """Resolve a status target and read its current or frozen status payload.
 
         :param str | None experiment_id: Catalog id for a current experiment read.
         :param str | None run_id: Persisted run id for a run-specific read.
         :return tuple: Target id, status data, optional run state and handle,
-            result provenance, and audit-safe resolved ids.
+            and result provenance.
         """
-        target_id, experiment, run, handle, resolved = self._resolve_read_target(
+        target_id, experiment, run, handle = self._resolve_read_target(
             experiment_id=experiment_id,
             run_id=run_id,
             include_run=True,
@@ -849,7 +768,7 @@ class PhaseSweepMCP:
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
-        return target_id, status, run, handle, result_source, resolved
+        return target_id, status, run, handle, result_source
 
     def _status_result(
         self,
@@ -885,14 +804,13 @@ class PhaseSweepMCP:
         experiment_id: str | None,
         run_id: str | None,
         include_run: bool,
-    ) -> tuple[str, Experiment, dict[str, Any] | None, RunHandle | None, dict[str, Any]]:
+    ) -> tuple[str, Experiment, dict[str, Any] | None, RunHandle | None]:
         """Resolve status/winner reads to the catalog config or immutable run snapshot.
 
         :param str | None experiment_id: Catalog id for current experiment-level reads.
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
-        :return tuple: Target id, parsed experiment, optional run payload and
-            handle, and audit-safe resolved ids.
+        :return tuple: Target id, parsed experiment, optional run payload, and handle.
         """
         if (experiment_id is None) == (run_id is None):
             provided = "neither" if experiment_id is None else "both"
@@ -904,22 +822,18 @@ class PhaseSweepMCP:
             handle = self._runs.get(run_id)
             if handle is None:
                 raise UnknownRunError(run_id)
-            resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             experiment = self._load_run_experiment(handle)
             run = None
             if include_run:
                 run = self._run_payload(handle)
-            return handle.experiment_id, experiment, run, handle, resolved
+            return handle.experiment_id, experiment, run, handle
 
         assert experiment_id is not None
         reg = self._registry.get(experiment_id)
         live = self._runs.live_run_for(experiment_id)
-        resolved = {"experiment_id": reg.id}
-        if live is not None:
-            resolved["run_id"] = live.run_id
         experiment = self._load_run_experiment(live) if live is not None else reg.experiment
         run = self._run_payload(live) if include_run and live is not None else None
-        return reg.id, experiment, run, live, resolved
+        return reg.id, experiment, run, live
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -958,49 +872,34 @@ class PhaseSweepMCP:
         :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
-        args = {"experiment_id": experiment_id, "run_id": run_id}
-        resolved: dict[str, Any] = {}
-        try:
-            target_id, experiment, _run, _handle, resolved = self._resolve_read_target(
-                experiment_id=experiment_id,
-                run_id=run_id,
-                include_run=False,
-            )
-            try:
-                visible_params = self._registry.get(target_id).visible_params
-            except UnknownExperimentError:
-                if run_id is None:
-                    raise
-                # A run snapshot remains readable after the operator removes
-                # its catalog entry. Without a current visibility policy,
-                # default to the strict redacted posture.
-                visible_params = "none"
-            snapshot = self._terminal_result_snapshot(_handle) if _handle is not None else None
-            winner_views = (
-                snapshot.winner_views() if snapshot is not None else read_winners(experiment)
-            )
-            result_source: ResultSource = (
-                "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
-            )
-            result = winners_payload(
-                target_id,
-                winner_views,
-                metric={"name": experiment.metric.name, "goal": experiment.metric.goal},
-                declared_phases=[phase.name for phase in experiment.phases],
-                result_source=result_source,
-                run_id=run_id,
-                visible_params=visible_params,
-            )
-        except Exception as exc:
-            self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_GET_WINNERS,
-            args,
-            resolved=resolved,
-            result_counts={"phases": len(result["phases"])},
+        target_id, experiment, _run, handle = self._resolve_read_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            include_run=False,
         )
-        return result
+        try:
+            visible_params = self._registry.get(target_id).visible_params
+        except UnknownExperimentError:
+            if run_id is None:
+                raise
+            # A run snapshot remains readable after the operator removes
+            # its catalog entry. Without a current visibility policy,
+            # default to the strict redacted posture.
+            visible_params = "none"
+        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
+        winner_views = snapshot.winner_views() if snapshot is not None else read_winners(experiment)
+        result_source: ResultSource = (
+            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
+        )
+        return winners_payload(
+            target_id,
+            winner_views,
+            metric={"name": experiment.metric.name, "goal": experiment.metric.goal},
+            declared_phases=[phase.name for phase in experiment.phases],
+            result_source=result_source,
+            run_id=run_id,
+            visible_params=visible_params,
+        )
 
     def _terminal_result_snapshot(self, handle: RunHandle) -> RunResultSnapshot | None:
         """Return a live run's current view or require its frozen terminal snapshot.
