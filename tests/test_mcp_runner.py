@@ -43,7 +43,7 @@ def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
     config.write_text(
         slow_mcp_config_text(
             tmp_path,
-            trainer=REPO / "examples" / "fake_train.py",
+            trainer=REPO / "src" / "phasesweep" / "examples" / "fake_train.py",
             name="cancel_me",
             sleep=sleep,
         )
