@@ -50,8 +50,17 @@ def _construct_mapping_strict(
 
     """
     literal_keys: dict[Any, None] = {}
+    merge_key_seen = False
     for key_node, _value_node in node.value:
         if key_node.tag == "tag:yaml.org,2002:merge":
+            if merge_key_seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found duplicate key '<<'",
+                    key_node.start_mark,
+                )
+            merge_key_seen = True
             continue
         key = loader.construct_object(key_node, deep=deep)
         try:

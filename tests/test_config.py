@@ -181,6 +181,32 @@ phases:
     ]
 
 
+def test_duplicate_yaml_merge_keys_rejected(tmp_path: Path) -> None:
+    body = """
+experiment: t
+storage: ":memory:"
+provenance: {revision: test-fixture-v1}
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
+phases:
+  - &first
+    name: first
+    n_trials: 1
+  - &second
+    name: second
+    n_trials: 2
+  - <<: *first
+    <<: *second
+    name: merged
+"""
+
+    with pytest.raises(ValueError, match=r"duplicate key '<<'"):
+        load_experiment(write_yaml(tmp_path, body))
+
+
 def test_n_jobs_default_is_one(tmp_path):
     body = """
 experiment: t
