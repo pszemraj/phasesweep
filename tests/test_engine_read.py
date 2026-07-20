@@ -110,6 +110,12 @@ def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: st
     assert not path.exists()
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
+    assert status["metric"]["objective_evidence"] == {
+        "kind": "log_regex",
+        "attempt_bound": True,
+        "checkpoint_bound": False,
+        "evaluation_policy_bound": False,
+    }
 
 
 def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None:

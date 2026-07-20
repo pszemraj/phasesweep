@@ -29,6 +29,7 @@ from phasesweep.engine.state import (
     _published_summary_path,
     _published_winner_path,
 )
+from phasesweep.evidence.models import objective_evidence_assurance
 
 
 @dataclass(frozen=True)
@@ -256,7 +257,11 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
     return {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
-        "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
+        "metric": {
+            "name": experiment.metric.name,
+            "goal": experiment.metric.goal,
+            "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+        },
         "phases": _phase_status_payloads(
             experiment,
             include_winner_path=False,

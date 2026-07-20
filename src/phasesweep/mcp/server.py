@@ -30,6 +30,7 @@ from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
+from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
@@ -229,11 +230,21 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ObjectiveEvidencePayload(_ToolPayload):
+    """Assurance properties enforced by the configured objective extractor."""
+
+    kind: Literal["json_envelope", "log_regex", "wandb"]
+    attempt_bound: bool
+    checkpoint_bound: bool
+    evaluation_policy_bound: bool
+
+
 class MetricPayload(_ToolPayload):
     """Optimization metric descriptor."""
 
     name: str = Field(description="Metric key extracted from trial output.")
     goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
+    objective_evidence: ObjectiveEvidencePayload
 
 
 class CapabilitiesPayload(_ToolPayload):
@@ -919,7 +930,11 @@ class PhaseSweepMCP:
         return winners_payload(
             target_id,
             winner_views,
-            metric={"name": experiment.metric.name, "goal": experiment.metric.goal},
+            metric={
+                "name": experiment.metric.name,
+                "goal": experiment.metric.goal,
+                "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+            },
             declared_phases=[phase.name for phase in experiment.phases],
             result_source=result_source,
             run_id=run_id,

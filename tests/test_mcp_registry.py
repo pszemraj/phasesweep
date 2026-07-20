@@ -82,7 +82,16 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     summary = summaries[0]
     assert summary["id"] == "reg_ok"
     assert summary["phases"] == ["warmup", "tune"]
-    assert summary["metric"] == {"name": "loss", "goal": "minimize"}
+    assert summary["metric"] == {
+        "name": "loss",
+        "goal": "minimize",
+        "objective_evidence": {
+            "kind": "json_envelope",
+            "attempt_bound": True,
+            "checkpoint_bound": True,
+            "evaluation_policy_bound": True,
+        },
+    }
     assert summary["capabilities"] == {
         "launch": False,
         "cancel": False,

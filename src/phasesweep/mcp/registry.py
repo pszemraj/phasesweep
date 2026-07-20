@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -165,11 +166,12 @@ class RegisteredExperiment:
         return [phase.name for phase in self.experiment.phases]
 
     @property
-    def metric_payload(self) -> dict[str, str]:
+    def metric_payload(self) -> dict[str, Any]:
         """Return the agent-visible optimization metric descriptor."""
         return {
             "name": self.experiment.metric.name,
             "goal": self.experiment.metric.goal,
+            "objective_evidence": objective_evidence_assurance(self.experiment.metric.extractor),
         }
 
     @property

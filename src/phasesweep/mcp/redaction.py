@@ -42,7 +42,7 @@ def winners_payload(
     experiment_id: str,
     views: list[PhaseWinnerView],
     *,
-    metric: dict[str, str],
+    metric: dict[str, Any],
     declared_phases: list[str],
     result_source: ResultSource,
     run_id: str | None = None,
@@ -57,7 +57,7 @@ def winners_payload(
 
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
-    :param dict[str, str] metric: Optimization metric name and goal.
+    :param dict[str, Any] metric: Optimization metric and objective-evidence assurance.
     :param list[str] declared_phases: All phase names in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.

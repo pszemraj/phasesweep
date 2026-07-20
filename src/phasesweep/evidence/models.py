@@ -121,6 +121,17 @@ ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
 Extractor = JsonExtractor | ObjectiveExtractor
 
 
+def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
+    """Describe which objective-evidence identities the extractor enforces."""
+    envelope = extractor.type == "json_envelope"
+    return {
+        "kind": extractor.type,
+        "attempt_bound": True,
+        "checkpoint_bound": envelope,
+        "evaluation_policy_bound": envelope,
+    }
+
+
 class RequiredFileGate(_TrialPathModel):
     """Require a file to exist under the trial directory."""
 

@@ -21,11 +21,21 @@ class _SnapshotModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
+class ObjectiveEvidenceSnapshot(_SnapshotModel):
+    """Assurance properties of the configured objective extractor."""
+
+    kind: Literal["json_envelope", "log_regex", "wandb"]
+    attempt_bound: bool
+    checkpoint_bound: bool
+    evaluation_policy_bound: bool
+
+
 class MetricSnapshot(_SnapshotModel):
     """Optimization metric stored with a terminal run snapshot."""
 
     name: str
     goal: Literal["minimize", "maximize"]
+    objective_evidence: ObjectiveEvidenceSnapshot
 
 
 class RunningAttemptSnapshot(_SnapshotModel):

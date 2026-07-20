@@ -113,6 +113,12 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
         winners = app.winners(run_id=run_id)
         assert winners["result_source"] == "frozen_run_snapshot"
+        assert winners["metric"]["objective_evidence"] == {
+            "kind": "json_envelope",
+            "attempt_bound": True,
+            "checkpoint_bound": True,
+            "evaluation_policy_bound": True,
+        }
         assert winners["all_phases_have_winners"] is True
         assert winners["missing_phases"] == []
         phases = winners["phases"]
