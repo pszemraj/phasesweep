@@ -54,6 +54,8 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     monkeypatch.setattr(wrapper, "_evaluate_final_checkpoint", fake_evaluate)
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
+    overrides_sha256 = hashlib.sha256(overrides_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", overrides_sha256)
 
     assert (
         wrapper.main(
@@ -84,7 +86,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "generation_id": "generation-test",
         "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
         "overrides": {"learning_rate": 0.001},
-        "overrides_sha256": hashlib.sha256(overrides_path.read_bytes()).hexdigest(),
+        "overrides_sha256": overrides_sha256,
         "schema_version": 1,
         "status": "complete",
         "val_loss": 0.25,
@@ -101,6 +103,8 @@ def test_result_publish_failure_preserves_existing_evidence(tmp_path, monkeypatc
     original = result_path.read_bytes()
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
+    overrides_sha256 = hashlib.sha256(b"{}").hexdigest()
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", overrides_sha256)
 
     def fail_replace(_source: Path, _destination: Path) -> None:
         raise OSError("simulated replace failure")
@@ -110,7 +114,7 @@ def test_result_publish_failure_preserves_existing_evidence(tmp_path, monkeypatc
         wrapper._write_result(
             trial_dir,
             {},
-            hashlib.sha256(b"{}").hexdigest(),
+            overrides_sha256,
             {
                 "checkpoint": "final.pt",
                 "policy": "final_checkpoint",

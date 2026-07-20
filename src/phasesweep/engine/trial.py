@@ -7,6 +7,7 @@ Split into two phases:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -149,6 +150,8 @@ def launch_trial(
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
+    resolved_overrides_path = workdir / "overrides_resolved.json"
+    resolved_overrides_path.write_text(_json_dump_overrides(overrides), encoding="utf-8")
 
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     cmd = render_command(
@@ -161,7 +164,12 @@ def launch_trial(
         run_name=run_name,
     )
 
-    (workdir / "overrides_resolved.json").write_text(_json_dump_overrides(overrides))
+    evidence_overrides_path = (
+        workdir / "overrides.json"
+        if experiment.override_format == "json_file"
+        else resolved_overrides_path
+    )
+    overrides_sha256 = hashlib.sha256(evidence_overrides_path.read_bytes()).hexdigest()
     (workdir / "command.txt").write_text(cmd + "\n")
 
     env = os.environ.copy()
@@ -172,6 +180,7 @@ def launch_trial(
     env["PHASESWEEP_RUN_NAME"] = run_name
     env["PHASESWEEP_GENERATION_ID"] = generation_id
     env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
+    env["PHASESWEEP_OVERRIDES_SHA256"] = overrides_sha256
     env["WANDB_RUN_ID"] = attempt_id
 
     if gpu_id is not None:
@@ -197,6 +206,7 @@ def launch_trial(
         trial_id=trial_id,
         generation_id=generation_id,
         attempt_id=attempt_id,
+        overrides_sha256=overrides_sha256,
         trial_dir=workdir,
         run_name=run_name,
         return_code=proc_result.return_code,

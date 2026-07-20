@@ -74,6 +74,18 @@ class JsonExtractor(_TrialPathModel, _JsonKeyModel):
     key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
 
 
+class JsonEnvelopeExtractor(_TrialPathModel):
+    """Extract a scalar from a versioned, attempt-bound result envelope."""
+
+    type: Literal["json_envelope"]
+    path: str = Field(default="result.json", description="Path relative to trial_dir.")
+    objective_name: str = Field(min_length=1)
+    split: str = Field(min_length=1)
+    policy: str = Field(min_length=1)
+    checkpoint: str | None = Field(default=None, min_length=1)
+    expected_step: int | None = Field(default=None, ge=0)
+
+
 class LogRegexExtractor(_TrialPathModel):
     """Extract a scalar from a log file via regex with a named 'value' group."""
 
@@ -105,7 +117,7 @@ class WandbExtractor(_Frozen):
     timeout_seconds: float = Field(default=120.0, ge=0.0)
 
 
-Extractor = JsonExtractor | LogRegexExtractor | WandbExtractor
+Extractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
 
 
 class RequiredFileGate(_TrialPathModel):

@@ -183,8 +183,11 @@ def _write_result(
 
     generation_id = os.environ.get("PHASESWEEP_GENERATION_ID")
     attempt_id = os.environ.get("PHASESWEEP_ATTEMPT_ID")
+    expected_overrides_sha256 = os.environ.get("PHASESWEEP_OVERRIDES_SHA256")
     if not generation_id or not attempt_id:
         raise ValueError("PhaseSweep generation and attempt IDs are required for result evidence")
+    if not expected_overrides_sha256 or overrides_sha256 != expected_overrides_sha256:
+        raise ValueError("Resolved overrides do not match this PhaseSweep attempt")
 
     result = {
         "attempt_id": attempt_id,

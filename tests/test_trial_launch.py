@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -92,5 +93,6 @@ def test_launch_trial_cuda_environment(
     assert env["CUDA_DEVICE_ORDER"] == expected_order
     assert env["PHASESWEEP_GENERATION_ID"] == "generation-test"
     assert env["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
+    assert env["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
     assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
     assert env["WANDB_RUN_ID"] == "attempt-test"

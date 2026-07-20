@@ -14,9 +14,13 @@ metric:
   name: val_loss
   goal: minimize
   extractor:
-    type: json
+    type: json_envelope
     path: result.json
-    key: val_loss
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+    checkpoint: final.pt
+    expected_step: 1000
 
 phases:
   - name: optimizer_scale

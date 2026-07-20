@@ -150,7 +150,7 @@
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
-# Applied over the parent process environment. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `WANDB_RUN_ID` for every trial.
+# Applied over the parent process environment. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
 
@@ -183,6 +183,15 @@
 # path: str (required)
 # key: str (required)
 # The selected JSON value must be a finite JSON number; strings and booleans are rejected.
+
+# type: Literal["json_envelope"] (required)
+# path: str = "result.json"
+# objective_name: str (required; nonempty)
+# split: str (required; nonempty)
+# policy: str (required; nonempty)
+# checkpoint: str | None = null (nonempty when set)
+# expected_step: int | None = null (>= 0)
+# Requires schema_version=1, status=complete, matching generation/attempt IDs and resolved-overrides digest, a numeric objective value with the configured name/split, and evaluation metadata with the configured policy. Every envelope must identify a checkpoint and non-negative step; checkpoint and step are matched exactly when configured.
 
 # type: Literal["log_regex"] (required)
 # file: str = "stdout.log"

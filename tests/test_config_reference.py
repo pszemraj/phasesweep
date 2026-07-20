@@ -13,6 +13,7 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
     JsonScalarBoundGate,
@@ -35,7 +36,12 @@ _FIELD_DECLARATION = re.compile(r"^# +([a-z][a-z0-9_]*):", re.MULTILINE)
 _SECTION_MODELS = {
     "EXPERIMENT ROOT": (Experiment, Metric, Constraint, Contract, Phase, Sampler),
     "SEARCH PARAMETER OBJECTS": (FloatParam, IntParam, CategoricalParam),
-    "EXTRACTOR OBJECTS": (JsonExtractor, LogRegexExtractor, WandbExtractor),
+    "EXTRACTOR OBJECTS": (
+        JsonExtractor,
+        JsonEnvelopeExtractor,
+        LogRegexExtractor,
+        WandbExtractor,
+    ),
     "GATE OBJECTS": (
         RequiredFileGate,
         JsonEqualsGate,

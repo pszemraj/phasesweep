@@ -8,7 +8,13 @@ from dataclasses import replace
 import pytest
 from pydantic import ValidationError
 
-from phasesweep.config import JsonEqualsGate, JsonExtractor, LogRegexExtractor, WandbExtractor
+from phasesweep.config import (
+    JsonEnvelopeExtractor,
+    JsonEqualsGate,
+    JsonExtractor,
+    LogRegexExtractor,
+    WandbExtractor,
+)
 from phasesweep.evidence import ExtractorError, run_extractor
 from tests.conftest import make_trial_context
 
@@ -98,6 +104,79 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
             (case_dir / filename).write_text(json.dumps(data))
         with pytest.raises(ExtractorError, match=match):
             run_extractor(make_trial_context(case_dir), cfg)
+
+
+def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "generation_id": "generation-test",
+        "attempt_id": "attempt-test",
+        "overrides_sha256": "a" * 64,
+        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
+        "evaluation": {
+            "policy": "final_checkpoint",
+            "checkpoint": "final.pt",
+            "step": 1000,
+        },
+    }
+    (tmp_path / "result.json").write_text(json.dumps(payload))
+    cfg = JsonEnvelopeExtractor(
+        type="json_envelope",
+        path="result.json",
+        objective_name="val_loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="final.pt",
+        expected_step=1000,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("attempt_id",), "prior-attempt", "does not match attempt"),
+        (("generation_id",), "prior-generation", "does not match generation"),
+        (("overrides_sha256",), "b" * 64, "resolved overrides"),
+        (("status",), "failed", "status='complete'"),
+        (("objective", "name"), "train_loss", "objective 'val_loss'"),
+        (("evaluation", "policy"), "last_periodic", "policy 'final_checkpoint'"),
+        (("evaluation", "step"), 900, "step 1000"),
+    ],
+)
+def test_json_envelope_rejects_mismatched_provenance(tmp_path, path, value, match):
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "generation_id": "generation-test",
+        "attempt_id": "attempt-test",
+        "overrides_sha256": "a" * 64,
+        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
+        "evaluation": {
+            "policy": "final_checkpoint",
+            "checkpoint": "final.pt",
+            "step": 1000,
+        },
+    }
+    target = payload
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    (tmp_path / "result.json").write_text(json.dumps(payload))
+    cfg = JsonEnvelopeExtractor(
+        type="json_envelope",
+        path="result.json",
+        objective_name="val_loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="final.pt",
+        expected_step=1000,
+    )
+
+    with pytest.raises(ExtractorError, match=match):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:

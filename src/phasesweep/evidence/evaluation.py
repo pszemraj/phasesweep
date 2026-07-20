@@ -9,12 +9,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Extractor,
     Gate,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
     JsonScalarBoundGate,
@@ -64,6 +65,30 @@ def json_float(value: Any, *, label: str) -> float:
     return float(value)
 
 
+def _reject_nonstandard_json_constant(value: str) -> NoReturn:
+    """Reject NaN and infinity tokens while parsing strict result envelopes.
+
+    :param str value: Non-standard numeric token accepted by Python's JSON parser.
+    :raises ValueError: Always, because the token is not valid JSON evidence.
+    """
+    raise ValueError(f"non-standard numeric constant {value!r}")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate member names.
+
+    :param list[tuple[str, Any]] pairs: Parsed object members in source order.
+    :raises ValueError: If a member name occurs more than once.
+    :return dict[str, Any]: Mapping containing each unique parsed member.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
 class ExtractorError(RuntimeError):
     """Raised when an extractor cannot produce a value (file missing, key missing, etc).
 
@@ -80,6 +105,7 @@ class TrialContext:
     trial_id: int
     generation_id: str
     attempt_id: str
+    overrides_sha256: str
     trial_dir: Path
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
@@ -119,6 +145,85 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
         return json_float(cur, label=cfg.key)
     except ValueError as exc:
         raise ExtractorError(str(exc)) from exc
+
+
+def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> float:
+    """Validate and extract an attempt-bound JSON result envelope.
+
+    :param TrialContext ctx: Current trial identity and resolved-overrides digest.
+    :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
+    :raises ExtractorError: If the envelope is missing, malformed, or belongs to
+        another execution attempt.
+    :return float: Validated objective value from the envelope.
+    """
+    target = ctx.trial_dir / cfg.path
+    try:
+        data = json.loads(
+            target.read_text(),
+            parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except FileNotFoundError as exc:
+        raise ExtractorError(f"JSON envelope not found: {target}") from exc
+    except (JSONDecodeError, ValueError) as exc:
+        raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read JSON envelope at {target}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ExtractorError(f"JSON envelope at {target} must be an object.")
+    if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
+        raise ExtractorError(f"JSON envelope at {target} must use schema_version 1.")
+    if data.get("status") != "complete":
+        raise ExtractorError(f"JSON envelope at {target} must report status='complete'.")
+    if data.get("generation_id") != ctx.generation_id:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match generation {ctx.generation_id!r}."
+        )
+    if data.get("attempt_id") != ctx.attempt_id:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match attempt {ctx.attempt_id!r}."
+        )
+    if data.get("overrides_sha256") != ctx.overrides_sha256:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match this attempt's resolved overrides."
+        )
+
+    objective = data.get("objective")
+    if not isinstance(objective, dict):
+        raise ExtractorError(f"JSON envelope at {target} has no objective object.")
+    if objective.get("name") != cfg.objective_name:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}."
+        )
+    if objective.get("split") != cfg.split:
+        raise ExtractorError(f"JSON envelope at {target} does not report split {cfg.split!r}.")
+
+    evaluation = data.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ExtractorError(f"JSON envelope at {target} has no evaluation object.")
+    if evaluation.get("policy") != cfg.policy:
+        raise ExtractorError(f"JSON envelope at {target} does not report policy {cfg.policy!r}.")
+    checkpoint = evaluation.get("checkpoint")
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise ExtractorError(f"JSON envelope at {target} has no checkpoint identity.")
+    if cfg.checkpoint is not None and checkpoint != cfg.checkpoint:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}."
+        )
+    step = evaluation.get("step")
+    if type(step) is not int or step < 0:
+        raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
+    if cfg.expected_step is not None and step != cfg.expected_step:
+        raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+
+    try:
+        value = json_float(objective.get("value"), label="objective.value")
+    except ValueError as exc:
+        raise ExtractorError(str(exc)) from exc
+    if not math.isfinite(value):
+        raise ExtractorError(f"JSON envelope at {target} has a non-finite objective value.")
+    return value
 
 
 def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
@@ -237,6 +342,7 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {
     JsonExtractor: _extract_json,
+    JsonEnvelopeExtractor: _extract_json_envelope,
     LogRegexExtractor: _extract_log_regex,
     WandbExtractor: _extract_wandb,
 }
