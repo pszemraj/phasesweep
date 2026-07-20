@@ -76,7 +76,7 @@ Missing studies are not created by this recovery read. Reaping every existing ph
 
 phasesweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
-A run always takes same-host `flock`s. By default they live in an owner-only per-user directory under `$XDG_RUNTIME_DIR/phasesweep/locks` or `~/.cache/phasesweep/locks`:
+A run always takes same-host `flock`s. By default they live in the owner-only per-user directory `~/.cache/phasesweep/locks`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.

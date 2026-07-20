@@ -18,18 +18,21 @@ from phasesweep.runtime import files as runtime_files
 from tests.conftest import make_experiment
 
 
-def test_lock_dir_defaults_to_private_xdg_runtime_dir(
+def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir(mode=0o700)
     runtime_dir.chmod(0o700)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
 
     path = runtime_files.lock_dir()
 
-    assert path == runtime_dir / "phasesweep" / "locks"
+    assert path == home / ".cache" / "phasesweep" / "locks"
     assert path.is_dir()
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
 

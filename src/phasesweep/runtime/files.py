@@ -95,24 +95,7 @@ def lock_dir() -> Path:
         _lock_policy(path)
         return path
 
-    runtime_root = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime_root:
-        root = Path(runtime_root)
-        try:
-            root_stat = root.lstat()
-        except OSError:
-            root = Path.home() / ".cache"
-        else:
-            if (
-                not stat.S_ISDIR(root_stat.st_mode)
-                or root_stat.st_uid != os.geteuid()
-                or stat.S_IMODE(root_stat.st_mode) & 0o077
-            ):
-                root = Path.home() / ".cache"
-    else:
-        root = Path.home() / ".cache"
-
-    path = root / "phasesweep" / "locks"
+    path = Path.home() / ".cache" / "phasesweep" / "locks"
     path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
     path.chmod(PRIVATE_DIR_MODE)
     _lock_policy(path)
