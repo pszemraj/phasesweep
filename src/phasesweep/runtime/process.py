@@ -413,7 +413,7 @@ def run_supervised(
     """
     import time
 
-    started = time.time()
+    started = time.monotonic()
 
     # The launch + register + identity-file writes must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
@@ -470,7 +470,7 @@ def run_supervised(
         cleanup_confirmed = _kill_group(target_pgid, proc)
         if pgid is not None:
             _unregister(pgid)
-        duration = time.time() - started
+        duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
             timed_out=False,
@@ -523,7 +523,7 @@ def run_supervised(
             for path in (pid_path, pgid_path, starttime_path):
                 path.unlink(missing_ok=True)
 
-    duration = time.time() - started
+    duration = time.monotonic() - started
     return ProcessResult(
         return_code=proc.returncode if proc.returncode is not None else -9,
         timed_out=timed_out,

@@ -94,6 +94,7 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
             trial_dir=trial_dir,
         )
     assert result.return_code == 0
+    assert result.duration_seconds >= 0.0
     for name in ("pid", "pgid", "pid_starttime"):
         assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
 
