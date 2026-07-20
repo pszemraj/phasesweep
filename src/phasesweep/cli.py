@@ -23,7 +23,7 @@ from phasesweep.engine.guards import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import _winner_path
+from phasesweep.engine.state import _published_winner_path
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
@@ -200,8 +200,8 @@ def show_winners(config_path: Path) -> None:
 def _show_experiment_winners(experiment: Experiment) -> None:
     """Print winner files for one experiment."""
     for p in experiment.phases:
-        wpath = _winner_path(experiment, p.name)
-        if wpath.is_file():
+        wpath = _published_winner_path(experiment, p.name)
+        if wpath is not None and wpath.is_file():
             click.echo(f"=== {p.name} ===")
             # Show design-intent before numerical results so the reader frames
             # them against the original hypothesis instead of the other way around.

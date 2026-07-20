@@ -11,6 +11,12 @@ from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import main as cli_main
+from phasesweep.engine.state import (
+    _generation_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _winner_path,
+)
 from tests.conftest import write_trainer, write_yaml
 
 
@@ -191,6 +197,46 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert result_without.exit_code == 0
     assert "(no winner yet)" in result_without.output
     assert comment_line in result_without.output
+
+
+def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
+    """Mutable compatibility files must not outrank immutable generation results."""
+    config_path = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: p
+            n_trials: 1
+            search_space: {{}}
+        """,
+    )
+    experiment = load_experiment(config_path)
+    immutable = _generation_winner_path(experiment, "successful", "p")
+    immutable.parent.mkdir(parents=True)
+    immutable.write_text("trial_number: 1\n")
+    compatibility = _winner_path(experiment, "p")
+    compatibility.parent.mkdir(parents=True, exist_ok=True)
+    compatibility.write_text("trial_number: 99\n")
+    _last_successful_generation_path(experiment).write_text("generation_id: successful\n")
+    _generation_path(experiment).write_text("generation_id: interrupted\n")
+
+    published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
+
+    assert published.exit_code == 0
+    assert "trial_number: 1" in published.output
+    assert "trial_number: 99" not in published.output
+
+    _last_successful_generation_path(experiment).unlink()
+    unpublished = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
+
+    assert unpublished.exit_code == 0
+    assert "(no winner yet)" in unpublished.output
+    assert "trial_number: 99" not in unpublished.output
 
 
 def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
