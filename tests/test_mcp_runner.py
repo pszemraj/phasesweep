@@ -18,7 +18,7 @@ import optuna
 import pytest
 
 from phasesweep.config import Experiment, Phase, load_config
-from phasesweep.engine import read_status, run_experiment
+from phasesweep.engine import NoFeasibleTrialError, read_status, run_experiment
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     _generation_path,
@@ -31,7 +31,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import _process_group_alive
-from tests.conftest import REPO, make_experiment, write_constant_trainer
+from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import slow_mcp_config_text
 
 pytestmark = pytest.mark.skipif(
@@ -230,6 +230,49 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
     assert current_phase["n_trials"] == 2
     assert current_phase["completed"] == 2
     assert current_phase["generation_trials"] == {"COMPLETE": 1}
+
+
+def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path: Path) -> None:
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        import sys
+
+        if os.environ["PHASESWEEP_PHASE"] == "a":
+            print("x=0.5")
+        else:
+            sys.exit(2)
+        """,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        phases=[
+            Phase(name="a", n_trials=1, search_space={}),
+            Phase(name="b", n_trials=1, max_consecutive_failures=1, search_space={}),
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    def capture_failed(generation_id: str, error: BaseException | None) -> None:
+        assert isinstance(error, NoFeasibleTrialError)
+        captured.update(
+            mcp_runner.capture_result_snapshot(
+                experiment,
+                cleanup_confirmed=True,
+                generation_id=generation_id,
+            )
+        )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment, terminal_callback=capture_failed)
+
+    phases = captured["status"]["phases"]  # type: ignore[index]
+    assert phases[0]["winner_present"] is True
+    assert phases[1]["winner_present"] is False
+    assert [winner["phase"] for winner in captured["winners"]] == ["a"]  # type: ignore[index]
 
 
 def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> None:

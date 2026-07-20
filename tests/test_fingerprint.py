@@ -21,6 +21,7 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
+from phasesweep.engine import read_winners
 from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
 from phasesweep.engine.state import (
     Winner,
@@ -151,6 +152,35 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     assert yaml.safe_load(
         _last_successful_generation_path(experiment).read_text()
     ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
+
+
+def test_interrupted_first_publication_does_not_expose_partial_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
+    run_module = importlib.import_module("phasesweep.engine.run")
+    real_copy = run_module._copy_yaml_projection
+    copied = 0
+
+    def interrupt_after_first_projection(source: Path, destination: Path) -> None:
+        nonlocal copied
+        if copied == 1:
+            raise OSError("publication interrupted")
+        real_copy(source, destination)
+        copied += 1
+
+    monkeypatch.setattr(run_module, "_copy_yaml_projection", interrupt_after_first_projection)
+
+    with pytest.raises(OSError, match="publication interrupted"):
+        run_experiment(experiment)
+
+    assert _winner_path(experiment, "arch").is_file()
+    assert not _last_successful_generation_path(experiment).exists()
+    assert read_winners(experiment) == []
+    with pytest.raises(FileNotFoundError, match="no generation has completed"):
+        _load_winner(experiment, experiment.phases[0], {})
 
 
 def test_fingerprint_changes_when_parent_winner_changes():

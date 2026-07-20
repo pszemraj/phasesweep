@@ -944,7 +944,14 @@ class PhaseSweepMCP:
             # default to the strict redacted posture.
             visible_params = "none"
         snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
-        winner_views = snapshot.winner_views() if snapshot is not None else read_winners(experiment)
+        winner_views = (
+            snapshot.winner_views()
+            if snapshot is not None
+            else read_winners(
+                experiment,
+                generation_id=handle.run_id if handle is not None else None,
+            )
+        )
         represented_generation_id = (
             snapshot.status.generation_id
             if snapshot is not None

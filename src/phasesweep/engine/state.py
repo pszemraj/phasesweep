@@ -206,23 +206,29 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     return generation_id if isinstance(generation_id, str) and generation_id else None
 
 
-def _published_winner_path(experiment: Experiment, phase_name: str) -> Path:
-    """Return the authoritative last-success winner, with legacy fallback."""
+def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | None:
+    """Return the authoritative last-success winner, with legacy fallback.
+
+    Compatibility projections are used only for layouts that predate generation
+    metadata. Once a generation has been published as current, the absence of a
+    last-success pointer means no result has been published yet; a partially
+    copied compatibility file must not become authoritative.
+    """
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
-        path = _generation_winner_path(experiment, generation_id, phase_name)
-        if path.is_file():
-            return path
+        return _generation_winner_path(experiment, generation_id, phase_name)
+    if _generation_path(experiment).is_file():
+        return None
     return _winner_path(experiment, phase_name)
 
 
-def _published_summary_path(experiment: Experiment) -> Path:
+def _published_summary_path(experiment: Experiment) -> Path | None:
     """Return the authoritative last-success summary, with legacy fallback."""
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
-        path = _generation_summary_path(experiment, generation_id)
-        if path.is_file():
-            return path
+        return _generation_summary_path(experiment, generation_id)
+    if _generation_path(experiment).is_file():
+        return None
     return _summary_path(experiment)
 
 
@@ -476,6 +482,10 @@ def _load_winner(
 
     """
     path = _published_winner_path(experiment, phase.name)
+    if path is None:
+        raise FileNotFoundError(
+            f"Winner file missing for phase {phase.name!r}: no generation has completed."
+        )
     if not path.is_file():
         raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
 

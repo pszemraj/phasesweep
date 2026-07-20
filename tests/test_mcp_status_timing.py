@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from phasesweep.engine.optuna import _phase_study_name
-from phasesweep.engine.state import _winner_path
+from phasesweep.engine.state import _generation_winner_path, _winner_path
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
     AWAIT_MAX_TIMEOUT_SECONDS,
@@ -328,7 +328,7 @@ def test_await_run_returns_when_phase_gains_winner(
 
     async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
-        winner = _winner_path(experiment, experiment.phases[0].name)
+        winner = _generation_winner_path(experiment, "r1", experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")
 

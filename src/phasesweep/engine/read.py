@@ -20,12 +20,14 @@ from typing import Any, cast
 import yaml
 
 from phasesweep.config import Experiment
+from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import (
     WinnerSource,
     WinnerSourceKind,
     _generation_path,
-    _last_successful_generation_id,
+    _generation_summary_path,
+    _generation_winner_path,
     _published_summary_path,
     _published_winner_path,
 )
@@ -62,6 +64,7 @@ def _phase_status_payloads(
     trial_counts: Mapping[str, dict[str, int]] | None = None,
     generation_trial_counts: Mapping[str, dict[str, int]] | None = None,
     trial_data_available: Mapping[str, bool] | None = None,
+    generation_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
 
@@ -72,11 +75,17 @@ def _phase_status_payloads(
     :param Mapping[str, bool] | None trial_data_available: Optional storage-read
         availability keyed by phase name. Included only in the path-free status
         view consumed by MCP.
+    :param str | None generation_id: Optional generation whose winner files are represented.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
-        winner_path = _published_winner_path(experiment, phase.name)
+        winner_path = (
+            _published_winner_path(experiment, phase.name)
+            if generation_id is None
+            else _generation_winner_path(experiment, generation_id, phase.name)
+        )
+        winner_present = winner_path is not None and winner_path.is_file()
         counts = (
             _phase_trial_stats(experiment, phase).counts
             if trial_counts is None
@@ -93,13 +102,13 @@ def _phase_status_payloads(
         }
         if include_winner_path:
             payload.update(
-                {"name": phase.name, "winner": str(winner_path) if winner_path.is_file() else None}
+                {"name": phase.name, "winner": str(winner_path) if winner_present else None}
             )
         else:
             payload.update(
                 {
                     "phase": phase.name,
-                    "winner_present": winner_path.is_file(),
+                    "winner_present": winner_present,
                     "trial_data_available": (
                         trial_data_available[phase.name]
                         if trial_data_available is not None
@@ -111,13 +120,19 @@ def _phase_status_payloads(
     return phases
 
 
-def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | None:
+def read_winner(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    generation_id: str | None = None,
+) -> PhaseWinnerView | None:
     """Read a single phase's persisted winner, or ``None`` if not yet written.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used to
             pull the scalar out of the ``metric`` block of ``winner.yaml``.
         phase_name: Phase whose ``winner.yaml`` to read.
+        generation_id: Optional generation whose immutable winner should be read.
 
     Returns:
         A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
@@ -130,8 +145,14 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         relaxed here.
 
     """
-    path = _published_winner_path(experiment, phase_name)
-    if not path.is_file():
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
+    path = (
+        _published_winner_path(experiment, phase_name)
+        if generation_id is None
+        else _generation_winner_path(experiment, generation_id, phase_name)
+    )
+    if path is None or not path.is_file():
         return None
     try:
         loaded = yaml.safe_load(path.read_text())
@@ -212,7 +233,11 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         return None
 
 
-def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
+def read_winners(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+) -> list[PhaseWinnerView]:
     """Read every persisted phase winner, in declared phase order.
 
     Phases without a winner yet are skipped, so the list length tells the
@@ -220,12 +245,18 @@ def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
 
     Args:
         experiment: Parsed experiment config whose phases are read in order.
+        generation_id: Optional generation whose immutable winners should be read.
 
     Returns:
         One :class:`PhaseWinnerView` per phase that has a winner on disk.
 
     """
-    views = (read_winner(experiment, phase.name) for phase in experiment.phases)
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
+    views = (
+        read_winner(experiment, phase.name, generation_id=generation_id)
+        for phase in experiment.phases
+    )
     return [view for view in views if view is not None]
 
 
@@ -255,12 +286,20 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
             generation = yaml.safe_load(_generation_path(experiment).read_text())
             if isinstance(generation, Mapping):
                 raw_generation_id = generation.get("generation_id")
-                if isinstance(raw_generation_id, str) and raw_generation_id:
+                if isinstance(raw_generation_id, str) and SAFE_NAME_PATTERN.fullmatch(
+                    raw_generation_id
+                ):
                     generation_id = raw_generation_id
         except (OSError, yaml.YAMLError):
             pass
+    else:
+        _validate_safe_name("generation", generation_id)
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
-    last_successful_generation_id = _last_successful_generation_id(experiment)
+    summary_path = (
+        _published_summary_path(experiment)
+        if generation_id is None
+        else _generation_summary_path(experiment, generation_id)
+    )
     return {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -278,13 +317,7 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
                 for name, stats in phase_stats.items()
             },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
+            generation_id=generation_id,
         ),
-        "summary_present": (
-            _published_summary_path(experiment).is_file()
-            and (
-                generation_id is None
-                or last_successful_generation_id is None
-                or generation_id == last_successful_generation_id
-            )
-        ),
+        "summary_present": summary_path is not None and summary_path.is_file(),
     }

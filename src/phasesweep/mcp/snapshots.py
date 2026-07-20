@@ -210,7 +210,7 @@ def capture_result_snapshot(
                     }
                 )
         phase_status["running_attempts"] = running_attempts
-    winners = read_winners(experiment)
+    winners = read_winners(experiment, generation_id=status["generation_id"])
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             generation_id=status["generation_id"],

@@ -24,6 +24,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
     _generation_path,
+    _generation_winner_path,
     _trial_dir_for,
     _winner_path,
 )
@@ -251,8 +252,13 @@ def _write_winner_yaml(
     *,
     phase_fingerprint: str,
     incomplete: bool = False,
+    generation_id: str | None = None,
 ) -> None:
-    path = _winner_path(experiment, phase_name)
+    path = (
+        _winner_path(experiment, phase_name)
+        if generation_id is None
+        else _generation_winner_path(experiment, generation_id, phase_name)
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         yaml.safe_dump(
@@ -268,7 +274,7 @@ def _write_winner_yaml(
                     "kind": "phase_trial",
                     "phase": phase_name,
                     "trial_number": 0,
-                    "generation_id": None,
+                    "generation_id": generation_id,
                     "attempt_id": None,
                     "study": None,
                 },
@@ -674,7 +680,12 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
         )
     )
     if method_name == "winners":
-        _write_winner_yaml(exp, "p", phase_fingerprint="0" * 64)
+        _write_winner_yaml(
+            exp,
+            "p",
+            phase_fingerprint="0" * 64,
+            generation_id=run_id,
+        )
     config.write_text(config.read_text().replace("- name: p", "- name: edited"))
 
     restarted_registry = Registry.load(catalog)
@@ -699,17 +710,18 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     old_config = _config(tmp_path, name="old")
     old_exp = load_config(old_config)
     assert isinstance(old_exp, Experiment)
+    run_id = "old-launched"
     _write_winner_yaml(
         old_exp,
         "p",
         phase_fingerprint=_phase_fingerprint(old_exp, old_exp.phases[0], {}),
+        generation_id=run_id,
     )
     other_config = _config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
     )
     snapshot = old_config.read_bytes()
-    run_id = "old-launched"
     store.config_snapshot_path(run_id).write_bytes(snapshot)
     store.save(
         make_run_handle(
