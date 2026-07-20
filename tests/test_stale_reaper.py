@@ -85,6 +85,15 @@ def test_is_same_process_rejects_wrong_starttime():
         assert not is_same_process(pid, st + 999999)
 
 
+def test_is_same_process_rejects_unreadable_current_starttime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda _pid: None)
+
+    assert not is_same_process(12345, saved_starttime=111)
+
+
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
@@ -292,6 +301,45 @@ def test_kill_stale_group_refuses_cleanup_on_pid_reuse_without_pgid(
 
     assert sent is False, "must refuse to advance when PID was reused and no PGID was saved"
     assert calls == [], "no kill signal should have been issued"
+
+
+def test_kill_stale_group_refuses_unreadable_live_pid_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda _pid: None)
+    monkeypatch.setattr("os.getpgid", lambda _pid: 7777)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
+    )
+
+    confirmed = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
+
+    assert confirmed is False
+    assert calls == []
+
+
+def test_kill_stale_group_refuses_unreadable_live_pgid_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._read_proc_stat", lambda _entry: None)
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
+    )
+
+    confirmed = kill_stale_group(pid=None, saved_starttime=111, pgid=12345)
+
+    assert confirmed is False
+    assert calls == []
 
 
 def test_kill_stale_group_refuses_pgid_fallback_when_group_leader_reused(

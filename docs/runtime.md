@@ -59,7 +59,7 @@ If cleanup cannot prove the process group is gone, phasesweep fails closed with 
 Before each reached phase begins, and separately before each skipped phase in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
 
 1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
-2. On Linux, match PID plus process start time to avoid PID-reuse kills. When `/proc` start time is unavailable, use the live PID as a best-effort identity check.
+2. On Linux, match PID plus process start time to avoid PID-reuse kills. A legacy record with no saved start time uses the live PID as a best-effort identity check; when a saved start time exists but the current `/proc` identity is unreadable, cleanup fails closed without signalling.
 3. Fall back to PGID cleanup when the root PID is gone but descendants remain.
 4. Mark the trial `FAIL` only after cleanup is confirmed.
 

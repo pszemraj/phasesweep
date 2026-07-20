@@ -613,8 +613,9 @@ def is_pid_alive(pid: int) -> bool:
 def is_same_process(pid: int, saved_starttime: int | None) -> bool:
     """Check whether `pid` is the same process that recorded `saved_starttime`.
 
-    If starttime verification is unavailable (non-Linux, or no saved starttime),
-    falls back to pid-alive check only (the pre-v0.4 behavior).
+    When no starttime was recorded, this falls back to a PID-alive check. When
+    a starttime was recorded but the current proc entry is unreadable, identity
+    is unknown and this fails closed instead of treating the PID as a match.
 
     Args:
         pid: PID read from a stale ``trial_dir/pid`` file.
@@ -624,7 +625,7 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
     Returns:
         ``True`` if ``pid`` is alive AND (no saved starttime, OR the current
         ``/proc`` starttime matches the saved value). ``False`` if the PID is
-        dead or has been reused by an unrelated process.
+        dead, has been reused by an unrelated process, or cannot be verified.
 
     """
     if not is_pid_alive(pid):
@@ -634,8 +635,7 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
         return True
     current_starttime = read_proc_starttime(pid)
     if current_starttime is None:
-        # Can't read /proc — non-Linux or proc vanished. Fall back.
-        return True
+        return False
     return current_starttime == saved_starttime
 
 
@@ -839,8 +839,8 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool:
-    """Return whether ``pgid`` appears to identify a new group leader.
+def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool | None:
+    """Return whether ``pgid`` identifies a new group leader, or is unverifiable.
 
     A PGID number can later be reused as an ordinary PID in another process
     group; that does not make ``killpg(pgid, ...)`` unsafe because the process
@@ -850,11 +850,14 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
 
     :param int pgid: Stored process-group ID whose leader identity is checked.
     :param int saved_starttime: Starttime recorded for the original group leader.
-    :return bool: ``True`` when ``/proc/<pgid>`` is a group leader of ``pgid``
-        whose starttime differs from the saved value.
+    :return bool | None: ``True`` for a reused leader, ``False`` when no live
+        leader exists or its identity is compatible, and ``None`` when a live
+        leader's proc identity is unreadable.
     """
     stat = _read_proc_stat(Path("/proc") / str(pgid))
-    return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime
+    if stat is None:
+        return None if is_pid_alive(pgid) else False
+    return stat.pgrp == pgid and stat.starttime != saved_starttime
 
 
 def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
@@ -969,7 +972,22 @@ def kill_stale_group(
     target_pgid: int | None = None
 
     if pid is not None:
-        if is_same_process(pid, saved_starttime):
+        pid_alive = is_pid_alive(pid)
+        same_process = False
+        if pid_alive:
+            if saved_starttime is None:
+                same_process = True
+            else:
+                current_starttime = read_proc_starttime(pid)
+                if current_starttime is None:
+                    log.warning(
+                        "PID %d is alive but its /proc start time is unreadable; "
+                        "refusing cleanup because process identity is unknown.",
+                        pid,
+                    )
+                    return False
+                same_process = current_starttime == saved_starttime
+        if same_process:
             try:
                 target_pgid = os.getpgid(pid)
             except ProcessLookupError:
@@ -977,7 +995,7 @@ def kill_stale_group(
             except (PermissionError, OSError) as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
-        elif is_pid_alive(pid) and saved_starttime is not None:
+        elif pid_alive and saved_starttime is not None:
             # PID reuse detected. A persisted PGID can still prove cleanup is
             # complete (group gone) or target original descendants (group alive
             # but not led by the reused PID). Refuse only when the stored PGID
@@ -999,7 +1017,15 @@ def kill_stale_group(
                     pid,
                 )
                 return False
-            if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+            pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
+            if pgid_reused is None:
+                log.warning(
+                    "Stored PGID %d has a live but unreadable leader; refusing "
+                    "PGID fallback because process identity is unknown.",
+                    pgid,
+                )
+                return False
+            if pgid_reused:
                 log.warning(
                     "PID %d is alive but starttime does not match saved value; "
                     "stored PGID %d is led by a different process. Refusing "
@@ -1012,7 +1038,15 @@ def kill_stale_group(
     if target_pgid is None and pgid is not None and saved_starttime is not None:
         if not _process_group_exists(pgid):
             return True
-        if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+        pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
+        if pgid_reused is None:
+            log.warning(
+                "Stored PGID %d has a live but unreadable leader; refusing PGID "
+                "fallback because process identity is unknown.",
+                pgid,
+            )
+            return False
+        if pgid_reused:
             log.warning(
                 "Stored PGID %d is now led by a different process. Refusing "
                 "PGID fallback to avoid killing an unrelated process group "
