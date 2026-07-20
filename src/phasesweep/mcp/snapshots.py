@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
+from phasesweep.engine.optuna import _load_existing_phase_study
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -26,6 +28,14 @@ class MetricSnapshot(_SnapshotModel):
     goal: Literal["minimize", "maximize"]
 
 
+class RunningAttemptSnapshot(_SnapshotModel):
+    """Concrete RUNNING row identity captured with a terminal snapshot."""
+
+    trial_number: NonNegativeInt
+    generation_id: str | None = None
+    attempt_id: str | None = None
+
+
 class PhaseStatusSnapshot(_SnapshotModel):
     """One phase's terminal trial counts and winner presence."""
 
@@ -36,6 +46,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     completed: NonNegativeInt
     winner_present: bool
     trial_data_available: bool
+    running_attempts: list[RunningAttemptSnapshot] = Field(default_factory=list)
 
 
 class StatusSnapshot(_SnapshotModel):
@@ -71,7 +82,10 @@ class RunResultSnapshot(_SnapshotModel):
 
         :return dict[str, Any]: Status mapping accepted by the MCP payload builder.
         """
-        return self.status.model_dump(mode="json")
+        payload = self.status.model_dump(mode="json")
+        for phase in payload["phases"]:
+            phase.pop("running_attempts", None)
+        return payload
 
     def winner_views(self) -> list[PhaseWinnerView]:
         """Return stored winners as the engine view consumed by MCP redaction.
@@ -124,16 +138,26 @@ def capture_result_snapshot(
                 "terminal trial data is unavailable for phase(s) "
                 f"{', '.join(unavailable)}; refusing to freeze ambiguous counts"
             )
-    if cleanup_confirmed:
-        # A signal can escape Optuna before it changes its RUNNING row to FAIL.
-        # Confirmed process cleanup means those trials are terminal in reality;
-        # the normal stale reaper will persist the same transition before a
-        # later resume. Freeze that truthful terminal view for this run now.
-        for phase in status["phases"]:
-            running = phase["trials"].pop("RUNNING", 0)
-            if running:
-                phase["trials"]["FAIL"] = phase["trials"].get("FAIL", 0) + running
-                phase["running"] = 0
+    del cleanup_confirmed
+    phases_by_name = {phase.name: phase for phase in experiment.phases}
+    for phase_status in status["phases"]:
+        phase = phases_by_name[phase_status["phase"]]
+        study = _load_existing_phase_study(experiment, phase)
+        running_attempts: list[dict[str, Any]] = []
+        if study is not None:
+            for trial in study.get_trials(deepcopy=False):
+                if trial.state.name != "RUNNING":
+                    continue
+                generation = trial.user_attrs.get(GENERATION_ID_ATTR)
+                attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+                running_attempts.append(
+                    {
+                        "trial_number": trial.number,
+                        "generation_id": generation if isinstance(generation, str) else None,
+                        "attempt_id": attempt if isinstance(attempt, str) else None,
+                    }
+                )
+        phase_status["running_attempts"] = running_attempts
     winners = read_winners(experiment)
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
@@ -163,6 +187,7 @@ def finalize_result_snapshot(
     snapshot: Mapping[str, object],
     *,
     cleanup_confirmed: bool,
+    confirmed_attempt_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     """Finalize a previously captured snapshot without rereading shared state.
 
@@ -170,14 +195,27 @@ def finalize_result_snapshot(
     :param bool cleanup_confirmed: Whether remaining trainer process groups are confirmed gone.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     """
+    del cleanup_confirmed
     parsed = RunResultSnapshot.model_validate(snapshot)
-    if not cleanup_confirmed:
-        return parsed.model_dump(mode="json")
+    confirmed = set(confirmed_attempt_ids)
     for phase in parsed.status.phases:
-        running = phase.trials.pop("RUNNING", 0)
-        if running:
-            phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + running
-            phase.running = 0
+        recovered = [
+            attempt
+            for attempt in phase.running_attempts
+            if attempt.attempt_id is not None and attempt.attempt_id in confirmed
+        ]
+        if not recovered:
+            continue
+        running = phase.trials.get("RUNNING", 0)
+        if len(recovered) > running:
+            raise RuntimeError("cleanup report identifies more attempts than the snapshot records")
+        phase.trials["RUNNING"] = running - len(recovered)
+        phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
+        phase.running = phase.trials["RUNNING"]
+        recovered_ids = {attempt.attempt_id for attempt in recovered}
+        phase.running_attempts = [
+            attempt for attempt in phase.running_attempts if attempt.attempt_id not in recovered_ids
+        ]
     return parsed.model_dump(mode="json")
 
 

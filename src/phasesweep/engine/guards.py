@@ -14,10 +14,13 @@ import optuna
 
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
-from phasesweep.engine.optuna import _create_phase_study
+from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     Winner,
     _experiment_dir,
@@ -408,12 +411,16 @@ def _reap_stale_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
+    *,
+    recovered_attempt_ids: set[str] | None = None,
 ) -> int:
     """Mark RUNNING trials as FAIL after killing orphaned process groups.
 
     :param optuna.Study study: Study whose stale RUNNING trials should be reaped.
     :param Experiment experiment: Experiment used to locate trial directories.
     :param str phase_name: Name of the phase containing the stale trials.
+    :param set[str] | None recovered_attempt_ids: Optional collector for exact
+        attempt identities whose durable state was changed to FAIL.
     :return int: Number of stale RUNNING trials marked as failed.
     """
     count = 0
@@ -454,9 +461,57 @@ def _reap_stale_trials(
                 f"with an inconsistent study. trial_dir={trial_dir}"
             ) from exc
 
+        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        if recovered_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
+            recovered_attempt_ids.add(attempt_id)
+
         log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
         count += 1
     return count
+
+
+def _validate_study_schema(study: optuna.Study) -> None:
+    """Initialize an empty study or reject populated incompatible storage."""
+    trials = study.get_trials(deepcopy=False)
+    version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
+    if not trials and version is None:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        return
+    if version == STUDY_SCHEMA_VERSION:
+        return
+
+    trial_numbers = [trial.number for trial in trials]
+    detail = "missing" if version is None else repr(version)
+    raise RuntimeError(
+        f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
+        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
+        "Use a new experiment name, or archive/delete the old study before running again."
+    )
+
+
+def _preflight_existing_studies(experiment: Experiment) -> dict[str, optuna.Study]:
+    """Validate and reap every existing declared phase study before launch."""
+    studies: dict[str, optuna.Study] = {}
+    errors: list[BaseException] = []
+    for phase in experiment.phases:
+        study = _load_existing_phase_study(experiment, phase)
+        if study is None:
+            continue
+        studies[phase.name] = study
+        try:
+            _validate_study_schema(study)
+            _reap_stale_trials(study, experiment, phase.name)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        first = errors[0]
+        if len(errors) == 1:
+            raise first
+        raise RuntimeError(
+            "Experiment recovery preflight found multiple unsafe studies: "
+            + "; ".join(str(error) for error in errors)
+        ) from first
+    return studies
 
 
 def _inspect_stale_running_trials(
@@ -630,4 +685,8 @@ def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
     """
     if experiment.storage is None:
         return
-    _reap_stale_trials(_create_phase_study(experiment, phase), experiment, phase.name)
+    study = _load_existing_phase_study(experiment, phase)
+    if study is None:
+        return
+    _validate_study_schema(study)
+    _reap_stale_trials(study, experiment, phase.name)

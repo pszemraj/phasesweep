@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,9 +21,18 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
+from phasesweep.engine import run_experiment
 from phasesweep.engine.guards import _reap_stale_trials
 from phasesweep.engine.phase import _run_phase
-from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_dir_for
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+    TRIAL_DIR_ATTR,
+    _generation_path,
+    _trial_dir_for,
+)
 from phasesweep.runtime.process import (
     StaleProcessIdentity,
     _read_proc_stat,
@@ -121,6 +132,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         direction="minimize",
     )
     study.set_user_attr("phasesweep_fingerprint", "OLD-FINGERPRINT")
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     t = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     # Don't call study.tell — leave it RUNNING.
 
@@ -183,6 +195,105 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         )
     assert reap_called["flag"]
     assert fingerprint_called["flag"]
+
+
+def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) -> None:
+    """A new generation starts only after every existing phase is recovered."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import os
+        from pathlib import Path
+
+        stat_path = Path("/proc") / os.environ["STALE_PID"] / "stat"
+        if stat_path.exists():
+            state = stat_path.read_text().rsplit(")", 1)[1].strip().split()[0]
+            alive = state != "Z"
+        else:
+            alive = False
+        Path(os.environ["PHASESWEEP_TRIAL_DIR"], "orphan_alive.txt").write_text(str(alive))
+        print("metric=1.0")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = Experiment(
+        experiment="cross_phase_orphan",
+        storage=storage,
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"{sys.executable} {trainer}",
+        metric=Metric(
+            name="metric",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=[
+            Phase(name="a", n_trials=1, search_space={}),
+            Phase(name="b", n_trials=2, search_space={}),
+        ],
+    )
+    stale = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        starttime = read_proc_starttime(stale.pid)
+        assert starttime is not None
+        study = optuna.create_study(
+            study_name="cross_phase_orphan::b", storage=storage, direction="minimize"
+        )
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        trial = study.ask()
+        trial_dir = _trial_dir_for(
+            experiment,
+            "b",
+            trial.number,
+            generation_id="old-generation",
+            attempt_id="old-attempt",
+        )
+        trial_dir.mkdir(parents=True)
+        trial.set_user_attr(GENERATION_ID_ATTR, "old-generation")
+        trial.set_user_attr(ATTEMPT_ID_ATTR, "old-attempt")
+        trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+        (trial_dir / "pid").write_text(str(stale.pid))
+        (trial_dir / "pgid").write_text(str(os.getpgid(stale.pid)))
+        (trial_dir / "pid_starttime").write_text(str(starttime))
+
+        experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
+        run_experiment(experiment)
+
+        marker = next(
+            (tmp_path / "runs" / experiment.experiment / "a").glob("trial_*/orphan_alive.txt")
+        )
+        assert marker.read_text() == "False"
+        assert stale.poll() == -signal.SIGTERM
+        assert study.get_trials(deepcopy=False)[trial.number].state == optuna.trial.TrialState.FAIL
+    finally:
+        if stale.poll() is None:
+            os.killpg(stale.pid, signal.SIGKILL)
+        stale.wait(timeout=5)
+
+
+def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) -> None:
+    """Unscoped historical rows never satisfy a current phase budget."""
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        experiment="legacy_trial",
+        storage=storage,
+        workdir=tmp_path / "runs",
+        trial_command=f"{sys.executable} -c \"print('metric=1')\"",
+        metric=Metric(
+            name="metric",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.]+)"),
+        ),
+        phases=[Phase(name="p", n_trials=1, search_space={})],
+    )
+    study = optuna.create_study(study_name="legacy_trial::p", storage=storage, direction="minimize")
+    study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"unsupported phasesweep storage schema missing.*Affected trial numbers: \[0\]",
+    ):
+        run_experiment(experiment)
+
+    assert len(study.get_trials(deepcopy=False)) == 1
+    assert not _generation_path(experiment).exists()
 
 
 def test_kill_stale_group_escalates_to_sigkill(tmp_path):

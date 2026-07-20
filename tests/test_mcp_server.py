@@ -18,8 +18,10 @@ from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
     _generation_path,
     _trial_dir_for,
@@ -79,12 +81,21 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
         direction="minimize",
     )
     trial = study.ask()
-    trial_dir = _trial_dir_for(exp, phase.name, trial.number)
+    attempt_id = f"stale-attempt-{trial.number}"
+    trial_dir = _trial_dir_for(
+        exp,
+        phase.name,
+        trial.number,
+        generation_id="stale-generation",
+        attempt_id=attempt_id,
+    )
     trial_dir.mkdir(parents=True)
     (trial_dir / "pid").write_text("4242\n")
     (trial_dir / "pgid").write_text("4242\n")
     (trial_dir / "pid_starttime").write_text("111\n")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(GENERATION_ID_ATTR, "stale-generation")
+    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     return trial.number
@@ -104,12 +115,21 @@ def _write_stale_running_trial(
         direction="minimize",
     )
     trial = study.ask()
-    trial_dir = _trial_dir_for(exp, phase.name, trial.number)
+    attempt_id = f"stale-attempt-{trial.number}"
+    trial_dir = _trial_dir_for(
+        exp,
+        phase.name,
+        trial.number,
+        generation_id="stale-generation",
+        attempt_id=attempt_id,
+    )
     trial_dir.mkdir(parents=True)
     (trial_dir / "pid").write_text("4343\n")
     (trial_dir / "pgid").write_text("4343\n")
     (trial_dir / "pid_starttime").write_text("222\n")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(GENERATION_ID_ATTR, "stale-generation")
+    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     if cleanup_confirmed is not None:
         trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, cleanup_confirmed)
     return trial.number

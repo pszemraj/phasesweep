@@ -365,6 +365,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 raise click.ClickException("runner process-group cleanup is still uncertain")
 
             reaped = 0
+            reaped_attempt_ids: set[str] = set()
             cleanup_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
@@ -379,7 +380,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                             config,
                             phase.name,
                         )
-                        reaped += _reap_stale_trials(study, config, phase.name)
+                        reaped += _reap_stale_trials(
+                            study,
+                            config,
+                            phase.name,
+                            recovered_attempt_ids=reaped_attempt_ids,
+                        )
                     else:
                         cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
                         reaped += _inspect_stale_running_trials(study, config, phase.name)
@@ -465,6 +471,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                         or cleanup_already_recovered
                         or terminal_status.get("cleanup_confirmed") is True
                     ),
+                    confirmed_attempt_ids=reaped_attempt_ids,
                 )
 
                 click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
@@ -483,6 +490,7 @@ def _finalize_stored_terminal_result_snapshot(
     terminal_status: dict,
     *,
     cleanup_confirmed: bool,
+    confirmed_attempt_ids: set[str],
 ) -> None:
     """Finalize and persist a snapshot captured before the experiment lock was released.
 
@@ -490,6 +498,7 @@ def _finalize_stored_terminal_result_snapshot(
     :param str run_id: Run whose stored terminal snapshot should be finalized.
     :param dict terminal_status: Validated terminal process status to enrich.
     :param bool cleanup_confirmed: Whether RUNNING trials are terminal in reality.
+    :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
     :raises click.ClickException: If the stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -503,10 +512,17 @@ def _finalize_stored_terminal_result_snapshot(
     terminal_status["result_snapshot_state"] = "pending"
     try:
         write_status_file(store.status_path(run_id), terminal_status)
-        terminal_status["result_snapshot"] = finalize_result_snapshot(
-            raw_snapshot,
-            cleanup_confirmed=cleanup_confirmed,
-        )
+        if confirmed_attempt_ids:
+            terminal_status["result_snapshot"] = finalize_result_snapshot(
+                raw_snapshot,
+                cleanup_confirmed=cleanup_confirmed,
+                confirmed_attempt_ids=confirmed_attempt_ids,
+            )
+        else:
+            terminal_status["result_snapshot"] = finalize_result_snapshot(
+                raw_snapshot,
+                cleanup_confirmed=cleanup_confirmed,
+            )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
     except Exception as exc:  # noqa: BLE001 - convert operator repair failures to CLI errors

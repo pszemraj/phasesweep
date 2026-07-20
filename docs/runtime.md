@@ -56,14 +56,14 @@ If cleanup cannot prove the process group is gone, phasesweep fails closed with 
 
 ## Stale trial reaping
 
-Before each reached phase begins, and separately before each skipped phase in `--from-phase`, phasesweep reaps Optuna trials stuck in `RUNNING`:
+Before a new generation is published or any phase begins, phasesweep inspects every declared phase study that already exists and reaps Optuna trials stuck in `RUNNING`:
 
 1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
 2. On Linux, match PID plus process start time to avoid PID-reuse kills. A legacy record with no saved start time uses the live PID as a best-effort identity check; when a saved start time exists but the current `/proc` identity is unreadable, cleanup fails closed without signalling.
 3. Fall back to PGID cleanup when the root PID is gone but descendants remain.
 4. Mark the trial `FAIL` only after cleanup is confirmed.
 
-Reaping runs before fingerprint checks, so a config mismatch cannot leave old GPU-holding processes alive.
+Missing studies are not created by this recovery read. Reaping every existing phase runs before fingerprint checks, so a config mismatch or a later-phase orphan cannot leave old GPU-holding processes alive while earlier work starts.
 
 ## Concurrency model
 
@@ -100,6 +100,8 @@ Each phase study stores a semantic fingerprint. Phase run-control fields are exc
 The payload includes the phasesweep package version; trial command; [override format](config.md#override-formats); environment; metric and constraints; contracts applied by the phase; every remaining phase field, including its name and inheritance declaration; and each inherited winner's effective overrides.
 
 With persistent storage, re-running the same YAML reuses a study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files after stale reaping and fingerprint verification, even when storage is in-memory. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
+
+Persistent studies also carry a PhaseSweep storage-schema version. An empty study can be initialized in place, but a populated study without the current schema is rejected before its rows count toward a trial budget. The error names the study and affected trial numbers; use a new experiment name or archive/delete the incompatible study rather than silently mixing unscoped historical trials.
 
 ## Validation and dry-run
 

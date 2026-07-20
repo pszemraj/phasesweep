@@ -10,7 +10,12 @@ from typing import Any
 from uuid import uuid4
 
 from phasesweep.config import Config, Experiment, Suite
-from phasesweep.engine.guards import _experiment_lock, _reap_skipped_phase, _suite_lock
+from phasesweep.engine.guards import (
+    _experiment_lock,
+    _preflight_existing_studies,
+    _suite_lock,
+    _verify_fingerprint,
+)
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import _phase_status_payloads
 from phasesweep.engine.selection import (
@@ -152,28 +157,44 @@ def run_experiment(
     generation_id = uuid4().hex
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
+        existing_studies: dict[str, Any] = {}
+        generation_prepared = False
         try:
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
                 if from_phase is not None and experiment.timeout_seconds_per_run is not None
                 else None
             )
+            existing_studies = _preflight_existing_studies(experiment)
             preloaded_winners = _preflight_skipped_winners(
                 experiment,
                 from_phase=from_phase,
                 run_deadline=run_deadline,
             )
+            _preflight_reached_fingerprint(
+                experiment,
+                from_phase=from_phase,
+                preloaded_winners=preloaded_winners,
+                existing_studies=existing_studies,
+            )
             _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
+            generation_prepared = True
             return _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
                 dry_run=False,
                 generation_id=generation_id,
                 preloaded_winners=preloaded_winners,
+                existing_studies=existing_studies,
                 run_deadline=run_deadline,
             )
         except BaseException as exc:
             terminal_error = exc
+            if generation_prepared:
+                try:
+                    _preflight_existing_studies(experiment)
+                except BaseException:
+                    log.exception("failed to reconcile all existing studies after run termination")
             raise
         finally:
             if terminal_callback is not None:
@@ -194,6 +215,7 @@ def _run_experiment_inner(
     dry_run: bool,
     generation_id: str | None,
     preloaded_winners: dict[str, Winner] | None = None,
+    existing_studies: dict[str, Any] | None = None,
     run_deadline: float | None = None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
@@ -206,6 +228,7 @@ def _run_experiment_inner(
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
+        existing_studies: Existing studies validated and reaped before launch.
         run_deadline: Optional precomputed whole-run monotonic deadline. Resume
             preflight passes this through so skipped-phase validation consumes
             the same budget as it did before preflight was separated.
@@ -261,6 +284,7 @@ def _run_experiment_inner(
             generation_id=generation_id,
             dry_run=dry_run,
             run_deadline=run_deadline,
+            existing_study=(existing_studies or {}).get(phase.name),
         )
         if not dry_run:
             promoted, promotion_decision = _apply_promotion(experiment, phase, winner, winners)
@@ -329,10 +353,27 @@ def _preflight_skipped_winners(
         if phase.name == from_phase:
             return winners
         inherited = {parent: winners[parent] for parent in phase.inherits}
-        _reap_skipped_phase(experiment, phase)
         winners[phase.name] = _load_winner(experiment, phase, inherited)
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
+
+
+def _preflight_reached_fingerprint(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+    preloaded_winners: dict[str, Winner],
+    existing_studies: dict[str, Any],
+) -> None:
+    """Verify the first reached study before publishing the new generation."""
+    phase = experiment.phases[0]
+    if from_phase is not None:
+        phase = next(item for item in experiment.phases if item.name == from_phase)
+    study = existing_studies.get(phase.name)
+    if study is None:
+        return
+    inherited = {name: preloaded_winners[name] for name in phase.inherits}
+    _verify_fingerprint(study, experiment, phase, inherited)
 
 
 def _prepare_generation(

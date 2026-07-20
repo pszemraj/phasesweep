@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import optuna
 import pytest
 
 from phasesweep.config import Experiment, Phase, load_config
@@ -240,6 +241,32 @@ def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> 
             cleanup_confirmed=False,
             generation_id="failed-new-generation",
         )
+
+
+def test_snapshot_finalization_preserves_unowned_running_trials(tmp_path: Path) -> None:
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        phases=[Phase(name="p", n_trials=1, search_space={})],
+    )
+    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    trial = study.ask()
+    trial.set_user_attr("phasesweep_generation_id", "old-generation")
+    trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
+    generation_path = _generation_path(experiment)
+    generation_path.parent.mkdir(parents=True)
+    generation_path.write_text("generation_id: current-generation\n")
+
+    captured = mcp_runner.capture_result_snapshot(
+        experiment,
+        cleanup_confirmed=False,
+        generation_id="current-generation",
+    )
+    finalized = mcp_runner.finalize_result_snapshot(captured, cleanup_confirmed=True)
+
+    assert finalized == captured
+    assert finalized["status"]["phases"][0]["trials"]["RUNNING"] == 1
+    assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
 def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: Path) -> None:
