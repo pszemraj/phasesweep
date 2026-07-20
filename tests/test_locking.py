@@ -18,47 +18,83 @@ from phasesweep.runtime import files as runtime_files
 from tests.conftest import make_experiment
 
 
-def test_lock_dir_defaults_to_host_stable_root_not_tmpdir(
+def test_lock_dir_defaults_to_private_xdg_runtime_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    job_tmp = tmp_path / "job-tmp"
-    job_tmp.mkdir()
-    default_lock_dir = tmp_path / "host-var-tmp" / "phasesweep-locks"
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir(mode=0o700)
+    runtime_dir.chmod(0o700)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
-    monkeypatch.setenv("TMPDIR", str(job_tmp))
-    monkeypatch.setattr(runtime_files, "_DEFAULT_LOCK_DIR", default_lock_dir)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
 
     path = runtime_files.lock_dir()
 
-    assert path == default_lock_dir
-    assert job_tmp not in path.parents
+    assert path == runtime_dir / "phasesweep" / "locks"
     assert path.is_dir()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o1777
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
 def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     override = tmp_path / "scheduler-shared-locks"
+    override.mkdir(mode=0o700)
+    override.chmod(0o700)
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
 
     path = runtime_files.lock_dir()
 
     assert path == override
     assert path.is_dir()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o1777
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
-def test_lock_dir_preserves_existing_override_permissions(
+def test_lock_dir_rejects_missing_or_unsafe_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     override = tmp_path / "operator-managed-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist"):
+        runtime_files.lock_dir()
+
     override.mkdir()
     override.chmod(0o750)
-    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
+        runtime_files.lock_dir()
 
-    path = runtime_files.lock_dir()
 
-    assert path == override
-    assert stat.S_IMODE(path.stat().st_mode) == 0o750
+def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir(mode=0o700)
+    lock_root.chmod(0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_root))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    (lock_root / "gpu_0.lock").symlink_to(victim)
+
+    from phasesweep.runtime.gpu import GpuDevice, _try_host_gpu_lease
+
+    with pytest.raises(OSError):
+        _try_host_gpu_lease(GpuDevice("0"))
+    assert victim.read_text() == "keep me"
+
+
+def test_lock_open_rejects_hardlinks_and_creates_private_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir(mode=0o700)
+    lock_root.chmod(0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_root))
+
+    handle = runtime_files.try_lock_file(lock_root / "safe.lock")
+    assert handle is not None
+    runtime_files.unlock_file(handle)
+    assert stat.S_IMODE((lock_root / "safe.lock").stat().st_mode) == 0o600
+
+    (lock_root / "linked.lock").hardlink_to(lock_root / "safe.lock")
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="one link"):
+        runtime_files.try_lock_file(lock_root / "linked.lock")
 
 
 def test_run_lock_blocks_even_when_processes_target_different_phases(

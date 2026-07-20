@@ -64,12 +64,20 @@ def fake_home(tmp_path, monkeypatch):
 # --- JSON member edits ---
 
 
-def test_merge_json_member_creates_missing_file(tmp_path):
+def test_merge_json_member_creates_missing_file(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "mcp.json"
+    fsynced: list[Path] = []
+
+    def observe_fsync(directory: Path) -> None:
+        assert path.exists()
+        fsynced.append(directory)
+
+    monkeypatch.setattr(install_edits, "fsync_directory", observe_fsync)
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "created"
     data = json.loads(path.read_text())
     assert data == {"mcpServers": {"phasesweep": ENTRY}}
     assert path.read_text().endswith("\n")
+    assert fsynced == [path.parent]
 
 
 def test_merge_json_member_preserves_data_order_and_indent(tmp_path):

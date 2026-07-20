@@ -69,7 +69,7 @@ Reaping runs before fingerprint checks, so a config mismatch cannot leave old GP
 
 phasesweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
-A run always takes same-host `flock`s under `PHASESWEEP_LOCK_DIR` when set, otherwise `/var/tmp/phasesweep-locks/`:
+A run always takes same-host `flock`s. By default they live in an owner-only per-user directory under `$XDG_RUNTIME_DIR/phasesweep/locks` or `~/.cache/phasesweep/locks`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
@@ -78,9 +78,9 @@ A run always takes same-host `flock`s under `PHASESWEEP_LOCK_DIR` when set, othe
 
 SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. File-backed storage lock identities ignore URL query options, so `sqlite:///x.db?timeout=30` and `sqlite:///x.db` share a lock. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
 
-The lock directory must resolve to one path shared by every cooperating phasesweep process on the host. Schedulers that set a per-job `TMPDIR`, containers with private `/tmp`, and systemd `PrivateTmp` units should set `PHASESWEEP_LOCK_DIR` to a host-shared path such as `/var/tmp/phasesweep-locks` or a site-managed node-local equivalent.
+The private default coordinates every phasesweep process running as the same user. Cross-user coordination is opt-in: an administrator must provision an existing root-owned directory with the scheduler group, setgid and sticky bits, and mode `03770`, then set `PHASESWEEP_LOCK_DIR` for every cooperating process. PhaseSweep validates that directory and creates group-readable/writable `0660` lock files; it never creates or changes a shared namespace itself. An explicit owner-only `0700` directory is also accepted for custom per-user placement.
 
-Upgrade note: older phasesweep builds used the process temp directory for these locks. Existing stale locks under `/tmp` or a scheduler-provided `TMPDIR` are not consulted after the default moves to `/var/tmp/phasesweep-locks`; set `PHASESWEEP_LOCK_DIR` explicitly during a staged upgrade if you need old and new processes to coordinate.
+Upgrade note: older phasesweep builds used `/var/tmp/phasesweep-locks`. Those files are not consulted by the private default; use a validated explicit `PHASESWEEP_LOCK_DIR` during a staged upgrade if old and new processes must coordinate.
 
 CUDA device tokens also take per-device host locks. The policies are:
 

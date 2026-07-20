@@ -31,7 +31,10 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-wide test locks inside each test's temp directory."""
-    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "phasesweep-locks"))
+    lock_dir = tmp_path / "phasesweep-locks"
+    lock_dir.mkdir(mode=0o700)
+    lock_dir.chmod(0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_dir))
 
 
 def copy_fake_train(tmp_path: Path) -> Path:

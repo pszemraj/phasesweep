@@ -7,6 +7,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
@@ -17,9 +18,24 @@ POSIX_RUNTIME_ERROR = (
     "Windows support needs a separate locking and process-tree implementation."
 )
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
-_DEFAULT_LOCK_DIR = Path("/var/tmp") / "phasesweep-locks"
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+SHARED_DIR_MODE = 0o3770
+SHARED_FILE_MODE = 0o660
+
+
+class UnsafeLockPathError(RuntimeError):
+    """Raised when a lock directory or file is not safe to trust."""
+
+
+@dataclass(frozen=True)
+class _LockPolicy:
+    """Ownership and mode expected for one lock namespace."""
+
+    shared: bool
+    uid: int
+    gid: int
+    file_mode: int
 
 
 def require_posix_runtime() -> None:
@@ -63,30 +79,112 @@ def _fcntl_available() -> bool:
 
 
 def lock_dir() -> Path:
-    """Return the shared same-host phasesweep lock directory.
+    """Return the validated same-host phasesweep lock directory.
 
-    ``PHASESWEEP_LOCK_DIR`` can override the location for schedulers,
-    containers, and managed hosts. The default deliberately avoids
-    ``tempfile.gettempdir()`` because job schedulers commonly set per-job
-    ``TMPDIR`` values, which would split the lock namespace and break
-    cross-process GPU/output/storage exclusion.
+    The default is private to the current user. ``PHASESWEEP_LOCK_DIR`` selects
+    an existing operator-provisioned directory and is never created or chmodded
+    by phasesweep.
 
     :return Path: Directory used for host-local lock files.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
-    path = Path(override) if override else _DEFAULT_LOCK_DIR
+    if override:
+        path = Path(override)
+        if not path.is_absolute():
+            raise UnsafeLockPathError(f"{_LOCK_DIR_ENV} must be an absolute path: {path}")
+        _lock_policy(path)
+        return path
+
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_root:
+        root = Path(runtime_root)
+        try:
+            root_stat = root.lstat()
+        except OSError:
+            root = Path.home() / ".cache"
+        else:
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or root_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(root_stat.st_mode) & 0o077
+            ):
+                root = Path.home() / ".cache"
+    else:
+        root = Path.home() / ".cache"
+
+    path = root / "phasesweep" / "locks"
+    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
+    path.chmod(PRIVATE_DIR_MODE)
+    _lock_policy(path)
+    return path
+
+
+def _lock_policy(path: Path) -> _LockPolicy:
+    """Validate a lock directory and return its file-sharing policy."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise UnsafeLockPathError(
+            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}."
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnsafeLockPathError(f"Lock directory {path} must be a real directory, not a symlink.")
+
+    mode = stat.S_IMODE(info.st_mode)
+    euid = os.geteuid()
+    if info.st_uid == euid and mode == PRIVATE_DIR_MODE:
+        return _LockPolicy(False, info.st_uid, info.st_gid, PRIVATE_FILE_MODE)
+
+    groups = {os.getegid(), *os.getgroups()}
+    if info.st_uid == 0 and info.st_gid in groups and mode == SHARED_DIR_MODE:
+        return _LockPolicy(True, info.st_uid, info.st_gid, SHARED_FILE_MODE)
+
+    raise UnsafeLockPathError(
+        f"Unsafe lock directory {path}: expected owner-only mode 0700 owned by uid {euid}, "
+        "or an administrator-owned shared directory with mode 03770 and an accessible group."
+    )
+
+
+def open_lock_file(path: Path) -> IO[str]:
+    """Safely open or create a regular lock file without following links."""
+    require_posix_runtime()
+    policy = _lock_policy(path.parent)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise UnsafeLockPathError("This platform cannot safely open lock files without symlinks.")
+    flags = os.O_RDWR | os.O_CLOEXEC | nofollow
     created = False
     try:
-        path.mkdir(parents=True, exist_ok=False)
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, policy.file_mode)
         created = True
     except FileExistsError:
-        if not path.is_dir():
-            raise
+        fd = os.open(path, flags)
 
-    if override is None or created:
-        with contextlib.suppress(OSError):
-            path.chmod(0o1777)
-    return path
+    try:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise UnsafeLockPathError(f"Lock path {path} must be a regular file with one link.")
+        if policy.shared:
+            if info.st_gid != policy.gid:
+                raise UnsafeLockPathError(
+                    f"Shared lock {path} has gid {info.st_gid}; expected {policy.gid}."
+                )
+        elif info.st_uid != policy.uid:
+            raise UnsafeLockPathError(
+                f"Private lock {path} is owned by uid {info.st_uid}; expected {policy.uid}."
+            )
+        if created:
+            os.fchmod(fd, policy.file_mode)
+            mode = policy.file_mode
+        if mode != policy.file_mode:
+            raise UnsafeLockPathError(
+                f"Lock file {path} has mode {mode:04o}; expected {policy.file_mode:04o}."
+            )
+        return os.fdopen(fd, "r+", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def try_lock_file(path: Path) -> IO[str] | None:
@@ -98,10 +196,7 @@ def try_lock_file(path: Path) -> IO[str] | None:
     require_posix_runtime()
     import fcntl
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Create the file if needed, but preserve holder diagnostics until we own it.
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
-    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    handle = open_lock_file(path)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

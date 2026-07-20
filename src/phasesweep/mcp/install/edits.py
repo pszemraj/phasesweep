@@ -31,7 +31,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Literal, TypeAlias
 
-from phasesweep.runtime.files import lock_dir
+from phasesweep.runtime.files import (
+    UnsafeLockPathError,
+    fsync_directory,
+    lock_dir,
+    open_lock_file,
+)
 from phasesweep.runtime.json import strict_json_loads
 
 Action: TypeAlias = Literal[
@@ -141,18 +146,13 @@ def _locked_editable_text(path: Path) -> Iterator[_TextSnapshot | None]:
     :return Iterator[_TextSnapshot | None]: Stable snapshot while the scoped
         lock is held, or ``None`` when locking or reading is unsafe.
     """
-    fd: int | None = None
     handle: IO[str] | None = None
     try:
-        fd = os.open(_edit_lock_path(path), os.O_RDWR | os.O_CREAT, 0o600)
-        handle = os.fdopen(fd, "a+", encoding="utf-8")
-        fd = None
+        handle = open_lock_file(_edit_lock_path(path))
         fcntl.flock(handle, fcntl.LOCK_EX)
-    except OSError:
+    except (OSError, UnsafeLockPathError):
         if handle is not None:
             handle.close()
-        elif fd is not None:
-            os.close(fd)
         yield None
         return
 
@@ -214,6 +214,7 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> boo
             return False
         os.replace(temporary, path)
         temporary = None
+        fsync_directory(path.parent)
         return True
     except OSError:
         return False
