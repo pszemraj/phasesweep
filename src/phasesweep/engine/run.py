@@ -106,6 +106,7 @@ def run_experiment(
     from_phase: str | None = None,
     dry_run: bool = False,
     terminal_callback: Callable[[str, BaseException | None], None] | None = None,
+    generation_id: str | None = None,
 ) -> dict[str, Winner]:
     """Run all phases in order, returning a map of phase name to Winner.
 
@@ -133,6 +134,8 @@ def run_experiment(
         terminal_callback: Optional synchronous callback invoked with the
             generation id and terminal exception, if any, while the experiment
             lock is still held.
+        generation_id: Optional caller-owned invocation identity. Detached MCP
+            runs use their run id; direct callers receive a generated identity.
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
@@ -163,7 +166,7 @@ def run_experiment(
         )
 
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
-    generation_id = uuid4().hex
+    generation_id = generation_id or uuid4().hex
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
         existing_studies: dict[str, Any] = {}

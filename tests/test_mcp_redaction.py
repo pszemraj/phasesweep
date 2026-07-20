@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
@@ -130,11 +131,29 @@ def test_winners_payload_applies_visible_params_policy(
 def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     payload = winners_payload(
         "exp",
-        [PhaseWinnerView("p1", 2, 0.1, {}, {}, None, False)],
+        [
+            PhaseWinnerView(
+                "p1",
+                2,
+                0.1,
+                {},
+                {},
+                None,
+                False,
+                source=WinnerSource(
+                    kind="phase_trial",
+                    phase="p1",
+                    trial_number=2,
+                    generation_id="generation-old",
+                    attempt_id="attempt-old",
+                ),
+            )
+        ],
         metric={"name": "loss", "goal": "minimize"},
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
         run_id="exp-run",
+        represented_generation_id="generation-new",
     )
 
     assert payload["run_id"] == "exp-run"
@@ -143,3 +162,4 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     assert payload["winner_count"] == 1
     assert payload["missing_phases"] == ["p2"]
     assert payload["all_phases_have_winners"] is False
+    assert payload["phases"][0]["winner_generation"] == "prior_generation"

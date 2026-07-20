@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import warnings
@@ -23,6 +24,7 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
+from phasesweep.engine.state import GENERATION_ID_ATTR
 from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage_backend
 
 
@@ -32,6 +34,7 @@ class _PhaseTrialStats:
 
     counts: dict[str, int]
     available: bool
+    generation_counts: dict[str, dict[str, int]]
 
 
 def _build_sampler(
@@ -258,25 +261,41 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
     if uri is None:
-        return _PhaseTrialStats({}, False)
+        return _PhaseTrialStats({}, False, {})
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
                 """
-                SELECT trials.state, COUNT(*)
+                SELECT trials.state, attrs.value_json, COUNT(*)
                 FROM trials
                 JOIN studies ON trials.study_id = studies.study_id
+                LEFT JOIN trial_user_attributes AS attrs
+                  ON trials.trial_id = attrs.trial_id AND attrs.key = ?
                 WHERE studies.study_name = ?
-                GROUP BY trials.state
+                GROUP BY trials.state, attrs.value_json
                 """,
-                (_phase_study_name(experiment, phase),),
+                (GENERATION_ID_ATTR, _phase_study_name(experiment, phase)),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return _PhaseTrialStats({}, False)
-    return _PhaseTrialStats({str(state): int(count) for state, count in rows}, True)
+        return _PhaseTrialStats({}, False, {})
+    counts: dict[str, int] = {}
+    generation_counts: dict[str, dict[str, int]] = {}
+    for state, value_json, count in rows:
+        state_name = str(state)
+        counts[state_name] = counts.get(state_name, 0) + int(count)
+        if value_json is None:
+            continue
+        try:
+            generation_id = json.loads(value_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(generation_id, str):
+            states = generation_counts.setdefault(generation_id, {})
+            states[state_name] = states.get(state_name, 0) + int(count)
+    return _PhaseTrialStats(counts, True, generation_counts)
 
 
 def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
@@ -287,18 +306,23 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.storage is None:
-        return _PhaseTrialStats({}, False)
+        return _PhaseTrialStats({}, False, {})
     backend = storage_backend(experiment.storage)
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase)
     if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return _PhaseTrialStats({}, False)
+        return _PhaseTrialStats({}, False, {})
     try:
         study = _load_phase_study(experiment, phase)
         trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, False)
+        return _PhaseTrialStats({}, False, {})
     counts: dict[str, int] = {}
+    generation_counts: dict[str, dict[str, int]] = {}
     for trial in trials:
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
-    return _PhaseTrialStats(counts, True)
+        generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
+        if isinstance(generation_id, str):
+            states = generation_counts.setdefault(generation_id, {})
+            states[trial.state.name] = states.get(trial.state.name, 0) + 1
+    return _PhaseTrialStats(counts, True, generation_counts)

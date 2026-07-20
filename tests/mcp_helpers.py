@@ -146,7 +146,7 @@ def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: floa
         status = app.status(run_id=run_id)
         if status["run"]["state"] in {"succeeded", "failed", "cancelled"}:
             return status["run"]["state"]
-        if status["phases"][0]["running"] >= 1:
+        if status["phases"][0]["running_trials_total"] >= 1:
             return "running"
         time.sleep(0.2)
     return "timeout"

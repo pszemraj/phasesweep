@@ -124,6 +124,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         phases = winners["phases"]
         assert [p["phase"] for p in phases] == ["depth", "lr"]
         for p in phases:
+            assert p["winner_generation"] == "current_generation"
             assert isinstance(p["metric"], float)
             assert p["metric"] == p["metric"]  # not NaN
             assert "params" in p
@@ -132,6 +133,12 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         # The chained phase reports only its sampled winner params; inherited
         # fixed/effective values stay out of MCP tool output.
         assert set(phases[1]["params"]) == {"lr"}
+        for phase_status in awaited["phases"]:
+            target = phase_status["target_terminal_trials"]
+            assert phase_status["attempts_launched_this_run"] == target
+            assert phase_status["terminal_trials_this_run"] == target
+            assert phase_status["terminal_trials_before_run"] == 0
+            assert phase_status["target_already_satisfied"] is False
     finally:
         cancel_mcp_run_quietly(app, run_id)
 

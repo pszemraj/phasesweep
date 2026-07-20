@@ -118,7 +118,8 @@ DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
     "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
-    "State counts are dense and terminal_trials/remaining_trials are already computed; "
+    "State counts are dense and explicitly split into cumulative, before-run, and this-run "
+    "dimensions; remaining_trials is already computed. "
     "trial_data_available=false means zero counts are not trustworthy. result_source names "
     "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
@@ -324,16 +325,28 @@ class PhaseStatusPayload(_ToolPayload):
 
     phase: PhaseName
     trials: dict[Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"], int] = Field(
-        description="Dense Optuna trial counts; every state key is always present."
+        description="Dense cumulative study counts; every state key is always present."
     )
-    running: int = Field(ge=0, description="Number of currently running trials.")
-    n_trials: int = Field(ge=0, description="Configured trial budget for this phase.")
-    completed: int = Field(ge=0, description="Trials completed so far in this phase.")
-    terminal_trials: int = Field(
-        ge=0, description="COMPLETE + PRUNED + FAIL attempts already charged to the budget."
+    running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")
+    target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
+    completed_trials_total: int = Field(ge=0, description="Cumulative COMPLETE study rows.")
+    terminal_trials_total: int = Field(
+        ge=0, description="Cumulative COMPLETE + PRUNED + FAIL study rows."
+    )
+    terminal_trials_before_run: int = Field(
+        ge=0, description="Terminal rows that predate the represented generation."
+    )
+    attempts_launched_this_run: int = Field(
+        ge=0, description="All attempts owned by the represented generation."
+    )
+    terminal_trials_this_run: int = Field(
+        ge=0, description="Terminal attempts owned by the represented generation."
     )
     remaining_trials: int = Field(
-        ge=0, description="Configured trial attempts remaining, already computed."
+        ge=0, description="Additional terminal trials needed to reach the configured target."
+    )
+    target_already_satisfied: bool = Field(
+        description="Whether pre-run terminal history already met the configured target."
     )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     trial_data_available: bool = Field(
@@ -405,6 +418,7 @@ class WinnerPhasePayload(_ToolPayload):
 
     phase: PhaseName
     winner_source: WinnerSourcePayload
+    winner_generation: Literal["current_generation", "prior_generation", "unknown"]
     promotion: PromotionOutcomePayload | None = None
     metric: float
     params: dict[str, Any] = Field(
@@ -800,7 +814,14 @@ class PhaseSweepMCP:
             include_run=True,
         )
         snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
-        status = snapshot.status_payload() if snapshot is not None else read_status(experiment)
+        status = (
+            snapshot.status_payload()
+            if snapshot is not None
+            else read_status(
+                experiment,
+                generation_id=handle.run_id if handle is not None else None,
+            )
+        )
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
@@ -924,6 +945,14 @@ class PhaseSweepMCP:
             visible_params = "none"
         snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
         winner_views = snapshot.winner_views() if snapshot is not None else read_winners(experiment)
+        represented_generation_id = (
+            snapshot.status.generation_id
+            if snapshot is not None
+            else read_status(
+                experiment,
+                generation_id=handle.run_id if handle is not None else None,
+            )["generation_id"]
+        )
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
@@ -938,6 +967,7 @@ class PhaseSweepMCP:
             declared_phases=[phase.name for phase in experiment.phases],
             result_source=result_source,
             run_id=run_id,
+            represented_generation_id=represented_generation_id,
             visible_params=visible_params,
         )
 

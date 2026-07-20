@@ -222,12 +222,14 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
     captured_phase = captured["status"]["phases"][0]  # type: ignore[index]
     assert captured_phase["n_trials"] == 1
     assert captured_phase["completed"] == 1
+    assert captured_phase["generation_trials"] == {"COMPLETE": 1}
     current_phase = mcp_runner.capture_result_snapshot(
         top_up,
         cleanup_confirmed=True,
     )["status"]["phases"][0]
     assert current_phase["n_trials"] == 2
     assert current_phase["completed"] == 2
+    assert current_phase["generation_trials"] == {"COMPLETE": 1}
 
 
 def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> None:

@@ -54,6 +54,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     running: NonNegativeInt
     n_trials: NonNegativeInt
     completed: NonNegativeInt
+    generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
     running_attempts: list[RunningAttemptSnapshot] = Field(default_factory=list)

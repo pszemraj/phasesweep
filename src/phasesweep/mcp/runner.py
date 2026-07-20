@@ -222,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             from_phase=args.from_phase,
             dry_run=False,
             terminal_callback=capture_terminal,
+            generation_id=args.run_id,
         )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1

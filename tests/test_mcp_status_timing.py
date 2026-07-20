@@ -104,8 +104,8 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     assert status["run"] is None
     assert status["elapsed_seconds"] is None
     (phase,) = status["phases"]
-    assert phase["n_trials"] == 1
-    assert phase["completed"] == 0
+    assert phase["target_terminal_trials"] == 1
+    assert phase["completed_trials_total"] == 0
     assert phase["trials"] == {
         "WAITING": 0,
         "RUNNING": 0,
@@ -113,7 +113,11 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
         "PRUNED": 0,
         "FAIL": 0,
     }
-    assert phase["terminal_trials"] == 0
+    assert phase["terminal_trials_total"] == 0
+    assert phase["terminal_trials_before_run"] == 0
+    assert phase["attempts_launched_this_run"] == 0
+    assert phase["terminal_trials_this_run"] == 0
+    assert phase["target_already_satisfied"] is False
     assert phase["remaining_trials"] == 1
     assert phase["trial_data_available"] is False
     assert status["result_source"] == "current_shared_study"
@@ -123,8 +127,12 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     _complete_trials(experiment, n=3)
     status = app.status(experiment_id="srv")
     (phase,) = status["phases"]
-    assert phase["completed"] == 3
-    assert phase["terminal_trials"] == 3
+    assert phase["completed_trials_total"] == 3
+    assert phase["terminal_trials_total"] == 3
+    assert phase["terminal_trials_before_run"] == 3
+    assert phase["attempts_launched_this_run"] == 0
+    assert phase["terminal_trials_this_run"] == 0
+    assert phase["target_already_satisfied"] is True
     assert phase["remaining_trials"] == 0
     assert phase["trial_data_available"] is True
 
@@ -147,6 +155,14 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
                 "metric": {"loss": 0.25},
                 "params": {"lr": 0.00025},
                 "effective_overrides": {"lr": 0.00025},
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": "p",
+                    "trial_number": 1,
+                    "generation_id": "prior-generation",
+                    "attempt_id": "attempt-1",
+                    "study": None,
+                },
             }
         )
     )
@@ -165,6 +181,14 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
                 "metric": {"loss": 9.9},
                 "params": {"lr": 0.009},
                 "effective_overrides": {"lr": 0.009},
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": "p",
+                    "trial_number": 9,
+                    "generation_id": "later-generation",
+                    "attempt_id": "attempt-9",
+                    "study": None,
+                },
             }
         )
     )
@@ -177,7 +201,11 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         "PRUNED": 0,
         "FAIL": 1,
     }
-    assert run_status["phases"][0]["terminal_trials"] == 3
+    assert run_status["phases"][0]["terminal_trials_total"] == 3
+    assert run_status["phases"][0]["terminal_trials_before_run"] == 3
+    assert run_status["phases"][0]["attempts_launched_this_run"] == 0
+    assert run_status["phases"][0]["terminal_trials_this_run"] == 0
+    assert run_status["phases"][0]["target_already_satisfied"] is True
     assert run_status["phases"][0]["remaining_trials"] == 0
     assert run_status["result_source"] == "frozen_run_snapshot"
     assert app.winners(run_id="r1")["phases"][0]["metric"] == 0.25

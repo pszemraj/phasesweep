@@ -46,6 +46,7 @@ def winners_payload(
     declared_phases: list[str],
     result_source: ResultSource,
     run_id: str | None = None,
+    represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
 ) -> dict[str, Any]:
     """Build the ``get_winners`` payload from path-free phase-winner views.
@@ -62,6 +63,7 @@ def winners_payload(
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
+    :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
     :return dict[str, Any]: MCP-safe winners payload.
     """
@@ -77,6 +79,14 @@ def winners_payload(
             "trial_number": (source.trial_number if source is not None else view.trial_number),
             "study": source.study if source is not None else None,
         }
+        source_generation_id = source.generation_id if source is not None else view.generation_id
+        winner_generation = (
+            "unknown"
+            if source_generation_id is None or represented_generation_id is None
+            else "current_generation"
+            if source_generation_id == represented_generation_id
+            else "prior_generation"
+        )
         promotion = None
         if view.promotion is not None and view.promotion.get("action") in (
             "promote",
@@ -96,6 +106,7 @@ def winners_payload(
             {
                 "phase": view.phase,
                 "winner_source": winner_source,
+                "winner_generation": winner_generation,
                 "promotion": promotion,
                 "metric": view.metric,
                 "params": params,
@@ -146,13 +157,31 @@ def status_payload(
     for phase in status["phases"]:
         raw_counts = phase["trials"]
         counts = {state: int(raw_counts.get(state, 0)) for state in _TRIAL_STATES}
-        terminal_trials = counts["COMPLETE"] + counts["PRUNED"] + counts["FAIL"]
+        raw_generation_counts = phase.get("generation_trials") or {}
+        generation_counts = {
+            state: int(raw_generation_counts.get(state, 0)) for state in _TRIAL_STATES
+        }
+        terminal_trials_total = counts["COMPLETE"] + counts["PRUNED"] + counts["FAIL"]
+        terminal_trials_this_run = (
+            generation_counts["COMPLETE"] + generation_counts["PRUNED"] + generation_counts["FAIL"]
+        )
+        terminal_trials_before_run = terminal_trials_total - terminal_trials_this_run
+        target_terminal_trials = int(phase["n_trials"])
         phases.append(
             {
-                **phase,
+                "phase": phase["phase"],
                 "trials": counts,
-                "terminal_trials": terminal_trials,
-                "remaining_trials": max(0, int(phase["n_trials"]) - terminal_trials),
+                "running_trials_total": counts["RUNNING"],
+                "target_terminal_trials": target_terminal_trials,
+                "completed_trials_total": counts["COMPLETE"],
+                "terminal_trials_total": terminal_trials_total,
+                "terminal_trials_before_run": terminal_trials_before_run,
+                "attempts_launched_this_run": sum(generation_counts.values()),
+                "terminal_trials_this_run": terminal_trials_this_run,
+                "remaining_trials": max(0, target_terminal_trials - terminal_trials_total),
+                "target_already_satisfied": (terminal_trials_before_run >= target_terminal_trials),
+                "winner_present": phase["winner_present"],
+                "trial_data_available": phase["trial_data_available"],
             }
         )
     return {

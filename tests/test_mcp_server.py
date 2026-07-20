@@ -361,12 +361,14 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         from_phase: str | None,
         dry_run: bool,
         terminal_callback,
+        generation_id: str,
     ) -> None:
+        assert generation_id == run_id
         calls.append((config_obj.experiment, from_phase, dry_run))
         generation_path = _generation_path(config_obj)
         generation_path.parent.mkdir(parents=True, exist_ok=True)
-        generation_path.write_text("generation_id: generation-test\n")
-        terminal_callback("generation-test", None)
+        generation_path.write_text(f"generation_id: {generation_id}\n")
+        terminal_callback(generation_id, None)
 
     monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", fake_run_experiment)
 
@@ -1849,7 +1851,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
         cleanup_confirmed=False,
         result_snapshot=capture_result_snapshot(exp, cleanup_confirmed=False),
     )
-    assert app.status(run_id=run_id)["phases"][0]["running"] == 1
+    assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
 
     runner_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
@@ -1928,7 +1930,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
         "PRUNED": 0,
         "FAIL": 1,
     }
-    assert recovered_status["phases"][0]["running"] == 0
+    assert recovered_status["phases"][0]["running_trials_total"] == 0
     assert runner_cleanup_calls == [(999999, 111, 999999)]
     assert trial_cleanup_calls == [(4343, 222, 4343)]
 

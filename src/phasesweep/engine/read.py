@@ -60,6 +60,7 @@ def _phase_status_payloads(
     *,
     include_winner_path: bool,
     trial_counts: Mapping[str, dict[str, int]] | None = None,
+    generation_trial_counts: Mapping[str, dict[str, int]] | None = None,
     trial_data_available: Mapping[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
@@ -67,6 +68,7 @@ def _phase_status_payloads(
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
     :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
     :param Mapping[str, dict[str, int]] | None trial_counts: Optional pre-read counts keyed by phase name.
+    :param Mapping[str, dict[str, int]] | None generation_trial_counts: Optional counts for the represented generation, keyed by phase name.
     :param Mapping[str, bool] | None trial_data_available: Optional storage-read
         availability keyed by phase name. Included only in the path-free status
         view consumed by MCP.
@@ -85,6 +87,9 @@ def _phase_status_payloads(
             "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
+            "generation_trials": (
+                generation_trial_counts[phase.name] if generation_trial_counts is not None else {}
+            ),
         }
         if include_winner_path:
             payload.update(
@@ -224,7 +229,7 @@ def read_winners(experiment: Experiment) -> list[PhaseWinnerView]:
     return [view for view in views if view is not None]
 
 
-def read_status(experiment: Experiment) -> dict[str, Any]:
+def read_status(experiment: Experiment, *, generation_id: str | None = None) -> dict[str, Any]:
     """Per-phase trial counts and winner presence, with no paths in the output.
 
     Trial counts come from ``_phase_trial_stats``, which reports empty counts
@@ -236,6 +241,8 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
 
     Args:
         experiment: Parsed experiment config whose phases are inspected.
+        generation_id: Optional invocation identity whose trial counts should
+            be separated from cumulative study history.
 
     Returns:
         A path-free mapping with the experiment name, metric descriptor, a
@@ -243,16 +250,16 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
         experiment summary has been written.
 
     """
+    if generation_id is None:
+        try:
+            generation = yaml.safe_load(_generation_path(experiment).read_text())
+            if isinstance(generation, Mapping):
+                raw_generation_id = generation.get("generation_id")
+                if isinstance(raw_generation_id, str) and raw_generation_id:
+                    generation_id = raw_generation_id
+        except (OSError, yaml.YAMLError):
+            pass
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
-    generation_id: str | None = None
-    try:
-        generation = yaml.safe_load(_generation_path(experiment).read_text())
-        if isinstance(generation, Mapping):
-            raw_generation_id = generation.get("generation_id")
-            if isinstance(raw_generation_id, str) and raw_generation_id:
-                generation_id = raw_generation_id
-    except (OSError, yaml.YAMLError):
-        pass
     last_successful_generation_id = _last_successful_generation_id(experiment)
     return {
         "experiment": experiment.experiment,
@@ -266,6 +273,10 @@ def read_status(experiment: Experiment) -> dict[str, Any]:
             experiment,
             include_winner_path=False,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
+            generation_trial_counts={
+                name: stats.generation_counts.get(generation_id, {}) if generation_id else {}
+                for name, stats in phase_stats.items()
+            },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
         ),
         "summary_present": (
