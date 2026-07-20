@@ -35,6 +35,7 @@ from phasesweep.engine.state import (
     RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
+    WinnerSource,
     _phase_dir,
     _trial_dir_for,
     _write_trials_csv,
@@ -554,6 +555,13 @@ def _run_phase(
         phase_fingerprint=phase_fingerprint,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
+        source=WinnerSource(
+            kind="phase_trial",
+            phase=phase.name,
+            trial_number=selected.trial_number,
+            generation_id=selected.generation_id,
+            attempt_id=selected.attempt_id,
+        ),
     )
     return winner
 
@@ -654,4 +662,11 @@ def _placeholder_winner(
             "reason": "dry_run",
             "timeout_scope": None,
         },
+        source=WinnerSource(
+            kind="phase_trial",
+            phase=phase.name,
+            trial_number=-1,
+            generation_id=None,
+            attempt_id=None,
+        ),
     )

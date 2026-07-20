@@ -15,13 +15,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import (
+    WinnerSource,
+    WinnerSourceKind,
     _generation_path,
     _last_successful_generation_id,
     _published_summary_path,
@@ -48,6 +50,8 @@ class PhaseWinnerView:
     incomplete: bool  # True when a wallclock timeout produced a partial winner
     generation_id: str | None = None
     attempt_id: str | None = None
+    source: WinnerSource | None = None
+    promotion: dict[str, Any] | None = None
 
 
 def _phase_status_payloads(
@@ -146,6 +150,33 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
         effective_overrides = data.get("effective_overrides") or {}
         if not isinstance(effective_overrides, Mapping):
             return None
+        source_data = data.get("winner_source")
+        if not isinstance(source_data, Mapping):
+            return None
+        source_kind = source_data.get("kind")
+        if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+            return None
+        source = WinnerSource(
+            kind=cast(WinnerSourceKind, source_kind),
+            phase=str(source_data["phase"]),
+            trial_number=int(source_data["trial_number"]),
+            generation_id=(
+                str(source_data["generation_id"])
+                if isinstance(source_data.get("generation_id"), str)
+                and source_data["generation_id"]
+                else None
+            ),
+            attempt_id=(
+                str(source_data["attempt_id"])
+                if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
+                else None
+            ),
+            study=(
+                str(source_data["study"])
+                if isinstance(source_data.get("study"), str) and source_data["study"]
+                else None
+            ),
+        )
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=int(data["trial_number"]),
@@ -163,6 +194,10 @@ def read_winner(experiment: Experiment, phase_name: str) -> PhaseWinnerView | No
                 str(data["attempt_id"])
                 if isinstance(data.get("attempt_id"), str) and data["attempt_id"]
                 else None
+            ),
+            source=source,
+            promotion=(
+                dict(data["promotion"]) if isinstance(data.get("promotion"), Mapping) else None
             ),
         )
     except (KeyError, ValueError, TypeError, OSError, yaml.YAMLError):

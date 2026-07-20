@@ -70,10 +70,33 @@ def winners_payload(
     phases: list[dict[str, Any]] = []
     for view in views:
         params, redacted = _visible_winner_params(view.params, visible_params)
+        source = view.source
+        winner_source = {
+            "kind": source.kind if source is not None else "phase_trial",
+            "phase": source.phase if source is not None else view.phase,
+            "trial_number": (source.trial_number if source is not None else view.trial_number),
+            "study": source.study if source is not None else None,
+        }
+        promotion = None
+        if view.promotion is not None and view.promotion.get("action") in (
+            "promote",
+            "continue_baseline",
+        ):
+            promotion = {
+                "action": view.promotion["action"],
+                "baseline_phase": view.promotion["baseline"],
+                "candidate_trial_number": view.promotion["candidate_trial_number"],
+                "candidate_metric": view.promotion["candidate_metric"],
+                "baseline_trial_number": view.promotion["baseline_trial_number"],
+                "baseline_metric": view.promotion["baseline_metric"],
+                "min_delta": view.promotion["min_delta"],
+                "improvement": view.promotion["improvement"],
+            }
         phases.append(
             {
                 "phase": view.phase,
-                "trial_number": view.trial_number,
+                "winner_source": winner_source,
+                "promotion": promotion,
                 "metric": view.metric,
                 "params": params,
                 "params_redacted": redacted,

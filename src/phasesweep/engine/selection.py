@@ -17,6 +17,9 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     Winner,
+    WinnerSource,
+    WinnerSourceKind,
+    _winner_source_payload,
     constraint_attr,
 )
 
@@ -173,6 +176,9 @@ def _gates_pass(gates: list[dict[str, Any]]) -> bool:
 def _clone_winner_from_baseline(
     baseline: Winner,
     *,
+    source_kind: WinnerSourceKind,
+    source_phase: str,
+    source_study: str | None = None,
     phase_fingerprint: str | None,
     completion: dict[str, Any] | None = None,
     promotion: dict[str, Any] | None = None,
@@ -180,12 +186,23 @@ def _clone_winner_from_baseline(
     """Clone a baseline winner for exposure under another phase/study.
 
     :param Winner baseline: Winner to copy into the exposed result slot.
+    :param WinnerSourceKind source_kind: Why the baseline supplies this exposure slot.
+    :param str source_phase: Phase containing the baseline source trial.
+    :param str | None source_study: Suite study containing the source trial, if applicable.
     :param str | None phase_fingerprint: Fingerprint to assign to the clone.
     :param dict[str, Any] | None completion: Optional completion payload to
         store instead of the baseline completion.
     :param dict[str, Any] | None promotion: Optional promotion audit payload.
     :return Winner: Cloned winner with copied mutable payloads.
     """
+    baseline_source = baseline.source or WinnerSource(
+        kind="phase_trial",
+        phase=source_phase,
+        trial_number=baseline.trial_number,
+        generation_id=baseline.generation_id,
+        attempt_id=baseline.attempt_id,
+        study=source_study,
+    )
     return Winner(
         trial_number=baseline.trial_number,
         params=dict(baseline.params),
@@ -198,6 +215,14 @@ def _clone_winner_from_baseline(
         phase_fingerprint=phase_fingerprint,
         generation_id=baseline.generation_id,
         attempt_id=baseline.attempt_id,
+        source=WinnerSource(
+            kind=source_kind,
+            phase=baseline_source.phase,
+            trial_number=baseline_source.trial_number,
+            generation_id=baseline_source.generation_id,
+            attempt_id=baseline_source.attempt_id,
+            study=source_study or baseline_source.study,
+        ),
     )
 
 
@@ -258,6 +283,7 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
+        "winner_source": _winner_source_payload(winner, name),
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
@@ -369,6 +395,8 @@ def _apply_promotion(
     return (
         _clone_winner_from_baseline(
             baseline,
+            source_kind="promotion_baseline",
+            source_phase=promotion.min_delta_vs,
             phase_fingerprint=candidate.phase_fingerprint,
             completion=candidate.completion,
             promotion=decision,
@@ -472,6 +500,21 @@ def _apply_study_promotion(
         "gates_passed": gates_passed,
         "promoted": promoted,
         "on_fail": promotion.on_fail,
+        "action": "promote" if promoted else promotion.on_fail,
+        "exposed_source": (
+            "candidate"
+            if promoted
+            else "baseline"
+            if promotion.on_fail == "continue_baseline"
+            else None
+        ),
+        "exposed_trial_number": (
+            candidate.trial_number
+            if promoted
+            else baseline.trial_number
+            if promotion.on_fail == "continue_baseline"
+            else None
+        ),
     }
     if promoted:
         log.info(
@@ -499,6 +542,11 @@ def _apply_study_promotion(
     exposed = dict(study_winners)
     exposed[final_phase] = _clone_winner_from_baseline(
         baseline,
+        source_kind="suite_baseline",
+        source_phase=baseline.source.phase if baseline.source is not None else baseline_label,
+        source_study=baseline_label.partition(".")[0],
         phase_fingerprint=candidate.phase_fingerprint,
+        completion=candidate.completion,
+        promotion=decision,
     )
     return exposed, decision

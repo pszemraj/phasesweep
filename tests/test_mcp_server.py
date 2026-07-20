@@ -264,6 +264,14 @@ def _write_winner_yaml(
                 "effective_overrides": {"lr": 0.001},
                 "completion": {"incomplete": incomplete},
                 "phase_fingerprint": phase_fingerprint,
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": phase_name,
+                    "trial_number": 0,
+                    "generation_id": None,
+                    "attempt_id": None,
+                    "study": None,
+                },
             }
         )
     )

@@ -14,7 +14,7 @@ When the user asks for a recommended next experiment, base it only on MCP output
 
 ## Failed and interrupted runs
 
-- A `failed` or `cancelled` state is terminal. Report the dense per-phase state counts, `terminal_trials`, `remaining_trials`, and any winners returned for completed phases. Do not relaunch automatically.
+- A `failed` or `cancelled` state is terminal. Report the dense per-phase state counts, `terminal_trials`, `remaining_trials`, and any winners returned for completed phases. Use each `winner_source` when identifying its actual phase and trial, especially after `continue_baseline`. Do not relaunch automatically.
 - The MCP tools do not expose trainer logs or a root-cause traceback. If the status and safe tool error do not explain the failure, tell the user that an operator must inspect the run artifacts.
 - Keep the `run_id` in your working context. If you lose it, call `phasesweep_get_latest_run` for the same experiment and reattach to the returned run. If it reports `found: false`, ask the user or operator rather than launching a replacement sweep.
 

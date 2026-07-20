@@ -550,6 +550,14 @@ def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None
                 "completion": {"incomplete": False},
                 "generation_id": "generation-test",
                 "attempt_id": "attempt-test",
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": "p",
+                    "trial_number": 0,
+                    "generation_id": "generation-test",
+                    "attempt_id": "attempt-test",
+                    "study": None,
+                },
             },
             sort_keys=False,
         )

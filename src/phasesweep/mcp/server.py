@@ -128,8 +128,10 @@ DESCRIPTION_GET_STATUS = (
     "the run will not become terminal on its own."
 )
 DESCRIPTION_GET_WINNERS = (
-    "The end of the workflow: per completed phase, the winning trial number, "
-    "metric value, policy-filtered sampled params, gate status, and completeness. "
+    "The end of the workflow: per completed phase, the concrete winner_source, "
+    "promotion context, metric value, policy-filtered sampled params, gate status, and "
+    "completeness. winner_source identifies the actual source phase and trial when "
+    "continue_baseline rejects a candidate. "
     "Phases that completed still report winners when the run later failed or was "
     "cancelled. Values shown as <redacted> are intentional catalog policy, not "
     "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
@@ -365,11 +367,34 @@ class AwaitRunResult(GetStatusResult):
     )
 
 
+class WinnerSourcePayload(_ToolPayload):
+    """Concrete trial that supplies an exposed winner."""
+
+    kind: Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+    phase: PhaseName
+    trial_number: int = Field(ge=0)
+    study: str | None = None
+
+
+class PromotionOutcomePayload(_ToolPayload):
+    """Safe phase-promotion context for an exposed winner."""
+
+    action: Literal["promote", "continue_baseline"]
+    baseline_phase: PhaseName
+    candidate_trial_number: int = Field(ge=0)
+    candidate_metric: float
+    baseline_trial_number: int = Field(ge=0)
+    baseline_metric: float
+    min_delta: float
+    improvement: float | None
+
+
 class WinnerPhasePayload(_ToolPayload):
     """Agent-visible phase winner."""
 
     phase: PhaseName
-    trial_number: int = Field(ge=0)
+    winner_source: WinnerSourcePayload
+    promotion: PromotionOutcomePayload | None = None
     metric: float
     params: dict[str, Any] = Field(
         description=(

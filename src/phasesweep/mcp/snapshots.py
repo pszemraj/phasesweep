@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, WinnerSource
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -58,6 +58,17 @@ class StatusSnapshot(_SnapshotModel):
     summary_present: bool
 
 
+class WinnerSourceSnapshot(_SnapshotModel):
+    """Concrete source trial for an exposed phase winner."""
+
+    kind: Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+    phase: str
+    trial_number: int
+    generation_id: str | None = None
+    attempt_id: str | None = None
+    study: str | None = None
+
+
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
 
@@ -69,6 +80,27 @@ class WinnerSnapshot(_SnapshotModel):
     incomplete: bool
     generation_id: str | None = None
     attempt_id: str | None = None
+    source: WinnerSourceSnapshot
+    promotion: dict[str, Any] | None = None
+
+
+def _winner_source_snapshot(winner: PhaseWinnerView) -> WinnerSourceSnapshot:
+    """Return the concrete source model for a winner view."""
+    source = winner.source or WinnerSource(
+        kind="phase_trial",
+        phase=winner.phase,
+        trial_number=winner.trial_number,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+    )
+    return WinnerSourceSnapshot(
+        kind=source.kind,
+        phase=source.phase,
+        trial_number=source.trial_number,
+        generation_id=source.generation_id,
+        attempt_id=source.attempt_id,
+        study=source.study,
+    )
 
 
 class RunResultSnapshot(_SnapshotModel):
@@ -103,6 +135,15 @@ class RunResultSnapshot(_SnapshotModel):
                 incomplete=winner.incomplete,
                 generation_id=winner.generation_id,
                 attempt_id=winner.attempt_id,
+                source=WinnerSource(
+                    kind=winner.source.kind,
+                    phase=winner.source.phase,
+                    trial_number=winner.source.trial_number,
+                    generation_id=winner.source.generation_id,
+                    attempt_id=winner.source.attempt_id,
+                    study=winner.source.study,
+                ),
+                promotion=winner.promotion,
             )
             for winner in self.winners
         ]
@@ -176,6 +217,8 @@ def capture_result_snapshot(
                 incomplete=winner.incomplete,
                 generation_id=winner.generation_id,
                 attempt_id=winner.attempt_id,
+                source=_winner_source_snapshot(winner),
+                promotion=winner.promotion,
             )
             for winner in winners
         ],

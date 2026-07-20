@@ -50,6 +50,14 @@ def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:
                 "effective_overrides": {"lr": 0.001},
                 "gates": [{"name": "g", "passed": True}],
                 "completion": {"incomplete": False},
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": "p",
+                    "trial_number": 3,
+                    "generation_id": "generation-test",
+                    "attempt_id": "attempt-test",
+                    "study": None,
+                },
             }
         )
     )
@@ -59,6 +67,9 @@ def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:
     assert view.metric == 0.123
     assert view.gates_passed is True
     assert view.incomplete is False
+    assert view.source is not None
+    assert view.source.phase == "p"
+    assert view.source.trial_number == 3
 
 
 @pytest.mark.parametrize(

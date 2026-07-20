@@ -8,13 +8,27 @@ import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.runtime.files import atomic_text_writer
+
+WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+
+
+@dataclass(frozen=True)
+class WinnerSource:
+    """Concrete trial that supplies an exposed winner."""
+
+    kind: WinnerSourceKind
+    phase: str
+    trial_number: int
+    generation_id: str | None
+    attempt_id: str | None
+    study: str | None = None
 
 
 @dataclass
@@ -43,6 +57,7 @@ class Winner:
     phase_fingerprint: str | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
+    source: WinnerSource | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -380,10 +395,30 @@ def _save_winner(
         "phase_fingerprint": winner.phase_fingerprint,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
+        "winner_source": _winner_source_payload(winner, phase_name),
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
     _write_yaml_atomic(path, payload)
+
+
+def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+    """Serialize the concrete source trial for an exposed winner."""
+    source = winner.source or WinnerSource(
+        kind="phase_trial",
+        phase=phase_name,
+        trial_number=winner.trial_number,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+    )
+    return {
+        "kind": source.kind,
+        "phase": source.phase,
+        "trial_number": source.trial_number,
+        "generation_id": source.generation_id,
+        "attempt_id": source.attempt_id,
+        "study": source.study,
+    }
 
 
 def _save_promotion_decision(
@@ -500,8 +535,37 @@ def _load_winner(
         raise RuntimeError(
             f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
         )
+    source_data = data.get("winner_source")
+    if not isinstance(source_data, dict):
+        raise RuntimeError(
+            f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
+        )
+    source_kind = source_data.get("kind")
+    if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+        raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
 
     try:
+        source = WinnerSource(
+            kind=cast(WinnerSourceKind, source_kind),
+            phase=str(source_data["phase"]),
+            trial_number=int(source_data["trial_number"]),
+            generation_id=(
+                str(source_data["generation_id"])
+                if isinstance(source_data.get("generation_id"), str)
+                and source_data["generation_id"]
+                else None
+            ),
+            attempt_id=(
+                str(source_data["attempt_id"])
+                if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
+                else None
+            ),
+            study=(
+                str(source_data["study"])
+                if isinstance(source_data.get("study"), str) and source_data["study"]
+                else None
+            ),
+        )
         return Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
@@ -514,6 +578,7 @@ def _load_winner(
             phase_fingerprint=str(stored_fp),
             generation_id=generation_id,
             attempt_id=attempt_id,
+            source=source,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(

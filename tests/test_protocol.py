@@ -22,9 +22,10 @@ from phasesweep.config import (
     Sha256Gate,
     Suite,
 )
-from phasesweep.engine import run_experiment
+from phasesweep.engine import read_winner, run_experiment
 from phasesweep.engine.state import Winner, _trial_dir_for
 from phasesweep.evidence.evaluation import evaluate_gates
+from phasesweep.mcp.redaction import winners_payload
 from tests.conftest import (
     make_experiment,
     make_trial_context,
@@ -121,6 +122,34 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     assert stored["metric"]["objective"] == pytest.approx(winners["baseline"].metric)
     assert stored["effective_overrides"] == winners["baseline"].effective_overrides
     assert stored["promotion"]["action"] == "continue_baseline"
+    assert stored["phase"] == "candidate"
+    assert stored["winner_source"] == {
+        "kind": "promotion_baseline",
+        "phase": "baseline",
+        "trial_number": winners["baseline"].trial_number,
+        "generation_id": winners["baseline"].generation_id,
+        "attempt_id": winners["baseline"].attempt_id,
+        "study": None,
+    }
+
+    winner_view = read_winner(exp, "candidate")
+    assert winner_view is not None
+    agent_phase = winners_payload(
+        "t",
+        [winner_view],
+        metric={"name": "objective", "goal": "minimize"},
+        declared_phases=["candidate"],
+        result_source="current_shared_study",
+    )["phases"][0]
+    assert "trial_number" not in agent_phase
+    assert agent_phase["winner_source"] == {
+        "kind": "promotion_baseline",
+        "phase": "baseline",
+        "trial_number": winners["baseline"].trial_number,
+        "study": None,
+    }
+    assert agent_phase["promotion"]["candidate_trial_number"] == 0
+    assert agent_phase["promotion"]["action"] == "continue_baseline"
 
     decision = yaml.safe_load(
         (tmp_path / "runs" / "t" / "candidate" / "promotion.yaml").read_text()
@@ -259,6 +288,14 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     first_decision = first_summary["promotion_decisions"][0]
     assert first_summary["studies"][1]["promotion"] == first_decision
     first_baseline = winners["baseline"]["eval"]
+    first_exposed = winners["candidate"]["eval"]
+    assert first_exposed.source is not None
+    assert first_exposed.source.kind == "suite_baseline"
+    assert first_exposed.source.study == "baseline"
+    assert first_exposed.source.phase == "eval"
+    assert first_summary["studies"][1]["phases"][0]["winner_source"]["kind"] == "suite_baseline"
+    assert first_decision["action"] == "continue_baseline"
+    assert first_decision["exposed_source"] == "baseline"
     assert first_decision["candidate_trial_number"] == 0
     assert first_decision["candidate_attempt_id"] != first_baseline.attempt_id
     assert first_decision["baseline_trial_number"] == first_baseline.trial_number
