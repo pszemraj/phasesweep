@@ -203,6 +203,22 @@ class LaunchInProgressError(McpToolError):
         super().__init__("another launch is in progress on this server; retry in a moment")
 
 
+class RunLaunchUnsettledError(McpToolError):
+    """Raised when cancellation has no verified runner identity to target."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create an unsettled-launch cancellation error.
+
+        :param str run_id: Run id whose launch has not published process identity.
+        """
+        super().__init__(
+            f"run {run_id!r} has not finished publishing a verified runner identity, so "
+            "cancellation cannot target it safely. Retry once after a short delay. If "
+            "phasesweep_get_status reports recovery_required, stop retrying and tell the "
+            "user that operator recovery is required."
+        )
+
+
 class ResumeNotReadyError(McpToolError):
     """Raised when ``from_phase`` resume is requested but an earlier winner is unusable."""
 

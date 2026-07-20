@@ -27,7 +27,11 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.mcp.audit import AuditLogger
-from phasesweep.mcp.errors import ConcurrencyLimitError, UnknownExperimentError
+from phasesweep.mcp.errors import (
+    ConcurrencyLimitError,
+    RunLaunchUnsettledError,
+    UnknownExperimentError,
+)
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import main as runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore
@@ -463,6 +467,26 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
 
     assert store.recovery_required(pending)
     assert store.live_runs() == [pending]
+
+
+def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    pending = make_run_handle(
+        run_id="srv-launch-gap",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+        allow_cancel=True,
+    )
+    store.save(pending)
+
+    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+        app.cancel(pending.run_id)
+
+    assert not store.cleanup_uncertain_path(pending.run_id).exists()
+    assert store.recovery_required(pending)
 
 
 @pytest.mark.parametrize(

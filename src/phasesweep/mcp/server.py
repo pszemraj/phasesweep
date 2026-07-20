@@ -43,6 +43,7 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    RunLaunchUnsettledError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
     UnknownExperimentError,
@@ -1171,6 +1172,11 @@ class PhaseSweepMCP:
                 "run_state": before,
                 "recovery_required": recovery_required,
             }
+            if before == "running" and handle.launch_state == "launching":
+                # No PID/PGID is durable yet. Signalling an empty identity and
+                # returning would let the launch continue immediately after a
+                # misleading cancellation response from a second server.
+                raise RunLaunchUnsettledError(run_id)
             if before != "running":
                 result = {
                     "run_id": run_id,
