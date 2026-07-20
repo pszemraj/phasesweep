@@ -267,9 +267,19 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
         registry.get("does-not-exist")
 
 
-def test_invalid_config_raises_catalog_error(tmp_path: Path) -> None:
-    # goal must be minimize/maximize; "sideways" is a Literal violation.
-    bad = _experiment_yaml(tmp_path).replace("goal: minimize", "goal: sideways")
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("goal: minimize", "goal: sideways"),
+        (
+            "n_trials: 2\n    search_space:",
+            "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
+        ),
+    ],
+    ids=["invalid_goal", "unknown_sampler"],
+)
+def test_invalid_config_raises_catalog_error(tmp_path: Path, old: str, new: str) -> None:
+    bad = _experiment_yaml(tmp_path).replace(old, new, 1)
     config = _write(tmp_path / "exp.yaml", bad)
     with pytest.raises(CatalogError, match="invalid config"):
         Registry.load(_catalog(tmp_path, config))
@@ -319,17 +329,6 @@ def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str)
 
     with pytest.raises(CatalogError, match="duplicate key"):
         Registry.load(catalog)
-
-
-def test_unknown_sampler_raises_catalog_error(tmp_path: Path) -> None:
-    bad = _experiment_yaml(tmp_path).replace(
-        "n_trials: 2\n    search_space:",
-        "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
-        1,
-    )
-    config = _write(tmp_path / "exp.yaml", bad)
-    with pytest.raises(CatalogError, match="invalid config"):
-        Registry.load(_catalog(tmp_path, config))
 
 
 def test_suite_config_rejected(tmp_path: Path) -> None:

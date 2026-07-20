@@ -9,35 +9,31 @@ import pytest
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.config import Experiment, load_config
+from phasesweep.config import Experiment, FloatParam, JsonExtractor, Metric, Phase
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.state import _winner_path
+from tests.conftest import make_experiment
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
-    config = tmp_path / "exp.yaml"
-    storage_line = f"storage: {storage}\n" if storage is not None else ""
-    config.write_text(
-        """\
-experiment: read_t
-{storage_line}\
-workdir: {wd}
-trial_command: "python x.py {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
-phases:
-  - name: p
-    n_trials: 1
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-""".format(storage_line=storage_line, wd=tmp_path / "wd")
+    return make_experiment(
+        experiment="read_t",
+        workdir=tmp_path / "wd",
+        storage=storage,
+        trial_command="python x.py {overrides}",
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=JsonExtractor(type="json", path="r.json", key="loss"),
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
+            )
+        ],
     )
-    parsed = load_config(config)
-    assert isinstance(parsed, Experiment)
-    return parsed
 
 
 def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:

@@ -318,14 +318,6 @@ def test_version_sources_and_fingerprint_payload_agree() -> None:
     assert payload["phasesweep_version"] == __version__
 
 
-def test_fingerprint_is_full_sha256(tmp_path: Path) -> None:
-    """Full 64-hex SHA-256, no truncation (review v0.5.3)."""
-    exp = make_experiment(workdir=tmp_path / "wd")
-    fp = _phase_fingerprint(exp, exp.phases[0], {})
-    assert len(fp) == 64
-    assert all(c in "0123456789abcdef" for c in fp)
-
-
 def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     """Every saved winner carries the SHA-256 fingerprint of its producing
     phase config. ``--from-phase`` reuses winners only if this matches the

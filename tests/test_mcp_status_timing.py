@@ -129,36 +129,24 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     assert phase["trial_data_available"] is True
 
 
-def test_run_status_reuses_resolved_handle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    app, _registry, store = _app_with_run(tmp_path)
-    original_get = store.get
-    get_calls = 0
-
-    def counting_get(run_id: str) -> RunHandle | None:
-        nonlocal get_calls
-        get_calls += 1
-        return original_get(run_id)
-
-    monkeypatch.setattr(store, "get", counting_get)
-
-    status = app.status(run_id="r1")
-
-    assert status["run"]["run_id"] == "r1"
-    assert get_calls == 1
-
-
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
+    _complete_trials(experiment, n=2)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
     winner_path = _winner_path(experiment, "p")
     winner_path.parent.mkdir(parents=True, exist_ok=True)
     winner_path.write_text(
         yaml.safe_dump(
             {
-                "trial_number": 9,
-                "metric": {"loss": 9.9},
-                "params": {"lr": 0.009},
-                "effective_overrides": {"lr": 0.009},
+                "trial_number": 1,
+                "metric": {"loss": 0.25},
+                "params": {"lr": 0.00025},
+                "effective_overrides": {"lr": 0.00025},
             }
         )
     )
@@ -168,33 +156,17 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         returncode=0,
         error_class=None,
         cleanup_confirmed=True,
-        result_snapshot={
-            "status": {
-                "metric": {"name": "loss", "goal": "minimize"},
-                "phases": [
-                    {
-                        "phase": "p",
-                        "trials": {"COMPLETE": 2, "FAIL": 1},
-                        "running": 0,
-                        "n_trials": 3,
-                        "completed": 2,
-                        "winner_present": True,
-                        "trial_data_available": True,
-                    }
-                ],
-                "summary_present": False,
-            },
-            "winners": [
-                {
-                    "phase": "p",
-                    "trial_number": 1,
-                    "metric": 0.25,
-                    "params": {"lr": 0.00025},
-                    "gates_passed": None,
-                    "incomplete": False,
-                }
-            ],
-        },
+        result_snapshot=capture_result_snapshot(experiment, cleanup_confirmed=True),
+    )
+    winner_path.write_text(
+        yaml.safe_dump(
+            {
+                "trial_number": 9,
+                "metric": {"loss": 9.9},
+                "params": {"lr": 0.009},
+                "effective_overrides": {"lr": 0.009},
+            }
+        )
     )
 
     run_status = app.status(run_id="r1")

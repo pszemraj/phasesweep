@@ -25,7 +25,13 @@ from phasesweep.config import (
 from phasesweep.engine import run_experiment
 from phasesweep.engine.state import Winner, _trial_dir_for
 from phasesweep.evidence.evaluation import evaluate_gates
-from tests.conftest import make_experiment, make_trial_context, write_trainer, write_yaml
+from tests.conftest import (
+    make_experiment,
+    make_trial_context,
+    write_constant_trainer,
+    write_trainer,
+    write_yaml,
+)
 
 
 def _write_score_trainer(tmp_path: Path) -> Path:
@@ -50,17 +56,7 @@ def _write_score_trainer(tmp_path: Path) -> Path:
 
 def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> None:
     """Contract overrides are immutable trial inputs and contract gates must pass."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, "w") as f:
-            json.dump({"x": 0.5}, f)
-        """,
-    )
+    trainer = write_constant_trainer(tmp_path)
     exp = Experiment(
         experiment="contract_test",
         workdir=str(tmp_path / "runs"),

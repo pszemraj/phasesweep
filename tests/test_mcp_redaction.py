@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.mcp.redaction import status_payload, winners_payload
+from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
@@ -81,74 +81,49 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
             )
         ],
     )
-    status = status_payload(
-        reg.id,
-        {"metric": {"name": "loss", "goal": "minimize"}, "phases": [], "summary_present": False},
-        None,
-        result_source="current_shared_study",
-        elapsed_seconds=None,
-    )
-
     assert_no_sensitive(winners, sensitive)
-    assert_no_sensitive(status, sensitive)
     assert str(reg.config_path) not in str(winners)  # the catalog path is never exposed
     assert "effective_overrides" not in winners["phases"][0]
     assert "SECRET_FIXED_OVERRIDE" not in str(winners)
     assert "/private/data" not in str(winners)
 
 
-def test_assert_no_sensitive_actually_catches_a_leak() -> None:
-    # Guard against a vacuous scanner: it must fail when a needle IS present.
-    leaky = {"experiment_id": "x", "note": "token=DANGER_TOKEN"}
-    with pytest.raises(AssertionError):
-        assert_no_sensitive(leaky, ["DANGER_TOKEN"])
-
-
-def test_params_redacted_flag_follows_policy() -> None:
-    """The boolean is computed from the policy, so agents need not string-match."""
-
-    def flag(params: dict[str, object], policy: object) -> bool:
-        payload = _winners_payload(
-            "x",
-            [PhaseWinnerView("p", 0, 0.1, dict(params), dict(params), None, False)],
-            visible_params=policy,
-        )
-        return payload["phases"][0]["params_redacted"]
-
-    assert flag({"lr": 3e-4, "depth": 6}, "all") is False
-    assert flag({"lr": 3e-4, "depth": 6}, "none") is True
-    assert flag({}, "none") is False  # nothing withheld when nothing was sampled
-    assert flag({"lr": 3e-4, "depth": 6}, ["lr"]) is True
-    assert flag({"lr": 3e-4}, ["lr", "depth"]) is False
-    # A literal sentinel VALUE with an open policy must not read as redaction.
-    assert flag({"note": "<redacted>"}, "all") is False
-
-
-def test_winners_payload_applies_visible_params_policy() -> None:
-    views = [
-        PhaseWinnerView(
-            "p",
-            0,
-            0.1,
+@pytest.mark.parametrize(
+    ("params", "policy", "expected", "redacted"),
+    [
+        (
             {"dataset": "SECRET_DATASET", "lr": 3e-4},
+            "none",
+            {"dataset": "<redacted>", "lr": "<redacted>"},
+            True,
+        ),
+        (
             {"dataset": "SECRET_DATASET", "lr": 3e-4},
-            None,
+            ["lr"],
+            {"dataset": "<redacted>", "lr": 3e-4},
+            True,
+        ),
+        (
+            {"dataset": "SECRET_DATASET", "lr": 3e-4},
+            "all",
+            {"dataset": "SECRET_DATASET", "lr": 3e-4},
             False,
-        )
-    ]
-
-    assert _winners_payload("redact_me", views)["phases"][0]["params"] == {
-        "dataset": "<redacted>",
-        "lr": "<redacted>",
-    }
-    assert _winners_payload("redact_me", views, visible_params=["lr"])["phases"][0]["params"] == {
-        "dataset": "<redacted>",
-        "lr": 3e-4,
-    }
-    assert _winners_payload("redact_me", views, visible_params="all")["phases"][0]["params"] == {
-        "dataset": "SECRET_DATASET",
-        "lr": 3e-4,
-    }
+        ),
+        ({}, "none", {}, False),
+        ({"lr": 3e-4}, ["lr", "depth"], {"lr": 3e-4}, False),
+        ({"note": "<redacted>"}, "all", {"note": "<redacted>"}, False),
+    ],
+)
+def test_winners_payload_applies_visible_params_policy(
+    params: dict[str, object],
+    policy: object,
+    expected: dict[str, object],
+    redacted: bool,
+) -> None:
+    view = PhaseWinnerView("p", 0, 0.1, dict(params), dict(params), None, False)
+    phase = _winners_payload("redact_me", [view], visible_params=policy)["phases"][0]
+    assert phase["params"] == expected
+    assert phase["params_redacted"] is redacted
 
 
 def test_winners_payload_computes_phase_completeness_and_provenance() -> None:

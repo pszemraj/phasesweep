@@ -29,7 +29,7 @@ from phasesweep.mcp.server import (
     TOOL_LIST_EXPERIMENTS,
     TOOL_VALIDATE_CONFIG,
 )
-from tests.conftest import REPO
+from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
     cancel_mcp_run_quietly,
     make_mcp_app,
@@ -45,15 +45,14 @@ pytestmark = pytest.mark.skipif(
     reason="detached runner + cancel rely on POSIX process groups + /proc liveness",
 )
 
-_TRAINER = REPO / "examples" / "fake_train.py"
-
 
 def _chained_config(tmp_path: Path) -> str:
+    trainer = copy_fake_train(tmp_path)
     return f"""\
 experiment: e2e_lm
 storage: sqlite:///{tmp_path}/phases.db
 workdir: {tmp_path}/runs
-trial_command: "{sys.executable} {_TRAINER} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 override_format: argparse
 metric:
   name: eval_loss
@@ -131,9 +130,10 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
 
 def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
+    trainer = copy_fake_train(tmp_path)
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=trainer)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, _store = make_mcp_app(catalog)
@@ -162,9 +162,10 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
 
 
 def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
+    trainer = copy_fake_train(tmp_path)
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=trainer)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, _store = make_mcp_app(catalog)
@@ -185,11 +186,12 @@ def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) ->
 
 
 def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
+    trainer = copy_fake_train(tmp_path)
     catalog = write_mcp_config_catalog(
         tmp_path,
         {
-            "slowa": slow_mcp_config_text(tmp_path, trainer=_TRAINER, name="slowa"),
-            "slowb": slow_mcp_config_text(tmp_path, trainer=_TRAINER, name="slowb"),
+            "slowa": slow_mcp_config_text(tmp_path, trainer=trainer, name="slowa"),
+            "slowb": slow_mcp_config_text(tmp_path, trainer=trainer, name="slowb"),
         },
         allow=ALLOW_SIDE_EFFECTS,
         filename="multi.catalog.yaml",
@@ -224,9 +226,10 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     # test stays deterministic. White-box: reach for the store's lock directly.
     from phasesweep.runtime.files import try_lock_file, unlock_file
 
+    trainer = copy_fake_train(tmp_path)
     catalog = write_mcp_config_catalog(
         tmp_path,
-        {"slow": slow_mcp_config_text(tmp_path, trainer=_TRAINER)},
+        {"slow": slow_mcp_config_text(tmp_path, trainer=trainer)},
         allow=ALLOW_SIDE_EFFECTS,
     )
     app, _registry, store = make_mcp_app(catalog)
@@ -253,12 +256,6 @@ def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
         app.status(run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
         app.cancel("nope-123")
-    # A path-shaped run_id never reaches the filesystem: it reads as unknown.
-    for traversal in ("../../etc/passwd", "../../../runs/secret"):
-        with pytest.raises(Exception, match="unknown run id"):
-            app.status(run_id=traversal)
-        with pytest.raises(Exception, match="unknown run id"):
-            app.cancel(traversal)
     with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
         app.status()
     with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):

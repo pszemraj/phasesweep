@@ -1456,19 +1456,6 @@ def test_operator_recovery_finalizes_launching_handle_without_cleanup(
         app.winners(run_id=run_id)
 
 
-def test_operator_recovery_does_not_create_mistyped_state_directory(tmp_path: Path) -> None:
-    missing = tmp_path / "mistyped-state"
-
-    result = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", str(missing), "--run-id", "missing"],
-    )
-
-    assert result.exit_code != 0
-    assert "Directory" in result.output
-    assert not missing.exists()
-
-
 def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))

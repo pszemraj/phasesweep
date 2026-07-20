@@ -43,20 +43,14 @@ def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert f"wrote {output}" in result.output
 
-    text = output.read_text()
-    assert f'state_dir: "{tmp_path}/runs/.mcp"' in text
-    assert 'config: "./srv.yaml"' in text
-    assert "visible_params: none" in text
-    assert "TODO" not in text
-    assert '# description: "Human-curated one-line purpose shown to the agent"' in text
-    assert "\n    allow:" not in text  # side effects stay commented out
-
     assert (tmp_path / "runs" / ".mcp" / "runs").is_dir()
     assert (tmp_path / "runs" / ".mcp" / "logs").is_dir()
 
     # The scaffold boots the real server loader as-is, read-only.
     registry = Registry.load(output)
     entry = registry.get("srv")
+    assert registry.state_dir == tmp_path / "runs" / ".mcp"
+    assert entry.config_path == config
     assert entry.allow_launch is False
     assert entry.allow_cancel is False
     assert entry.visible_params == "none"

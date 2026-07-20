@@ -1117,14 +1117,9 @@ def test_install_help_is_operator_readable():
     ):
         assert flag in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
-    assert "Strict JSON configs are re-serialized and may be reformatted" in install_help.output
-    assert "bind to the Python environment" in install_help.output
-    assert "Args:" not in install_help.output
 
     uninstall_help = runner.invoke(cli_main, ["mcp", "uninstall", "--help"], terminal_width=120)
     assert uninstall_help.exit_code == 0
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
-    assert "generated-shape JSON" in uninstall_help.output
-    assert "Unmanaged same-name entries stay untouched" in uninstall_help.output

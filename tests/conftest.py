@@ -43,10 +43,12 @@ def copy_fake_train(tmp_path: Path) -> Path:
 
 def make_experiment(
     *,
+    experiment: str = "t",
     workdir: str | Path | None = None,
     storage: str | None = None,
     trial_command: str = "echo {overrides}",
     override_format: str = "argparse",
+    metric: Metric | None = None,
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
@@ -68,10 +70,10 @@ def make_experiment(
         phases = [Phase(**base)]  # type: ignore[arg-type]
 
     kwargs: dict[str, Any] = dict(
-        experiment="t",
+        experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=metric or Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
         phases=phases,
     )
     if workdir is not None:

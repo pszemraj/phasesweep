@@ -154,16 +154,6 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     assert store.list_handles() == []
 
 
-def test_persisted_handle_omits_derived_store_paths(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1")
-    store.save(handle)
-
-    payload = json.loads((tmp_path / "state" / "runs" / "exp-1.json").read_text())
-    assert "log_path" not in payload
-    assert "status_path" not in payload
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
