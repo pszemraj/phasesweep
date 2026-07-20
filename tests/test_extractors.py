@@ -106,6 +106,22 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
             run_extractor(make_trial_context(case_dir), cfg)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"x": 1, "x": 2}',
+        '{"x": NaN}',
+        '{"x": Infinity}',
+    ],
+)
+def test_json_extractor_rejects_ambiguous_nonstandard_json(tmp_path, payload):
+    (tmp_path / "result.json").write_text(payload)
+    cfg = JsonExtractor(type="json", path="result.json", key="x")
+
+    with pytest.raises(ExtractorError, match="Invalid JSON"):
+        run_extractor(make_trial_context(tmp_path), cfg)
+
+
 def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path):
     cases = [
         (

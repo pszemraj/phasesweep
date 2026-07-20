@@ -489,6 +489,60 @@ def test_sha256_gate_streams_file_without_read_bytes(
     assert results[0].passed is True
 
 
+def test_file_metadata_gate_io_failures_are_failed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_path = tmp_path / "model.bin"
+    model_path.write_bytes(b"payload")
+    digest = hashlib.sha256(b"payload").hexdigest()
+    original_open = Path.open
+
+    def fail_model_open(self: Path, *args: object, **kwargs: object):
+        if self == model_path:
+            raise OSError("artifact became unreadable")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_model_open)
+
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [Sha256Gate(type="sha256", path="model.bin", sha256=digest)],
+    )[0]
+
+    assert result.passed is False
+    assert "could not read model.bin" in result.detail
+
+
+def test_artifact_size_io_failure_is_failed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_path = tmp_path / "model.bin"
+    model_path.write_bytes(b"payload")
+    original_stat = Path.stat
+
+    def fail_model_stat(self: Path, *args: object, **kwargs: object):
+        if self == model_path:
+            raise OSError("artifact metadata unavailable")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_model_stat)
+
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [
+            ArtifactSizeGate(
+                type="artifact_size",
+                source="file",
+                path="model.bin",
+                max_bytes=1024,
+            )
+        ],
+    )[0]
+
+    assert result.passed is False
+    assert "could not inspect model.bin" in result.detail
+
+
 def test_json_equals_gate_requires_matching_json_type(tmp_path: Path) -> None:
     """Protocol equality is type-strict; numeric tolerance belongs in scalar bounds."""
     (tmp_path / "result.json").write_text('{"flag": true, "count": 1}')

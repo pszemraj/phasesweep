@@ -43,7 +43,11 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
-    cur = json.loads(target.read_text(encoding="utf-8"))
+    cur = json.loads(
+        target.read_text(encoding="utf-8"),
+        parse_constant=_reject_nonstandard_json_constant,
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -132,12 +136,12 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
         target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key)
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON file not found: {exc.args[0]}") from exc
-    except JSONDecodeError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
     except UnicodeError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
+    except (JSONDecodeError, ValueError) as exc:
+        target = ctx.trial_dir / cfg.path
+        raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
     except OSError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"Could not read JSON at {target}: {exc}") from exc
@@ -456,14 +460,20 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     """
     path = ctx.trial_dir / gate.path
     if gate.source == "file":
-        if not path.is_file():
-            return GateResult(gate.type, False, f"{gate.path} is not a file")
-        size = path.stat().st_size
+        try:
+            if not path.is_file():
+                return GateResult(gate.type, False, f"{gate.path} is not a file")
+            size = path.stat().st_size
+        except OSError as exc:
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} file size"
     elif gate.source == "directory":
-        if not path.is_dir():
-            return GateResult(gate.type, False, f"{gate.path} is not a directory")
-        size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        try:
+            if not path.is_dir():
+                return GateResult(gate.type, False, f"{gate.path} is not a directory")
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        except OSError as exc:
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} directory size"
     else:
         assert gate.key is not None
@@ -492,12 +502,15 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     path = ctx.trial_dir / gate.path
-    if not path.is_file():
-        return GateResult(gate.type, False, f"{gate.path} is missing")
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
+    try:
+        if not path.is_file():
+            return GateResult(gate.type, False, f"{gate.path} is missing")
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError as exc:
+        return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
     digest = hasher.hexdigest()
     if digest == gate.sha256:
         return GateResult(gate.type, True, f"{gate.path} sha256 matched")
