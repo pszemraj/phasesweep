@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -13,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from phasesweep.runtime.files import atomic_write_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "upstream"
@@ -46,44 +52,160 @@ def _read_yaml_mapping(path: Path) -> dict[str, Any]:
     return data
 
 
-def _read_json_mapping(path: Path) -> dict[str, Any]:
-    """Read a JSON file and require a top-level mapping."""
-    data = json.loads(path.read_text())
+def _read_json_mapping(path: Path) -> tuple[dict[str, Any], str]:
+    """Read a JSON mapping and hash the exact bytes supplied by PhaseSweep."""
+    raw = path.read_bytes()
+    data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
 
 
-def _last_metric(metrics_path: Path) -> dict[str, Any]:
-    """Read the last JSONL metric record emitted by the trainer."""
-    last: dict[str, Any] | None = None
-    with metrics_path.open() as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError(f"{metrics_path} contains a non-object JSONL record")
-                last = record
-    if last is None:
-        raise ValueError(f"{metrics_path} did not contain any metric records")
-    return last
+def _load_upstream_trainer(template_root: Path) -> Any:
+    """Load the pinned trainer module so final evaluation reuses its data utilities."""
+    train_py = template_root / "train.py"
+    if not train_py.is_file():
+        raise FileNotFoundError(
+            f"decoder-pytorch-template checkout not found at {template_root}; expected {train_py}"
+        )
+    spec = importlib.util.spec_from_file_location("_phasesweep_decoder_trainer", train_py)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load decoder trainer from {train_py}")
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(template_root))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(template_root))
+    return module
+
+
+def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> dict[str, Any]:
+    """Evaluate the saved final checkpoint with the trainer's validation semantics."""
+    trainer = _load_upstream_trainer(template_root)
+    torch = trainer.torch
+    checkpoint_path = trainer_run_dir / "final.pt"
+    device, device_type, amp_dtype = trainer.get_optimal_device()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(f"{checkpoint_path} is missing its trainer config")
+
+    flash_attn = config.get("flash_attn")
+    supports_flash_attn = device_type in ("cuda", "mps")
+    if flash_attn is None:
+        flash_attn = supports_flash_attn
+    elif flash_attn and not supports_flash_attn:
+        flash_attn = False
+
+    model = trainer.Llama(
+        num_tokens=config.get("num_tokens", 256),
+        dim=config.get("dim", 512),
+        depth=config.get("depth", 16),
+        heads=config.get("heads", 8),
+        dim_head=config.get("dim_head", 64),
+        tied_embedding=config.get("tied_embedding", True),
+        ffn_dim_multiplier=config.get("ffn_dim_multiplier"),
+        flash_attn=bool(flash_attn),
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+
+    if config.get("seed"):
+        torch.manual_seed(config["seed"])
+    data_path = Path(config["data_path"])
+    if not data_path.is_absolute():
+        data_path = template_root / data_path
+    _, val_data = trainer.load_data(str(data_path))
+    val_dataset = trainer.SequenceDataset(val_data, config["seq_len"])
+    val_loader = trainer.cycle(
+        trainer.DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
+    )
+
+    use_autocast = bool(config.get("use_autocast", True))
+
+    def autocast_context() -> Any:
+        if use_autocast:
+            return torch.autocast(device_type=device_type, dtype=amp_dtype)
+        return contextlib.nullcontext()
+
+    val_loss_sum = 0.0
+    val_tokens = 0
+    for _ in range(config.get("val_batches", 50)):
+        data = next(val_loader).to(device)
+        inputs = data[:, :-1]
+        targets = data[:, 1:]
+        with torch.no_grad(), autocast_context():
+            logits = model(inputs, return_loss=False)
+            loss_unreduced = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+            )
+            val_loss_sum += loss_unreduced.sum().item()
+            val_tokens += targets.numel()
+
+    return {
+        "checkpoint": checkpoint_path.name,
+        "policy": "final_checkpoint",
+        "step": checkpoint.get("step"),
+        "val_loss": val_loss_sum / val_tokens,
+    }
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically publish one JSON artifact in its destination directory."""
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _write_result(
-    trial_dir: Path, overrides: Mapping[str, Any], metric_record: Mapping[str, Any]
+    trial_dir: Path,
+    overrides: Mapping[str, Any],
+    overrides_sha256: str,
+    metric_record: Mapping[str, Any],
 ) -> None:
-    """Write PhaseSweep's scalar result artifact plus the trial's overrides."""
+    """Write an attempt-scoped final-checkpoint result artifact."""
     val_loss = metric_record.get("val_loss")
-    if not isinstance(val_loss, int | float):
-        raise ValueError(f"Last metric record is missing numeric val_loss: {metric_record!r}")
+    if (
+        isinstance(val_loss, bool)
+        or not isinstance(val_loss, int | float)
+        or not math.isfinite(val_loss)
+    ):
+        raise ValueError(f"Final evaluation is missing finite numeric val_loss: {metric_record!r}")
+    step = metric_record.get("step")
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise ValueError(f"Final evaluation is missing its integer step: {metric_record!r}")
+    if (
+        metric_record.get("policy") != "final_checkpoint"
+        or metric_record.get("checkpoint") != "final.pt"
+    ):
+        raise ValueError(f"Final evaluation has unexpected checkpoint metadata: {metric_record!r}")
+
+    generation_id = os.environ.get("PHASESWEEP_GENERATION_ID")
+    attempt_id = os.environ.get("PHASESWEEP_ATTEMPT_ID")
+    if not generation_id or not attempt_id:
+        raise ValueError("PhaseSweep generation and attempt IDs are required for result evidence")
 
     result = {
-        "val_loss": float(val_loss),
-        "step": metric_record.get("step"),
+        "attempt_id": attempt_id,
+        "evaluation": {
+            "checkpoint": "final.pt",
+            "policy": "final_checkpoint",
+            "step": step,
+        },
+        "generation_id": generation_id,
+        "objective": {
+            "name": "val_loss",
+            "split": "validation",
+            "value": float(val_loss),
+        },
         "overrides": dict(overrides),
+        "overrides_sha256": overrides_sha256,
+        "schema_version": 1,
+        "status": "complete",
+        "val_loss": float(val_loss),
     }
-    (trial_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    _atomic_write_json(trial_dir / "result.json", result)
 
 
 def _run_template(template_root: Path, config_path: Path) -> None:
@@ -126,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
 
     template_root = _resolve_repo_path(args.template_root)
     base_config = _read_yaml_mapping(_resolve_repo_path(args.base_config))
-    overrides = _read_json_mapping(Path(args.overrides_path))
+    overrides, overrides_sha256 = _read_json_mapping(Path(args.overrides_path))
     trial_dir = Path(args.trial_dir).resolve()
     trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -138,8 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     generated_config.write_text(yaml.safe_dump(composed, sort_keys=True))
 
     _run_template(template_root, generated_config)
-    metric_record = _last_metric(trainer_run_dir / "metrics.jsonl")
-    _write_result(trial_dir, overrides, metric_record)
+    metric_record = _evaluate_final_checkpoint(template_root, trainer_run_dir)
+    _write_result(trial_dir, overrides, overrides_sha256, metric_record)
     return 0
 
 
