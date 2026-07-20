@@ -10,7 +10,7 @@ import optuna
 import pytest
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
+from phasesweep.config import Experiment, LogRegexExtractor, Metric, Phase
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import _load_winner
@@ -48,13 +48,16 @@ def _sleeping_score_experiment(
         time.sleep(0.15)
         with open(args.out, "w") as f:
             json.dump({"x": 1.0}, f)
+        print("x=1.0")
         """,
     )
     return Experiment(
         experiment=experiment,
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         timeout_seconds_per_run=timeout_seconds_per_run,
         phases=[
             Phase(
@@ -86,7 +89,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: lr_sweep
     n_trials: 8
@@ -125,7 +128,7 @@ trial_command: "false {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: a
     n_trials: 3
@@ -154,6 +157,7 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_or_winner_evidence(
         """
         import json, pathlib, sys
         pathlib.Path(sys.argv[1]).write_text(json.dumps({"x": 0.123}))
+        print("x=0.123")
         """,
     )
     no_result = write_trainer(tmp_path / "no_result.py", "pass")
@@ -198,6 +202,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
         # Write metric only — constraint extractor will fail to find param_bytes.
         with open(args.out, 'w') as f:
             json.dump({'eval_loss': 1.0}, f)
+        print('eval_loss=1.0')
         """,
     )
 
@@ -210,7 +215,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
 constraints:
   - name: param_bytes
     extractor: {{ type: json, path: result.json, key: param_bytes }}
@@ -240,17 +245,19 @@ phases:
 
 
 @pytest.mark.parametrize(
-    ("trainer_payload", "constraints_yaml", "exp_name"),
+    ("trainer_payload", "metric_log", "constraints_yaml", "exp_name"),
     [
         # Constraint extractor returns NaN
         (
             "{'eval_loss': 1.0, 'param_bytes': float('nan')}",
+            "1.0",
             "constraints:\n  - name: param_bytes\n    extractor: { type: json, path: result.json, key: param_bytes }\n    max: 1000\n",
             "nan_c",
         ),
         # Metric extractor returns +inf
         (
             "{'eval_loss': float('inf')}",
+            "inf",
             "",
             "inf_m",
         ),
@@ -258,7 +265,11 @@ phases:
     ids=["nan_constraint", "inf_metric"],
 )
 def test_non_finite_extracted_value_marks_trial_fail(
-    tmp_path, trainer_payload: str, constraints_yaml: str, exp_name: str
+    tmp_path,
+    trainer_payload: str,
+    metric_log: str,
+    constraints_yaml: str,
+    exp_name: str,
 ):
     """A non-finite metric or constraint value is a malformed trial — FAIL,
     not COMPLETE-with-sentinel. Both the metric path and the constraint path
@@ -274,6 +285,7 @@ def test_non_finite_extracted_value_marks_trial_fail(
         args, _ = ap.parse_known_args()
         with open(args.out, 'w') as f:
             json.dump({trainer_payload}, f)
+        print('eval_loss={metric_log}')
         """,
     )
 
@@ -286,7 +298,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
 {constraints_yaml}
 phases:
   - name: a
@@ -330,7 +342,7 @@ trial_command: "python {trainer} {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, objective_name: eval_loss, split: test, policy: test }}
 phases:
   - name: p
     n_trials: 16
@@ -422,7 +434,7 @@ trial_command: "echo {{overrides}}"
 metric:
   name: x
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: x }}
+  extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
 phases:
   - name: p
     n_trials: 1
@@ -450,7 +462,7 @@ trial_command: "false {{overrides}}"
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
 phases:
   - name: a
     n_trials: 100
@@ -544,6 +556,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
             with open(args.out, "w") as f:
                 json.dump({"x": 1.0}, f)
+            print("x=1.0")
         else:
             time.sleep(5.0)
         """,
@@ -552,7 +565,9 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         experiment="phase_timeout_all_terminal",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(
                 name="p",
@@ -594,6 +609,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
             with open(args.out, "w") as f:
                 json.dump({"x": 1.0}, f)
+            print("x=1.0")
         else:
             time.sleep(1.0)
         """,
@@ -602,7 +618,9 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         experiment="phase_timeout_allowed_abort_counter",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(
                 name="p",

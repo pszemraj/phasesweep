@@ -17,7 +17,7 @@ from phasesweep.config import (
     Constraint,
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -73,7 +73,13 @@ def make_experiment(
         experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=metric or Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=metric
+        or Metric(
+            extractor=LogRegexExtractor(
+                type="log_regex",
+                pattern=r"x=(?P<value>[0-9.eE+-]+)",
+            )
+        ),
         phases=phases,
     )
     if workdir is not None:
@@ -116,7 +122,7 @@ def write_trainer(path: Path, body: str) -> Path:
 
 
 def write_constant_trainer(tmp_path: Path) -> Path:
-    """Drop a minimal trainer that writes ``{"x": 0.5}`` to ``--out``.
+    """Drop a minimal trainer that writes and logs a constant objective.
 
     Cheap enough for tests that need a real subprocess run before mutating
     the parent config and re-running with ``--from-phase``.
@@ -132,6 +138,7 @@ def write_constant_trainer(tmp_path: Path) -> Path:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"x": 0.5}))
+        print("x=0.5")
         """,
     )
 

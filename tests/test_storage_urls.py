@@ -11,7 +11,7 @@ from phasesweep import load_experiment
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -63,7 +63,7 @@ def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         phases:
           - name: p
             n_trials: 1{parallel}
@@ -130,7 +130,9 @@ def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
             experiment="t",
             storage="sqlite:///test.db",
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",

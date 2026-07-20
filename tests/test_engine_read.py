@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.config import Experiment, FloatParam, JsonExtractor, Metric, Phase
+from phasesweep.config import Experiment, FloatParam, LogRegexExtractor, Metric, Phase
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.state import _winner_path
 from tests.conftest import make_experiment
@@ -24,7 +24,7 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
         metric=Metric(
             name="loss",
             goal="minimize",
-            extractor=JsonExtractor(type="json", path="r.json", key="loss"),
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         ),
         phases=[
             Phase(

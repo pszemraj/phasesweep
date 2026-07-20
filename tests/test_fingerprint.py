@@ -17,7 +17,7 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -79,7 +79,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: a
     n_trials: 2
@@ -106,7 +106,9 @@ def test_fingerprint_changes_when_parent_winner_changes():
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(
                 name="arch",
@@ -152,7 +154,7 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         phases:
           - name: arch
             fixed_overrides:
@@ -190,14 +192,22 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
-                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
+                    )
+                ),
                 phases=[base_phase],
                 env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
             ),
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
-                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
+                    )
+                ),
                 phases=[base_phase],
                 env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"},
             ),
@@ -269,6 +279,7 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
         ap.add_argument('--out', required=True)
         args, _ = ap.parse_known_args()
         with open(args.out, 'w') as f: json.dump({'eval_loss': 0.5}, f)
+        print('eval_loss=0.5')
         """,
     )
     db = tmp_path / "phases.db"
@@ -280,7 +291,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
 phases:
   - name: a
     n_trials: 2
@@ -535,7 +546,9 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
             experiment="t",
             workdir=str(tmp_path / "wd"),
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",

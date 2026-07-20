@@ -8,6 +8,7 @@ from phasesweep.config import (
     Experiment,
     IntParam,
     JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -178,7 +179,9 @@ def test_rejects_nan_constraint_values_defensively(tmp_path):
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         constraints=[
             Constraint(
                 name="size",

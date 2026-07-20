@@ -19,6 +19,7 @@ from phasesweep.config import (
     FloatParam,
     IntParam,
     JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
@@ -39,7 +40,7 @@ def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: p
             n_trials: {n_trials}
@@ -126,7 +127,7 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -220,7 +221,7 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 2
@@ -243,7 +244,7 @@ def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> N
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -328,7 +329,11 @@ def test_rejects_dotted_prefix_collisions() -> None:
             Experiment(
                 experiment=f"t_{case}",
                 trial_command="echo {overrides}",
-                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
+                    )
+                ),
                 phases=phases,
             )
 
@@ -475,7 +480,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -609,7 +614,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1

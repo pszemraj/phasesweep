@@ -99,7 +99,7 @@ trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
 phases:
 {phases}"""
 
@@ -120,7 +120,7 @@ override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: p
     n_trials: 1

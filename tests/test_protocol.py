@@ -15,7 +15,7 @@ from phasesweep.config import (
     Experiment,
     IntParam,
     JsonEqualsGate,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
     RequiredFileGate,
@@ -50,6 +50,7 @@ def _write_score_trainer(tmp_path: Path) -> Path:
                 value = float(item.split("=", 1)[1])
         with open(args.out, "w") as f:
             json.dump({"x": value}, f)
+        print(f"x={value}")
         """,
     )
 
@@ -61,7 +62,9 @@ def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> No
         experiment="contract_test",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         contracts={
             "fixed_eval": Contract(
                 fixed_overrides={"eval.seq_len": 1024},
@@ -191,7 +194,7 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         metric:
           name: objective
           goal: minimize
-          extractor: {{ type: json, path: metrics.json, key: objective }}
+          extractor: {{ type: json_envelope, path: metrics.json, objective_name: objective, split: test, policy: test }}
         phases:
           - name: baseline
             n_trials: 1
@@ -223,7 +226,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         studies:
           - name: baseline
             phases:
@@ -301,7 +304,7 @@ def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Pat
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         studies:
           - name: baseline
             phases:
@@ -332,7 +335,7 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         studies:
           - name: ablation_a
             phases:
@@ -364,7 +367,7 @@ def test_failed_suite_rerun_clears_previous_summary(
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         studies:
           - name: one
             phases:
@@ -411,7 +414,9 @@ def test_contract_keys_cannot_be_resampled() -> None:
         Experiment(
             experiment="bad_contract",
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             contracts={"c": Contract(fixed_overrides={"seq_len": 1024})},
             phases=[
                 Phase(

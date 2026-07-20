@@ -24,7 +24,7 @@ from phasesweep.config.search import (
     _placeholder_values_for,
     _validate_sampler_search_space,
 )
-from phasesweep.evidence.models import Extractor, Gate
+from phasesweep.evidence.models import Extractor, Gate, ObjectiveExtractor
 from phasesweep.runtime.files import storage_backend
 
 
@@ -33,7 +33,7 @@ class Metric(_Frozen):
 
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
-    extractor: Extractor = Field(discriminator="type")
+    extractor: ObjectiveExtractor = Field(discriminator="type")
 
 
 class Constraint(_Frozen):

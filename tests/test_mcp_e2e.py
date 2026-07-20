@@ -57,7 +57,7 @@ override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 constraints:
   - name: param_bytes
     extractor: {{ type: json, path: result.json, key: param_bytes }}

@@ -452,14 +452,8 @@ def test_public_run_experiment_installs_signal_handlers(
     contract as CLI callers."""
     installed = _install_signal_probe(monkeypatch)
 
-    # Minimal trial_command that writes the metric file the JsonExtractor expects.
-    # Avoid {} literals in the script so the override-template parser doesn't
-    # mistake them for placeholders.
-    script = (
-        "import json, pathlib, sys; "
-        "trial_dir = sys.argv[1].split('=', 1)[1]; "
-        "pathlib.Path(trial_dir, 'r.json').write_text(json.dumps(dict(x=1)))"
-    )
+    # Minimal trial_command that emits the metric captured by the log extractor.
+    script = "print('x=1')"
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f'{sys.executable} -c "{script}" trial_dir={{trial_dir}} {{overrides}}',

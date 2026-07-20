@@ -6,9 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import (
-    Phase,
-)
+from phasesweep.config import JsonExtractor, Metric, Phase
 from tests.conftest import write_yaml
 
 
@@ -22,7 +20,7 @@ trial_command: "echo {trial_dir}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     inherits: [b]
@@ -47,7 +45,7 @@ trial_command: "echo"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 constraints:
   - name: bytes
     extractor: { type: json, path: r.json, key: bytes }
@@ -71,7 +69,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 constraints:
   - name: loss
     max: 1
@@ -106,7 +104,7 @@ trial_command: "second {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -119,7 +117,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -134,7 +132,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -159,7 +157,7 @@ trial_command: "echo"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - &phase_defaults
     name: baseline
@@ -184,7 +182,7 @@ trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -194,3 +192,8 @@ phases:
     assert exp.override_format == "argparse"
     assert exp.phases[0].n_jobs == 1
     assert exp.phases[0].max_consecutive_failures == 5
+
+
+def test_plain_json_extractor_is_not_a_primary_objective() -> None:
+    with pytest.raises(ValidationError, match="json_envelope"):
+        Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))

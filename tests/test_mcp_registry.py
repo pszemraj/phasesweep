@@ -44,7 +44,7 @@ def _suite_yaml(tmp_path: Path) -> str:
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         studies:
           - name: a
             phases:

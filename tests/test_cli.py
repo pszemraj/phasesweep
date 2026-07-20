@@ -112,7 +112,7 @@ def test_validate_cli_renders_comment(tmp_path: Path) -> None:
         experiment: t
         trial_command: "echo {overrides}"
         metric:
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: depth
             comment: |
@@ -163,7 +163,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
             workdir: {workdir_str}
             trial_command: "echo {{overrides}}"
             metric:
-              extractor: {{ type: json, path: r.json, key: x }}
+              extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
             phases:
               - name: depth
                 comment: settle the depth before anything else.
@@ -205,7 +205,7 @@ trial_command: "false {{overrides}}"
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
 phases:
   - name: a
     n_trials: 5
@@ -239,6 +239,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         import argparse, json
         ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)
         args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))
+        print('x=1.0')
         """,
     )
     p = write_yaml(
@@ -251,7 +252,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         phases:
           - name: p
             n_trials: 1

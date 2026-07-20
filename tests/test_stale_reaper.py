@@ -15,7 +15,7 @@ import pytest
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -164,7 +164,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         storage=storage,
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="result.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(name="a", n_trials=1, search_space={"x": IntParam(type="int", low=0, high=10)})
         ],

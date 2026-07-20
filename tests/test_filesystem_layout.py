@@ -9,7 +9,7 @@ import pytest
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -80,7 +80,9 @@ def test_experiment_name_rejected(bad_name: str) -> None:
         Experiment(
             experiment=bad_name,
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",
@@ -96,7 +98,9 @@ def test_experiment_name_accepts_valid() -> None:
     Experiment(
         experiment="tiny_lm-16mb",
         trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(  # type: ignore[arg-type]
                 name="p",

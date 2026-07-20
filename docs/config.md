@@ -98,7 +98,7 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Plain `json` objectives must be numbers; numeric strings and booleans are rejected. Use `json_envelope` to bind a result to the current attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 

@@ -36,8 +36,8 @@
 #   Must be distinct from every constraints[].name.
 #   goal: Literal["minimize", "maximize"] = "minimize"
 #   Sets Optuna direction and the sign used by promotion.min_delta.
-#   extractor: Extractor (required)
-#   The extracted value must coerce to a finite float or the trial fails. Extractor shapes are defined below.
+#   extractor: ObjectiveExtractor (required)
+#   Accepts json_envelope, log_regex, or wandb. Plain json is not a primary-objective extractor because it cannot prove attempt identity. The extracted value must be finite or the trial fails. Extractor shapes are defined below.
 
 # constraints: list[Constraint] = []
 # Each Constraint object has these keys:
@@ -182,7 +182,7 @@
 # type: Literal["json"] (required)
 # path: str (required)
 # key: str (required)
-# The selected JSON value must be a finite JSON number; strings and booleans are rejected.
+# Constraint-only scalar extractor. The selected JSON value must be a finite JSON number; strings and booleans are rejected.
 
 # type: Literal["json_envelope"] (required)
 # path: str = "result.json"

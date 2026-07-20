@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -110,7 +111,21 @@ def main() -> None:
     param_bytes = n_layers * 1_100_000
 
     result = {
-        "eval_loss": loss,
+        "schema_version": 1,
+        "status": "complete",
+        "generation_id": os.environ["PHASESWEEP_GENERATION_ID"],
+        "attempt_id": os.environ["PHASESWEEP_ATTEMPT_ID"],
+        "overrides_sha256": os.environ["PHASESWEEP_OVERRIDES_SHA256"],
+        "objective": {
+            "name": "eval_loss",
+            "split": "validation",
+            "value": loss,
+        },
+        "evaluation": {
+            "policy": "synthetic",
+            "checkpoint": "toy_formula",
+            "step": 100,
+        },
         "param_bytes": param_bytes,
         "config": {
             "n_layers": n_layers,

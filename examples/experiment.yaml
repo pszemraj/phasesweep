@@ -14,9 +14,13 @@ metric:
   name: eval_loss
   goal: minimize
   extractor:
-    type: json
+    type: json_envelope
     path: result.json
-    key: eval_loss
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
 
 constraints:
   - name: param_bytes

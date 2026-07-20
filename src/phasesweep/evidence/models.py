@@ -117,7 +117,8 @@ class WandbExtractor(_Frozen):
     timeout_seconds: float = Field(default=120.0, ge=0.0)
 
 
-Extractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+Extractor = JsonExtractor | ObjectiveExtractor
 
 
 class RequiredFileGate(_TrialPathModel):

@@ -339,7 +339,8 @@ def run_extractor(ctx: TrialContext, cfg: Extractor) -> float:
     Args:
         ctx: Trial context passed through to the chosen extractor.
         cfg: A concrete extractor config (one of :class:`JsonExtractor`,
-            :class:`LogRegexExtractor`, :class:`WandbExtractor`).
+            :class:`JsonEnvelopeExtractor`, :class:`LogRegexExtractor`,
+            :class:`WandbExtractor`).
 
     Returns:
         The numeric value the extractor pulled from this trial's outputs.

@@ -83,7 +83,7 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -112,7 +112,7 @@ trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: arch
     fixed_overrides:
@@ -152,7 +152,7 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: arch
             n_trials: 1
@@ -185,7 +185,7 @@ def test_multi_parent_collision_unresolved_errors(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: a
             n_trials: 1
@@ -217,7 +217,7 @@ def test_multi_parent_collision_resolved_by_fixed_override(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: a
             n_trials: 1

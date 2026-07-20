@@ -43,7 +43,7 @@ override_format: argparse
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
 env:
   HF_TOKEN: SECRET_ENV_VALUE
 phases:
