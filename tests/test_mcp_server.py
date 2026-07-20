@@ -340,6 +340,25 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
 
     monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", fake_run_experiment)
 
+    def capture_without_fake_trial_storage(
+        experiment: Experiment,
+        *,
+        cleanup_confirmed: bool,
+        generation_id: str,
+        require_trial_data: bool,
+    ) -> dict[str, object]:
+        assert require_trial_data is True
+        return capture_result_snapshot(
+            experiment,
+            cleanup_confirmed=cleanup_confirmed,
+            generation_id=generation_id,
+        )
+
+    monkeypatch.setattr(
+        "phasesweep.mcp.runner.capture_result_snapshot",
+        capture_without_fake_trial_storage,
+    )
+
     assert (
         runner_main(
             [
