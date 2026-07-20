@@ -64,6 +64,8 @@ Automatic edits are limited to regular UTF-8 files at the expected target. Proje
 
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
+An instructions-only install (`--type instructions`) needs neither a catalog nor the optional MCP dependency and remains available outside the MCP runtime's [platform requirements](runtime.md#platform-support).
+
 Claude Desktop and Codex MCP entries are user-scoped, so those clients see the server from every project. The plan flags this. Interactive installs require confirmation; unattended `--yes` installs additionally require `--allow-user-scope`.
 
 Restart the client after any config change.

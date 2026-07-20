@@ -59,6 +59,32 @@ The trial environment starts from the phasesweep process environment, then top-l
 
 Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; metric values within an absolute `1e-12` of the best value resolve to the lowest trial number. When a swept key has no measurable effect, the selected value is therefore the lowest-numbered near-best trial's choice, not evidence of a preference.
 
+### Result envelope
+
+A `json_envelope` trainer publishes this versioned shape after successful evaluation:
+
+```json
+{
+  "schema_version": 1,
+  "status": "complete",
+  "generation_id": "<current generation ID>",
+  "attempt_id": "<current attempt ID>",
+  "overrides_sha256": "<current resolved-overrides digest>",
+  "objective": {
+    "name": "val_loss",
+    "split": "validation",
+    "value": 0.123
+  },
+  "evaluation": {
+    "policy": "final_checkpoint",
+    "checkpoint": "final.pt",
+    "step": 1000
+  }
+}
+```
+
+Copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values listed in the [config reference](config_reference.yaml). The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+
 ## Override order
 
 Within one trial, later layers override earlier layers:
