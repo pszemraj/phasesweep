@@ -16,7 +16,7 @@ from click.testing import CliRunner
 
 from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
-from phasesweep.engine.guards import _phase_fingerprint
+from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
@@ -1228,6 +1228,56 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(
+        _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    reg = registry.get("srv")
+    run_id = "srv-recovery-lock-contention"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.save(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    cleanup_calls = 0
+
+    def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+    with _experiment_lock(reg.experiment):
+        result = CliRunner().invoke(
+            cli_main,
+            [
+                "mcp",
+                "recover-run",
+                "--state-dir",
+                str(registry.state_dir),
+                "--run-id",
+                run_id,
+                "--confirm",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "Another phasesweep process" in result.output
+    assert cleanup_calls == 0
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    assert not store.cleanup_recovery_path(run_id).exists()
+    assert not store.status_path(run_id).exists()
 
 
 def test_operator_recovery_finalizes_launching_handle_without_cleanup(

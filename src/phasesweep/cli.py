@@ -18,6 +18,7 @@ from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import config_status, run_config
 from phasesweep.engine.guards import (
+    _experiment_lock,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
     _reap_stale_trials,
@@ -322,18 +323,6 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         )
     if _runner_appears_live(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
-    if (
-        cleanup_recovery_needed
-        and confirm
-        and not kill_stale_group(
-            identity.pid,
-            identity.pid_starttime,
-            pgid=identity.pgid,
-            grace_seconds=30.0,
-        )
-    ):
-        raise click.ClickException("runner process-group cleanup is still uncertain")
-
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
         raise click.ClickException(f"run config snapshot is missing: {snapshot}")
@@ -347,109 +336,134 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if not isinstance(config, Experiment):
         raise click.ClickException("run snapshot is not a single experiment")
 
-    reaped = 0
-    cleanup_recovered = 0
-    inspected_studies = 0
-    if cleanup_recovery_needed:
-        try:
-            for phase in config.phases:
-                study = _load_existing_phase_study(config, phase)
-                if study is None:
-                    continue
-                inspected_studies += 1
-                if confirm:
-                    cleanup_recovered += _recover_cleanup_uncertain_trials(
-                        study,
-                        config,
-                        phase.name,
-                    )
-                    reaped += _reap_stale_trials(study, config, phase.name)
-                else:
-                    cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
-                    reaped += _inspect_stale_running_trials(study, config, phase.name)
-        except RuntimeError as exc:
-            raise click.ClickException(str(exc)) from None
-    cleanup_evidence_count = reaped + cleanup_recovered
-    if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
-        if inspected_studies == 0:
-            detail = "no existing Optuna studies could be loaded from the run snapshot storage"
-        else:
-            detail = (
-                "no RUNNING trials were reaped and no terminal trials recorded cleanup uncertainty"
-            )
-        raise click.ClickException(
-            "runner status recorded cleanup_confirmed=false, but recovery could not "
-            f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
-            "cleanup uncertainty."
-        )
-
-    if not confirm:
-        actions = []
-        if cleanup_recovery_needed:
-            actions.append(
-                "attempt runner process-group cleanup, "
-                f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
-                "cleanup-uncertain terminal trial(s)"
-            )
-        if snapshot_finalize_needed:
-            actions.append("finalize the stored terminal snapshot with cleanup evidence")
-        elif snapshot_unavailable:
-            actions.append("record that the historical terminal snapshot is unavailable")
-        click.echo(
-            f"Recovery preflight for {run_id}: would {' and '.join(actions)}. "
-            "Re-run with --confirm to perform those actions."
-        )
-        return
-
-    if terminal_status is None:
-        terminal_status = {
-            "run_id": run_id,
-            "returncode": 1,
-            "error_class": "RunnerExitedWithoutStatus",
-            "cleanup_confirmed": True,
-            "ended_at": utc_now_iso(),
-            "result_snapshot_state": "failed",
-            "result_snapshot_error": "HistoricalSnapshotUnavailable",
-        }
-        write_status_file(store.status_path(run_id), terminal_status)
-
-    if cleanup_recovery_needed:
-        payload = {
-            "run_id": run_id,
-            "config_sha256": handle.config_sha256,
-            "recovered_at": utc_now_iso(),
-            "cleanup_confirmed": True,
-            "reaped_running_trials": reaped,
-            "cleanup_uncertain_terminal_trials": cleanup_recovered,
-        }
-        private_atomic_write_text(
-            store.cleanup_recovery_path(run_id),
-            json.dumps(payload, indent=2) + "\n",
-        )
-        store.clear_cleanup_uncertain(handle)
-        click.echo(
-            f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
-            f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
-        )
-
-    if snapshot_finalize_needed:
-        _finalize_stored_terminal_result_snapshot(
-            store,
-            run_id,
-            terminal_status,
-            cleanup_confirmed=(
+    recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
+    try:
+        with recovery_lock:
+            # Lock contention proves another ordinary CLI or MCP orchestrator is
+            # using this exact output/storage namespace. Re-check runner liveness
+            # only after acquiring the lock, then keep it through every signal,
+            # study mutation, and recovery-state write.
+            if confirm and _runner_appears_live(identity.pid, identity.pid_starttime):
+                raise click.ClickException(
+                    "runner still appears live; use phasesweep_cancel_sweep first"
+                )
+            if (
                 cleanup_recovery_needed
-                or cleanup_already_recovered
-                or terminal_status.get("cleanup_confirmed") is True
-            ),
-        )
+                and confirm
+                and not kill_stale_group(
+                    identity.pid,
+                    identity.pid_starttime,
+                    pgid=identity.pgid,
+                    grace_seconds=30.0,
+                )
+            ):
+                raise click.ClickException("runner process-group cleanup is still uncertain")
 
-        click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
-    elif snapshot_unavailable:
-        click.echo(
-            f"Historical terminal result snapshot for {run_id} is unavailable and was not "
-            "rebuilt from mutable shared state."
-        )
+            reaped = 0
+            cleanup_recovered = 0
+            inspected_studies = 0
+            if cleanup_recovery_needed:
+                for phase in config.phases:
+                    study = _load_existing_phase_study(config, phase)
+                    if study is None:
+                        continue
+                    inspected_studies += 1
+                    if confirm:
+                        cleanup_recovered += _recover_cleanup_uncertain_trials(
+                            study,
+                            config,
+                            phase.name,
+                        )
+                        reaped += _reap_stale_trials(study, config, phase.name)
+                    else:
+                        cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
+                        reaped += _inspect_stale_running_trials(study, config, phase.name)
+            cleanup_evidence_count = reaped + cleanup_recovered
+            if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
+                if inspected_studies == 0:
+                    detail = (
+                        "no existing Optuna studies could be loaded from the run snapshot storage"
+                    )
+                else:
+                    detail = (
+                        "no RUNNING trials were reaped and no terminal trials recorded cleanup "
+                        "uncertainty"
+                    )
+                raise click.ClickException(
+                    "runner status recorded cleanup_confirmed=false, but recovery could not "
+                    f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
+                    "cleanup uncertainty."
+                )
+
+            if not confirm:
+                actions = []
+                if cleanup_recovery_needed:
+                    actions.append(
+                        "attempt runner process-group cleanup, "
+                        f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
+                        "cleanup-uncertain terminal trial(s)"
+                    )
+                if snapshot_finalize_needed:
+                    actions.append("finalize the stored terminal snapshot with cleanup evidence")
+                elif snapshot_unavailable:
+                    actions.append("record that the historical terminal snapshot is unavailable")
+                click.echo(
+                    f"Recovery preflight for {run_id}: would {' and '.join(actions)}. "
+                    "Re-run with --confirm to perform those actions."
+                )
+                return
+
+            if terminal_status is None:
+                terminal_status = {
+                    "run_id": run_id,
+                    "returncode": 1,
+                    "error_class": "RunnerExitedWithoutStatus",
+                    "cleanup_confirmed": True,
+                    "ended_at": utc_now_iso(),
+                    "result_snapshot_state": "failed",
+                    "result_snapshot_error": "HistoricalSnapshotUnavailable",
+                }
+                write_status_file(store.status_path(run_id), terminal_status)
+
+            if cleanup_recovery_needed:
+                payload = {
+                    "run_id": run_id,
+                    "config_sha256": handle.config_sha256,
+                    "recovered_at": utc_now_iso(),
+                    "cleanup_confirmed": True,
+                    "reaped_running_trials": reaped,
+                    "cleanup_uncertain_terminal_trials": cleanup_recovered,
+                }
+                private_atomic_write_text(
+                    store.cleanup_recovery_path(run_id),
+                    json.dumps(payload, indent=2) + "\n",
+                )
+                store.clear_cleanup_uncertain(handle)
+                click.echo(
+                    f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
+                    f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
+                )
+
+            if snapshot_finalize_needed:
+                _finalize_stored_terminal_result_snapshot(
+                    store,
+                    run_id,
+                    terminal_status,
+                    cleanup_confirmed=(
+                        cleanup_recovery_needed
+                        or cleanup_already_recovered
+                        or terminal_status.get("cleanup_confirmed") is True
+                    ),
+                )
+
+                click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
+            elif snapshot_unavailable:
+                click.echo(
+                    f"Historical terminal result snapshot for {run_id} is unavailable and was "
+                    "not rebuilt from mutable shared state."
+                )
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
 
 
 def _finalize_stored_terminal_result_snapshot(
