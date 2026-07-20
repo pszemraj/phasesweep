@@ -23,7 +23,7 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import run_experiment
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import Winner, _trial_dir_for
 from phasesweep.evidence.evaluation import evaluate_gates
 from tests.conftest import make_experiment, make_trial_context, write_trainer, write_yaml
 
@@ -131,9 +131,22 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     assert decision["baseline_metric"] == pytest.approx(1.0)
     assert decision["action"] == "continue_baseline"
     assert decision["exposed_source"] == "baseline"
+    assert decision["candidate_trial_number"] == 0
+    assert decision["candidate_generation_id"] == decision["generation_id"]
+    assert decision["candidate_attempt_id"] != winners["baseline"].attempt_id
+    assert decision["baseline_trial_number"] == winners["baseline"].trial_number
+    assert decision["baseline_generation_id"] == winners["baseline"].generation_id
+    assert decision["baseline_attempt_id"] == winners["baseline"].attempt_id
+    assert _trial_dir_for(
+        exp,
+        "candidate",
+        decision["candidate_trial_number"],
+        generation_id=decision["candidate_generation_id"],
+        attempt_id=decision["candidate_attempt_id"],
+    ).is_dir()
     summary = yaml.safe_load((tmp_path / "runs" / "t" / "summary.yaml").read_text())
-    assert summary["promotion_decisions"][0]["action"] == "continue_baseline"
-    assert summary["phases"][1]["promotion"]["action"] == "continue_baseline"
+    assert summary["promotion_decisions"][0] == decision
+    assert summary["phases"][1]["promotion"] == decision
 
 
 def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
@@ -240,6 +253,45 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     winners = run_config(config)
 
     assert winners["candidate"]["eval"].metric == winners["baseline"]["eval"].metric
+    assert isinstance(config, Suite)
+    summary_path = tmp_path / "runs" / "promote_suite" / "suite_summary.yaml"
+    first_summary = yaml.safe_load(summary_path.read_text())
+    first_decision = first_summary["promotion_decisions"][0]
+    assert first_summary["studies"][1]["promotion"] == first_decision
+    first_baseline = winners["baseline"]["eval"]
+    assert first_decision["candidate_trial_number"] == 0
+    assert first_decision["candidate_attempt_id"] != first_baseline.attempt_id
+    assert first_decision["baseline_trial_number"] == first_baseline.trial_number
+    assert first_decision["baseline_generation_id"] == first_baseline.generation_id
+    assert first_decision["baseline_attempt_id"] == first_baseline.attempt_id
+    candidate_experiment = config.experiment_for_study(config.studies[1])
+    first_candidate_dir = _trial_dir_for(
+        candidate_experiment,
+        "eval",
+        first_decision["candidate_trial_number"],
+        generation_id=first_decision["candidate_generation_id"],
+        attempt_id=first_decision["candidate_attempt_id"],
+    )
+    assert first_candidate_dir.is_dir()
+
+    second_winners = run_config(config)
+
+    second_summary = yaml.safe_load(summary_path.read_text())
+    second_decision = second_summary["promotion_decisions"][0]
+    assert second_summary["studies"][1]["promotion"] == second_decision
+    second_baseline = second_winners["baseline"]["eval"]
+    assert second_decision["candidate_generation_id"] != first_decision["candidate_generation_id"]
+    assert second_decision["candidate_attempt_id"] != first_decision["candidate_attempt_id"]
+    assert second_decision["baseline_generation_id"] == second_baseline.generation_id
+    assert second_decision["baseline_attempt_id"] == second_baseline.attempt_id
+    assert first_candidate_dir.is_dir()
+    assert _trial_dir_for(
+        candidate_experiment,
+        "eval",
+        second_decision["candidate_trial_number"],
+        generation_id=second_decision["candidate_generation_id"],
+        attempt_id=second_decision["candidate_attempt_id"],
+    ).is_dir()
 
 
 def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:
