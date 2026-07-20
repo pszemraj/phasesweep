@@ -14,6 +14,7 @@ import yaml
 
 from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Suite
+from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.guards import (
     _experiment_lock,
     _preflight_existing_studies,
@@ -136,6 +137,7 @@ def run_experiment(
             lock is still held.
         generation_id: Optional caller-owned invocation identity. Detached MCP
             runs use their run id; direct callers receive a generated identity.
+            Supplied values must contain only alphanumerics, underscores, and dashes.
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
@@ -149,6 +151,7 @@ def run_experiment(
         RuntimeError: Lock contention (another orchestrator running),
             fingerprint mismatch on ``--from-phase`` resume, or stale-reaper
             uncertainty (review v0.5.7 / blocker 2).
+        ValueError: A caller-supplied generation id is not a safe filesystem name.
         FileNotFoundError: ``--from-phase`` requested but a prior phase has
             no persisted ``winner.yaml``.
 
@@ -165,24 +168,26 @@ def run_experiment(
             generation_id=None,
         )
 
+    generation_id = (
+        uuid4().hex if generation_id is None else _validate_safe_name("generation", generation_id)
+    )
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
-    generation_id = generation_id or uuid4().hex
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
         existing_studies: dict[str, Any] = {}
         generation_prepared = False
         try:
+            run_deadline = (
+                time.monotonic() + experiment.timeout_seconds_per_run
+                if experiment.timeout_seconds_per_run is not None
+                else None
+            )
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
                 state="preflighting",
                 from_phase=from_phase,
                 publish_current=False,
-            )
-            run_deadline = (
-                time.monotonic() + experiment.timeout_seconds_per_run
-                if from_phase is not None and experiment.timeout_seconds_per_run is not None
-                else None
             )
             existing_studies = _preflight_existing_studies(experiment)
             preloaded_winners = _preflight_skipped_winners(
@@ -257,9 +262,9 @@ def _run_experiment_inner(
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
         existing_studies: Existing studies validated and reaped before launch.
-        run_deadline: Optional precomputed whole-run monotonic deadline. Resume
-            preflight passes this through so skipped-phase validation consumes
-            the same budget as it did before preflight was separated.
+        run_deadline: Optional precomputed whole-run monotonic deadline. Preflight
+            passes this through so validation and stale cleanup consume the same
+            invocation budget as trial execution.
 
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.

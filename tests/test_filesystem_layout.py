@@ -109,3 +109,16 @@ def test_experiment_name_accepts_valid() -> None:
             )
         ],
     )
+
+
+@pytest.mark.parametrize("generation_id", ["../escape", "/tmp/escape", ""])
+def test_run_experiment_rejects_unsafe_generation_id_before_writing_state(
+    tmp_path: Path,
+    generation_id: str,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="generation name"):
+        run_experiment(experiment, generation_id=generation_id)
+
+    assert not _experiment_dir(experiment).exists()

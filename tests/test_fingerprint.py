@@ -529,6 +529,31 @@ def test_from_phase_preflight_consumes_run_deadline(
         run_experiment(resumed, from_phase="lr")
 
 
+def test_fresh_run_preflight_consumes_run_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs").model_copy(
+        update={"timeout_seconds_per_run": 1.0}
+    )
+    run_module = importlib.import_module("phasesweep.engine.run")
+    clock = {"now": 100.0}
+
+    def delayed_preflight(_experiment: Experiment) -> dict[str, optuna.Study]:
+        clock["now"] += 2.0
+        return {}
+
+    monkeypatch.setattr(
+        run_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    monkeypatch.setattr(run_module, "_preflight_existing_studies", delayed_preflight)
+
+    with pytest.raises(TimeoutError, match="before phase 'p' could start"):
+        run_experiment(experiment)
+
+
 def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path) -> None:
     """Skipped winners need a matching fingerprint, not just plausible YAML."""
 
