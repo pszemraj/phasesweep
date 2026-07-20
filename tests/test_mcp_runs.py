@@ -31,7 +31,7 @@ def test_save_get_roundtrip(tmp_path: Path) -> None:
     assert store.get("missing") is None
 
 
-def test_launching_handle_roundtrip_is_failed_without_status(tmp_path: Path) -> None:
+def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1", launch_state="launching")
 
@@ -39,8 +39,10 @@ def test_launching_handle_roundtrip_is_failed_without_status(tmp_path: Path) -> 
     loaded = store.get("exp-1")
 
     assert loaded == handle
-    assert store.state(loaded) == "failed"
-    assert store.live_runs() == []
+    assert store.state(loaded) == "running"
+    assert store.recovery_required(loaded)
+    assert store.live_runs() == [loaded]
+    assert store.live_run_for("exp") == loaded
 
 
 def test_save_replaces_existing_handle_without_temp_files(tmp_path: Path) -> None:

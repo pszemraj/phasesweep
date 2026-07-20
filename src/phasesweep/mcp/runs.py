@@ -294,7 +294,10 @@ class RunStore:
         means running. A dead or unverifiable spawned runner with no status
         cannot prove that its separately-sessioned trial descendants are gone,
         so it is marked cleanup-uncertain and remains ``running`` until
-        operator recovery records cleanup evidence.
+        operator recovery records cleanup evidence. An unresolved pre-spawn
+        handle also remains ``running`` because a server restart cannot know
+        whether ``Popen`` completed before the crash; known launch failures
+        write terminal status explicitly.
 
         Args:
             handle: The run handle to evaluate.
@@ -327,7 +330,11 @@ class RunStore:
                 return "cancelled"
             return "failed"
         if handle.launch_state == "launching" or handle.pid is None:
-            return "failed"
+            # The launching record is durable before Popen. After a server
+            # crash it cannot distinguish "not spawned" from "spawned but the
+            # child has not self-persisted yet", so reserve concurrency until
+            # a known launch error or operator recovery writes terminal status.
+            return "running"
         if handle.pid_starttime is None:
             if self._cleanup_recovered(handle):
                 return "failed"
@@ -471,7 +478,13 @@ class RunStore:
         :return bool: True when cleanup remains uncertain or terminal snapshot
             finalization was interrupted after the runner exited.
         """
-        return self.cleanup_recovery_required(handle) or self.snapshot_recovery_required(handle)
+        status = self._read_status(handle)
+        launch_outcome_unknown = handle.launch_state == "launching" and status is None
+        return (
+            launch_outcome_unknown
+            or self.cleanup_recovery_required(handle)
+            or self.snapshot_recovery_required(handle)
+        )
 
     def cleanup_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether process cleanup still requires operator recovery.

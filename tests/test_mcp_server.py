@@ -399,6 +399,53 @@ def test_launch_does_not_spawn_when_pending_handle_save_fails(
     assert store.list_handles() == []
 
 
+def test_launch_finalizes_pending_handle_when_popen_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    def fail_popen(*args: object, **kwargs: object) -> None:
+        raise OSError("runner executable is unavailable")
+
+    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fail_popen)
+
+    with pytest.raises(OSError, match="runner executable"):
+        app.launch("srv")
+
+    (handle,) = store.list_handles()
+    assert handle.launch_state == "launching"
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["error_class"] == "OSError"
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["result_snapshot_state"] == "failed"
+
+
+def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    pending = make_run_handle(
+        run_id="srv-launch-gap",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    store.save(pending)
+
+    restarted = PhaseSweepMCP(registry, RunStore(registry.state_dir))
+    with pytest.raises(Exception, match="already has a running sweep"):
+        restarted.launch("srv")
+
+    assert store.recovery_required(pending)
+    assert store.live_runs() == [pending]
+
+
 @pytest.mark.parametrize(
     ("cleanup_confirmed", "expected_state"),
     [(True, "failed"), (False, "running")],
@@ -433,6 +480,7 @@ def test_launch_refuses_runner_without_linux_process_identity(
     assert len(handles) == 1
     assert handles[0].launch_state == "launching"
     assert store.state(handles[0]) == expected_state
+    assert store.recovery_required(handles[0]) is (not cleanup_confirmed)
     assert bool(store.cleanup_uncertain(handles[0])) is (not cleanup_confirmed)
     assert cleanup_calls and cleanup_calls[0][1] is None
 
@@ -508,8 +556,8 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_final_save_failure(
 
     assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
     assert "failed to persist cleanup uncertainty marker" in caplog.text
-    assert "original save error" in caplog.text
-    assert "cleanup uncertain after failed handle save" in caplog.text
+    assert "original error" in caplog.text
+    assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
 
 
 def test_launch_spawns_runner_with_registered_cwd(
@@ -1630,7 +1678,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert first.exit_code != 0
     assert "failed to finalize terminal result snapshot" in first.output
     assert store.cleanup_recovery_path(run_id).is_file()
-    assert not store.recovery_required(handle)
+    assert store.recovery_required(handle)
     assert runner_cleanup_calls == 1
     assert trial_cleanup_calls == 1
 
@@ -1643,6 +1691,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert snapshot_cleanup_flags == [True, True]
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"
+    assert not store.recovery_required(handle)
 
 
 def test_operator_recovery_consumes_terminal_cleanup_evidence(

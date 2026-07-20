@@ -50,7 +50,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
-from phasesweep.mcp.runs import RunHandle, RunState, RunStore
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore, write_status_file
 from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
 from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
 from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
@@ -1089,47 +1089,36 @@ class PhaseSweepMCP:
                 config_snapshot_path = self._snapshot_config(reg, run_id)
                 pending = self._pending_handle(reg, run_id)
                 self._runs.save(pending)
-                handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
+                try:
+                    handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
+                except Exception as spawn_exc:
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=True,
+                        error_class=type(spawn_exc).__name__,
+                    )
+                    raise
+                if handle.pid_starttime is None:
+                    launch_exc = RuntimeError(
+                        "spawned runner has no Linux /proc start time; refused launch because "
+                        "later cancellation could not distinguish PID reuse"
+                    )
+                    cleanup_confirmed = self._terminate_failed_spawn(handle, launch_exc)
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=cleanup_confirmed,
+                        error_class=type(launch_exc).__name__,
+                    )
+                    raise launch_exc
                 try:
                     self._runs.save(handle)
                 except Exception as save_exc:
-                    marker_written = False
-                    try:
-                        self._runs.mark_cleanup_uncertain(handle)
-                        marker_written = True
-                    except Exception as marker_exc:
-                        log.error(
-                            "cleanup uncertain after failed handle save for run_id=%s pgid=%s, "
-                            "but failed to persist cleanup uncertainty marker; original save error: %r",
-                            handle.run_id,
-                            handle.pgid,
-                            save_exc,
-                            exc_info=(type(marker_exc), marker_exc, marker_exc.__traceback__),
-                        )
-                    try:
-                        assert handle.pgid is not None
-                        cleanup_confirmed = kill_stale_group(
-                            handle.pid,
-                            handle.pid_starttime,
-                            pgid=handle.pgid,
-                        )
-                    except Exception:
-                        log.exception(
-                            "failed to terminate unsaved runner run_id=%s pgid=%s",
-                            handle.run_id,
-                            handle.pgid,
-                        )
-                    else:
-                        if cleanup_confirmed:
-                            if marker_written:
-                                with contextlib.suppress(Exception):
-                                    self._runs.clear_cleanup_uncertain(handle)
-                        else:
-                            log.error(
-                                "cleanup uncertain after failed handle save for run_id=%s pgid=%s",
-                                handle.run_id,
-                                handle.pgid,
-                            )
+                    cleanup_confirmed = self._terminate_failed_spawn(handle, save_exc)
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=cleanup_confirmed,
+                        error_class=type(save_exc).__name__,
+                    )
                     raise
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
@@ -1345,6 +1334,88 @@ class PhaseSweepMCP:
             allow_cancel=reg.allow_cancel,
         )
 
+    def _record_launch_failure(
+        self,
+        pending: RunHandle,
+        *,
+        cleanup_confirmed: bool,
+        error_class: str,
+    ) -> None:
+        """Finalize a known failed launch without masking its original error.
+
+        :param RunHandle pending: Durable pre-spawn handle to finalize.
+        :param bool cleanup_confirmed: Whether any spawned runner group is confirmed gone.
+        :param str error_class: Operator-facing class of the original launch failure.
+        """
+        try:
+            write_status_file(
+                self._runs.status_path(pending.run_id),
+                {
+                    "run_id": pending.run_id,
+                    "returncode": 1,
+                    "error_class": error_class,
+                    "cleanup_confirmed": cleanup_confirmed,
+                    "ended_at": utc_now_iso(),
+                    "result_snapshot_state": "failed",
+                    "result_snapshot_error": "LaunchDidNotProduceSnapshot",
+                },
+            )
+        except Exception:
+            # The unresolved launching handle remains a fail-closed concurrency
+            # reservation when even terminal bookkeeping cannot be persisted.
+            log.exception("failed to finalize launch error for run_id=%s", pending.run_id)
+
+    def _terminate_failed_spawn(
+        self,
+        handle: RunHandle,
+        original_error: BaseException,
+    ) -> bool:
+        """Terminate a spawned runner whose durable bookkeeping failed.
+
+        :param RunHandle handle: Spawned runner identity available in memory.
+        :param BaseException original_error: Launch failure preserved for diagnostics.
+        :return bool: Whether the runner process group is confirmed gone.
+        """
+        marker_written = False
+        try:
+            self._runs.mark_cleanup_uncertain(handle)
+            marker_written = True
+        except Exception as marker_exc:
+            log.error(
+                "cleanup uncertain after failed runner launch bookkeeping for "
+                "run_id=%s pgid=%s, but failed to persist cleanup uncertainty marker; "
+                "original error: %r",
+                handle.run_id,
+                handle.pgid,
+                original_error,
+                exc_info=(type(marker_exc), marker_exc, marker_exc.__traceback__),
+            )
+        try:
+            assert handle.pgid is not None
+            cleanup_confirmed = kill_stale_group(
+                handle.pid,
+                handle.pid_starttime,
+                pgid=handle.pgid,
+            )
+        except Exception:
+            log.exception(
+                "failed to terminate untracked runner run_id=%s pgid=%s",
+                handle.run_id,
+                handle.pgid,
+            )
+            return False
+        if cleanup_confirmed:
+            if marker_written:
+                with contextlib.suppress(Exception):
+                    self._runs.clear_cleanup_uncertain(handle)
+        else:
+            log.error(
+                "cleanup uncertain after failed runner launch bookkeeping for run_id=%s pgid=%s",
+                handle.run_id,
+                handle.pgid,
+            )
+        return cleanup_confirmed
+
     def _spawn(
         self,
         reg: RegisteredExperiment,
@@ -1410,15 +1481,6 @@ class PhaseSweepMCP:
             launch_state="spawned",
             allow_cancel=reg.allow_cancel,
         )
-        if handle.pid_starttime is None:
-            self._runs.mark_cleanup_uncertain(handle)
-            cleanup_confirmed = kill_stale_group(handle.pid, None, pgid=handle.pgid)
-            if cleanup_confirmed:
-                self._runs.clear_cleanup_uncertain(handle)
-            raise RuntimeError(
-                "spawned runner has no Linux /proc start time; refused launch because "
-                "later cancellation could not distinguish PID reuse"
-            )
         return handle
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
