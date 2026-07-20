@@ -50,7 +50,7 @@ def _sleeping_score_experiment(
         ap = argparse.ArgumentParser()
         ap.add_argument("--out", required=True)
         args, _ = ap.parse_known_args()
-        time.sleep(0.15)
+        time.sleep(0.5)
         with open(args.out, "w") as f:
             json.dump({"x": 1.0}, f)
         print("x=1.0")
@@ -542,7 +542,7 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
         tmp_path,
         experiment="phase_timeout_allowed",
         n_trials=10,
-        timeout_seconds_per_phase=1.0,
+        timeout_seconds_per_phase=3.0,
         allow_incomplete_on_timeout=True,
     )
 
@@ -590,7 +590,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
             Phase(
                 name="p",
                 n_trials=2,
-                timeout_seconds_per_phase=0.8,
+                timeout_seconds_per_phase=3.0,
                 allow_incomplete_on_timeout=allow_incomplete_on_timeout,
                 search_space={},
             )
@@ -629,7 +629,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
                 json.dump({"x": 1.0}, f)
             print("x=1.0")
         else:
-            time.sleep(1.0)
+            time.sleep(10.0)
         """,
     )
     exp = Experiment(
@@ -644,7 +644,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
                 name="p",
                 n_trials=3,
                 max_consecutive_failures=1,
-                timeout_seconds_per_phase=0.5,
+                timeout_seconds_per_phase=3.0,
                 allow_incomplete_on_timeout=True,
                 search_space={},
             )
@@ -672,7 +672,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
         tmp_path,
         experiment="phase_timeout_resume_guard",
         n_trials=10,
-        timeout_seconds_per_phase=1.0,
+        timeout_seconds_per_phase=3.0,
         allow_incomplete_on_timeout=True,
     )
     run_experiment(accepted)
@@ -681,7 +681,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
         tmp_path,
         experiment="phase_timeout_resume_guard",
         n_trials=10,
-        timeout_seconds_per_phase=1.0,
+        timeout_seconds_per_phase=3.0,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
         _load_winner(current, current.phases[0], {})
