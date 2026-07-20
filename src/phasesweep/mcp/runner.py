@@ -203,7 +203,11 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("MCP runner config snapshot is not a single experiment")
 
         def capture_terminal(generation_id: str, _error: BaseException | None) -> None:
-            """Capture immutable results while ``run_experiment`` still owns its lock."""
+            """Capture immutable results while ``run_experiment`` still owns its lock.
+
+            :param str generation_id: Identifier for the completed engine invocation.
+            :param BaseException | None _error: Terminal engine error, if one occurred.
+            """
             nonlocal result_snapshot, result_snapshot_error
             try:
                 result_snapshot = capture_result_snapshot(
