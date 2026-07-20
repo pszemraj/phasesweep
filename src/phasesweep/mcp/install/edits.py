@@ -22,7 +22,6 @@ import contextlib
 import fcntl
 import hashlib
 import json
-import math
 import os
 import re
 import stat
@@ -33,6 +32,7 @@ from pathlib import Path
 from typing import IO, Literal, TypeAlias
 
 from phasesweep.runtime.files import lock_dir
+from phasesweep.runtime.json import strict_json_loads
 
 Action: TypeAlias = Literal[
     "created",
@@ -234,59 +234,6 @@ def _detected_indent(text: str) -> str:
     return match.group(1) if match else "  "
 
 
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """Build a JSON object while rejecting ambiguous duplicate member names.
-
-    :param list[tuple[str, object]] pairs: Parsed object members in source order.
-    :raises ValueError: If a member name occurs more than once.
-    :return dict[str, object]: Ordered unique member mapping.
-    """
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON member {key!r}")
-        result[key] = value
-    return result
-
-
-def _finite_json_float(value: str) -> float:
-    """Parse one JSON float and reject values outside finite float range.
-
-    :param str value: Raw JSON numeric token.
-    :raises ValueError: If the token overflows to a non-finite Python float.
-    :return float: Finite parsed value.
-    """
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError(f"non-finite JSON number {value!r}")
-    return parsed
-
-
-def _reject_json_constant(value: str) -> object:
-    """Reject Python JSON extensions such as ``NaN`` and ``Infinity``.
-
-    :param str value: Non-standard constant token accepted by Python's parser.
-    :raises ValueError: Always; strict JSON has no such constants.
-    :return object: This function never returns.
-    """
-    raise ValueError(f"non-standard JSON constant {value!r}")
-
-
-def _load_strict_json(text: str) -> object:
-    """Parse strict JSON with unique keys and finite numeric values.
-
-    :param str text: Complete JSON document.
-    :raises ValueError: If syntax, key uniqueness, or numeric finiteness is invalid.
-    :return object: Parsed JSON value.
-    """
-    return json.loads(
-        text,
-        object_pairs_hook=_unique_json_object,
-        parse_float=_finite_json_float,
-        parse_constant=_reject_json_constant,
-    )
-
-
 def _dump_json(data: dict[str, object], *, indent: str, trailing_newline: bool) -> str:
     """Serialize a JSON document preserving the source file's surface style.
 
@@ -310,39 +257,35 @@ def manual_json_snippet(container_key: str, member_key: str, entry: dict[str, ob
     return json.dumps({container_key: {member_key: entry}}, indent=2, allow_nan=False)
 
 
-def merge_json_member(
+def _edit_json_member(
     path: Path,
     container_key: str,
     member_key: str,
-    entry: dict[str, object],
     *,
-    managed: MemberPredicate | None = None,
+    operation: Literal["merge", "remove"],
+    entry: dict[str, object] | None,
+    managed: MemberPredicate,
     dry_run: bool = False,
 ) -> Action:
-    """Add or update ``container_key.member_key = entry`` in a JSON config file.
+    """Apply one managed JSON member mutation through a locked transaction.
 
-    Missing or empty files are created fresh. Existing files are parsed as
-    strict JSON and rewritten with their detected indentation; key order and
-    supported values survive at Python's JSON precision. Comment-bearing
-    configs (``.jsonc``/JSON5) fail strict parsing and are left untouched.
-
-    :param Path path: Client config file to edit.
-    :param str container_key: Top-level key holding the client's server map.
-    :param str member_key: Server name to add or update within the container.
-    :param dict[str, object] entry: Server entry value to store.
-    :param MemberPredicate | None managed: Optional predicate identifying an
-        existing member as installer-managed and therefore safe to update.
-    :param bool dry_run: Compute the action without writing the file.
-    :return Action: ``created``/``updated``/``unchanged`` on success,
-        ``skipped`` when the file is not strict JSON, ``error`` when the
-        document or container is not an object, or ``conflict`` when a
-        differing unmanaged member already exists.
+    :param Path path: Client configuration path.
+    :param str container_key: Top-level server-map key.
+    :param str member_key: Managed server name.
+    :param Literal operation: Mutation to apply.
+    :param dict[str, object] | None entry: Entry used by a merge.
+    :param MemberPredicate managed: Predicate recognizing an owned existing entry.
+    :param bool dry_run: Return the action without writing.
+    :return Action: Edit result.
     """
     with _locked_editable_text(path) as loaded:
         if loaded is None:
             return "error"
         text = loaded.text
-        if not text.strip():
+        if operation == "remove" and not loaded.existed:
+            return "not-found"
+        if operation == "merge" and not text.strip():
+            assert entry is not None
             if dry_run:
                 return "updated" if loaded.existed else "created"
             try:
@@ -355,22 +298,34 @@ def merge_json_member(
             return ("updated" if loaded.existed else "created") if written else "error"
 
         try:
-            data = _load_strict_json(text)
+            data = strict_json_loads(text, finite_floats=True) if text.strip() else {}
         except ValueError:
             return "skipped"
         if not isinstance(data, dict):
             return "error"
+        if operation == "remove" and container_key not in data:
+            return "not-found"
         container = data.setdefault(container_key, {})
         if not isinstance(container, dict):
             return "error"
-        current = container.get(member_key)
-        if member_key in container and current == entry:
-            return "unchanged"
-        if member_key in container and (managed is None or not managed(current)):
-            return "conflict"
-        container[member_key] = entry
+        if operation == "merge":
+            assert entry is not None
+            current = container.get(member_key)
+            if member_key in container and current == entry:
+                return "unchanged"
+            if member_key in container and not managed(current):
+                return "conflict"
+            container[member_key] = entry
+            action: Action = "updated"
+        else:
+            if member_key not in container:
+                return "not-found"
+            if not managed(container[member_key]):
+                return "conflict"
+            del container[member_key]
+            action = "removed"
         if dry_run:
-            return "updated"
+            return action
         try:
             updated = _dump_json(
                 data,
@@ -380,7 +335,37 @@ def merge_json_member(
         except (TypeError, ValueError):
             return "error"
         written = _atomic_write_text(path, updated, expected=loaded)
-        return "updated" if written else "error"
+        return action if written else "error"
+
+
+def merge_json_member(
+    path: Path,
+    container_key: str,
+    member_key: str,
+    entry: dict[str, object],
+    *,
+    managed: MemberPredicate,
+    dry_run: bool = False,
+) -> Action:
+    """Add or update one installer-managed JSON member.
+
+    :param Path path: Client configuration path.
+    :param str container_key: Top-level server-map key.
+    :param str member_key: Managed server name.
+    :param dict[str, object] entry: Entry to install.
+    :param MemberPredicate managed: Predicate recognizing an owned existing entry.
+    :param bool dry_run: Return the action without writing.
+    :return Action: Edit result.
+    """
+    return _edit_json_member(
+        path,
+        container_key,
+        member_key,
+        operation="merge",
+        entry=entry,
+        managed=managed,
+        dry_run=dry_run,
+    )
 
 
 def remove_json_member(
@@ -388,59 +373,27 @@ def remove_json_member(
     container_key: str,
     member_key: str,
     *,
-    managed: MemberPredicate | None = None,
+    managed: MemberPredicate,
     dry_run: bool = False,
 ) -> Action:
-    """Remove ``container_key.member_key`` from a JSON config file.
+    """Remove one installer-managed JSON member.
 
-    The containing object and config file remain even when empty because the
-    installer does not persist enough provenance to prove it created them.
-
-    :param Path path: Client config file to edit.
-    :param str container_key: Top-level key holding the client's server map.
-    :param str member_key: Server name to remove from the container.
-    :param MemberPredicate | None managed: Optional predicate the existing
-        member must satisfy before removal.
-    :param bool dry_run: Compute the action without writing the file.
-    :return Action: ``removed`` on success, ``not-found`` when the file or
-        member is absent, ``skipped`` when the file is not strict JSON,
-        ``error`` when the document or container is not an object, or
-        ``conflict`` when the member is not installer-managed.
+    :param Path path: Client configuration path.
+    :param str container_key: Top-level server-map key.
+    :param str member_key: Managed server name.
+    :param MemberPredicate managed: Predicate recognizing an owned existing entry.
+    :param bool dry_run: Return the action without writing.
+    :return Action: Edit result.
     """
-    with _locked_editable_text(path) as loaded:
-        if loaded is None:
-            return "error"
-        text = loaded.text
-        if not loaded.existed:
-            return "not-found"
-        try:
-            data = _load_strict_json(text) if text.strip() else {}
-        except ValueError:
-            return "skipped"
-        if not isinstance(data, dict):
-            return "error"
-        if container_key not in data:
-            return "not-found"
-        container = data[container_key]
-        if not isinstance(container, dict):
-            return "error"
-        if member_key not in container:
-            return "not-found"
-        if managed is not None and not managed(container[member_key]):
-            return "conflict"
-        del container[member_key]
-        if dry_run:
-            return "removed"
-        try:
-            updated = _dump_json(
-                data,
-                indent=_detected_indent(text),
-                trailing_newline=text.endswith("\n"),
-            )
-        except (TypeError, ValueError):
-            return "error"
-        written = _atomic_write_text(path, updated, expected=loaded)
-        return "removed" if written else "error"
+    return _edit_json_member(
+        path,
+        container_key,
+        member_key,
+        operation="remove",
+        entry=None,
+        managed=managed,
+        dry_run=dry_run,
+    )
 
 
 def render_marked_block(content: str, *, start: str, end: str) -> str:
@@ -527,75 +480,3 @@ def removed_marked_text(existing: str, *, start: str, end: str) -> str | None:
         # block's newline style also handles a file later normalized to CRLF.
         before = before[: -len(separator)]
     return before + existing[cut_end:]
-
-
-def replace_or_append_marked(
-    path: Path,
-    content: str,
-    *,
-    start: str,
-    end: str,
-    dry_run: bool = False,
-) -> Action:
-    """Install a marker-fenced block into a text file, idempotently.
-
-    An existing fenced block is replaced in place (bytes outside the markers
-    untouched); otherwise the block is appended after a newline separator.
-
-    :param Path path: Text file to edit (created if missing).
-    :param str content: Block body to place between the markers.
-    :param str start: Start marker line.
-    :param str end: End marker line.
-    :param bool dry_run: Compute the action without writing the file.
-    :return Action: ``created``/``updated``/``unchanged``.
-    """
-    with _locked_editable_text(path) as loaded:
-        if loaded is None:
-            return "error"
-        try:
-            updated = updated_marked_text(loaded.text, content, start=start, end=end)
-        except ValueError:
-            return "error"
-        if updated == loaded.text:
-            return "unchanged"
-        if dry_run:
-            return "created" if not loaded.existed else "updated"
-        if not _atomic_write_text(path, updated, expected=loaded):
-            return "error"
-        return "created" if not loaded.existed else "updated"
-
-
-def remove_marked(
-    path: Path,
-    *,
-    start: str,
-    end: str,
-    dry_run: bool = False,
-) -> Action:
-    """Remove a marker-fenced block, undoing :func:`replace_or_append_marked`.
-
-    The pre-install bytes come back exactly, including newline style and final
-    newline state. The file remains even when empty because emptiness does not
-    prove that the installer created the file.
-
-    :param Path path: Text file to edit.
-    :param str start: Start marker line.
-    :param str end: End marker line.
-    :param bool dry_run: Compute the action without writing the file.
-    :return Action: ``removed`` on success, ``not-found`` when the file or a
-        well-formed marker pair is absent.
-    """
-    with _locked_editable_text(path) as loaded:
-        if loaded is None:
-            return "error"
-        if not loaded.existed:
-            return "not-found"
-        try:
-            remainder = removed_marked_text(loaded.text, start=start, end=end)
-        except ValueError:
-            return "error"
-        if remainder is None:
-            return "not-found"
-        if dry_run:
-            return "removed"
-        return "removed" if _atomic_write_text(path, remainder, expected=loaded) else "error"

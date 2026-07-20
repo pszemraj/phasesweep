@@ -28,7 +28,7 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import _winner_path
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
-from phasesweep.mcp.install.targets import AGENT_IDS
+from phasesweep.mcp.install.targets import agent_ids
 from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
@@ -749,7 +749,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
     "--agent",
     "agents",
     multiple=True,
-    type=click.Choice(AGENT_IDS),
+    type=click.Choice(agent_ids()),
     help="Agent to configure explicitly; repeat for more.",
 )
 @click.option(
@@ -899,7 +899,7 @@ def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
     "--agent",
     "agents",
     multiple=True,
-    type=click.Choice(AGENT_IDS),
+    type=click.Choice(agent_ids()),
     help="Agent to clean up explicitly; repeat for more.",
 )
 @click.option(

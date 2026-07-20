@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
@@ -30,6 +29,7 @@ from phasesweep.evidence.wandb import (
     WandbRunTerminalError,
     poll_wandb_summary,
 )
+from phasesweep.runtime.json import strict_json_loads
 
 
 def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path, Any]:
@@ -43,11 +43,7 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
-    cur = json.loads(
-        target.read_text(encoding="utf-8"),
-        parse_constant=_reject_nonstandard_json_constant,
-        object_pairs_hook=_reject_duplicate_json_keys,
-    )
+    cur = strict_json_loads(target.read_text(encoding="utf-8"))
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -67,30 +63,6 @@ def json_float(value: Any, *, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"Value at {label!r} is not a JSON number: {value!r}")
     return float(value)
-
-
-def _reject_nonstandard_json_constant(value: str) -> NoReturn:
-    """Reject NaN and infinity tokens while parsing strict result envelopes.
-
-    :param str value: Non-standard numeric token accepted by Python's JSON parser.
-    :raises ValueError: Always, because the token is not valid JSON evidence.
-    """
-    raise ValueError(f"non-standard numeric constant {value!r}")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Build a JSON object while rejecting ambiguous duplicate member names.
-
-    :param list[tuple[str, Any]] pairs: Parsed object members in source order.
-    :raises ValueError: If a member name occurs more than once.
-    :return dict[str, Any]: Mapping containing each unique parsed member.
-    """
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key {key!r}")
-        result[key] = value
-    return result
 
 
 class ExtractorError(RuntimeError):
@@ -168,11 +140,7 @@ def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> flo
     """
     target = ctx.trial_dir / cfg.path
     try:
-        data = json.loads(
-            target.read_text(encoding="utf-8"),
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_reject_duplicate_json_keys,
-        )
+        data = strict_json_loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON envelope not found: {target}") from exc
     except UnicodeError as exc:

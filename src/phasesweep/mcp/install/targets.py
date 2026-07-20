@@ -40,16 +40,6 @@ TOML_END = "# PHASESWEEP_END"
 Scope = Literal["project", "user"]
 EntryStyle = Literal["stdio", "stdio-typed", "opencode"]
 
-AGENT_IDS: tuple[str, ...] = (
-    "claude",
-    "claude-desktop",
-    "codex",
-    "cursor",
-    "vscode",
-    "gemini",
-    "opencode",
-)
-
 
 @dataclass(frozen=True)
 class McpSpec:
@@ -296,3 +286,11 @@ def agent_targets(project: Path) -> list[AgentTarget]:
             instructions_path=project / "AGENTS.md",
         ),
     ]
+
+
+def agent_ids() -> tuple[str, ...]:
+    """Return supported target identifiers in display order.
+
+    :return tuple[str, ...]: Supported target identifiers.
+    """
+    return tuple(target.id for target in agent_targets(Path()))

@@ -6,6 +6,7 @@ import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -19,18 +20,13 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.install import edits as install_edits
 from phasesweep.mcp.install import installer
-from phasesweep.mcp.install.edits import (
-    merge_json_member,
-    remove_json_member,
-    remove_marked,
-    replace_or_append_marked,
-)
+from phasesweep.mcp.install.edits import removed_marked_text, updated_marked_text
 from phasesweep.mcp.install.targets import (
-    AGENT_IDS,
     MARKDOWN_END,
     MARKDOWN_START,
     TOML_END,
     TOML_START,
+    agent_ids,
     agent_targets,
     codex_toml_content,
     is_managed_mcp_entry,
@@ -42,6 +38,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "examples" / "mcp_experiment.yaml"
 
 ENTRY = {"command": "/venv/bin/phasesweep-mcp", "args": ["--catalog", "/proj/catalog.yaml"]}
+ALL_AGENT_IDS = agent_ids()
+
+
+def _is_test_entry(value: object) -> bool:
+    """Recognize the managed entry used by low-level edit tests."""
+    return value == ENTRY
+
+
+merge_json_member = partial(install_edits.merge_json_member, managed=_is_test_entry)
+remove_json_member = partial(install_edits.remove_json_member, managed=_is_test_entry)
 
 
 @pytest.fixture()
@@ -173,11 +179,6 @@ def test_config_edits_refuse_directories_and_symlinks(tmp_path):
     for path in (directory, symlink):
         assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
         assert remove_json_member(path, "mcpServers", "phasesweep") == "error"
-        assert (
-            replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END)
-            == "error"
-        )
-        assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "error"
     assert target.read_text() == "{}\n"
 
 
@@ -255,159 +256,62 @@ def test_json_edit_dry_run_reports_actions_without_writing(tmp_path):
     assert path.read_text() == original
 
 
-# --- marker-fenced blocks ---
+# --- marker-fenced text transforms ---
 
 
-def test_marked_block_round_trip_is_byte_identical(tmp_path):
-    path = tmp_path / "CLAUDE.md"
-    original = "# My project\n\nHouse rules.\n"
-    path.write_text(original)
-    assert (
-        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+@pytest.mark.parametrize(
+    "original",
+    ["# My project\n\nHouse rules.\n", "# My project", "before\r\n", "   \r\n", ""],
+)
+def test_marked_text_round_trip_is_identical(original):
+    updated = updated_marked_text(
+        original,
+        "body",
+        start=MARKDOWN_START,
+        end=MARKDOWN_END,
     )
-    assert path.read_text() == f"{original}\n{MARKDOWN_START}\nbody\n{MARKDOWN_END}\n"
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_text() == original
+    assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == original
 
 
-def test_marked_block_round_trip_preserves_missing_final_newline(tmp_path):
-    path = tmp_path / "CLAUDE.md"
-    original = "# My project"
-    path.write_text(original)
-
-    assert (
-        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+def test_marked_text_replaces_in_place_and_preserves_crlf():
+    existing = f"before\r\n\r\n{MARKDOWN_START}\r\nold\r\n{MARKDOWN_END}\r\n"
+    updated = updated_marked_text(
+        existing,
+        "new",
+        start=MARKDOWN_START,
+        end=MARKDOWN_END,
     )
-    assert path.read_text() == f"{original}\n{MARKDOWN_START}\nbody\n{MARKDOWN_END}\n"
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_text() == original
+    assert updated == f"before\r\n\r\n{MARKDOWN_START}\r\nnew\r\n{MARKDOWN_END}\r\n"
+    assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == "before\r\n"
 
 
-@pytest.mark.parametrize("original", [b"before\r\n", b"   \r\n"])
-def test_marked_block_round_trip_preserves_raw_newline_bytes(tmp_path, original):
-    path = tmp_path / "AGENTS.md"
-    path.write_bytes(original)
-
-    assert (
-        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
-    )
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_bytes() == original
-
-
-def test_marked_block_update_and_removal_preserve_existing_crlf_style(tmp_path):
-    path = tmp_path / "AGENTS.md"
-    existing = (
-        b"before\r\n\r\n"
-        + MARKDOWN_START.encode()
-        + b"\r\nold\r\n"
-        + MARKDOWN_END.encode()
-        + b"\r\n"
-    )
-    path.write_bytes(existing)
-
-    assert (
-        replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
-    )
-    assert b"\r\nnew\r\n" in path.read_bytes()
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_bytes() == b"before\r\n"
-
-
-def test_marker_text_must_be_an_exact_standalone_line(tmp_path):
-    path = tmp_path / "AGENTS.md"
+def test_marker_text_must_be_an_exact_standalone_line():
     original = f"mention {MARKDOWN_START} inline and leave it alone\n"
-    path.write_text(original)
-
-    assert (
-        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
+    updated = updated_marked_text(
+        original,
+        "body",
+        start=MARKDOWN_START,
+        end=MARKDOWN_END,
     )
-    updated = path.read_text()
     assert updated.startswith(original)
     assert updated.count(MARKDOWN_START) == 2
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_text() == original
+    assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == original
 
 
-def test_marked_block_on_fresh_file_remains_empty_on_removal(tmp_path):
-    path = tmp_path / "AGENTS.md"
-    assert (
-        replace_or_append_marked(path, "body", start=MARKDOWN_START, end=MARKDOWN_END) == "created"
-    )
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "removed"
-    assert path.read_bytes() == b""
-
-
-def test_marked_block_replaces_in_place(tmp_path):
-    path = tmp_path / "AGENTS.md"
-    path.write_text(f"before\n\n{MARKDOWN_START}\nold\n{MARKDOWN_END}\nafter\n")
-    assert (
-        replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "updated"
-    )
-    assert path.read_text() == f"before\n\n{MARKDOWN_START}\nnew\n{MARKDOWN_END}\nafter\n"
-    assert (
-        replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "unchanged"
-    )
-    assert (
-        remove_marked(tmp_path / "absent.md", start=MARKDOWN_START, end=MARKDOWN_END) == "not-found"
-    )
-
-
-def test_marked_block_refuses_unmatched_marker(tmp_path):
-    path = tmp_path / "AGENTS.md"
+def test_marked_text_refuses_unmatched_marker():
     original = f"before\n{MARKDOWN_START}\nunterminated\n"
-    path.write_text(original)
-
-    assert replace_or_append_marked(path, "new", start=MARKDOWN_START, end=MARKDOWN_END) == "error"
-    assert remove_marked(path, start=MARKDOWN_START, end=MARKDOWN_END) == "error"
-    assert path.read_text() == original
-
-
-def test_marked_edit_dry_run_reports_actions_without_writing(tmp_path):
-    path = tmp_path / "AGENTS.md"
-    assert (
-        replace_or_append_marked(
-            path,
-            "body",
-            start=MARKDOWN_START,
-            end=MARKDOWN_END,
-            dry_run=True,
-        )
-        == "created"
-    )
-    assert not path.exists()
-
-    path.write_text(f"before\n{MARKDOWN_START}\nold\n{MARKDOWN_END}\n")
-    original = path.read_text()
-    assert (
-        replace_or_append_marked(
-            path,
-            "new",
-            start=MARKDOWN_START,
-            end=MARKDOWN_END,
-            dry_run=True,
-        )
-        == "updated"
-    )
-    assert (
-        remove_marked(
-            path,
-            start=MARKDOWN_START,
-            end=MARKDOWN_END,
-            dry_run=True,
-        )
-        == "removed"
-    )
-    assert path.read_text() == original
+    with pytest.raises(ValueError):
+        updated_marked_text(original, "new", start=MARKDOWN_START, end=MARKDOWN_END)
+    with pytest.raises(ValueError):
+        removed_marked_text(original, start=MARKDOWN_START, end=MARKDOWN_END)
 
 
 # --- targets ---
 
 
-def test_agent_targets_match_public_ids_and_scopes(fake_home, tmp_path):
+def test_agent_target_scopes(fake_home, tmp_path):
     project = tmp_path / "proj"
     targets = {target.id: target for target in agent_targets(project)}
-    assert tuple(targets) == AGENT_IDS
 
     assert targets["claude"].mcp.path == project / ".mcp.json"
     assert targets["claude"].mcp.key == "mcpServers"
@@ -511,7 +415,7 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
         "install",
         project,
         catalog,
-        list(AGENT_IDS),
+        list(ALL_AGENT_IDS),
         "all",
         yes=True,
         allow_user_scope=True,
@@ -534,7 +438,7 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
             "install",
             project,
             catalog,
-            list(AGENT_IDS),
+            list(ALL_AGENT_IDS),
             "all",
             yes=True,
             allow_user_scope=True,
@@ -543,7 +447,7 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     )
     assert "unchanged" in capsys.readouterr().out
 
-    assert installer.run("uninstall", project, None, list(AGENT_IDS), "all", yes=True) == 0
+    assert installer.run("uninstall", project, None, list(ALL_AGENT_IDS), "all", yes=True) == 0
     for target in agent_targets(project):
         if target.mcp.format == "toml":
             assert target.mcp.path.read_bytes() == b""
@@ -712,26 +616,6 @@ def test_installer_reports_non_regular_json_config(fake_home, tmp_path, capsys, 
     assert "config path is not a regular file" in capsys.readouterr().out
 
 
-def test_installer_skips_unmanaged_codex_table(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-    codex_config = fake_home / ".codex" / "config.toml"
-    codex_config.parent.mkdir()
-    original = '[mcp_servers.phasesweep]\ncommand = "custom"\n'
-    codex_config.write_text(original)
-
-    code = installer.run(
-        "install", project, catalog, ["codex"], "mcp", yes=True, allow_user_scope=True
-    )
-    assert code == 1
-    assert "skipped" in capsys.readouterr().out
-    assert codex_config.read_text() == original
-    # Uninstall never touches unmanaged tables either.
-    assert installer.run("uninstall", project, None, ["codex"], "mcp", yes=True) == 0
-    assert codex_config.read_text() == original
-
-
 @pytest.mark.parametrize(
     "agent_id",
     ["claude", "claude-desktop", "cursor", "vscode", "gemini", "opencode"],
@@ -819,6 +703,7 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
 @pytest.mark.parametrize(
     "original",
     [
+        '[mcp_servers.phasesweep]\ncommand = "custom"\n',
         '[mcp_servers."phasesweep"]\ncommand = "custom"\n',
         'mcp_servers = { phasesweep = { command = "custom" } }\n',
         'mcp_servers.phasesweep.command = "custom"\n',
@@ -840,6 +725,8 @@ def test_installer_detects_unmanaged_codex_table_semantically(
 
     assert code == 1
     assert "unmanaged" in capsys.readouterr().out
+    assert codex_config.read_text() == original
+    assert installer.run("uninstall", project, None, ["codex"], "mcp", yes=True) == 0
     assert codex_config.read_text() == original
 
 

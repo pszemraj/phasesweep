@@ -142,8 +142,6 @@ def _apply_toml_mcp(
     :param bool dry_run: Compute the verdict without committing the candidate.
     :return StepResult: Safe edit or manual-attention verdict.
     """
-    if mode == "install" and catalog is None:
-        raise ValueError("installing an MCP entry requires a catalog path")
     content = codex_toml_content(command, catalog) if catalog is not None else ""
 
     with _locked_editable_text(path) as loaded:
@@ -197,8 +195,7 @@ def _apply_toml_mcp(
                     ),
                 )
             candidate = removed_marked_text(loaded.text, start=TOML_START, end=TOML_END)
-            if candidate is None:  # guarded by ``span`` above
-                return StepResult("mcp", path, "not-found")
+            assert candidate is not None
             try:
                 parsed_candidate = tomllib.loads(candidate)
             except tomllib.TOMLDecodeError as exc:
@@ -335,8 +332,7 @@ def _apply_mcp(
         else:
             note = None
         return StepResult("mcp", spec.path, action, note=note)
-    if catalog is None:
-        raise ValueError("installing an MCP entry requires a catalog path")
+    assert catalog is not None
     if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
         return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
     entry = mcp_entry(spec.style, command, catalog)
@@ -489,8 +485,7 @@ def _apply_instructions(
                 start=MARKDOWN_START,
                 end=MARKDOWN_END,
             )
-            if removal_candidate is None:  # guarded by parsed owner metadata above
-                return StepResult("instructions", path, "not-found")
+            assert removal_candidate is not None
             if dry_run:
                 return StepResult("instructions", path, "removed")
             action = (
