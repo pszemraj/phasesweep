@@ -247,6 +247,7 @@ def finalize_result_snapshot(
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param bool cleanup_confirmed: Whether remaining trainer process groups are confirmed gone.
+    :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     """
     del cleanup_confirmed
@@ -266,6 +267,22 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
         phase.running = phase.trials["RUNNING"]
+        generation_id = parsed.status.generation_id
+        generation_recovered = [
+            attempt
+            for attempt in recovered
+            if generation_id is not None and attempt.generation_id == generation_id
+        ]
+        if generation_recovered:
+            generation_running = phase.generation_trials.get("RUNNING", 0)
+            if len(generation_recovered) > generation_running:
+                raise RuntimeError(
+                    "cleanup report identifies more generation attempts than the snapshot records"
+                )
+            phase.generation_trials["RUNNING"] = generation_running - len(generation_recovered)
+            phase.generation_trials["FAIL"] = phase.generation_trials.get("FAIL", 0) + len(
+                generation_recovered
+            )
         recovered_ids = {attempt.attempt_id for attempt in recovered}
         phase.running_attempts = [
             attempt for attempt in phase.running_attempts if attempt.attempt_id not in recovered_ids

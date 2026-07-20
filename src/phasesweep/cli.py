@@ -279,6 +279,20 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     if handle is None:
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
+    if handle.launch_state == "launching" and terminal_status is None:
+        refreshed_handle = store.get(run_id)
+        if refreshed_handle is not None:
+            refreshed_status = store.recorded_terminal_status(refreshed_handle)
+            if refreshed_handle.launch_state != "launching" or refreshed_status is not None:
+                handle = refreshed_handle
+                terminal_status = refreshed_status
+        if handle.launch_state == "launching" and terminal_status is None:
+            raise click.ClickException(
+                "launch outcome is unresolved: the durable handle cannot distinguish a "
+                "pre-spawn failure from a child that has not persisted its process identity. "
+                "The run remains reserved; retry after a runner identity or terminal status "
+                "appears."
+            )
     cleanup_recovery_required = store.cleanup_recovery_required(handle)
     snapshot_recovery_required = store.snapshot_recovery_required(handle)
     terminal_cleanup_uncertain = (
@@ -365,7 +379,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 raise click.ClickException("runner process-group cleanup is still uncertain")
 
             reaped = 0
-            reaped_attempt_ids: set[str] = set()
+            reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
             cleanup_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
@@ -443,6 +457,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     "recovered_at": utc_now_iso(),
                     "cleanup_confirmed": True,
                     "reaped_running_trials": reaped,
+                    "reaped_attempt_ids": sorted(reaped_attempt_ids),
                     "cleanup_uncertain_terminal_trials": cleanup_recovered,
                 }
                 private_atomic_write_text(

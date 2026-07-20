@@ -106,6 +106,7 @@ def _write_stale_running_trial(
     config: Path,
     *,
     cleanup_confirmed: bool | None = None,
+    generation_id: str = "stale-generation",
 ) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -121,7 +122,7 @@ def _write_stale_running_trial(
         exp,
         phase.name,
         trial.number,
-        generation_id="stale-generation",
+        generation_id=generation_id,
         attempt_id=attempt_id,
     )
     trial_dir.mkdir(parents=True)
@@ -129,7 +130,7 @@ def _write_stale_running_trial(
     (trial_dir / "pgid").write_text("4343\n")
     (trial_dir / "pid_starttime").write_text("222\n")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    trial.set_user_attr(GENERATION_ID_ATTR, "stale-generation")
+    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     if cleanup_confirmed is not None:
         trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, cleanup_confirmed)
@@ -1448,7 +1449,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
         app.status(run_id=run_id)
 
 
-def test_operator_recovery_finalizes_launching_handle_without_cleanup(
+def test_operator_recovery_keeps_unresolved_launch_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1483,19 +1484,15 @@ def test_operator_recovery_finalizes_launching_handle_without_cleanup(
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert "Historical terminal result snapshot" in result.output
+    assert result.exit_code != 0
+    assert "launch outcome is unresolved" in result.output
+    assert "remains reserved" in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
-    terminal = json.loads(store.status_path(run_id).read_text())
-    assert terminal["error_class"] == "RunnerExitedWithoutStatus"
-    assert terminal["cleanup_confirmed"] is True
-    assert terminal["result_snapshot_state"] == "failed"
-    assert terminal["result_snapshot_error"] == "HistoricalSnapshotUnavailable"
-    assert store.state(handle) == "failed"
-    with pytest.raises(Exception, match="finalization state: failed"):
-        app.status(run_id=run_id)
-    with pytest.raises(Exception, match="finalization state: failed"):
-        app.winners(run_id=run_id)
+    assert not store.status_path(run_id).exists()
+    assert store.state(handle) == "running"
+    assert store.recovery_required(handle)
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
 
 
 def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_path: Path) -> None:
@@ -1666,10 +1663,15 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
-    _write_cleanup_uncertain_failed_trial(config)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-retry-result-repair"
+    trial_number = _write_stale_running_trial(
+        config,
+        cleanup_confirmed=False,
+        generation_id=run_id,
+    )
+    attempt_id = f"stale-attempt-{trial_number}"
     handle = make_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
@@ -1681,6 +1683,9 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
+    generation_path = _generation_path(experiment)
+    generation_path.parent.mkdir(parents=True, exist_ok=True)
+    generation_path.write_text(yaml.safe_dump({"generation_id": run_id}))
     write_run_status(
         store,
         run_id,
@@ -1688,7 +1693,11 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         error_class="UnsafeProcessCleanupError",
         cleanup_confirmed=False,
         result_snapshot_state="complete",
-        result_snapshot=capture_result_snapshot(experiment, cleanup_confirmed=False),
+        result_snapshot=capture_result_snapshot(
+            experiment,
+            cleanup_confirmed=False,
+            generation_id=run_id,
+        ),
     )
 
     runner_cleanup_calls = 0
@@ -1705,12 +1714,23 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         return True
 
     snapshot_cleanup_flags: list[bool] = []
+    snapshot_attempt_ids: list[set[str]] = []
 
-    def flaky_snapshot(snapshot: dict, *, cleanup_confirmed: bool) -> dict:
+    def flaky_snapshot(
+        snapshot: dict,
+        *,
+        cleanup_confirmed: bool,
+        confirmed_attempt_ids=(),
+    ) -> dict:
         snapshot_cleanup_flags.append(cleanup_confirmed)
+        snapshot_attempt_ids.append(set(confirmed_attempt_ids))
         if len(snapshot_cleanup_flags) == 1:
             raise RuntimeError("snapshot finalization failed")
-        return finalize_result_snapshot(snapshot, cleanup_confirmed=cleanup_confirmed)
+        return finalize_result_snapshot(
+            snapshot,
+            cleanup_confirmed=cleanup_confirmed,
+            confirmed_attempt_ids=confirmed_attempt_ids,
+        )
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
@@ -1731,6 +1751,8 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert first.exit_code != 0
     assert "failed to finalize terminal result snapshot" in first.output
     assert store.cleanup_recovery_path(run_id).is_file()
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert store.recovery_required(handle)
     assert runner_cleanup_calls == 1
     assert trial_cleanup_calls == 1
@@ -1742,9 +1764,19 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert runner_cleanup_calls == 1
     assert trial_cleanup_calls == 1
     assert snapshot_cleanup_flags == [True, True]
+    assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"
+    phase = terminal["result_snapshot"]["status"]["phases"][0]
+    assert phase["trials"]["RUNNING"] == 0
+    assert phase["trials"]["FAIL"] == 1
+    assert phase["generation_trials"]["RUNNING"] == 0
+    assert phase["generation_trials"]["FAIL"] == 1
     assert not store.recovery_required(handle)
+    recovered_status = app.status(run_id=run_id)["phases"][0]
+    assert recovered_status["terminal_trials_this_run"] == 1
+    assert recovered_status["terminal_trials_before_run"] == 0
+    assert recovered_status["target_already_satisfied"] is False
 
 
 def test_operator_recovery_consumes_terminal_cleanup_evidence(

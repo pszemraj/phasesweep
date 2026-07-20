@@ -501,6 +501,20 @@ class RunStore:
         status = self._read_status(handle)
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
 
+    def cleanup_recovered_attempt_ids(self, handle: RunHandle) -> set[str]:
+        """Return exact reaped attempt IDs from valid operator recovery evidence.
+
+        :param RunHandle handle: Run whose cleanup recovery evidence should be read.
+        :return set[str]: Reaped attempt identities persisted for snapshot finalization.
+        """
+        payload = self._read_cleanup_recovery(handle)
+        if payload is None:
+            return set()
+        values = payload.get("reaped_attempt_ids")
+        if not isinstance(values, list):
+            return set()
+        return {value for value in values if isinstance(value, str) and value}
+
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
 
@@ -593,20 +607,26 @@ class RunStore:
         :param RunHandle handle: Run handle whose recovery evidence should be checked.
         :return bool: Whether valid recovery evidence confirms cleanup.
         """
+        return self._read_cleanup_recovery(handle) is not None
+
+    def _read_cleanup_recovery(self, handle: RunHandle) -> dict[str, object] | None:
+        """Read matching operator cleanup evidence for a run handle."""
         path = self.cleanup_recovery_path(handle.run_id)
         if not path.is_file():
-            return False
+            return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return False
+            return None
         if not isinstance(payload, dict):
-            return False
-        return (
+            return None
+        if not (
             payload.get("run_id") == handle.run_id
             and payload.get("config_sha256") == handle.config_sha256
             and payload.get("cleanup_confirmed") is True
-        )
+        ):
+            return None
+        return payload
 
     def _read_cleanup_identity(
         self,

@@ -289,7 +289,9 @@ def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> 
         )
 
 
-def test_snapshot_finalization_preserves_unowned_running_trials(tmp_path: Path) -> None:
+def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
+    tmp_path: Path,
+) -> None:
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
@@ -308,10 +310,16 @@ def test_snapshot_finalization_preserves_unowned_running_trials(tmp_path: Path) 
         cleanup_confirmed=False,
         generation_id="current-generation",
     )
-    finalized = mcp_runner.finalize_result_snapshot(captured, cleanup_confirmed=True)
+    finalized = mcp_runner.finalize_result_snapshot(
+        captured,
+        cleanup_confirmed=True,
+        confirmed_attempt_ids={"old-attempt"},
+    )
 
-    assert finalized == captured
-    assert finalized["status"]["phases"][0]["trials"]["RUNNING"] == 1
+    phase = finalized["status"]["phases"][0]
+    assert phase["trials"]["RUNNING"] == 0
+    assert phase["trials"]["FAIL"] == 1
+    assert phase["generation_trials"] == {}
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
