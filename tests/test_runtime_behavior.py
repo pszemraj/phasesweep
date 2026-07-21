@@ -413,6 +413,17 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
     logging.getLogger().handlers.clear()
 
 
+def test_runtime_rejects_unexplained_trial_budget_shortfall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sampler that stops early cannot publish a falsely complete winner."""
+    exp = _sleeping_score_experiment(tmp_path, experiment="budget_shortfall", n_trials=1)
+    monkeypatch.setattr(optuna.Study, "optimize", lambda self, objective, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials"):
+        run_experiment(exp)
+
+
 def test_runtime_platform_guard_feature_checks_and_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

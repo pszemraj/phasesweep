@@ -532,6 +532,12 @@ def _run_phase(
             f"{phase.max_consecutive_failures} consecutive failures. "
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
+    if finished_after < phase.n_trials and not accepted_partial_timeout:
+        raise RuntimeError(
+            f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
+            "terminal trials without an accepted timeout; refusing to publish "
+            "an incomplete winner."
+        )
     completion = {
         "requested_trials": phase.n_trials,
         "finished_trials": finished_after,

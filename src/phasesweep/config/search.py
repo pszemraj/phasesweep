@@ -163,7 +163,12 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             len(values)
             for values in grid_search_space(phase.search_space, phase_name=phase.name).values()
         )
-        if not phase.allow_partial_grid and phase.n_trials < cardinality:
+        if phase.n_trials > cardinality:
+            raise ValueError(
+                f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
+                f"cardinality {cardinality}."
+            )
+        if not phase.allow_partial_grid and phase.n_trials != cardinality:
             raise ValueError(
                 f"Phase {phase.name!r}: grid sampler has {cardinality} combinations "
                 f"but n_trials={phase.n_trials}. Grid phases run the full matrix by "

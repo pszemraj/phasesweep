@@ -168,6 +168,12 @@ def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
             2,
             "grid sampler has 3 combinations",
         ),
+        (
+            "over_budget",
+            "x: { type: categorical, choices: [1, 2] }",
+            3,
+            "n_trials=3 exceeds the grid cardinality 2",
+        ),
     ]
 
     for _case, search_space, n_trials, match in cases:
@@ -232,6 +238,31 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
         """,
     )
     load_experiment(p)
+
+
+def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None:
+    """Partial-grid mode permits a subset, not an impossible oversized budget."""
+    with pytest.raises(ValidationError, match="n_trials=4 exceeds the grid cardinality 3"):
+        load_experiment(
+            write_yaml(
+                tmp_path,
+                """
+                experiment: t
+                trial_command: "echo {overrides}"
+                metric:
+                  name: x
+                  goal: minimize
+                  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+                phases:
+                  - name: p
+                    n_trials: 4
+                    sampler: { type: grid }
+                    allow_partial_grid: true
+                    search_space:
+                      x: { type: categorical, choices: [1, 2, 3] }
+                """,
+            )
+        )
 
 
 def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
