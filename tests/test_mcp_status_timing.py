@@ -225,7 +225,7 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
         experiment_id="srv",
         config_sha256=hashlib.sha256(data).hexdigest(),
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(data)
     return app, registry, store
 

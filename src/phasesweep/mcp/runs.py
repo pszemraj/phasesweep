@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -22,6 +23,8 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     ensure_private_dir,
+    fsync_directory,
+    open_private_text,
     private_atomic_write_text,
     try_lock_file,
     unlock_file,
@@ -160,7 +163,7 @@ class RunStore:
         :param str experiment_id: Catalog id to include in the run id prefix.
         :return str: Newly generated safe run id.
         """
-        return f"{experiment_id}-{uuid4().hex[:12]}"
+        return f"{experiment_id}-{uuid4().hex}"
 
     def log_path(self, run_id: str) -> Path:
         """Path to the captured stdout/stderr log for a run.
@@ -202,12 +205,37 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
-    def save(self, handle: RunHandle) -> None:
-        """Persist a run handle as JSON under the runs dir.
+    def create(self, handle: RunHandle) -> None:
+        """Exclusively claim and persist a new run identity."""
+        target = self._runs_dir / f"{handle.run_id}.json"
+        payload = json.dumps(asdict(handle), indent=2)
+        with open_private_text(target, "x") as output:
+            output.write(payload + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        fsync_directory(target.parent)
 
-        Writes through a same-directory temp file and then replaces the target so
-        readers never observe a partially-written handle.
-        """
+    def update(self, handle: RunHandle) -> None:
+        """Persist the one legal launching-to-spawned identity transition."""
+        current = self.get(handle.run_id)
+        if current is None:
+            raise FileNotFoundError(f"Run {handle.run_id!r} has not been created.")
+        immutable_fields = (
+            "run_id",
+            "experiment_id",
+            "config_sha256",
+            "started_at",
+            "allow_cancel",
+        )
+        changed = [
+            name for name in immutable_fields if getattr(current, name) != getattr(handle, name)
+        ]
+        if changed:
+            raise ValueError(f"Run {handle.run_id!r} update changes immutable field(s): {changed}.")
+        if current == handle:
+            return
+        if current.launch_state != "launching" or handle.launch_state != "spawned":
+            raise ValueError(f"Run {handle.run_id!r} permits only a launching-to-spawned update.")
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
         private_atomic_write_text(target, payload + "\n")

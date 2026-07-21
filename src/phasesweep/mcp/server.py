@@ -1084,11 +1084,27 @@ class PhaseSweepMCP:
                         self._registry.max_concurrent_runs,
                         blocking_run_ids,
                     )
-                run_id = self._runs.new_run_id(reg.id)
+                config_bytes = self._current_config_bytes(reg)
+                for _ in range(10):
+                    run_id = self._runs.new_run_id(reg.id)
+                    pending = self._pending_handle(reg, run_id)
+                    try:
+                        self._runs.create(pending)
+                    except FileExistsError:
+                        continue
+                    break
+                else:
+                    raise RuntimeError("failed to mint an unused MCP run id")
                 resolved["run_id"] = run_id
-                config_snapshot_path = self._snapshot_config(reg, run_id)
-                pending = self._pending_handle(reg, run_id)
-                self._runs.save(pending)
+                try:
+                    config_snapshot_path = self._snapshot_config(reg, run_id, config_bytes)
+                except Exception as snapshot_exc:
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=True,
+                        error_class=type(snapshot_exc).__name__,
+                    )
+                    raise
                 try:
                     handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
                 except Exception as spawn_exc:
@@ -1111,7 +1127,7 @@ class PhaseSweepMCP:
                     )
                     raise launch_exc
                 try:
-                    self._runs.save(handle)
+                    self._runs.update(handle)
                 except Exception as save_exc:
                     cleanup_confirmed = self._terminate_failed_spawn(handle, save_exc)
                     self._record_launch_failure(
@@ -1275,14 +1291,21 @@ class PhaseSweepMCP:
                     reason="has no compatible winner for the current config",
                 ) from None
 
-    def _snapshot_config(self, reg: RegisteredExperiment, run_id: str) -> Path:
+    def _snapshot_config(
+        self,
+        reg: RegisteredExperiment,
+        run_id: str,
+        data: bytes | None = None,
+    ) -> Path:
         """Write the immutable per-run config snapshot after hash verification.
 
         :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
         :param str run_id: Run id whose snapshot path should be used.
+        :param bytes | None data: Already-verified config bytes, if available.
         :return Path: Written config snapshot path consumed by the detached runner.
         """
-        data = self._current_config_bytes(reg)
+        if data is None:
+            data = self._current_config_bytes(reg)
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
             private_atomic_write_bytes(snapshot_path, data)

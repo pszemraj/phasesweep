@@ -252,19 +252,24 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     """Open a UTF-8 text file with owner-only permissions.
 
     :param Path path: File to open.
-    :param str mode: Either ``"w"`` or ``"a"``.
+    :param str mode: ``"w"``, ``"a"``, or exclusive-create ``"x"``.
     :return IO[str]: Open text handle.
     :raises ValueError: If ``mode`` is unsupported.
     """
-    if mode not in {"w", "a"}:
+    if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
     ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT
-    flags |= os.O_TRUNC if mode == "w" else os.O_APPEND
+    if mode == "w":
+        flags |= os.O_TRUNC
+    elif mode == "a":
+        flags |= os.O_APPEND
+    else:
+        flags |= os.O_EXCL
     fd = os.open(path, flags, PRIVATE_FILE_MODE)
     try:
         os.fchmod(fd, PRIVATE_FILE_MODE)
-        return os.fdopen(fd, mode, encoding="utf-8")
+        return os.fdopen(fd, "w" if mode == "x" else mode, encoding="utf-8")
     except Exception:
         os.close(fd)
         raise

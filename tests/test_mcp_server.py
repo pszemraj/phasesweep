@@ -31,7 +31,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
-    _generation_path,
+    _generation_record_path,
     _generation_winner_path,
     _trial_dir_for,
     _winner_path,
@@ -78,6 +78,29 @@ def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None)
         {"srv": config},
         allow=allow,
         filename="srv.catalog.yaml",
+    )
+
+
+def _claim_runner_handle(
+    store: RunStore,
+    *,
+    run_id: str,
+    config_sha256: str,
+    started_at: str,
+    experiment_id: str = "srv",
+) -> None:
+    """Create the server-owned launch reservation expected by ``runner_main``."""
+    store.create(
+        RunHandle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=started_at,
+            launch_state="launching",
+        )
     )
 
 
@@ -360,6 +383,45 @@ def test_launch_passes_config_snapshot_to_runner(
     assert cmd[cmd.index("--started-at") + 1] == handle.started_at
 
 
+def test_launch_retries_run_id_collision_without_touching_existing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    collision_id = "srv-collision"
+    fresh_id = "srv-fresh"
+    existing = make_run_handle(
+        run_id=collision_id,
+        experiment_id="srv",
+        config_sha256=registry.get("srv").config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(existing)
+    store.config_snapshot_path(collision_id).write_bytes(b"existing config\n")
+    store.log_path(collision_id).write_bytes(b"existing log\n")
+    write_run_status(store, collision_id, returncode=0, cleanup_confirmed=True)
+    before = {
+        path: path.read_bytes()
+        for path in (
+            registry.state_dir / "runs" / f"{collision_id}.json",
+            store.config_snapshot_path(collision_id),
+            store.log_path(collision_id),
+            store.status_path(collision_id),
+        )
+    }
+    minted = iter((collision_id, fresh_id))
+    monkeypatch.setattr(store, "new_run_id", lambda _experiment_id: next(minted))
+
+    result = app.launch("srv")
+
+    assert result["run_id"] == fresh_id
+    assert store.get(collision_id) == existing
+    assert {path: path.read_bytes() for path in before} == before
+
+
 def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -369,6 +431,12 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     run_id = "srv-recover"
     started_at = "2026-06-24T00:00:00Z"
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
     calls: list[tuple[str, str | None, bool]] = []
 
     def fake_run_experiment(
@@ -381,7 +449,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     ) -> None:
         assert generation_id == run_id
         calls.append((config_obj.experiment, from_phase, dry_run))
-        generation_path = _generation_path(config_obj)
+        generation_path = _generation_record_path(config_obj, generation_id)
         generation_path.parent.mkdir(parents=True, exist_ok=True)
         generation_path.write_text(f"generation_id: {generation_id}\n")
         terminal_callback(
@@ -455,17 +523,17 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert terminal["result_snapshot"]["winners"] == []
 
 
-def test_launch_does_not_spawn_when_pending_handle_save_fails(
+def test_launch_does_not_spawn_when_pending_handle_create_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     captured = patch_popen_capture(monkeypatch)
 
-    def fail_save(handle: RunHandle) -> None:
+    def fail_create(handle: RunHandle) -> None:
         raise OSError("runs directory is not writable")
 
-    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr(store, "create", fail_create)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
@@ -511,7 +579,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
         config_sha256=reg.config_sha256,
         launch_state="launching",
     )
-    store.save(pending)
+    store.create(pending)
 
     restarted = PhaseSweepMCP(registry, RunStore(registry.state_dir))
     with pytest.raises(Exception, match="already has a running sweep"):
@@ -532,7 +600,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path)
         launch_state="launching",
         allow_cancel=True,
     )
-    store.save(pending)
+    store.create(pending)
 
     with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
         app.cancel(pending.run_id)
@@ -580,21 +648,17 @@ def test_launch_refuses_runner_without_linux_process_identity(
     assert cleanup_calls and cleanup_calls[0][1] is None
 
 
-def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
+def test_launch_terminates_spawned_runner_when_handle_update_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    original_save = store.save
-    saved: list[RunHandle] = []
+    updated: list[RunHandle] = []
     terminated: list[tuple[int | None, int | None, int | None]] = []
 
-    def fail_second_save(handle: RunHandle) -> None:
-        saved.append(handle)
-        if len(saved) == 1:
-            original_save(handle)
-            return
+    def fail_update(handle: RunHandle) -> None:
+        updated.append(handle)
         raise OSError("runs directory is not writable")
 
     def fake_kill_stale_group(
@@ -606,21 +670,22 @@ def test_launch_terminates_spawned_runner_when_final_handle_save_fails(
         terminated.append((pid, saved_starttime, pgid))
         return True
 
-    monkeypatch.setattr(store, "save", fail_second_save)
+    monkeypatch.setattr(store, "update", fail_update)
     monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
 
-    assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
-    assert terminated == [(saved[1].pid, saved[1].pid_starttime, saved[1].pgid)]
-    pending = store.get(saved[0].run_id)
+    assert [handle.launch_state for handle in updated] == ["spawned"]
+    spawned = updated[0]
+    assert terminated == [(spawned.pid, spawned.pid_starttime, spawned.pgid)]
+    pending = store.get(spawned.run_id)
     assert pending is not None
     assert pending.launch_state == "launching"
     assert store.state(pending) == "failed"
 
 
-def test_launch_logs_when_cleanup_marker_write_fails_after_final_save_failure(
+def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -628,20 +693,16 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_final_save_failure(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    original_save = store.save
-    saved: list[RunHandle] = []
+    updated: list[RunHandle] = []
 
-    def fail_second_save(handle: RunHandle) -> None:
-        saved.append(handle)
-        if len(saved) == 1:
-            original_save(handle)
-            return
+    def fail_update(handle: RunHandle) -> None:
+        updated.append(handle)
         raise OSError("runs directory is not writable")
 
     def fail_marker(_handle: RunHandle) -> None:
         raise OSError("logs directory is not writable")
 
-    monkeypatch.setattr(store, "save", fail_second_save)
+    monkeypatch.setattr(store, "update", fail_update)
     monkeypatch.setattr(store, "mark_cleanup_uncertain", fail_marker)
     monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: False)
     caplog.set_level(logging.ERROR, logger="phasesweep.mcp.server")
@@ -649,7 +710,7 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_final_save_failure(
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
 
-    assert [handle.launch_state for handle in saved] == ["launching", "spawned"]
+    assert [handle.launch_state for handle in updated] == ["spawned"]
     assert "failed to persist cleanup uncertainty marker" in caplog.text
     assert "original error" in caplog.text
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
@@ -690,7 +751,7 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     run_id = "srv-launched"
     snapshot = config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.save(
+    store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id=reg.id,
@@ -741,7 +802,7 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     )
     snapshot = old_config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.save(
+    store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id="old",
@@ -765,7 +826,7 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     run_id = "srv-mismatch"
     snapshot = config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.save(
+    store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id=registry.get("srv").id,
@@ -858,7 +919,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
         experiment_id=registry.get("srv").id,
         config_sha256=registry.get("srv").config_sha256,
     )
-    store.save(handle)
+    store.create(handle)
 
     result = app.latest_run("srv")
     assert result["found"] is True
@@ -867,6 +928,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
         "state": "running",
         "started_at": handle.started_at,
         "recovery_required": False,
+        "failure": None,
     }
 
 
@@ -966,6 +1028,13 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
+    started_at = "2026-06-24T00:00:00Z"
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="0" * 64,
+        started_at=started_at,
+    )
 
     with pytest.raises(RuntimeError, match="hash mismatch"):
         runner_main(
@@ -983,7 +1052,7 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
                 "--experiment-id",
                 "srv",
                 "--started-at",
-                "2026-06-24T00:00:00Z",
+                started_at,
             ]
         )
 
@@ -1021,6 +1090,13 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     snapshot_path = store.config_snapshot_path(run_id)
     snapshot_path.write_bytes(config.read_bytes())
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
 
     with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
         runner_main(
@@ -1038,7 +1114,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
                 "--experiment-id",
                 "srv",
                 "--started-at",
-                "2026-06-24T00:00:00Z",
+                started_at,
             ]
         )
 
@@ -1074,6 +1150,14 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
 
     def raise_cleanup_uncertain(*args: object, **kwargs: object) -> None:
         raise UnsafeProcessCleanupError("trial cleanup uncertain")
@@ -1088,7 +1172,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
                 "--config",
                 str(config),
                 "--config-sha256",
-                hashlib.sha256(config.read_bytes()).hexdigest(),
+                config_sha256,
                 "--status-path",
                 str(status_path),
                 "--state-dir",
@@ -1096,7 +1180,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
                 "--experiment-id",
                 "srv",
                 "--started-at",
-                "2026-06-24T00:00:00Z",
+                started_at,
             ]
         )
 
@@ -1114,6 +1198,14 @@ def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
     primary = NoFeasibleTrialError("trainer failed")
 
     def fail_with_uncertain_cleanup(
@@ -1150,7 +1242,7 @@ def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
                 "--config",
                 str(config),
                 "--config-sha256",
-                hashlib.sha256(config.read_bytes()).hexdigest(),
+                config_sha256,
                 "--status-path",
                 str(status_path),
                 "--state-dir",
@@ -1158,7 +1250,7 @@ def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
                 "--experiment-id",
                 "srv",
                 "--started-at",
-                "2026-06-24T00:00:00Z",
+                started_at,
             ]
         )
 
@@ -1180,7 +1272,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     write_run_status(
         store,
         run_id,
@@ -1201,7 +1293,7 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
     )
     reg = registry.get("srv")
     run_id = "srv-denied"
-    store.save(
+    store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id=reg.id,
@@ -1230,7 +1322,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
         allow_cancel=True,
     )
-    store.save(handle)
+    store.create(handle)
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
         write_run_status(
@@ -1263,7 +1355,7 @@ def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: 
         write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
     )
     run_id = "old-no-cancel"
-    store.save(
+    store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id="old",
@@ -1288,8 +1380,10 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
         assert store.cleanup_uncertain_path(run_id).is_file()
@@ -1306,15 +1400,6 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
         "recovery_required": True,
     }
     assert store.cleanup_uncertain_path(run_id).is_file()
-
-    stale_handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=999999,
-        starttime=111,
-    )
-    store.save(stale_handle)
 
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
@@ -1333,7 +1418,7 @@ def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
     )
-    store.save(handle)
+    store.create(handle)
 
     monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: True)
 
@@ -1365,7 +1450,7 @@ def test_cancel_requires_runner_status_cleanup_confirmation(
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
     )
-    store.save(handle)
+    store.create(handle)
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
         write_run_status(
@@ -1403,7 +1488,7 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
     )
-    store.save(handle)
+    store.create(handle)
     store.mark_cleanup_uncertain(handle)
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
@@ -1444,7 +1529,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
 
@@ -1512,7 +1597,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
     cleanup_calls = 0
@@ -1557,7 +1642,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -1615,7 +1700,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
         config_sha256=reg.config_sha256,
         launch_state="launching",
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
 
     def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
@@ -1659,7 +1744,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -1718,7 +1803,7 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -1831,11 +1916,11 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
-    generation_path = _generation_path(experiment)
+    generation_path = _generation_record_path(experiment, run_id)
     generation_path.parent.mkdir(parents=True, exist_ok=True)
     generation_path.write_text(yaml.safe_dump({"generation_id": run_id}))
     write_run_status(
@@ -1954,7 +2039,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         pid=999999,
         starttime=111,
     )
-    store.save(first_handle)
+    store.create(first_handle)
     store.config_snapshot_path(first_run).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -1990,7 +2075,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         pid=999998,
         starttime=112,
     )
-    store.save(second_handle)
+    store.create(second_handle)
     store.config_snapshot_path(second_run).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -2035,7 +2120,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -2156,7 +2241,7 @@ def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     write_run_status(
         store,
@@ -2197,7 +2282,7 @@ def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> Non
         pid=999999,
         starttime=111,
     )
-    store.save(handle)
+    store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + b"\n# drifted\n")
     store.mark_cleanup_uncertain(handle)
 

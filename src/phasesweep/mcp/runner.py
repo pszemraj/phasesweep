@@ -210,7 +210,7 @@ def _persist_spawned_handle(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux "
             "/proc start time is unavailable"
         )
-    store.save(
+    store.update(
         RunHandle(
             run_id=run_id,
             experiment_id=experiment_id,
