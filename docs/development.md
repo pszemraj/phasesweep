@@ -47,7 +47,6 @@ Tests are organized by behavior:
 
 ## Tracked TODOs
 
-- TODO(runtime): Consider a trial bootstrap/exec handshake before claiming hard-crash durability for the `Popen` to identity-file window; normal exceptions and shutdown signals are cleaned up, but SIGKILL or host loss in that narrow interval cannot be repaired by the killed parent process.
 - TODO(mcp): Remove the private FastMCP strict-schema patch once the `mcp` SDK exposes a tested public closed-input-schema API; until then keep the optional dependency pinned to the tested 1.27.x range and keep the behavior-level request-handler tests as the safety net.
 - TODO(mcp): Split `mcp/server.py` into SDK-free application logic, schemas, launch lifecycle, and FastMCP adapter modules after the MCP alpha surface stabilizes.
 - TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
