@@ -24,8 +24,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +33,11 @@ from typing import IO, Literal, TypeAlias
 
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
+    UnsafePrivatePathError,
     _absolute_path,
-    fsync_directory,
+    _leaf_name,
+    _nofollow_flag,
+    _open_directory_fd,
     lock_dir,
     open_lock_file,
 )
@@ -166,14 +169,49 @@ def _locked_editable_text(path: Path) -> Iterator[_TextSnapshot | None]:
             handle.close()
 
 
-def _snapshot_matches(path: Path, expected: _TextSnapshot) -> bool:
-    """Return whether ``path`` still exactly matches ``expected``.
+def _read_editable_text_at(parent_fd: int, leaf: str) -> _TextSnapshot | None:
+    """Read an editable leaf relative to one already-validated parent directory.
 
-    :param Path path: Target to compare immediately before replacement.
+    :param int parent_fd: Open descriptor for the target's parent directory.
+    :param str leaf: Target filename relative to ``parent_fd``.
+    :return _TextSnapshot | None: Stable snapshot, missing-file description,
+        or ``None`` when the leaf is unsafe or unreadable.
+    """
+    flags = os.O_RDONLY | os.O_CLOEXEC | _nofollow_flag() | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(leaf, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return _TextSnapshot(False, "", b"", None)
+    except OSError:
+        return None
+
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            raw = handle.read()
+            after = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    if _stat_token(before) != _stat_token(after):
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        return None
+    return _TextSnapshot(True, text, raw, _stat_token(after))
+
+
+def _snapshot_matches(parent_fd: int, leaf: str, expected: _TextSnapshot) -> bool:
+    """Return whether one dir-fd-relative target still matches ``expected``.
+
+    :param int parent_fd: Open descriptor for the target's parent directory.
+    :param str leaf: Target filename relative to ``parent_fd``.
     :param _TextSnapshot expected: Snapshot captured at transaction start.
     :return bool: Whether identity, metadata, and raw bytes still match.
     """
-    current = _read_editable_text(path)
+    current = _read_editable_text_at(parent_fd, leaf)
     if current is None:
         return False
     if current.existed != expected.existed:
@@ -181,6 +219,25 @@ def _snapshot_matches(path: Path, expected: _TextSnapshot) -> bool:
     if not expected.existed:
         return True
     return current.stat_token == expected.stat_token and current.raw == expected.raw
+
+
+def _new_temporary_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
+    """Create an umask-governed temporary file relative to ``parent_fd``.
+
+    :param int parent_fd: Open descriptor for the target's parent directory.
+    :param str leaf: Destination filename used to make the temporary name recognizable.
+    :param int mode: Requested creation mode, subject to the process umask.
+    :return tuple[int, str]: Open descriptor and temporary filename.
+    :raises FileExistsError: If ten random temporary names all collide.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
+    for _ in range(10):
+        temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
+        try:
+            return os.open(temporary, flags, mode, dir_fd=parent_fd), temporary
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
 
 
 def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> bool:
@@ -196,33 +253,39 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> boo
     :param _TextSnapshot expected: Snapshot that must still match before replace.
     :return bool: Whether the replacement completed successfully.
     """
-    temporary: Path | None = None
+    parent_fd = -1
+    temporary: str | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
+        parent_fd = _open_directory_fd(
+            path.parent,
+            create=True,
+            private_final=False,
+            umask_created_dirs=True,
         )
-        temporary = Path(temporary_name)
+        leaf = _leaf_name(path)
+        create_mode = expected.mode if expected.mode is not None else 0o666
+        fd, temporary = _new_temporary_fd(parent_fd, leaf, create_mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            if expected.mode is not None:
+                os.fchmod(handle.fileno(), expected.mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        if expected.mode is not None:
-            os.chmod(temporary, expected.mode)
-        if not _snapshot_matches(path, expected):
+        if not _snapshot_matches(parent_fd, leaf, expected):
             return False
-        os.replace(temporary, path)
+        os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = None
-        fsync_directory(path.parent)
+        os.fsync(parent_fd)
         return True
-    except OSError:
+    except (OSError, UnsafePrivatePathError):
         return False
     finally:
-        if temporary is not None:
+        if temporary is not None and parent_fd >= 0:
             with contextlib.suppress(OSError):
-                temporary.unlink()
+                os.unlink(temporary, dir_fd=parent_fd)
+        if parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
 
 
 def _detected_indent(text: str) -> str:
@@ -244,7 +307,7 @@ def _dump_json(data: dict[str, object], *, indent: str, trailing_newline: bool) 
     :param bool trailing_newline: Whether the output should end with a newline.
     :return str: Serialized JSON text.
     """
-    text = json.dumps(data, indent=indent, allow_nan=False)
+    text = json.dumps(data, indent=indent, allow_nan=False, ensure_ascii=False)
     return text + "\n" if trailing_newline else text
 
 

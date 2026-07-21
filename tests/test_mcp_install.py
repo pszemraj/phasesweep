@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -64,20 +66,38 @@ def fake_home(tmp_path, monkeypatch):
 # --- JSON member edits ---
 
 
-def test_merge_json_member_creates_missing_file(tmp_path, monkeypatch):
+def test_merge_json_member_creates_missing_file(tmp_path):
     path = tmp_path / "cfg" / "mcp.json"
-    fsynced: list[Path] = []
-
-    def observe_fsync(directory: Path) -> None:
-        assert path.exists()
-        fsynced.append(directory)
-
-    monkeypatch.setattr(install_edits, "fsync_directory", observe_fsync)
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "created"
     data = json.loads(path.read_text())
     assert data == {"mcpServers": {"phasesweep": ENTRY}}
     assert path.read_text().endswith("\n")
-    assert fsynced == [path.parent]
+
+
+def test_config_edits_apply_umask_to_new_paths_and_preserve_existing_mode(tmp_path):
+    path = tmp_path / "cfg" / "mcp.json"
+    previous_umask = os.umask(0o002)
+    try:
+        assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "created"
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o775
+    assert stat.S_IMODE(path.stat().st_mode) == 0o664
+
+    path.chmod(0o640)
+    replacement = {**ENTRY, "env": {"UPDATED": "1"}}
+    assert (
+        install_edits.merge_json_member(
+            path,
+            "mcpServers",
+            "phasesweep",
+            replacement,
+            managed=lambda _entry: True,
+        )
+        == "updated"
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
@@ -95,6 +115,17 @@ def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
     assert '    "theme"' in text  # detected 4-space indent
     assert text.endswith("\n")
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
+
+
+def test_merge_json_member_preserves_literal_unicode(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"label":"café","mcpServers":{}}\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+
+    text = path.read_text()
+    assert "café" in text
+    assert "\\u00e9" not in text
 
 
 def test_merge_json_member_skips_commented_config(tmp_path):
@@ -195,7 +226,7 @@ def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
     original = '{"mcpServers": {"other": {"command": "x"}}}\n'
     path.write_text(original)
 
-    def fail_replace(_source, _destination):
+    def fail_replace(_source, _destination, **_kwargs):
         raise OSError("simulated replace failure")
 
     monkeypatch.setattr(install_edits.os, "replace", fail_replace)
@@ -209,14 +240,14 @@ def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatc
     path = tmp_path / "mcp.json"
     path.write_text('{"mcpServers": {"other": {"command": "x"}}}\n')
     external = '{"changed_by": "another process"}\n'
-    real_mkstemp = install_edits.tempfile.mkstemp
+    real_new_temporary_fd = install_edits._new_temporary_fd
 
-    def change_after_temp_creation(*args, **kwargs):
-        fd, name = real_mkstemp(*args, **kwargs)
+    def change_after_temp_creation(parent_fd, leaf, mode):
+        fd, name = real_new_temporary_fd(parent_fd, leaf, mode)
         path.write_text(external)
         return fd, name
 
-    monkeypatch.setattr(install_edits.tempfile, "mkstemp", change_after_temp_creation)
+    monkeypatch.setattr(install_edits, "_new_temporary_fd", change_after_temp_creation)
 
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
     assert path.read_text() == external
@@ -571,6 +602,40 @@ def test_installer_refuses_invalid_utf8_instructions_without_raising(fake_home, 
     assert instructions.read_bytes() == original
 
 
+def test_installer_reports_repeated_instruction_markers_separately_from_ownership(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+    original = (
+        f"{MARKDOWN_START}\nfirst\n{MARKDOWN_END}\n{MARKDOWN_START}\nsecond\n{MARKDOWN_END}\n"
+    )
+    instructions.write_text(original)
+
+    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "incomplete or repeated PhaseSweep markers" in output
+    assert "invalid ownership metadata" not in output
+    assert instructions.read_text() == original
+
+
+def test_installer_identifies_symlinked_instruction_file(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = project / "instructions-target.md"
+    target.write_text("# Keep me\n")
+    (project / "AGENTS.md").symlink_to(target.name)
+
+    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+
+    assert code == 1
+    assert "instructions path is a symlink" in capsys.readouterr().out
+    assert target.read_text() == "# Keep me\n"
+
+
 def test_installer_refuses_missing_server_command_before_edits(
     fake_home, tmp_path, capsys, monkeypatch
 ):
@@ -708,6 +773,37 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
     assert not (outside / "mcp.json").exists()
 
 
+def test_installer_refuses_project_parent_symlink_swap(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_config = outside / "mcp.json"
+    original = '{"outside": true}\n'
+    outside_config.write_text(original)
+    config_parent = project / ".cursor"
+    real_open_directory_fd = install_edits._open_directory_fd
+    swapped = False
+
+    def swap_before_open(path, **kwargs):
+        nonlocal swapped
+        if path == config_parent and not swapped:
+            swapped = True
+            config_parent.symlink_to(outside, target_is_directory=True)
+        return real_open_directory_fd(path, **kwargs)
+
+    monkeypatch.setattr(install_edits, "_open_directory_fd", swap_before_open)
+
+    code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
+
+    assert code == 1
+    assert swapped
+    assert "error" in capsys.readouterr().out
+    assert outside_config.read_text() == original
+    assert list(outside.glob(".mcp.json.*.tmp")) == []
+
+
 @pytest.mark.parametrize(
     "original",
     [
@@ -819,6 +915,21 @@ def test_installer_writes_unicode_codex_catalog_path(fake_home, tmp_path, capsys
 
 
 # --- CLI flow ---
+
+
+def test_cli_catalog_scaffold_honors_umask(tmp_path):
+    output = tmp_path / "project" / "catalog.yaml"
+    previous_umask = os.umask(0o002)
+    try:
+        result = CliRunner().invoke(
+            cli_main,
+            ["mcp", "init-catalog", "--from", str(EXAMPLE_CONFIG), "-o", str(output)],
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(output.stat().st_mode) == 0o664
 
 
 @pytest.mark.parametrize("agent_id", ["codex", "claude-desktop"])

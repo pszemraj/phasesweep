@@ -391,6 +391,7 @@ def _open_directory_fd(
     *,
     create: bool,
     private_final: bool,
+    umask_created_dirs: bool = False,
 ) -> int:
     """Open a directory by walking every path component relative to its parent, refusing symlinks.
 
@@ -402,23 +403,27 @@ def _open_directory_fd(
     (TOCTOU). A component that is not a real directory — including a
     symlink — raises, as does a component that changed identity mid-open.
 
-    A missing component is created (mode ``0700``, owned by the caller)
-    only when ``create`` is true; otherwise the underlying
-    ``FileNotFoundError`` propagates uncaught so callers can distinguish
-    "does not exist" from "unsafe". Components created this way are always
-    validated private regardless of ``private_final``; pre-existing
-    intermediate components are only checked to be real directories and are
-    **not** required to be owner-only — only the final component is
-    validated against the private owner/mode policy, and only when
-    ``private_final`` is true.
+    A missing component is created only when ``create`` is true. By default,
+    it is forced to owner-only mode ``0700`` and validated accordingly;
+    ``umask_created_dirs=True`` instead requests mode ``0777`` and leaves the
+    resulting permissions to the process umask for non-private config paths.
+    When ``create`` is false, the underlying ``FileNotFoundError`` propagates
+    uncaught so callers can distinguish "does not exist" from "unsafe".
+    Components created this way are always
+    validated private unless ``umask_created_dirs`` is true. Pre-existing intermediate
+    components are only checked to be real directories and are **not** required
+    to be owner-only — only the final component is validated against the private
+    owner/mode policy, and only when ``private_final`` is true.
 
     :param Path path: Directory to open, resolved lexically (not through
         the filesystem) before walking.
-    :param bool create: Whether to ``mkdir`` any missing path component
-        (owner-only mode) instead of failing on the first missing one.
+    :param bool create: Whether to ``mkdir`` any missing path component instead
+        of failing on the first missing one.
     :param bool private_final: Whether the last path component must pass
         :func:`_validate_private_dir_info` (owner-only, mode ``0700``) even
         when it already existed.
+    :param bool umask_created_dirs: Create missing components with mode ``0777``
+        governed by the process umask instead of forcing private mode ``0700``.
     :return int: Open, ``O_NOFOLLOW``-validated file descriptor for the
         final directory; ownership transfers to the caller, who must close
         it.
@@ -445,7 +450,8 @@ def _open_directory_fd(
                 if not create:
                     raise
                 try:
-                    os.mkdir(component, PRIVATE_DIR_MODE, dir_fd=current_fd)
+                    mode = 0o777 if umask_created_dirs else PRIVATE_DIR_MODE
+                    os.mkdir(component, mode, dir_fd=current_fd)
                     created = True
                 except FileExistsError:
                     pass
@@ -477,7 +483,7 @@ def _open_directory_fd(
                 )
             os.close(current_fd)
             current_fd = next_fd
-            if created:
+            if created and not umask_created_dirs:
                 os.fchmod(current_fd, PRIVATE_DIR_MODE)
                 _validate_private_dir_info(absolute, os.fstat(current_fd))
             if private_final and index == len(parts) - 1:

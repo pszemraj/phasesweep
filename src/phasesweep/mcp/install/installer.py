@@ -364,11 +364,9 @@ def _read_instruction_block(
     :param set[str] valid_owner_ids: Agent ids allowed to own this exact path.
     :return tuple[set[str], str] | None: Owners and body, an empty pair when no
         block exists, or ``None`` when ownership metadata is unsafe to edit.
+    :raises ValueError: If marker lines are incomplete, repeated, or out of order.
     """
-    try:
-        span = _marked_span(existing, start=MARKDOWN_START, end=MARKDOWN_END)
-    except ValueError:
-        return None
+    span = _marked_span(existing, start=MARKDOWN_START, end=MARKDOWN_END)
     if span is None:
         return set(), ""
     start_idx, end_idx = span
@@ -431,6 +429,13 @@ def _apply_instructions(
             "error",
             note="refusing instructions path that resolves outside the project",
         )
+    if path.is_symlink():
+        return StepResult(
+            "instructions",
+            path,
+            "error",
+            note="instructions path is a symlink; refusing to follow it",
+        )
     valid_owner_ids = {
         candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
     }
@@ -442,7 +447,15 @@ def _apply_instructions(
                 "error",
                 note="instructions path is not a readable regular UTF-8 file",
             )
-        block = _read_instruction_block(loaded.text, valid_owner_ids)
+        try:
+            block = _read_instruction_block(loaded.text, valid_owner_ids)
+        except ValueError as exc:
+            return StepResult(
+                "instructions",
+                path,
+                "error",
+                note=f"instructions contain incomplete or repeated PhaseSweep markers ({exc})",
+            )
         if block is None:
             return StepResult(
                 "instructions",

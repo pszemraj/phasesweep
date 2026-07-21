@@ -7,8 +7,8 @@ import importlib.util
 import json
 import logging
 import os
+import secrets
 import sys
-import tempfile
 from pathlib import Path
 
 import click
@@ -750,15 +750,18 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
     try:
         text = scaffold_catalog_text(output, from_configs)
         output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=output.parent,
-            prefix=f".{output.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            staged = Path(handle.name)
+        handle = None
+        for _ in range(10):
+            candidate = output.with_name(f".{output.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {output}")
+        with handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
