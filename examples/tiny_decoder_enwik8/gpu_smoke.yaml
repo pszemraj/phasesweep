@@ -1,0 +1,43 @@
+# Two-trial CUDA smoke sweep for validating the real trainer integration quickly.
+# It uses the upstream test model and writes only local artifacts under /tmp.
+
+experiment: tiny_decoder_enwik8_gpu_smoke
+storage: null
+workdir: /tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/upstream/configs/test.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
+override_format: json_file
+timeout_seconds_per_run: 300
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  WANDB_MODE: disabled
+
+metric:
+  name: val_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+    checkpoint: final.pt
+    expected_step: 10
+
+phases:
+  - name: learning_rate_smoke
+    comment: "Run two short CUDA trials to verify GPU leasing, typed overrides, training, checkpoint evaluation, and objective evidence."
+    n_trials: 2
+    n_jobs: 1
+    gpu_ids: [0]
+    timeout_seconds_per_trial: 120
+    sampler:
+      type: grid
+    fixed_overrides:
+      num_batches: 10
+      grad_accum_every: 1
+      validate_every: 10
+      val_batches: 2
+      generate_every: 1000000
+      save_every: 1000000
+    search_space:
+      learning_rate: { type: categorical, choices: [0.0003, 0.001] }

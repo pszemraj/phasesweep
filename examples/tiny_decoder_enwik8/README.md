@@ -21,6 +21,18 @@ This is an orchestration smoke test, not a PyTorch training-template recommendat
 
 ## CLI smoke sweep
 
+For a genuinely short GPU integration check, run the dedicated two-trial config first. It explicitly leases CUDA device `0`, runs 10 training batches per trial, disables W&B, has bounded trial/run timeouts, and writes only local artifacts under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
+
+```bash
+phasesweep validate examples/tiny_decoder_enwik8/gpu_smoke.yaml
+phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
+phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
+```
+
+The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and top-ups matter.
+
+Use the full three-phase example only when you intentionally want the longer experiment:
+
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep run examples/tiny_decoder_enwik8/experiment.yaml --dry-run
