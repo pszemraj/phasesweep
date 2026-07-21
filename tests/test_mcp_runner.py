@@ -548,6 +548,45 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     assert report.cleanup_error is shutdown
 
 
+def test_shutdown_during_post_error_reconciliation_remains_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(
+            signum=signal.SIGTERM,
+            cleanup_confirmed=True,
+            child_pgids=(),
+        ),
+    )
+    preflight_calls = 0
+
+    def preflight(_experiment: Experiment, *, cleanup_report) -> dict:
+        nonlocal preflight_calls
+        del cleanup_report
+        preflight_calls += 1
+        if preflight_calls == 2:
+            raise shutdown
+        return {}
+
+    def fail_run(*args: object, **kwargs: object) -> None:
+        raise NoFeasibleTrialError("trainer failed")
+
+    captured: list[TerminalReport] = []
+    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert exc_info.value is shutdown
+    assert len(captured) == 1
+    assert captured[0].primary_error is shutdown
+    assert captured[0].cleanup_confirmed is True
+
+
 def test_runner_records_snapshot_serialization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -451,7 +451,7 @@ def _reap_stale_trials(
     count = 0
     try:
         trials = study.get_trials(deepcopy=False)
-    except BaseException as exc:
+    except Exception as exc:
         raise ProcessCleanupUncertainError(
             f"Could not inspect study {study.study_name!r} for stale RUNNING trials."
         ) from exc
@@ -534,7 +534,7 @@ def _preflight_existing_studies(
     """Validate and reap every existing declared phase study before launch."""
     report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)
@@ -557,14 +557,14 @@ def _preflight_existing_studies(
                 recovered_attempt_ids=report.recovered_attempt_ids,
                 uncertain_attempt_ids=report.uncertain_attempt_ids,
             )
-        except BaseException as exc:
+        except Exception as exc:
             if isinstance(exc, ProcessCleanupUncertainError):
                 report.mark_uncertain(exc)
             errors.append(exc)
             continue
         try:
             _validate_study_schema(study)
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
     if errors:
         first = errors[0]
@@ -577,8 +577,12 @@ def _preflight_existing_studies(
             raise StudySchemaMismatchError(message) from first
         if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
             raise StudyStorageUnavailableError(message) from first
-        if all(isinstance(error, ProcessCleanupUncertainError) for error in errors):
-            raise ProcessCleanupUncertainError(message) from first
+        cleanup_error = next(
+            (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
+            None,
+        )
+        if cleanup_error is not None:
+            raise ProcessCleanupUncertainError(message) from cleanup_error
         raise RuntimeError(message) from first
     return studies
 

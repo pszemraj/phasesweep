@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     _generation_path,
     _trial_dir_for,
 )
+from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
@@ -333,6 +334,93 @@ def test_storage_preflight_does_not_convert_shutdown_to_storage_failure(
     assert exc_info.value is shutdown
     assert cleanup.cleanup_confirmed is True
     assert cleanup.error is None
+
+
+@pytest.mark.parametrize("stage", ["get_trials", "stale_reaper", "schema_validation"])
+def test_recovery_preflight_preserves_shutdown_control_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    shutdown = PhaseSweepShutdown(
+        signal.SIGINT,
+        ShutdownCleanupReport(
+            signum=signal.SIGINT,
+            cleanup_confirmed=True,
+            child_pgids=(),
+        ),
+    )
+
+    if stage == "get_trials":
+        study = SimpleNamespace(
+            study_name="shutdown::p",
+            get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.guards._load_existing_phase_study",
+            lambda *_args, **_kwargs: study,
+        )
+    else:
+        study = optuna.create_study(direction="minimize")
+        monkeypatch.setattr(
+            "phasesweep.engine.guards._load_existing_phase_study",
+            lambda *_args, **_kwargs: study,
+        )
+        if stage == "stale_reaper":
+            monkeypatch.setattr(
+                "phasesweep.engine.guards._reap_stale_trials",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
+            )
+        else:
+            monkeypatch.setattr(
+                "phasesweep.engine.guards._reap_stale_trials",
+                lambda *_args, **_kwargs: 0,
+            )
+            monkeypatch.setattr(
+                "phasesweep.engine.guards._validate_study_schema",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
+            )
+
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
+        _preflight_existing_studies(experiment)
+
+    assert exc_info.value is shutdown
+
+
+def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        phases=[
+            Phase(name="a", n_trials=1, search_space={}),
+            Phase(name="b", n_trials=1, search_space={}),
+        ],
+    )
+    studies = {
+        phase.name: optuna.create_study(study_name=phase.name, direction="minimize")
+        for phase in experiment.phases
+    }
+    monkeypatch.setattr(
+        "phasesweep.engine.guards._load_existing_phase_study",
+        lambda _experiment, phase: studies[phase.name],
+    )
+
+    def reap(_study: optuna.Study, _experiment: Experiment, phase_name: str, **_kwargs) -> int:
+        if phase_name == "a":
+            raise ProcessCleanupUncertainError("cleanup uncertain")
+        return 0
+
+    monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards._validate_study_schema",
+        lambda _study: (_ for _ in ()).throw(RuntimeError("schema read failed")),
+    )
+
+    with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
+        _preflight_existing_studies(experiment)
 
 
 def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:

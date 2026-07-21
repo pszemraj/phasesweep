@@ -252,6 +252,7 @@ def run_experiment(
             return result
         except BaseException as exc:
             terminal_error = exc
+            control_error: BaseException | None = None
             if generation_prepared:
                 reconciliation = _PreflightCleanupReport()
                 try:
@@ -259,7 +260,10 @@ def run_experiment(
                         experiment,
                         cleanup_report=reconciliation,
                     )
-                except BaseException as cleanup_exc:
+                except (KeyboardInterrupt, SystemExit, GeneratorExit) as cleanup_exc:
+                    control_error = cleanup_exc
+                    terminal_error = cleanup_exc
+                except Exception as cleanup_exc:
                     if isinstance(cleanup_exc, ProcessCleanupUncertainError):
                         reconciliation.mark_uncertain(cleanup_exc)
                     log.exception("failed to reconcile all existing studies after run termination")
@@ -267,13 +271,15 @@ def run_experiment(
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
+            primary_error = control_error or exc
             shutdown_cleanup_uncertain = (
-                isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
+                isinstance(primary_error, PhaseSweepShutdown)
+                and not primary_error.report.cleanup_confirmed
             )
             if shutdown_cleanup_uncertain:
-                cleanup.mark_uncertain(exc)
-            if isinstance(exc, ProcessCleanupUncertainError):
-                cleanup.mark_uncertain(exc)
+                cleanup.mark_uncertain(primary_error)
+            if isinstance(primary_error, ProcessCleanupUncertainError):
+                cleanup.mark_uncertain(primary_error)
             with contextlib.suppress(Exception):
                 _write_generation_state(
                     experiment,
@@ -281,11 +287,11 @@ def run_experiment(
                     state="failed",
                     from_phase=from_phase,
                     publish_current=generation_prepared,
-                    error_class=type(exc).__name__,
+                    error_class=type(primary_error).__name__,
                 )
             terminal_report = TerminalReport(
                 generation_id=generation_id,
-                primary_error=exc,
+                primary_error=primary_error,
                 cleanup_confirmed=cleanup.cleanup_confirmed,
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
                 uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
@@ -294,12 +300,14 @@ def run_experiment(
             )
             if (
                 not cleanup.cleanup_confirmed
-                and not isinstance(exc, ProcessCleanupUncertainError)
+                and not isinstance(primary_error, ProcessCleanupUncertainError)
                 and not shutdown_cleanup_uncertain
             ):
                 raise ProcessCleanupUncertainError(
                     "The run failed and subsequent process cleanup could not be confirmed."
-                ) from exc
+                ) from primary_error
+            if control_error is not None:
+                raise control_error from exc
             raise
         finally:
             if terminal_callback is not None:
@@ -315,7 +323,7 @@ def run_experiment(
                             failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
-                except BaseException:
+                except Exception:
                     if terminal_error is None:
                         raise
                     log.exception(
