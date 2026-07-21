@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 import yaml
+from click.testing import CliRunner
 
 from phasesweep import load_config, run_config
+from phasesweep.cli import main as cli_main
 from phasesweep.config import (
     ArtifactSizeGate,
     Contract,
@@ -311,6 +313,15 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     )
     assert first_candidate_dir.is_dir()
 
+    shown = CliRunner().invoke(cli_main, ["show-winners", str(p)])
+    assert shown.exit_code == 0, shown.output
+    candidate_view = shown.output.split("### study candidate", maxsplit=1)[1]
+    assert "--- suite promotion decision ---" in candidate_view
+    assert "--- exposed winners ---" in candidate_view
+    assert "metric: 1.0" in candidate_view
+    assert "kind: suite_baseline" in candidate_view
+    assert "study: baseline" in candidate_view
+
     second_winners = run_config(config)
 
     second_summary = yaml.safe_load(summary_path.read_text())
@@ -391,7 +402,7 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
     assert not (tmp_path / "runs").exists()
 
 
-def test_failed_suite_rerun_clears_previous_summary(
+def test_failed_suite_rerun_preserves_previous_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,6 +445,7 @@ def test_failed_suite_rerun_clears_previous_summary(
     run_config(config)
     summary_path = tmp_path / "runs" / "stale_suite" / "suite_summary.yaml"
     assert summary_path.is_file()
+    summary_before = summary_path.read_bytes()
 
     def fail_rerun(*_args: object, **_kwargs: object) -> dict[str, Winner]:
         raise RuntimeError("later suite invocation failed")
@@ -443,7 +455,7 @@ def test_failed_suite_rerun_clears_previous_summary(
     with pytest.raises(RuntimeError, match="later suite invocation failed"):
         run_config(config)
 
-    assert not summary_path.exists()
+    assert summary_path.read_bytes() == summary_before
 
 
 def test_contract_keys_cannot_be_resampled() -> None:

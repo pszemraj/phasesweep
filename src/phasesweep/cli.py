@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import click
+import yaml
 
 from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import config_status, run_config
@@ -23,7 +24,7 @@ from phasesweep.engine.guards import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import _published_winner_path
+from phasesweep.engine.state import _published_winner_path, _suite_summary_path
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
@@ -182,7 +183,7 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 @main.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
-    help="Print winner.yaml content for every phase in a phasesweep experiment or suite.",
+    help="Print published experiment winners or the last successful exposed suite winners.",
     short_help="Print saved phase winners.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
@@ -190,11 +191,63 @@ def show_winners(config_path: Path) -> None:
     """Print winner files from ``config_path``."""
     config = load_config(config_path)
     if isinstance(config, Suite):
-        for study in config.studies:
-            click.echo(f"### study {study.name}")
-            _show_experiment_winners(config.experiment_for_study(study))
+        _show_suite_winners(config)
         return
     _show_experiment_winners(config)
+
+
+def _show_suite_winners(suite: Suite) -> None:
+    """Print the authoritative exposed winners from the last successful suite run."""
+    summary_path = _suite_summary_path(suite)
+    if not summary_path.is_file():
+        click.echo("(no successful suite result yet)")
+        return
+    try:
+        summary = yaml.safe_load(summary_path.read_text())
+        studies = summary["studies"]
+        if not isinstance(studies, list):
+            raise TypeError("studies must be a list")
+        by_name = {
+            item["name"]: item
+            for item in studies
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as exc:
+        raise click.ClickException(
+            "the last successful suite summary is unreadable; refusing to substitute "
+            "raw component-experiment winners"
+        ) from exc
+
+    for study_spec in suite.studies:
+        click.echo(f"### study {study_spec.name}")
+        study = by_name.get(study_spec.name)
+        if study is None:
+            click.echo("(no exposed winner in the last successful suite result)")
+            continue
+        promotion = study.get("promotion")
+        if isinstance(promotion, dict):
+            click.echo("--- suite promotion decision ---")
+            click.echo(yaml.safe_dump(promotion, sort_keys=False).rstrip())
+        click.echo("--- exposed winners ---")
+        phases = study.get("phases")
+        if not isinstance(phases, list):
+            raise click.ClickException(
+                "the last successful suite summary has invalid phase records"
+            )
+        phase_by_name = {
+            item["name"]: item
+            for item in phases
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        experiment = suite.experiment_for_study(study_spec)
+        for phase in experiment.phases:
+            winner = phase_by_name.get(phase.name)
+            if winner is None:
+                click.echo(f"=== {phase.name} === (no exposed winner)")
+                continue
+            click.echo(f"=== {phase.name} ===")
+            _render_phase_comment(phase.comment, prefix="# ")
+            click.echo(yaml.safe_dump(winner, sort_keys=False).rstrip())
 
 
 def _show_experiment_winners(experiment: Experiment) -> None:

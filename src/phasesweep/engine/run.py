@@ -673,7 +673,6 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     require_posix_runtime()
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
-        _suite_summary_path(suite).unlink(missing_ok=True)
         for study_spec in suite.studies:
             for dep in study_spec.depends_on:
                 if dep not in results:
