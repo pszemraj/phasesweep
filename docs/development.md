@@ -12,6 +12,8 @@ pytest
 
 Run `pytest` by itself, with no concurrent `ruff`, `mypy`, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise.
 
+The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads the local SQLite schema directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
+
 ## Package map
 
 The package is organized by behavior:
@@ -51,5 +53,5 @@ Tests are organized by behavior:
 - TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
 - TODO(mcp): Add an aggregated read-only trial-count path for JournalStorage before recommending very frequent `phasesweep_get_status` polling on very large local studies; external RDB-backed studies remain outside the MCP local-node support scope until multi-host cleanup and locking semantics are designed.
 - TODO(runtime): Design an explicit `trial_budget_mode: complete` before promising `n_trials` successful objective evaluations; the current behavior intentionally matches Optuna's terminal-attempt budget, while a completion budget needs repeated optimize scheduling, a total-attempt safety cap, and clear interactions with pruning, infeasible-but-COMPLETE trials, max-consecutive-failure aborts, and wallclock deadlines.
-- TODO(storage): Re-verify the direct SQLite status-query path against Optuna's trial-state schema on every Optuna version bump; the dependency currently has no upper bound.
+- TODO(storage): Re-verify the direct SQLite status-query path, Journal reads, study attributes, trial-state counts, and sampler policies before widening the tested Optuna upper bound.
 - TODO(example): Update the `examples/tiny_decoder_enwik8/upstream` submodule after the trainer template handles `seed: 0`, CPU/MPS autocast as fp32/disabled by default, uses CUDA-only `pin_memory`, moves batches with CUDA-only `non_blocking=True`, accumulates RMSNorm reductions in FP32, rejects overlong causal-mask sequence lengths, and unwraps `torch.compile` modules before checkpointing; keep those PyTorch training changes in the upstream trainer repo rather than patching the gitlink contents here.
