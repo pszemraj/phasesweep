@@ -209,7 +209,6 @@ def run_experiment(
                 dry_run=False,
                 generation_id=generation_id,
                 preloaded_winners=preloaded_winners,
-                existing_studies=existing_studies,
                 run_deadline=run_deadline,
             )
         except BaseException as exc:
@@ -248,7 +247,6 @@ def _run_experiment_inner(
     dry_run: bool,
     generation_id: str | None,
     preloaded_winners: dict[str, Winner] | None = None,
-    existing_studies: dict[str, Any] | None = None,
     run_deadline: float | None = None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
@@ -261,7 +259,6 @@ def _run_experiment_inner(
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
-        existing_studies: Existing studies validated and reaped before launch.
         run_deadline: Optional precomputed whole-run monotonic deadline. Preflight
             passes this through so validation and stale cleanup consume the same
             invocation budget as trial execution.
@@ -333,7 +330,6 @@ def _run_experiment_inner(
             generation_id=generation_id,
             dry_run=dry_run,
             run_deadline=run_deadline,
-            existing_study=(existing_studies or {}).get(phase.name),
         )
         if not dry_run:
             promoted, promotion_decision = _apply_promotion(experiment, phase, winner, winners)

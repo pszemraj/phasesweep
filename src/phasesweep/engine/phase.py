@@ -145,7 +145,6 @@ def _run_phase(
     generation_id: str | None,
     dry_run: bool = False,
     run_deadline: float | None = None,
-    existing_study: optuna.Study | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
@@ -162,7 +161,6 @@ def _run_phase(
             placeholder midpoint winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
-        existing_study: Study already validated and reaped by run preflight.
 
     Returns:
         The selected phase :class:`Winner`.
@@ -176,13 +174,12 @@ def _run_phase(
 
     """
     study_name = _phase_study_name(experiment, phase)
-    study = existing_study or _create_phase_study(experiment, phase, dry_run=dry_run)
+    study = _create_phase_study(experiment, phase, dry_run=dry_run)
     phase_fingerprint: str
 
     if not dry_run:
         _validate_study_schema(study)
-        if existing_study is None:
-            _reap_stale_trials(study, experiment, phase.name)
+        _reap_stale_trials(study, experiment, phase.name)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
 
     completed = _finished_trial_count(study.get_trials(deepcopy=False))

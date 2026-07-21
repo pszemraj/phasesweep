@@ -242,7 +242,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
-FINGERPRINT_SCHEMA_VERSION = 1
+FINGERPRINT_SCHEMA_VERSION = 2
 
 
 def _phase_semantic_payload(

@@ -108,6 +108,8 @@ The payload starts with an explicit fingerprint-schema version and includes the 
 
 With persistent storage, re-running the same YAML reuses a study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files after stale reaping and fingerprint verification, even when storage is in-memory. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
 
+Every top-up attaches the sampler declared by the phase rather than the Optuna default. Seeded random sampling derives each draw from the durable study name, trial number, and parameter name, so one uninterrupted invocation and arbitrarily batched top-ups produce the same parameter sequence. Grid sampling resumes from stored grid assignments. TPE and CMA-ES are reconstructed with the declared configuration and stored trial history on each invocation; their adaptive history is preserved, but PhaseSweep does not promise byte-for-byte equivalence with one uninterrupted in-memory sampler process.
+
 Persistent studies also carry a PhaseSweep storage-schema version. An empty study can be initialized in place, but a populated study without the current schema is rejected before its rows count toward a trial budget. The error names the study and affected trial numbers; use a new experiment name or archive/delete the incompatible study rather than silently mixing unscoped historical trials.
 
 ## Validation and dry-run

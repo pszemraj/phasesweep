@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -37,6 +38,30 @@ class _PhaseTrialStats:
     generation_counts: dict[str, dict[str, int]]
 
 
+class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
+    """Seeded random sampler whose draws survive process-local RNG restarts."""
+
+    def __init__(self, *, seed: int) -> None:
+        super().__init__(seed=None)
+        self._base_seed = seed
+
+    def sample_independent(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        param_name: str,
+        param_distribution: optuna.distributions.BaseDistribution,
+    ) -> Any:
+        """Sample from a deterministic stream position owned by the durable trial."""
+        material = json.dumps(
+            [self._base_seed, study.study_name, trial.number, param_name],
+            separators=(",", ":"),
+        ).encode()
+        derived_seed = int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+        sampler = optuna.samplers.RandomSampler(seed=derived_seed)
+        return sampler.sample_independent(study, trial, param_name, param_distribution)
+
+
 def _build_sampler(
     cfg: Sampler, search_space: dict[str, SearchParam], n_jobs: int = 1
 ) -> optuna.samplers.BaseSampler:
@@ -69,7 +94,9 @@ def _build_sampler(
                 constant_liar=(n_jobs > 1),
             )
     if cfg.type == "random":
-        return optuna.samplers.RandomSampler(seed=cfg.seed)
+        if cfg.seed is None:
+            return optuna.samplers.RandomSampler()
+        return _TrialNumberRandomSampler(seed=cfg.seed)
     if cfg.type == "grid":
         return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":

@@ -10,7 +10,16 @@ import optuna
 import pytest
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import Experiment, LogRegexExtractor, Metric, Phase
+from phasesweep.config import (
+    CategoricalParam,
+    Experiment,
+    IntParam,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
+from phasesweep.engine.optuna import _build_sampler, _create_phase_study
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -32,6 +41,136 @@ def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
     throttle.mark_written(finished=11, now=120.0)
     assert not throttle.should_write(finished=12, now=149.9)
     assert throttle.should_write(finished=12, now=150.0)
+
+
+def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) -> None:
+    """Seeded random draws depend on durable trial identity, not process lifetime."""
+    phase = Phase(
+        name="p",
+        n_trials=4,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": CategoricalParam(type="categorical", choices=list(range(100)))},
+    )
+
+    def sampled(storage: Path, batches: list[int]) -> list[int]:
+        for n_trials in batches:
+            study = optuna.create_study(
+                study_name="stable-random::p",
+                storage=f"sqlite:///{storage}",
+                sampler=_build_sampler(phase.sampler, phase.search_space),
+                load_if_exists=True,
+            )
+            study.optimize(
+                lambda trial: float(trial.suggest_categorical("x", list(range(100)))),
+                n_trials=n_trials,
+            )
+        loaded = optuna.load_study(
+            study_name="stable-random::p",
+            storage=f"sqlite:///{storage}",
+        )
+        return [int(trial.params["x"]) for trial in loaded.trials]
+
+    assert sampled(tmp_path / "single.db", [4]) == sampled(tmp_path / "batched.db", [1, 1, 1, 1])
+
+
+def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
+    """A reconstructed GridSampler continues through its stored grid assignments."""
+    search_space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])}
+    sampler = Sampler(type="grid", seed=0)
+    storage = f"sqlite:///{tmp_path / 'grid.db'}"
+
+    for _ in range(2):
+        study = optuna.create_study(
+            study_name="stable-grid::p",
+            storage=storage,
+            sampler=_build_sampler(sampler, search_space),
+            load_if_exists=True,
+        )
+        study.optimize(
+            lambda trial: float(trial.suggest_categorical("x", [1, 2, 3, 4])), n_trials=2
+        )
+
+    loaded = optuna.load_study(study_name="stable-grid::p", storage=storage)
+    assert len(loaded.trials) == 4
+    assert {trial.params["x"] for trial in loaded.trials} == {1, 2, 3, 4}
+
+
+@pytest.mark.parametrize(
+    ("sampler", "search_space", "n_trials", "expected_type"),
+    [
+        pytest.param(
+            Sampler(type="random", seed=0),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            1,
+            "_TrialNumberRandomSampler",
+            id="random",
+        ),
+        pytest.param(
+            Sampler(type="grid", seed=0),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            2,
+            "GridSampler",
+            id="grid",
+        ),
+        pytest.param(
+            Sampler(type="tpe", seed=0, n_startup_trials=3),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            1,
+            "TPESampler",
+            id="tpe",
+        ),
+        pytest.param(
+            Sampler(type="cmaes", seed=0),
+            {"x": IntParam(type="int", low=1, high=2)},
+            1,
+            "CmaEsSampler",
+            id="cmaes",
+        ),
+    ],
+)
+def test_persistent_execution_reattaches_configured_sampler_and_pruner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sampler: Sampler,
+    search_space: dict,
+    n_trials: int,
+    expected_type: str,
+) -> None:
+    """A validation-only load cannot supply Optuna defaults to execution."""
+
+    class OptimizeObserved(RuntimeError):
+        pass
+
+    phase = Phase(
+        name="p",
+        n_trials=n_trials,
+        allow_partial_grid=sampler.type == "grid",
+        sampler=sampler,
+        search_space=search_space,
+    )
+    exp = make_experiment(
+        experiment=f"sampler_{sampler.type}",
+        storage=f"sqlite:///{tmp_path / f'{sampler.type}.db'}",
+        workdir=tmp_path / "runs",
+        phases=[phase],
+    )
+    _create_phase_study(exp, phase)
+    observed: dict[str, object] = {}
+
+    def inspect_optimize(study: optuna.Study, objective, **kwargs) -> None:
+        observed["sampler"] = type(study.sampler).__name__
+        observed["pruner"] = type(study.pruner).__name__
+        observed["n_startup_trials"] = getattr(study.sampler, "_n_startup_trials", None)
+        raise OptimizeObserved
+
+    monkeypatch.setattr(optuna.Study, "optimize", inspect_optimize)
+    with pytest.raises(OptimizeObserved):
+        run_experiment(exp)
+
+    assert observed["sampler"] == expected_type
+    assert observed["pruner"] == "NopPruner"
+    if sampler.type == "tpe":
+        assert observed["n_startup_trials"] == 3
 
 
 def _sleeping_score_experiment(
