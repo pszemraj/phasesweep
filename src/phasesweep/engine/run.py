@@ -190,6 +190,11 @@ def run_experiment(
                 publish_current=False,
             )
             existing_studies = _preflight_existing_studies(experiment)
+            _reject_bound_descendant_topups(
+                experiment,
+                from_phase=from_phase,
+                existing_studies=existing_studies,
+            )
             preloaded_winners = _preflight_skipped_winners(
                 experiment,
                 from_phase=from_phase,
@@ -412,6 +417,47 @@ def _preflight_skipped_winners(
         winners[phase.name] = _load_winner(experiment, phase, inherited)
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
+
+
+def _reject_bound_descendant_topups(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+    existing_studies: dict[str, Any],
+) -> None:
+    """Reject upstream top-ups that could invalidate a bound descendant study."""
+    reached = from_phase is None
+    for index, phase in enumerate(experiment.phases):
+        if phase.name == from_phase:
+            reached = True
+        if not reached:
+            continue
+        study = existing_studies.get(phase.name)
+        if study is None:
+            continue
+        terminal = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+        if terminal >= phase.n_trials:
+            continue
+
+        descendants: set[str] = set()
+        ancestry = {phase.name}
+        for candidate in experiment.phases[index + 1 :]:
+            if ancestry.intersection(candidate.inherits):
+                descendants.add(candidate.name)
+                ancestry.add(candidate.name)
+        bound = [
+            name
+            for name in descendants
+            if (dependent := existing_studies.get(name)) is not None
+            and isinstance(dependent.user_attrs.get("phasesweep_fingerprint"), str)
+        ]
+        if bound:
+            raise RuntimeError(
+                f"Phase {phase.name!r} has {phase.n_trials - terminal} top-up trial(s) "
+                f"remaining, but dependent phase study/studies {bound} are already bound "
+                "to its published winner. Use a new experiment name to run the larger "
+                "upstream budget without mutating this completed phase chain."
+            )
 
 
 def _preflight_reached_fingerprint(

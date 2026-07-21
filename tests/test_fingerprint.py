@@ -402,6 +402,35 @@ phases:
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
 
+def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path) -> None:
+    """A bound child makes an ancestor top-up a non-destructive preflight refusal."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+        arch_n_trials=1,
+    )
+    run_experiment(experiment)
+    protected_paths = [
+        _summary_path(experiment),
+        _last_successful_generation_path(experiment),
+        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+    ]
+    before = {path: path.read_bytes() for path in protected_paths}
+    parent_before = optuna.load_study(study_name="t::arch", storage=storage).trials
+    topped_up_parent = experiment.phases[0].model_copy(update={"n_trials": 2})
+    topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
+
+    with pytest.raises(RuntimeError, match="dependent phase study.*new experiment name"):
+        run_experiment(topped_up)
+
+    parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
+    assert len(parent_after) == len(parent_before) == 1
+    assert {path: path.read_bytes() for path in protected_paths} == before
+
+
 def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     """Package version is audit metadata, not semantic experiment identity.
 
