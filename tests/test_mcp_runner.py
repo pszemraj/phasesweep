@@ -38,7 +38,11 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import open_private_text
-from phasesweep.runtime.process import _process_group_alive
+from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    ShutdownCleanupReport,
+    _process_group_alive,
+)
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import slow_mcp_config_text
 
@@ -472,6 +476,47 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
     assert isinstance(report.primary_error, NoFeasibleTrialError)
     assert report.cleanup_confirmed is False
     assert report.cleanup_error is cleanup_error
+
+
+def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storage reconciliation cannot override shutdown process evidence."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(
+            signum=signal.SIGTERM,
+            cleanup_confirmed=False,
+            child_pgids=(1234,),
+        ),
+    )
+    preflight_calls = 0
+
+    def preflight(_experiment: Experiment, *, cleanup_report) -> dict:
+        nonlocal preflight_calls
+        del cleanup_report
+        preflight_calls += 1
+        return {}
+
+    def cancel_run(*args: object, **kwargs: object) -> None:
+        raise shutdown
+
+    captured: list[TerminalReport] = []
+    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", cancel_run)
+
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert exc_info.value is shutdown
+    assert preflight_calls == 2
+    assert len(captured) == 1
+    report = captured[0]
+    assert report.primary_error is shutdown
+    assert report.cleanup_confirmed is False
+    assert report.cleanup_error is shutdown
 
 
 def test_runner_records_snapshot_serialization_failure(

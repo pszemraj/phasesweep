@@ -58,7 +58,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import require_posix_runtime
-from phasesweep.runtime.process import install_signal_handlers
+from phasesweep.runtime.process import PhaseSweepShutdown, install_signal_handlers
 
 
 @dataclass(frozen=True)
@@ -267,6 +267,11 @@ def run_experiment(
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
+            shutdown_cleanup_uncertain = (
+                isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
+            )
+            if shutdown_cleanup_uncertain:
+                cleanup.mark_uncertain(exc)
             if isinstance(exc, ProcessCleanupUncertainError):
                 cleanup.mark_uncertain(exc)
             with contextlib.suppress(Exception):
@@ -287,7 +292,11 @@ def run_experiment(
                 cleanup_error=cleanup.error,
                 failure_stage="execution" if generation_prepared else "preflight",
             )
-            if not cleanup.cleanup_confirmed and not isinstance(exc, ProcessCleanupUncertainError):
+            if (
+                not cleanup.cleanup_confirmed
+                and not isinstance(exc, ProcessCleanupUncertainError)
+                and not shutdown_cleanup_uncertain
+            ):
                 raise ProcessCleanupUncertainError(
                     "The run failed and subsequent process cleanup could not be confirmed."
                 ) from exc
