@@ -25,7 +25,14 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import read_winner, run_experiment
-from phasesweep.engine.state import Winner, _trial_dir_for
+from phasesweep.engine.state import (
+    Winner,
+    _generation_path,
+    _generation_promotion_decision_path,
+    _last_successful_generation_path,
+    _promotion_decision_path,
+    _trial_dir_for,
+)
 from phasesweep.evidence.evaluation import evaluate_gates
 from phasesweep.mcp.redaction import winners_payload
 from tests.conftest import (
@@ -340,6 +347,53 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         generation_id=second_decision["candidate_generation_id"],
         attempt_id=second_decision["candidate_attempt_id"],
     ).is_dir()
+
+
+def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path) -> None:
+    trainer = _write_score_trainer(tmp_path)
+    experiment = make_experiment(
+        experiment="resume_promotion",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="baseline",
+                n_trials=1,
+                fixed_overrides={"score": 1.0},
+                search_space={},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 2.0},
+                search_space={},
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "on_fail": "continue_baseline",
+                },
+            ),
+            Phase(name="later", n_trials=1, search_space={}),
+        ],
+    )
+    run_experiment(experiment)
+    successful = yaml.safe_load(_last_successful_generation_path(experiment).read_text())[
+        "generation_id"
+    ]
+    authoritative = yaml.safe_load(
+        _generation_promotion_decision_path(experiment, successful, "candidate").read_text()
+    )
+    _promotion_decision_path(experiment, "candidate").write_text(
+        "generation_id: forged\naction: stop\nmessage: tampered\n"
+    )
+
+    run_experiment(experiment, from_phase="later")
+
+    resumed = yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+    copied = yaml.safe_load(
+        _generation_promotion_decision_path(experiment, resumed, "candidate").read_text()
+    )
+    assert copied == authoritative
 
 
 def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:

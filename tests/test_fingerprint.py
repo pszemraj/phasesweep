@@ -26,6 +26,9 @@ from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerpr
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
+    _generation_record_path,
+    _generation_summary_path,
+    _generation_winner_path,
     _last_successful_generation_path,
     _load_winner,
     _phase_dir,
@@ -429,6 +432,31 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
     assert len(parent_after) == len(parent_before) == 1
     assert {path: path.read_bytes() for path in protected_paths} == before
+
+
+def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    generation_id = "fixed-generation"
+    run_experiment(experiment, generation_id=generation_id)
+    protected = [
+        _generation_record_path(experiment, generation_id),
+        _generation_summary_path(experiment, generation_id),
+        _generation_winner_path(experiment, generation_id, "p"),
+    ]
+    before = {path: path.read_bytes() for path in protected}
+
+    with pytest.raises(RuntimeError, match="already exists; refusing to overwrite history"):
+        run_experiment(experiment, generation_id=generation_id)
+
+    assert {path: path.read_bytes() for path in protected} == before
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert len(study.trials) == 1
 
 
 def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:

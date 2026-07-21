@@ -233,6 +233,19 @@ def _published_summary_path(experiment: Experiment) -> Path | None:
     return _summary_path(experiment)
 
 
+def _published_promotion_decision_path(
+    experiment: Experiment,
+    phase_name: str,
+) -> Path | None:
+    """Return the authoritative last-success promotion decision, with legacy fallback."""
+    generation_id = _last_successful_generation_id(experiment)
+    if generation_id is not None:
+        return _generation_promotion_decision_path(experiment, generation_id, phase_name)
+    if _generation_path(experiment).is_file():
+        return None
+    return _promotion_decision_path(experiment, phase_name)
+
+
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
     """Return the path to a phase's persisted winner.
 

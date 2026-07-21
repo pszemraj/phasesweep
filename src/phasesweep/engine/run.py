@@ -35,14 +35,17 @@ from phasesweep.engine.state import (
     Winner,
     _experiment_dir,
     _file_log_handler,
+    _generation_dir,
     _generation_path,
     _generation_promotion_decision_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _generations_dir,
     _last_successful_generation_path,
     _load_winner,
     _promotion_decision_path,
+    _published_promotion_decision_path,
     _run_log_path,
     _save_promotion_decision,
     _save_winner,
@@ -184,11 +187,12 @@ def run_experiment(
             generation_id=None,
         )
 
-    generation_id = (
-        uuid4().hex if generation_id is None else _validate_safe_name("generation", generation_id)
+    requested_generation_id = (
+        None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
+        generation_id = _claim_generation(experiment, requested_generation_id)
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = _PreflightCleanupReport()
@@ -372,8 +376,8 @@ def _run_experiment_inner(
                         winners[phase.name],
                         generation_id=generation_id,
                     )
-                    prior_promotion = _promotion_decision_path(experiment, phase.name)
-                    if prior_promotion.is_file():
+                    prior_promotion = _published_promotion_decision_path(experiment, phase.name)
+                    if prior_promotion is not None and prior_promotion.is_file():
                         _copy_yaml_projection(
                             prior_promotion,
                             _generation_promotion_decision_path(
@@ -562,6 +566,29 @@ def _prepare_generation(
         from_phase=from_phase,
         publish_current=True,
     )
+
+
+def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
+    """Create one exclusively owned generation namespace under the experiment lock."""
+    root = _generations_dir(experiment)
+    root.mkdir(parents=True, exist_ok=True)
+    if requested_id is not None:
+        try:
+            _generation_dir(experiment, requested_id).mkdir()
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"Generation id {requested_id!r} already exists; refusing to overwrite history."
+            ) from exc
+        return requested_id
+
+    for _ in range(10):
+        candidate = uuid4().hex
+        try:
+            _generation_dir(experiment, candidate).mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("Could not mint an unused generation id after 10 attempts.")
 
 
 def _write_generation_state(
