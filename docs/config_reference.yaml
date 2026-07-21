@@ -115,9 +115,9 @@
 # sampler: Sampler = {}
 # Sampler object keys:
 #   type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
-#   `grid` rejects log parameters, requires float steps, and requires n_trials >= cardinality unless allow_partial_grid is true. `cmaes` rejects categorical parameters and requires the installed `cmaes` dependency.
+#   `grid` rejects log parameters, requires float steps, and requires n_trials to equal cardinality unless allow_partial_grid is true. `cmaes` rejects categorical parameters and requires the installed `cmaes` dependency.
 #   seed: int | None = null
-#   Reproducibility seed for all four sampler types; grid uses it for traversal order.
+#   Reproducibility seed for all four sampler types; grid uses it for traversal order. Seeded random draws are keyed by durable trial identity so top-up batching does not restart the stream.
 #   n_startup_trials: int = 10 (>= 0)
 #   Used only by TPE; ignored by random, grid, and CMA-ES.
 
@@ -137,7 +137,7 @@
 # It does not rescue an ordinary per-trial timeout. Timeout handling takes precedence over max_consecutive_failures, and a persisted incomplete winner can be resumed only while this remains true.
 
 # allow_partial_grid: bool = false
-# False requires n_trials >= the concrete grid cardinality; true intentionally permits truncation. Used only with sampler.type: "grid" and excluded from the semantic fingerprint.
+# False requires n_trials to equal the concrete grid cardinality; true permits a budget from 1 through cardinality. Used only with sampler.type: "grid" and excluded from the semantic fingerprint.
 
 # allow_seed_search: bool = false
 # False rejects search_space keys named `seed` or ending in `.seed`; set true only for an explicit variance audit. Excluded from the semantic fingerprint.
