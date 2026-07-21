@@ -272,6 +272,28 @@ _RUN_CONTROL_KEYS = frozenset(
     }
 )
 FINGERPRINT_SCHEMA_VERSION = 2
+SUITE_FINGERPRINT_SCHEMA_VERSION = 1
+
+
+def _suite_fingerprint(suite: Suite) -> str:
+    """Hash the fully compiled suite plan, including historical annotations."""
+    payload = {
+        "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
+        "suite": suite.suite,
+        "studies": [
+            {
+                "name": study.name,
+                "depends_on": study.depends_on,
+                "promotion": (
+                    None if study.promotion is None else study.promotion.model_dump(mode="json")
+                ),
+                "experiment": suite.experiment_for_study(study).model_dump(mode="json"),
+            }
+            for study in suite.studies
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _phase_semantic_payload(

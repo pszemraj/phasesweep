@@ -22,9 +22,10 @@ from phasesweep.engine.guards import (
     _inspect_stale_running_trials,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
+    _suite_fingerprint,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import _published_winner_path, _suite_summary_path
+from phasesweep.engine.state import _published_suite_summary_path, _published_winner_path
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
@@ -198,32 +199,38 @@ def show_winners(config_path: Path) -> None:
 
 def _show_suite_winners(suite: Suite) -> None:
     """Print the authoritative exposed winners from the last successful suite run."""
-    summary_path = _suite_summary_path(suite)
-    if not summary_path.is_file():
+    summary_path = _published_suite_summary_path(suite)
+    if summary_path is None or not summary_path.is_file():
         click.echo("(no successful suite result yet)")
         return
     try:
         summary = yaml.safe_load(summary_path.read_text())
+        if not isinstance(summary, dict):
+            raise TypeError("summary must be a mapping")
         studies = summary["studies"]
         if not isinstance(studies, list):
             raise TypeError("studies must be a list")
-        by_name = {
-            item["name"]: item
-            for item in studies
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
     except (OSError, KeyError, TypeError, yaml.YAMLError) as exc:
         raise click.ClickException(
             "the last successful suite summary is unreadable; refusing to substitute "
             "raw component-experiment winners"
         ) from exc
 
-    for study_spec in suite.studies:
-        click.echo(f"### study {study_spec.name}")
-        study = by_name.get(study_spec.name)
-        if study is None:
-            click.echo("(no exposed winner in the last successful suite result)")
-            continue
+    stored_fingerprint = summary.get("suite_fingerprint")
+    if isinstance(stored_fingerprint, str) and stored_fingerprint != _suite_fingerprint(suite):
+        generation_id = summary.get("suite_generation_id", "unknown")
+        click.echo(
+            "# Historical suite result: saved generation "
+            f"{generation_id} does not match the current compiled suite config."
+        )
+        click.echo("# Rendering the saved study graph and annotations.")
+
+    for study in studies:
+        if not isinstance(study, dict) or not isinstance(study.get("name"), str):
+            raise click.ClickException(
+                "the last successful suite summary has invalid study records"
+            )
+        click.echo(f"### study {study['name']}")
         promotion = study.get("promotion")
         if isinstance(promotion, dict):
             click.echo("--- suite promotion decision ---")
@@ -234,19 +241,23 @@ def _show_suite_winners(suite: Suite) -> None:
             raise click.ClickException(
                 "the last successful suite summary has invalid phase records"
             )
-        phase_by_name = {
-            item["name"]: item
-            for item in phases
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        experiment = suite.experiment_for_study(study_spec)
-        for phase in experiment.phases:
-            winner = phase_by_name.get(phase.name)
-            if winner is None:
-                click.echo(f"=== {phase.name} === (no exposed winner)")
+        for winner in phases:
+            if not isinstance(winner, dict) or not isinstance(winner.get("name"), str):
+                raise click.ClickException(
+                    "the last successful suite summary has invalid phase records"
+                )
+            phase_name = winner["name"]
+            comment = winner.get("comment")
+            if comment is not None and not isinstance(comment, str):
+                raise click.ClickException(
+                    "the last successful suite summary has an invalid phase annotation"
+                )
+            if winner.get("exposed") is False:
+                click.echo(f"=== {phase_name} === (no exposed winner)")
+                _render_phase_comment(comment, prefix="# ")
                 continue
-            click.echo(f"=== {phase.name} ===")
-            _render_phase_comment(phase.comment, prefix="# ")
+            click.echo(f"=== {phase_name} ===")
+            _render_phase_comment(comment, prefix="# ")
             click.echo(yaml.safe_dump(winner, sort_keys=False).rstrip())
 
 

@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,7 @@ from phasesweep.engine.guards import (
     _experiment_lock,
     _preflight_existing_studies,
     _PreflightCleanupReport,
+    _suite_fingerprint,
     _suite_lock,
     _validate_sampler_continuation,
     _verify_fingerprint,
@@ -43,7 +45,9 @@ from phasesweep.engine.state import (
     _generation_summary_path,
     _generation_winner_path,
     _generations_dir,
+    _last_successful_generation_id,
     _last_successful_generation_path,
+    _last_successful_suite_generation_path,
     _load_winner,
     _promotion_decision_path,
     _published_promotion_decision_path,
@@ -51,6 +55,11 @@ from phasesweep.engine.state import (
     _save_promotion_decision,
     _save_winner,
     _suite_dir,
+    _suite_generation_dir,
+    _suite_generation_path,
+    _suite_generation_record_path,
+    _suite_generation_summary_path,
+    _suite_generations_dir,
     _suite_log_path,
     _suite_summary_path,
     _summary_path,
@@ -741,42 +750,189 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     require_posix_runtime()
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
-        for study_spec in suite.studies:
-            for dep in study_spec.depends_on:
-                if dep not in results:
+        generation_id = _claim_suite_generation(suite)
+        started_at = datetime.now(timezone.utc).isoformat()
+        _write_suite_generation_state(
+            suite,
+            generation_id=generation_id,
+            state="running",
+            started_at=started_at,
+        )
+        component_records: dict[str, dict[str, Any]] = {}
+        try:
+            for study_spec in suite.studies:
+                for dep in study_spec.depends_on:
+                    if dep not in results:
+                        raise RuntimeError(
+                            f"Study {study_spec.name!r} dependency {dep!r} did not complete."
+                        )
+                experiment = suite.experiment_for_study(study_spec)
+                log.info("suite=%s study=%s START", suite.suite, study_spec.name)
+                study_winners = run_experiment(experiment, dry_run=False)
+                experiment_generation_id = _last_successful_generation_id(experiment)
+                if experiment_generation_id is None:
                     raise RuntimeError(
-                        f"Study {study_spec.name!r} dependency {dep!r} did not complete."
+                        f"Study {study_spec.name!r} completed without publishing an "
+                        "experiment generation."
                     )
-            experiment = suite.experiment_for_study(study_spec)
-            log.info("suite=%s study=%s START", suite.suite, study_spec.name)
-            study_winners = run_experiment(experiment, dry_run=False)
-            exposed_winners, decision = _apply_study_promotion(
-                suite=suite,
-                study_name=study_spec.name,
-                experiment=experiment,
-                study_winners=study_winners,
-                prior_results=results,
-            )
-            if decision is not None:
-                promotion_decisions[study_spec.name] = decision
-            if exposed_winners is not None:
-                results[study_spec.name] = exposed_winners
-            log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
-
-        summary = {
-            "suite": suite.suite,
-            "promotion_decisions": list(promotion_decisions.values()),
-            "studies": [
-                {
-                    "name": study_name,
-                    "promotion": promotion_decisions.get(study_name),
-                    "phases": [
-                        _winner_summary_item(phase_name, winner)
+                component_records[study_spec.name] = {
+                    "experiment": experiment.experiment,
+                    "experiment_generation_id": experiment_generation_id,
+                    "experiment_phase_fingerprints": {
+                        phase_name: winner.phase_fingerprint
                         for phase_name, winner in study_winners.items()
-                    ],
+                    },
                 }
-                for study_name, study_winners in results.items()
-            ],
-        }
-        _write_yaml_atomic(_suite_summary_path(suite), summary)
+                exposed_winners, decision = _apply_study_promotion(
+                    suite=suite,
+                    study_name=study_spec.name,
+                    experiment=experiment,
+                    study_winners=study_winners,
+                    prior_results=results,
+                )
+                if decision is not None:
+                    promotion_decisions[study_spec.name] = decision
+                if exposed_winners is not None:
+                    results[study_spec.name] = exposed_winners
+                log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
+
+            ended_at = datetime.now(timezone.utc).isoformat()
+            summary = _suite_summary_payload(
+                suite,
+                generation_id=generation_id,
+                started_at=started_at,
+                ended_at=ended_at,
+                results=results,
+                promotion_decisions=promotion_decisions,
+                component_records=component_records,
+            )
+            immutable_summary = _suite_generation_summary_path(suite, generation_id)
+            _write_yaml_atomic(immutable_summary, summary)
+            _write_suite_generation_state(
+                suite,
+                generation_id=generation_id,
+                state="complete",
+                started_at=started_at,
+                ended_at=ended_at,
+                publish_current=False,
+            )
+            _copy_yaml_projection(immutable_summary, _suite_summary_path(suite))
+            _write_yaml_atomic(
+                _last_successful_suite_generation_path(suite),
+                {"suite": suite.suite, "suite_generation_id": generation_id},
+            )
+            _write_suite_generation_state(
+                suite,
+                generation_id=generation_id,
+                state="complete",
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        except BaseException as exc:
+            _write_suite_generation_state(
+                suite,
+                generation_id=generation_id,
+                state="failed",
+                started_at=started_at,
+                ended_at=datetime.now(timezone.utc).isoformat(),
+                error_class=type(exc).__name__,
+            )
+            raise
     return results
+
+
+def _claim_suite_generation(suite: Suite) -> str:
+    """Create one exclusively owned suite-generation namespace."""
+    root = _suite_generations_dir(suite)
+    root.mkdir(parents=True, exist_ok=True)
+    for _ in range(10):
+        generation_id = uuid4().hex
+        try:
+            _suite_generation_dir(suite, generation_id).mkdir()
+        except FileExistsError:
+            continue
+        return generation_id
+    raise RuntimeError("Could not mint an unused suite generation id after 10 attempts.")
+
+
+def _write_suite_generation_state(
+    suite: Suite,
+    *,
+    generation_id: str,
+    state: str,
+    started_at: str,
+    ended_at: str | None = None,
+    error_class: str | None = None,
+    publish_current: bool = True,
+) -> None:
+    """Persist one suite invocation's lifecycle and optionally publish it as current."""
+    payload = {
+        "schema_version": 1,
+        "suite": suite.suite,
+        "suite_generation_id": generation_id,
+        "suite_fingerprint": _suite_fingerprint(suite),
+        "state": state,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "error_class": error_class,
+        "phasesweep_version": __version__,
+    }
+    _write_yaml_atomic(_suite_generation_record_path(suite, generation_id), payload)
+    if publish_current:
+        _write_yaml_atomic(_suite_generation_path(suite), payload)
+
+
+def _suite_summary_payload(
+    suite: Suite,
+    *,
+    generation_id: str,
+    started_at: str,
+    ended_at: str,
+    results: dict[str, dict[str, Winner]],
+    promotion_decisions: dict[str, dict[str, Any]],
+    component_records: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the immutable suite summary from the compiled historical plan."""
+    studies: list[dict[str, Any]] = []
+    for study_spec in suite.studies:
+        experiment = suite.experiment_for_study(study_spec)
+        exposed = results.get(study_spec.name, {})
+        phases = []
+        for phase in experiment.phases:
+            winner = exposed.get(phase.name)
+            if winner is None:
+                phases.append({"name": phase.name, "comment": phase.comment, "exposed": False})
+                continue
+            phases.append(
+                {
+                    **_winner_summary_item(phase.name, winner),
+                    "comment": phase.comment,
+                    "exposed": True,
+                }
+            )
+        studies.append(
+            {
+                "name": study_spec.name,
+                "depends_on": study_spec.depends_on,
+                "promotion_rule": (
+                    None
+                    if study_spec.promotion is None
+                    else study_spec.promotion.model_dump(mode="json")
+                ),
+                "promotion": promotion_decisions.get(study_spec.name),
+                **component_records[study_spec.name],
+                "phases": phases,
+            }
+        )
+    fingerprint = _suite_fingerprint(suite)
+    return {
+        "schema_version": 1,
+        "suite": suite.suite,
+        "suite_generation_id": generation_id,
+        "suite_fingerprint": fingerprint,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "phasesweep_version": __version__,
+        "promotion_decisions": list(promotion_decisions.values()),
+        "studies": studies,
+    }

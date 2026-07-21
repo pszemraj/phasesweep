@@ -67,7 +67,7 @@
 # Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names.
 
 # comment: str | None = null
-# Design note shown by `validate` and `show-winners`. It has no runtime effect and is excluded from semantic fingerprints.
+# Design note shown by `validate` and `show-winners`. It has no trial-runtime effect and is excluded from phase fingerprints, but suite generations retain it in their historical plan identity.
 
 # inherits: list[str] = []
 # Names prior phases whose exposed `effective_overrides` become the lowest-priority override layer; forward references are rejected.

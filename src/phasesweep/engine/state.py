@@ -286,6 +286,51 @@ def _suite_summary_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "suite_summary.yaml"
 
 
+def _suite_generation_path(suite: Suite) -> Path:
+    """Return the current suite-generation lifecycle path."""
+    return _suite_dir(suite) / "suite_generation.yaml"
+
+
+def _suite_generations_dir(suite: Suite) -> Path:
+    """Return the immutable suite-generation root."""
+    return _suite_dir(suite) / "suite_generations"
+
+
+def _suite_generation_dir(suite: Suite, generation_id: str) -> Path:
+    """Return one immutable suite-generation directory."""
+    return _suite_generations_dir(suite) / generation_id
+
+
+def _suite_generation_record_path(suite: Suite, generation_id: str) -> Path:
+    """Return one suite generation's lifecycle record path."""
+    return _suite_generation_dir(suite, generation_id) / "generation.yaml"
+
+
+def _suite_generation_summary_path(suite: Suite, generation_id: str) -> Path:
+    """Return one suite generation's immutable summary path."""
+    return _suite_generation_dir(suite, generation_id) / "summary.yaml"
+
+
+def _last_successful_suite_generation_path(suite: Suite) -> Path:
+    """Return the pointer to the last fully published suite generation."""
+    return _suite_dir(suite) / "last_successful_suite_generation.yaml"
+
+
+def _published_suite_summary_path(suite: Suite) -> Path | None:
+    """Return the authoritative last-success suite summary, with legacy fallback."""
+    try:
+        payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
+    except (OSError, yaml.YAMLError):
+        payload = None
+    if isinstance(payload, dict):
+        generation_id = payload.get("suite_generation_id")
+        if isinstance(generation_id, str) and generation_id:
+            return _suite_generation_summary_path(suite, generation_id)
+    if _suite_generation_path(suite).is_file():
+        return None
+    return _suite_summary_path(suite)
+
+
 def _suite_log_path(suite: Suite) -> Path:
     """Path to a suite-level run log.
 

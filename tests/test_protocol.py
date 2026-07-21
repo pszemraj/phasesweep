@@ -475,6 +475,7 @@ def test_failed_suite_rerun_preserves_previous_summary(
           - name: one
             phases:
               - name: eval
+                comment: original suite annotation
                 n_trials: 1
                 search_space: {{}}
         """,
@@ -491,14 +492,34 @@ def test_failed_suite_rerun_preserves_previous_summary(
         generation_id="generation-one",
         attempt_id="attempt-one",
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.run.run_experiment",
-        lambda *_args, **_kwargs: {"eval": winner},
-    )
+
+    def succeed(experiment: Experiment, **_kwargs: object) -> dict[str, Winner]:
+        pointer = (
+            Path(experiment.workdir) / experiment.experiment / "last_successful_generation.yaml"
+        )
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text("generation_id: component-generation\n")
+        return {"eval": winner}
+
+    monkeypatch.setattr("phasesweep.engine.run.run_experiment", succeed)
 
     run_config(config)
     summary_path = tmp_path / "runs" / "stale_suite" / "suite_summary.yaml"
     assert summary_path.is_file()
+    first_summary = yaml.safe_load(summary_path.read_text())
+    suite_generation_id = first_summary["suite_generation_id"]
+    immutable_summary = (
+        tmp_path
+        / "runs"
+        / "stale_suite"
+        / "suite_generations"
+        / suite_generation_id
+        / "summary.yaml"
+    )
+    assert immutable_summary.read_bytes() == summary_path.read_bytes()
+    assert len(first_summary["suite_fingerprint"]) == 64
+    assert first_summary["studies"][0]["experiment_generation_id"] == "component-generation"
+    assert first_summary["studies"][0]["phases"][0]["comment"] == ("original suite annotation")
     summary_before = summary_path.read_bytes()
 
     def fail_rerun(*_args: object, **_kwargs: object) -> dict[str, Winner]:
@@ -510,6 +531,19 @@ def test_failed_suite_rerun_preserves_previous_summary(
         run_config(config)
 
     assert summary_path.read_bytes() == summary_before
+    assert immutable_summary.read_bytes() == summary_before
+
+    config_path.write_text(
+        config_path.read_text().replace(
+            "original suite annotation", "new annotation that never produced this result"
+        )
+    )
+    shown = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
+
+    assert shown.exit_code == 0, shown.output
+    assert "Historical suite result" in shown.output
+    assert "original suite annotation" in shown.output
+    assert "new annotation that never produced this result" not in shown.output
 
 
 def test_contract_keys_cannot_be_resampled() -> None:
