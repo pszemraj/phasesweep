@@ -313,8 +313,9 @@ def _open_directory_fd(
     try:
         for index, component in enumerate(parts):
             created = False
+            component_path = Path(*absolute.parts[: index + 2])
             try:
-                next_fd = os.open(component, flags, dir_fd=current_fd)
+                before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
             except FileNotFoundError:
                 if not create:
                     raise
@@ -324,15 +325,31 @@ def _open_directory_fd(
                 except FileExistsError:
                     pass
                 try:
-                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                    before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
                 except OSError as exc:
                     raise UnsafePrivatePathError(
-                        f"Private path component {absolute} is not a real directory."
+                        f"Private path component {component_path} is not a real directory."
                     ) from exc
             except OSError as exc:
                 raise UnsafePrivatePathError(
-                    f"Private path component {absolute} is not a real directory."
+                    f"Private path component {component_path} is not a real directory."
                 ) from exc
+            if not stat.S_ISDIR(before.st_mode):
+                raise UnsafePrivatePathError(
+                    f"Private path component {component_path} is not a real directory."
+                )
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise UnsafePrivatePathError(
+                    f"Private path component {component_path} is not a real directory."
+                ) from exc
+            after = os.fstat(next_fd)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                os.close(next_fd)
+                raise UnsafePrivatePathError(
+                    f"Private path component {component_path} changed while it was opened."
+                )
             os.close(current_fd)
             current_fd = next_fd
             if created:

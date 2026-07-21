@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import threading
 from pathlib import Path
@@ -225,6 +226,72 @@ def test_private_atomic_write_rejects_symlink_and_intermediate_symlink(
     assert not (outside / "new.txt").exists()
     assert unsafe_mode.read_text() == "unsafe mode"
     assert stat.S_IMODE(unsafe_mode.stat().st_mode) == 0o644
+
+
+def test_private_atomic_write_rejects_intermediate_symlink_inserted_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    child = state / "child"
+    child.mkdir(parents=True, mode=0o700)
+    state.chmod(0o700)
+    child.chmod(0o700)
+    moved = state / "moved-child"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o700)
+    original_stat = runtime_files.os.stat
+    swapped = False
+
+    def insert_symlink(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal swapped
+        info = original_stat(path, *args, **kwargs)
+        if path == "child" and not swapped:
+            swapped = True
+            child.rename(moved)
+            child.symlink_to(outside, target_is_directory=True)
+        return info
+
+    monkeypatch.setattr(runtime_files.os, "stat", insert_symlink)
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.private_atomic_write_text(child / "status.json", "escaped")
+
+    assert not (outside / "status.json").exists()
+    assert not (moved / "status.json").exists()
+
+
+def test_private_atomic_write_rejects_intermediate_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    child = state / "child"
+    child.mkdir(parents=True, mode=0o700)
+    state.chmod(0o700)
+    child.chmod(0o700)
+    moved = state / "moved-child"
+    original_stat = runtime_files.os.stat
+    swapped = False
+
+    def swap_directory(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal swapped
+        info = original_stat(path, *args, **kwargs)
+        if path == "child" and not swapped:
+            swapped = True
+            child.rename(moved)
+            child.mkdir(mode=0o700)
+            child.chmod(0o700)
+        return info
+
+    monkeypatch.setattr(runtime_files.os, "stat", swap_directory)
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError, match="changed while it was opened"):
+        runtime_files.private_atomic_write_text(child / "status.json", "replacement")
+
+    assert not (child / "status.json").exists()
+    assert not (moved / "status.json").exists()
 
 
 def test_private_atomic_write_keeps_opened_parent_during_path_swap(
