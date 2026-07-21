@@ -605,9 +605,18 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
 
 @pytest.mark.parametrize(
     "content",
-    [None, "{", '{"schema_version": 1, "attempt_id": "attempt"}'],
+    [
+        None,
+        "{",
+        '{"schema_version": 1, "attempt_id": "attempt"}',
+        (
+            '{"schema_version": 1, "attempt_id": "attempt", "pid": 12345, '
+            '"pid": 54321, "pgid": 12345, "proc_starttime": 111, '
+            '"boot_id": "boot", "launch_nonce": "nonce"}'
+        ),
+    ],
 )
-def test_read_stale_process_identity_rejects_missing_or_partial_records(
+def test_read_stale_process_identity_rejects_malformed_or_partial_records(
     tmp_path: Path,
     content: str | None,
 ) -> None:

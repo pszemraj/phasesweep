@@ -30,6 +30,7 @@ from types import FrameType
 from typing import IO
 
 from phasesweep.runtime.files import atomic_write_text
+from phasesweep.runtime.json import strict_json_loads
 
 log = logging.getLogger("phasesweep.runtime.process")
 
@@ -52,6 +53,7 @@ _installed = False
 # acquires the same lock before snapshotting, which forces it to wait until
 # every in-flight launch has either registered its PGID or failed.
 _launch_lock = threading.Lock()
+_shutdown_handler_lock = threading.Lock()
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
     sig
     for sig in (
@@ -134,6 +136,11 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     main-thread ``_defer_shutdown_signals()`` window is open the handler
     records the signal and returns; the window exit re-invokes it.
 
+    A second signal delivered while this handler is already running returns
+    immediately. The first invocation remains responsible for the complete
+    PGID snapshot and its cleanup evidence instead of re-entering the
+    non-reentrant registry locks or interrupting the kill loop.
+
     Args:
         signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
             ``SIGHUP`` where available).
@@ -143,59 +150,69 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     Raises:
         SystemExit: With exit code ``128 + signum`` (POSIX ``signaled-exit``
             convention) — always, except when deferred mid-critical-section
-            as described above.
+            or ignored during an active handler invocation as described above.
 
     """
     global _deferred_shutdown_signum  # noqa: PLW0603
 
-    if _main_thread_defer_depth > 0:
-        # The main thread is inside a launch/unregister critical section and
-        # may already hold the locks below. Record and return; the outermost
-        # window exit services the shutdown.
-        _deferred_shutdown_signum = signum
+    # Python signal handlers can interrupt an earlier invocation of this
+    # handler. Let the first signal finish the authoritative cleanup pass;
+    # re-entering could deadlock on the non-reentrant registry locks or replace
+    # the first signal's cleanup evidence partway through the kill loop.
+    if not _shutdown_handler_lock.acquire(blocking=False):
         return
-    # Any recorded-but-unserviced signal is superseded by this invocation.
-    _deferred_shutdown_signum = None
 
-    with _launch_lock, _lock:
-        pgids = tuple(_active_children)
+    try:
+        if _main_thread_defer_depth > 0:
+            # The main thread is inside a launch/unregister critical section and
+            # may already hold the locks below. Record and return; the outermost
+            # window exit services the shutdown.
+            _deferred_shutdown_signum = signum
+            return
+        # Any recorded-but-unserviced signal is superseded by this invocation.
+        _deferred_shutdown_signum = None
 
-    log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
+        with _launch_lock, _lock:
+            pgids = tuple(_active_children)
 
-    confirmed_by_pgid: dict[int, bool] = {}
-    for pgid in pgids:
-        try:
-            confirmed_by_pgid[pgid] = _terminate_process_group(
-                pgid,
-                grace_seconds=_KILL_GRACE_SECONDS,
-            )
-        except Exception:
-            log.exception(
-                "Failed while cleaning child process group %d after signal %d", pgid, signum
-            )
-            confirmed_by_pgid[pgid] = False
+        log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
-    cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
-    report = ShutdownCleanupReport(
-        signum=signum,
-        cleanup_confirmed=cleanup_confirmed,
-        child_pgids=pgids,
-    )
-    if cleanup_confirmed:
-        log.warning(
-            "Received signal %d; confirmed cleanup for %d child group(s)",
-            signum,
-            len(pgids),
+        confirmed_by_pgid: dict[int, bool] = {}
+        for pgid in pgids:
+            try:
+                confirmed_by_pgid[pgid] = _terminate_process_group(
+                    pgid,
+                    grace_seconds=_KILL_GRACE_SECONDS,
+                )
+            except Exception:
+                log.exception(
+                    "Failed while cleaning child process group %d after signal %d", pgid, signum
+                )
+                confirmed_by_pgid[pgid] = False
+
+        cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
+        report = ShutdownCleanupReport(
+            signum=signum,
+            cleanup_confirmed=cleanup_confirmed,
+            child_pgids=pgids,
         )
-    else:
-        uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
-        log.error(
-            "Received signal %d; cleanup is uncertain for child group(s): %s",
-            signum,
-            uncertain,
-        )
+        if cleanup_confirmed:
+            log.warning(
+                "Received signal %d; confirmed cleanup for %d child group(s)",
+                signum,
+                len(pgids),
+            )
+        else:
+            uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
+            log.error(
+                "Received signal %d; cleanup is uncertain for child group(s): %s",
+                signum,
+                uncertain,
+            )
 
-    raise PhaseSweepShutdown(signum, report)
+        raise PhaseSweepShutdown(signum, report)
+    finally:
+        _shutdown_handler_lock.release()
 
 
 def _unblock_shutdown_signals() -> None:
@@ -898,8 +915,8 @@ def read_stale_process_identity(
     """
     path = trial_dir / PROCESS_IDENTITY_FILE
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        payload = strict_json_loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
         raise ValueError(f"Malformed trial process identity at {path}.") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Trial process identity at {path} must be a JSON object.")

@@ -470,6 +470,41 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     assert excinfo.value.report.child_pgids == (1234,)
 
 
+def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first shutdown signal owns cleanup evidence until its pass completes."""
+    active: dict[int, object] = {1234: object(), 5678: object()}
+    terminated: list[int] = []
+    reentered = False
+
+    monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
+
+    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
+        nonlocal reentered
+        terminated.append(pgid)
+        if not reentered:
+            reentered = True
+            assert _shutdown_handler(signal.SIGINT, None) is None
+        return True
+
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
+
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
+        _shutdown_handler(signal.SIGTERM, None)
+
+    assert terminated == [1234, 5678]
+    assert excinfo.value.signum == signal.SIGTERM
+    assert excinfo.value.report.signum == signal.SIGTERM
+    assert excinfo.value.report.cleanup_confirmed is True
+    assert excinfo.value.report.child_pgids == (1234, 5678)
+
+    active.clear()
+    with pytest.raises(PhaseSweepShutdown) as subsequent:
+        _shutdown_handler(signal.SIGINT, None)
+    assert subsequent.value.signum == signal.SIGINT
+
+
 def test_process_group_alive_uses_cached_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
