@@ -333,14 +333,23 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
+        primary = (
+            terminal_report.primary_error
+            if terminal_report is not None and terminal_report.primary_error is not None
+            else exc
+        )
         status["failure"] = _safe_failure_payload(
-            terminal_report.primary_error if terminal_report is not None else exc,
+            primary,
             stage=terminal_report.failure_stage if terminal_report is not None else "execution",
         )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
-        primary = terminal_report.primary_error if terminal_report is not None else exc
+        primary = (
+            terminal_report.primary_error
+            if terminal_report is not None and terminal_report.primary_error is not None
+            else exc
+        )
         status["error_class"] = type(primary).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else False
@@ -352,7 +361,11 @@ def main(argv: list[str] | None = None) -> int:
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
-        primary = terminal_report.primary_error if terminal_report is not None else exc
+        primary = (
+            terminal_report.primary_error
+            if terminal_report is not None and terminal_report.primary_error is not None
+            else exc
+        )
         status["error_class"] = type(primary).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else True
