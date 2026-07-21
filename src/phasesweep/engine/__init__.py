@@ -1,5 +1,9 @@
 """Sweep execution engine API."""
 
+from phasesweep.engine.errors import (
+    SamplerContinuationUnsupportedError,
+    TrialTargetRegressionError,
+)
 from phasesweep.engine.read import (
     PhaseWinnerView,
     read_status,
@@ -21,7 +25,9 @@ __all__ = [
     "NoFeasibleTrialError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
+    "SamplerContinuationUnsupportedError",
     "TerminalReport",
+    "TrialTargetRegressionError",
     "UnsafeProcessCleanupError",
     "Winner",
     "config_status",

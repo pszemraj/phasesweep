@@ -85,12 +85,12 @@
 # Keys named `seed` or ending in `.seed` require allow_seed_search: true.
 
 # n_trials: int (required; >= 1)
-# Target number of terminal attempts in this phase's study; COMPLETE, FAIL, and PRUNED trials all count. Persistent reruns launch only the remaining top-up, so lowering this value does not remove history.
+# Monotonic target number of terminal attempts in this phase's study; COMPLETE, FAIL, and PRUNED trials all count. Persistent random/grid reruns launch only the remaining top-up. Lowering an accepted target is rejected; use a new experiment name for a smaller study.
 # For a full grid, set this to the grid cardinality; a smaller value requires allow_partial_grid: true.
 
 # n_jobs: int = 1 (>= 1)
 # Maximum concurrent trials inside one orchestrator. SQLite rejects values > 1; a smaller GPU pool can serialize trainer launches below this number.
-# TPE enables its parallel constant-liar heuristic when this is > 1. n_jobs is excluded from the semantic fingerprint, so changing it during a top-up changes sampling behavior without starting a new study.
+# TPE enables its parallel constant-liar heuristic when this is > 1. TPE/CMA-ES cross-invocation top-ups are rejected because their process-local continuation state is not fully durable.
 
 # gpu_policy: Literal["single_per_trial", "whole_node", "none"] = "single_per_trial"
 # `single_per_trial` leases one detected/configured CUDA-visible token per active trainer; a single-job phase with no visible GPU runs without isolation.
@@ -117,7 +117,7 @@
 #   type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
 #   `grid` rejects log parameters, requires float steps, and requires n_trials to equal cardinality unless allow_partial_grid is true. `cmaes` rejects categorical parameters and requires the installed `cmaes` dependency.
 #   seed: int | None = null
-#   Reproducibility seed for all four sampler types; grid uses it for traversal order. Seeded random draws are keyed by durable trial identity so top-up batching does not restart the stream.
+#   Seed for sampler behavior within one invocation; grid uses it for traversal order. Seeded random draws are keyed by durable trial identity so supported top-up batching does not restart the stream. TPE/CMA-ES top-ups are rejected rather than described as reproducible across process boundaries.
 #   n_startup_trials: int = 10 (>= 0)
 #   Used only by TPE; ignored by random, grid, and CMA-ES.
 

@@ -15,3 +15,11 @@ class StudyContextConflictError(RuntimeError):
 
 class StudyStorageUnavailableError(RuntimeError):
     """Raised when persistent study storage cannot be inspected during preflight."""
+
+
+class SamplerContinuationUnsupportedError(RuntimeError):
+    """Raised when a stateful sampler cannot safely continue across invocations."""
+
+
+class TrialTargetRegressionError(RuntimeError):
+    """Raised when a persistent study requests less than its accepted trial target."""

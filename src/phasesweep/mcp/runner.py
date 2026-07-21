@@ -17,10 +17,12 @@ from pathlib import Path
 
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
 from phasesweep.engine.errors import (
+    SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrialTargetRegressionError,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
@@ -72,6 +74,27 @@ def _safe_failure_payload(
             "actor": "operator",
             "remediation": (
                 "Ask the operator to restore the configured study storage, then start a new run."
+            ),
+        }
+    if isinstance(error, SamplerContinuationUnsupportedError):
+        return {
+            "code": "sampler_continuation_unsupported",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Use a new experiment name for this TPE/CMA-ES extension, or run the "
+                "full target in one invocation."
+            ),
+        }
+    if isinstance(error, TrialTargetRegressionError):
+        return {
+            "code": "trial_target_regression",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Restore the study's prior trial target, or use a new experiment name."
             ),
         }
     if isinstance(error, ProcessCleanupUncertainError):

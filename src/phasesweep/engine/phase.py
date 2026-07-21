@@ -18,6 +18,7 @@ from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.guards import (
     _reap_stale_trials,
+    _record_trial_target,
     _validate_study_schema,
     _verify_fingerprint,
 )
@@ -181,6 +182,7 @@ def _run_phase(
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
+        _record_trial_target(study, phase)
 
     completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)

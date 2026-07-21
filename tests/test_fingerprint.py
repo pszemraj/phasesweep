@@ -20,10 +20,16 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
 )
-from phasesweep.engine import read_winners
+from phasesweep.engine import (
+    SamplerContinuationUnsupportedError,
+    TrialTargetRegressionError,
+    read_winners,
+)
 from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
 from phasesweep.engine.state import (
+    TRIAL_TARGET_ATTR,
     Winner,
     _generation_path,
     _generation_record_path,
@@ -403,6 +409,84 @@ phases:
     study = optuna.load_study(study_name="topup::a", storage=f"sqlite:///{db}")
     finished = [t for t in study.get_trials() if t.state.is_finished()]
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
+
+
+@pytest.mark.parametrize(
+    ("sampler", "search_space"),
+    [
+        pytest.param(
+            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            {"x": IntParam(type="int", low=0, high=10)},
+            id="tpe",
+        ),
+        pytest.param(
+            Sampler(type="cmaes", seed=0),
+            {"x": FloatParam(type="float", low=0.0, high=1.0)},
+            id="cmaes",
+        ),
+    ],
+)
+def test_stateful_sampler_top_up_is_rejected_before_mutation(
+    tmp_path: Path,
+    sampler: Sampler,
+    search_space: dict,
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        sampler=sampler,
+        search_space=search_space,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[phase],
+    )
+    run_experiment(experiment)
+    winner_before = _winner_path(experiment, "p").read_bytes()
+
+    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 2})]})
+    with pytest.raises(
+        SamplerContinuationUnsupportedError,
+        match="process-local continuation state.*new experiment name",
+    ):
+        run_experiment(top_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert len(study.trials) == 1
+    assert _winner_path(experiment, "p").read_bytes() == winner_before
+
+
+def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    phase = Phase(
+        name="p",
+        n_trials=3,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[phase],
+    )
+    winners = run_experiment(experiment)
+    winner_before = _winner_path(experiment, "p").read_bytes()
+
+    lowered = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 1})]})
+    with pytest.raises(TrialTargetRegressionError, match="accepted a target of 3"):
+        run_experiment(lowered)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
+    assert len(study.trials) == 3
+    assert winners["p"].completion["finished_trials"] == 3
+    assert _winner_path(experiment, "p").read_bytes() == winner_before
 
 
 def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path) -> None:

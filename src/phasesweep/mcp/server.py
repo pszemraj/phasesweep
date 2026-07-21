@@ -305,6 +305,8 @@ class FailurePayload(_ToolPayload):
         "fingerprint_mismatch",
         "study_schema_mismatch",
         "storage_unavailable",
+        "sampler_continuation_unsupported",
+        "trial_target_regression",
         "trainer_failed",
         "timeout",
         "cleanup_uncertain",

@@ -15,9 +15,11 @@ import optuna
 
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.engine.errors import (
+    SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrialTargetRegressionError,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
@@ -27,6 +29,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    TRIAL_TARGET_ATTR,
     Winner,
     _experiment_dir,
     _suite_dir,
@@ -554,6 +557,56 @@ def _validate_study_schema(study: optuna.Study) -> None:
     )
 
 
+def _accepted_trial_target(study: optuna.Study) -> int:
+    """Return the durable target, inferring old current-schema studies from history."""
+    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
+    if stored is None:
+        return finished
+    if type(stored) is not int or stored < 1 or finished > stored:
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
+            f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
+            "the inconsistent study before running again."
+        )
+    return stored
+
+
+def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
+    """Reject a target lower than the study's durable accepted target."""
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials < accepted_target:
+        raise TrialTargetRegressionError(
+            f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
+            f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
+            "target or a new experiment name."
+        )
+
+
+def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
+    """Reject a stateful sampler restart that would depend on invocation batching."""
+    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    if 0 < finished < phase.n_trials and phase.sampler.type in {"tpe", "cmaes"}:
+        raise SamplerContinuationUnsupportedError(
+            f"Phase {phase.name!r} uses {phase.sampler.type!r} and has {finished} terminal "
+            f"trial(s) toward a target of {phase.n_trials}. PhaseSweep cannot reproduce this "
+            "sampler's process-local continuation state safely. Use a new experiment name, "
+            "or run the full target in one invocation."
+        )
+
+
+def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
+    """Persist the highest accepted target before the phase launches work."""
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials < accepted_target:
+        raise TrialTargetRegressionError(
+            f"Phase {phase.name!r} cannot lower its accepted trial target from "
+            f"{accepted_target} to {phase.n_trials}."
+        )
+    if phase.n_trials != study.user_attrs.get(TRIAL_TARGET_ATTR):
+        study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+
+
 def _preflight_existing_studies(
     experiment: Experiment,
     *,
@@ -592,6 +645,7 @@ def _preflight_existing_studies(
             continue
         try:
             _validate_study_schema(study)
+            _validate_trial_target(study, phase)
         except Exception as exc:
             errors.append(exc)
     if errors:
@@ -605,6 +659,8 @@ def _preflight_existing_studies(
             raise StudySchemaMismatchError(message) from first
         if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
             raise StudyStorageUnavailableError(message) from first
+        if all(isinstance(error, TrialTargetRegressionError) for error in errors):
+            raise TrialTargetRegressionError(message) from first
         cleanup_error = next(
             (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
             None,

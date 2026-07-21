@@ -17,11 +17,13 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.config import Experiment, Phase, load_config
+from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
+    SamplerContinuationUnsupportedError,
     TerminalReport,
+    TrialTargetRegressionError,
     read_status,
     run_experiment,
 )
@@ -229,6 +231,7 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         n_trials=1,
+        sampler=Sampler(type="random", seed=0),
     )
     captured: dict[str, object] = {}
 
@@ -265,6 +268,33 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
     assert current_phase["n_trials"] == 2
     assert current_phase["completed"] == 2
     assert current_phase["generation_trials"] == {"COMPLETE": 1}
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        pytest.param(
+            SamplerContinuationUnsupportedError("unsupported continuation"),
+            "sampler_continuation_unsupported",
+            id="sampler",
+        ),
+        pytest.param(
+            TrialTargetRegressionError("target moved backward"),
+            "trial_target_regression",
+            id="target",
+        ),
+    ],
+)
+def test_continuation_preflight_failures_have_actionable_mcp_categories(
+    error: RuntimeError,
+    code: str,
+) -> None:
+    failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+
+    assert failure["code"] == code
+    assert failure["stage"] == "preflight"
+    assert failure["retryable"] is False
+    assert failure["actor"] == "operator"
 
 
 def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path: Path) -> None:

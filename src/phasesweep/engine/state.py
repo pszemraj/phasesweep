@@ -66,6 +66,7 @@ GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 STUDY_SCHEMA_VERSION = 1
+TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 RETURN_CODE_ATTR = "phasesweep_return_code"

@@ -22,6 +22,7 @@ from phasesweep.engine.guards import (
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _suite_lock,
+    _validate_sampler_continuation,
     _verify_fingerprint,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
@@ -216,6 +217,11 @@ def run_experiment(
                 cleanup_report=cleanup,
             )
             _reject_bound_descendant_topups(
+                experiment,
+                from_phase=from_phase,
+                existing_studies=existing_studies,
+            )
+            _reject_unsupported_sampler_topups(
                 experiment,
                 from_phase=from_phase,
                 existing_studies=existing_studies,
@@ -544,6 +550,24 @@ def _reject_bound_descendant_topups(
                 "to its published winner. Use a new experiment name to run the larger "
                 "upstream budget without mutating this completed phase chain."
             )
+
+
+def _reject_unsupported_sampler_topups(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+    existing_studies: dict[str, Any],
+) -> None:
+    """Reject stateful sampler continuation after bound-descendant checks."""
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if not reached:
+            continue
+        study = existing_studies.get(phase.name)
+        if study is not None:
+            _validate_sampler_continuation(study, phase)
 
 
 def _preflight_reached_fingerprint(
