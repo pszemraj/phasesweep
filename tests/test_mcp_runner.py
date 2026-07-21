@@ -28,14 +28,16 @@ from phasesweep.engine import (
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     _generation_path,
+    _generation_record_path,
     _generations_dir,
     _summary_path,
     _trial_dir_for,
     _winner_path,
 )
 from phasesweep.mcp import runner as mcp_runner
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import _process_group_alive
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import slow_mcp_config_text
@@ -75,6 +77,28 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
                     return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
+
+
+def _claim_runner_handle(
+    store: RunStore,
+    *,
+    run_id: str,
+    config_sha256: str,
+    started_at: str,
+) -> None:
+    """Create the launch reservation a real MCP server owns before spawning."""
+    store.create(
+        RunHandle(
+            run_id=run_id,
+            experiment_id="cancel_me",
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=started_at,
+            launch_state="launching",
+        )
+    )
 
 
 def test_runner_persists_terminal_evidence_before_snapshot_finalization(
@@ -307,7 +331,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
-    generation_path = _generation_path(experiment)
+    generation_path = _generation_record_path(experiment, "current-generation")
     generation_path.parent.mkdir(parents=True)
     generation_path.write_text("generation_id: current-generation\n")
 
@@ -503,6 +527,14 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     run_id = "r1"
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -512,7 +544,7 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         "--config",
         str(config),
         "--config-sha256",
-        hashlib.sha256(config.read_bytes()).hexdigest(),
+        config_sha256,
         "--status-path",
         str(status_path),
         "--state-dir",
@@ -520,9 +552,9 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         "--experiment-id",
         "cancel_me",
         "--started-at",
-        utc_now_iso(),
+        started_at,
     ]
-    with open(log_path, "w") as log_file:
+    with open_private_text(log_path, "w") as log_file:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -561,17 +593,23 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
 def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: Path) -> None:
     """A cancel arriving before any trial starts must still write status.json.
 
-    The runner installs shutdown handlers before persisting its handle, so once
-    the handle file exists a SIGTERM is guaranteed to be caught — even while the
-    config is still loading. Without the early install, a cancel in that window
-    killed the runner with the default disposition, no status was recorded, and
-    the run derived "running" behind its cleanup-uncertainty marker forever.
+    The server creates a launching handle before spawn. The runner installs
+    shutdown handlers before updating that handle to spawned, so the transition
+    proves SIGTERM is caught even while the config is still loading.
     """
     config = _slow_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r2"
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -581,7 +619,7 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
         "--config",
         str(config),
         "--config-sha256",
-        hashlib.sha256(config.read_bytes()).hexdigest(),
+        config_sha256,
         "--status-path",
         str(status_path),
         "--state-dir",
@@ -589,10 +627,9 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
         "--experiment-id",
         "cancel_me",
         "--started-at",
-        utc_now_iso(),
+        started_at,
     ]
-    handle_path = tmp_path / "state" / "runs" / f"{run_id}.json"
-    with open(log_path, "w") as log_file:
+    with open_private_text(log_path, "w") as log_file:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -601,16 +638,19 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
             start_new_session=True,
         )
     try:
-        # The self-persisted handle is written after handler installation, so
-        # its appearance proves SIGTERM will be caught from here on.
+        # The spawned transition occurs after handler installation, so it is
+        # the synchronization point for this pre-trial cancellation.
         deadline = time.time() + 25
-        while not handle_path.is_file():
+        while True:
+            handle = store.get(run_id)
+            if handle is not None and handle.launch_state == "spawned":
+                break
             if proc.poll() is not None:
                 raise AssertionError(
                     f"runner exited early ({proc.returncode}); log:\n{log_path.read_text()}"
                 )
             if time.time() > deadline:
-                raise AssertionError(f"handle never appeared; log:\n{log_path.read_text()}")
+                raise AssertionError(f"handle never became spawned; log:\n{log_path.read_text()}")
             time.sleep(0.02)
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=30)

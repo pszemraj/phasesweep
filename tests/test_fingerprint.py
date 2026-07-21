@@ -596,7 +596,12 @@ def test_fresh_run_preflight_consumes_run_deadline(
     run_module = importlib.import_module("phasesweep.engine.run")
     clock = {"now": 100.0}
 
-    def delayed_preflight(_experiment: Experiment) -> dict[str, optuna.Study]:
+    def delayed_preflight(
+        _experiment: Experiment,
+        *,
+        cleanup_report: object,
+    ) -> dict[str, optuna.Study]:
+        del cleanup_report
         clock["now"] += 2.0
         return {}
 
