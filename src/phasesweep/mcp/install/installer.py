@@ -20,11 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 import click
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+import tomllib
 
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (

@@ -5,7 +5,7 @@ Install the extra, create a catalog, connect a client, verify the connection, an
 ## Prerequisites
 
 - The MCP [platform requirements](runtime.md#platform-support).
-- Python 3.10 or newer.
+- Python 3.11 or newer.
 - At least one phasesweep experiment config that already passes `phasesweep validate`.
 - A coding client with local stdio MCP support. Local use requires no API key or OAuth credential.
 

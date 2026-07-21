@@ -10,7 +10,7 @@ Use `phasesweep` when a full joint sweep is too expensive and the search can be 
 
 ## Requirements
 
-- Python 3.10+; see [platform support](docs/runtime.md#platform-support) for real-run and MCP requirements
+- Python 3.11+; see [platform support](docs/runtime.md#platform-support) for real-run and MCP requirements
 - A trainer command that follows the [trainer contract](docs/config.md#trainer-contract)
 - GPU optional; see [GPU concurrency and isolation](docs/runtime.md#concurrency-model)
 
