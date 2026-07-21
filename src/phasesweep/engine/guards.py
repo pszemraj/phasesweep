@@ -15,6 +15,7 @@ import optuna
 
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.engine.errors import (
+    ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -203,7 +204,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         ``None``. Use as ``with _experiment_lock(exp): ...``.
 
     Raises:
-        RuntimeError: Another phasesweep process holds one of the required
+        ExperimentLockBusyError: Another phasesweep process holds one of the required
             locks (output namespace or storage identity).
 
     """
@@ -213,7 +214,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         for path in paths:
             handle = try_lock_file(path)
             if handle is None:
-                raise RuntimeError(
+                raise ExperimentLockBusyError(
                     f"Another phasesweep process appears to be using the same "
                     f"experiment backend or output namespace for "
                     f"{experiment.experiment!r} (lock file: {path}). phasesweep "

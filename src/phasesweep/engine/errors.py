@@ -17,6 +17,10 @@ class StudyStorageUnavailableError(RuntimeError):
     """Raised when persistent study storage cannot be inspected during preflight."""
 
 
+class ExperimentLockBusyError(RuntimeError):
+    """Raised when another orchestrator owns an experiment consistency lock."""
+
+
 class SamplerContinuationUnsupportedError(RuntimeError):
     """Raised when a stateful sampler cannot safely continue across invocations."""
 

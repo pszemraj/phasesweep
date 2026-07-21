@@ -1,6 +1,7 @@
 """Sweep execution engine API."""
 
 from phasesweep.engine.errors import (
+    ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
     TrialTargetRegressionError,
 )
@@ -22,6 +23,7 @@ from phasesweep.engine.state import Winner
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
+    "ExperimentLockBusyError",
     "NoFeasibleTrialError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",

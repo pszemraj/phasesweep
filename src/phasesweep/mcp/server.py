@@ -298,25 +298,35 @@ class ValidateConfigResult(_ToolPayload):
     phases: list[PhaseValidationPayload]
 
 
-class FailurePayload(_ToolPayload):
-    """Path-free terminal failure category and recovery policy."""
+FailureCode = Literal[
+    "fingerprint_mismatch",
+    "study_schema_mismatch",
+    "storage_unavailable",
+    "sampler_continuation_unsupported",
+    "trial_target_regression",
+    "experiment_busy",
+    "trainer_failed",
+    "timeout",
+    "cleanup_uncertain",
+    "cancelled",
+    "internal_error",
+]
 
-    code: Literal[
-        "fingerprint_mismatch",
-        "study_schema_mismatch",
-        "storage_unavailable",
-        "sampler_continuation_unsupported",
-        "trial_target_regression",
-        "trainer_failed",
-        "timeout",
-        "cleanup_uncertain",
-        "cancelled",
-        "internal_error",
-    ]
+
+class FailureCausePayload(_ToolPayload):
+    """Safe secondary cause retained beneath an actionable terminal failure."""
+
+    code: FailureCode
     stage: Literal["preflight", "execution", "cleanup"]
     retryable: bool
     actor: Literal["agent", "operator"]
     remediation: str
+
+
+class FailurePayload(FailureCausePayload):
+    """Path-free terminal failure category and recovery policy."""
+
+    cause: FailureCausePayload | None = None
 
 
 class RunPayload(_ToolPayload):
@@ -745,7 +755,9 @@ class PhaseSweepMCP:
         if terminal is None or terminal.get("failure") is None:
             return None
         try:
-            return FailurePayload.model_validate(terminal["failure"]).model_dump(mode="json")
+            return FailurePayload.model_validate(terminal["failure"]).model_dump(
+                mode="json", exclude_none=True
+            )
         except ValidationError:
             return None
 

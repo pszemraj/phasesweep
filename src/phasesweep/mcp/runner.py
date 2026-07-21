@@ -15,8 +15,10 @@ import os
 import sys
 from pathlib import Path
 
+from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
 from phasesweep.engine.errors import (
+    ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -27,7 +29,11 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
+from phasesweep.mcp.snapshots import (
+    capture_pre_generation_result_snapshot,
+    capture_result_snapshot,
+    finalize_result_snapshot,
+)
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -37,13 +43,24 @@ from phasesweep.runtime.process import (
 )
 
 
-def _safe_failure_payload(
+def _base_failure_payload(
     error: BaseException,
     *,
     stage: str | None,
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure."""
     failure_stage = stage if stage in {"preflight", "execution", "cleanup"} else "execution"
+    if isinstance(error, ExperimentLockBusyError):
+        return {
+            "code": "experiment_busy",
+            "stage": "preflight",
+            "retryable": True,
+            "actor": "agent",
+            "remediation": (
+                "Wait briefly, then start a new run; another orchestrator currently owns "
+                "this experiment's consistency lock."
+            ),
+        }
     if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
         return {
             "code": "fingerprint_mismatch",
@@ -142,6 +159,32 @@ def _safe_failure_payload(
         "actor": "operator",
         "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
     }
+
+
+def _safe_failure_payload(
+    error: BaseException,
+    *,
+    stage: str | None,
+    cause: BaseException | None = None,
+) -> dict[str, object]:
+    """Map an error and optional secondary cause to one stable agent failure."""
+    payload = _base_failure_payload(error, stage=stage)
+    if cause is not None and cause is not error:
+        payload["cause"] = _base_failure_payload(cause, stage=stage)
+    return payload
+
+
+def _cleanup_failure_payload(
+    primary: BaseException,
+    *,
+    cause_stage: str | None,
+) -> dict[str, object]:
+    """Make cleanup uncertainty actionable while retaining its safe primary cause."""
+    cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
+    payload = _base_failure_payload(cleanup, stage="cleanup")
+    if not isinstance(primary, ProcessCleanupUncertainError):
+        payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
+    return payload
 
 
 def _write_status(
@@ -293,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     result_snapshot: dict | None = None
     result_snapshot_error: str | None = None
     terminal_report: TerminalReport | None = None
+    config: Experiment | None = None
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -323,9 +367,16 @@ def main(argv: list[str] | None = None) -> int:
             terminal_report = report
             status["cleanup_confirmed"] = report.cleanup_confirmed
             if report.primary_error is not None:
-                status["failure"] = _safe_failure_payload(
-                    report.primary_error,
-                    stage=report.failure_stage,
+                status["failure"] = (
+                    _cleanup_failure_payload(
+                        report.primary_error,
+                        cause_stage=report.failure_stage,
+                    )
+                    if not report.cleanup_confirmed
+                    else _safe_failure_payload(
+                        report.primary_error,
+                        stage=report.failure_stage,
+                    )
                 )
             try:
                 result_snapshot = capture_result_snapshot(
@@ -361,9 +412,13 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_report is not None and terminal_report.primary_error is not None
             else exc
         )
-        status["failure"] = _safe_failure_payload(
-            primary,
-            stage=terminal_report.failure_stage if terminal_report is not None else "execution",
+        failure_stage = (
+            terminal_report.failure_stage if terminal_report is not None else "execution"
+        )
+        status["failure"] = (
+            _cleanup_failure_payload(primary, cause_stage=failure_stage)
+            if status["cleanup_confirmed"] is False
+            else _safe_failure_payload(primary, stage=failure_stage)
         )
         raise
     except ProcessCleanupUncertainError as exc:
@@ -373,13 +428,15 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_report is not None and terminal_report.primary_error is not None
             else exc
         )
-        status["error_class"] = type(primary).__name__
+        status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else False
         )
-        status["failure"] = _safe_failure_payload(
+        status["failure"] = _cleanup_failure_payload(
             primary,
-            stage=terminal_report.failure_stage if terminal_report is not None else "cleanup",
+            cause_stage=terminal_report.failure_stage
+            if terminal_report is not None
+            else "execution",
         )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
@@ -393,12 +450,23 @@ def main(argv: list[str] | None = None) -> int:
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else True
         )
-        status["failure"] = _safe_failure_payload(
-            primary,
-            stage=terminal_report.failure_stage if terminal_report is not None else "execution",
+        failure_stage = (
+            terminal_report.failure_stage if terminal_report is not None else "execution"
+        )
+        status["failure"] = (
+            _cleanup_failure_payload(primary, cause_stage=failure_stage)
+            if status["cleanup_confirmed"] is False
+            else _safe_failure_payload(primary, stage=failure_stage)
         )
         raise
     finally:
+        if result_snapshot is None and terminal_report is None and config is not None:
+            try:
+                result_snapshot = capture_pre_generation_result_snapshot(config)
+            except Exception as exc:  # noqa: BLE001 - preserve the terminal engine failure
+                result_snapshot_error = type(exc).__name__
+            else:
+                status["generation_unavailable_reason"] = "engine_generation_not_claimed"
         _write_status(
             args.status_path,
             status,

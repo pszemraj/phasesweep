@@ -19,6 +19,7 @@ import pytest
 
 from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
+    ExperimentLockBusyError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     SamplerContinuationUnsupportedError,
@@ -295,6 +296,60 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     assert failure["stage"] == "preflight"
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
+
+
+def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
+    tmp_path: Path,
+) -> None:
+    config_path = _slow_config(tmp_path)
+    experiment = load_config(config_path)
+    assert isinstance(experiment, Experiment)
+    store = RunStore(tmp_path / "state")
+    run_id = "lock-busy"
+    status_path = store.status_path(run_id)
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
+
+    with (
+        _experiment_lock(experiment),
+        pytest.raises(ExperimentLockBusyError),
+    ):
+        mcp_runner.main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config_path),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(status_path),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "cancel_me",
+                "--started-at",
+                started_at,
+            ]
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["failure"]["code"] == "experiment_busy"
+    assert status["failure"]["stage"] == "preflight"
+    assert status["failure"]["retryable"] is True
+    assert status["failure"]["actor"] == "agent"
+    assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
+    assert status["result_snapshot_state"] == "complete"
+    snapshot = status["result_snapshot"]
+    assert snapshot["status"]["generation_id"] is None
+    assert snapshot["winners"] == []
+    assert all(phase["trial_data_available"] is False for phase in snapshot["status"]["phases"])
 
 
 def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import pytest
 
 from phasesweep.config import FloatParam, IntParam, Phase
 from phasesweep.engine import run_experiment
+from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.guards import (
     _experiment_lock,
     _run_lock_paths,
@@ -364,7 +365,7 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
     with (
         _experiment_lock(exp_a),
         pytest.raises(  # noqa: SIM117
-            RuntimeError, match="Another phasesweep process"
+            ExperimentLockBusyError, match="Another phasesweep process"
         ),
         _experiment_lock(exp_b),
     ):

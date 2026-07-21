@@ -1291,7 +1291,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     assert status["cleanup_confirmed"] is False
 
 
-def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
+def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1357,8 +1357,14 @@ def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
 
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
-    assert status["error_class"] == "NoFeasibleTrialError"
+    assert status["error_class"] == "ProcessCleanupUncertainError"
     assert status["cleanup_confirmed"] is False
+    assert status["failure"]["code"] == "cleanup_uncertain"
+    assert status["failure"]["stage"] == "cleanup"
+    assert status["failure"]["retryable"] is False
+    assert status["failure"]["actor"] == "operator"
+    assert status["failure"]["cause"]["code"] == "trainer_failed"
+    assert status["failure"]["cause"]["stage"] == "execution"
 
 
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:

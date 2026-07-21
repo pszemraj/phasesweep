@@ -17,6 +17,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _generation_record_path,
 )
+from phasesweep.evidence.models import objective_evidence_assurance
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -164,6 +165,39 @@ class RunResultSnapshot(_SnapshotModel):
             )
             for winner in self.winners
         ]
+
+
+def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, Any]:
+    """Freeze known config shape without reading mutable study or winner state."""
+    zero_counts = {state: 0 for state in ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")}
+    snapshot = RunResultSnapshot(
+        status=StatusSnapshot(
+            generation_id=None,
+            metric=MetricSnapshot(
+                name=experiment.metric.name,
+                goal=experiment.metric.goal,
+                objective_evidence=ObjectiveEvidenceSnapshot.model_validate(
+                    objective_evidence_assurance(experiment.metric.extractor)
+                ),
+            ),
+            phases=[
+                PhaseStatusSnapshot(
+                    phase=phase.name,
+                    trials=dict(zero_counts),
+                    running=0,
+                    n_trials=phase.n_trials,
+                    completed=0,
+                    generation_trials={},
+                    winner_present=False,
+                    trial_data_available=False,
+                )
+                for phase in experiment.phases
+            ],
+            summary_present=False,
+        ),
+        winners=[],
+    )
+    return snapshot.model_dump(mode="json")
 
 
 def capture_result_snapshot(
