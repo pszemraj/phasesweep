@@ -22,12 +22,14 @@ from uuid import uuid4
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
+    UnsafePrivatePathError,
     ensure_private_dir,
     fsync_directory,
     open_private_text,
     private_atomic_write_text,
     try_lock_file,
     unlock_file,
+    validate_private_dir,
 )
 from phasesweep.runtime.process import is_same_live_process, reap_child
 
@@ -116,9 +118,12 @@ class RunStore:
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
-        missing = [
-            str(path) for path in (state_dir, store._runs_dir, store._logs_dir) if not path.is_dir()
-        ]
+        missing = []
+        for path in (state_dir, store._runs_dir, store._logs_dir):
+            try:
+                validate_private_dir(path)
+            except (OSError, UnsafePrivatePathError):
+                missing.append(str(path))
         if missing:
             raise ValueError(
                 "not an existing MCP state directory; expected directories are missing: "

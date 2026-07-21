@@ -100,6 +100,162 @@ def test_lock_open_rejects_hardlinks_and_creates_private_mode(
         runtime_files.try_lock_file(lock_root / "linked.lock")
 
 
+def test_default_lock_dir_rejects_symlink_without_chmodding_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    namespace = home / ".cache" / "phasesweep"
+    namespace.mkdir(parents=True, mode=0o700)
+    namespace.chmod(0o700)
+    target = tmp_path / "unrelated"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    (namespace / "locks").symlink_to(target, target_is_directory=True)
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe"):
+        runtime_files.lock_dir()
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_lock_open_rejects_unsafe_mode_without_modifying_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir(mode=0o700)
+    lock_root.chmod(0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_root))
+    lock_path = lock_root / "unsafe.lock"
+    lock_path.write_text("unchanged")
+    lock_path.chmod(0o644)
+
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="expected 0600"):
+        runtime_files.open_lock_file(lock_path)
+
+    assert lock_path.read_text() == "unchanged"
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o644
+
+
+def test_private_directory_rejects_symlink_without_modifying_target(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    target = tmp_path / "unrelated"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    linked = root / "state"
+    linked.symlink_to(target, target_is_directory=True)
+    unsafe_mode = root / "unsafe-mode"
+    unsafe_mode.mkdir(mode=0o755)
+    unsafe_mode.chmod(0o755)
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.ensure_private_dir(linked)
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.ensure_private_dir(unsafe_mode)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert stat.S_IMODE(unsafe_mode.stat().st_mode) == 0o755
+
+
+def test_private_open_rejects_symlink_hardlink_and_wrong_mode_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not destroy")
+    victim.chmod(0o600)
+    victim_mode = stat.S_IMODE(victim.stat().st_mode)
+    symlink = root / "symlink.log"
+    symlink.symlink_to(victim)
+    hardlink = root / "hardlink.log"
+    hardlink.hardlink_to(victim)
+    unsafe_mode = root / "mode.log"
+    unsafe_mode.write_text("keep mode")
+    unsafe_mode.chmod(0o644)
+
+    for path in (symlink, hardlink, unsafe_mode):
+        with (
+            pytest.raises((OSError, runtime_files.UnsafePrivatePathError)),
+            runtime_files.open_private_text(path, "w") as handle,
+        ):
+            handle.write("replacement")
+
+    assert victim.read_text() == "do not destroy"
+    assert stat.S_IMODE(victim.stat().st_mode) == victim_mode
+    assert unsafe_mode.read_text() == "keep mode"
+    assert stat.S_IMODE(unsafe_mode.stat().st_mode) == 0o644
+
+
+def test_private_atomic_write_rejects_symlink_and_intermediate_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o700)
+    victim = outside / "victim.txt"
+    victim.write_text("unchanged")
+    victim.chmod(0o600)
+    final_link = root / "status.json"
+    final_link.symlink_to(victim)
+    parent_link = root / "linked-parent"
+    parent_link.symlink_to(outside, target_is_directory=True)
+    unsafe_mode = root / "unsafe-mode.json"
+    unsafe_mode.write_text("unsafe mode")
+    unsafe_mode.chmod(0o644)
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.private_atomic_write_text(final_link, "replacement")
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.private_atomic_write_text(parent_link / "new.txt", "replacement")
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.private_atomic_write_text(unsafe_mode, "replacement")
+
+    assert victim.read_text() == "unchanged"
+    assert final_link.is_symlink()
+    assert not (outside / "new.txt").exists()
+    assert unsafe_mode.read_text() == "unsafe mode"
+    assert stat.S_IMODE(unsafe_mode.stat().st_mode) == 0o644
+
+
+def test_private_atomic_write_keeps_opened_parent_during_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    moved = tmp_path / "moved-state"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o700)
+    outside_status = outside / "status.json"
+    outside_status.write_text("outside")
+    outside_status.chmod(0o600)
+    original_new_temp = runtime_files._new_private_temp_fd
+
+    def swap_parent(parent_fd: int, leaf: str) -> tuple[int, str]:
+        state.rename(moved)
+        state.symlink_to(outside, target_is_directory=True)
+        return original_new_temp(parent_fd, leaf)
+
+    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", swap_parent)
+
+    runtime_files.private_atomic_write_text(state / "status.json", "inside")
+
+    assert (moved / "status.json").read_text() == "inside"
+    assert outside_status.read_text() == "outside"
+
+
 def test_run_lock_blocks_even_when_processes_target_different_phases(
     tmp_path: Path,
 ) -> None:

@@ -11,6 +11,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
 )
+from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import GpuPool, _gpu_lock_path
 
 
@@ -60,7 +61,7 @@ def test_whole_node_policy_assigns_all_configured_devices() -> None:
 def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     lock_path = _gpu_lock_path(1)
-    with lock_path.open("w") as held:
+    with open_lock_file(lock_path) as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
         with (
@@ -182,7 +183,7 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     lock_path = _gpu_lock_path(3)
     holder_marker = "holder-pid\n"
-    with lock_path.open("w") as held:
+    with open_lock_file(lock_path) as held:
         held.write(holder_marker)
         held.flush()
         fcntl.flock(held, fcntl.LOCK_EX)

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any, cast
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 POSIX_RUNTIME_ERROR = (
@@ -26,6 +27,10 @@ SHARED_FILE_MODE = 0o660
 
 class UnsafeLockPathError(RuntimeError):
     """Raised when a lock directory or file is not safe to trust."""
+
+
+class UnsafePrivatePathError(RuntimeError):
+    """Raised when a private directory or file is not safe to mutate."""
 
 
 @dataclass(frozen=True)
@@ -96,8 +101,10 @@ def lock_dir() -> Path:
         return path
 
     path = Path.home() / ".cache" / "phasesweep" / "locks"
-    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
-    path.chmod(PRIVATE_DIR_MODE)
+    try:
+        ensure_private_dir(path)
+    except UnsafePrivatePathError as exc:
+        raise UnsafeLockPathError(f"Default lock directory {path} is unsafe.") from exc
     _lock_policy(path)
     return path
 
@@ -105,11 +112,21 @@ def lock_dir() -> Path:
 def _lock_policy(path: Path) -> _LockPolicy:
     """Validate a lock directory and return its file-sharing policy."""
     try:
-        info = path.lstat()
+        fd = _open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
             f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}."
         ) from exc
+    except UnsafePrivatePathError as exc:
+        raise UnsafeLockPathError(f"Lock directory {path} has an unsafe path component.") from exc
+    try:
+        return _lock_policy_for_info(path, os.fstat(fd))
+    finally:
+        os.close(fd)
+
+
+def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
+    """Return the sharing policy for an already-opened lock directory."""
     if not stat.S_ISDIR(info.st_mode):
         raise UnsafeLockPathError(f"Lock directory {path} must be a real directory, not a symlink.")
 
@@ -131,17 +148,33 @@ def _lock_policy(path: Path) -> _LockPolicy:
 def open_lock_file(path: Path) -> IO[str]:
     """Safely open or create a regular lock file without following links."""
     require_posix_runtime()
-    policy = _lock_policy(path.parent)
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise UnsafeLockPathError("This platform cannot safely open lock files without symlinks.")
-    flags = os.O_RDWR | os.O_CLOEXEC | nofollow
-    created = False
     try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, policy.file_mode)
-        created = True
-    except FileExistsError:
-        fd = os.open(path, flags)
+        parent_fd = _open_directory_fd(path.parent, create=False, private_final=False)
+    except (FileNotFoundError, UnsafePrivatePathError) as exc:
+        raise UnsafeLockPathError(f"Lock directory {path.parent} is not safe to open.") from exc
+    try:
+        policy = _lock_policy_for_info(path.parent, os.fstat(parent_fd))
+        try:
+            leaf = _leaf_name(path)
+        except UnsafePrivatePathError as exc:
+            raise UnsafeLockPathError(f"Lock path {path} has no safe filename.") from exc
+        flags = os.O_RDWR | os.O_CLOEXEC | nofollow
+        created = False
+        try:
+            fd = os.open(
+                leaf,
+                flags | os.O_CREAT | os.O_EXCL,
+                policy.file_mode,
+                dir_fd=parent_fd,
+            )
+            created = True
+        except FileExistsError:
+            fd = os.open(leaf, flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
     try:
         info = os.fstat(fd)
@@ -228,24 +261,129 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def ensure_private_dir(path: Path) -> None:
-    """Create ``path`` and remove group/other access from an existing directory.
+def _nofollow_flag() -> int:
+    """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise UnsafePrivatePathError(
+            "This platform cannot safely access private files without following symlinks."
+        )
+    return nofollow
 
-    ``mkdir(mode=...)`` is still filtered through the process umask. MCP state
-    directories hold operator-only logs, config snapshots, and status files, so
-    creation and reuse both converge to a private mode and fail if that cannot
-    be enforced.
+
+def _absolute_path(path: Path) -> Path:
+    """Return a lexical absolute path without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _leaf_name(path: Path) -> str:
+    """Return a safe single final path component."""
+    leaf = path.name
+    if leaf in {"", ".", ".."}:
+        raise UnsafePrivatePathError(f"Path {path} has no safe final component.")
+    return leaf
+
+
+def _validate_private_dir_info(path: Path, info: os.stat_result) -> None:
+    """Validate an opened owner-only directory without changing it."""
+    mode = stat.S_IMODE(info.st_mode)
+    euid = os.geteuid()
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnsafePrivatePathError(f"Private directory {path} is not a directory.")
+    if info.st_uid != euid or mode != PRIVATE_DIR_MODE:
+        raise UnsafePrivatePathError(
+            f"Private directory {path} must be owned by uid {euid} with mode 0700; "
+            f"found uid {info.st_uid} and mode {mode:04o}."
+        )
+
+
+def _open_directory_fd(
+    path: Path,
+    *,
+    create: bool,
+    private_final: bool,
+) -> int:
+    """Open a directory by walking every component without following links."""
+    absolute = _absolute_path(path)
+    parts = absolute.parts[1:]
+    if not parts:
+        raise UnsafePrivatePathError("The filesystem root cannot be a private directory.")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | _nofollow_flag()
+    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, component in enumerate(parts):
+            created = False
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, PRIVATE_DIR_MODE, dir_fd=current_fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError as exc:
+                    raise UnsafePrivatePathError(
+                        f"Private path component {absolute} is not a real directory."
+                    ) from exc
+            except OSError as exc:
+                raise UnsafePrivatePathError(
+                    f"Private path component {absolute} is not a real directory."
+                ) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+            if created:
+                os.fchmod(current_fd, PRIVATE_DIR_MODE)
+                _validate_private_dir_info(absolute, os.fstat(current_fd))
+            if private_final and index == len(parts) - 1:
+                _validate_private_dir_info(absolute, os.fstat(current_fd))
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def ensure_private_dir(path: Path) -> None:
+    """Create or validate an owner-only directory without following links.
 
     :param Path path: Directory that must be accessible only by the owner.
-    :raises PermissionError: If group/other access remains after chmod.
+    :raises UnsafePrivatePathError: If a component is a link or the final mode/owner is unsafe.
     """
-    path.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        path.chmod(mode & ~0o077)
-    final_mode = stat.S_IMODE(path.stat().st_mode)
-    if final_mode & 0o077:
-        raise PermissionError(f"{path} is accessible by group or other users")
+    fd = _open_directory_fd(path, create=True, private_final=True)
+    os.close(fd)
+
+
+def validate_private_dir(path: Path) -> None:
+    """Validate an existing owner-only directory without changing it."""
+    fd = _open_directory_fd(path, create=False, private_final=True)
+    os.close(fd)
+
+
+def _validate_private_file_info(path: Path, info: os.stat_result) -> None:
+    """Validate an opened private file before any content mutation."""
+    mode = stat.S_IMODE(info.st_mode)
+    euid = os.geteuid()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise UnsafePrivatePathError(f"Private file {path} must be one regular file.")
+    if info.st_uid != euid or mode != PRIVATE_FILE_MODE:
+        raise UnsafePrivatePathError(
+            f"Private file {path} must be owned by uid {euid} with mode 0600; "
+            f"found uid {info.st_uid} and mode {mode:04o}."
+        )
+
+
+def _validate_private_destination(parent_fd: int, leaf: str, path: Path) -> None:
+    """Validate an existing atomic-replace destination without following it."""
+    try:
+        info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _validate_private_file_info(path, info)
 
 
 def open_private_text(path: Path, mode: str = "w") -> IO[str]:
@@ -258,21 +396,100 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     """
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
-    ensure_private_dir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT
-    if mode == "w":
-        flags |= os.O_TRUNC
-    elif mode == "a":
+    parent_fd = _open_directory_fd(path.parent, create=True, private_final=True)
+    leaf = _leaf_name(path)
+    flags = os.O_WRONLY | os.O_CLOEXEC | _nofollow_flag()
+    if mode == "a":
         flags |= os.O_APPEND
-    else:
-        flags |= os.O_EXCL
-    fd = os.open(path, flags, PRIVATE_FILE_MODE)
+    created = False
     try:
+        if mode == "x":
+            fd = os.open(
+                leaf,
+                flags | os.O_CREAT | os.O_EXCL,
+                PRIVATE_FILE_MODE,
+                dir_fd=parent_fd,
+            )
+            created = True
+        else:
+            try:
+                fd = os.open(
+                    leaf,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    PRIVATE_FILE_MODE,
+                    dir_fd=parent_fd,
+                )
+                created = True
+            except FileExistsError:
+                fd = os.open(leaf, flags, dir_fd=parent_fd)
+        try:
+            if created:
+                os.fchmod(fd, PRIVATE_FILE_MODE)
+            _validate_private_file_info(path, os.fstat(fd))
+            if mode == "w":
+                os.ftruncate(fd, 0)
+            return os.fdopen(fd, "w" if mode == "x" else mode, encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            if created:
+                with contextlib.suppress(OSError):
+                    os.unlink(leaf, dir_fd=parent_fd)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
+    """Create one owner-only temporary file relative to an opened directory."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
+    for _ in range(10):
+        temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(temporary, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
         os.fchmod(fd, PRIVATE_FILE_MODE)
-        return os.fdopen(fd, "w" if mode == "x" else mode, encoding="utf-8")
-    except Exception:
-        os.close(fd)
-        raise
+        return fd, temporary
+    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
+
+
+@contextlib.contextmanager
+def _private_atomic_writer(
+    path: Path,
+    *,
+    binary: bool,
+    newline: str | None = None,
+) -> Iterator[IO[Any]]:
+    """Write through a descriptor-relative temporary and replace a validated destination."""
+    parent_fd = _open_directory_fd(path.parent, create=True, private_final=True)
+    leaf = _leaf_name(path)
+    fd = -1
+    temporary: str | None = None
+    replaced = False
+    try:
+        fd, temporary = _new_private_temp_fd(parent_fd, leaf)
+        stream: IO[Any]
+        if binary:
+            stream = os.fdopen(fd, "wb")
+        else:
+            stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
+        fd = -1
+        with stream as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        _validate_private_destination(parent_fd, leaf, path)
+        os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        replaced = True
+        with contextlib.suppress(OSError):
+            os.fsync(parent_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None and not replaced:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=parent_fd)
+        os.close(parent_fd)
 
 
 @contextlib.contextmanager
@@ -283,30 +500,8 @@ def private_atomic_text_writer(path: Path, *, newline: str | None = None) -> Ite
     :param str | None newline: Newline handling passed to ``open``.
     :return Iterator[IO[str]]: Writable text handle.
     """
-    ensure_private_dir(path.parent)
-    tmp_path: Path | None = None
-    replaced = False
-    try:
-        fd, name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            text=True,
-        )
-        os.fchmod(fd, PRIVATE_FILE_MODE)
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as handle:
-            tmp_path = Path(name)
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        assert tmp_path is not None
-        os.replace(tmp_path, path)
-        os.chmod(path, PRIVATE_FILE_MODE)
-        replaced = True
-        fsync_directory(path.parent)
-    finally:
-        if tmp_path is not None and not replaced:
-            tmp_path.unlink(missing_ok=True)
+    with _private_atomic_writer(path, binary=False, newline=newline) as handle:
+        yield cast(IO[str], handle)
 
 
 def private_atomic_write_text(path: Path, text: str) -> None:
@@ -326,29 +521,8 @@ def private_atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
     :param Path path: Destination path to replace.
     :return Iterator[IO[bytes]]: Writable binary handle.
     """
-    ensure_private_dir(path.parent)
-    tmp_path: Path | None = None
-    replaced = False
-    try:
-        fd, name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        os.fchmod(fd, PRIVATE_FILE_MODE)
-        with os.fdopen(fd, "wb") as handle:
-            tmp_path = Path(name)
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        assert tmp_path is not None
-        os.replace(tmp_path, path)
-        os.chmod(path, PRIVATE_FILE_MODE)
-        replaced = True
-        fsync_directory(path.parent)
-    finally:
-        if tmp_path is not None and not replaced:
-            tmp_path.unlink(missing_ok=True)
+    with _private_atomic_writer(path, binary=True) as handle:
+        yield cast(IO[bytes], handle)
 
 
 def private_atomic_write_bytes(path: Path, data: bytes) -> None:
