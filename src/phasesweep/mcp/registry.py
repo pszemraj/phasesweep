@@ -27,6 +27,7 @@ from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
+    UnsafePrivatePathError,
     file_url_path,
     sqlite_uri_filename_path,
     storage_backend,
@@ -226,7 +227,7 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
-    except OSError as exc:
+    except (OSError, UnsafePrivatePathError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
             suggestion="set state_dir to a writable directory path (not a file)",
