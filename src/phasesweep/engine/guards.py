@@ -570,10 +570,16 @@ def _preflight_existing_studies(
         first = errors[0]
         if len(errors) == 1:
             raise first
-        raise RuntimeError(
-            "Experiment recovery preflight found multiple unsafe studies: "
-            + "; ".join(str(error) for error in errors)
-        ) from first
+        message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
+            str(error) for error in errors
+        )
+        if all(isinstance(error, StudySchemaMismatchError) for error in errors):
+            raise StudySchemaMismatchError(message) from first
+        if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
+            raise StudyStorageUnavailableError(message) from first
+        if all(isinstance(error, ProcessCleanupUncertainError) for error in errors):
+            raise ProcessCleanupUncertainError(message) from first
+        raise RuntimeError(message) from first
     return studies
 
 

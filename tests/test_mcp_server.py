@@ -23,7 +23,7 @@ from phasesweep.engine import (
     TerminalReport,
     run_experiment,
 )
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -1140,6 +1140,73 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     assert awaited["reason"] == "terminal"
     assert winners["winner_count"] == 0
     assert winners["failure"]["code"] == "fingerprint_mismatch"
+
+
+def test_aggregated_schema_preflight_preserves_actionable_failure_category(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        phases="""\
+  - name: a
+    n_trials: 1
+    search_space: {}
+  - name: b
+    n_trials: 1
+    search_space: {}
+""",
+    )
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    for phase in experiment.phases:
+        study = optuna.create_study(
+            study_name=f"{experiment.experiment}::{phase.name}",
+            storage=experiment.storage,
+            direction="minimize",
+        )
+        study.add_trial(
+            optuna.trial.create_trial(
+                value=0.5,
+                state=optuna.trial.TrialState.COMPLETE,
+            )
+        )
+
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-schema-mismatch"
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    _claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
+
+    with pytest.raises(StudySchemaMismatchError, match="multiple unsafe studies"):
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(store.status_path(run_id)),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                started_at,
+            ]
+        )
+
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    assert terminal["failure"]["code"] == "study_schema_mismatch"
+    assert terminal["failure"]["retryable"] is False
+    assert "unsupported persistent study" in terminal["failure"]["remediation"]
 
 
 def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
