@@ -198,6 +198,7 @@ def launch_trial(
             stderr=ferr,
             timeout=timeout_seconds,
             trial_dir=workdir,
+            attempt_id=attempt_id,
         )
 
     ctx = TrialContext(

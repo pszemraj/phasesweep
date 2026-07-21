@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -15,14 +17,21 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.guards import _reap_stale_trials
-from phasesweep.engine.state import TRIAL_DIR_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
+    StaleProcessIdentity,
     _defer_shutdown_signals,
     _process_group_alive_with_members,
     _shutdown_handler,
     _terminate_process_group,
+    cleanup_stale_trial_process,
+    is_pid_alive,
+    is_pid_zombie,
+    read_stale_process_identity,
     reap_child,
     run_supervised,
 )
@@ -56,7 +65,7 @@ def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
 
 
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
-    """Failing trials leave pid + pgid + starttime files for forensic recovery."""
+    """Failing trials leave one complete atomic identity for forensic recovery."""
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
 
@@ -70,15 +79,21 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="failure-attempt",
         )
     assert result.return_code != 0
-    assert (trial_dir / "pid").is_file(), "pid file must persist on failure"
-    assert (trial_dir / "pgid").is_file(), "pgid file must persist on failure"
-    assert (trial_dir / "pid_starttime").is_file(), "starttime file must persist on failure"
+    identity = read_stale_process_identity(
+        trial_dir,
+        expected_attempt_id="failure-attempt",
+    )
+    assert identity.pid == result.pid
+    assert identity.pgid == result.pid
+    assert identity.proc_starttime is not None
+    assert identity.boot_id is not None
 
 
 def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None:
-    """Clean exit removes all three identity files."""
+    """Clean exit removes the durable process identity."""
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
 
@@ -92,11 +107,11 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="success-attempt",
         )
     assert result.return_code == 0
     assert result.duration_seconds >= 0.0
-    for name in ("pid", "pgid", "pid_starttime"):
-        assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
 def test_run_supervised_terminates_child_when_identity_write_fails(
@@ -109,7 +124,7 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
     real_atomic_write_text = process.atomic_write_text
 
     def fail_pid_write(path: Path, text: str) -> None:
-        if path.name == "pid":
+        if path.name == PROCESS_IDENTITY_FILE:
             raise OSError("identity disk full")
         real_atomic_write_text(path, text)
 
@@ -117,20 +132,148 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
+    trainer_started = tmp_path / "trainer-started"
     with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
         result = run_supervised(
-            f"{sys.executable} -c 'import time; time.sleep(60)'",
+            f'{sys.executable} -c "from pathlib import Path; '
+            f"Path({str(trainer_started)!r}).write_text('started')\"",
             env=os.environ.copy(),
             stdout=fout,
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="identity-write-failure",
         )
 
     assert result.cleanup_confirmed is True
     assert "failed to persist process identity" in (result.failure_reason or "")
+    assert not trainer_started.exists()
     with pytest.raises(ProcessLookupError):
         os.kill(result.pid, 0)
+
+
+def test_hard_parent_death_before_identity_commit_never_starts_trainer(tmp_path: Path) -> None:
+    """The supervisor exits on acknowledgement-pipe EOF without execing the trainer."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    trainer_started = tmp_path / "trainer-started"
+    command = (
+        f'{sys.executable} -c "from pathlib import Path; '
+        f"Path({str(trainer_started)!r}).write_text('started')\""
+    )
+    parent_code = f"""
+import os
+import time
+from pathlib import Path
+import phasesweep.runtime.process as process
+
+def stall_identity_write(path: Path, text: str) -> None:
+    print(text, flush=True)
+    while True:
+        time.sleep(1)
+
+process.atomic_write_text = stall_identity_write
+env = os.environ.copy()
+env["PHASESWEEP_TRIAL_DIR"] = {str(trial_dir)!r}
+with open(os.devnull, "w") as output:
+    process.run_supervised(
+        {command!r},
+        env=env,
+        stdout=output,
+        stderr=output,
+        timeout=None,
+        trial_dir=Path({str(trial_dir)!r}),
+        attempt_id="pre-commit-attempt",
+    )
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    supervisor_pid: int | None = None
+    try:
+        assert parent.stdout is not None
+        readable, _, _ = select.select([parent.stdout], [], [], 10.0)
+        assert readable, f"identity write was not reached; parent returncode={parent.poll()}"
+        supervisor_pid = json.loads(parent.stdout.readline())["pid"]
+
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        deadline = time.time() + 5
+        while (
+            is_pid_alive(supervisor_pid)
+            and not is_pid_zombie(supervisor_pid)
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+
+        assert not trainer_started.exists()
+        assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+        assert not is_pid_alive(supervisor_pid) or is_pid_zombie(supervisor_pid)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+        if supervisor_pid is not None and is_pid_alive(supervisor_pid):
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(supervisor_pid, signal.SIGKILL)
+
+
+def test_hard_parent_death_after_ack_leaves_recoverable_identity(tmp_path: Path) -> None:
+    """Once the trainer starts, a complete identity exists and can reap its group."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    trainer_started = tmp_path / "trainer-started"
+    command = (
+        f'{sys.executable} -c "from pathlib import Path; import time; '
+        f"Path({str(trainer_started)!r}).write_text('started'); time.sleep(60)\""
+    )
+    parent_code = f"""
+import os
+from pathlib import Path
+from phasesweep.runtime.process import run_supervised
+
+env = os.environ.copy()
+env["PHASESWEEP_TRIAL_DIR"] = {str(trial_dir)!r}
+with open(os.devnull, "w") as output:
+    run_supervised(
+        {command!r},
+        env=env,
+        stdout=output,
+        stderr=output,
+        timeout=None,
+        trial_dir=Path({str(trial_dir)!r}),
+        attempt_id="post-ack-attempt",
+    )
+"""
+    parent = subprocess.Popen([sys.executable, "-c", parent_code])
+    identity = None
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if trainer_started.exists() and (trial_dir / PROCESS_IDENTITY_FILE).exists():
+                identity = read_stale_process_identity(
+                    trial_dir,
+                    expected_attempt_id="post-ack-attempt",
+                )
+                break
+            if parent.poll() is not None:
+                pytest.fail(f"launch parent exited early with code {parent.returncode}")
+            time.sleep(0.05)
+        assert identity is not None
+
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        assert cleanup_stale_trial_process(identity, grace_seconds=0.2) is True
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+        if identity is not None and is_pid_alive(identity.pid):
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(identity.pgid, signal.SIGKILL)
 
 
 def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,6 +341,7 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
             stderr=err,
             timeout=2.0,
             trial_dir=trial_dir,
+            attempt_id="timeout-attempt",
         )
 
     assert result.timed_out, "trial should have hit the configured timeout"
@@ -254,15 +398,15 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
             stderr=err,
             timeout=10.0,
             trial_dir=trial_dir,
+            attempt_id="descendant-attempt",
         )
 
     # Must be flagged as a lifecycle failure, not a clean exit.
     assert result.failure_reason is not None
     assert "still had live descendants" in result.failure_reason
 
-    # Identity files must be preserved for forensics.
-    assert (trial_dir / "pid").exists()
-    assert (trial_dir / "pgid").exists()
+    # The atomic identity must be preserved for forensics.
+    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
     # Descendant must be dead.
     assert marker.exists(), "child PID marker was never written; test setup broken"
@@ -422,14 +566,20 @@ def test_reaper_raises_when_cleanup_uncertain(
     """
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards.read_stale_process_identity",
-        lambda trial_dir: __import__(
-            "phasesweep.runtime.process", fromlist=["StaleProcessIdentity"]
-        ).StaleProcessIdentity(pid=99999, pgid=99999, starttime=12345),
+        "phasesweep.engine.guards._read_trial_process_identity",
+        lambda *_args, **_kwargs: StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id="uncertain-attempt",
+            pid=99999,
+            pgid=99999,
+            proc_starttime=12345,
+            boot_id="test-boot",
+            launch_nonce="test-nonce",
+        ),
     )
     monkeypatch.setattr(
-        "phasesweep.engine.guards.kill_stale_group",
-        lambda pid, starttime, *, pgid: False,
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: False,
     )
 
     exp = make_experiment(workdir=tmp_path / "runs")
@@ -437,6 +587,7 @@ def test_reaper_raises_when_cleanup_uncertain(
 
     # Inject one RUNNING trial so the reaper has something to chew on.
     trial = study.ask()
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "uncertain-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
@@ -693,13 +844,13 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
             stderr=stderr,
             timeout=0.1,
             trial_dir=tmp_path,
+            attempt_id="uncertain-attempt",
         )
 
     assert result.timed_out is True
     assert result.cleanup_confirmed is False
-    # Identity files must be preserved for forensics.
-    assert (tmp_path / "pid").exists()
-    assert (tmp_path / "pgid").exists()
+    # The atomic identity must be preserved for forensics.
+    assert (tmp_path / PROCESS_IDENTITY_FILE).exists()
 
 
 def test_uncertain_cleanup_aborts_optimization_not_just_trial(
@@ -767,20 +918,20 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
 
         # The queued second worker must have pruned before launch. If the
         # GPU was reused or hard_abort was checked too late, a second
-        # ``trial_*/pid`` file would exist.
-        launched_pid_files = sorted(phase_dir.glob("trial_*/pid"))
-        assert len(launched_pid_files) == 1, (
+        # ``trial_*/process_identity.json`` record would exist.
+        launched_identities = sorted(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
+        assert len(launched_identities) == 1, (
             f"A queued parallel trial launched after unsafe cleanup. "
-            f"Found pid files: {[p.parent.name for p in launched_pid_files]}. "
+            f"Found identities: {[p.parent.name for p in launched_identities]}. "
             "Unsafe cleanup must hard-abort BEFORE the GPU lease is released "
             "to a queued worker."
         )
     finally:
         # Defense in depth: if the fake cleanup is ever changed to actually
         # leak, kill the surviving group here so we don't pollute the host.
-        for pgid_file in phase_dir.glob("trial_*/pgid"):
+        for identity_file in phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"):
             with _contextlib.suppress(Exception):
-                os.killpg(int(pgid_file.read_text().strip()), signal.SIGKILL)
+                os.killpg(json.loads(identity_file.read_text())["pgid"], signal.SIGKILL)
 
 
 def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
@@ -824,6 +975,6 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
         # The failed trial should be recorded as FAIL, not lost.
         assert "FAIL" in content, f"CSV missing FAIL row for hard-aborted trial: {content!r}"
     finally:
-        for pgid_file in phase_dir.glob("trial_*/pgid"):
+        for identity_file in phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"):
             with _contextlib.suppress(Exception):
-                os.killpg(int(pgid_file.read_text().strip()), signal.SIGKILL)
+                os.killpg(json.loads(identity_file.read_text())["pgid"], signal.SIGKILL)

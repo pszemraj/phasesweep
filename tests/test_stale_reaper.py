@@ -39,16 +39,44 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
     ShutdownCleanupReport,
     StaleProcessIdentity,
     _read_proc_stat,
+    _write_process_identity,
+    cleanup_stale_trial_process,
     is_same_process,
     kill_stale_group,
+    read_boot_id,
     read_proc_starttime,
     read_stale_process_identity,
 )
 from tests.conftest import make_experiment, write_trainer
+
+
+def _write_test_process_identity(
+    trial_dir: Path,
+    *,
+    attempt_id: str,
+    pid: int,
+    pgid: int,
+    starttime: int | None,
+    boot_id: str | None = None,
+) -> None:
+    _write_process_identity(
+        trial_dir / PROCESS_IDENTITY_FILE,
+        StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id=attempt_id,
+            pid=pid,
+            pgid=pgid,
+            proc_starttime=starttime,
+            boot_id=read_boot_id() if boot_id is None else boot_id,
+            launch_nonce="test-launch-nonce",
+        ),
+    )
 
 
 def test_read_proc_starttime_self():
@@ -143,13 +171,10 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     t = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     # Don't call study.tell — leave it RUNNING.
 
-    # Create a trial dir with a pid file pointing at our own PID (which is alive).
+    # The reaper is replaced below; the directory only makes the historical
+    # workdir shape explicit for the fingerprint-order assertion.
     trial_dir = tmp_path / "runs" / "a" / f"trial_{t.number:05d}"
     trial_dir.mkdir(parents=True)
-    (trial_dir / "pid").write_text(f"{os.getpid()}\n")
-    # No starttime file — kill_stale_group will fall back to is_pid_alive only,
-    # but won't actually kill anything in this test because we don't want to
-    # SIGTERM ourselves. Instead we monkeypatch kill_stale_group.
 
     reap_called = {"flag": False}
     fingerprint_called = {"flag": False}
@@ -259,9 +284,13 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         trial.set_user_attr(GENERATION_ID_ATTR, "old-generation")
         trial.set_user_attr(ATTEMPT_ID_ATTR, "old-attempt")
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-        (trial_dir / "pid").write_text(str(stale.pid))
-        (trial_dir / "pgid").write_text(str(os.getpgid(stale.pid)))
-        (trial_dir / "pid_starttime").write_text(str(starttime))
+        _write_test_process_identity(
+            trial_dir,
+            attempt_id="old-attempt",
+            pid=stale.pid,
+            pgid=os.getpgid(stale.pid),
+            starttime=starttime,
+        )
 
         experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
         run_experiment(experiment)
@@ -455,9 +484,13 @@ def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path)
         trial.set_user_attr(GENERATION_ID_ATTR, "legacy-generation")
         trial.set_user_attr(ATTEMPT_ID_ATTR, "legacy-attempt")
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-        (trial_dir / "pid").write_text(f"{stale.pid}\n")
-        (trial_dir / "pgid").write_text(f"{os.getpgid(stale.pid)}\n")
-        (trial_dir / "pid_starttime").write_text(f"{starttime}\n")
+        _write_test_process_identity(
+            trial_dir,
+            attempt_id="legacy-attempt",
+            pid=stale.pid,
+            pgid=os.getpgid(stale.pid),
+            starttime=starttime,
+        )
 
         with pytest.raises(RuntimeError, match="unsupported phasesweep storage schema missing"):
             run_experiment(experiment)
@@ -537,6 +570,8 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
         start_new_session=True,
     )
     pgid = os.getpgid(parent.pid)
+    starttime = read_proc_starttime(parent.pid)
+    assert starttime is not None
     child_pid = int(parent.stdout.readline().strip())
     parent.wait(timeout=5)  # parent is dead now
     assert parent.poll() is not None
@@ -548,7 +583,7 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
         pytest.fail("Test setup error: child died too early")
 
     # PID-based recovery would fail (parent's PID is dead), but pgid fallback works.
-    sent = kill_stale_group(parent.pid, None, pgid=pgid, grace_seconds=1.0)
+    sent = kill_stale_group(parent.pid, starttime, pgid=pgid, grace_seconds=1.0)
     assert sent is True
 
     # Confirm child is actually dead.
@@ -562,16 +597,87 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
     pytest.fail(f"Descendant child {child_pid} survived pgid-based kill")
 
 
-def test_read_stale_process_identity_handles_missing_files(tmp_path: Path) -> None:
-    """Missing/partial identity files yield ``None`` fields, not an exception."""
-    empty = read_stale_process_identity(tmp_path)
-    assert empty == StaleProcessIdentity(pid=None, pgid=None, starttime=None)
+@pytest.mark.parametrize(
+    "content",
+    [None, "{", '{"schema_version": 1, "attempt_id": "attempt"}'],
+)
+def test_read_stale_process_identity_rejects_missing_or_partial_records(
+    tmp_path: Path,
+    content: str | None,
+) -> None:
+    if content is not None:
+        (tmp_path / PROCESS_IDENTITY_FILE).write_text(content)
 
-    (tmp_path / "pid").write_text("12345\n")
-    partial = read_stale_process_identity(tmp_path)
-    assert partial.pid == 12345
-    assert partial.pgid is None
-    assert partial.starttime is None
+    with pytest.raises((OSError, ValueError)):
+        read_stale_process_identity(tmp_path, expected_attempt_id="attempt")
+
+
+def test_read_stale_process_identity_rejects_wrong_attempt(tmp_path: Path) -> None:
+    _write_test_process_identity(
+        tmp_path,
+        attempt_id="first-attempt",
+        pid=12345,
+        pgid=12345,
+        starttime=111,
+    )
+
+    with pytest.raises(ValueError, match="another attempt"):
+        read_stale_process_identity(tmp_path, expected_attempt_id="second-attempt")
+
+
+def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id="old-boot-attempt",
+        pid=12345,
+        pgid=12345,
+        proc_starttime=111,
+        boot_id="old-boot",
+        launch_nonce="test-nonce",
+    )
+    monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: "current-boot")
+    monkeypatch.setattr(
+        "phasesweep.runtime.process.kill_stale_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a prior-boot identity must never signal current processes")
+        ),
+    )
+
+    assert cleanup_stale_trial_process(identity) is True
+
+
+def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id="no-proc-attempt",
+        pid=12345,
+        pgid=12345,
+        proc_starttime=None,
+        boot_id=None,
+        launch_nonce="test-nonce",
+    )
+    monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: None)
+
+    assert cleanup_stale_trial_process(identity) is False
+
+
+def test_kill_stale_group_refuses_live_pid_without_starttime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
+    )
+
+    assert kill_stale_group(pid=12345, saved_starttime=None, pgid=12345) is False
+    assert calls == []
 
 
 def test_kill_stale_group_refuses_cleanup_on_pid_reuse_without_pgid(
@@ -778,35 +884,45 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
     persisted_trial_dir = workdir_A / "p" / "trial_00000"
     persisted_trial_dir.mkdir(parents=True)
 
-    # Plant identity files at the persisted trial dir.
-    (persisted_trial_dir / "pid").write_text("99999\n")
-    (persisted_trial_dir / "pgid").write_text("99999\n")
-
     exp = make_experiment(workdir=workdir_B)
 
     # Set up an in-memory study with one RUNNING trial that has the user_attr.
     study = optuna.create_study(study_name="t::p")
     trial = study.ask()
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "persisted-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(persisted_trial_dir))
     # Leave it RUNNING — that's what the reaper looks for.
 
     seen_dirs: list[str] = []
 
-    def fake_read_identity(trial_dir: Path) -> object:
+    def fake_read_identity(
+        trial_dir: Path,
+        *,
+        expected_attempt_id: str,
+    ) -> StaleProcessIdentity:
         seen_dirs.append(str(trial_dir))
-
-        from phasesweep.runtime.process import StaleProcessIdentity
-
-        return StaleProcessIdentity(pid=None, pgid=None, starttime=None)
+        assert expected_attempt_id == "persisted-attempt"
+        return StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id=expected_attempt_id,
+            pid=99999,
+            pgid=99999,
+            proc_starttime=12345,
+            boot_id="test-boot",
+            launch_nonce="test-nonce",
+        )
 
     import phasesweep.engine.guards as _reaper
 
     real_read = _reaper.read_stale_process_identity
     _reaper.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_cleanup = _reaper.cleanup_stale_trial_process
+    _reaper.cleanup_stale_trial_process = lambda _identity: True
     try:
         _reap_stale_trials(study, exp, "p")
     finally:
         _reaper.read_stale_process_identity = real_read  # type: ignore[assignment]
+        _reaper.cleanup_stale_trial_process = real_cleanup
 
     assert seen_dirs == [str(persisted_trial_dir)], (
         f"reaper should have used persisted trial_dir; got {seen_dirs}"
@@ -828,22 +944,17 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
     trial = study.ask()
     expected_trial_dir = _trial_dir_for(exp, exp.phases[0].name, trial.number)
 
-    seen_dirs: list[Path] = []
-
-    def fake_read_identity(trial_dir: Path) -> StaleProcessIdentity:
-        seen_dirs.append(trial_dir)
-        return StaleProcessIdentity(pid=None, pgid=None, starttime=None)
-
-    def fail_if_called(pid: int | None, starttime: int | None, *, pgid: int | None) -> bool:
-        raise AssertionError("no process cleanup should run when no identity files exist")
-
-    monkeypatch.setattr("phasesweep.engine.guards.read_stale_process_identity", fake_read_identity)
-    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fail_if_called)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.read_stale_process_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("prelaunch trials must not read process identity")
+        ),
+    )
 
     reaped = _reap_stale_trials(study, exp, exp.phases[0].name)
 
     assert reaped == 1
-    assert seen_dirs == [expected_trial_dir]
+    assert expected_trial_dir.parent == tmp_path / "runs" / "t" / "p"
     assert study.trials[trial.number].state == optuna.trial.TrialState.FAIL
 
 
@@ -880,12 +991,22 @@ def test_reaper_raises_when_tell_fails_after_cleanup(
     exp = make_experiment(workdir=tmp_path / "runs")
     study = optuna.create_study(direction="maximize")
     trial = study.ask()
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "tell-failure-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards.read_stale_process_identity",
-        lambda trial_dir: StaleProcessIdentity(pid=None, pgid=None, starttime=None),
+        "phasesweep.engine.guards._read_trial_process_identity",
+        lambda *_args, **_kwargs: StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id="tell-failure-attempt",
+            pid=99999,
+            pgid=99999,
+            proc_starttime=12345,
+            boot_id="test-boot",
+            launch_nonce="test-nonce",
+        ),
     )
+    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)
 
     def fail_tell(*args: object, **kwargs: object) -> None:
         raise RuntimeError("storage write failed")

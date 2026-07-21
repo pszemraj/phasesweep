@@ -14,10 +14,14 @@ Design:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
+import secrets
+import select
 import signal
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -30,6 +34,9 @@ from phasesweep.runtime.files import atomic_write_text
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
+_SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
+PROCESS_IDENTITY_FILE = "process_identity.json"
+PROCESS_IDENTITY_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Global child registry + signal handler
@@ -366,6 +373,128 @@ class ProcessResult:
     cleanup_confirmed: bool = True
 
 
+@dataclass(frozen=True)
+class StaleProcessIdentity:
+    """Durable identity of one launched trial process group."""
+
+    schema_version: int
+    attempt_id: str
+    pid: int
+    pgid: int
+    proc_starttime: int | None
+    boot_id: str | None
+    launch_nonce: str
+
+
+def read_boot_id() -> str | None:
+    """Return the current Linux boot identity, or ``None`` when unavailable."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _trial_process_identity(
+    *,
+    attempt_id: str,
+    pid: int,
+    pgid: int,
+    launch_nonce: str,
+) -> StaleProcessIdentity:
+    """Build the identity persisted before a blocked supervisor may exec the trainer."""
+    return StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id=attempt_id,
+        pid=pid,
+        pgid=pgid,
+        proc_starttime=read_proc_starttime(pid),
+        boot_id=read_boot_id(),
+        launch_nonce=launch_nonce,
+    )
+
+
+def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
+    """Atomically persist one complete process identity record."""
+    atomic_write_text(
+        path,
+        json.dumps(
+            {
+                "schema_version": identity.schema_version,
+                "attempt_id": identity.attempt_id,
+                "pid": identity.pid,
+                "pgid": identity.pgid,
+                "proc_starttime": identity.proc_starttime,
+                "boot_id": identity.boot_id,
+                "launch_nonce": identity.launch_nonce,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def _spawn_blocked_supervisor(
+    cmd: str,
+    *,
+    env: dict[str, str],
+    stdout: IO[str],
+    stderr: IO[str],
+) -> tuple[subprocess.Popen, int, int]:
+    """Spawn a supervisor that cannot exec ``cmd`` until its parent acknowledges it."""
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "phasesweep.runtime.supervisor",
+                str(ready_write),
+                str(ack_read),
+                cmd,
+            ],
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+            pass_fds=(ready_write, ack_read),
+        )
+        os.close(ready_write)
+        ready_write = -1
+        os.close(ack_read)
+        ack_read = -1
+
+        pgid = _register(proc)
+        readable, _, _ = select.select(
+            [ready_read],
+            [],
+            [],
+            _SUPERVISOR_READY_TIMEOUT_SECONDS,
+        )
+        if not readable or os.read(ready_read, 1) != b"R":
+            raise RuntimeError("trial supervisor did not become ready before launch")
+        os.close(ready_read)
+        ready_read = -1
+        return proc, pgid, ack_write
+    except Exception:
+        if ack_write >= 0:
+            os.close(ack_write)
+            ack_write = -1
+        if proc is not None:
+            target_pgid = pgid if pgid is not None else proc.pid
+            _kill_group(target_pgid, proc)
+        if pgid is not None:
+            _unregister(pgid)
+        raise
+    finally:
+        for fd in (ready_read, ready_write, ack_read):
+            if fd >= 0:
+                os.close(fd)
+
+
 def run_supervised(
     cmd: str,
     *,
@@ -374,35 +503,33 @@ def run_supervised(
     stderr: IO[str],
     timeout: float | None,
     trial_dir: Path,
+    attempt_id: str,
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
-    On launch, writes three identity files into ``trial_dir``:
+    Launches a small supervisor first. The supervisor waits on an inherited
+    acknowledgement pipe while the parent atomically persists
+    ``process_identity.json``. Only after the identity is durable does the
+    parent acknowledge the supervisor, which then execs the trainer command.
+    If the parent dies before acknowledgement, pipe EOF makes the supervisor
+    exit without starting training.
 
-    * ``pid`` — root subprocess PID, for forensic identification.
-    * ``pgid`` — process-group ID, used by the stale reaper as a fallback when
-      the root PID has exited but descendants are still alive (review v0.5.2 /
-      blocker 7). Without this, a reaper that only knows the root PID cannot
-      recover the PGID via ``os.getpgid`` once the shell has exited.
-    * ``pid_starttime`` — ``/proc/<pid>/stat`` field 22, used to detect PID
-      reuse so the reaper never kills an unrelated process that recycled the PID.
-
-    Identity files are removed only on a fully clean exit: root returned 0
+    The identity record is removed only on a fully clean exit: root returned 0
     **and** no descendant processes were left alive. If the root exits cleanly
     but leaves GPU-holding descendants running, we treat that as a lifecycle
-    failure, kill the group, and preserve identity files for forensics (review
+    failure, kill the group, and preserve the identity record for forensics (review
     v0.5.5 / blocker 1).
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
     Args:
-        cmd: Shell command string to execute (passed to ``Popen(shell=True)``).
+        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
         env: Full process environment for the subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
         timeout: Wall-clock timeout in seconds, or ``None`` for no timeout.
-        trial_dir: Per-trial directory; identity files (``pid``, ``pgid``,
-            ``pid_starttime``) are written here.
+        trial_dir: Per-trial directory where ``process_identity.json`` is written.
+        attempt_id: Immutable attempt identity already persisted in Optuna.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
@@ -415,7 +542,7 @@ def run_supervised(
 
     started = time.monotonic()
 
-    # The launch + register + identity-file writes must be atomic from the
+    # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
     # SIGTERM/SIGINT cannot land between ``_launch_lock`` acquisition and
     # signal masking (review v0.5.9 / blocker 2). Reversing the order
@@ -432,32 +559,34 @@ def run_supervised(
     # released, so the handler can safely acquire it.
     proc: subprocess.Popen | None = None
     pgid: int | None = None
-    pid_path = trial_dir / "pid"
-    pgid_path = trial_dir / "pgid"
-    starttime_path = trial_dir / "pid_starttime"
+    ack_write: int | None = None
+    identity_path = trial_dir / PROCESS_IDENTITY_FILE
+    launch_nonce = secrets.token_hex(16)
+    supervisor_env = dict(env)
+    supervisor_env["PHASESWEEP_LAUNCH_NONCE"] = launch_nonce
 
     try:
         with _defer_shutdown_signals(), _launch_lock:
-            proc = subprocess.Popen(
+            proc, pgid, ack_write = _spawn_blocked_supervisor(
                 cmd,
-                shell=True,  # noqa: S602
-                env=env,
+                env=supervisor_env,
                 stdout=stdout,
                 stderr=stderr,
-                start_new_session=True,
             )
-
-            # Register in the global child registry immediately so the signal handler
-            # can reach this group even if we haven't written files yet.
-            pgid = _register(proc)
-
-            atomic_write_text(pid_path, f"{proc.pid}\n")
-            atomic_write_text(pgid_path, f"{pgid}\n")
-
-            starttime = read_proc_starttime(proc.pid)
-            if starttime is not None:
-                atomic_write_text(starttime_path, f"{starttime}\n")
+            identity = _trial_process_identity(
+                attempt_id=attempt_id,
+                pid=proc.pid,
+                pgid=pgid,
+                launch_nonce=launch_nonce,
+            )
+            _write_process_identity(identity_path, identity)
+            if os.write(ack_write, b"A") != 1:
+                raise RuntimeError("trial supervisor acknowledgement was not delivered")
+            os.close(ack_write)
+            ack_write = None
     except Exception as exc:
+        if ack_write is not None:
+            os.close(ack_write)
         if proc is None:
             raise
         target_pgid = pgid if pgid is not None else proc.pid
@@ -517,11 +646,10 @@ def run_supervised(
     finally:
         _unregister(pgid)
 
-        # Only clean identity files when the trial exited cleanly AND no
+        # Only clean the identity record when the trial exited cleanly AND no
         # descendant cleanup was required.
         if failure_reason is None and proc.returncode == 0:
-            for path in (pid_path, pgid_path, starttime_path):
-                path.unlink(missing_ok=True)
+            identity_path.unlink(missing_ok=True)
 
     duration = time.monotonic() - started
     return ProcessResult(
@@ -698,53 +826,106 @@ def reap_child(pid: int) -> bool:
     return waited == pid
 
 
-@dataclass
-class StaleProcessIdentity:
-    """Forensic identity files left in a trial directory after launch.
-
-    Persisted by ``run_supervised`` and read by the orchestrator's stale-trial
-    reaper (review v0.5.2 / blocker 7). PGID is the fallback when the root PID
-    has exited but descendants are still alive.
-    """
-
-    pid: int | None
-    pgid: int | None
-    starttime: int | None
-
-
-def read_stale_process_identity(trial_dir: Path) -> StaleProcessIdentity:
-    """Load all available identity files for a possibly-stale trial.
+def read_stale_process_identity(
+    trial_dir: Path,
+    *,
+    expected_attempt_id: str,
+) -> StaleProcessIdentity:
+    """Load and validate the atomic identity for a possibly-stale trial.
 
     Args:
-        trial_dir: A trial directory possibly containing ``pid``, ``pgid``,
-            and ``pid_starttime`` files written by :func:`run_supervised`.
+        trial_dir: Trial directory containing ``process_identity.json``.
+        expected_attempt_id: Attempt identity stored on the Optuna trial.
 
     Returns:
-        :class:`StaleProcessIdentity` with whichever fields could be read.
-        Missing or malformed files surface as ``None`` on the respective
-        attributes; this is the input the stale reaper uses to decide
-        whether to kill the group.
+        A complete, attempt-bound :class:`StaleProcessIdentity`.
+
+    Raises:
+        OSError: The identity record is missing or unreadable.
+        ValueError: The identity record is malformed or belongs to another attempt.
 
     """
-    pid: int | None = None
-    pgid: int | None = None
-    starttime: int | None = None
+    path = trial_dir / PROCESS_IDENTITY_FILE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Malformed trial process identity at {path}.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Trial process identity at {path} must be a JSON object.")
+    required_fields = {
+        "schema_version",
+        "attempt_id",
+        "pid",
+        "pgid",
+        "proc_starttime",
+        "boot_id",
+        "launch_nonce",
+    }
+    if not required_fields.issubset(payload):
+        raise ValueError(f"Trial process identity at {path} is partial.")
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int or schema_version != PROCESS_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported trial process identity schema at {path}.")
+    attempt_id = payload.get("attempt_id")
+    if attempt_id != expected_attempt_id:
+        raise ValueError(f"Trial process identity at {path} belongs to another attempt.")
 
-    pid_file = trial_dir / "pid"
-    pgid_file = trial_dir / "pgid"
-    starttime_file = trial_dir / "pid_starttime"
+    def positive_int(field: str) -> int:
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Trial process identity field {field!r} is invalid at {path}.")
+        return value
 
-    if pid_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            pid = int(pid_file.read_text().strip())
-    if pgid_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            pgid = int(pgid_file.read_text().strip())
-    if starttime_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            starttime = int(starttime_file.read_text().strip())
+    proc_starttime = payload.get("proc_starttime")
+    if proc_starttime is not None and (
+        isinstance(proc_starttime, bool)
+        or not isinstance(proc_starttime, int)
+        or proc_starttime <= 0
+    ):
+        raise ValueError(f"Trial process identity field 'proc_starttime' is invalid at {path}.")
+    boot_id = payload.get("boot_id")
+    if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
+        raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
+    launch_nonce = payload.get("launch_nonce")
+    if not isinstance(launch_nonce, str) or not launch_nonce:
+        raise ValueError(f"Trial process identity field 'launch_nonce' is invalid at {path}.")
+    return StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id=attempt_id,
+        pid=positive_int("pid"),
+        pgid=positive_int("pgid"),
+        proc_starttime=proc_starttime,
+        boot_id=boot_id,
+        launch_nonce=launch_nonce,
+    )
 
-    return StaleProcessIdentity(pid=pid, pgid=pgid, starttime=starttime)
+
+def cleanup_stale_trial_process(
+    identity: StaleProcessIdentity,
+    *,
+    grace_seconds: float = _KILL_GRACE_SECONDS,
+) -> bool:
+    """Safely clean a stale trial group using boot- and process-bound identity."""
+    current_boot_id = read_boot_id()
+    if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
+        log.warning(
+            "Refusing automatic cleanup for attempt %s because robust process-birth identity "
+            "is unavailable on this platform.",
+            identity.attempt_id,
+        )
+        return False
+    if identity.boot_id != current_boot_id:
+        log.warning(
+            "Attempt %s belongs to an earlier host boot; no process from that boot remains.",
+            identity.attempt_id,
+        )
+        return True
+    return kill_stale_group(
+        identity.pid,
+        identity.proc_starttime,
+        pgid=identity.pgid,
+        grace_seconds=grace_seconds,
+    )
 
 
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
@@ -958,18 +1139,16 @@ def kill_stale_group(
        cleanup is complete. If the PGID still exists, use it only when the
        reused PID is not the leader of that group; otherwise fail closed to
        avoid killing an unrelated process group.
-    3. ``pid`` is unrecoverable (dead or never recorded) but ``pgid`` was
-       persisted at launch: best-effort PGID kill with a loud warning. The
-       root PID may have exited (``shell=True`` shells often do) while
-       descendants are still holding GPU memory.
+    3. ``pid`` is dead but its verified same-boot identity includes ``pgid``:
+       use the group only when its leader identity has not been reused. The
+       root shell may have exited while descendants still hold GPU memory.
     4. No PID and no PGID: nothing to clean up, return ``True``.
 
     Args:
-        pid: Root PID read from ``trial_dir/pid``, or ``None`` if unrecorded.
-        saved_starttime: Starttime read from ``trial_dir/pid_starttime``, or
-            ``None`` if unavailable / non-Linux.
-        pgid: Process-group ID read from ``trial_dir/pgid`` (the fallback
-            target when ``pid`` cannot be trusted).
+        pid: Root PID from a durable process identity, or ``None`` if absent.
+        saved_starttime: Saved Linux process start time, or ``None`` when identity
+            cannot be verified. A live PID/PGID is never signalled in that case.
+        pgid: Process-group ID from the same durable identity.
         grace_seconds: Seconds to wait after SIGTERM before escalating to
             SIGKILL; passed through to :func:`_terminate_process_group`.
 
@@ -981,22 +1160,31 @@ def kill_stale_group(
     """
     target_pgid: int | None = None
 
+    if saved_starttime is None:
+        pid_alive = pid is not None and is_pid_alive(pid)
+        pgid_alive = pgid is not None and _process_group_exists(pgid)
+        if pid_alive or pgid_alive:
+            log.warning(
+                "Refusing to signal stale pid=%s pgid=%s without a saved process start time.",
+                pid,
+                pgid,
+            )
+            return False
+        return True
+
     if pid is not None:
         pid_alive = is_pid_alive(pid)
         same_process = False
         if pid_alive:
-            if saved_starttime is None:
-                same_process = True
-            else:
-                current_starttime = read_proc_starttime(pid)
-                if current_starttime is None:
-                    log.warning(
-                        "PID %d is alive but its /proc start time is unreadable; "
-                        "refusing cleanup because process identity is unknown.",
-                        pid,
-                    )
-                    return False
-                same_process = current_starttime == saved_starttime
+            current_starttime = read_proc_starttime(pid)
+            if current_starttime is None:
+                log.warning(
+                    "PID %d is alive but its /proc start time is unreadable; "
+                    "refusing cleanup because process identity is unknown.",
+                    pid,
+                )
+                return False
+            same_process = current_starttime == saved_starttime
         if same_process:
             try:
                 target_pgid = os.getpgid(pid)

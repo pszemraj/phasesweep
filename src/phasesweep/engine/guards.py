@@ -42,7 +42,11 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
-from phasesweep.runtime.process import kill_stale_group, read_stale_process_identity
+from phasesweep.runtime.process import (
+    StaleProcessIdentity,
+    cleanup_stale_trial_process,
+    read_stale_process_identity,
+)
 
 
 @dataclass
@@ -429,6 +433,31 @@ def _trial_dir_for_reaping(
     return Path(stored)
 
 
+def _read_trial_process_identity(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+) -> StaleProcessIdentity:
+    """Read one complete process identity bound to its persisted attempt."""
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+        )
+    try:
+        return read_stale_process_identity(
+            trial_dir,
+            expected_attempt_id=attempt_id,
+        )
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: its durable "
+            f"process identity is missing, malformed, partial, or belongs to another attempt. "
+            f"trial_dir={trial_dir}."
+        ) from exc
+
+
 def _reap_stale_trials(
     study: optuna.Study,
     experiment: Experiment,
@@ -462,11 +491,10 @@ def _reap_stale_trials(
         try:
             trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
 
-            identity = read_stale_process_identity(trial_dir)
-            if identity.pid is not None or identity.pgid is not None:
-                safe_to_fail = kill_stale_group(
-                    identity.pid, identity.starttime, pgid=identity.pgid
-                )
+            identity: StaleProcessIdentity | None = None
+            if TRIAL_DIR_ATTR in trial.user_attrs:
+                identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
+                safe_to_fail = cleanup_stale_trial_process(identity)
                 if not safe_to_fail:
                     raise ProcessCleanupUncertainError(
                         f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
@@ -607,7 +635,9 @@ def _inspect_stale_running_trials(
     for trial in study.get_trials(deepcopy=False):
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
-        _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+        if TRIAL_DIR_ATTR in trial.user_attrs:
+            _read_trial_process_identity(trial, trial_dir, study.study_name)
         count += 1
     return count
 
@@ -691,15 +721,8 @@ def _recover_cleanup_uncertain_trials(
             continue
 
         trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is None and identity.pgid is None:
-            raise ProcessCleanupUncertainError(
-                f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
-                f"study {study.study_name}: no persisted process identity was found "
-                f"under trial_dir={trial_dir}. A leaked process group cannot be "
-                "ruled out."
-            )
-        safe_to_clear = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
+        identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
+        safe_to_clear = cleanup_stale_trial_process(identity)
         if not safe_to_clear:
             raise ProcessCleanupUncertainError(
                 f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
@@ -739,13 +762,7 @@ def _inspect_cleanup_uncertain_trials(study: optuna.Study) -> int:
         if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
             continue
         trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is None and identity.pgid is None:
-            raise ProcessCleanupUncertainError(
-                f"Refusing to plan cleanup recovery for trial {trial.number} in "
-                f"study {study.study_name}: no persisted process identity was found "
-                f"under trial_dir={trial_dir}. A leaked process group cannot be ruled out."
-            )
+        _read_trial_process_identity(trial, trial_dir, study.study_name)
         count += 1
     return count
 

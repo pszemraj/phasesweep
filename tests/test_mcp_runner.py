@@ -39,6 +39,7 @@ from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
     PhaseSweepShutdown,
     ShutdownCleanupReport,
     _process_group_alive,
@@ -77,7 +78,7 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
         if status["phases"][0]["running"] >= 1:
             phase_dir = _trial_dir_for(experiment, "p", 0).parent
             for trial_dir in phase_dir.glob("trial_00000__*"):
-                if (trial_dir / "pid").is_file() and (trial_dir / "pgid").is_file():
+                if (trial_dir / PROCESS_IDENTITY_FILE).is_file():
                     return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
@@ -677,7 +678,7 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         )
     try:
         trial_dir = _wait_for_running_trial(config, proc, log_path)
-        trial_pgid = int((trial_dir / "pgid").read_text())
+        trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
         # SIGTERM the runner's process group. The trial runs in its OWN session,
         # so this does not reach it directly; the runner's installed shutdown

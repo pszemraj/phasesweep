@@ -52,7 +52,14 @@ from phasesweep.mcp.server import (
     _safe_tool,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    PROCESS_IDENTITY_SCHEMA_VERSION,
+    StaleProcessIdentity,
+    _write_process_identity,
+    read_boot_id,
+    read_proc_starttime,
+)
 from tests.conftest import make_experiment, write_constant_trainer
 from tests.mcp_helpers import (
     make_mcp_app,
@@ -104,6 +111,27 @@ def _claim_runner_handle(
     )
 
 
+def _write_trial_process_identity(
+    trial_dir: Path,
+    *,
+    attempt_id: str,
+    pid: int,
+    starttime: int,
+) -> None:
+    _write_process_identity(
+        trial_dir / PROCESS_IDENTITY_FILE,
+        StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id=attempt_id,
+            pid=pid,
+            pgid=pid,
+            proc_starttime=starttime,
+            boot_id=read_boot_id(),
+            launch_nonce="test-launch-nonce",
+        ),
+    )
+
+
 def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -123,9 +151,12 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
         attempt_id=attempt_id,
     )
     trial_dir.mkdir(parents=True)
-    (trial_dir / "pid").write_text("4242\n")
-    (trial_dir / "pgid").write_text("4242\n")
-    (trial_dir / "pid_starttime").write_text("111\n")
+    _write_trial_process_identity(
+        trial_dir,
+        attempt_id=attempt_id,
+        pid=4242,
+        starttime=111,
+    )
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(GENERATION_ID_ATTR, "stale-generation")
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
@@ -158,9 +189,12 @@ def _write_stale_running_trial(
         attempt_id=attempt_id,
     )
     trial_dir.mkdir(parents=True)
-    (trial_dir / "pid").write_text("4343\n")
-    (trial_dir / "pgid").write_text("4343\n")
-    (trial_dir / "pid_starttime").write_text("222\n")
+    _write_trial_process_identity(
+        trial_dir,
+        attempt_id=attempt_id,
+        pid=4343,
+        starttime=222,
+    )
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
@@ -1893,18 +1927,15 @@ def test_operator_recovery_clears_terminal_cleanup_uncertainty(
         runner_cleanup_calls.append((pid, saved_starttime, pgid))
         return True
 
-    def fake_trial_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-        grace_seconds: float = 30.0,
-    ) -> bool:
-        trial_cleanup_calls.append((pid, saved_starttime, pgid))
+    def fake_trial_cleanup(identity: StaleProcessIdentity) -> bool:
+        trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        fake_trial_cleanup,
+    )
 
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
@@ -2037,7 +2068,10 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         )
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        fake_trial_cleanup,
+    )
     monkeypatch.setattr("phasesweep.cli.finalize_result_snapshot", flaky_snapshot)
 
     command = [
@@ -2096,7 +2130,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         return True
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
 
     first_run = "srv-terminal-first"
     first_handle = make_run_handle(
@@ -2214,18 +2248,15 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
         runner_cleanup_calls.append((pid, saved_starttime, pgid))
         return True
 
-    def fake_trial_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-        grace_seconds: float = 30.0,
-    ) -> bool:
-        trial_cleanup_calls.append((pid, saved_starttime, pgid))
+    def fake_trial_cleanup(identity: StaleProcessIdentity) -> bool:
+        trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.kill_stale_group", fake_trial_cleanup)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        fake_trial_cleanup,
+    )
 
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")

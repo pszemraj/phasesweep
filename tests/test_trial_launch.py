@@ -30,8 +30,10 @@ def _capture_launch_env(
         stderr: Any,
         timeout: float | None,
         trial_dir: Path,
+        attempt_id: str,
     ) -> ProcessResult:
         captured.update(env)
+        captured["run_supervised_attempt_id"] = attempt_id
         return ProcessResult(
             return_code=0,
             timed_out=False,
@@ -96,3 +98,4 @@ def test_launch_trial_cuda_environment(
     assert env["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
     assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
     assert env["WANDB_RUN_ID"] == "attempt-test"
+    assert env["run_supervised_attempt_id"] == "attempt-test"

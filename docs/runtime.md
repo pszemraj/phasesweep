@@ -17,6 +17,7 @@ runs/
       trial_00000__generation_<generation-id>__attempt_<attempt-id>/
         command.txt
         overrides_resolved.json
+        process_identity.json
         result.json
         stdout.log
         stderr.log
@@ -39,7 +40,7 @@ runs/
 
 Every non-dry experiment invocation mints a generation ID, and every subprocess launch mints an attempt ID. Both are stored in Optuna before launch and included in the trial directory name, so a repeated in-memory study cannot read files left by an older trial with the same number. A generation namespace is claimed exactly once under the experiment lock; a reused caller-supplied ID is rejected before any lifecycle or trial state changes. Each generation keeps its lifecycle record, summary, winners, and promotion decisions under `generations/<generation-id>/`. `generation.yaml` identifies the current invocation, while `last_successful_generation.yaml` advances only after a complete generation has been published. The phase-level winners and root summary are compatibility projections of that last successful generation; a failed preflight or late-phase fingerprint check leaves them untouched. Resume loads both skipped winners and their promotion decisions from the immutable last-success generation, never from mutable compatibility projections. Winner entries retain the generation and attempt that produced their evidence, which can be older when a top-up reselects an existing trial or `--from-phase` reuses a validated parent winner.
 
-`pid` and `pgid` are written atomically while a trial is live. On Linux, phasesweep also writes `/proc` start time to `pid_starttime` when it is readable. Identity files are removed on clean exit and preserved on failure for inspection. If an identity write fails after launch, phasesweep terminates the new process group before returning a failed trial result.
+Each trainer starts behind a supervisor ready/ack handshake. The supervisor cannot exec the trainer until PhaseSweep atomically writes and fsyncs `process_identity.json` with the attempt ID, PID, PGID, Linux process start time, host boot ID, and a launch nonce. If the orchestrator dies before acknowledgement, pipe EOF makes the supervisor exit without starting training. The identity record is removed on clean exit and preserved on failure for inspection. If identity persistence fails, PhaseSweep terminates the blocked supervisor group before returning a failed trial result.
 
 `json_file` trials additionally receive `overrides.json`, and a phase with a promotion rule writes `promotion.yaml` when that rule is evaluated. Files such as `result.json` are trainer-owned evidence, not fixed phasesweep output.
 
@@ -57,7 +58,7 @@ Metric extraction and evidence gates run after the trainer process and outside t
 
 SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to active groups, waits briefly, sends SIGKILL to survivors, and exits with `128 + signum`. SIGKILL and hard OOM kills cannot be caught by Python.
 
-Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled.
+Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled; uncatchable parent death before identity commit cannot start the trainer because the supervisor still awaits acknowledgement.
 
 If cleanup cannot prove the process group is gone, phasesweep fails closed with `UnsafeProcessCleanupError`. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
 
@@ -66,9 +67,10 @@ If cleanup cannot prove the process group is gone, phasesweep fails closed with 
 Before a new generation is published or any phase begins, phasesweep inspects every declared phase study that already exists and reaps Optuna trials stuck in `RUNNING`:
 
 1. Read the persisted `phasesweep_trial_dir` user attribute, or fall back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
-2. On Linux, match PID plus process start time to avoid PID-reuse kills. A legacy record with no saved start time uses the live PID as a best-effort identity check; when a saved start time exists but the current `/proc` identity is unreadable, cleanup fails closed without signalling.
-3. Fall back to PGID cleanup when the root PID is gone but descendants remain.
-4. Mark the trial `FAIL` only after cleanup is confirmed.
+2. Require one complete atomic identity bound to the Optuna attempt. Missing, malformed, partial, or wrong-attempt identity leaves cleanup uncertain rather than proving absence.
+3. On Linux, match boot ID plus PID and process start time to avoid PID- and reboot-reuse kills. A record from an earlier boot is safe to close without signalling because no process from that boot can remain. When robust process-birth identity is unavailable, automatic stale signalling fails closed for operator recovery.
+4. Fall back to the verified PGID when the root PID is gone but descendants remain.
+5. Mark the trial `FAIL` only after cleanup is confirmed.
 
 Missing studies are not created by this recovery read. Reaping every existing phase runs before fingerprint checks, so a config mismatch or a later-phase orphan cannot leave old GPU-holding processes alive while earlier work starts.
 
