@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Literal
 
 import click
-import tomllib
 
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (

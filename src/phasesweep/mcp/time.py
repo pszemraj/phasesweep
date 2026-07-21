@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def parse_utc_iso(value: object) -> datetime | None:
@@ -28,4 +28,4 @@ def utc_now_iso() -> str:
         Timezone-aware UTC timestamp.
 
     """
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
