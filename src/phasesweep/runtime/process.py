@@ -402,7 +402,24 @@ def _trial_process_identity(
     pgid: int,
     launch_nonce: str,
 ) -> StaleProcessIdentity:
-    """Build the identity persisted before a blocked supervisor may exec the trainer."""
+    """Build the identity persisted before a blocked supervisor may exec the trainer.
+
+    Args:
+        attempt_id: Immutable attempt identity already persisted in Optuna;
+            binds this identity record to exactly one attempt so a later
+            reader cannot mistake it for a different trial's process.
+        pid: PID of the just-launched supervisor process.
+        pgid: Process-group ID the supervisor was registered under.
+        launch_nonce: Per-launch random token distinguishing this launch from
+            any other that might reuse the same PID/PGID pair.
+
+    Returns:
+        A :class:`StaleProcessIdentity` combining the given fields with the
+        current schema version, this process's ``/proc`` start time (``None``
+        off-Linux or if unreadable), and the current boot id (``None`` when
+        unavailable).
+
+    """
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id=attempt_id,
@@ -415,7 +432,13 @@ def _trial_process_identity(
 
 
 def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
-    """Atomically persist one complete process identity record."""
+    """Atomically persist one complete process identity record.
+
+    Args:
+        path: Destination ``process_identity.json`` path under the trial dir.
+        identity: Complete identity record to serialize as sorted-key JSON.
+
+    """
     atomic_write_text(
         path,
         json.dumps(
@@ -441,7 +464,35 @@ def _spawn_blocked_supervisor(
     stdout: IO[str],
     stderr: IO[str],
 ) -> tuple[subprocess.Popen, int, int]:
-    """Spawn a supervisor that cannot exec ``cmd`` until its parent acknowledges it."""
+    """Spawn a supervisor that cannot exec ``cmd`` until its parent acknowledges it.
+
+    Launches ``phasesweep.runtime.supervisor`` in its own session, passing it
+    a readiness pipe and an acknowledgement pipe. Blocks (via ``select``) until
+    the supervisor signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS``
+    elapses, then registers the new process group. On any failure — timeout,
+    an unexpected readiness byte, or an exception from ``Popen`` itself — any
+    spawned process group is killed and unregistered before the exception
+    propagates.
+
+    Args:
+        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
+        env: Full process environment for the supervisor subprocess.
+        stdout: Already-open file handle that receives the subprocess stdout.
+        stderr: Already-open file handle that receives the subprocess stderr.
+
+    Returns:
+        A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
+        its registered process-group id, and the write end of the
+        acknowledgement pipe. The caller owns ``ack_write`` and must write one
+        acknowledgement byte and close it once the trial's process identity is
+        durably persisted.
+
+    Raises:
+        RuntimeError: If the supervisor does not signal readiness within
+            ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
+            than ``b"R"``.
+
+    """
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
     proc: subprocess.Popen | None = None
@@ -871,6 +922,21 @@ def read_stale_process_identity(
         raise ValueError(f"Trial process identity at {path} belongs to another attempt.")
 
     def positive_int(field: str) -> int:
+        """Validate and return one required positive-int identity field.
+
+        Args:
+            field: Name of the top-level identity field to validate, used
+                only to build the error message.
+
+        Returns:
+            The field's value, guaranteed to be a non-bool ``int`` greater
+            than zero.
+
+        Raises:
+            ValueError: If the field is missing, not an ``int`` (or is a
+                ``bool``), or not strictly positive.
+
+        """
         value = payload.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"Trial process identity field {field!r} is invalid at {path}.")
@@ -905,7 +971,27 @@ def cleanup_stale_trial_process(
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
 ) -> bool:
-    """Safely clean a stale trial group using boot- and process-bound identity."""
+    """Safely clean a stale trial group using boot- and process-bound identity.
+
+    Refuses to act when ``identity`` lacks a recorded boot id or start time, or
+    the current boot id cannot be read, since PID-reuse safety cannot be
+    verified in that case. When ``identity.boot_id`` differs from the current
+    boot id, the host has rebooted since launch, so no process from that boot
+    can still be alive and cleanup is trivially complete. Otherwise delegates
+    to :func:`kill_stale_group` with the identity's ``pid``/``pgid``/starttime.
+
+    Args:
+        identity: Durable process identity read from ``process_identity.json``.
+        grace_seconds: Seconds to wait after SIGTERM before escalating to
+            SIGKILL; forwarded to :func:`kill_stale_group`.
+
+    Returns:
+        ``True`` when it is safe to mark the trial ``FAIL`` (nothing to clean,
+        the host rebooted, or cleanup was confirmed). ``False`` when identity
+        cannot be verified or :func:`kill_stale_group` reports cleanup is
+        uncertain; callers must not advance state in that case.
+
+    """
     current_boot_id = read_boot_id()
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
         log.warning(

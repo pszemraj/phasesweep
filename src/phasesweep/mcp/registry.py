@@ -238,7 +238,18 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
 
 
 def _state_dir_remediation(state_dir: Path) -> str:
-    """Return an exact mode fix when an existing private directory is repairable."""
+    """Return an exact mode fix when an existing private directory is repairable.
+
+    Checks ``state_dir`` and its ``runs``/``logs`` subdirectories for one this
+    process owns whose mode is not ``0700``, and if found, suggests the exact
+    ``chmod`` command to fix it. Falls back to a generic suggestion when none
+    of those directories exist, none are owned by this process, or the
+    problem is something other than permissions (e.g. a file or symlink in
+    place of a directory).
+
+    :param Path state_dir: Operator-configured MCP state directory root.
+    :return str: Operator-facing suggestion for ``phasesweep mcp check``.
+    """
     for directory in (state_dir, state_dir / "runs", state_dir / "logs"):
         try:
             info = os.stat(directory, follow_symlinks=False)

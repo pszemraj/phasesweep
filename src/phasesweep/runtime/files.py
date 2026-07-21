@@ -110,7 +110,20 @@ def lock_dir() -> Path:
 
 
 def _lock_policy(path: Path) -> _LockPolicy:
-    """Validate a lock directory and return its file-sharing policy."""
+    """Open, validate, and classify a lock directory as private or shared.
+
+    Walks ``path`` with :func:`_open_directory_fd` (no ``O_NOFOLLOW`` bypass,
+    directory not created) and hands the resulting descriptor to
+    :func:`_lock_policy_for_info` for the ownership/mode check; the
+    descriptor is always closed before returning.
+
+    :param Path path: Lock directory to validate.
+    :return _LockPolicy: Sharing policy (private vs. group-shared) with the
+        owner uid/gid and lock-file mode this directory requires.
+    :raises UnsafeLockPathError: If ``path`` does not exist, contains a
+        symlinked component, or fails the private/shared ownership-and-mode
+        check.
+    """
     try:
         fd = _open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
@@ -126,7 +139,25 @@ def _lock_policy(path: Path) -> _LockPolicy:
 
 
 def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
-    """Return the sharing policy for an already-opened lock directory."""
+    """Classify an already-opened lock directory's ownership and mode.
+
+    Accepts either an owner-only directory (mode ``0700``, owned by the
+    current effective uid) or an administrator-owned shared directory (mode
+    ``03770``, owned by uid 0, with a gid in the caller's current group
+    set). Any other owner/mode combination — including a non-directory,
+    which indicates the path resolved to a symlink or other non-directory
+    entry — is refused.
+
+    :param Path path: Lock directory the ``info`` was captured from, used
+        only for error messages.
+    :param os.stat_result info: ``stat`` result of the already-opened
+        directory descriptor.
+    :return _LockPolicy: Sharing policy: ``shared=False`` with owner-uid
+        file mode ``0600`` for a private directory, or ``shared=True`` with
+        group file mode ``0660`` for a shared directory.
+    :raises UnsafeLockPathError: If ``info`` is not a real directory or its
+        owner/mode does not match either the private or shared policy.
+    """
     if not stat.S_ISDIR(info.st_mode):
         raise UnsafeLockPathError(f"Lock directory {path} must be a real directory, not a symlink.")
 
@@ -146,7 +177,27 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
 
 
 def open_lock_file(path: Path) -> IO[str]:
-    """Safely open or create a regular lock file without following links."""
+    """Open or create a validated regular lock file inside a validated lock directory.
+
+    Requires a POSIX runtime and ``O_NOFOLLOW``. Walks and validates
+    ``path.parent`` as a private-or-shared lock directory (see
+    :func:`_lock_policy_for_info`), then opens ``path`` relative to that
+    directory descriptor with ``O_NOFOLLOW`` so a symlinked lock path is
+    refused rather than followed. If the file does not exist it is created
+    exclusively at the policy's file mode; if it already exists, it is
+    opened as-is and re-validated: it must be a regular file with a single
+    hard link, owned by the expected uid (private policy) or gid (shared
+    policy), and already at the policy's file mode. The parent directory
+    descriptor is always closed before returning; the returned file handle
+    is closed automatically if any validation step after opening fails.
+
+    :param Path path: Lock file path to open or create.
+    :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
+        validated lock file.
+    :raises UnsafeLockPathError: If the platform lacks ``O_NOFOLLOW``, the
+        parent directory is missing or unsafe, the leaf name is unsafe, or
+        the file fails the regular-file/ownership/mode checks.
+    """
     require_posix_runtime()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -300,7 +351,14 @@ def _absolute_path(path: Path) -> Path:
 
 
 def _leaf_name(path: Path) -> str:
-    """Return a safe single final path component."""
+    """Return the final path component, refusing names with no fixed identity.
+
+    :param Path path: Path whose final component is extracted.
+    :return str: The final path component (``path.name``).
+    :raises UnsafePrivatePathError: If the final component is empty, ``"."``,
+        or ``".."`` — none of which name a single, unambiguous filesystem
+        entry safe to open relative to a parent directory descriptor.
+    """
     leaf = path.name
     if leaf in {"", ".", ".."}:
         raise UnsafePrivatePathError(f"Path {path} has no safe final component.")
@@ -308,7 +366,15 @@ def _leaf_name(path: Path) -> str:
 
 
 def _validate_private_dir_info(path: Path, info: os.stat_result) -> None:
-    """Validate an opened owner-only directory without changing it."""
+    """Validate that an opened directory is owner-only, without modifying it.
+
+    :param Path path: Directory the ``info`` was captured from, used only
+        for error messages.
+    :param os.stat_result info: ``stat`` result of the already-opened
+        directory descriptor.
+    :raises UnsafePrivatePathError: If the entry is not a directory, or is
+        not owned by the current effective uid with mode ``0700``.
+    """
     mode = stat.S_IMODE(info.st_mode)
     euid = os.geteuid()
     if not stat.S_ISDIR(info.st_mode):
@@ -326,7 +392,43 @@ def _open_directory_fd(
     create: bool,
     private_final: bool,
 ) -> int:
-    """Open a directory by walking every component without following links."""
+    """Open a directory by walking every path component relative to its parent, refusing symlinks.
+
+    Starts from an ``O_DIRECTORY`` descriptor on ``/`` and, for each
+    component, ``lstat``s it relative to the currently-held parent
+    descriptor, opens it with ``O_NOFOLLOW`` relative to that same
+    descriptor, then compares the pre-open ``lstat`` and post-open
+    ``fstat`` device/inode to detect a symlink swapped in between
+    (TOCTOU). A component that is not a real directory — including a
+    symlink — raises, as does a component that changed identity mid-open.
+
+    A missing component is created (mode ``0700``, owned by the caller)
+    only when ``create`` is true; otherwise the underlying
+    ``FileNotFoundError`` propagates uncaught so callers can distinguish
+    "does not exist" from "unsafe". Components created this way are always
+    validated private regardless of ``private_final``; pre-existing
+    intermediate components are only checked to be real directories and are
+    **not** required to be owner-only — only the final component is
+    validated against the private owner/mode policy, and only when
+    ``private_final`` is true.
+
+    :param Path path: Directory to open, resolved lexically (not through
+        the filesystem) before walking.
+    :param bool create: Whether to ``mkdir`` any missing path component
+        (owner-only mode) instead of failing on the first missing one.
+    :param bool private_final: Whether the last path component must pass
+        :func:`_validate_private_dir_info` (owner-only, mode ``0700``) even
+        when it already existed.
+    :return int: Open, ``O_NOFOLLOW``-validated file descriptor for the
+        final directory; ownership transfers to the caller, who must close
+        it.
+    :raises FileNotFoundError: If a component is missing and ``create`` is
+        false.
+    :raises UnsafePrivatePathError: If the path is the filesystem root, a
+        component is not a real directory, a component changed between its
+        pre-open stat and the open, or the final component fails the
+        private policy when ``private_final`` is true.
+    """
     absolute = _absolute_path(path)
     parts = absolute.parts[1:]
     if not parts:
@@ -405,7 +507,17 @@ def validate_private_dir(path: Path) -> None:
 
 
 def _validate_private_file_info(path: Path, info: os.stat_result) -> None:
-    """Validate an opened private file before any content mutation."""
+    """Validate that an opened file is a private, unshared regular file.
+
+    :param Path path: File the ``info`` was captured from, used only for
+        error messages.
+    :param os.stat_result info: ``stat`` result of the already-opened file
+        descriptor.
+    :raises UnsafePrivatePathError: If the entry is not a regular file, has
+        more than one hard link (so another path could reach the same
+        inode), or is not owned by the current effective uid with mode
+        ``0600``.
+    """
     mode = stat.S_IMODE(info.st_mode)
     euid = os.geteuid()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -418,7 +530,22 @@ def _validate_private_file_info(path: Path, info: os.stat_result) -> None:
 
 
 def _validate_private_destination(parent_fd: int, leaf: str, path: Path) -> None:
-    """Validate an existing atomic-replace destination without following it."""
+    """Validate an atomic-replace destination if it exists, without following it.
+
+    Called immediately before :func:`os.replace` so a destination that is a
+    symlink, a hardlinked file, or has the wrong owner/mode is refused
+    instead of being silently overwritten. A missing destination is not an
+    error — :func:`os.replace` is expected to create it.
+
+    :param int parent_fd: Open descriptor on the destination's parent
+        directory; not closed or otherwise consumed by this function.
+    :param str leaf: Final path component of the destination, resolved
+        relative to ``parent_fd``.
+    :param Path path: Full destination path, used only for error messages.
+    :raises UnsafePrivatePathError: If the destination exists and is not a
+        private, unshared regular file (see
+        :func:`_validate_private_file_info`).
+    """
     try:
         info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -480,7 +607,24 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
 
 
 def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
-    """Create one owner-only temporary file relative to an opened directory."""
+    """Create a uniquely-named, owner-only temporary file next to a destination leaf.
+
+    Uses ``O_CREAT | O_EXCL`` with ``O_NOFOLLOW`` relative to ``parent_fd``
+    so the temporary file can never collide with an existing path or be a
+    followed symlink, then ``fchmod``s it to the private file mode
+    (belt-and-suspenders against umask). Retries with a fresh random suffix
+    on a name collision.
+
+    :param int parent_fd: Open descriptor on the destination directory the
+        temporary file is created inside; not closed or otherwise consumed
+        by this function.
+    :param str leaf: Final path component of the eventual destination, used
+        only to build a recognizable temporary filename.
+    :return tuple[int, str]: The open file descriptor (ownership transfers
+        to the caller, who must close it) and the temporary file's name,
+        relative to ``parent_fd``.
+    :raises FileExistsError: If 10 consecutive random names all collide.
+    """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
     for _ in range(10):
         temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
@@ -500,7 +644,29 @@ def _private_atomic_writer(
     binary: bool,
     newline: str | None = None,
 ) -> Iterator[IO[Any]]:
-    """Write through a descriptor-relative temporary and replace a validated destination."""
+    """Write to a private temporary file, then atomically replace a validated destination.
+
+    Opens (creating if needed) the private destination directory, creates a
+    uniquely-named owner-only temporary file inside it, and yields a handle
+    to the caller to populate. On a clean exit from the ``with`` block, the
+    handle is flushed and ``fsync``ed, the destination is validated if it
+    already exists (refusing anything but a private, unshared regular file;
+    see :func:`_validate_private_destination`), and the temporary file is
+    renamed onto ``path`` with :func:`os.replace` — atomic because both
+    names resolve relative to the same open parent directory descriptor.
+    The parent directory is then best-effort ``fsync``ed. If the caller's
+    block raises, or if any step before the rename fails, the temporary
+    file is unlinked and ``path`` is left untouched.
+
+    :param Path path: Destination path to replace.
+    :param bool binary: Whether to open the temporary file in binary
+        (``"wb"``) mode instead of UTF-8 text (``"w"``).
+    :param str | None newline: Newline handling passed to the text-mode
+        ``open`` call; ignored when ``binary`` is true.
+    :return Iterator[IO[Any]]: Writable handle (binary or text per
+        ``binary``) on the temporary file, open for the caller to populate
+        before the atomic replace.
+    """
     parent_fd = _open_directory_fd(path.parent, create=True, private_final=True)
     leaf = _leaf_name(path)
     fd = -1

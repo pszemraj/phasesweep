@@ -160,44 +160,85 @@ def _generation_path(experiment: Experiment) -> Path:
 
 
 def _generations_dir(experiment: Experiment) -> Path:
-    """Return the immutable generation-record root for an experiment."""
+    """Return the immutable generation-record root for an experiment.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Directory containing all immutable per-generation namespaces.
+    """
     return _experiment_dir(experiment) / "generations"
 
 
 def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
-    """Return one generation's immutable artifact namespace."""
+    """Return one generation's immutable artifact namespace.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Directory scoped to the given generation.
+    """
     return _generations_dir(experiment) / generation_id
 
 
 def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
-    """Return one generation's lifecycle record path."""
+    """Return one generation's lifecycle record path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's lifecycle record YAML file.
+    """
     return _generation_dir(experiment, generation_id) / "generation.yaml"
 
 
 def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
-    """Return one generation's summary path."""
+    """Return one generation's summary path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's summary YAML file.
+    """
     return _generation_dir(experiment, generation_id) / "summary.yaml"
 
 
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
-    """Return one generation's phase-winner path."""
+    """Return one generation's phase-winner path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :param str phase_name: Phase name whose generation-scoped winner path is requested.
+    :return Path: Path to the phase's winner YAML file within the generation namespace.
+    """
     return _generation_dir(experiment, generation_id) / "phases" / phase_name / "winner.yaml"
 
 
 def _generation_promotion_decision_path(
     experiment: Experiment, generation_id: str, phase_name: str
 ) -> Path:
-    """Return one generation's phase-promotion path."""
+    """Return one generation's phase-promotion path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :param str phase_name: Phase name whose generation-scoped promotion path is requested.
+    :return Path: Path to the phase's promotion-decision YAML file within the
+        generation namespace.
+    """
     return _generation_dir(experiment, generation_id) / "phases" / phase_name / "promotion.yaml"
 
 
 def _last_successful_generation_path(experiment: Experiment) -> Path:
-    """Return the pointer to the last fully published generation."""
+    """Return the pointer to the last fully published generation.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the YAML file recording the last-successful generation id.
+    """
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
 
 def _last_successful_generation_id(experiment: Experiment) -> str | None:
-    """Read the last-success pointer, returning ``None`` for legacy layouts."""
+    """Read the last-success pointer, returning ``None`` for legacy layouts.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return str | None: The last-successful generation id, or ``None`` if the
+        pointer file is missing, unreadable, malformed, or has no valid id.
+    """
     try:
         payload = yaml.safe_load(_last_successful_generation_path(experiment).read_text())
     except (OSError, yaml.YAMLError):
@@ -215,6 +256,13 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
     metadata. Once a generation has been published as current, the absence of a
     last-success pointer means no result has been published yet; a partially
     copied compatibility file must not become authoritative.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose published winner path is requested.
+    :return Path | None: The generation-scoped winner path when a last-success
+        pointer exists; the legacy compatibility winner path when no generation
+        has ever been published; ``None`` when a generation exists but none has
+        completed successfully yet.
     """
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
@@ -225,7 +273,14 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
 
 
 def _published_summary_path(experiment: Experiment) -> Path | None:
-    """Return the authoritative last-success summary, with legacy fallback."""
+    """Return the authoritative last-success summary, with legacy fallback.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path | None: The generation-scoped summary path when a last-success
+        pointer exists; the legacy compatibility summary path when no
+        generation has ever been published; ``None`` when a generation exists
+        but none has completed successfully yet.
+    """
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
         return _generation_summary_path(experiment, generation_id)
@@ -238,7 +293,15 @@ def _published_promotion_decision_path(
     experiment: Experiment,
     phase_name: str,
 ) -> Path | None:
-    """Return the authoritative last-success promotion decision, with legacy fallback."""
+    """Return the authoritative last-success promotion decision, with legacy fallback.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose published promotion-decision path is requested.
+    :return Path | None: The generation-scoped promotion-decision path when a
+        last-success pointer exists; the legacy compatibility path when no
+        generation has ever been published; ``None`` when a generation exists
+        but none has completed successfully yet.
+    """
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
         return _generation_promotion_decision_path(experiment, generation_id, phase_name)
@@ -287,37 +350,71 @@ def _suite_summary_path(suite: Suite) -> Path:
 
 
 def _suite_generation_path(suite: Suite) -> Path:
-    """Return the current suite-generation lifecycle path."""
+    """Return the current suite-generation lifecycle path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the current suite-generation lifecycle YAML file.
+    """
     return _suite_dir(suite) / "suite_generation.yaml"
 
 
 def _suite_generations_dir(suite: Suite) -> Path:
-    """Return the immutable suite-generation root."""
+    """Return the immutable suite-generation root.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Directory containing all immutable per-suite-generation namespaces.
+    """
     return _suite_dir(suite) / "suite_generations"
 
 
 def _suite_generation_dir(suite: Suite, generation_id: str) -> Path:
-    """Return one immutable suite-generation directory."""
+    """Return one immutable suite-generation directory.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Directory scoped to the given suite generation.
+    """
     return _suite_generations_dir(suite) / generation_id
 
 
 def _suite_generation_record_path(suite: Suite, generation_id: str) -> Path:
-    """Return one suite generation's lifecycle record path."""
+    """Return one suite generation's lifecycle record path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Path to the suite generation's lifecycle record YAML file.
+    """
     return _suite_generation_dir(suite, generation_id) / "generation.yaml"
 
 
 def _suite_generation_summary_path(suite: Suite, generation_id: str) -> Path:
-    """Return one suite generation's immutable summary path."""
+    """Return one suite generation's immutable summary path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Path to the suite generation's summary YAML file.
+    """
     return _suite_generation_dir(suite, generation_id) / "summary.yaml"
 
 
 def _last_successful_suite_generation_path(suite: Suite) -> Path:
-    """Return the pointer to the last fully published suite generation."""
+    """Return the pointer to the last fully published suite generation.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the YAML file recording the last-successful suite generation id.
+    """
     return _suite_dir(suite) / "last_successful_suite_generation.yaml"
 
 
 def _published_suite_summary_path(suite: Suite) -> Path | None:
-    """Return the authoritative last-success suite summary, with legacy fallback."""
+    """Return the authoritative last-success suite summary, with legacy fallback.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path | None: The generation-scoped suite summary path when a
+        last-success pointer exists; the legacy compatibility summary path when
+        no suite generation has ever been published; ``None`` when a suite
+        generation exists but none has completed successfully yet.
+    """
     try:
         payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
     except (OSError, yaml.YAMLError):
@@ -469,7 +566,16 @@ def _save_winner(
 
 
 def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
-    """Serialize the concrete source trial for an exposed winner."""
+    """Serialize the concrete source trial for an exposed winner.
+
+    :param Winner winner: Winner whose recorded ``source`` is serialized; when
+        unset, a ``phase_trial`` source is synthesized from the winner's own fields.
+    :param str phase_name: Phase name used to synthesize a fallback source when
+        ``winner.source`` is unset.
+    :return dict[str, Any]: JSON-serializable winner-source payload with
+        ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
+        and ``study`` keys.
+    """
     source = winner.source or WinnerSource(
         kind="phase_trial",
         phase=phase_name,

@@ -7,7 +7,16 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Signal readiness, await the parent acknowledgement, then exec the trainer."""
+    """Signal readiness, await the parent acknowledgement, then exec the trainer.
+
+    :param list[str] | None argv: Optional ``[ready_fd, ack_fd, command]``
+        argument vector; defaults to ``sys.argv[1:]`` when omitted.
+    :return int: ``64`` if ``argv`` does not have exactly three elements;
+        ``75`` if the acknowledgement pipe does not deliver exactly ``b"A"``;
+        on success, ``os.execl`` replaces this process image with ``/bin/sh -c
+        command`` and never returns here — the trailing ``127`` only guards
+        against ``execl`` returning unexpectedly.
+    """
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 3:
         return 64

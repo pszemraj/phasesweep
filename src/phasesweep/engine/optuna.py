@@ -9,11 +9,10 @@ import sqlite3
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
-from typing_extensions import assert_never
 
 from phasesweep.config import (
     CategoricalParam,
@@ -42,6 +41,17 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
     """Seeded random sampler whose draws survive process-local RNG restarts."""
 
     def __init__(self, *, seed: int) -> None:
+        """Store the caller's seed without handing it to the base sampler.
+
+        The base ``RandomSampler`` is constructed with ``seed=None`` because
+        this sampler never draws through it directly; ``seed`` is instead
+        mixed into a fresh per-draw seed by :meth:`sample_independent`, so
+        continuation across process restarts stays deterministic.
+
+        Args:
+            seed: Base seed supplied by the phase's sampler config.
+
+        """
         super().__init__(seed=None)
         self._base_seed = seed
 
@@ -52,7 +62,25 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
         param_name: str,
         param_distribution: optuna.distributions.BaseDistribution,
     ) -> Any:
-        """Sample from a deterministic stream position owned by the durable trial."""
+        """Sample from a deterministic stream position owned by the durable trial.
+
+        Derives a fresh per-parameter seed from the base seed, study name,
+        trial number, and parameter name, so the same (trial, param) pair
+        always draws the same value regardless of process restarts or call
+        ordering.
+
+        Args:
+            study: The active Optuna study (contributes ``study_name`` to the
+                derived seed).
+            trial: The trial being sampled for (contributes ``trial.number``).
+            param_name: Name of the parameter being sampled.
+            param_distribution: The parameter's Optuna distribution.
+
+        Returns:
+            The sampled value, drawn from a fresh :class:`optuna.samplers.RandomSampler`
+            seeded deterministically from ``(base_seed, study_name, trial.number, param_name)``.
+
+        """
         material = json.dumps(
             [self._base_seed, study.study_name, trial.number, param_name],
             separators=(",", ":"),

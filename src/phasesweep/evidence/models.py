@@ -122,7 +122,14 @@ Extractor = JsonExtractor | ObjectiveExtractor
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
-    """Describe which objective-evidence identities the extractor enforces."""
+    """Describe which objective-evidence identities the extractor enforces.
+
+    :param ObjectiveExtractor extractor: Configured objective extractor to describe.
+    :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
+        and boolean flags for whether it binds evidence to the attempt (always
+        ``True``) and to a specific checkpoint/evaluation policy (``True`` only
+        for ``json_envelope`` extractors).
+    """
     envelope = extractor.type == "json_envelope"
     return {
         "kind": extractor.type,

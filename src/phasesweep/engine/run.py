@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -526,7 +526,17 @@ def _reject_bound_descendant_topups(
     from_phase: str | None,
     existing_studies: dict[str, Any],
 ) -> None:
-    """Reject upstream top-ups that could invalidate a bound descendant study."""
+    """Reject upstream top-ups that could invalidate a bound descendant study.
+
+    :param Experiment experiment: Parsed experiment whose phase chain is scanned
+        from ``from_phase`` (or the start) onward.
+    :param str | None from_phase: Optional resume point; phases before it are skipped.
+    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+        phase name, as returned by :func:`_preflight_existing_studies`.
+    :raises StudyContextConflictError: An upstream phase still has unfinished
+        top-up trials remaining while a descendant phase's study is already
+        bound to a published winner fingerprint.
+    """
     reached = from_phase is None
     for index, phase in enumerate(experiment.phases):
         if phase.name == from_phase:
@@ -567,7 +577,17 @@ def _reject_unsupported_sampler_topups(
     from_phase: str | None,
     existing_studies: dict[str, Any],
 ) -> None:
-    """Reject stateful sampler continuation after bound-descendant checks."""
+    """Reject stateful sampler continuation after bound-descendant checks.
+
+    :param Experiment experiment: Parsed experiment whose phase chain is scanned
+        from ``from_phase`` (or the start) onward.
+    :param str | None from_phase: Optional resume point; phases before it are skipped.
+    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+        phase name, as returned by :func:`_preflight_existing_studies`.
+    :raises SamplerContinuationUnsupportedError: A reached phase's study cannot
+        safely continue with its configured stateful sampler; delegated to
+        :func:`_validate_sampler_continuation`.
+    """
     reached = from_phase is None
     for phase in experiment.phases:
         if phase.name == from_phase:
@@ -586,7 +606,19 @@ def _preflight_reached_fingerprint(
     preloaded_winners: dict[str, Winner],
     existing_studies: dict[str, Any],
 ) -> None:
-    """Verify the first reached study before publishing the new generation."""
+    """Verify the first reached study before publishing the new generation.
+
+    :param Experiment experiment: Parsed experiment whose first reached phase
+        (``from_phase``, or the first declared phase) is checked.
+    :param str | None from_phase: Optional resume point identifying the first
+        phase that will actually execute.
+    :param dict[str, Winner] preloaded_winners: Validated skipped-phase winners,
+        used to resolve the reached phase's inherited context.
+    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+        phase name; a no-op if the reached phase has none yet.
+    :raises StudyFingerprintMismatchError: The reached study's stored
+        fingerprint does not match the current config.
+    """
     phase = experiment.phases[0]
     if from_phase is not None:
         phase = next(item for item in experiment.phases if item.name == from_phase)
@@ -619,7 +651,16 @@ def _prepare_generation(
 
 
 def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
-    """Create one exclusively owned generation namespace under the experiment lock."""
+    """Create one exclusively owned generation namespace under the experiment lock.
+
+    :param Experiment experiment: Experiment whose generations root is created if missing.
+    :param str | None requested_id: Caller-supplied generation id to claim, or
+        ``None`` to mint a fresh random id.
+    :return str: The claimed generation id (``requested_id`` if supplied and
+        free, otherwise a freshly minted UUID4 hex string).
+    :raises RuntimeError: ``requested_id`` already exists, or no unused random
+        id could be minted after 10 attempts.
+    """
     root = _generations_dir(experiment)
     root.mkdir(parents=True, exist_ok=True)
     if requested_id is not None:
@@ -650,7 +691,18 @@ def _write_generation_state(
     publish_current: bool,
     error_class: str | None = None,
 ) -> None:
-    """Write one generation lifecycle record and optionally its current pointer."""
+    """Write one generation lifecycle record and optionally its current pointer.
+
+    :param Experiment experiment: Experiment whose generation record is written.
+    :param str generation_id: Immutable generation namespace being recorded.
+    :param str state: Lifecycle state label (e.g. ``"preflighting"``,
+        ``"running"``, ``"failed"``, ``"complete"``).
+    :param str | None from_phase: Resume point for this invocation, or ``None``.
+    :param bool publish_current: If ``True``, also overwrite the experiment's
+        current-generation pointer with this record.
+    :param str | None error_class: Optional exception class name to record for
+        a failed state.
+    """
     payload = {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -665,7 +717,11 @@ def _write_generation_state(
 
 
 def _copy_yaml_projection(source: Path, destination: Path) -> None:
-    """Atomically project one immutable YAML artifact to its compatibility path."""
+    """Atomically project one immutable YAML artifact to its compatibility path.
+
+    :param Path source: Immutable generation-scoped YAML file to read.
+    :param Path destination: Legacy compatibility path to atomically overwrite.
+    """
     payload = yaml.safe_load(source.read_text())
     _write_yaml_atomic(destination, payload)
 
@@ -676,7 +732,17 @@ def _publish_generation(
     *,
     from_phase: str | None,
 ) -> None:
-    """Publish a complete immutable generation as the last successful result."""
+    """Publish a complete immutable generation as the last successful result.
+
+    Projects each phase's winner/promotion artifacts and the run summary from
+    the immutable generation namespace onto their legacy compatibility paths,
+    then records the generation as complete and advances the last-successful
+    pointer.
+
+    :param Experiment experiment: Experiment whose generation is being published.
+    :param str generation_id: Immutable generation namespace to publish.
+    :param str | None from_phase: Resume point recorded on the completion state.
+    """
     for phase in experiment.phases:
         source_winner = _generation_winner_path(experiment, generation_id, phase.name)
         projected_winner = _winner_path(experiment, phase.name)
@@ -751,7 +817,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
         generation_id = _claim_suite_generation(suite)
-        started_at = datetime.now(timezone.utc).isoformat()
+        started_at = datetime.now(UTC).isoformat()
         _write_suite_generation_state(
             suite,
             generation_id=generation_id,
@@ -796,7 +862,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     results[study_spec.name] = exposed_winners
                 log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
 
-            ended_at = datetime.now(timezone.utc).isoformat()
+            ended_at = datetime.now(UTC).isoformat()
             summary = _suite_summary_payload(
                 suite,
                 generation_id=generation_id,
@@ -834,7 +900,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 generation_id=generation_id,
                 state="failed",
                 started_at=started_at,
-                ended_at=datetime.now(timezone.utc).isoformat(),
+                ended_at=datetime.now(UTC).isoformat(),
                 error_class=type(exc).__name__,
             )
             raise
@@ -842,7 +908,13 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
 
 
 def _claim_suite_generation(suite: Suite) -> str:
-    """Create one exclusively owned suite-generation namespace."""
+    """Create one exclusively owned suite-generation namespace.
+
+    :param Suite suite: Suite whose suite-generations root is created if missing.
+    :return str: Freshly minted UUID4 hex suite-generation id.
+    :raises RuntimeError: No unused suite-generation id could be minted after
+        10 attempts.
+    """
     root = _suite_generations_dir(suite)
     root.mkdir(parents=True, exist_ok=True)
     for _ in range(10):
@@ -865,7 +937,20 @@ def _write_suite_generation_state(
     error_class: str | None = None,
     publish_current: bool = True,
 ) -> None:
-    """Persist one suite invocation's lifecycle and optionally publish it as current."""
+    """Persist one suite invocation's lifecycle and optionally publish it as current.
+
+    :param Suite suite: Suite whose generation record is written.
+    :param str generation_id: Immutable suite-generation namespace being recorded.
+    :param str state: Lifecycle state label (e.g. ``"running"``, ``"failed"``,
+        ``"complete"``).
+    :param str started_at: ISO timestamp when the suite invocation started.
+    :param str | None ended_at: ISO timestamp when the suite invocation ended,
+        or ``None`` while still running.
+    :param str | None error_class: Optional exception class name to record for
+        a failed state.
+    :param bool publish_current: If ``True``, also overwrite the suite's
+        current-generation pointer with this record.
+    """
     payload = {
         "schema_version": 1,
         "suite": suite.suite,
@@ -892,7 +977,23 @@ def _suite_summary_payload(
     promotion_decisions: dict[str, dict[str, Any]],
     component_records: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build the immutable suite summary from the compiled historical plan."""
+    """Build the immutable suite summary from the compiled historical plan.
+
+    :param Suite suite: Compiled suite plan whose studies are iterated in
+        declaration order.
+    :param str generation_id: Immutable suite-generation namespace this summary belongs to.
+    :param str started_at: ISO timestamp when the suite invocation started.
+    :param str ended_at: ISO timestamp when the suite invocation ended.
+    :param dict[str, dict[str, Winner]] results: Exposed winners keyed by study
+        name, then phase name.
+    :param dict[str, dict[str, Any]] promotion_decisions: Study-level promotion
+        decisions keyed by study name.
+    :param dict[str, dict[str, Any]] component_records: Per-study experiment
+        provenance (experiment name, generation id, phase fingerprints) keyed
+        by study name.
+    :return dict[str, Any]: Immutable suite summary payload, including each
+        study's exposed phases, promotion rule/decision, and component provenance.
+    """
     studies: list[dict[str, Any]] = []
     for study_spec in suite.studies:
         experiment = suite.experiment_for_study(study_spec)

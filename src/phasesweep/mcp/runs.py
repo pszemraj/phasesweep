@@ -646,7 +646,14 @@ class RunStore:
         return self._read_cleanup_recovery(handle) is not None
 
     def _read_cleanup_recovery(self, handle: RunHandle) -> dict[str, object] | None:
-        """Read matching operator cleanup evidence for a run handle."""
+        """Read matching operator cleanup evidence for a run handle.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be read.
+        :return dict[str, object] | None: The recovery payload when the file
+            exists, parses as a JSON object, and its ``run_id``,
+            ``config_sha256``, and ``cleanup_confirmed`` fields match this
+            handle; ``None`` otherwise.
+        """
         path = self.cleanup_recovery_path(handle.run_id)
         if not path.is_file():
             return None

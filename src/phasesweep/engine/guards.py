@@ -277,7 +277,18 @@ SUITE_FINGERPRINT_SCHEMA_VERSION = 1
 
 
 def _suite_fingerprint(suite: Suite) -> str:
-    """Hash the fully compiled suite plan, including historical annotations."""
+    """Hash the fully compiled suite plan, including historical annotations.
+
+    Args:
+        suite: Parsed suite config; each study's name, dependency edges,
+            promotion rule, and fully resolved experiment contribute to the
+            digest.
+
+    Returns:
+        SHA-256 hex digest (64 characters) of the canonicalised suite payload.
+        Stamped onto suite-generation records to detect incompatible suite edits.
+
+    """
     payload = {
         "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
         "suite": suite.suite,
@@ -464,7 +475,19 @@ def _read_trial_process_identity(
     trial_dir: Path,
     study_name: str,
 ) -> StaleProcessIdentity:
-    """Read one complete process identity bound to its persisted attempt."""
+    """Read one complete process identity bound to its persisted attempt.
+
+    :param optuna.trial.FrozenTrial trial: RUNNING or terminal trial whose
+        process identity is being read for stale-trial recovery.
+    :param Path trial_dir: Persisted trial directory expected to contain the
+        durable process identity files.
+    :param str study_name: Study name, used only for diagnostics.
+    :return StaleProcessIdentity: Process identity bound to the trial's
+        persisted attempt id.
+    :raises ProcessCleanupUncertainError: The trial has no valid persisted
+        attempt id, or its durable process identity is missing, malformed,
+        partial, or belongs to a different attempt.
+    """
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ProcessCleanupUncertainError(
@@ -581,7 +604,14 @@ def _validate_study_schema(study: optuna.Study) -> None:
 
 
 def _accepted_trial_target(study: optuna.Study) -> int:
-    """Return the durable target, inferring old current-schema studies from history."""
+    """Return the durable target, inferring old current-schema studies from history.
+
+    :param optuna.Study study: Study whose accepted trial target is read.
+    :return int: The stored ``phasesweep_trial_target`` user attr, or the
+        number of finished trials when no target has been recorded yet.
+    :raises StudySchemaMismatchError: The stored target is not a positive int,
+        or is lower than the number of already-finished trials.
+    """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
     if stored is None:
@@ -596,7 +626,13 @@ def _accepted_trial_target(study: optuna.Study) -> int:
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
-    """Reject a target lower than the study's durable accepted target."""
+    """Reject a target lower than the study's durable accepted target.
+
+    :param optuna.Study study: Existing study whose accepted target is checked.
+    :param Phase phase: Phase config supplying the requested ``n_trials`` target.
+    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+        study's durable accepted target.
+    """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
         raise TrialTargetRegressionError(
@@ -607,7 +643,15 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
 
 def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
-    """Reject a stateful sampler restart that would depend on invocation batching."""
+    """Reject a stateful sampler restart that would depend on invocation batching.
+
+    :param optuna.Study study: Existing study whose finished-trial count is checked.
+    :param Phase phase: Phase config supplying the sampler type and trial target.
+    :raises SamplerContinuationUnsupportedError: The phase uses a stateful
+        sampler (``tpe`` or ``cmaes``) and has some but not all of its target
+        trials finished, so process-local sampler continuation state cannot be
+        reproduced safely.
+    """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
     if 0 < finished < phase.n_trials and phase.sampler.type in {"tpe", "cmaes"}:
         raise SamplerContinuationUnsupportedError(
@@ -619,7 +663,13 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
-    """Persist the highest accepted target before the phase launches work."""
+    """Persist the highest accepted target before the phase launches work.
+
+    :param optuna.Study study: Study whose accepted trial target is stored.
+    :param Phase phase: Phase config supplying the new ``n_trials`` target.
+    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+        study's already-accepted target.
+    """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
         raise TrialTargetRegressionError(
@@ -635,7 +685,24 @@ def _preflight_existing_studies(
     *,
     cleanup_report: _PreflightCleanupReport | None = None,
 ) -> dict[str, optuna.Study]:
-    """Validate and reap every existing declared phase study before launch."""
+    """Validate and reap every existing declared phase study before launch.
+
+    :param Experiment experiment: Parsed experiment whose declared phases are inspected.
+    :param _PreflightCleanupReport | None cleanup_report: Optional shared report to
+        accumulate cleanup evidence into; a fresh one is created if omitted.
+    :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
+        with no durable study yet are omitted).
+    :raises StudyStorageUnavailableError: A phase's persistent storage could not
+        be inspected.
+    :raises StudySchemaMismatchError: A phase's study uses an incompatible
+        storage schema.
+    :raises TrialTargetRegressionError: A phase's study already accepted a
+        higher trial target than the current config requests.
+    :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
+        confirmed safe for a phase's study.
+    :raises RuntimeError: Multiple studies failed preflight for mixed reasons
+        not covered by a single common exception type.
+    """
     report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []

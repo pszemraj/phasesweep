@@ -103,7 +103,15 @@ class WinnerSnapshot(_SnapshotModel):
 
 
 def _winner_source_snapshot(winner: PhaseWinnerView) -> WinnerSourceSnapshot:
-    """Return the concrete source model for a winner view."""
+    """Return the concrete source model for a winner view.
+
+    Falls back to a ``"phase_trial"`` source built from the winner's own
+    phase/trial/generation/attempt identity when ``winner.source`` is unset
+    (winners persisted before source tracking was added have no ``source``).
+
+    :param PhaseWinnerView winner: Winner view whose source should be captured.
+    :return WinnerSourceSnapshot: Concrete, validated source snapshot.
+    """
     source = winner.source or WinnerSource(
         kind="phase_trial",
         phase=winner.phase,
@@ -168,7 +176,18 @@ class RunResultSnapshot(_SnapshotModel):
 
 
 def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, Any]:
-    """Freeze known config shape without reading mutable study or winner state."""
+    """Freeze known config shape without reading mutable study or winner state.
+
+    Used when the engine crashed before ever claiming a generation, so no
+    lock-protected read of shared Optuna study/winner state is safe. Builds a
+    snapshot purely from the static experiment config: every phase's declared
+    ``n_trials`` with all trial-state counts at zero, no winners, and no
+    generation id.
+
+    :param Experiment experiment: Exact config snapshot the detached runner
+        attempted to execute.
+    :return dict[str, Any]: JSON-serializable placeholder result snapshot.
+    """
     zero_counts = {state: 0 for state in ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")}
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(

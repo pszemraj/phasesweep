@@ -48,7 +48,19 @@ def _base_failure_payload(
     *,
     stage: str | None,
 ) -> dict[str, object]:
-    """Map an operator-facing exception to one stable, path-free agent failure."""
+    """Map an operator-facing exception to one stable, path-free agent failure.
+
+    :param BaseException error: Exception whose type selects the failure code.
+    :param str | None stage: Failure stage to report for most error types;
+        clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
+        falling back to ``"execution"`` for any other value. Two error types
+        override this with a fixed stage regardless of input:
+        :class:`ExperimentLockBusyError` always reports ``"preflight"`` and
+        :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
+    :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
+        ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
+        for any exception type not otherwise recognized.
+    """
     failure_stage = stage if stage in {"preflight", "execution", "cleanup"} else "execution"
     if isinstance(error, ExperimentLockBusyError):
         return {
@@ -167,7 +179,17 @@ def _safe_failure_payload(
     stage: str | None,
     cause: BaseException | None = None,
 ) -> dict[str, object]:
-    """Map an error and optional secondary cause to one stable agent failure."""
+    """Map an error and optional secondary cause to one stable agent failure.
+
+    :param BaseException error: Primary exception to classify.
+    :param str | None stage: Stage forwarded to :func:`_base_failure_payload`
+        for both ``error`` and, when present, ``cause``.
+    :param BaseException | None cause: Secondary exception distinct from
+        ``error``; when given, its own classified payload is nested under
+        the returned payload's ``"cause"`` key.
+    :return dict[str, object]: The primary failure payload, with a nested
+        ``cause`` payload added when ``cause`` is given and is not ``error``.
+    """
     payload = _base_failure_payload(error, stage=stage)
     if cause is not None and cause is not error:
         payload["cause"] = _base_failure_payload(cause, stage=stage)
@@ -179,7 +201,16 @@ def _cleanup_failure_payload(
     *,
     cause_stage: str | None,
 ) -> dict[str, object]:
-    """Make cleanup uncertainty actionable while retaining its safe primary cause."""
+    """Make cleanup uncertainty actionable while retaining its safe primary cause.
+
+    :param BaseException primary: Terminal error observed before cleanup was
+        found to be uncertain.
+    :param str | None cause_stage: Stage at which ``primary`` occurred, used
+        when classifying it as the nested cause.
+    :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
+        ``primary`` nested under ``"cause"`` unless ``primary`` is itself a
+        :class:`ProcessCleanupUncertainError`.
+    """
     cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
     payload = _base_failure_payload(cleanup, stage="cleanup")
     if not isinstance(primary, ProcessCleanupUncertainError):

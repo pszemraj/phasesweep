@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
 
@@ -550,7 +550,7 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     assert started is not None
     ended: datetime | None
     if state == "running":
-        ended = datetime.now(timezone.utc)
+        ended = datetime.now(UTC)
     else:
         status = store.recorded_terminal_status(handle)
         ended = parse_utc_iso(status.get("ended_at")) if status is not None else None
@@ -750,7 +750,15 @@ class PhaseSweepMCP:
         }
 
     def _run_failure_payload(self, handle: RunHandle) -> dict[str, Any] | None:
-        """Return a validated safe terminal failure, never the raw exception text."""
+        """Return a validated safe terminal failure, never the raw exception text.
+
+        :param RunHandle handle: Run handle whose recorded terminal status
+            should be inspected.
+        :return dict[str, Any] | None: The run's ``failure`` payload validated
+            against :class:`FailurePayload` and dumped to JSON-safe types, or
+            ``None`` when there is no recorded terminal status, no failure was
+            recorded, or the stored failure fails schema validation.
+        """
         terminal = self._runs.recorded_terminal_status(handle)
         if terminal is None or terminal.get("failure") is None:
             return None
