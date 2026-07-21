@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from phasesweep.engine import run_experiment
+from phasesweep.engine import TerminalReport, run_experiment
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
@@ -176,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     result_snapshot: dict | None = None
     result_snapshot_error: str | None = None
+    terminal_report: TerminalReport | None = None
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -197,19 +198,20 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc
 
-        def capture_terminal(generation_id: str, _error: BaseException | None) -> None:
+        def capture_terminal(report: TerminalReport) -> None:
             """Capture immutable results while ``run_experiment`` still owns its lock.
 
-            :param str generation_id: Identifier for the completed engine invocation.
-            :param BaseException | None _error: Terminal engine error, if one occurred.
+            :param TerminalReport report: Engine outcome and cleanup evidence.
             """
-            nonlocal result_snapshot, result_snapshot_error
+            nonlocal result_snapshot, result_snapshot_error, terminal_report
+            terminal_report = report
+            status["cleanup_confirmed"] = report.cleanup_confirmed
             try:
                 result_snapshot = capture_result_snapshot(
                     config,
                     cleanup_confirmed=False,
-                    generation_id=generation_id,
-                    require_trial_data=_error is None,
+                    generation_id=report.generation_id,
+                    require_trial_data=report.primary_error is None,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
                 result_snapshot_error = type(exc).__name__
@@ -228,17 +230,27 @@ def main(argv: list[str] | None = None) -> int:
         code = exc.code if isinstance(exc.code, int) else 1
         status["returncode"] = code
         status["error_class"] = "cancelled"
-        status["cleanup_confirmed"] = exc.report.cleanup_confirmed
+        status["cleanup_confirmed"] = (
+            terminal_report.cleanup_confirmed
+            if terminal_report is not None
+            else exc.report.cleanup_confirmed
+        )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
-        status["error_class"] = type(exc).__name__
-        status["cleanup_confirmed"] = False
+        primary = terminal_report.primary_error if terminal_report is not None else exc
+        status["error_class"] = type(primary).__name__
+        status["cleanup_confirmed"] = (
+            terminal_report.cleanup_confirmed if terminal_report is not None else False
+        )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
-        status["error_class"] = type(exc).__name__
-        status["cleanup_confirmed"] = True
+        primary = terminal_report.primary_error if terminal_report is not None else exc
+        status["error_class"] = type(primary).__name__
+        status["cleanup_confirmed"] = (
+            terminal_report.cleanup_confirmed if terminal_report is not None else True
+        )
         raise
     finally:
         _write_status(

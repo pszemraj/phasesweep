@@ -6,6 +6,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -18,6 +19,7 @@ from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.guards import (
     _experiment_lock,
     _preflight_existing_studies,
+    _PreflightCleanupReport,
     _suite_lock,
     _verify_fingerprint,
 )
@@ -50,8 +52,21 @@ from phasesweep.engine.state import (
     _winner_path,
     _write_yaml_atomic,
 )
+from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import install_signal_handlers
+
+
+@dataclass(frozen=True)
+class TerminalReport:
+    """One engine invocation's primary outcome and independent cleanup evidence."""
+
+    generation_id: str
+    primary_error: BaseException | None
+    cleanup_confirmed: bool
+    recovered_attempt_ids: frozenset[str]
+    uncertain_attempt_ids: frozenset[str]
+    cleanup_error: BaseException | None = None
 
 
 def run_config(
@@ -106,7 +121,7 @@ def run_experiment(
     *,
     from_phase: str | None = None,
     dry_run: bool = False,
-    terminal_callback: Callable[[str, BaseException | None], None] | None = None,
+    terminal_callback: Callable[[TerminalReport], None] | None = None,
     generation_id: str | None = None,
 ) -> dict[str, Winner]:
     """Run all phases in order, returning a map of phase name to Winner.
@@ -133,8 +148,7 @@ def run_experiment(
         dry_run: If ``True``, render and log one example trial command per
             phase but launch no subprocesses; no summary is written.
         terminal_callback: Optional synchronous callback invoked with the
-            generation id and terminal exception, if any, while the experiment
-            lock is still held.
+            structured terminal report while the experiment lock is still held.
         generation_id: Optional caller-owned invocation identity. Detached MCP
             runs use their run id; direct callers receive a generated identity.
             Supplied values must contain only alphanumerics, underscores, and dashes.
@@ -174,6 +188,8 @@ def run_experiment(
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
         terminal_error: BaseException | None = None
+        terminal_report: TerminalReport | None = None
+        cleanup = _PreflightCleanupReport()
         existing_studies: dict[str, Any] = {}
         generation_prepared = False
         try:
@@ -189,7 +205,10 @@ def run_experiment(
                 from_phase=from_phase,
                 publish_current=False,
             )
-            existing_studies = _preflight_existing_studies(experiment)
+            existing_studies = _preflight_existing_studies(
+                experiment,
+                cleanup_report=cleanup,
+            )
             _reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,
@@ -208,7 +227,7 @@ def run_experiment(
             )
             _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
             generation_prepared = True
-            return _run_experiment_inner(
+            result = _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
                 dry_run=False,
@@ -216,13 +235,33 @@ def run_experiment(
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
             )
+            terminal_report = TerminalReport(
+                generation_id=generation_id,
+                primary_error=None,
+                cleanup_confirmed=True,
+                recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                uncertain_attempt_ids=frozenset(),
+            )
+            return result
         except BaseException as exc:
             terminal_error = exc
             if generation_prepared:
+                reconciliation = _PreflightCleanupReport()
                 try:
-                    _preflight_existing_studies(experiment)
-                except BaseException:
+                    _preflight_existing_studies(
+                        experiment,
+                        cleanup_report=reconciliation,
+                    )
+                except BaseException as cleanup_exc:
+                    if isinstance(cleanup_exc, ProcessCleanupUncertainError):
+                        reconciliation.mark_uncertain(cleanup_exc)
                     log.exception("failed to reconcile all existing studies after run termination")
+                cleanup.recovered_attempt_ids.update(reconciliation.recovered_attempt_ids)
+                cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
+                cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
+                cleanup.error = reconciliation.error
+            if isinstance(exc, ProcessCleanupUncertainError):
+                cleanup.mark_uncertain(exc)
             with contextlib.suppress(Exception):
                 _write_generation_state(
                     experiment,
@@ -232,11 +271,32 @@ def run_experiment(
                     publish_current=generation_prepared,
                     error_class=type(exc).__name__,
                 )
+            terminal_report = TerminalReport(
+                generation_id=generation_id,
+                primary_error=exc,
+                cleanup_confirmed=cleanup.cleanup_confirmed,
+                recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
+                cleanup_error=cleanup.error,
+            )
+            if not cleanup.cleanup_confirmed and not isinstance(exc, ProcessCleanupUncertainError):
+                raise ProcessCleanupUncertainError(
+                    "The run failed and subsequent process cleanup could not be confirmed."
+                ) from exc
             raise
         finally:
             if terminal_callback is not None:
                 try:
-                    terminal_callback(generation_id, terminal_error)
+                    if terminal_report is None:
+                        terminal_report = TerminalReport(
+                            generation_id=generation_id,
+                            primary_error=terminal_error,
+                            cleanup_confirmed=cleanup.cleanup_confirmed,
+                            recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                            uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
+                            cleanup_error=cleanup.error,
+                        )
+                    terminal_callback(terminal_report)
                 except BaseException:
                     if terminal_error is None:
                         raise

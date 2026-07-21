@@ -7,6 +7,7 @@ from phasesweep.engine.read import (
     read_winners,
 )
 from phasesweep.engine.run import (
+    TerminalReport,
     config_status,
     run_config,
     run_experiment,
@@ -20,6 +21,7 @@ __all__ = [
     "NoFeasibleTrialError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
+    "TerminalReport",
     "UnsafeProcessCleanupError",
     "Winner",
     "config_status",

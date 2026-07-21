@@ -16,6 +16,7 @@ from click.testing import CliRunner
 
 from phasesweep.cli import main as cli_main
 from phasesweep.config import Experiment, load_config
+from phasesweep.engine import NoFeasibleTrialError, ProcessCleanupUncertainError, TerminalReport
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -375,7 +376,15 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         generation_path = _generation_path(config_obj)
         generation_path.parent.mkdir(parents=True, exist_ok=True)
         generation_path.write_text(f"generation_id: {generation_id}\n")
-        terminal_callback(generation_id, None)
+        terminal_callback(
+            TerminalReport(
+                generation_id=generation_id,
+                primary_error=None,
+                cleanup_confirmed=True,
+                recovered_attempt_ids=frozenset(),
+                uncertain_attempt_ids=frozenset(),
+            )
+        )
 
     monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", fake_run_experiment)
 
@@ -1013,6 +1022,68 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
     assert status["error_class"] == "UnsafeProcessCleanupError"
+    assert status["cleanup_confirmed"] is False
+
+
+def test_runner_preserves_primary_failure_when_reconciliation_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "r-secondary-cleanup"
+    status_path = store.status_path(run_id)
+    primary = NoFeasibleTrialError("trainer failed")
+
+    def fail_with_uncertain_cleanup(
+        config_obj: Experiment,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback,
+        generation_id: str,
+    ) -> None:
+        del config_obj, from_phase, dry_run
+        terminal_callback(
+            TerminalReport(
+                generation_id=generation_id,
+                primary_error=primary,
+                cleanup_confirmed=False,
+                recovered_attempt_ids=frozenset(),
+                uncertain_attempt_ids=frozenset({"attempt-1"}),
+                cleanup_error=ProcessCleanupUncertainError("cleanup uncertain"),
+            )
+        )
+        raise ProcessCleanupUncertainError("cleanup uncertain") from primary
+
+    monkeypatch.setattr(
+        "phasesweep.mcp.runner.run_experiment",
+        fail_with_uncertain_cleanup,
+    )
+
+    with pytest.raises(ProcessCleanupUncertainError):
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config),
+                "--config-sha256",
+                hashlib.sha256(config.read_bytes()).hexdigest(),
+                "--status-path",
+                str(status_path),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                "2026-06-24T00:00:00Z",
+            ]
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["returncode"] == 1
+    assert status["error_class"] == "NoFeasibleTrialError"
     assert status["cleanup_confirmed"] is False
 
 

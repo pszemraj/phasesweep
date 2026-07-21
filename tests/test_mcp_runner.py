@@ -18,7 +18,13 @@ import optuna
 import pytest
 
 from phasesweep.config import Experiment, Phase, load_config
-from phasesweep.engine import NoFeasibleTrialError, read_status, run_experiment
+from phasesweep.engine import (
+    NoFeasibleTrialError,
+    ProcessCleanupUncertainError,
+    TerminalReport,
+    read_status,
+    run_experiment,
+)
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     _generation_path,
@@ -197,8 +203,8 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
     )
     captured: dict[str, object] = {}
 
-    def capture_locked(generation_id: str, error: BaseException | None) -> None:
-        assert error is None
+    def capture_locked(report: TerminalReport) -> None:
+        assert report.primary_error is None
         with (
             pytest.raises(RuntimeError, match="Another phasesweep process"),
             _experiment_lock(experiment),
@@ -208,7 +214,7 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
             mcp_runner.capture_result_snapshot(
                 experiment,
                 cleanup_confirmed=False,
-                generation_id=generation_id,
+                generation_id=report.generation_id,
             )
         )
 
@@ -256,13 +262,13 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
     )
     captured: dict[str, object] = {}
 
-    def capture_failed(generation_id: str, error: BaseException | None) -> None:
-        assert isinstance(error, NoFeasibleTrialError)
+    def capture_failed(report: TerminalReport) -> None:
+        assert isinstance(report.primary_error, NoFeasibleTrialError)
         captured.update(
             mcp_runner.capture_result_snapshot(
                 experiment,
                 cleanup_confirmed=True,
-                generation_id=generation_id,
+                generation_id=report.generation_id,
             )
         )
 
@@ -374,14 +380,14 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
     )
     callback_generations: list[str] = []
 
-    def capture_failed_resume(generation_id: str, error: BaseException | None) -> None:
-        assert isinstance(error, RuntimeError)
-        callback_generations.append(generation_id)
+    def capture_failed_resume(report: TerminalReport) -> None:
+        assert isinstance(report.primary_error, RuntimeError)
+        callback_generations.append(report.generation_id)
         with pytest.raises(RuntimeError, match="generation marker does not match"):
             mcp_runner.capture_result_snapshot(
                 changed,
                 cleanup_confirmed=False,
-                generation_id=generation_id,
+                generation_id=report.generation_id,
             )
 
     with pytest.raises(RuntimeError, match="different phase config"):
@@ -396,6 +402,42 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
     failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
     assert len(failed_generations) == 1
     assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
+
+
+def test_terminal_report_preserves_secondary_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A primary run failure cannot hide a later cleanup-uncertain result."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    calls = 0
+    cleanup_error = ProcessCleanupUncertainError("cleanup could not be proven")
+
+    def preflight(_experiment: Experiment, *, cleanup_report) -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            cleanup_report.mark_uncertain(cleanup_error)
+            raise cleanup_error
+        return {}
+
+    def fail_run(*args: object, **kwargs: object) -> None:
+        raise NoFeasibleTrialError("trainer failed")
+
+    captured: list[TerminalReport] = []
+    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+
+    with pytest.raises(ProcessCleanupUncertainError) as exc_info:
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
+    assert calls == 2
+    assert len(captured) == 1
+    report = captured[0]
+    assert isinstance(report.primary_error, NoFeasibleTrialError)
+    assert report.cleanup_confirmed is False
+    assert report.cleanup_error is cleanup_error
 
 
 def test_runner_records_snapshot_serialization_failure(

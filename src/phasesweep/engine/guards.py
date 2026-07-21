@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,22 @@ from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
 from phasesweep.runtime.process import kill_stale_group, read_stale_process_identity
+
+
+@dataclass
+class _PreflightCleanupReport:
+    """Cleanup evidence accumulated while inspecting all existing phase studies."""
+
+    cleanup_confirmed: bool = True
+    recovered_attempt_ids: set[str] = field(default_factory=set)
+    uncertain_attempt_ids: set[str] = field(default_factory=set)
+    error: BaseException | None = None
+
+    def mark_uncertain(self, error: BaseException) -> None:
+        """Record the first cleanup uncertainty and fail the aggregate closed."""
+        self.cleanup_confirmed = False
+        if self.error is None:
+            self.error = error
 
 
 def _lock_digest(material: dict[str, Any]) -> str:
@@ -413,6 +430,7 @@ def _reap_stale_trials(
     phase_name: str,
     *,
     recovered_attempt_ids: set[str] | None = None,
+    uncertain_attempt_ids: set[str] | None = None,
 ) -> int:
     """Mark RUNNING trials as FAIL after killing orphaned process groups.
 
@@ -421,34 +439,49 @@ def _reap_stale_trials(
     :param str phase_name: Name of the phase containing the stale trials.
     :param set[str] | None recovered_attempt_ids: Optional collector for exact
         attempt identities whose durable state was changed to FAIL.
+    :param set[str] | None uncertain_attempt_ids: Optional collector for exact
+        attempt identities whose cleanup could not be proven.
     :return int: Number of stale RUNNING trials marked as failed.
     """
     count = 0
-    for trial in study.get_trials(deepcopy=False):
+    try:
+        trials = study.get_trials(deepcopy=False)
+    except BaseException as exc:
+        raise ProcessCleanupUncertainError(
+            f"Could not inspect study {study.study_name!r} for stale RUNNING trials."
+        ) from exc
+    for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
+        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        try:
+            trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
 
-        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
-
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is not None or identity.pgid is not None:
-            safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
-            if not safe_to_fail:
-                raise ProcessCleanupUncertainError(
-                    f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
-                    f"could not prove the process group is gone. trial_dir={trial_dir} "
-                    f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
-                    "process may still be holding GPU memory. Investigate "
-                    f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
-                    f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
-                    "phasesweep."
+            identity = read_stale_process_identity(trial_dir)
+            if identity.pid is not None or identity.pgid is not None:
+                safe_to_fail = kill_stale_group(
+                    identity.pid, identity.starttime, pgid=identity.pgid
                 )
-            log.warning(
-                "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
-                trial.number,
-                identity.pid,
-                identity.pgid,
-            )
+                if not safe_to_fail:
+                    raise ProcessCleanupUncertainError(
+                        f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
+                        f"could not prove the process group is gone. trial_dir={trial_dir} "
+                        f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
+                        "process may still be holding GPU memory. Investigate "
+                        f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
+                        f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
+                        "phasesweep."
+                    )
+                log.warning(
+                    "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
+                    trial.number,
+                    identity.pid,
+                    identity.pgid,
+                )
+        except ProcessCleanupUncertainError:
+            if uncertain_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
+                uncertain_attempt_ids.add(attempt_id)
+            raise
 
         if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
             _record_cleanup_recovery(study, trial)
@@ -461,7 +494,6 @@ def _reap_stale_trials(
                 f"with an inconsistent study. trial_dir={trial_dir}"
             ) from exc
 
-        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         if recovered_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
             recovered_attempt_ids.add(attempt_id)
 
@@ -489,17 +521,39 @@ def _validate_study_schema(study: optuna.Study) -> None:
     )
 
 
-def _preflight_existing_studies(experiment: Experiment) -> dict[str, optuna.Study]:
+def _preflight_existing_studies(
+    experiment: Experiment,
+    *,
+    cleanup_report: _PreflightCleanupReport | None = None,
+) -> dict[str, optuna.Study]:
     """Validate and reap every existing declared phase study before launch."""
+    report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}
     errors: list[BaseException] = []
     for phase in experiment.phases:
-        study = _load_existing_phase_study(experiment, phase)
+        try:
+            study = _load_existing_phase_study(experiment, phase)
+        except BaseException as exc:
+            report.mark_uncertain(exc)
+            errors.append(exc)
+            continue
         if study is None:
             continue
         studies[phase.name] = study
         try:
-            _reap_stale_trials(study, experiment, phase.name)
+            _reap_stale_trials(
+                study,
+                experiment,
+                phase.name,
+                recovered_attempt_ids=report.recovered_attempt_ids,
+                uncertain_attempt_ids=report.uncertain_attempt_ids,
+            )
+        except BaseException as exc:
+            if isinstance(exc, ProcessCleanupUncertainError):
+                report.mark_uncertain(exc)
+            errors.append(exc)
+            continue
+        try:
             _validate_study_schema(study)
         except BaseException as exc:
             errors.append(exc)
