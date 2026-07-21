@@ -538,7 +538,7 @@ def _preflight_existing_studies(
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)
-        except BaseException as exc:
+        except Exception as exc:
             unavailable = StudyStorageUnavailableError(
                 f"Could not inspect persistent study storage for phase {phase.name!r}."
             )

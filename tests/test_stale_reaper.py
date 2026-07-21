@@ -22,7 +22,11 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.engine import run_experiment
-from phasesweep.engine.guards import _reap_stale_trials
+from phasesweep.engine.guards import (
+    _preflight_existing_studies,
+    _PreflightCleanupReport,
+    _reap_stale_trials,
+)
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -34,6 +38,8 @@ from phasesweep.engine.state import (
     _trial_dir_for,
 )
 from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    ShutdownCleanupReport,
     StaleProcessIdentity,
     _read_proc_stat,
     is_same_process,
@@ -296,6 +302,37 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
 
     assert len(study.get_trials(deepcopy=False)) == 1
     assert not _generation_path(experiment).exists()
+
+
+def test_storage_preflight_does_not_convert_shutdown_to_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(
+            signum=signal.SIGTERM,
+            cleanup_confirmed=True,
+            child_pgids=(),
+        ),
+    )
+
+    def interrupt_load(*args: object, **kwargs: object) -> None:
+        raise shutdown
+
+    monkeypatch.setattr(
+        "phasesweep.engine.guards._load_existing_phase_study",
+        interrupt_load,
+    )
+    cleanup = _PreflightCleanupReport()
+
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
+        _preflight_existing_studies(experiment, cleanup_report=cleanup)
+
+    assert exc_info.value is shutdown
+    assert cleanup.cleanup_confirmed is True
+    assert cleanup.error is None
 
 
 def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:
