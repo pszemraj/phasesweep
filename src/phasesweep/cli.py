@@ -754,7 +754,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
     :return bool: True when the catalog was written; False after printing why not.
     """
-    if os.path.lexists(output):
+    if output.is_symlink() or output.exists():
         click.echo(
             f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
             "Pass -o to choose another name.",

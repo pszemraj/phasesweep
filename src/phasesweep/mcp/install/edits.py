@@ -33,6 +33,7 @@ from typing import IO, Literal, TypeAlias
 
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
+    _absolute_path,
     fsync_directory,
     lock_dir,
     open_lock_file,
@@ -99,7 +100,7 @@ def _read_editable_text(path: Path) -> _TextSnapshot | None:
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
-        if os.path.lexists(path):
+        if path.is_symlink() or path.exists():
             return None
         return _TextSnapshot(False, "", b"", None)
     except OSError:
@@ -133,7 +134,7 @@ def _edit_lock_path(path: Path) -> Path:
     :param Path path: User config path whose transactions must serialize.
     :return Path: Persistent lock file in the shared host-local lock directory.
     """
-    absolute = os.path.abspath(os.fspath(path))
+    absolute = str(_absolute_path(path))
     digest = hashlib.sha256(os.fsencode(absolute)).hexdigest()
     return lock_dir() / f"installer-{digest}.lock"
 

@@ -272,8 +272,31 @@ def _nofollow_flag() -> int:
 
 
 def _absolute_path(path: Path) -> Path:
-    """Return a lexical absolute path without resolving symlinks."""
-    return Path(os.path.abspath(os.fspath(path)))
+    """Return a lexical absolute path without resolving symlinks.
+
+    Anchors a relative path at the current working directory, then collapses
+    ``.`` and ``..`` components purely by name, matching
+    :func:`posixpath.normpath`. This must not touch the filesystem: callers
+    such as :func:`_open_directory_fd` walk the resulting components with
+    ``O_NOFOLLOW`` specifically to detect symlinks, so resolving them here
+    would defeat that check.
+
+    :param Path path: Candidate path, absolute or relative to the current
+        working directory.
+    :return Path: Absolute path with ``.`` and ``..`` components collapsed
+        lexically; a ``..`` above the root stays at the root.
+    """
+    anchored = path if path.is_absolute() else Path.cwd() / path
+    collapsed: list[str] = []
+    for part in anchored.parts[1:]:
+        if part == ".":
+            continue
+        if part == "..":
+            if collapsed:
+                collapsed.pop()
+            continue
+        collapsed.append(part)
+    return Path(anchored.parts[0], *collapsed)
 
 
 def _leaf_name(path: Path) -> str:
