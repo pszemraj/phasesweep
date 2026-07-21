@@ -54,19 +54,23 @@ def test_check_catalog_read_only_entry_has_no_actions(tmp_path: Path) -> None:
     assert report.entries[0].actions == ()
 
 
-def test_check_catalog_provisions_private_state_layout(tmp_path: Path) -> None:
+def test_check_catalog_rejects_unsafe_existing_state_layout_without_mutation(
+    tmp_path: Path,
+) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path, {"quiet": mcp_experiment_config_text(tmp_path, name="quiet")}
     )
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o755)
+    state_dir.chmod(0o755)
 
-    report = check_catalog(catalog)
+    with pytest.raises(CatalogError, match="found uid.*mode 0755") as exc_info:
+        check_catalog(catalog)
 
-    assert report.ok
-    assert state_dir.stat().st_mode & 0o777 == 0o700
-    assert (state_dir / "runs").stat().st_mode & 0o777 == 0o700
-    assert (state_dir / "logs").stat().st_mode & 0o777 == 0o700
+    assert f"chmod 700 {state_dir}" in (exc_info.value.suggestion or "")
+    assert state_dir.stat().st_mode & 0o777 == 0o755
+    assert not (state_dir / "runs").exists()
+    assert not (state_dir / "logs").exists()
 
 
 def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:

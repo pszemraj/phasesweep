@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.runs import RunStore, write_status_file
+from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import is_pid_zombie, read_proc_starttime
 from tests.mcp_helpers import make_run_handle, write_run_status
 
@@ -456,7 +457,7 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
         starttime=111,
     )
     store.create(handle)
-    store.cleanup_uncertain_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
+    private_atomic_write_text(store.cleanup_uncertain_path("exp-1"), json.dumps(payload))
 
     assert not store.cleanup_uncertain(handle)
     assert store.state(handle) == "running"

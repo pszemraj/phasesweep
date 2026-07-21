@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -230,9 +232,25 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
     except (OSError, UnsafePrivatePathError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
-            suggestion="set state_dir to a writable directory path (not a file)",
+            suggestion=_state_dir_remediation(resolved),
         ) from exc
     return resolved
+
+
+def _state_dir_remediation(state_dir: Path) -> str:
+    """Return an exact mode fix when an existing private directory is repairable."""
+    for directory in (state_dir, state_dir / "runs", state_dir / "logs"):
+        try:
+            info = os.stat(directory, follow_symlinks=False)
+        except OSError:
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and mode != 0o700:
+            return (
+                f"run chmod 700 {shlex.quote(str(directory))}, then retry "
+                f"(found uid {info.st_uid} and mode {mode:04o})"
+            )
+    return "set state_dir to a writable directory path (owner-only; not a file or symlink)"
 
 
 def _require_mcp_stable_paths(
