@@ -20,6 +20,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
 )
 from phasesweep.engine import run_experiment
 from phasesweep.engine.guards import (
@@ -261,7 +262,12 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         ),
         phases=[
             Phase(name="a", n_trials=1, search_space={}),
-            Phase(name="b", n_trials=2, search_space={}),
+            Phase(
+                name="b",
+                n_trials=2,
+                sampler=Sampler(type="random", seed=0),
+                search_space={},
+            ),
         ],
     )
     stale = subprocess.Popen(["sleep", "60"], start_new_session=True)
