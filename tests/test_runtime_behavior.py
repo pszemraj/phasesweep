@@ -70,7 +70,10 @@ def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) 
         )
         return [int(trial.params["x"]) for trial in loaded.trials]
 
-    assert sampled(tmp_path / "single.db", [4]) == sampled(tmp_path / "batched.db", [1, 1, 1, 1])
+    expected = sampled(tmp_path / "single.db", [4])
+    assert expected == sampled(tmp_path / "ones.db", [1, 1, 1, 1])
+    assert expected == sampled(tmp_path / "uneven.db", [1, 3])
+    assert expected == sampled(tmp_path / "mixed.db", [2, 1, 1])
 
 
 def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
@@ -144,13 +147,21 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
     phase = Phase(
         name="p",
         n_trials=n_trials,
+        n_jobs=2 if sampler.type == "tpe" else 1,
+        gpu_policy="none" if sampler.type == "tpe" else "single_per_trial",
+        allow_no_gpu_isolation=sampler.type == "tpe",
         allow_partial_grid=sampler.type == "grid",
         sampler=sampler,
         search_space=search_space,
     )
+    storage = (
+        f"journal:///{tmp_path / 'tpe.journal'}"
+        if sampler.type == "tpe"
+        else f"sqlite:///{tmp_path / f'{sampler.type}.db'}"
+    )
     exp = make_experiment(
         experiment=f"sampler_{sampler.type}",
-        storage=f"sqlite:///{tmp_path / f'{sampler.type}.db'}",
+        storage=storage,
         workdir=tmp_path / "runs",
         phases=[phase],
     )
@@ -161,6 +172,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         observed["sampler"] = type(study.sampler).__name__
         observed["pruner"] = type(study.pruner).__name__
         observed["n_startup_trials"] = getattr(study.sampler, "_n_startup_trials", None)
+        observed["constant_liar"] = getattr(study.sampler, "_constant_liar", None)
         raise OptimizeObserved
 
     monkeypatch.setattr(optuna.Study, "optimize", inspect_optimize)
@@ -171,6 +183,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
     assert observed["pruner"] == "NopPruner"
     if sampler.type == "tpe":
         assert observed["n_startup_trials"] == 3
+        assert observed["constant_liar"] is True
 
 
 def _sleeping_score_experiment(
