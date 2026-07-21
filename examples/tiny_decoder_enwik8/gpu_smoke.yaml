@@ -39,5 +39,10 @@ phases:
       val_batches: 2
       generate_every: 1000000
       save_every: 1000000
+    gates:
+      - type: json_equals
+        path: result.json
+        key: runtime.device_type
+        value: cuda
     search_space:
       learning_rate: { type: categorical, choices: [0.0003, 0.001] }

@@ -147,6 +147,7 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
 
     return {
         "checkpoint": checkpoint_path.name,
+        "device_type": device_type,
         "policy": "final_checkpoint",
         "step": checkpoint.get("step"),
         "val_loss": val_loss_sum / val_tokens,
@@ -179,6 +180,9 @@ def _write_result(
         or metric_record.get("checkpoint") != "final.pt"
     ):
         raise ValueError(f"Final evaluation has unexpected checkpoint metadata: {metric_record!r}")
+    device_type = metric_record.get("device_type")
+    if not isinstance(device_type, str) or not device_type:
+        raise ValueError(f"Final evaluation is missing its device type: {metric_record!r}")
 
     generation_id = os.environ.get("PHASESWEEP_GENERATION_ID")
     attempt_id = os.environ.get("PHASESWEEP_ATTEMPT_ID")
@@ -202,6 +206,7 @@ def _write_result(
             "value": float(val_loss),
         },
         "overrides_sha256": overrides_sha256,
+        "runtime": {"device_type": device_type},
         "schema_version": 1,
         "status": "complete",
     }

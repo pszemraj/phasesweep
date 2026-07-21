@@ -48,6 +48,11 @@ def test_help_registers_commands_and_options() -> None:
     assert "--dry-run" in run_help
     assert "-v, --verbose" in run_help
 
+    winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
+    assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
+    assert "Pass the same experiment or suite" in winners_help
+    assert "config YAML used for the run" in winners_help
+
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
     for command in ("check", "init-catalog", "install", "recover-run", "serve", "uninstall"):

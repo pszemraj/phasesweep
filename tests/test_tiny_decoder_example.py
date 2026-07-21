@@ -45,6 +45,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         assert (run_dir / "final.pt").read_bytes() == b"checkpoint"
         return {
             "checkpoint": "final.pt",
+            "device_type": "cuda",
             "policy": "final_checkpoint",
             "step": 1000,
             "val_loss": 0.25,
@@ -86,6 +87,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "generation_id": "generation-test",
         "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
         "overrides_sha256": overrides_sha256,
+        "runtime": {"device_type": "cuda"},
         "schema_version": 1,
         "status": "complete",
     }

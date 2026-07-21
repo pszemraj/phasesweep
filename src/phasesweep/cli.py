@@ -184,12 +184,15 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 @main.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
-    help="Print published experiment winners or the last successful exposed suite winners.",
+    help=(
+        "Print published experiment winners or the last successful exposed suite winners. "
+        "Pass the same experiment or suite config YAML used for the run."
+    ),
     short_help="Print saved phase winners.",
 )
-@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
-    """Print winner files from ``config_path``."""
+    """Print winner files referenced by ``config_path``."""
     config = load_config(config_path)
     if isinstance(config, Suite):
         _show_suite_winners(config)
