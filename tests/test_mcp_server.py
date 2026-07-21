@@ -397,6 +397,14 @@ def test_launch_passes_config_snapshot_to_runner(
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     captured = patch_popen_capture(monkeypatch)
+    original_create = store.create
+    snapshots_before_publish: list[bytes] = []
+
+    def create_after_snapshot(handle: RunHandle) -> None:
+        snapshots_before_publish.append(store.config_snapshot_path(handle.run_id).read_bytes())
+        original_create(handle)
+
+    monkeypatch.setattr(store, "create", create_after_snapshot)
 
     result = app.launch("srv")
 
@@ -405,6 +413,7 @@ def test_launch_passes_config_snapshot_to_runner(
     sha_arg = cmd[cmd.index("--config-sha256") + 1]
     assert config_arg != config.resolve()
     assert config_arg.read_bytes() == config.read_bytes()
+    assert snapshots_before_publish == [config.read_bytes()]
     assert sha_arg == registry.get("srv").config_sha256
     assert config_arg == registry.state_dir / "logs" / f"{result['run_id']}.config.yaml"
     assert Path(cmd[cmd.index("--state-dir") + 1]) == registry.state_dir
@@ -501,14 +510,12 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     def capture_without_fake_trial_storage(
         experiment: Experiment,
         *,
-        cleanup_confirmed: bool,
         generation_id: str,
         require_trial_data: bool,
     ) -> dict[str, object]:
         assert require_trial_data is True
         return capture_result_snapshot(
             experiment,
-            cleanup_confirmed=cleanup_confirmed,
             generation_id=generation_id,
         )
 
@@ -574,6 +581,7 @@ def test_launch_does_not_spawn_when_pending_handle_create_fails(
 
     assert "cmd" not in captured
     assert store.list_handles() == []
+    assert list((tmp_path / "state" / "logs").glob("*.config.yaml")) == []
 
 
 def test_launch_finalizes_pending_handle_when_popen_fails(
@@ -2036,7 +2044,6 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(
             experiment,
-            cleanup_confirmed=False,
             generation_id=run_id,
         ),
     )
@@ -2054,22 +2061,21 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         trial_cleanup_calls += 1
         return True
 
-    snapshot_cleanup_flags: list[bool] = []
+    snapshot_calls = 0
     snapshot_attempt_ids: list[set[str]] = []
 
     def flaky_snapshot(
         snapshot: dict,
         *,
-        cleanup_confirmed: bool,
         confirmed_attempt_ids=(),
     ) -> dict:
-        snapshot_cleanup_flags.append(cleanup_confirmed)
+        nonlocal snapshot_calls
+        snapshot_calls += 1
         snapshot_attempt_ids.append(set(confirmed_attempt_ids))
-        if len(snapshot_cleanup_flags) == 1:
+        if snapshot_calls == 1:
             raise RuntimeError("snapshot finalization failed")
         return finalize_result_snapshot(
             snapshot,
-            cleanup_confirmed=cleanup_confirmed,
             confirmed_attempt_ids=confirmed_attempt_ids,
         )
 
@@ -2107,7 +2113,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert "Finalized stored terminal result snapshot" in retry.output
     assert runner_cleanup_calls == 1
     assert trial_cleanup_calls == 1
-    assert snapshot_cleanup_flags == [True, True]
+    assert snapshot_calls == 2
     assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"
@@ -2237,7 +2243,7 @@ def test_operator_recovery_counts_reaped_running_trials_as_cleanup_evidence(
         returncode=1,
         error_class="UnsafeProcessCleanupError",
         cleanup_confirmed=False,
-        result_snapshot=capture_result_snapshot(exp, cleanup_confirmed=False),
+        result_snapshot=capture_result_snapshot(exp),
     )
     assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
 

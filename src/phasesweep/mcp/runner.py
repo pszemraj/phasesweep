@@ -252,7 +252,6 @@ def _write_status(
                 raise RuntimeError(result_snapshot_error or "terminal snapshot was not captured")
             terminal["result_snapshot"] = finalize_result_snapshot(
                 result_snapshot,
-                cleanup_confirmed=terminal.get("cleanup_confirmed") is True,
             )
         except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
             terminal["result_snapshot_state"] = "failed"
@@ -412,7 +411,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result_snapshot = capture_result_snapshot(
                     config,
-                    cleanup_confirmed=False,
                     generation_id=report.generation_id,
                     require_trial_data=report.primary_error is None,
                 )

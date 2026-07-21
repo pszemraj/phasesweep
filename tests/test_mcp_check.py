@@ -169,6 +169,10 @@ def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_pat
         {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
     )
     blocked = tmp_path / blocked_path
+    if blocked_path != "state":
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(mode=0o700)
+        state_dir.chmod(0o700)
     blocked.parent.mkdir(parents=True, exist_ok=True)
     blocked.write_text("not a directory\n")
 

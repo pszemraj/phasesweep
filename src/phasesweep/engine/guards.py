@@ -911,18 +911,3 @@ def _inspect_cleanup_uncertain_trials(study: optuna.Study) -> int:
         _read_trial_process_identity(trial, trial_dir, study.study_name)
         count += 1
     return count
-
-
-def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
-    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``.
-
-    :param Experiment experiment: Parsed experiment config containing storage details.
-    :param Phase phase: Phase being skipped and recovered before loading its winner.
-    """
-    if experiment.storage is None:
-        return
-    study = _load_existing_phase_study(experiment, phase)
-    if study is None:
-        return
-    _reap_stale_trials(study, experiment, phase.name)
-    _validate_study_schema(study)

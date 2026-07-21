@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import inspect
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -55,7 +56,7 @@ from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore, write_status_file
 from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
 from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
-from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
+from phasesweep.runtime.files import fsync_directory, open_private_text
 from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
 
 log = logging.getLogger("phasesweep.mcp.server")
@@ -1111,22 +1112,23 @@ class PhaseSweepMCP:
                     run_id = self._runs.new_run_id(reg.id)
                     pending = self._pending_handle(reg, run_id)
                     try:
-                        self._runs.create(pending)
+                        config_snapshot_path = self._snapshot_config(reg, run_id, config_bytes)
                     except FileExistsError:
                         continue
+                    try:
+                        self._runs.create(pending)
+                    except FileExistsError:
+                        with contextlib.suppress(OSError):
+                            config_snapshot_path.unlink()
+                        continue
+                    except Exception:
+                        with contextlib.suppress(OSError):
+                            config_snapshot_path.unlink()
+                        raise
                     break
                 else:
                     raise RuntimeError("failed to mint an unused MCP run id")
                 resolved["run_id"] = run_id
-                try:
-                    config_snapshot_path = self._snapshot_config(reg, run_id, config_bytes)
-                except Exception as snapshot_exc:
-                    self._record_launch_failure(
-                        pending,
-                        cleanup_confirmed=True,
-                        error_class=type(snapshot_exc).__name__,
-                    )
-                    raise
                 try:
                     handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
                 except Exception as spawn_exc:
@@ -1319,7 +1321,7 @@ class PhaseSweepMCP:
         run_id: str,
         data: bytes | None = None,
     ) -> Path:
-        """Write the immutable per-run config snapshot after hash verification.
+        """Exclusively create the immutable config snapshot before publishing its run.
 
         :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
         :param str run_id: Run id whose snapshot path should be used.
@@ -1330,7 +1332,13 @@ class PhaseSweepMCP:
             data = self._current_config_bytes(reg)
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
-            private_atomic_write_bytes(snapshot_path, data)
+            with open_private_text(snapshot_path, "x") as output:
+                output.write(data.decode("utf-8"))
+                output.flush()
+                os.fsync(output.fileno())
+            fsync_directory(snapshot_path.parent)
+        except FileExistsError:
+            raise
         except OSError as exc:
             log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
             raise RuntimeError("failed to create run config snapshot") from None

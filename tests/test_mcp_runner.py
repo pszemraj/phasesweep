@@ -153,7 +153,7 @@ import phasesweep.mcp.runner as runner
 
 runner.install_signal_handlers()
 
-def slow_finalization(snapshot, *, cleanup_confirmed):
+def slow_finalization(snapshot):
     time.sleep(0.5)
     return snapshot
 
@@ -206,7 +206,7 @@ def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None
     status_path = tmp_path / "status.json"
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
-    snapshot = mcp_runner.capture_result_snapshot(experiment, cleanup_confirmed=False)
+    snapshot = mcp_runner.capture_result_snapshot(experiment)
 
     mcp_runner._write_status(
         status_path,
@@ -246,7 +246,6 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
         captured.update(
             mcp_runner.capture_result_snapshot(
                 experiment,
-                cleanup_confirmed=False,
                 generation_id=report.generation_id,
             )
         )
@@ -262,10 +261,7 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
     assert captured_phase["n_trials"] == 1
     assert captured_phase["completed"] == 1
     assert captured_phase["generation_trials"] == {"COMPLETE": 1}
-    current_phase = mcp_runner.capture_result_snapshot(
-        top_up,
-        cleanup_confirmed=True,
-    )["status"]["phases"][0]
+    current_phase = mcp_runner.capture_result_snapshot(top_up)["status"]["phases"][0]
     assert current_phase["n_trials"] == 2
     assert current_phase["completed"] == 2
     assert current_phase["generation_trials"] == {"COMPLETE": 1}
@@ -381,7 +377,6 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         captured.update(
             mcp_runner.capture_result_snapshot(
                 experiment,
-                cleanup_confirmed=True,
                 generation_id=report.generation_id,
             )
         )
@@ -404,7 +399,6 @@ def test_terminal_snapshot_rejects_generation_without_lifecycle_record(tmp_path:
     with pytest.raises(RuntimeError, match="no readable immutable lifecycle record"):
         mcp_runner.capture_result_snapshot(
             experiment,
-            cleanup_confirmed=False,
             generation_id="failed-new-generation",
         )
 
@@ -427,17 +421,15 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
 
     captured = mcp_runner.capture_result_snapshot(
         experiment,
-        cleanup_confirmed=False,
         generation_id="current-generation",
     )
-    unowned = mcp_runner.finalize_result_snapshot(captured, cleanup_confirmed=True)
+    unowned = mcp_runner.finalize_result_snapshot(captured)
 
     assert unowned == captured
     assert unowned["status"]["phases"][0]["trials"]["RUNNING"] == 1
 
     finalized = mcp_runner.finalize_result_snapshot(
         captured,
-        cleanup_confirmed=True,
         confirmed_attempt_ids={"old-attempt"},
     )
 
@@ -454,7 +446,6 @@ def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: P
     with pytest.raises(RuntimeError, match="terminal trial data is unavailable.*p"):
         mcp_runner.capture_result_snapshot(
             experiment,
-            cleanup_confirmed=False,
             require_trial_data=True,
         )
 
@@ -479,7 +470,6 @@ def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
 
     snapshot = mcp_runner.capture_result_snapshot(
         experiment,
-        cleanup_confirmed=False,
         require_trial_data=False,
     )
 
@@ -530,7 +520,6 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
         captured.append(
             mcp_runner.capture_result_snapshot(
                 changed,
-                cleanup_confirmed=False,
                 generation_id=report.generation_id,
             )
         )

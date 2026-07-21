@@ -222,14 +222,12 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
 def capture_result_snapshot(
     experiment: Experiment,
     *,
-    cleanup_confirmed: bool,
     generation_id: str | None = None,
     require_trial_data: bool = False,
 ) -> dict[str, Any]:
     """Capture one experiment's current path-free status and sampled winners.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
-    :param bool cleanup_confirmed: Whether all trainer process groups are confirmed gone.
     :param str | None generation_id: Engine generation known to own the experiment lock.
     :param bool require_trial_data: Refuse ambiguous storage reads when the engine succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
@@ -255,7 +253,6 @@ def capture_result_snapshot(
                 "terminal trial data is unavailable for phase(s) "
                 f"{', '.join(unavailable)}; refusing to freeze ambiguous counts"
             )
-    del cleanup_confirmed
     phases_by_name = {phase.name: phase for phase in experiment.phases}
     for phase_status in status["phases"]:
         running_attempts: list[dict[str, Any]] = []
@@ -306,17 +303,14 @@ def capture_result_snapshot(
 def finalize_result_snapshot(
     snapshot: Mapping[str, object],
     *,
-    cleanup_confirmed: bool,
     confirmed_attempt_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     """Finalize a previously captured snapshot without rereading shared state.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
-    :param bool cleanup_confirmed: Whether remaining trainer process groups are confirmed gone.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     """
-    del cleanup_confirmed
     parsed = RunResultSnapshot.model_validate(snapshot)
     confirmed = set(confirmed_attempt_ids)
     for phase in parsed.status.phases:

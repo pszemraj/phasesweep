@@ -28,6 +28,7 @@ from phasesweep.engine import (
     read_winners,
 )
 from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
+from phasesweep.engine.run import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
     Winner,
@@ -516,6 +517,33 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
     assert len(parent_after) == len(parent_before) == 1
     assert {path: path.read_bytes() for path in protected_paths} == before
+
+
+def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
+    """A grandchild study binds its ancestor even when the middle study is absent."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(name="schedule", inherits=["arch"], n_trials=1, search_space={}),
+            Phase(name="final", inherits=["schedule"], n_trials=1, search_space={}),
+        ]
+    )
+    parent_study = SimpleNamespace(
+        user_attrs={},
+        get_trials=lambda *, deepcopy: [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE)],
+    )
+    grandchild_study = SimpleNamespace(user_attrs={"phasesweep_fingerprint": "bound-grandchild"})
+
+    with pytest.raises(RuntimeError, match=r"dependent phase study/studies \['final'\]"):
+        _reject_bound_descendant_topups(
+            experiment,
+            from_phase=None,
+            existing_studies={"arch": parent_study, "final": grandchild_study},
+        )
 
 
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:

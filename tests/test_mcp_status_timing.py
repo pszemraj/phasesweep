@@ -172,7 +172,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         returncode=0,
         error_class=None,
         cleanup_confirmed=True,
-        result_snapshot=capture_result_snapshot(experiment, cleanup_confirmed=True),
+        result_snapshot=capture_result_snapshot(experiment),
     )
     winner_path.write_text(
         yaml.safe_dump(
@@ -256,7 +256,6 @@ def test_await_run_returns_immediately_on_terminal(
         ended_at=utc_now_iso(),
         result_snapshot=capture_result_snapshot(
             registry.get("srv").experiment,
-            cleanup_confirmed=True,
         ),
     )
     clock = _fake_clock(monkeypatch)
@@ -360,7 +359,6 @@ def test_await_run_returns_when_run_fails_mid_wait(
             cleanup_confirmed=True,
             result_snapshot=capture_result_snapshot(
                 registry.get("srv").experiment,
-                cleanup_confirmed=True,
             ),
         )
 

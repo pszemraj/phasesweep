@@ -12,8 +12,10 @@ import pytest
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import (
     CategoricalParam,
+    Constraint,
     Experiment,
     IntParam,
+    JsonExtractor,
     LogRegexExtractor,
     Metric,
     Phase,
@@ -28,6 +30,9 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+from phasesweep.evidence import TrialContext
+from phasesweep.runtime.process import ProcessResult
 from tests.conftest import copy_fake_train, make_experiment, write_trainer, write_yaml
 
 
@@ -412,79 +417,71 @@ phases:
 
 
 @pytest.mark.parametrize(
-    ("trainer_payload", "metric_log", "constraints_yaml", "exp_name"),
+    ("extracted_values", "failure_reason"),
     [
-        # Constraint extractor returns NaN
-        (
-            "{'eval_loss': 1.0, 'param_bytes': float('nan')}",
-            "1.0",
-            "constraints:\n  - name: param_bytes\n    extractor: { type: json, path: result.json, key: param_bytes }\n    max: 1000\n",
-            "nan_c",
+        pytest.param(
+            [float("inf")],
+            "metric extractor returned non-finite value: inf",
+            id="inf_metric",
         ),
-        # Metric extractor returns +inf
-        (
-            "{'eval_loss': float('inf')}",
-            "inf",
-            "",
-            "inf_m",
+        pytest.param(
+            [1.0, float("nan")],
+            "constraint extractor 'param_bytes' returned non-finite value: nan",
+            id="nan_constraint",
         ),
     ],
-    ids=["nan_constraint", "inf_metric"],
 )
-def test_non_finite_extracted_value_marks_trial_fail(
-    tmp_path,
-    trainer_payload: str,
-    metric_log: str,
-    constraints_yaml: str,
-    exp_name: str,
-):
-    """A non-finite metric or constraint value is a malformed trial — FAIL,
-    not COMPLETE-with-sentinel. Both the metric path and the constraint path
-    must surface the failure the same way; one parametrized test exercises
-    both routes through the same end-to-end pipeline."""
-    trainer = tmp_path / "trainer.py"
-    write_trainer(
-        trainer,
-        f"""
-        import json, sys, argparse, math
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, 'w') as f:
-            json.dump({trainer_payload}, f)
-        print('eval_loss={metric_log}')
-        """,
+def test_non_finite_extracted_value_returns_failed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extracted_values: list[float],
+    failure_reason: str,
+) -> None:
+    """Non-finite extractor returns reach both engine-level finite-value guards."""
+    experiment = make_experiment(
+        constraints=[
+            Constraint(
+                name="param_bytes",
+                extractor=JsonExtractor(
+                    type="json",
+                    path="result.json",
+                    key="param_bytes",
+                ),
+                max=1000,
+            )
+        ]
+    )
+    values = iter(extracted_values)
+    monkeypatch.setattr(
+        "phasesweep.engine.trial.run_extractor",
+        lambda *_args, **_kwargs: next(values),
+    )
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=0,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(
+            return_code=0,
+            timed_out=False,
+            pid=123,
+            duration_seconds=0.1,
+        ),
     )
 
-    db = tmp_path / "phases.db"
-    yaml_text = f"""
-experiment: {exp_name}
-storage: sqlite:///{db}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
-{constraints_yaml}
-phases:
-  - name: a
-    n_trials: 2
-    max_consecutive_failures: 10
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    p = tmp_path / "exp.yaml"
-    p.write_text(yaml_text)
-    exp = load_experiment(p)
-    from phasesweep.engine.selection import NoFeasibleTrialError
+    result = extract_trial_result(experiment=experiment, executed=executed)
 
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(exp)
-
-    study = optuna.load_study(study_name=f"{exp_name}::a", storage=f"sqlite:///{db}")
-    for trial in study.get_trials():
-        assert trial.state == optuna.trial.TrialState.FAIL
+    assert result.metric is None
+    assert result.feasible is False
+    assert result.failure_reason == failure_reason
 
 
 def test_abort_after_gpu_acquire_prevents_queued_trials(tmp_path: Path) -> None:
