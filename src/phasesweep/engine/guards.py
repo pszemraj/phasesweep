@@ -14,6 +14,11 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.engine.errors import (
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -362,7 +367,7 @@ def _verify_fingerprint(
     if existing is None:
         study.set_user_attr("phasesweep_fingerprint", fp)
     elif existing != fp:
-        raise RuntimeError(
+        raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
             f"old study, or rename the phase."
@@ -514,7 +519,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
 
     trial_numbers = [trial.number for trial in trials]
     detail = "missing" if version is None else repr(version)
-    raise RuntimeError(
+    raise StudySchemaMismatchError(
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
         "Use a new experiment name, or archive/delete the old study before running again."
@@ -534,8 +539,12 @@ def _preflight_existing_studies(
         try:
             study = _load_existing_phase_study(experiment, phase)
         except BaseException as exc:
-            report.mark_uncertain(exc)
-            errors.append(exc)
+            unavailable = StudyStorageUnavailableError(
+                f"Could not inspect persistent study storage for phase {phase.name!r}."
+            )
+            unavailable.__cause__ = exc
+            report.mark_uncertain(unavailable)
+            errors.append(unavailable)
             continue
         if study is None:
             continue

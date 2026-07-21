@@ -16,6 +16,7 @@ import yaml
 from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Suite
 from phasesweep.config.common import _validate_safe_name
+from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.guards import (
     _experiment_lock,
     _preflight_existing_studies,
@@ -67,6 +68,7 @@ class TerminalReport:
     recovered_attempt_ids: frozenset[str]
     uncertain_attempt_ids: frozenset[str]
     cleanup_error: BaseException | None = None
+    failure_stage: str | None = None
 
 
 def run_config(
@@ -241,6 +243,7 @@ def run_experiment(
                 cleanup_confirmed=True,
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
                 uncertain_attempt_ids=frozenset(),
+                failure_stage=None,
             )
             return result
         except BaseException as exc:
@@ -278,6 +281,7 @@ def run_experiment(
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
                 uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 cleanup_error=cleanup.error,
+                failure_stage="execution" if generation_prepared else "preflight",
             )
             if not cleanup.cleanup_confirmed and not isinstance(exc, ProcessCleanupUncertainError):
                 raise ProcessCleanupUncertainError(
@@ -295,6 +299,7 @@ def run_experiment(
                             recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
                             uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                             cleanup_error=cleanup.error,
+                            failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
                 except BaseException:
@@ -512,7 +517,7 @@ def _reject_bound_descendant_topups(
             and isinstance(dependent.user_attrs.get("phasesweep_fingerprint"), str)
         ]
         if bound:
-            raise RuntimeError(
+            raise StudyContextConflictError(
                 f"Phase {phase.name!r} has {phase.n_trials - terminal} top-up trial(s) "
                 f"remaining, but dependent phase study/studies {bound} are already bound "
                 "to its published winner. Use a new experiment name to run the larger "

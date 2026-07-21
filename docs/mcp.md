@@ -43,9 +43,9 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | `phasesweep_list_experiments` | optional `limit` (1-100; default 50), `cursor` | read | catalog ids, description, phase names, metric name + goal, authorized capabilities, `total_count`, `next_cursor` |
 | `phasesweep_validate_config` | `experiment_id` | read | capabilities and per-phase name, `n_trials`, sampler, inherited phases, and search-space *keys* (not ranges); a changed config is a tool error |
 | `phasesweep_get_latest_run` | `experiment_id` | read | the newest durable run, selected by launch timestamp with a stable tie-breaker, or `found: false` |
-| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | dense cumulative state counts plus explicit before-run and this-run progress, computed remaining attempts, storage-read availability, winner presence, result provenance, run state, and elapsed time; terminal run-id reads require a frozen snapshot |
+| `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | dense cumulative state counts plus explicit before-run and this-run progress, computed remaining attempts, storage-read availability, winner presence, result provenance, run state, elapsed time, and a safe actionable failure category when terminal; terminal run-id reads require a frozen snapshot |
 | `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (5-600; default 120) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`recovery_required` / `terminal` / `phase_completed` / `timeout`) |
-| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | objective metadata, result provenance, declared/winner counts, missing phases, all-phases completeness, and per-winner trial number, metric, policy-filtered sampled params, gate status, and partial-winner status |
+| `phasesweep_get_winners` | exactly one of `experiment_id` or `run_id` | read | objective metadata, result provenance, declared/winner counts, missing phases, all-phases completeness, safe terminal failure context, and per-winner trial number, metric, policy-filtered sampled params, gate status, and partial-winner status |
 | `phasesweep_launch_sweep` | `experiment_id`, optional `from_phase` | spawn detached | `{run_id, experiment_id, state}` |
 | `phasesweep_cancel_sweep` | `run_id` | signal | `{run_id, state, cleanup_confirmed, recovery_required}` |
 
@@ -62,6 +62,8 @@ A launched sweep runs as a detached background process in its own session, so it
 - `null`: the run was already terminal and no cancellation was attempted.
 
 Use `recovery_required` as the decision field: when true, stop monitoring and report the run to the user because it will not become terminal until an operator resolves an uncertain launch, cleanup, or interrupted result finalization. `phasesweep_await_run` returns immediately with `reason: recovery_required`; status and latest-run payloads expose the same flag in their run metadata.
+
+Terminal run metadata includes a path-free `failure` object with `code`, `stage`, `retryable`, `actor`, and a canned `remediation`. Raw exception messages remain operator-only because they can contain storage details or filesystem paths. A preflight refusal has its own frozen generation snapshot with zero attempts owned by that generation, so run-specific status and winner reads remain usable without replacing the last successful experiment result.
 
 Cleanup confirmation is emitted by the engine shutdown handler after it terminates active trial process groups through the same confirmed cleanup path used by stale-trial recovery. If a spawned runner disappears without recording terminal status, if the runner group is gone but cancellation cannot observe status, or if status reports unconfirmed trial cleanup, the server writes a cleanup-uncertain marker and keeps the run counted as live so later launches do not reuse possibly-held resources. Normal runner shutdown asks the engine to tear down trial groups, and uncertain trainer leftovers are handled by the engine's stale reaper before later launches.
 

@@ -15,7 +15,13 @@ import os
 import sys
 from pathlib import Path
 
-from phasesweep.engine import TerminalReport, run_experiment
+from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
+from phasesweep.engine.errors import (
+    StudyContextConflictError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
@@ -27,6 +33,92 @@ from phasesweep.runtime.process import (
     install_signal_handlers,
     read_proc_starttime,
 )
+
+
+def _safe_failure_payload(
+    error: BaseException,
+    *,
+    stage: str | None,
+) -> dict[str, object]:
+    """Map an operator-facing exception to one stable, path-free agent failure."""
+    failure_stage = stage if stage in {"preflight", "execution", "cleanup"} else "execution"
+    if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
+        return {
+            "code": "fingerprint_mismatch",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Use a new experiment name, or ask the operator to archive the "
+                "incompatible persistent study before retrying."
+            ),
+        }
+    if isinstance(error, StudySchemaMismatchError):
+        return {
+            "code": "study_schema_mismatch",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Use a new experiment name, or ask the operator to archive the "
+                "unsupported persistent study before retrying."
+            ),
+        }
+    if isinstance(error, StudyStorageUnavailableError):
+        return {
+            "code": "storage_unavailable",
+            "stage": failure_stage,
+            "retryable": True,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to restore the configured study storage, then start a new run."
+            ),
+        }
+    if isinstance(error, ProcessCleanupUncertainError):
+        return {
+            "code": "cleanup_uncertain",
+            "stage": "cleanup",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to run phasesweep mcp recover-run before another launch."
+            ),
+        }
+    if isinstance(error, NoFeasibleTrialError):
+        return {
+            "code": "trainer_failed",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to inspect trainer and evidence logs before starting a new run."
+            ),
+        }
+    if isinstance(error, TimeoutError):
+        return {
+            "code": "timeout",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to review the configured wallclock budget before retrying."
+            ),
+        }
+    if isinstance(error, PhaseSweepShutdown):
+        return {
+            "code": "cancelled",
+            "stage": failure_stage,
+            "retryable": True,
+            "actor": "agent",
+            "remediation": "Start a new run only if the user still wants the sweep to continue.",
+        }
+    return {
+        "code": "internal_error",
+        "stage": failure_stage,
+        "retryable": False,
+        "actor": "operator",
+        "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
+    }
 
 
 def _write_status(
@@ -173,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         "returncode": 0,
         "error_class": None,
         "cleanup_confirmed": True,
+        "failure": None,
     }
     result_snapshot: dict | None = None
     result_snapshot_error: str | None = None
@@ -206,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
             nonlocal result_snapshot, result_snapshot_error, terminal_report
             terminal_report = report
             status["cleanup_confirmed"] = report.cleanup_confirmed
+            if report.primary_error is not None:
+                status["failure"] = _safe_failure_payload(
+                    report.primary_error,
+                    stage=report.failure_stage,
+                )
             try:
                 result_snapshot = capture_result_snapshot(
                     config,
@@ -235,6 +333,10 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
+        status["failure"] = _safe_failure_payload(
+            terminal_report.primary_error if terminal_report is not None else exc,
+            stage=terminal_report.failure_stage if terminal_report is not None else "execution",
+        )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
@@ -243,6 +345,10 @@ def main(argv: list[str] | None = None) -> int:
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else False
         )
+        status["failure"] = _safe_failure_payload(
+            primary,
+            stage=terminal_report.failure_stage if terminal_report is not None else "cleanup",
+        )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
@@ -250,6 +356,10 @@ def main(argv: list[str] | None = None) -> int:
         status["error_class"] = type(primary).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else True
+        )
+        status["failure"] = _safe_failure_payload(
+            primary,
+            stage=terminal_report.failure_stage if terminal_report is not None else "execution",
         )
         raise
     finally:

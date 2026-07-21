@@ -14,6 +14,7 @@ import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.runtime.files import atomic_text_writer
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
@@ -516,7 +517,7 @@ def _load_winner(
         )
 
     if stored_fp != current_fp:
-        raise RuntimeError(
+        raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
             f"(stored fingerprint {stored_fp[:16]}... != current "
             f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "

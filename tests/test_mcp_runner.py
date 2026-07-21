@@ -281,13 +281,13 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
     assert [winner["phase"] for winner in captured["winners"]] == ["a"]  # type: ignore[index]
 
 
-def test_terminal_snapshot_rejects_a_stale_generation_marker(tmp_path: Path) -> None:
+def test_terminal_snapshot_rejects_generation_without_lifecycle_record(tmp_path: Path) -> None:
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     generation_path = _generation_path(experiment)
     generation_path.parent.mkdir(parents=True)
     generation_path.write_text("generation_id: prior-generation\n")
 
-    with pytest.raises(RuntimeError, match="generation marker does not match"):
+    with pytest.raises(RuntimeError, match="no readable immutable lifecycle record"):
         mcp_runner.capture_result_snapshot(
             experiment,
             cleanup_confirmed=False,
@@ -379,16 +379,18 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
         }
     )
     callback_generations: list[str] = []
+    captured: list[dict[str, object]] = []
 
     def capture_failed_resume(report: TerminalReport) -> None:
         assert isinstance(report.primary_error, RuntimeError)
         callback_generations.append(report.generation_id)
-        with pytest.raises(RuntimeError, match="generation marker does not match"):
+        captured.append(
             mcp_runner.capture_result_snapshot(
                 changed,
                 cleanup_confirmed=False,
                 generation_id=report.generation_id,
             )
+        )
 
     with pytest.raises(RuntimeError, match="different phase config"):
         run_experiment(
@@ -398,6 +400,14 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
         )
 
     assert len(callback_generations) == 1
+    assert len(captured) == 1
+    assert captured[0]["status"]["generation_id"] == callback_generations[0]  # type: ignore[index]
+    assert captured[0]["status"]["summary_present"] is False  # type: ignore[index]
+    assert all(
+        phase["generation_trials"] == {}
+        for phase in captured[0]["status"]["phases"]  # type: ignore[index]
+    )
+    assert captured[0]["winners"] == []
     assert {path: path.read_bytes() for path in protected_paths} == before
     failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
     assert len(failed_generations) == 1

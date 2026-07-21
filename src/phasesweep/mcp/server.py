@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -298,6 +298,25 @@ class ValidateConfigResult(_ToolPayload):
     phases: list[PhaseValidationPayload]
 
 
+class FailurePayload(_ToolPayload):
+    """Path-free terminal failure category and recovery policy."""
+
+    code: Literal[
+        "fingerprint_mismatch",
+        "study_schema_mismatch",
+        "storage_unavailable",
+        "trainer_failed",
+        "timeout",
+        "cleanup_uncertain",
+        "cancelled",
+        "internal_error",
+    ]
+    stage: Literal["preflight", "execution", "cleanup"]
+    retryable: bool
+    actor: Literal["agent", "operator"]
+    remediation: str
+
+
 class RunPayload(_ToolPayload):
     """Agent-visible run process state."""
 
@@ -309,6 +328,10 @@ class RunPayload(_ToolPayload):
             "True when cleanup is uncertain and only the operator can run "
             "phasesweep mcp recover-run; the run remains state=running until recovery."
         )
+    )
+    failure: FailurePayload | None = Field(
+        default=None,
+        description="Safe terminal failure category and next action; null while running or successful.",
     )
 
 
@@ -451,6 +474,7 @@ class GetWinnersResult(_ToolPayload):
     missing_phases: list[PhaseName]
     all_phases_have_winners: bool
     phases: list[WinnerPhasePayload]
+    failure: FailurePayload | None = None
 
 
 class LaunchSweepResult(_ToolPayload):
@@ -710,7 +734,18 @@ class PhaseSweepMCP:
             "state": state,
             "started_at": handle.started_at,
             "recovery_required": self._runs.recovery_required(handle),
+            "failure": self._run_failure_payload(handle),
         }
+
+    def _run_failure_payload(self, handle: RunHandle) -> dict[str, Any] | None:
+        """Return a validated safe terminal failure, never the raw exception text."""
+        terminal = self._runs.recorded_terminal_status(handle)
+        if terminal is None or terminal.get("failure") is None:
+            return None
+        try:
+            return FailurePayload.model_validate(terminal["failure"]).model_dump(mode="json")
+        except ValidationError:
+            return None
 
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
         """Per-phase trial counts and winner presence plus the run process state.
@@ -963,7 +998,7 @@ class PhaseSweepMCP:
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
-        return winners_payload(
+        result = winners_payload(
             target_id,
             winner_views,
             metric={
@@ -977,6 +1012,8 @@ class PhaseSweepMCP:
             represented_generation_id=represented_generation_id,
             visible_params=visible_params,
         )
+        result["failure"] = self._run_failure_payload(handle) if handle is not None else None
+        return result
 
     def _terminal_result_snapshot(self, handle: RunHandle) -> RunResultSnapshot | None:
         """Return a live run's current view or require its frozen terminal snapshot.

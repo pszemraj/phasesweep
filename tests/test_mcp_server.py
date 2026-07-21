@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -15,8 +16,14 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import main as cli_main
-from phasesweep.config import Experiment, load_config
-from phasesweep.engine import NoFeasibleTrialError, ProcessCleanupUncertainError, TerminalReport
+from phasesweep.config import Experiment, Phase, load_config
+from phasesweep.engine import (
+    NoFeasibleTrialError,
+    ProcessCleanupUncertainError,
+    TerminalReport,
+    run_experiment,
+)
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -46,6 +53,7 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.runtime.process import read_proc_starttime
+from tests.conftest import make_experiment, write_constant_trainer
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -983,6 +991,79 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     assert status["returncode"] == 1
     assert status["error_class"] == "RuntimeError"
     assert status["cleanup_confirmed"] is True
+
+
+def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    config = tmp_path / "srv.yaml"
+    experiment = make_experiment(
+        experiment="srv",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                fixed_overrides={"k": 1},
+                search_space={},
+            )
+        ],
+    )
+    run_experiment(experiment)
+    changed = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"fixed_overrides": {"k": 2}})]}
+    )
+    config.write_text(yaml.safe_dump(changed.model_dump(mode="json"), sort_keys=False))
+    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    store = RunStore(registry.state_dir)
+    run_id = "srv-preflight-failure"
+    snapshot_path = store.config_snapshot_path(run_id)
+    snapshot_path.write_bytes(config.read_bytes())
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+
+    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(snapshot_path),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(store.status_path(run_id)),
+                "--state-dir",
+                str(registry.state_dir),
+                "--experiment-id",
+                "srv",
+                "--started-at",
+                "2026-06-24T00:00:00Z",
+            ]
+        )
+
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["result_snapshot_state"] == "complete"
+    assert terminal["failure"]["code"] == "fingerprint_mismatch"
+    app = PhaseSweepMCP(registry, store)
+    latest = app.latest_run("srv")
+    status = app.status(run_id=run_id)
+    awaited = asyncio.run(app.await_run(run_id))
+    winners = app.winners(run_id=run_id)
+
+    for payload in (latest["run"], status["run"], awaited["run"]):
+        assert payload["failure"]["code"] == "fingerprint_mismatch"
+        assert payload["failure"]["retryable"] is False
+        assert payload["failure"]["actor"] == "operator"
+    assert status["result_source"] == "frozen_run_snapshot"
+    assert status["summary_present"] is False
+    assert status["phases"][0]["attempts_launched_this_run"] == 0
+    assert awaited["reason"] == "terminal"
+    assert winners["winner_count"] == 0
+    assert winners["failure"]["code"] == "fingerprint_mismatch"
 
 
 def test_runner_records_cleanup_uncertainty_for_cleanup_errors(

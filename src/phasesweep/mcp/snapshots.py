@@ -5,12 +5,18 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Annotated, Any, Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, WinnerSource
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    WinnerSource,
+    _generation_record_path,
+)
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -175,12 +181,18 @@ def capture_result_snapshot(
     :param bool require_trial_data: Refuse ambiguous storage reads when the engine succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
     """
-    status = read_status(experiment)
-    if generation_id is not None and status["generation_id"] != generation_id:
-        raise RuntimeError(
-            "current generation marker does not match the locked engine generation; "
-            "refusing to freeze stale result artifacts"
-        )
+    if generation_id is not None:
+        try:
+            lifecycle = yaml.safe_load(
+                _generation_record_path(experiment, generation_id).read_text()
+            )
+        except (OSError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                "requested generation has no readable immutable lifecycle record"
+            ) from exc
+        if not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id:
+            raise RuntimeError("requested generation lifecycle record does not match its identity")
+    status = read_status(experiment, generation_id=generation_id)
     if require_trial_data:
         unavailable = [
             phase["phase"] for phase in status["phases"] if not phase["trial_data_available"]
