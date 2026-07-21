@@ -205,22 +205,23 @@ def capture_result_snapshot(
     del cleanup_confirmed
     phases_by_name = {phase.name: phase for phase in experiment.phases}
     for phase_status in status["phases"]:
-        phase = phases_by_name[phase_status["phase"]]
-        study = _load_existing_phase_study(experiment, phase)
         running_attempts: list[dict[str, Any]] = []
-        if study is not None:
-            for trial in study.get_trials(deepcopy=False):
-                if trial.state.name != "RUNNING":
-                    continue
-                generation = trial.user_attrs.get(GENERATION_ID_ATTR)
-                attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-                running_attempts.append(
-                    {
-                        "trial_number": trial.number,
-                        "generation_id": generation if isinstance(generation, str) else None,
-                        "attempt_id": attempt if isinstance(attempt, str) else None,
-                    }
-                )
+        if phase_status["trial_data_available"]:
+            phase = phases_by_name[phase_status["phase"]]
+            study = _load_existing_phase_study(experiment, phase)
+            if study is not None:
+                for trial in study.get_trials(deepcopy=False):
+                    if trial.state.name != "RUNNING":
+                        continue
+                    generation = trial.user_attrs.get(GENERATION_ID_ATTR)
+                    attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+                    running_attempts.append(
+                        {
+                            "trial_number": trial.number,
+                            "generation_id": generation if isinstance(generation, str) else None,
+                            "attempt_id": attempt if isinstance(attempt, str) else None,
+                        }
+                    )
         phase_status["running_attempts"] = running_attempts
     winners = read_winners(experiment, generation_id=status["generation_id"])
     snapshot = RunResultSnapshot(

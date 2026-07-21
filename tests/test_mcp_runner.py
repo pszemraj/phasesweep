@@ -373,6 +373,35 @@ def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: P
         )
 
 
+def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'missing' / 'studies.db'}",
+        n_trials=1,
+    )
+
+    def fail_redundant_read(*args: object, **kwargs: object) -> None:
+        raise OSError("storage remains unavailable")
+
+    monkeypatch.setattr(
+        "phasesweep.mcp.snapshots._load_existing_phase_study",
+        fail_redundant_read,
+    )
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        cleanup_confirmed=False,
+        require_trial_data=False,
+    )
+
+    phase = snapshot["status"]["phases"][0]
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] == []
+
+
 @pytest.mark.parametrize("from_phase", [None, "b"])
 def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
     tmp_path: Path,
