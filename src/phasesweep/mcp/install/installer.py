@@ -305,15 +305,36 @@ def _apply_mcp(
             "error",
             note="refusing project config path that resolves outside the project",
         )
+    # Dotfile managers commonly symlink user config directories. Pin their
+    # physical parent once while retaining the stricter project-path policy.
+    try:
+        edit_path = (
+            spec.path.parent.resolve(strict=False) / spec.path.name
+            if spec.scope == "user"
+            else spec.path
+        )
+    except (OSError, RuntimeError):
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note="config directory could not be resolved",
+        )
     if spec.format == "toml":
-        if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
+        if edit_path.is_symlink() or (edit_path.exists() and not edit_path.is_file()):
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-        return _apply_toml_mcp(spec.path, mode, command, catalog, dry_run)
+        result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run)
+        return StepResult(
+            result.integration,
+            spec.path,
+            result.action,
+            result.note,
+        )
 
     if mode == "uninstall":
         managed = partial(is_managed_mcp_entry, spec.style)
         action = remove_json_member(
-            spec.path,
+            edit_path,
             spec.key,
             SERVER_NAME,
             managed=managed,
@@ -329,12 +350,12 @@ def _apply_mcp(
             note = None
         return StepResult("mcp", spec.path, action, note=note)
     assert catalog is not None
-    if spec.path.is_symlink() or (spec.path.exists() and not spec.path.is_file()):
+    if edit_path.is_symlink() or (edit_path.exists() and not edit_path.is_file()):
         return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
     entry = mcp_entry(spec.style, command, catalog)
     managed = partial(is_managed_mcp_entry, spec.style)
     action = merge_json_member(
-        spec.path,
+        edit_path,
         spec.key,
         SERVER_NAME,
         entry,

@@ -501,6 +501,37 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     assert all(path.read_bytes() == b"" for path in instruction_paths)
 
 
+@pytest.mark.parametrize(
+    ("agent_id", "config_dir"),
+    [("codex", Path(".codex")), ("claude-desktop", Path(".config/Claude"))],
+)
+def test_installer_supports_symlinked_user_config_directory(
+    fake_home, tmp_path, capsys, agent_id, config_dir
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    managed_dir = fake_home / "dotfiles" / agent_id
+    managed_dir.mkdir(parents=True)
+    link = fake_home / config_dir
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(managed_dir, target_is_directory=True)
+
+    code = installer.run(
+        "install",
+        project,
+        catalog,
+        [agent_id],
+        "mcp",
+        yes=True,
+        allow_user_scope=True,
+    )
+
+    assert code == 0, capsys.readouterr().out
+    config = next(target for target in agent_targets(project) if target.id == agent_id).mcp.path
+    assert "phasesweep" in config.read_text()
+
+
 def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
