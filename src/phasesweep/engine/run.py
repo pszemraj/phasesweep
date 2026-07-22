@@ -318,6 +318,8 @@ def run_experiment(
                 and not isinstance(primary_error, ProcessCleanupUncertainError)
                 and not shutdown_cleanup_uncertain
             ):
+                # Cleanup uncertainty intentionally becomes the actionable error;
+                # the original failure remains chained for diagnosis but is unsafe to handle alone.
                 raise ProcessCleanupUncertainError(
                     "The run failed and subsequent process cleanup could not be confirmed."
                 ) from primary_error
