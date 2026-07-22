@@ -23,6 +23,7 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import (
+    NoFeasibleTrialError,
     SamplerContinuationUnsupportedError,
     TrialTargetRegressionError,
     read_winners,
@@ -422,21 +423,25 @@ phases:
         ),
         pytest.param(
             Sampler(type="cmaes", seed=0),
-            {"x": FloatParam(type="float", low=0.0, high=1.0)},
+            {
+                "x": FloatParam(type="float", low=0.0, high=1.0),
+                "y": FloatParam(type="float", low=0.0, high=1.0),
+            },
             id="cmaes",
         ),
     ],
 )
-def test_stateful_sampler_top_up_is_rejected_before_mutation(
+def test_stateful_sampler_resumes_accepted_target_but_rejects_top_up(
     tmp_path: Path,
     sampler: Sampler,
     search_space: dict,
 ) -> None:
-    trainer = write_constant_trainer(tmp_path)
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     phase = Phase(
         name="p",
-        n_trials=1,
+        n_trials=3,
+        max_consecutive_failures=1,
         sampler=sampler,
         search_space=search_space,
     )
@@ -446,10 +451,17 @@ def test_stateful_sampler_top_up_is_rejected_before_mutation(
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         phases=[phase],
     )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(experiment)
+
+    write_constant_trainer(tmp_path)
     run_experiment(experiment)
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert len(study.trials) == 3
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     winner_before = _winner_path(experiment, "p").read_bytes()
 
-    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 2})]})
+    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
     with pytest.raises(
         SamplerContinuationUnsupportedError,
         match="process-local continuation state.*new experiment name",
@@ -457,7 +469,7 @@ def test_stateful_sampler_top_up_is_rejected_before_mutation(
         run_experiment(top_up)
 
     study = optuna.load_study(study_name="t::p", storage=storage)
-    assert len(study.trials) == 1
+    assert len(study.trials) == 3
     assert _winner_path(experiment, "p").read_bytes() == winner_before
 
 

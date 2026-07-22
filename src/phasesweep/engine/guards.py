@@ -643,22 +643,33 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
 
 def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
-    """Reject a stateful sampler restart that would depend on invocation batching.
+    """Allow interrupted stateful runs, but reject a larger cross-invocation target.
 
     :param optuna.Study study: Existing study whose finished-trial count is checked.
     :param Phase phase: Phase config supplying the sampler type and trial target.
-    :raises SamplerContinuationUnsupportedError: The phase uses a stateful
-        sampler (``tpe`` or ``cmaes``) and has some but not all of its target
-        trials finished, so process-local sampler continuation state cannot be
-        reproduced safely.
+    :raises SamplerContinuationUnsupportedError: The phase uses a stateful sampler
+        (``tpe`` or ``cmaes``) and raises its previously accepted trial target.
     """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
-    if 0 < finished < phase.n_trials and phase.sampler.type in {"tpe", "cmaes"}:
+    if phase.sampler.type not in {"tpe", "cmaes"} or finished == 0:
+        return
+
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials > accepted_target:
         raise SamplerContinuationUnsupportedError(
-            f"Phase {phase.name!r} uses {phase.sampler.type!r} and has {finished} terminal "
-            f"trial(s) toward a target of {phase.n_trials}. PhaseSweep cannot reproduce this "
-            "sampler's process-local continuation state safely. Use a new experiment name, "
-            "or run the full target in one invocation."
+            f"Phase {phase.name!r} uses {phase.sampler.type!r} and raises its accepted target "
+            f"from {accepted_target} to {phase.n_trials} terminal trial(s). PhaseSweep cannot "
+            "reproduce this sampler's process-local continuation state safely. Use a new "
+            "experiment name, or run the full target in one invocation."
+        )
+    if finished < phase.n_trials:
+        log.warning(
+            "phase=%s resuming %s sampler after interruption at %d/%d terminal trials; "
+            "the seeded suggestion sequence may differ from an uninterrupted run",
+            phase.name,
+            phase.sampler.type,
+            finished,
+            phase.n_trials,
         )
 
 
