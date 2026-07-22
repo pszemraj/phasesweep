@@ -23,7 +23,7 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry remains bound to this Python environment. If you move, delete, or recreate it, install PhaseSweep in the replacement environment and rerun the same step-3 install command to update the managed entry.
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry remains bound to this Python environment; see [Troubleshooting](#troubleshooting) if it moves.
 
 ```bash
 which phasesweep-mcp
@@ -60,8 +60,6 @@ phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-s
 
 Without `--agent`, interactive installs preselect detected clients in one menu while leaving undetected clients selectable; unattended `--yes` installs select every detected client. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
-Automatic edits are limited to regular UTF-8 files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Each file edit is serialized with other PhaseSweep installer processes and refused if the file changes again before replacement. Malformed configs and same-name entries that do not match the generated shape are left untouched with manual guidance. Marker fences are recognized only as exact standalone lines; text outside a managed block retains its original bytes and newline style. Strict JSON edits change only the managed data member, then re-serialize the whole document: duplicate keys, non-finite values, and floating-point values that overflow to infinity are refused; key order, detected indentation, final-newline state, and permissions are retained; compact whitespace and numeric spellings may be normalized, and finite numbers use Python's JSON precision. `uninstall` removes the managed member or block and leaves now-empty files and JSON containers in place because the installer does not persist whole-file creation provenance. Shared instruction blocks remain until their last installed agent owner is removed.
-
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 
 An instructions-only install (`--type instructions`) needs neither a catalog nor the optional MCP dependency and remains available outside the MCP runtime's [platform requirements](runtime.md#platform-support).
@@ -69,6 +67,15 @@ An instructions-only install (`--type instructions`) needs neither a catalog nor
 Claude Desktop and Codex MCP entries are user-scoped, so those clients see the server from every project. The plan flags this. Interactive installs require confirmation; unattended `--yes` installs additionally require `--allow-user-scope`.
 
 Restart the client after any config change.
+
+<details>
+<summary>What automatic edits preserve</summary>
+
+Automatic edits are limited to regular UTF-8 files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Each edit is serialized with other PhaseSweep installers and refused if the file changes before replacement. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+
+Marker-fenced edits preserve all bytes outside the managed block. Strict JSON edits re-serialize the document while retaining key order, detected indentation and newline style, final-newline state, and permissions; compact whitespace and numeric spellings may be normalized. Duplicate keys, non-finite or overflowing numbers, comments, and JSON5 are refused. `uninstall` leaves empty files and containers in place because whole-file creation ownership is not persisted. Shared instruction blocks remain until their last installed agent owner is removed.
+
+</details>
 
 <details>
 <summary>Manual setup (any client)</summary>
