@@ -740,8 +740,8 @@ def test_fresh_run_preflight_consumes_run_deadline(
         run_experiment(experiment)
 
 
-def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path) -> None:
-    """Skipped winners need a matching fingerprint, not just plausible YAML."""
+def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
+    """Skipped winners need matching fingerprints and scoped provenance."""
 
     def strip_fingerprint(data: dict) -> str:
         del data["phase_fingerprint"]
@@ -751,7 +751,26 @@ def test_from_phase_refuses_winner_yaml_with_invalid_fingerprint(tmp_path: Path)
         data["phase_fingerprint"] = "0" * 64
         return "different phase config"
 
-    for case, mutate in (("missing", strip_fingerprint), ("tampered", tamper_fingerprint)):
+    def strip_generation_id(data: dict) -> str:
+        del data["generation_id"]
+        return "no valid generation_id"
+
+    def strip_attempt_id(data: dict) -> str:
+        del data["attempt_id"]
+        return "no valid attempt_id"
+
+    def strip_winner_source(data: dict) -> str:
+        del data["winner_source"]
+        return "no valid winner_source"
+
+    cases = (
+        ("missing-fingerprint", strip_fingerprint),
+        ("tampered-fingerprint", tamper_fingerprint),
+        ("legacy-generation", strip_generation_id),
+        ("legacy-attempt", strip_attempt_id),
+        ("legacy-source", strip_winner_source),
+    )
+    for case, mutate in cases:
         case_dir = tmp_path / case
         case_dir.mkdir()
         trainer = write_constant_trainer(case_dir)
