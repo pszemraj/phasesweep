@@ -117,6 +117,21 @@ def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
 
 
+def test_json_member_edits_preserve_crlf(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_bytes(b'{\r\n  "theme": "dark",\r\n  "mcpServers": {}\r\n}\r\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+    installed = path.read_bytes()
+    assert installed.endswith(b"\r\n")
+    assert b"\n" not in installed.replace(b"\r\n", b"")
+
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
+    removed = path.read_bytes()
+    assert removed.endswith(b"\r\n")
+    assert b"\n" not in removed.replace(b"\r\n", b"")
+
+
 def test_merge_json_member_preserves_literal_unicode(tmp_path):
     path = tmp_path / "mcp.json"
     path.write_text('{"label":"café","mcpServers":{}}\n')

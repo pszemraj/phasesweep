@@ -5,8 +5,8 @@ content, refuse same-name conflicts, and serialize each target's complete
 read-modify-write transaction:
 
 - JSON member edits: parse the whole document, change one member under one
-  container key, and re-serialize with the file's detected indentation. Key
-  order is retained, but whitespace and finite-number spellings may change.
+  container key, and re-serialize with the file's detected indentation and
+  newline style. Key order is retained, but whitespace and finite-number spellings may change.
   Duplicate keys, non-finite/overflowing numbers, comments, and JSON5 are
   never modified; the caller gets ``"skipped"`` and prints a manual snippet.
 - Marker-fenced text blocks: replace-or-append a block between start/end
@@ -299,16 +299,31 @@ def _detected_indent(text: str) -> str:
     return match.group(1) if match else "  "
 
 
-def _dump_json(data: dict[str, object], *, indent: str, trailing_newline: bool) -> str:
+def _detected_newline(text: str) -> str:
+    """Return the first newline convention used by a JSON document."""
+    newline = text.find("\n")
+    return "\r\n" if newline > 0 and text[newline - 1] == "\r" else "\n"
+
+
+def _dump_json(
+    data: dict[str, object],
+    *,
+    indent: str,
+    newline: str,
+    trailing_newline: bool,
+) -> str:
     """Serialize a JSON document preserving the source file's surface style.
 
     :param dict[str, object] data: Document to serialize.
     :param str indent: Indentation unit to apply.
+    :param str newline: Newline convention to apply.
     :param bool trailing_newline: Whether the output should end with a newline.
     :return str: Serialized JSON text.
     """
-    text = json.dumps(data, indent=indent, allow_nan=False, ensure_ascii=False)
-    return text + "\n" if trailing_newline else text
+    text = json.dumps(data, indent=indent, allow_nan=False, ensure_ascii=False).replace(
+        "\n", newline
+    )
+    return text + newline if trailing_newline else text
 
 
 def manual_json_snippet(container_key: str, member_key: str, entry: dict[str, object]) -> str:
@@ -355,7 +370,10 @@ def _edit_json_member(
                 return "updated" if loaded.existed else "created"
             try:
                 updated = _dump_json(
-                    {container_key: {member_key: entry}}, indent="  ", trailing_newline=True
+                    {container_key: {member_key: entry}},
+                    indent="  ",
+                    newline="\n",
+                    trailing_newline=True,
                 )
             except (TypeError, ValueError):
                 return "error"
@@ -395,6 +413,7 @@ def _edit_json_member(
             updated = _dump_json(
                 data,
                 indent=_detected_indent(text),
+                newline=_detected_newline(text),
                 trailing_newline=text.endswith("\n"),
             )
         except (TypeError, ValueError):
