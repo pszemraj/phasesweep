@@ -12,6 +12,8 @@ from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.server import PhaseSweepMCP
 from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
 
 
@@ -59,7 +61,8 @@ phases:
 
 
 def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
-    reg = Registry.load(_write_catalog(tmp_path)).get("redact_me")
+    registry = Registry.load(_write_catalog(tmp_path))
+    reg = registry.get("redact_me")
     sensitive = [
         reg.experiment.trial_command,
         reg.experiment.storage,
@@ -88,6 +91,16 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
     assert "effective_overrides" not in winners["phases"][0]
     assert "SECRET_FIXED_OVERRIDE" not in str(winners)
     assert "/private/data" not in str(winners)
+
+    app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
+    tool_results = [
+        app.list_experiments(),
+        app.validate(reg.id),
+        app.latest_run(reg.id),
+        app.status(experiment_id=reg.id),
+        app.winners(experiment_id=reg.id),
+    ]
+    assert_no_sensitive(tool_results, sensitive)
 
 
 @pytest.mark.parametrize(

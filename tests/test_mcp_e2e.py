@@ -305,8 +305,16 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
-    assert server._tool_manager.get_tool(TOOL_AWAIT_RUN).is_async is True
-    assert server._tool_manager.get_tool(TOOL_CANCEL_SWEEP).is_async is True
+    for tool_name in (
+        TOOL_VALIDATE_CONFIG,
+        TOOL_GET_LATEST_RUN,
+        TOOL_GET_STATUS,
+        TOOL_AWAIT_RUN,
+        TOOL_GET_WINNERS,
+        TOOL_LAUNCH_SWEEP,
+        TOOL_CANCEL_SWEEP,
+    ):
+        assert server._tool_manager.get_tool(tool_name).is_async is True
 
     descriptions = {t.name: t.description for t in tools}
     assert (
@@ -314,8 +322,11 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         in descriptions[TOOL_VALIDATE_CONFIG]
     )
     assert "independently re-checks config identity" in descriptions[TOOL_LAUNCH_SWEEP]
+    assert "If found=false" in descriptions[TOOL_GET_LATEST_RUN]
     assert "run.recovery_required" in descriptions[TOOL_GET_STATUS]
     assert "reason is recovery_required" in descriptions[TOOL_AWAIT_RUN]
+    assert "reason is terminal" in descriptions[TOOL_AWAIT_RUN]
+    assert "reason is phase_completed" in descriptions[TOOL_AWAIT_RUN]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
@@ -382,10 +393,11 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "target or label columns" in str(prompt)
 
 
-def test_fastmcp_cancel_does_not_block_concurrent_await(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_SWEEP, TOOL_LAUNCH_SWEEP])
+def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocking_tool: str
 ) -> None:
-    """The real SDK dispatch must keep await responsive during blocking cancellation."""
+    """The real SDK dispatch must keep await responsive during blocking work."""
     pytest.importorskip("mcp")
     from mcp import types
 
@@ -423,8 +435,18 @@ def test_fastmcp_cancel_does_not_block_concurrent_await(
             "recovery_required": False,
         }
 
+    def blocking_launch(experiment_id: str, from_phase: str | None = None) -> dict:
+        del from_phase
+        time.sleep(0.3)
+        return {"run_id": "r2", "experiment_id": experiment_id, "state": "running"}
+
     monkeypatch.setattr(app, "await_run", quick_await)
-    monkeypatch.setattr(app, "cancel", blocking_cancel)
+    if blocking_tool == TOOL_CANCEL_SWEEP:
+        monkeypatch.setattr(app, "cancel", blocking_cancel)
+        blocking_arguments = {"run_id": "r1"}
+    else:
+        monkeypatch.setattr(app, "launch", blocking_launch)
+        blocking_arguments = {"experiment_id": "e2e_lm"}
     server = build_server(app)
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     await_request = types.CallToolRequest(
@@ -433,30 +455,32 @@ def test_fastmcp_cancel_does_not_block_concurrent_await(
             arguments={"run_id": "r1", "timeout_seconds": AWAIT_MIN_TIMEOUT_SECONDS},
         )
     )
-    cancel_request = types.CallToolRequest(
+    blocking_request = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name=TOOL_CANCEL_SWEEP,
-            arguments={"run_id": "r1"},
+            name=blocking_tool,
+            arguments=blocking_arguments,
         )
     )
 
     async def dispatch_concurrently() -> tuple[float, object, object]:
         started = time.perf_counter()
         await_task = asyncio.create_task(handler(await_request))
-        cancel_task = asyncio.create_task(handler(cancel_request))
+        blocking_task = asyncio.create_task(handler(blocking_request))
         await_result = await await_task
         await_elapsed = time.perf_counter() - started
-        cancel_result = await cancel_task
-        return await_elapsed, await_result.root, cancel_result.root
+        blocking_result = await blocking_task
+        return await_elapsed, await_result.root, blocking_result.root
 
-    await_elapsed, await_result, cancel_result = asyncio.run(dispatch_concurrently())
+    await_elapsed, await_result, blocking_result = asyncio.run(dispatch_concurrently())
 
     assert await_elapsed < 0.15
     assert await_result.isError is False
-    assert cancel_result.isError is False
+    assert blocking_result.isError is False
 
 
-def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
+def test_fastmcp_tool_errors_are_is_error_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("mcp")
     import asyncio
 
@@ -479,6 +503,28 @@ def test_fastmcp_tool_errors_are_is_error_results(tmp_path: Path) -> None:
 
     assert result.isError is True
     assert "unknown experiment id 'missing'" in result.content[0].text
+
+    monkeypatch.setattr(
+        app,
+        "validate",
+        lambda _experiment_id: (_ for _ in ()).throw(
+            OSError("/tmp/SECRET_PATH/private-config.yaml")
+        ),
+    )
+    leaked = asyncio.run(
+        handler(
+            types.CallToolRequest(
+                params=types.CallToolRequestParams(
+                    name=TOOL_VALIDATE_CONFIG,
+                    arguments={"experiment_id": "e2e_lm"},
+                )
+            )
+        )
+    ).root
+
+    assert leaked.isError is True
+    assert "internal server error" in leaked.content[0].text
+    assert "SECRET_PATH" not in leaked.content[0].text
 
 
 def test_fastmcp_rejects_extra_tool_arguments(tmp_path: Path) -> None:

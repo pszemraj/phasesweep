@@ -101,7 +101,8 @@ DESCRIPTION_VALIDATE_CONFIG = (
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the single most recently launched MCP run for one catalog experiment, or "
     "found=false if none exists. Read-only. Use after reconnecting or when a prior run_id "
-    f"was lost; this computes the newest run so you must not scan or rank a list. Then use "
+    "was lost; this computes the newest run so you must not scan or rank a list. If found=false, "
+    "report that no prior run exists and ask the user before launching a replacement. Then use "
     f"the returned run_id with {TOOL_AWAIT_RUN}, {TOOL_GET_STATUS}, or {TOOL_GET_WINNERS}."
 )
 DESCRIPTION_LAUNCH_SWEEP = (
@@ -117,7 +118,9 @@ DESCRIPTION_LAUNCH_SWEEP = (
 )
 DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
-    "failed / cancelled). Provide exactly one of experiment_id or run_id; after a "
+    "failed / cancelled). If run.recovery_required is true, stop monitoring and report "
+    "it to the user: operator recovery is required, and the run will not become terminal "
+    "on its own. Provide exactly one of experiment_id or run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
     "State counts are dense and explicitly split into cumulative, before-run, and this-run "
     "dimensions; remaining_trials is already computed. "
@@ -126,9 +129,7 @@ DESCRIPTION_GET_STATUS = (
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
     "instead, wait at least 30 seconds between calls. When terminal, call "
-    f"{TOOL_GET_WINNERS} with the same run_id. If run.recovery_required is true, "
-    "stop monitoring and report it to the user: operator recovery is required, and "
-    "the run will not become terminal on its own."
+    f"{TOOL_GET_WINNERS} with the same run_id."
 )
 DESCRIPTION_GET_WINNERS = (
     "The end of the workflow: per completed phase, the concrete winner_source, "
@@ -158,7 +159,9 @@ DESCRIPTION_AWAIT_RUN = (
     f"{TOOL_GET_STATUS} plus changed and reason (recovery_required / terminal / "
     f"phase_completed / timeout). If reason is recovery_required, stop waiting and "
     "report it to the user: the run needs operator recovery and will not become terminal "
-    "on its own. Read-only. While waiting, status is rechecked at most once every "
+    f"on its own. If reason is terminal, call {TOOL_GET_WINNERS} with the same run_id. "
+    f"If reason is phase_completed, call {TOOL_AWAIT_RUN} again with the same run_id. "
+    "Read-only. While waiting, status is rechecked at most once every "
     f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
 
@@ -1552,6 +1555,9 @@ def _raise_safe_tool_error(tool_name: str, exc: Exception) -> NoReturn:
     :raises ValueError: Always, with either a domain message or generic text.
     """
     if isinstance(exc, McpToolError):
+        # Immediate invocation failures use MCP's isError text channel. Durable
+        # run failures are separate successful status reads with FailurePayload;
+        # FastMCP 1.27 does not attach structured content to raised tool errors.
         raise ValueError(str(exc)) from None
     log.exception("unhandled error in tool %s", tool_name, exc_info=exc)
     raise ValueError(
@@ -1717,13 +1723,15 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
+    async def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
         :return ValidateConfigResult: Structured validation payload.
         """
-        return ValidateConfigResult.model_validate(app.validate(experiment_id))
+        return ValidateConfigResult.model_validate(
+            await asyncio.to_thread(app.validate, experiment_id)
+        )
 
     @mcp.tool(
         name=TOOL_GET_LATEST_RUN,
@@ -1732,13 +1740,15 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
+    async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
         """Return the newest recorded MCP run for one experiment, already selected by launch time.
 
         :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
         :return GetLatestRunResult: One computed run handle or ``found=false``.
         """
-        return GetLatestRunResult.model_validate(app.latest_run(experiment_id))
+        return GetLatestRunResult.model_validate(
+            await asyncio.to_thread(app.latest_run, experiment_id)
+        )
 
     @mcp.tool(
         name=TOOL_GET_STATUS,
@@ -1747,7 +1757,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def get_status(
+    async def get_status(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetStatusResult:
@@ -1758,7 +1768,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :return GetStatusResult: Structured status payload.
         """
         return GetStatusResult.model_validate(
-            app.status(experiment_id=experiment_id, run_id=run_id)
+            await asyncio.to_thread(app.status, experiment_id=experiment_id, run_id=run_id)
         )
 
     @mcp.tool(
@@ -1789,7 +1799,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def get_winners(
+    async def get_winners(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetWinnersResult:
@@ -1800,7 +1810,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :return GetWinnersResult: Structured winners payload.
         """
         return GetWinnersResult.model_validate(
-            app.winners(experiment_id=experiment_id, run_id=run_id)
+            await asyncio.to_thread(app.winners, experiment_id=experiment_id, run_id=run_id)
         )
 
     @mcp.tool(
@@ -1816,7 +1826,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    def launch_sweep(
+    async def launch_sweep(
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
     ) -> LaunchSweepResult:
@@ -1826,7 +1836,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param MaybePhaseName from_phase: Optional phase to resume from.
         :return LaunchSweepResult: Structured launch result.
         """
-        return LaunchSweepResult.model_validate(app.launch(experiment_id, from_phase=from_phase))
+        return LaunchSweepResult.model_validate(
+            await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
+        )
 
     @mcp.tool(
         name=TOOL_CANCEL_SWEEP,
