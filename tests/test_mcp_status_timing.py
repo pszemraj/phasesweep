@@ -281,6 +281,32 @@ def test_await_run_times_out_with_unchanged_status(
     assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
 
 
+def test_await_run_reports_failed_trial_progress_at_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, registry, _store = _app_with_run(tmp_path)
+    experiment = registry.get("srv").experiment
+    clock = {"now": 0.0}
+
+    async def sleep_then_fail_trial(seconds: float) -> None:
+        clock["now"] += seconds
+        study = optuna.create_study(
+            study_name=_phase_study_name(experiment, experiment.phases[0]),
+            storage=experiment.storage,
+            direction="minimize",
+        )
+        study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail_trial)
+
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
+
+    assert result["reason"] == "timeout"
+    assert result["changed"] is True
+    assert result["phases"][0]["trials"]["FAIL"] == 1
+
+
 def test_await_run_returns_immediately_when_recovery_is_required(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

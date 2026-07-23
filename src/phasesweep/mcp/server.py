@@ -581,13 +581,17 @@ def _await_snapshot(
     :param bool recovery_required: Whether the run needs operator recovery.
     :param dict[str, Any] status: Path-free ``read_status`` payload.
     :return tuple[Any, ...]: Hashable snapshot of run state, recovery requirement,
-        and per-phase winner presence and completed-trial counts.
+        and per-phase winner presence and dense trial-state counts.
     """
     return (
         state,
         recovery_required,
         tuple(
-            (phase["phase"], phase["winner_present"], phase["completed"])
+            (
+                phase["phase"],
+                phase["winner_present"],
+                tuple(sorted(phase["trials"].items())),
+            )
             for phase in status["phases"]
         ),
     )
@@ -600,9 +604,9 @@ def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -
     :param tuple[Any, ...] snapshot: Snapshot from the latest recheck.
     :return bool: ``True`` when a phase's winner artifact appeared mid-wait.
     """
-    had_winner = {phase: winner for phase, winner, _completed in baseline[2]}
+    had_winner = {phase: winner for phase, winner, _counts in baseline[2]}
     return any(
-        winner and not had_winner.get(phase, False) for phase, winner, _completed in snapshot[2]
+        winner and not had_winner.get(phase, False) for phase, winner, _counts in snapshot[2]
     )
 
 
