@@ -358,8 +358,9 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             raise click.ClickException(
                 "launch outcome is unresolved: the durable handle cannot distinguish a "
                 "pre-spawn failure from a child that has not persisted its process identity. "
-                "The run remains reserved; retry after a runner identity or terminal status "
-                "appears."
+                "The run remains reserved. Wait briefly and retry; if this persists after a "
+                "server crash, inspect the host because automated recovery cannot safely "
+                "declare that no runner was spawned."
             )
     cleanup_recovery_required = store.cleanup_recovery_required(handle)
     snapshot_recovery_required = store.snapshot_recovery_required(handle)

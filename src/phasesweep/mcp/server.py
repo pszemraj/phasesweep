@@ -141,7 +141,9 @@ DESCRIPTION_GET_WINNERS = (
     "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
     "run_id); result_source identifies current versus frozen results, and missing_phases plus "
     "all_phases_have_winners already compute completeness. Terminal run-id winners stay frozen "
-    "if the experiment is later resumed and never fall back to mutable results. Read-only."
+    "if the experiment is later resumed and never fall back to mutable results. This returns "
+    "winners, not search ranges or non-winning trial history: do not infer convergence, trends, "
+    "robustness, or boundary effects from it. Read-only."
 )
 DESCRIPTION_CANCEL_SWEEP = (
     "Stop a launched run by run_id. Use only when the user asks or to prevent an "

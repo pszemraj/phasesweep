@@ -112,7 +112,7 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 - `List the available phasesweep experiments and validate the tiny LM example.`
 - `Launch the tiny-lm sweep, monitor it until completion, then summarize each phase winner.`
 - `Check whether run <run_id> is still active and show phase-level trial counts.`
-- `Read the current winners for <experiment_id> and suggest a next manual experiment using only MCP outputs.`
+- `Read the current winners for <experiment_id>, separate observations from hypotheses, and tell me what additional evidence is needed before choosing the next manual experiment.`
 
 ## Troubleshooting
 
@@ -120,6 +120,7 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
 - `concurrency limit reached`: the refusal names up to five blocking run IDs. Await one directly and retry the refused launch after it becomes terminal, ask the user before cancelling it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
 - `terminal result snapshot ... unavailable`: follow [run state and recovery](mcp.md#run-state-and-recovery); historical results are never rebuilt from mutable experiment state.
+- `launch outcome is unresolved`: wait briefly and retry `recover-run`. If it persists after a server crash, automated recovery cannot distinguish a pre-spawn crash from a not-yet-registered runner; inspect the host and keep the run reserved until a matching runner is ruled out.
 - Path or storage rejected at startup: follow the MCP [path and working-directory rules](mcp.md#paths-and-the-working-directory); catalogs support local-node SQLite and Journal storage, not in-memory or external RDB storage.
 - A cancelled or failed run stays `running` with `cleanup_confirmed: false`: follow the operator procedure under [run state and recovery](mcp.md#run-state-and-recovery).
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.

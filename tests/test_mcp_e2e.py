@@ -291,6 +291,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert initialization.instructions == agent_prompt_text(strip=True)
     assert "unchanged relaunches do not need another validation call" in initialization.instructions
     assert "reason: recovery_required" in initialization.instructions
+    assert "do not claim convergence, trends, robustness" in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -327,6 +328,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "reason is recovery_required" in descriptions[TOOL_AWAIT_RUN]
     assert "reason is terminal" in descriptions[TOOL_AWAIT_RUN]
     assert "reason is phase_completed" in descriptions[TOOL_AWAIT_RUN]
+    assert "not search ranges or non-winning trial history" in descriptions[TOOL_GET_WINNERS]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent

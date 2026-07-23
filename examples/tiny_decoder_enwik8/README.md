@@ -48,9 +48,9 @@ The config uses 1000 training batches per trial. The upstream trainer validates 
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
-## MCP smoke sweep
+## MCP full sweep
 
-The catalog pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
+The MCP catalog exposes the same nine-trial, 1000-batch-per-trial experiment as the full CLI config above; it is not the two-trial quick smoke. It pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
 
 ```bash
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
@@ -58,11 +58,7 @@ phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml --dry
 phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-Restart the selected client after installation, then ask it to list the available phasesweep experiments. To exercise the stdio server directly instead of installing a client entry:
-
-```bash
-phasesweep mcp serve --catalog examples/tiny_decoder_enwik8/catalog.yaml
-```
+Restart the selected client after installation, then ask it to list the available phasesweep experiments. `phasesweep mcp serve` is a stdio JSON-RPC endpoint for MCP clients, not an interactive terminal interface; use `mcp check` for a direct startup preflight.
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
 
