@@ -456,13 +456,13 @@ def _apply_instructions(
             note="instructions path could not be resolved",
         )
     valid_owner_ids: set[str] = set()
-    for candidate in agent_targets(project):
-        candidate_path = candidate.instructions_path
+    for candidate_target in agent_targets(project):
+        candidate_path = candidate_target.instructions_path
         if candidate_path is None:
             continue
         try:
             if candidate_path.resolve(strict=False) == edit_path:
-                valid_owner_ids.add(candidate.id)
+                valid_owner_ids.add(candidate_target.id)
         except (OSError, RuntimeError):
             continue
     with _locked_editable_text(edit_path) as loaded:
