@@ -609,7 +609,6 @@ def test_reaper_raises_when_cleanup_uncertain(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-            launch_nonce="test-nonce",
         ),
     )
     monkeypatch.setattr(

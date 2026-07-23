@@ -75,7 +75,6 @@ def _write_test_process_identity(
             pgid=pgid,
             proc_starttime=starttime,
             boot_id=read_boot_id() if boot_id is None else boot_id,
-            launch_nonce="test-launch-nonce",
         ),
     )
 
@@ -612,7 +611,7 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
         (
             '{"schema_version": 1, "attempt_id": "attempt", "pid": 12345, '
             '"pid": 54321, "pgid": 12345, "proc_starttime": 111, '
-            '"boot_id": "boot", "launch_nonce": "nonce"}'
+            '"boot_id": "boot"}'
         ),
     ],
 )
@@ -650,7 +649,6 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         pgid=12345,
         proc_starttime=111,
         boot_id="old-boot",
-        launch_nonce="test-nonce",
     )
     monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
@@ -673,7 +671,6 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         pgid=12345,
         proc_starttime=None,
         boot_id=None,
-        launch_nonce="test-nonce",
     )
     monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: None)
 
@@ -924,7 +921,6 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-            launch_nonce="test-nonce",
         )
 
     import phasesweep.engine.guards as _reaper
@@ -1018,7 +1014,6 @@ def test_reaper_raises_when_tell_fails_after_cleanup(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-            launch_nonce="test-nonce",
         ),
     )
     monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)

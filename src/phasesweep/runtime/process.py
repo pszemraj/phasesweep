@@ -17,7 +17,6 @@ import contextlib
 import json
 import logging
 import os
-import secrets
 import select
 import signal
 import subprocess
@@ -400,7 +399,6 @@ class StaleProcessIdentity:
     pgid: int
     proc_starttime: int | None
     boot_id: str | None
-    launch_nonce: str
 
 
 def read_boot_id() -> str | None:
@@ -417,7 +415,6 @@ def _trial_process_identity(
     attempt_id: str,
     pid: int,
     pgid: int,
-    launch_nonce: str,
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
@@ -427,8 +424,6 @@ def _trial_process_identity(
             reader cannot mistake it for a different trial's process.
         pid: PID of the just-launched supervisor process.
         pgid: Process-group ID the supervisor was registered under.
-        launch_nonce: Per-launch random token distinguishing this launch from
-            any other that might reuse the same PID/PGID pair.
 
     Returns:
         A :class:`StaleProcessIdentity` combining the given fields with the
@@ -444,7 +439,6 @@ def _trial_process_identity(
         pgid=pgid,
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
-        launch_nonce=launch_nonce,
     )
 
 
@@ -466,7 +460,6 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
                 "pgid": identity.pgid,
                 "proc_starttime": identity.proc_starttime,
                 "boot_id": identity.boot_id,
-                "launch_nonce": identity.launch_nonce,
             },
             sort_keys=True,
         )
@@ -629,15 +622,12 @@ def run_supervised(
     pgid: int | None = None
     ack_write: int | None = None
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
-    launch_nonce = secrets.token_hex(16)
-    supervisor_env = dict(env)
-    supervisor_env["PHASESWEEP_LAUNCH_NONCE"] = launch_nonce
 
     try:
         with _defer_shutdown_signals(), _launch_lock:
             proc, pgid, ack_write = _spawn_blocked_supervisor(
                 cmd,
-                env=supervisor_env,
+                env=env,
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -645,7 +635,6 @@ def run_supervised(
                 attempt_id=attempt_id,
                 pid=proc.pid,
                 pgid=pgid,
-                launch_nonce=launch_nonce,
             )
             _write_process_identity(identity_path, identity)
             if os.write(ack_write, b"A") != 1:
@@ -927,7 +916,6 @@ def read_stale_process_identity(
         "pgid",
         "proc_starttime",
         "boot_id",
-        "launch_nonce",
     }
     if not required_fields.issubset(payload):
         raise ValueError(f"Trial process identity at {path} is partial.")
@@ -969,9 +957,6 @@ def read_stale_process_identity(
     boot_id = payload.get("boot_id")
     if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
         raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
-    launch_nonce = payload.get("launch_nonce")
-    if not isinstance(launch_nonce, str) or not launch_nonce:
-        raise ValueError(f"Trial process identity field 'launch_nonce' is invalid at {path}.")
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id=attempt_id,
@@ -979,7 +964,6 @@ def read_stale_process_identity(
         pgid=positive_int("pgid"),
         proc_starttime=proc_starttime,
         boot_id=boot_id,
-        launch_nonce=launch_nonce,
     )
 
 
@@ -1296,7 +1280,7 @@ def kill_stale_group(
             except (PermissionError, OSError) as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
-        elif pid_alive and saved_starttime is not None:
+        elif pid_alive:
             # PID reuse detected. A persisted PGID can still prove cleanup is
             # complete (group gone) or target original descendants (group alive
             # but not led by the reused PID). Refuse only when the stored PGID

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import secrets
 import stat
@@ -223,7 +224,12 @@ def open_lock_file(path: Path) -> IO[str]:
             )
             created = True
         except FileExistsError:
-            fd = os.open(leaf, flags, dir_fd=parent_fd)
+            try:
+                fd = os.open(leaf, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise UnsafeLockPathError(f"Lock path {path} must not be a symlink.") from exc
+                raise
     finally:
         os.close(parent_fd)
 
@@ -566,6 +572,7 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     :param str mode: ``"w"``, ``"a"``, or exclusive-create ``"x"``.
     :return IO[str]: Open text handle.
     :raises ValueError: If ``mode`` is unsupported.
+    :raises UnsafePrivatePathError: If the file or its parent path is unsafe.
     """
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
@@ -594,7 +601,14 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
                 )
                 created = True
             except FileExistsError:
-                fd = os.open(leaf, flags, dir_fd=parent_fd)
+                try:
+                    fd = os.open(leaf, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise UnsafePrivatePathError(
+                            f"Private file {path} must not be a symlink."
+                        ) from exc
+                    raise
         try:
             if created:
                 os.fchmod(fd, PRIVATE_FILE_MODE)

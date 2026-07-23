@@ -52,6 +52,35 @@ def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.M
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
+def test_lock_dir_accepts_admin_shared_directory_and_creates_group_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    override = tmp_path / "scheduler-shared-locks"
+    override.mkdir(mode=runtime_files.SHARED_DIR_MODE)
+    override.chmod(runtime_files.SHARED_DIR_MODE)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    real_fstat = runtime_files.os.fstat
+
+    def root_owned_directories(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            return info
+        values = list(info)
+        values[0] = (info.st_mode & ~0o7777) | runtime_files.SHARED_DIR_MODE
+        values[4] = 0
+        values[5] = os.getegid()
+        return os.stat_result(values)
+
+    monkeypatch.setattr(runtime_files.os, "fstat", root_owned_directories)
+
+    assert runtime_files.lock_dir() == override
+    handle = runtime_files.try_lock_file(override / "shared.lock")
+    assert handle is not None
+    runtime_files.unlock_file(handle)
+    assert stat.S_IMODE((override / "shared.lock").stat().st_mode) == 0o660
+
+
 def test_lock_dir_rejects_missing_or_unsafe_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -79,7 +108,7 @@ def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
 
     from phasesweep.runtime.gpu import GpuDevice, _try_host_gpu_lease
 
-    with pytest.raises(OSError):
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="must not be a symlink"):
         _try_host_gpu_lease(GpuDevice("0"))
     assert victim.read_text() == "keep me"
 
@@ -184,7 +213,7 @@ def test_private_open_rejects_symlink_hardlink_and_wrong_mode_without_mutation(
 
     for path in (symlink, hardlink, unsafe_mode):
         with (
-            pytest.raises((OSError, runtime_files.UnsafePrivatePathError)),
+            pytest.raises(runtime_files.UnsafePrivatePathError),
             runtime_files.open_private_text(path, "w") as handle,
         ):
             handle.write("replacement")

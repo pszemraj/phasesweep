@@ -127,7 +127,6 @@ def _write_trial_process_identity(
             pgid=pid,
             proc_starttime=starttime,
             boot_id=read_boot_id(),
-            launch_nonce="test-launch-nonce",
         ),
     )
 
