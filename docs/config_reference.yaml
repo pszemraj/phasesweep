@@ -312,7 +312,7 @@
 # If omitted, inherits defaults.trial_command; explicit null blocks fallback and fails compilation. It must resolve non-null.
 
 # provenance: dict[str, str] | None = null
-# If omitted, inherits defaults.provenance; a non-null mapping replaces the default mapping. The compiled persistent experiment requires at least one entry.
+# If omitted, inherits defaults.provenance; a non-null mapping replaces the default mapping, while explicit null clears it to `{}`. The compiled persistent experiment requires at least one entry.
 
 # override_format: Literal["argparse", "hydra", "json_file"] | None = null
 # If omitted, inherits defaults.override_format; explicit null blocks fallback and fails compilation. The resolved value follows the Experiment contract.

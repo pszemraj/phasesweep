@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import JsonExtractor, Metric, Phase
+from phasesweep.config import Experiment, JsonExtractor, LogRegexExtractor, Metric, Phase
 from tests.conftest import write_yaml
 
 
@@ -91,6 +91,31 @@ phases:
 def test_phase_name_validation(name: str) -> None:
     with pytest.raises(ValidationError):
         Phase(name=name, n_trials=1, search_space={})
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"": "trainer-v1"},
+        {" ": "trainer-v1"},
+        {"revision": ""},
+        {"revision": " "},
+    ],
+)
+def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match="provenance keys and values must be nonempty"):
+        Experiment(
+            experiment="invalid_provenance",
+            trial_command="echo",
+            provenance=provenance,
+            metric=Metric(
+                extractor=LogRegexExtractor(
+                    type="log_regex",
+                    pattern=r"x=(?P<value>[0-9.]+)",
+                )
+            ),
+            phases=[Phase(name="p", n_trials=1)],
+        )
 
 
 # ---- migrated from version-named files ----

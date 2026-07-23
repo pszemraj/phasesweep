@@ -456,6 +456,40 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
     assert not (tmp_path / "runs").exists()
 
 
+def test_suite_study_provenance_inherits_replaces_and_clears(tmp_path: Path) -> None:
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: provenance_suite
+            defaults:
+              trial_command: "echo"
+              provenance: {revision: default-v1}
+              metric:
+                name: x
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
+            studies:
+              - name: inherited
+                phases: [{name: p, n_trials: 1}]
+              - name: replaced
+                provenance: {revision: replacement-v2}
+                phases: [{name: p, n_trials: 1}]
+              - name: cleared
+                provenance: null
+                phases: [{name: p, n_trials: 1}]
+            """,
+        )
+    )
+
+    assert isinstance(config, Suite)
+    assert [config.experiment_for_study(study).provenance for study in config.studies] == [
+        {"revision": "default-v1"},
+        {"revision": "replacement-v2"},
+        {},
+    ]
+
+
 def test_failed_suite_rerun_preserves_previous_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
