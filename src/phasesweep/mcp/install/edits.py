@@ -314,7 +314,11 @@ def _detected_indent(text: str) -> str:
 
 
 def _detected_newline(text: str) -> str:
-    """Return the first newline convention used by a text document."""
+    """Return the first newline convention used by a text document.
+
+    :param str text: Raw text to inspect.
+    :return str: The detected newline convention.
+    """
     newline = text.find("\n")
     return "\r\n" if newline > 0 and text[newline - 1] == "\r" else "\n"
 
