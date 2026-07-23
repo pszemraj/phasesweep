@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
+import tomllib
 from importlib import resources
 from pathlib import Path
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
 
 
 def test_public_package_metadata() -> None:

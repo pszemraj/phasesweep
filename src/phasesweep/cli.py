@@ -996,8 +996,6 @@ def _format_status(status_obj: dict) -> str:
     :param dict status_obj: Status payload returned by :func:`config_status`.
     :return str: YAML-formatted status text without a trailing newline.
     """
-    import yaml
-
     return yaml.safe_dump(status_obj, sort_keys=False).rstrip()
 
 

@@ -7,17 +7,13 @@ import math
 import os
 import stat
 import threading
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
 
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.install import edits as install_edits
