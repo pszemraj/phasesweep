@@ -105,7 +105,7 @@ def _project_path_is_contained(path: Path, project: Path) -> bool:
     """
     try:
         path.resolve(strict=False).relative_to(project.resolve(strict=True))
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return False
     return True
 
@@ -305,23 +305,19 @@ def _apply_mcp(
             "error",
             note="refusing project config path that resolves outside the project",
         )
-    # Dotfile managers commonly symlink user config directories. Pin their
-    # physical parent once while retaining the stricter project-path policy.
+    # Pin the physical target once. Project paths have already passed the
+    # containment check; user config symlinks are operator-owned dotfile state.
     try:
-        edit_path = (
-            spec.path.parent.resolve(strict=False) / spec.path.name
-            if spec.scope == "user"
-            else spec.path
-        )
+        edit_path = spec.path.resolve(strict=False)
     except (OSError, RuntimeError):
         return StepResult(
             "mcp",
             spec.path,
             "error",
-            note="config directory could not be resolved",
+            note="config path could not be resolved",
         )
     if spec.format == "toml":
-        if edit_path.is_symlink() or (edit_path.exists() and not edit_path.is_file()):
+        if edit_path.exists() and not edit_path.is_file():
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
         result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run)
         return StepResult(
@@ -350,7 +346,7 @@ def _apply_mcp(
             note = None
         return StepResult("mcp", spec.path, action, note=note)
     assert catalog is not None
-    if edit_path.is_symlink() or (edit_path.exists() and not edit_path.is_file()):
+    if edit_path.exists() and not edit_path.is_file():
         return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
     entry = mcp_entry(spec.style, command, catalog)
     managed = partial(is_managed_mcp_entry, spec.style)
@@ -450,17 +446,26 @@ def _apply_instructions(
             "error",
             note="refusing instructions path that resolves outside the project",
         )
-    if path.is_symlink():
+    try:
+        edit_path = path.resolve(strict=False)
+    except (OSError, RuntimeError):
         return StepResult(
             "instructions",
             path,
             "error",
-            note="instructions path is a symlink; refusing to follow it",
+            note="instructions path could not be resolved",
         )
-    valid_owner_ids = {
-        candidate.id for candidate in agent_targets(project) if candidate.instructions_path == path
-    }
-    with _locked_editable_text(path) as loaded:
+    valid_owner_ids: set[str] = set()
+    for candidate in agent_targets(project):
+        candidate_path = candidate.instructions_path
+        if candidate_path is None:
+            continue
+        try:
+            if candidate_path.resolve(strict=False) == edit_path:
+                valid_owner_ids.add(candidate.id)
+        except (OSError, RuntimeError):
+            continue
+    with _locked_editable_text(edit_path) as loaded:
         if loaded is None:
             return StepResult(
                 "instructions",
@@ -501,7 +506,7 @@ def _apply_instructions(
                 else:
                     action = (
                         "updated"
-                        if _atomic_write_text(path, candidate, expected=loaded)
+                        if _atomic_write_text(edit_path, candidate, expected=loaded)
                         else "error"
                     )
                 retained_note = (
@@ -520,7 +525,7 @@ def _apply_instructions(
                 return StepResult("instructions", path, "removed")
             action = (
                 "removed"
-                if _atomic_write_text(path, removal_candidate, expected=loaded)
+                if _atomic_write_text(edit_path, removal_candidate, expected=loaded)
                 else "error"
             )
             removal_note = None if action == "removed" else "instructions changed before removal"
@@ -543,7 +548,7 @@ def _apply_instructions(
             )
         action = (
             ("updated" if loaded.existed else "created")
-            if _atomic_write_text(path, candidate, expected=loaded)
+            if _atomic_write_text(edit_path, candidate, expected=loaded)
             else "error"
         )
         install_note = (

@@ -300,7 +300,7 @@ def _detected_indent(text: str) -> str:
 
 
 def _detected_newline(text: str) -> str:
-    """Return the first newline convention used by a JSON document."""
+    """Return the first newline convention used by a text document."""
     newline = text.find("\n")
     return "\r\n" if newline > 0 and text[newline - 1] == "\r" else "\n"
 
@@ -532,8 +532,11 @@ def updated_marked_text(existing: str, content: str, *, start: str, end: str) ->
         if newline == "\r\n":
             block = block.replace("\r\n", "\n").replace("\n", "\r\n")
         return existing[:start_idx] + block.removesuffix(newline) + existing[end_idx + len(end) :]
+    newline = _detected_newline(existing)
     block = render_marked_block(content, start=start, end=end)
-    separator = "" if not existing else "\n"
+    if newline == "\r\n":
+        block = block.replace("\n", "\r\n")
+    separator = "" if not existing else newline
     return existing + separator + block
 
 

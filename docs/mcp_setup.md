@@ -71,7 +71,7 @@ Restart the client after any config change.
 <details>
 <summary>What automatic edits preserve</summary>
 
-Automatic edits are limited to regular UTF-8 files at the expected target. Project-scoped paths must remain inside the selected project after symlink resolution, and direct file symlinks are refused. Each edit is serialized with other PhaseSweep installers and refused if the file changes before replacement. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed, and project-scoped symlinks are followed only when their resolved target remains inside the selected project. Each edit pins that physical target, serializes with other PhaseSweep installers, and is refused if the file changes before replacement. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
 
 Marker-fenced edits preserve all bytes outside the managed block. Strict JSON edits re-serialize the document while retaining key order, detected indentation and newline style, final-newline state, and permissions; compact whitespace and numeric spellings may be normalized. Duplicate keys, non-finite or overflowing numbers, comments, and JSON5 are refused. `uninstall` leaves empty files and containers in place because whole-file creation ownership is not persisted. Shared instruction blocks remain until their last installed agent owner is removed.
 

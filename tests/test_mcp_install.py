@@ -339,6 +339,19 @@ def test_marked_text_replaces_in_place_and_preserves_crlf():
     assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == "before\r\n"
 
 
+def test_marked_text_append_preserves_crlf():
+    original = "before\r\n"
+    updated = updated_marked_text(
+        original,
+        "body",
+        start=MARKDOWN_START,
+        end=MARKDOWN_END,
+    )
+
+    assert updated == f"before\r\n\r\n{MARKDOWN_START}\r\nbody\r\n{MARKDOWN_END}\r\n"
+    assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == original
+
+
 def test_marker_text_must_be_an_exact_standalone_line():
     original = f"mention {MARKDOWN_START} inline and leave it alone\n"
     updated = updated_marked_text(
@@ -516,21 +529,28 @@ def test_installer_round_trip_across_all_targets(fake_home, tmp_path, capsys):
     assert all(path.read_bytes() == b"" for path in instruction_paths)
 
 
-@pytest.mark.parametrize(
-    ("agent_id", "config_dir"),
-    [("codex", Path(".codex")), ("claude-desktop", Path(".config/Claude"))],
-)
-def test_installer_supports_symlinked_user_config_directory(
-    fake_home, tmp_path, capsys, agent_id, config_dir
+@pytest.mark.parametrize("agent_id", ["codex", "claude-desktop"])
+@pytest.mark.parametrize("symlink_kind", ["directory", "file"])
+def test_installer_supports_symlinked_user_config(
+    fake_home, tmp_path, capsys, agent_id, symlink_kind
 ):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
-    managed_dir = fake_home / "dotfiles" / agent_id
-    managed_dir.mkdir(parents=True)
-    link = fake_home / config_dir
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(managed_dir, target_is_directory=True)
+    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    config = target.mcp.path
+    managed = fake_home / "dotfiles" / agent_id
+    if symlink_kind == "directory":
+        managed.mkdir(parents=True)
+        config.parent.parent.mkdir(parents=True, exist_ok=True)
+        config.parent.symlink_to(managed, target_is_directory=True)
+        physical_config = managed / config.name
+    else:
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        managed.write_text("")
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.symlink_to(managed)
+        physical_config = managed
 
     code = installer.run(
         "install",
@@ -543,8 +563,12 @@ def test_installer_supports_symlinked_user_config_directory(
     )
 
     assert code == 0, capsys.readouterr().out
-    config = next(target for target in agent_targets(project) if target.id == agent_id).mcp.path
-    assert "phasesweep" in config.read_text()
+    assert config.is_symlink() is (symlink_kind == "file")
+    assert "phasesweep" in physical_config.read_text()
+
+    assert installer.run("uninstall", project, None, [agent_id], "mcp", yes=True) == 0
+    assert config.is_symlink() is (symlink_kind == "file")
+    assert "phasesweep" not in physical_config.read_text()
 
 
 def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_path, capsys):
@@ -668,18 +692,26 @@ def test_installer_reports_repeated_instruction_markers_separately_from_ownershi
     assert instructions.read_text() == original
 
 
-def test_installer_identifies_symlinked_instruction_file(fake_home, tmp_path, capsys):
+def test_installer_supports_shared_symlinked_instruction_file(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
-    target = project / "instructions-target.md"
-    target.write_text("# Keep me\n")
-    (project / "AGENTS.md").symlink_to(target.name)
+    instructions = project / "AGENTS.md"
+    original = "# Keep me\n"
+    instructions.write_text(original)
+    claude_instructions = project / "CLAUDE.md"
+    claude_instructions.symlink_to(instructions.name)
 
-    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+    code = installer.run("install", project, None, ["claude", "cursor"], "instructions", yes=True)
 
-    assert code == 1
-    assert "instructions path is a symlink" in capsys.readouterr().out
-    assert target.read_text() == "# Keep me\n"
+    assert code == 0, capsys.readouterr().out
+    assert claude_instructions.is_symlink()
+    assert "<!-- PHASESWEEP_OWNERS: claude,cursor -->" in instructions.read_text()
+
+    assert installer.run("uninstall", project, None, ["claude"], "instructions", yes=True) == 0
+    assert "PHASESWEEP_OWNERS: cursor" in instructions.read_text()
+    assert installer.run("uninstall", project, None, ["cursor"], "instructions", yes=True) == 0
+    assert instructions.read_text() == original
+    assert claude_instructions.is_symlink()
 
 
 def test_installer_refuses_missing_server_command_before_edits(
@@ -716,23 +748,35 @@ def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, 
     assert "// keep" in (project / "opencode.json").read_text()
 
 
-@pytest.mark.parametrize("path_kind", ["directory", "symlink"])
-def test_installer_reports_non_regular_json_config(fake_home, tmp_path, capsys, path_kind):
+def test_installer_reports_non_regular_json_config(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
     config = project / ".mcp.json"
-    if path_kind == "directory":
-        config.mkdir()
-    else:
-        target = project / "target.json"
-        target.write_text("{}\n")
-        config.symlink_to(target)
+    config.mkdir()
 
     code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
 
     assert code == 1
     assert "config path is not a regular file" in capsys.readouterr().out
+
+
+def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    physical_config = project / "shared-mcp.json"
+    physical_config.write_text("{}\n")
+    config = project / ".mcp.json"
+    config.symlink_to(physical_config.name)
+
+    assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    assert config.is_symlink()
+    assert "phasesweep" in json.loads(physical_config.read_text())["mcpServers"]
+
+    assert installer.run("uninstall", project, None, ["claude"], "mcp", yes=True) == 0
+    assert config.is_symlink()
+    assert "phasesweep" not in json.loads(physical_config.read_text())["mcpServers"]
 
 
 @pytest.mark.parametrize(
