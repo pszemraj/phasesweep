@@ -163,6 +163,8 @@ DESCRIPTION_AWAIT_RUN = (
     "report it to the user: the run needs operator recovery and will not become terminal "
     f"on its own. If reason is terminal, call {TOOL_GET_WINNERS} with the same run_id. "
     f"If reason is phase_completed, call {TOOL_AWAIT_RUN} again with the same run_id. "
+    "At timeout, changed may still be true when trial counts advanced without another stop "
+    "condition; report that progress and call this tool again while the run is running. "
     "Read-only. While waiting, status is rechecked at most once every "
     f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
 )
@@ -432,7 +434,9 @@ class AwaitRunResult(GetStatusResult):
     reason: Literal["recovery_required", "terminal", "phase_completed", "timeout"] = Field(
         description=(
             "Why the wait returned: operator recovery is required, the run reached a "
-            "terminal state, a phase gained a winner, or the timeout elapsed with no change."
+            "terminal state, a phase gained a winner, or the timeout elapsed without one "
+            "of those stop conditions. At timeout, changed may still be true when trial "
+            "counts advanced."
         )
     )
 
