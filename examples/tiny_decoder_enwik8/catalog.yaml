@@ -1,4 +1,4 @@
-# Example MCP catalog for the tiny Enwik8 decoder smoke sweep. Start it with:
+# Example MCP catalog for the full tiny Enwik8 decoder sweep. Start it with:
 #   phasesweep mcp serve --catalog examples/tiny_decoder_enwik8/catalog.yaml
 
 state_dir: /tmp/phasesweep-mcp-tiny-decoder-enwik8/state
@@ -8,7 +8,7 @@ experiments:
     config: ./mcp_experiment.yaml
     cwd: ../..
     visible_params: all
-    description: "Tiny Enwik8 decoder GPU sweep over LR, weight decay, and gradient clipping"
+    description: "9-trial CUDA sweep (1000 batches/trial) over LR, weight decay, and gradient clipping"
     allow:
       launch: true
       cancel: true

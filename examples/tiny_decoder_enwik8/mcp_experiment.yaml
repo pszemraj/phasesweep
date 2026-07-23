@@ -1,8 +1,8 @@
-# MCP-safe variant of the tiny Enwik8 decoder smoke sweep.
+# MCP-safe variant of the full tiny Enwik8 decoder sweep.
 #
 # MCP requires absolute workdir and storage paths so detached runs survive restarts and arbitrary client working directories. The catalog pins cwd to the repository root because the trainer command below is intentionally repo-relative.
 
-experiment: tiny_decoder_enwik8_hparam_smoke_mcp
+experiment: tiny_decoder_enwik8_hparams_mcp
 storage: sqlite:////tmp/phasesweep-mcp-tiny-decoder-enwik8/phases.db
 provenance:
   trainer: "run-trial-v1+decoder-template@9c90a551"
