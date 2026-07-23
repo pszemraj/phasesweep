@@ -92,7 +92,7 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 )
 DESCRIPTION_VALIDATE_CONFIG = (
     "Re-check that the cataloged config has not changed, then inspect it before launching: "
-    "authorized capabilities plus per-phase names, trial counts, "
+    "authorized capabilities plus per-phase names, terminal-attempt targets, "
     "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
     "Call once while planning an experiment; "
     f"{TOOL_LAUNCH_SWEEP} independently refuses a changed config, so unchanged "
@@ -289,7 +289,12 @@ class PhaseValidationPayload(_ToolPayload):
     """Agent-safe phase structure."""
 
     name: PhaseName
-    n_trials: int = Field(ge=0, description="Number of trials configured for this phase.")
+    n_trials: int = Field(
+        ge=1,
+        description=(
+            "Target number of terminal attempts; COMPLETE, FAIL, and PRUNED trials all count."
+        ),
+    )
     sampler: str = Field(description="Sampler type only; sampler internals stay in the config.")
     inherits: list[PhaseName] = Field(description="Parent phases inherited by this phase.")
     search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")

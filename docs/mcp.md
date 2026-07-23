@@ -41,7 +41,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 | Tool | Inputs | Effect | Returns |
 | --- | --- | --- | --- |
 | `phasesweep_list_experiments` | optional `limit` (1-100; default 50), `cursor` | read | catalog ids, description, phase names, metric name + goal, authorized capabilities, `total_count`, `next_cursor` |
-| `phasesweep_validate_config` | `experiment_id` | read | capabilities and per-phase name, `n_trials`, sampler, inherited phases, and search-space *keys* (not ranges); a changed config is a tool error |
+| `phasesweep_validate_config` | `experiment_id` | read | capabilities and per-phase name, terminal-attempt target (`n_trials`; COMPLETE, FAIL, and PRUNED all count), sampler, inherited phases, and search-space *keys* (not ranges); a changed config is a tool error |
 | `phasesweep_get_latest_run` | `experiment_id` | read | the newest durable run, selected by launch timestamp with a stable tie-breaker, or `found: false` |
 | `phasesweep_get_status` | exactly one of `experiment_id` or `run_id` | read | dense cumulative state counts plus explicit before-run and this-run progress, computed remaining attempts, storage-read availability, winner presence, result provenance, run state, elapsed time, and a safe actionable failure category when terminal; terminal run-id reads require a frozen snapshot |
 | `phasesweep_await_run` | `run_id`, optional `timeout_seconds` (5-600; default 120) | read (waits) | the `phasesweep_get_status` payload plus `changed` and `reason` (`recovery_required` / `terminal` / `phase_completed` / `timeout`) |

@@ -322,6 +322,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         "unchanged relaunches do not need another validation call"
         in descriptions[TOOL_VALIDATE_CONFIG]
     )
+    assert "terminal-attempt targets" in descriptions[TOOL_VALIDATE_CONFIG]
     assert "independently re-checks config identity" in descriptions[TOOL_LAUNCH_SWEEP]
     assert "If found=false" in descriptions[TOOL_GET_LATEST_RUN]
     assert "run.recovery_required" in descriptions[TOOL_GET_STATUS]
