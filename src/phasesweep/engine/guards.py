@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
@@ -404,9 +405,9 @@ def _verify_fingerprint(
 
     """
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
-    existing = study.user_attrs.get("phasesweep_fingerprint")
+    existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
     if existing is None:
-        study.set_user_attr("phasesweep_fingerprint", fp)
+        study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "

@@ -21,6 +21,7 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
+from phasesweep.engine import TerminalReport, read_status, read_winner
 from phasesweep.engine.optuna import _build_sampler, _create_phase_study
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -352,12 +353,101 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(second)
 
+    published_winner = read_winner(second, "p")
+    status = read_status(second)
+    assert published_winner is not None
+    assert status["generation_id"] != published_winner.generation_id
+    assert status["phases"][0]["winner_present"] is True
+
     trial_dirs = sorted(phase_dir.glob("trial_*"))
     assert len(trial_dirs) == 2
     assert first_trial_dir in trial_dirs
     second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
     assert not (second_trial_dir / "r.json").exists()
     assert {path: path.read_bytes() for path in protected} == protected
+
+
+def test_terminal_callback_reports_success_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    captured: list[TerminalReport] = []
+
+    def preflight(_experiment, *, cleanup_report):
+        cleanup_report.uncertain_attempt_ids.add("attempt-uncertain")
+        return {}
+
+    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr(
+        "phasesweep.engine.run._run_experiment_inner",
+        lambda *_args, **_kwargs: {},
+    )
+
+    assert run_experiment(experiment, terminal_callback=captured.append) == {}
+    assert len(captured) == 1
+    report = captured[0]
+    assert report.primary_error is None
+    assert report.failure_stage is None
+    assert report.uncertain_attempt_ids == frozenset({"attempt-uncertain"})
+
+
+def test_terminal_callback_preserves_failure_when_callback_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    primary_error = NoFeasibleTrialError("phase failed")
+    captured: list[TerminalReport] = []
+
+    class CallbackError(RuntimeError):
+        pass
+
+    def fail_run(*_args, **_kwargs):
+        raise primary_error
+
+    def fail_callback(report: TerminalReport) -> None:
+        captured.append(report)
+        raise CallbackError("snapshot failed")
+
+    monkeypatch.setattr(
+        "phasesweep.engine.run._preflight_existing_studies",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+
+    with pytest.raises(NoFeasibleTrialError) as exc_info:
+        run_experiment(experiment, terminal_callback=fail_callback)
+
+    assert exc_info.value is primary_error
+    assert len(captured) == 1
+    assert captured[0].primary_error is primary_error
+    assert captured[0].failure_stage == "execution"
+
+
+def test_terminal_callback_failure_propagates_after_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+
+    class CallbackError(RuntimeError):
+        pass
+
+    def fail_callback(_report: TerminalReport) -> None:
+        raise CallbackError("snapshot failed")
+
+    monkeypatch.setattr(
+        "phasesweep.engine.run._preflight_existing_studies",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.run._run_experiment_inner",
+        lambda *_args, **_kwargs: {},
+    )
+
+    with pytest.raises(CallbackError, match="snapshot failed"):
+        run_experiment(experiment, terminal_callback=fail_callback)
 
 
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):

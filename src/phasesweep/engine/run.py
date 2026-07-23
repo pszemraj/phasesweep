@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import optuna
 import yaml
 
 from phasesweep._metadata import __version__
@@ -35,6 +36,7 @@ from phasesweep.engine.selection import (
     _winner_summary_item,
 )
 from phasesweep.engine.state import (
+    PHASE_FINGERPRINT_ATTR,
     Winner,
     _experiment_dir,
     _file_log_handler,
@@ -206,7 +208,7 @@ def run_experiment(
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = _PreflightCleanupReport()
-        existing_studies: dict[str, Any] = {}
+        existing_studies: dict[str, optuna.Study] = {}
         generation_prepared = False
         try:
             run_deadline = (
@@ -261,7 +263,7 @@ def run_experiment(
                 primary_error=None,
                 cleanup_confirmed=True,
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
-                uncertain_attempt_ids=frozenset(),
+                uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 failure_stage=None,
             )
             return result
@@ -526,14 +528,14 @@ def _reject_bound_descendant_topups(
     experiment: Experiment,
     *,
     from_phase: str | None,
-    existing_studies: dict[str, Any],
+    existing_studies: dict[str, optuna.Study],
 ) -> None:
     """Reject upstream top-ups that could invalidate a bound descendant study.
 
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`_preflight_existing_studies`.
     :raises StudyContextConflictError: An upstream phase still has unfinished
         top-up trials remaining while a descendant phase's study is already
@@ -562,7 +564,7 @@ def _reject_bound_descendant_topups(
             name
             for name in descendants
             if (dependent := existing_studies.get(name)) is not None
-            and isinstance(dependent.user_attrs.get("phasesweep_fingerprint"), str)
+            and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
         ]
         if bound:
             raise StudyContextConflictError(
@@ -577,14 +579,14 @@ def _reject_unsupported_sampler_topups(
     experiment: Experiment,
     *,
     from_phase: str | None,
-    existing_studies: dict[str, Any],
+    existing_studies: dict[str, optuna.Study],
 ) -> None:
     """Reject stateful sampler continuation after bound-descendant checks.
 
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`_preflight_existing_studies`.
     :raises SamplerContinuationUnsupportedError: A reached phase's study cannot
         safely continue with its configured stateful sampler; delegated to
@@ -606,7 +608,7 @@ def _preflight_reached_fingerprint(
     *,
     from_phase: str | None,
     preloaded_winners: dict[str, Winner],
-    existing_studies: dict[str, Any],
+    existing_studies: dict[str, optuna.Study],
 ) -> None:
     """Verify the first reached study before publishing the new generation.
 
@@ -616,7 +618,7 @@ def _preflight_reached_fingerprint(
         phase that will actually execute.
     :param dict[str, Winner] preloaded_winners: Validated skipped-phase winners,
         used to resolve the reached phase's inherited context.
-    :param dict[str, Any] existing_studies: Existing Optuna studies keyed by
+    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name; a no-op if the reached phase has none yet.
     :raises StudyFingerprintMismatchError: The reached study's stored
         fingerprint does not match the current config.

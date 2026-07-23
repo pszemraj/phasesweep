@@ -273,7 +273,10 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
     Args:
         experiment: Parsed experiment config whose phases are inspected.
         generation_id: Optional invocation identity whose trial counts should
-            be separated from cumulative study history.
+            be separated from cumulative study history and whose immutable
+            artifacts should be inspected. When omitted, counts use the current
+            invocation while winner presence uses the last successfully
+            published generation.
 
     Returns:
         A path-free mapping with the experiment name, metric descriptor, a
@@ -281,6 +284,7 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
         experiment summary has been written.
 
     """
+    requested_generation_id = generation_id
     if generation_id is None:
         try:
             generation = yaml.safe_load(_generation_path(experiment).read_text())
@@ -317,7 +321,7 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
                 for name, stats in phase_stats.items()
             },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
-            generation_id=generation_id,
+            generation_id=requested_generation_id,
         ),
         "summary_present": summary_path is not None and summary_path.is_file(),
     }

@@ -3,6 +3,10 @@
 from phasesweep.engine.errors import (
     ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
+    StudyContextConflictError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
     TrialTargetRegressionError,
 )
 from phasesweep.engine.read import (
@@ -28,6 +32,10 @@ __all__ = [
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
     "SamplerContinuationUnsupportedError",
+    "StudyContextConflictError",
+    "StudyFingerprintMismatchError",
+    "StudySchemaMismatchError",
+    "StudyStorageUnavailableError",
     "TerminalReport",
     "TrialTargetRegressionError",
     "UnsafeProcessCleanupError",
