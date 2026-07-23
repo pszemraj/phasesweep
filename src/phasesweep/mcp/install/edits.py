@@ -535,7 +535,7 @@ def updated_marked_text(existing: str, content: str, *, start: str, end: str) ->
     newline = _detected_newline(existing)
     block = render_marked_block(content, start=start, end=end)
     if newline == "\r\n":
-        block = block.replace("\n", "\r\n")
+        block = block.replace("\r\n", "\n").replace("\n", "\r\n")
     separator = "" if not existing else newline
     return existing + separator + block
 

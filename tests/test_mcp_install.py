@@ -343,12 +343,12 @@ def test_marked_text_append_preserves_crlf():
     original = "before\r\n"
     updated = updated_marked_text(
         original,
-        "body",
+        "first\r\nsecond",
         start=MARKDOWN_START,
         end=MARKDOWN_END,
     )
 
-    assert updated == f"before\r\n\r\n{MARKDOWN_START}\r\nbody\r\n{MARKDOWN_END}\r\n"
+    assert updated == f"before\r\n\r\n{MARKDOWN_START}\r\nfirst\r\nsecond\r\n{MARKDOWN_END}\r\n"
     assert removed_marked_text(updated, start=MARKDOWN_START, end=MARKDOWN_END) == original
 
 
