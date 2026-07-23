@@ -103,6 +103,13 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
     assert_no_sensitive(tool_results, sensitive)
 
 
+def test_assert_no_sensitive_actually_catches_a_leak() -> None:
+    leaky = {"experiment_id": "x", "note": "token=DANGER_TOKEN"}
+
+    with pytest.raises(AssertionError):
+        assert_no_sensitive(leaky, ["DANGER_TOKEN"])
+
+
 @pytest.mark.parametrize(
     ("params", "policy", "expected", "redacted"),
     [
