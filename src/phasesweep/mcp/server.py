@@ -1061,7 +1061,7 @@ class PhaseSweepMCP:
 
         :param RunHandle handle: Resolved run whose terminal status should be inspected.
         :return RunResultSnapshot | None: Validated snapshot, or ``None`` while
-            the runner has not recorded terminal status yet.
+            the run remains non-terminal.
         :raises RunResultSnapshotUnavailableError: Terminal status exists but
             its immutable result snapshot is absent or invalid.
         """
@@ -1069,13 +1069,24 @@ class PhaseSweepMCP:
         if terminal_status is None:
             return None
         snapshot = parse_result_snapshot(terminal_status)
-        if snapshot is None:
-            finalization_state = terminal_status.get("result_snapshot_state")
-            raise RunResultSnapshotUnavailableError(
-                handle.run_id,
-                finalization_state if isinstance(finalization_state, str) else None,
-            )
-        return snapshot
+        if snapshot is not None:
+            return snapshot
+        if self._runs.state(handle) == "running":
+            return None
+        # The runner may have completed the second atomic status write between
+        # the first read and the state check. Re-read before declaring a
+        # terminal snapshot unavailable.
+        latest_status = self._runs.recorded_terminal_status(handle)
+        if latest_status is not None:
+            terminal_status = latest_status
+            snapshot = parse_result_snapshot(terminal_status)
+            if snapshot is not None:
+                return snapshot
+        finalization_state = terminal_status.get("result_snapshot_state")
+        raise RunResultSnapshotUnavailableError(
+            handle.run_id,
+            finalization_state if isinstance(finalization_state, str) else None,
+        )
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> dict[str, Any]:
         """Start the sweep as a detached background run; return its run_id.

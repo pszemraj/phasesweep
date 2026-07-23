@@ -1769,6 +1769,16 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
 
     assert store.state(handle) == "running"
     assert store.recovery_required(handle)
+    status = app.status(run_id=run_id)
+    winners = app.winners(run_id=run_id)
+    awaited = asyncio.run(app.await_run(run_id))
+
+    for payload in (status, awaited):
+        assert payload["result_source"] == "current_shared_study"
+        assert payload["run"]["state"] == "running"
+        assert payload["run"]["recovery_required"] is True
+    assert winners["result_source"] == "current_shared_study"
+    assert awaited["reason"] == "recovery_required"
     preflight = CliRunner().invoke(
         cli_main,
         ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
@@ -1798,6 +1808,43 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     assert store.live_runs() == []
     with pytest.raises(Exception, match="finalization state: failed"):
         app.status(run_id=run_id)
+
+
+def test_read_tools_use_live_view_while_result_snapshot_is_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-live-pending-finalization"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="pending",
+    )
+
+    status = app.status(run_id=run_id)
+    winners = app.winners(run_id=run_id)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
+
+    for payload in (status, awaited):
+        assert payload["result_source"] == "current_shared_study"
+        assert payload["run"]["state"] == "running"
+        assert payload["run"]["recovery_required"] is False
+    assert winners["result_source"] == "current_shared_study"
+    assert awaited["reason"] == "timeout"
 
 
 def test_operator_recovery_keeps_unresolved_launch_reserved(
