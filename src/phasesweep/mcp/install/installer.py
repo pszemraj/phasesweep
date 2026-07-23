@@ -222,9 +222,8 @@ def _apply_toml_mcp(
                 )
             if dry_run:
                 return StepResult("mcp", path, "removed")
-            action: Action = (
-                "removed" if _atomic_write_text(path, candidate, expected=loaded) else "error"
-            )
+            write_result = _atomic_write_text(path, candidate, expected=loaded)
+            action: Action = "removed" if write_result == "written" else "error"
             note = None if action == "removed" else "config changed before it could be replaced"
             return StepResult("mcp", path, action, note=note)
 
@@ -282,10 +281,9 @@ def _apply_toml_mcp(
             return StepResult("mcp", path, "unchanged")
         if dry_run:
             return StepResult("mcp", path, "updated" if loaded.existed else "created")
+        write_result = _atomic_write_text(path, candidate, expected=loaded)
         action = (
-            ("updated" if loaded.existed else "created")
-            if _atomic_write_text(path, candidate, expected=loaded)
-            else "error"
+            ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
         note = None if action != "error" else "config changed before it could be replaced"
         return StepResult("mcp", path, action, note=note)
@@ -350,6 +348,13 @@ def _apply_mcp(
         )
         if action == "lock-error":
             return StepResult("mcp", spec.path, "error", note=_LOCK_UNAVAILABLE_NOTE)
+        if action == "stale":
+            return StepResult(
+                "mcp",
+                spec.path,
+                "error",
+                note="config changed before it could be replaced",
+            )
         if action == "skipped":
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
@@ -374,6 +379,16 @@ def _apply_mcp(
     )
     if action == "lock-error":
         return StepResult("mcp", spec.path, "error", note=_LOCK_UNAVAILABLE_NOTE)
+    if action == "stale":
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note=(
+                "config changed before it could be replaced; merge this manually:\n"
+                f"{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
+            ),
+        )
     note = None
     if action in ("skipped", "conflict", "error"):
         if action == "skipped":
@@ -527,11 +542,8 @@ def _apply_instructions(
                 if dry_run:
                     action: Action = "updated"
                 else:
-                    action = (
-                        "updated"
-                        if _atomic_write_text(edit_path, candidate, expected=loaded)
-                        else "error"
-                    )
+                    write_result = _atomic_write_text(edit_path, candidate, expected=loaded)
+                    action = "updated" if write_result == "written" else "error"
                 retained_note = (
                     f"retained for: {', '.join(sorted(owners))}"
                     if action != "error"
@@ -546,11 +558,8 @@ def _apply_instructions(
             assert removal_candidate is not None
             if dry_run:
                 return StepResult("instructions", path, "removed")
-            action = (
-                "removed"
-                if _atomic_write_text(edit_path, removal_candidate, expected=loaded)
-                else "error"
-            )
+            write_result = _atomic_write_text(edit_path, removal_candidate, expected=loaded)
+            action = "removed" if write_result == "written" else "error"
             removal_note = None if action == "removed" else "instructions changed before removal"
             return StepResult("instructions", path, action, note=removal_note)
 
@@ -569,10 +578,9 @@ def _apply_instructions(
                 path,
                 "updated" if loaded.existed else "created",
             )
+        write_result = _atomic_write_text(edit_path, candidate, expected=loaded)
         action = (
-            ("updated" if loaded.existed else "created")
-            if _atomic_write_text(edit_path, candidate, expected=loaded)
-            else "error"
+            ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
         install_note = (
             None if action != "error" else "instructions changed before they could be replaced"
@@ -596,7 +604,15 @@ def _select_targets(
     targets = agent_targets(project)
     if agent_ids is not None:
         by_id = {target.id: target for target in targets}
-        return [by_id[agent_id] for agent_id in dict.fromkeys(agent_ids)]
+        selected_ids = list(dict.fromkeys(agent_ids))
+        unknown = [agent_id for agent_id in selected_ids if agent_id not in by_id]
+        if unknown:
+            click.echo(
+                f"unknown coding agent id(s): {', '.join(unknown)} (choices: {', '.join(by_id)})",
+                err=True,
+            )
+            return None
+        return [by_id[agent_id] for agent_id in selected_ids]
     detected_by_id = {target.id: target.is_detected() for target in targets}
     detected = [target for target in targets if detected_by_id[target.id]]
     if yes:

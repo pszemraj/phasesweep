@@ -260,7 +260,7 @@ def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatc
 
     monkeypatch.setattr(install_edits, "_new_temporary_fd", change_after_temp_creation)
 
-    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "stale"
     assert path.read_text() == external
     assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
 
@@ -777,6 +777,31 @@ def test_installer_reports_lock_namespace_failure(fake_home, tmp_path, capsys, m
     assert "not a readable regular UTF-8 file" not in output
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
+
+
+def test_installer_reports_json_config_race_as_stale(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    monkeypatch.setattr(install_edits, "_snapshot_matches", lambda *_args: False)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "config changed before it could be replaced" in output
+    assert "config path or shape was unexpected" not in output
+
+
+def test_installer_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    code = installer.run("install", project, catalog, ["unknown"], "mcp", yes=True)
+
+    assert code == 2
+    assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
 
 
 def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path, capsys):

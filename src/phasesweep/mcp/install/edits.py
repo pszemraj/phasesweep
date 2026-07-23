@@ -47,6 +47,7 @@ Action: TypeAlias = Literal[
     "created",
     "updated",
     "unchanged",
+    "stale",
     "skipped",
     "conflict",
     "error",
@@ -54,6 +55,7 @@ Action: TypeAlias = Literal[
     "removed",
     "not-found",
 ]
+AtomicWriteResult: TypeAlias = Literal["written", "stale", "error"]
 MemberPredicate: TypeAlias = Callable[[object], bool]
 
 _INDENT_PATTERN = re.compile(r"^([ \t]+)\S", re.MULTILINE)
@@ -251,7 +253,7 @@ def _new_temporary_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
     raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
 
 
-def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> bool:
+def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> AtomicWriteResult:
     """Atomically replace ``path`` with UTF-8 ``text`` in the same directory.
 
     Existing permissions are retained. The replacement is refused when the
@@ -262,7 +264,8 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> boo
     :param Path path: Destination config path.
     :param str text: Complete replacement contents.
     :param _TextSnapshot expected: Snapshot that must still match before replace.
-    :return bool: Whether the replacement completed successfully.
+    :return AtomicWriteResult: ``written`` on success, ``stale`` when the
+        target changed since it was read, or ``error`` when replacement failed.
     """
     parent_fd = -1
     temporary: str | None = None
@@ -283,13 +286,13 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> boo
             handle.flush()
             os.fsync(handle.fileno())
         if not _snapshot_matches(parent_fd, leaf, expected):
-            return False
+            return "stale"
         os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = None
         os.fsync(parent_fd)
-        return True
+        return "written"
     except (OSError, UnsafePrivatePathError):
-        return False
+        return "error"
     finally:
         if temporary is not None and parent_fd >= 0:
             with contextlib.suppress(OSError):
@@ -390,8 +393,10 @@ def _edit_json_member(
                 )
             except (TypeError, ValueError):
                 return "error"
-            written = _atomic_write_text(path, updated, expected=loaded)
-            return ("updated" if loaded.existed else "created") if written else "error"
+            write_result = _atomic_write_text(path, updated, expected=loaded)
+            if write_result == "written":
+                return "updated" if loaded.existed else "created"
+            return write_result
 
         try:
             data = strict_json_loads(text, finite_floats=True) if text.strip() else {}
@@ -431,8 +436,8 @@ def _edit_json_member(
             )
         except (TypeError, ValueError):
             return "error"
-        written = _atomic_write_text(path, updated, expected=loaded)
-        return action if written else "error"
+        write_result = _atomic_write_text(path, updated, expected=loaded)
+        return action if write_result == "written" else write_result
 
 
 def merge_json_member(
