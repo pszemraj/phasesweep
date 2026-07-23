@@ -51,10 +51,29 @@ def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     entry = registry.get("srv")
     assert registry.state_dir == tmp_path / "runs" / ".mcp"
     assert entry.config_path == config
+    assert entry.cwd == output.parent.resolve()
     assert entry.allow_launch is False
     assert entry.allow_cancel is False
     assert entry.visible_params == "none"
     assert entry.description == ""
+
+
+def test_init_catalog_pins_runner_cwd_to_catalog_directory(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    configs = project / "configs"
+    configs.mkdir(parents=True)
+    config = _write_config(configs, "srv.yaml")
+    output = project / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Registry.load(output).get("srv").cwd == project.resolve()
+    text = output.read_text()
+    assert 'cwd: "."' in text
+    assert f"phasesweep mcp check --catalog {output}" in text
 
 
 @pytest.mark.parametrize("filename", ["model # 1.yaml", "model: 1.yaml", "model\n1.yaml"])

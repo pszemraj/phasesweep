@@ -1185,7 +1185,7 @@ def test_cli_install_dry_run_does_not_offer_to_scaffold_missing_catalog(
     )
 
     assert result.exit_code == 2
-    assert "Scaffold one first" in result.output
+    assert "Create and review one first" in result.output
     assert "experiment config to scaffold" not in result.output
     assert not (project / "catalog.yaml").exists()
 
@@ -1200,19 +1200,20 @@ def test_cli_install_requires_catalog_when_unattended(fake_home, tmp_path, monke
     assert not (project / ".mcp.json").exists()
 
 
-def test_cli_install_offers_catalog_scaffold_interactively(fake_home, tmp_path, monkeypatch):
+def test_cli_install_requires_reviewed_catalog_interactively(fake_home, tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.chdir(project)
-    # Prompt answers: config path to scaffold from, then per-plan confirmation.
     result = CliRunner().invoke(
         cli_main,
         ["mcp", "install", "--agent", "claude", "--type", "mcp"],
-        input=f"{EXAMPLE_CONFIG}\ny\n",
     )
-    assert result.exit_code == 0, result.output
-    assert (project / "catalog.yaml").is_file()
-    assert "phasesweep" in json.loads((project / ".mcp.json").read_text())["mcpServers"]
+
+    assert result.exit_code == 2
+    assert "descriptions, visibility, and permissions" in result.output
+    assert "phasesweep mcp check" in result.output
+    assert not (project / "catalog.yaml").exists()
+    assert not (project / ".mcp.json").exists()
 
 
 def test_cli_install_instructions_only_needs_no_catalog_or_sdk(fake_home, tmp_path, monkeypatch):

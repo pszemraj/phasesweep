@@ -9,6 +9,7 @@ deliberate operator edit. Operator-facing: rendered output contains real paths.
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -88,6 +89,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             f"""\
   - id: {experiment_id_scalar}          # the only token the agent ever sends
     config: {config_path}   # resolved relative to this catalog file
+    cwd: "."                     # detached trainer cwd; change if trial_command normally starts elsewhere
     # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
     # Side effects default to false. Uncomment deliberately to let the agent act:
@@ -98,11 +100,12 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
 """
         )
     state_dir = catalog_dir / "runs" / ".mcp"
+    catalog_arg = shlex.quote(str(output.resolve()))
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the
 # descriptions, paths, visibility, and permissions below, run:
-#   phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
-#   phasesweep mcp install --catalog /absolute/path/to/catalog.yaml --dry-run
+#   phasesweep mcp check --catalog {catalog_arg}
+#   phasesweep mcp install --catalog {catalog_arg} --dry-run
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which

@@ -6,7 +6,7 @@ Install the extra, create a catalog, connect a client, verify the connection, an
 
 - The MCP [platform requirements](runtime.md#platform-support).
 - Python 3.11 or newer.
-- At least one phasesweep experiment config that already passes `phasesweep validate`.
+- At least one phasesweep experiment config that passes `phasesweep validate` and uses the restart-stable MCP paths described in step 2.
 - A coding client with local stdio MCP support. Local use requires no API key or OAuth credential.
 
 ## 1. Install
@@ -37,7 +37,9 @@ Scaffold a catalog next to your project:
 phasesweep mcp init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
 ```
 
-This stages an annotated `catalog.yaml`, validates it through the server startup path, provisions its private state directories, and publishes it only after validation succeeds without overwriting an existing file. Each entry starts with side effects disabled and winner values redacted. Fill in its description, review the generated paths, enable only the actions and parameter values the agent should receive, then run the `phasesweep mcp check` command printed by the scaffold. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml).
+An ordinary CLI config with relative `workdir` or storage can pass `phasesweep validate` but is not restart-stable enough for MCP. Use an absolute `workdir` and an absolute local SQLite or Journal storage path; [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) shows the MCP variant of the toy config.
+
+This stages an annotated `catalog.yaml`, validates it through the server startup path, provisions its private state directories, and publishes it only after validation succeeds without overwriting an existing file. Each generated entry pins the detached trainer working directory to the catalog directory; change `cwd` if its relative `trial_command` normally starts elsewhere. Entries begin with side effects disabled and winner values redacted. Fill in each description, review the generated paths, enable only the actions and parameter values the agent should receive, then run the `phasesweep mcp check` command printed in the scaffold. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for the toy MCP config.
 
 Confirm the catalog loads before touching any client config:
 
@@ -58,7 +60,7 @@ phasesweep mcp install --agent claude --dry-run  # validate and show planned cli
 phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
 ```
 
-Without `--agent`, interactive installs preselect detected clients in one menu while leaving undetected clients selectable; unattended `--yes` installs select every detected client. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. An interactive install can scaffold a missing catalog; unattended installs print the exact `init-catalog` command instead. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
+Without `--agent`, interactive installs preselect detected clients in one menu while leaving undetected clients selectable; unattended `--yes` installs select every detected client. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. A missing catalog is never created implicitly: the command prints the exact `init-catalog` step so you can review permissions before connecting a client. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
 
 Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
 

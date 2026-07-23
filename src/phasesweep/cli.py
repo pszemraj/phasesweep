@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import sys
 from pathlib import Path
 
@@ -859,8 +860,8 @@ def install(
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
 
-    Validates (or interactively scaffolds) the catalog first, then delegates
-    the plan-then-apply flow to :mod:`phasesweep.mcp.install.installer`.
+    Validates the operator-reviewed catalog first, then delegates the
+    plan-then-apply flow to :mod:`phasesweep.mcp.install.installer`.
     Operator-facing: output may include paths.
 
     :param click.Context ctx: Active Click context used for the exit code.
@@ -884,16 +885,16 @@ def install(
             ctx.exit(2)
         catalog_path = (catalog if catalog is not None else project / "catalog.yaml").resolve()
         if not catalog_path.exists():
-            if dry_run:
-                click.echo(
-                    f"phasesweep mcp install: no catalog at {catalog_path}. Scaffold one first:\n"
-                    f"  phasesweep mcp init-catalog --from <experiment.yaml> -o {catalog_path}; "
-                    "nothing was changed.",
-                    err=True,
-                )
-                ctx.exit(2)
-            if not _offer_catalog_scaffold(catalog_path, yes):
-                ctx.exit(2)
+            output_arg = shlex.quote(str(catalog_path))
+            click.echo(
+                f"phasesweep mcp install: no catalog at {catalog_path}. Create and review one first:\n"
+                "  phasesweep mcp init-catalog --from <experiment.yaml> "
+                f"-o {output_arg}\n"
+                "Then edit its descriptions, visibility, and permissions, run "
+                "`phasesweep mcp check`, and retry install; nothing was changed.",
+                err=True,
+            )
+            ctx.exit(2)
         try:
             report = check_catalog(catalog_path)
         except CatalogError as exc:
@@ -919,40 +920,6 @@ def install(
             allow_user_scope,
         )
     )
-
-
-def _offer_catalog_scaffold(catalog_path: Path, yes: bool) -> bool:
-    """Offer to scaffold a missing catalog before installing.
-
-    Unattended runs fail with the exact command to run instead; interactive
-    runs prompt for one experiment config and scaffold from it.
-
-    :param Path catalog_path: Missing catalog destination.
-    :param bool yes: Whether the run is unattended.
-    :return bool: True when a validated catalog now exists at ``catalog_path``.
-    """
-    suggestion = f"phasesweep mcp init-catalog --from <experiment.yaml> -o {catalog_path}"
-    if yes:
-        click.echo(
-            f"phasesweep mcp install: no catalog at {catalog_path}. Scaffold one first:\n"
-            f"  {suggestion}",
-            err=True,
-        )
-        return False
-    click.echo(f"no catalog at {catalog_path}.")
-    raw = click.prompt(
-        "experiment config to scaffold it from (blank to abort)",
-        default="",
-        show_default=False,
-    ).strip()
-    if not raw:
-        click.echo(f"aborted; scaffold a catalog with: {suggestion}", err=True)
-        return False
-    config = Path(raw)
-    if not config.is_file():
-        click.echo(f"phasesweep mcp install: no such config file: {config}", err=True)
-        return False
-    return _write_catalog_scaffold(catalog_path, (config,))
 
 
 @mcp.command(
