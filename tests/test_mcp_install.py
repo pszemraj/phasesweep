@@ -761,6 +761,28 @@ def test_installer_reports_non_regular_json_config(fake_home, tmp_path, capsys):
     assert "config path is not a regular file" in capsys.readouterr().out
 
 
+def test_installer_reports_lock_namespace_failure(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def refuse_lock(_path):
+        raise PermissionError("lock directory unavailable")
+
+    monkeypatch.setattr(install_edits, "open_lock_file", refuse_lock)
+
+    code = installer.run("install", project, catalog, ["claude"], "all", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert output.count("installer lock unavailable") == 2
+    assert "PHASESWEEP_LOCK_DIR" in output
+    assert "config path or shape was unexpected" not in output
+    assert "not a readable regular UTF-8 file" not in output
+    assert not (project / ".mcp.json").exists()
+    assert not (project / "CLAUDE.md").exists()
+
+
 def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()

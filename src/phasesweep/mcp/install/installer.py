@@ -26,6 +26,7 @@ from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.install.edits import (
     Action,
     _atomic_write_text,
+    _EditLockUnavailable,
     _locked_editable_text,
     _marked_span,
     manual_json_snippet,
@@ -54,6 +55,10 @@ _OK_ACTIONS: frozenset[str] = frozenset({"created", "updated", "unchanged", "rem
 _CODEX_TABLE_HEADER = f"[mcp_servers.{SERVER_NAME}]"
 _INSTRUCTION_OWNERS_PREFIX = "<!-- PHASESWEEP_OWNERS: "
 _INSTRUCTION_OWNERS_SUFFIX = " -->"
+_LOCK_UNAVAILABLE_NOTE = (
+    "installer lock unavailable; ensure the phasesweep lock directory is writable and "
+    "PHASESWEEP_LOCK_DIR, if set, names an existing safe directory"
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,13 @@ def _apply_toml_mcp(
     content = codex_toml_content(command, catalog) if catalog is not None else ""
 
     with _locked_editable_text(path) as loaded:
+        if isinstance(loaded, _EditLockUnavailable):
+            return StepResult(
+                "mcp",
+                path,
+                "error",
+                note=_LOCK_UNAVAILABLE_NOTE,
+            )
         if loaded is None:
             guidance = (
                 f"; merge this manually:\n{content}"
@@ -336,6 +348,8 @@ def _apply_mcp(
             managed=managed,
             dry_run=dry_run,
         )
+        if action == "lock-error":
+            return StepResult("mcp", spec.path, "error", note=_LOCK_UNAVAILABLE_NOTE)
         if action == "skipped":
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
@@ -358,6 +372,8 @@ def _apply_mcp(
         managed=managed,
         dry_run=dry_run,
     )
+    if action == "lock-error":
+        return StepResult("mcp", spec.path, "error", note=_LOCK_UNAVAILABLE_NOTE)
     note = None
     if action in ("skipped", "conflict", "error"):
         if action == "skipped":
@@ -466,6 +482,13 @@ def _apply_instructions(
         except (OSError, RuntimeError):
             continue
     with _locked_editable_text(edit_path) as loaded:
+        if isinstance(loaded, _EditLockUnavailable):
+            return StepResult(
+                "instructions",
+                path,
+                "error",
+                note=_LOCK_UNAVAILABLE_NOTE,
+            )
         if loaded is None:
             return StepResult(
                 "instructions",

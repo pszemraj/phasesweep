@@ -50,6 +50,7 @@ Action: TypeAlias = Literal[
     "skipped",
     "conflict",
     "error",
+    "lock-error",
     "removed",
     "not-found",
 ]
@@ -73,6 +74,13 @@ class _TextSnapshot:
         if self.stat_token is None:
             return None
         return stat.S_IMODE(self.stat_token[2])
+
+
+class _EditLockUnavailable:
+    """Sentinel distinguishing lock failure from an unreadable edit target."""
+
+
+_EDIT_LOCK_UNAVAILABLE = _EditLockUnavailable()
 
 
 def _stat_token(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -143,12 +151,15 @@ def _edit_lock_path(path: Path) -> Path:
 
 
 @contextlib.contextmanager
-def _locked_editable_text(path: Path) -> Iterator[_TextSnapshot | None]:
+def _locked_editable_text(
+    path: Path,
+) -> Iterator[_TextSnapshot | _EditLockUnavailable | None]:
     """Serialize one target's read-modify-write transaction and read it once.
 
     :param Path path: Config or instructions file being edited.
-    :return Iterator[_TextSnapshot | None]: Stable snapshot while the scoped
-        lock is held, or ``None`` when locking or reading is unsafe.
+    :return Iterator: Stable snapshot while the scoped lock is held,
+        ``_EDIT_LOCK_UNAVAILABLE`` when locking fails, or ``None`` when the
+        edit target is unsafe or unreadable.
     """
     handle: IO[str] | None = None
     try:
@@ -157,7 +168,7 @@ def _locked_editable_text(path: Path) -> Iterator[_TextSnapshot | None]:
     except (OSError, UnsafeLockPathError):
         if handle is not None:
             handle.close()
-        yield None
+        yield _EDIT_LOCK_UNAVAILABLE
         return
 
     try:
@@ -359,6 +370,8 @@ def _edit_json_member(
     :return Action: Edit result.
     """
     with _locked_editable_text(path) as loaded:
+        if isinstance(loaded, _EditLockUnavailable):
+            return "lock-error"
         if loaded is None:
             return "error"
         text = loaded.text
