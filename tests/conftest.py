@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,32 @@ def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     lock_dir.mkdir(mode=0o700)
     lock_dir.chmod(0o700)
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_dir))
+
+
+@pytest.fixture(autouse=True)
+def isolate_signal_ownership_tokens() -> Iterator[None]:
+    """Snapshot and restore the process-lifetime signal-ownership tokens per test.
+
+    ``phasesweep.runtime.process._process_lifetime_owner`` and ``_scope_depth``
+    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
+    re-derived from OS ground truth the way the actual signal handlers are.
+    A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
+    in-process) would otherwise permanently flip ``_process_lifetime_owner``
+    for the rest of the pytest process, silently turning every later
+    ``signal_handler_scope()`` call into a no-op regardless of what OS-level
+    handlers that later test itself restores. This is a cheap attribute
+    save/restore, matching the existing convention in this suite of tests
+    manually restoring real signal handlers around themselves.
+    """
+    import phasesweep.runtime.process as process
+
+    prior_owner = process._process_lifetime_owner
+    prior_depth = process._scope_depth
+    try:
+        yield
+    finally:
+        process._process_lifetime_owner = prior_owner
+        process._scope_depth = prior_depth
 
 
 def copy_fake_train(tmp_path: Path) -> Path:

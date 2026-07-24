@@ -9,6 +9,19 @@ Design:
     can kill the whole tree with os.killpg, not just the shell.
   - A global registry of live children lets us clean up on orchestrator death.
   - PID files in each trial_dir let operators identify orphans manually.
+
+Launch barrier (review v0.5.15 / blocker 1): every trial launches through a
+two-phase supervisor. Before the parent acknowledges, the supervisor is a
+stdlib-only helper script (``phasesweep.runtime.supervisor``) run directly
+(never ``-m``) under ``python -I -S`` with a minimal sanitized environment —
+just ``PATH``. It cannot import the phasesweep package, a poisoned/shadowed
+package from the trainer's ``PYTHONPATH``, or a trainer-composed
+``sitecustomize``, and it starts in ~30ms instead of paying phasesweep's
+package-import cost. Only after this process durably persists
+``process_identity.json`` does it send the trainer's shell command and full
+environment to the supervisor as a framed JSON payload; the supervisor then
+``execve``s ``/bin/sh -c cmd`` under that environment, replacing itself as
+the same PID/process group already registered here.
 """
 
 from __future__ import annotations
@@ -28,15 +41,44 @@ from pathlib import Path
 from types import FrameType
 from typing import IO
 
+from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
 
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
+_DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
+# With the -I -S stdlib-only launch (review v0.5.15 / blocker 1), supervisor
+# startup no longer pays phasesweep's package-import cost (~0.55s pre-fix) —
+# real-world readiness lands in ~30ms. 10s stays generous headroom for a
+# loaded host, not a tight bound.
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
 PROCESS_IDENTITY_SCHEMA_VERSION = 1
+
+
+def _supervisor_script_path() -> str:
+    """Return the absolute on-disk path to the stdlib-only supervisor script.
+
+    Importing :mod:`phasesweep.runtime.supervisor` here (in the PARENT) is
+    safe — the parent already has the full ``phasesweep`` package loaded.
+    Only the supervisor *subprocess* must stay import-free before the
+    ready/ack barrier (review v0.5.15 / blocker 1); this import never runs in
+    that subprocess, which launches the file directly via its path instead.
+
+    :return str: Absolute path to ``supervisor.py`` on disk.
+    :raises RuntimeError: If the imported module has no ``__file__`` (e.g. a
+        namespace package or frozen build), making a subprocess launch by
+        path impossible.
+    """
+    module_file = _supervisor.__file__
+    if module_file is None:
+        raise RuntimeError("phasesweep.runtime.supervisor has no __file__; cannot launch it.")
+    return str(Path(module_file).resolve())
+
+
+_SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 
 # ---------------------------------------------------------------------------
 # Global child registry + signal handler
@@ -226,6 +268,22 @@ def _unblock_shutdown_signals() -> None:
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
 
 
+# Explicit shutdown-signal ownership tokens (review v0.5.15 / blocker 2B),
+# replacing inference from ``signal.getsignal(sig) is _shutdown_handler``.
+# That inference could not distinguish "this call's own enclosing scope" from
+# "an unrelated concurrent top-level run in another thread" — both look like
+# "the shutdown handler is already installed" — so the first of two
+# concurrent top-level runs to finish would tear down handlers the second
+# run still depends on (false nesting). Both globals are mutated only from
+# the main thread (``install_signal_handlers`` and ``signal_handler_scope``'s
+# install/restore branch both run there; the main thread is where
+# ``signal.signal`` is even callable), so no lock is needed — CPython's GIL
+# already makes a single attribute assignment atomic, and there is never a
+# writer to race against a writer.
+_process_lifetime_owner = False
+_scope_depth = 0
+
+
 def install_signal_handlers() -> None:
     """Install shutdown handlers that clean up child process groups.
 
@@ -237,9 +295,17 @@ def install_signal_handlers() -> None:
     shutdown signals are unblocked on each call so an inherited signal mask
     cannot prevent the handlers from running. Must be called from the main
     thread.
+
+    On success — including the idempotent already-installed path — this
+    takes process-lifetime ownership of the shutdown signals: every later
+    :func:`signal_handler_scope` call, on any thread, becomes a no-op for the
+    rest of the process (review v0.5.15 / blocker 2B). Ownership is NOT taken
+    when installation fails because this was called off the main thread.
     """
+    global _process_lifetime_owner  # noqa: PLW0603
     _unblock_shutdown_signals()
     if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
+        _process_lifetime_owner = True
         return
     try:
         signal.signal(signal.SIGTERM, _shutdown_handler)
@@ -248,6 +314,8 @@ def install_signal_handlers() -> None:
             signal.signal(signal.SIGHUP, _shutdown_handler)
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")
+        return
+    _process_lifetime_owner = True
 
 
 @contextlib.contextmanager
@@ -257,22 +325,33 @@ def signal_handler_scope() -> Iterator[None]:
     A library must not leave its shutdown handlers and unblocked signal mask
     installed after it returns control — that permanently steals the
     embedding process's own SIGTERM/SIGINT/SIGHUP handling (review v0.5.14 /
-    blocker 6). This context manager scopes ownership to one call tree instead:
+    blocker 6). This context manager scopes ownership to one call tree,
+    tracked with explicit tokens rather than handler-identity inference
+    (review v0.5.15 / blocker 2B). Ownership contract:
 
-    - If ``_shutdown_handler`` is already installed for every shutdown signal
-      (an enclosing scope, or a process-lifetime :func:`install_signal_handlers`
-      call by an entry point such as the CLI or MCP server), this is a no-op:
-      it neither touches the handlers/mask nor restores anything on exit. This
-      makes the scope reentrant and lets entry points keep explicit ownership
-      for the whole process lifetime.
-    - Otherwise, on the main thread, it snapshots the prior handlers and mask,
-      installs ``_shutdown_handler``, unblocks the shutdown signals, and
-      restores the snapshot in ``finally`` — on every exit path, success or
-      exception.
-    - Otherwise (not the main thread, and nothing installed yet), signal
-      ownership cannot be established here at all: ``signal.signal`` only
-      works on the main thread, so this raises rather than silently running
-      unprotected.
+      1. A process-lifetime :func:`install_signal_handlers` call (CLI/MCP
+         entry points) owns the shutdown signals for the rest of the
+         process; every scope call afterward, on any thread, is a no-op.
+      2. Absent that, the MAIN THREAD may take temporary ownership for one
+         call tree: the outermost call installs and restores; lexically
+         nested calls on that same thread share the ownership and touch
+         nothing.
+      3. A call from a thread that is neither the main thread nor covered by
+         (1) raises :class:`SignalOwnershipUnavailableError` instead of
+         silently running unprotected, because ``signal.signal`` only works
+         on the main thread.
+
+    Restoration on exit (the outermost main-thread call only) happens in a
+    fixed order — re-block, then restore handlers, then restore the mask
+    (review v0.5.15 / blocker 2A) — so a shutdown signal pending at exit
+    cannot fire against a handler that is mid-restoration: pre-fix, restoring
+    the mask before the handlers let a pending signal invoke
+    ``_shutdown_handler`` while it was still installed, raising
+    ``PhaseSweepShutdown`` out of this cleanup path and leaving some host
+    handlers unrestored. Restoration continues past an individual
+    ``signal.signal`` failure instead of aborting the loop, and the first
+    such error is raised only when the scope body itself did not already
+    raise (see the ``finally`` block below).
 
     Raises:
         SignalOwnershipUnavailableError: Called from a non-main thread while
@@ -284,11 +363,11 @@ def signal_handler_scope() -> Iterator[None]:
         outermost run whose child processes must be cleaned up on shutdown.
 
     """
-    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
-        # Reentrant no-op: an enclosing scope (or a process-lifetime
-        # install_signal_handlers() call) already owns the shutdown signals.
-        # Nesting must install once and restore once, so the inner call
-        # touches nothing.
+    global _scope_depth  # noqa: PLW0603
+
+    if _process_lifetime_owner:
+        # An entry point (CLI/MCP) already owns shutdown signals for the
+        # whole process. Nothing to install or restore, on any thread.
         yield
         return
 
@@ -301,20 +380,38 @@ def signal_handler_scope() -> Iterator[None]:
             "start, or run this from the main thread."
         )
 
+    if _scope_depth > 0:
+        # True lexical nesting on the main thread: an enclosing scope call
+        # already installed the handlers and mask. Just track depth so only
+        # the outermost exit restores anything.
+        _scope_depth += 1
+        try:
+            yield
+        finally:
+            _scope_depth -= 1
+        return
+
     prior_handlers = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
     prior_mask = None
     if hasattr(signal, "pthread_sigmask"):
         # An empty-set SIG_BLOCK call changes nothing; it is a pure read that
         # returns the mask already in effect, for restoration later.
         prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    _scope_depth = 1
     try:
         for sig in _SHUTDOWN_SIGNALS:
             signal.signal(sig, _shutdown_handler)
         _unblock_shutdown_signals()
         yield
     finally:
-        if prior_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        _scope_depth = 0
+        # Ordering matters (review v0.5.15 / blocker 2A): block first, THEN
+        # restore handlers, THEN restore the mask. Restoring the mask before
+        # the handlers would deliver a pending shutdown signal while
+        # ``_shutdown_handler`` is still installed for it.
+        if hasattr(signal, "pthread_sigmask"):
+            signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+        restoration_error: Exception | None = None
         for sig, handler in prior_handlers.items():
             if handler is None:
                 log.warning(
@@ -324,7 +421,24 @@ def signal_handler_scope() -> Iterator[None]:
                     sig,
                 )
                 continue
-            signal.signal(sig, handler)
+            try:
+                signal.signal(sig, handler)
+            except Exception as exc:  # noqa: BLE001 - continue past one bad restore
+                log.exception(
+                    "Failed to restore the prior handler for signal %d after scope exit", sig
+                )
+                if restoration_error is None:
+                    restoration_error = exc
+        if prior_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        if restoration_error is not None:
+            if sys.exc_info()[1] is None:
+                raise restoration_error
+            log.error(
+                "Signal handler restoration failed while another exception was already "
+                "propagating out of this scope; not overriding it: %s",
+                restoration_error,
+            )
 
 
 @contextlib.contextmanager
@@ -436,21 +550,45 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     propagate uncertainty so the orchestrator can refuse to schedule more work
     onto a potentially-leaked GPU (review v0.5.9 / blocker 3).
 
+    Pre-v0.5.15 this only reaped the direct child (``proc``) when a single
+    nonblocking ``poll()`` already observed it exited — a race where the
+    child died right after ``poll()`` returned ``None`` left it an unreaped
+    zombie despite ``cleanup_confirmed`` being reported ``True`` (review
+    v0.5.15 / blocker 4). Once :func:`_terminate_process_group` confirms every
+    group member is gone, this now unconditionally does one bounded blocking
+    ``wait`` on the direct child so it is provably reaped (or cleanup is
+    reported unconfirmed) before returning. This never calls ``proc.wait()``
+    from ``_shutdown_handler`` itself — that path documents why it must not
+    block (see :func:`_shutdown_handler`); this function only runs on normal
+    (non-signal-handler) cleanup paths.
+
     Args:
         pgid: Process-group ID of the trial subprocess.
-        proc: The root subprocess's :class:`subprocess.Popen` handle. Used
-            for a final non-blocking ``wait`` to reap the zombie root.
+        proc: The root subprocess's :class:`subprocess.Popen` handle. Reaped
+            via a bounded ``wait`` once the group is confirmed terminated.
 
     Returns:
         ``True`` if every process in the group is gone after the SIGTERM →
-        SIGKILL escalation; ``False`` if at least one survived or cleanup
-        status was inconclusive.
+        SIGKILL escalation AND the direct child was reaped within
+        ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one
+        group member survived, cleanup status was inconclusive, or the direct
+        child failed to reap in time.
 
     """
     cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
-    if proc.poll() is not None:
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=0)
+    try:
+        proc.wait(timeout=_DIRECT_CHILD_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        log.error(
+            "Direct child PID %d (pgid %d) did not reap within %.1fs after group "
+            "termination; treating cleanup as unconfirmed",
+            proc.pid,
+            pgid,
+            _DIRECT_CHILD_REAP_TIMEOUT_SECONDS,
+        )
+        cleanup_confirmed = False
+    except ChildProcessError:
+        pass  # Already reaped elsewhere (e.g. a concurrent wait()).
     return cleanup_confirmed
 
 
@@ -549,35 +687,76 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     )
 
 
+def _sanitized_supervisor_env() -> dict[str, str]:
+    """Build the minimal environment for the pre-ACK supervisor interpreter.
+
+    Only ``PATH`` is passed through. Everything else — the full trainer
+    environment, ``PYTHONPATH``/``PYTHONHOME``, and any ``CUDA_*`` var
+    composed for this trial — is intentionally withheld: the interpreter
+    that runs ``supervisor.py`` has not yet passed the ready/ack barrier, so
+    it must not see anything a trainer-composed environment could use to
+    execute code before phasesweep's process identity is durable (review
+    v0.5.15 / blocker 1). The trainer environment is delivered separately,
+    over the ack pipe, only after identity persistence succeeds.
+
+    :return dict[str, str]: ``{"PATH": ...}`` using the parent's ``PATH``, or
+        a conservative fallback when the parent has none.
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def _encode_launch_payload(cmd: str, env: dict[str, str]) -> bytes:
+    """Frame the trainer command and environment for the supervisor's ack pipe.
+
+    :param str cmd: Shell command string the supervisor execs with ``/bin/sh``.
+    :param dict[str, str] env: Full trainer process environment.
+    :return bytes: A 10-ASCII-digit decimal length header (byte length of the
+        UTF-8 JSON body) immediately followed by that many body bytes.
+    """
+    body = json.dumps({"cmd": cmd, "env": env}).encode("utf-8")
+    return f"{len(body):010d}".encode("ascii") + body
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, looping past partial pipe writes.
+
+    :param int fd: Open file descriptor to write to.
+    :param bytes data: Bytes to write in full.
+    :raises OSError: If the underlying ``os.write`` call fails.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
 def _spawn_blocked_supervisor(
-    cmd: str,
     *,
-    env: dict[str, str],
     stdout: IO[str],
     stderr: IO[str],
 ) -> tuple[subprocess.Popen, int, int]:
-    """Spawn a supervisor that cannot exec ``cmd`` until its parent acknowledges it.
+    """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
-    Launches ``phasesweep.runtime.supervisor`` in its own session, passing it
-    a readiness pipe and an acknowledgement pipe. Blocks (via ``select``) until
-    the supervisor signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS``
-    elapses, then registers the new process group. On any failure — timeout,
-    an unexpected readiness byte, or an exception from ``Popen`` itself — any
-    spawned process group is killed and unregistered before the exception
-    propagates.
+    Launches the stdlib-only ``phasesweep.runtime.supervisor`` script
+    directly (never ``-m phasesweep.runtime.supervisor``) under
+    ``python -I -S`` with a minimal sanitized environment — see
+    :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
+    acknowledgement pipe. Blocks (via ``select``) until the supervisor
+    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses, then
+    registers the new process group. On any failure — timeout, an unexpected
+    readiness byte, or an exception from ``Popen`` itself — any spawned
+    process group is killed and unregistered before the exception propagates.
 
     Args:
-        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
-        env: Full process environment for the supervisor subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
 
     Returns:
         A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
         its registered process-group id, and the write end of the
-        acknowledgement pipe. The caller owns ``ack_write`` and must write one
-        acknowledgement byte and close it once the trial's process identity is
-        durably persisted.
+        acknowledgement pipe. The caller owns ``ack_write`` and must send the
+        framed launch payload (see :func:`_encode_launch_payload`) and close
+        it once the trial's process identity is durably persisted.
 
     Raises:
         RuntimeError: If the supervisor does not signal readiness within
@@ -593,13 +772,13 @@ def _spawn_blocked_supervisor(
         proc = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "phasesweep.runtime.supervisor",
+                "-I",
+                "-S",
+                _SUPERVISOR_SCRIPT_PATH,
                 str(ready_write),
                 str(ack_read),
-                cmd,
             ],
-            env=env,
+            env=_sanitized_supervisor_env(),
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
@@ -650,12 +829,15 @@ def run_supervised(
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
-    Launches a small supervisor first. The supervisor waits on an inherited
-    acknowledgement pipe while the parent atomically persists
-    ``process_identity.json``. Only after the identity is durable does the
-    parent acknowledge the supervisor, which then execs the trainer command.
-    If the parent dies before acknowledgement, pipe EOF makes the supervisor
-    exit without starting training.
+    Launches a small stdlib-only supervisor first (see module docstring for
+    the pre-ACK/post-ACK launch boundary; review v0.5.15 / blocker 1). The
+    supervisor waits on an inherited acknowledgement pipe while the parent
+    atomically persists ``process_identity.json``. Only after the identity is
+    durable does the parent send the trainer command and full trainer
+    environment to the supervisor as a framed JSON payload, which the
+    supervisor then execs the trainer command under. If the parent dies
+    before delivering that payload, pipe EOF makes the supervisor exit
+    without starting training.
 
     The identity record is removed only on a fully clean exit: root returned 0
     **and** no descendant processes were left alive. If the root exits cleanly
@@ -708,8 +890,6 @@ def run_supervised(
     try:
         with _defer_shutdown_signals(), _launch_lock:
             proc, pgid, ack_write = _spawn_blocked_supervisor(
-                cmd,
-                env=env,
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -719,8 +899,10 @@ def run_supervised(
                 pgid=pgid,
             )
             _write_process_identity(identity_path, identity)
-            if os.write(ack_write, b"A") != 1:
-                raise RuntimeError("trial supervisor acknowledgement was not delivered")
+            # Only now does the trainer command and full trainer environment
+            # cross into the supervisor — after identity is durable, over the
+            # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
+            _write_all(ack_write, _encode_launch_payload(cmd, env))
             os.close(ack_write)
             ack_write = None
     except Exception as exc:
@@ -729,9 +911,15 @@ def run_supervised(
         if proc is None:
             raise
         target_pgid = pgid if pgid is not None else proc.pid
-        identity_failure_reason = f"failed to persist process identity: {exc}"
+        # Covers both a failed identity write and a failed payload delivery;
+        # the substring "failed to persist process identity" is kept stable
+        # because it is asserted on by existing tests.
+        launch_failure_reason = (
+            f"failed to persist process identity or deliver launch payload: {exc}"
+        )
         log.exception(
-            "Trial PID %d (pgid %d) launched but identity persistence failed; terminating group",
+            "Trial PID %d (pgid %d) launched but identity persistence or launch payload "
+            "delivery failed; terminating group",
             proc.pid,
             target_pgid,
         )
@@ -744,7 +932,7 @@ def run_supervised(
             timed_out=False,
             pid=proc.pid,
             duration_seconds=duration,
-            failure_reason=identity_failure_reason,
+            failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
         )
 

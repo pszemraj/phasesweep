@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -1120,6 +1121,106 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
         assert_host_state_active()
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
+    """A signal pending at scope-exit must reach the restored HOST handler, not
+    ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
+
+    Pre-fix, the mask was restored before the host handlers, so a pending
+    SIGTERM fired while ``_shutdown_handler`` was still installed for it,
+    raising ``PhaseSweepShutdown`` out of the cleanup path and leaving some
+    host handlers unrestored. The fixed order is: block, then restore
+    handlers, then restore the mask.
+    """
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask not available")
+
+    received: list[int] = []
+
+    def host_handler(signum: int, _frame: object) -> None:
+        received.append(signum)
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+
+        with signal_handler_scope():
+            # Block SIGTERM ourselves so the kill below queues instead of
+            # firing immediately (the scope's own entry unblocks it).
+            signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert received == [], "signal fired before scope exit"
+
+        # Scope exit order: block -> restore handlers -> restore mask. The
+        # pending SIGTERM is delivered on the final unblock, by which point
+        # the HOST handler (not phasesweep's) is installed. CPython only
+        # invokes the Python-level handler at the next eval-breaker check,
+        # not necessarily synchronously with the unblocking call, so poll
+        # briefly instead of asserting immediately.
+        deadline = time.monotonic() + 2.0
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert received == [signal.SIGTERM]
+        assert signal.getsignal(signal.SIGTERM) is host_handler
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed ``signal.signal`` restore must not abort the rest of the loop.
+
+    Every other prior handler must still be restored, and the first
+    restoration error surfaces once the scope body itself did not already
+    raise (review v0.5.15 / blocker 2A).
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+
+        def make_sentinel(tag: int):
+            def handler(signum: int, frame: object) -> None:
+                return None
+
+            handler.__name__ = f"sentinel_{tag}"
+            return handler
+
+        sentinel_handlers = {sig: make_sentinel(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+        for sig, handler in sentinel_handlers.items():
+            signal.signal(sig, handler)
+
+        first_signal = runtime_process._SHUTDOWN_SIGNALS[0]
+        real_signal = signal.signal
+        failed_once: set[int] = set()
+
+        def flaky_signal(signalnum: int, handler: object) -> object:
+            if signalnum == first_signal and signalnum not in failed_once:
+                failed_once.add(signalnum)
+                raise OSError("simulated restore failure")
+            return real_signal(signalnum, handler)
+
+        with pytest.raises(OSError, match="simulated restore failure"), signal_handler_scope():
+            # Patch only after the scope's own entry-time installation
+            # (which uses the real signal.signal) has already happened.
+            monkeypatch.setattr(signal, "signal", flaky_signal)
+
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            if sig == first_signal:
+                # Restoration failed for this one; phasesweep's handler is
+                # still installed until manual cleanup below.
+                assert signal.getsignal(sig) is runtime_process._shutdown_handler
+                continue
+            assert signal.getsignal(sig) is sentinel_handlers[sig]
+    finally:
+        monkeypatch.undo()
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
 

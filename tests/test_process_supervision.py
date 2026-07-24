@@ -20,14 +20,17 @@ from phasesweep import run_experiment
 from phasesweep.engine.guards import _reap_stale_trials
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
     StaleProcessIdentity,
     _defer_shutdown_signals,
+    _kill_group,
     _process_group_alive_with_members,
     _shutdown_handler,
+    _spawn_blocked_supervisor,
     _terminate_process_group,
     cleanup_stale_trial_process,
     is_pid_alive,
@@ -126,7 +129,16 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A metadata write failure after Popen must not leave the child running."""
+    """A metadata write failure after Popen must not leave the child running.
+
+    Looped ~30 times (review v0.5.15 / blocker 4): pre-fix, ``_kill_group``
+    only reaped the direct child when a single nonblocking ``poll()`` already
+    observed it exited, so a child that died right after ``poll()`` returned
+    ``None`` could remain an unreaped zombie despite ``cleanup_confirmed``
+    being reported ``True``. The bounded, unconditional ``wait()`` fix reaps
+    deterministically; the loop guards against a single lucky run masking a
+    reintroduced race.
+    """
     import phasesweep.runtime.process as process
 
     real_atomic_write_text = process.atomic_write_text
@@ -138,26 +150,47 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
 
     monkeypatch.setattr("phasesweep.runtime.process.atomic_write_text", fail_pid_write)
 
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    trainer_started = tmp_path / "trainer-started"
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            f'{sys.executable} -c "from pathlib import Path; '
-            f"Path({str(trainer_started)!r}).write_text('started')\"",
-            env=os.environ.copy(),
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="identity-write-failure",
-        )
+    for i in range(30):
+        trial_dir = tmp_path / f"trial_{i}"
+        trial_dir.mkdir()
+        trainer_started = tmp_path / f"trainer-started-{i}"
+        with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+            result = run_supervised(
+                f'{sys.executable} -c "from pathlib import Path; '
+                f"Path({str(trainer_started)!r}).write_text('started')\"",
+                env=os.environ.copy(),
+                stdout=fout,
+                stderr=ferr,
+                timeout=None,
+                trial_dir=trial_dir,
+                attempt_id=f"identity-write-failure-{i}",
+            )
 
-    assert result.cleanup_confirmed is True
-    assert "failed to persist process identity" in (result.failure_reason or "")
-    assert not trainer_started.exists()
-    with pytest.raises(ProcessLookupError):
-        os.kill(result.pid, 0)
+        assert result.cleanup_confirmed is True, i
+        assert "failed to persist process identity" in (result.failure_reason or ""), i
+        assert not trainer_started.exists(), i
+        with pytest.raises(ProcessLookupError):
+            os.kill(result.pid, 0)
+
+
+def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct child that never reaps within the bounded wait must report cleanup
+    as unconfirmed, not silently ``True`` (review v0.5.15 / blocker 4)."""
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: True,
+    )
+
+    class _NeverReapsProc:
+        pid = 424243
+        returncode = None
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
+
+    assert _kill_group(999999, _NeverReapsProc()) is False  # type: ignore[arg-type]
 
 
 def test_hard_parent_death_before_identity_commit_never_starts_trainer(tmp_path: Path) -> None:
@@ -282,6 +315,242 @@ with open(os.devnull, "w") as output:
         if identity is not None and is_pid_alive(identity.pid):
             with __import__("contextlib").suppress(ProcessLookupError):
                 os.killpg(identity.pgid, signal.SIGKILL)
+
+
+def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Wrap ``_write_process_identity`` so a test can prove it ran, without disturbing it.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to wrap the writer.
+    :return list[bool]: Appended to (a single ``True``) once the real writer
+        has completed.
+    """
+    import phasesweep.runtime.process as process
+
+    real_write_identity = process._write_process_identity
+    written: list[bool] = []
+
+    def spy(path: Path, identity: StaleProcessIdentity) -> None:
+        real_write_identity(path, identity)
+        written.append(True)
+
+    monkeypatch.setattr(process, "_write_process_identity", spy)
+    return written
+
+
+def test_supervisor_never_imports_poisoned_phasesweep_from_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poisoned PYTHONPATH on the trainer env must never reach the supervisor.
+
+    Pre-fix (review v0.5.15 / blocker 1), the supervisor ran ``-m
+    phasesweep.runtime.supervisor`` under the FULL trainer environment,
+    including any ``PYTHONPATH`` composed from ``experiment.env``. A
+    shadowed/poisoned ``phasesweep`` package on that path would execute at
+    import time, before ``process_identity.json`` exists. The fix launches a
+    stdlib-only script directly under a sanitized ``{"PATH": ...}``
+    environment, so the poisoned package must never even be importable.
+    """
+    poison_root = tmp_path / "poison"
+    package_dir = poison_root / "phasesweep"
+    package_dir.mkdir(parents=True)
+    marker = tmp_path / "poison-marker"
+    (package_dir / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
+    )
+
+    written = _spy_write_process_identity(monkeypatch)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(poison_root)
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            "true",
+            env=env,
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="poison-pythonpath",
+        )
+
+    assert result.return_code == 0
+    assert not marker.exists(), "supervisor imported the poisoned phasesweep package"
+    assert written == [True], "process_identity.json was never written before exec"
+
+
+def test_supervisor_never_imports_poisoned_sitecustomize_from_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``-S`` must keep site initialization (and thus ``sitecustomize``) off pre-ACK.
+
+    Even without an ``-m phasesweep...`` import, a bare ``python`` invocation
+    still runs ``sitecustomize``/``usercustomize`` during site initialization
+    when their directory is importable at process start — e.g. via a
+    ``PYTHONPATH`` composed into the trainer environment. ``-S`` disables
+    that (review v0.5.15 / blocker 1).
+    """
+    poison_root = tmp_path / "site-poison"
+    poison_root.mkdir()
+    marker = tmp_path / "sitecustomize-marker"
+    (poison_root / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
+    )
+
+    written = _spy_write_process_identity(monkeypatch)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(poison_root)
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            "true",
+            env=env,
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="poison-sitecustomize",
+        )
+
+    assert result.return_code == 0
+    assert not marker.exists(), "supervisor ran a poisoned sitecustomize.py"
+    assert written == [True], "process_identity.json was never written before exec"
+
+
+def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None:
+    """The framed ack payload must still deliver the full trainer environment
+    to the exec'd command (review v0.5.15 / blocker 1)."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    out_path = tmp_path / "env-var.txt"
+    env = os.environ.copy()
+    env["PHASESWEEP_TEST_MARKER"] = "trial-env-value"
+    cmd = (
+        f'{sys.executable} -c "import os, pathlib; '
+        f"pathlib.Path({str(out_path)!r}).write_text(os.environ['PHASESWEEP_TEST_MARKER'])\""
+    )
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            cmd,
+            env=env,
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="env-flow-attempt",
+        )
+
+    assert result.return_code == 0
+    assert out_path.read_text() == "trial-env-value"
+
+
+def test_spawn_blocked_supervisor_launch_argv_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_spawn_blocked_supervisor`` must launch the stdlib script directly under
+    ``-I -S`` with a minimal sanitized environment; the trainer command must
+    never appear in argv (review v0.5.15 / blocker 1)."""
+    import phasesweep.runtime.process as process
+
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    def spy_popen(argv: list[str], **kwargs: object) -> subprocess.Popen:
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs.get("env") or {})  # type: ignore[arg-type]
+        return real_popen(argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(process.subprocess, "Popen", spy_popen)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        proc, pgid, ack_write = _spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+    try:
+        argv = captured["argv"]
+        assert isinstance(argv, list)
+        assert len(argv) == 6
+        assert argv[:4] == [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(supervisor.__file__).resolve()),
+        ]
+        # Last two elements are the dynamic ready/ack pipe fd numbers; the
+        # trainer command must never appear anywhere in argv.
+        assert all(fd.isdigit() for fd in argv[4:])
+        assert set(captured["env"]) == {"PATH"}
+    finally:
+        os.close(ack_write)
+        _kill_group(pgid, proc)
+        process._unregister(pgid)
+
+
+def test_supervisor_main_exits_without_exec_on_ack_pipe_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent death before the ack payload must not let the supervisor exec anything.
+
+    Adapts the old three-arg pre-ack contract test to the new two-arg
+    ready/ack protocol (review v0.5.15 / blocker 1): with the ack pipe closed
+    before any payload is sent (simulating parent death), ``main()`` must
+    return 75 without ever calling ``os.execve``.
+    """
+    exec_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    os.close(ack_write)  # Simulate parent death: EOF with no payload ever sent.
+
+    exit_code = supervisor.main([str(ready_write), str(ack_read)])
+
+    assert os.read(ready_read, 1) == b"R"  # Readiness was still signaled first.
+    assert exit_code == 75
+    assert exec_calls == []
+    os.close(ready_read)
+
+
+def _frame(body: bytes) -> bytes:
+    """Build one length-prefixed supervisor payload frame for test fixtures."""
+    return f"{len(body):010d}".encode("ascii") + body
+
+
+@pytest.mark.parametrize(
+    "raw_payload",
+    [
+        pytest.param(b"NOTALENGTH", id="bad_header"),
+        pytest.param(f"{10:010d}".encode("ascii") + b"{}", id="truncated_body"),
+        pytest.param(_frame(b"[1, 2, 3]"), id="non_dict_json"),
+        pytest.param(
+            _frame(json.dumps({"cmd": "true", "env": {"X": 1}}).encode("utf-8")),
+            id="non_str_env_value",
+        ),
+    ],
+)
+def test_supervisor_main_rejects_malformed_payload(
+    monkeypatch: pytest.MonkeyPatch, raw_payload: bytes
+) -> None:
+    """Any payload shape violation must return 75 without ever execing (review
+    v0.5.15 / blocker 1)."""
+    exec_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    os.write(ack_write, raw_payload)
+    os.close(ack_write)
+
+    exit_code = supervisor.main([str(ready_write), str(ack_read)])
+
+    assert exit_code == 75
+    assert exec_calls == []
+    os.close(ready_read)
 
 
 def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
