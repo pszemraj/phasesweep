@@ -17,7 +17,7 @@
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
 
 # allow_unsafe_multihost: bool = false
-# Required acknowledgement to use any storage backend other than sqlite/journal. PhaseSweep's coordination (locks, generation pointers) is host-local-filesystem based; a shared RDB storage silently breaks that safety across hosts. Set true only when every process that will ever touch this storage and workdir runs on a single host.
+# Acknowledges the loss of PhaseSweep's host-local-filesystem-based coordination (locks, generation pointers) when using a shared RDB storage backend. Set true only when every process that will ever touch this storage and workdir runs on a single host.
 
 # workdir: str = "./runs"
 # Output root for trial artifacts, winners, and summaries. Relative paths resolve from the invocation cwd, not the config file.

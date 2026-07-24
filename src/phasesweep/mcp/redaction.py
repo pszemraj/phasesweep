@@ -144,11 +144,11 @@ def status_payload(
     by the server - durations only, never timestamps of operator activity or
     anything path-shaped.
 
-    ``current_generation_id`` and ``published_generation_id`` are always
-    surfaced explicitly and may differ (e.g. a failed rerun after an earlier
-    successful publication): ``attempts_launched_this_run``/
-    ``terminal_trials_this_run`` describe ``current_generation_id`` while
-    ``winner_present``/``summary_present`` describe ``published_generation_id``.
+    ``current_generation_id``/``published_generation_id`` follow the
+    current-vs-published split :func:`phasesweep.engine.read.read_status`
+    defines: ``attempts_launched_this_run``/``terminal_trials_this_run``
+    describe ``current_generation_id`` while ``winner_present``/
+    ``summary_present`` describe ``published_generation_id``.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.

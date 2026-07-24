@@ -382,14 +382,11 @@ class Experiment(_Frozen):
     allow_unsafe_multihost: bool = Field(
         default=False,
         description=(
-            "Acknowledge and accept the loss of PhaseSweep's coordination guarantees "
-            "when storage is a shared relational backend (e.g. postgresql://, mysql://). "
-            "PhaseSweep's locks and generation pointers are host-local-filesystem based; "
-            "pointing several hosts at one shared RDB storage silently breaks those "
-            "safety guarantees. Set this to true only when every process that will ever "
-            "touch this storage and workdir runs on a single host (i.e. you are using an "
-            "RDB backend for durable storage or dashboarding, not for multi-host "
-            "orchestration)."
+            "Acknowledge the loss of PhaseSweep's host-local-filesystem-based "
+            "coordination guarantees (locks, generation pointers) when storage is a "
+            "shared relational backend (e.g. postgresql://, mysql://). Set this to true "
+            "only when every process that will ever touch this storage and workdir "
+            "runs on a single host."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
