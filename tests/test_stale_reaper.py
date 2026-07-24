@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep.config import (
     Experiment,
@@ -336,7 +337,13 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
         run_experiment(experiment)
 
     assert len(study.get_trials(deepcopy=False)) == 1
-    assert not _generation_path(experiment).exists()
+    # The current pointer legitimately exists now (a new invocation always
+    # overwrites it starting from "preflighting", and every outcome path must
+    # reach a terminal state -- review v0.5.15 / blocker 3), but this
+    # generation never got prepared/published: it must show "failed", not a
+    # state that could make the phase's budget look satisfied.
+    current = yaml.safe_load(_generation_path(experiment).read_text())
+    assert current["state"] == "failed"
 
 
 def test_storage_preflight_does_not_convert_shutdown_to_storage_failure(

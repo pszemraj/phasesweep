@@ -16,6 +16,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
@@ -33,6 +34,7 @@ from phasesweep.engine.state import (
     _generation_path,
     _generation_record_path,
     _generations_dir,
+    _last_successful_generation_id,
     _summary_path,
     _trial_dir_for,
     _winner_path,
@@ -481,10 +483,19 @@ def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
-def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
+def test_failed_fingerprint_preflight_preserves_published_results(
     tmp_path: Path,
     from_phase: str | None,
 ) -> None:
+    """A failed preflight advances the current pointer but never the published one.
+
+    The current-generation pointer legitimately moves to this new (failed)
+    invocation -- a new invocation always overwrites it starting from
+    "preflighting", and every outcome path must drive it to a terminal state
+    (review v0.5.15 / blocker 3) -- but the legacy compatibility caches and,
+    critically, the last-success pointer stay exactly as the prior successful
+    publication left them.
+    """
     trainer = write_constant_trainer(tmp_path)
     phases = [
         Phase(name="a", n_trials=1, fixed_overrides={"k": 1}, search_space={}),
@@ -497,9 +508,13 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
         phases=phases,
     )
     run_experiment(experiment)
+    first_generation = _last_successful_generation_id(experiment)
+    assert first_generation is not None
 
+    # The legacy compatibility caches must stay untouched by a failed resume;
+    # the current-generation pointer is deliberately excluded here since it
+    # legitimately advances even on a preflight failure (see docstring).
     protected_paths = [
-        _generation_path(experiment),
         _summary_path(experiment),
         *(_winner_path(experiment, phase.name) for phase in phases),
     ]
@@ -535,18 +550,35 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
 
     assert len(callback_generations) == 1
     assert len(captured) == 1
+    # current_generation_id is always the actual mutable pointer, which this
+    # failed preflight attempt does legitimately claim (a new invocation
+    # overwrites it with "preflighting" before it knows whether preflight
+    # will succeed). published_generation_id is always the actual validated
+    # last-success pointer -- the *first* (successful) run here -- never
+    # forced to equal the pinned generation_id, even though this pinned
+    # capture's own represented_generation_id is that failed generation
+    # (review v0.5.15 / blocker 3, defect 2: "pinned reads lie").
     assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
-    assert captured[0]["status"]["published_generation_id"] == callback_generations[0]  # type: ignore[index]
+    assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
+    assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]
+    assert captured[0]["status"]["is_published"] is False  # type: ignore[index]
     assert captured[0]["status"]["summary_present"] is False  # type: ignore[index]
     assert all(
         phase["generation_trials"] == {}
         for phase in captured[0]["status"]["phases"]  # type: ignore[index]
     )
     assert captured[0]["winners"] == []
+    # Legacy compatibility caches are untouched, and the published pointer
+    # still resolves to the prior successful generation.
     assert {path: path.read_bytes() for path in protected_paths} == before
+    assert _last_successful_generation_id(experiment) == first_generation
     failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
     assert len(failed_generations) == 1
     assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
+    # The current pointer legitimately advanced to this failed attempt.
+    current_pointer = yaml.safe_load(_generation_path(experiment).read_text())
+    assert current_pointer["generation_id"] == callback_generations[0]
+    assert current_pointer["state"] == "failed"
 
 
 def test_terminal_report_preserves_secondary_cleanup_uncertainty(

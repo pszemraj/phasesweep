@@ -124,9 +124,12 @@ DESCRIPTION_GET_STATUS = (
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
     "State counts are dense and explicitly split into cumulative, before-run, and this-run "
     "dimensions; remaining_trials is already computed. "
-    "current_generation_id and published_generation_id are reported explicitly and can differ "
-    "(e.g. after a failed rerun): this-run counts describe current_generation_id, while "
-    "winner_present and summary_present describe published_generation_id. "
+    "current_generation_id and published_generation_id are always the actual pointers, never "
+    "forced to a queried run_id; represented_generation_id is the generation whose winner_present "
+    "and summary_present this payload shows - a run_id itself when querying by run_id, otherwise "
+    "published_generation_id. is_published is true only when represented_generation_id is the "
+    "actual published one; a run_id whose own publication failed still reports its own "
+    "this-run counts and winners with is_published=false. "
     "trial_data_available=false means zero counts are not trustworthy. result_source names "
     "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
@@ -415,15 +418,29 @@ class GetStatusResult(_ToolPayload):
     current_generation_id: str | None = Field(
         description=(
             "Most recent generation id known to this experiment; may be failed or "
-            "in-progress. Null when no generation has ever started. attempts_launched_this_run "
-            "and terminal_trials_this_run describe this generation."
+            "in-progress. Null when no generation has ever started. Always the actual "
+            "mutable pointer, never forced to a queried run_id."
         )
     )
     published_generation_id: str | None = Field(
         description=(
             "Last successfully published generation id. Null when nothing has published "
-            "yet. winner_present and summary_present describe this generation, which may "
-            "differ from current_generation_id (e.g. after a failed rerun)."
+            "yet. Always the actual validated pointer, never forced to a queried run_id, "
+            "and may differ from represented_generation_id."
+        )
+    )
+    represented_generation_id: str | None = Field(
+        description=(
+            "The generation whose winner_present, summary_present, and this-run trial "
+            "counts this payload shows: the queried run_id itself when one was given, "
+            "otherwise published_generation_id."
+        )
+    )
+    is_published: bool = Field(
+        description=(
+            "True only when represented_generation_id is not null and equals "
+            "published_generation_id. A run_id whose own publication failed reports "
+            "false here while still showing that generation's own winners."
         )
     )
     metric: MetricPayload
@@ -1036,22 +1053,23 @@ class PhaseSweepMCP:
             # default to the strict redacted posture.
             visible_params = "none"
         snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
-        winner_views = (
-            snapshot.winner_views()
-            if snapshot is not None
-            else read_winners(
+        if snapshot is not None:
+            winner_views = snapshot.winner_views()
+            represented_generation_id = snapshot.status.represented_generation_id
+        else:
+            # Resolve the represented generation once via read_status, then
+            # reuse that exact id for read_winners: two independent pointer
+            # resolutions here could otherwise mix identities from different
+            # moments (review v0.5.15 / blocker 3). represented_generation_id
+            # is the queried run_id itself when pinned, else the captured
+            # published id -- never the live current pointer, which is what
+            # this used to (incorrectly) label winners with.
+            status = read_status(
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
             )
-        )
-        represented_generation_id = (
-            snapshot.status.current_generation_id
-            if snapshot is not None
-            else read_status(
-                experiment,
-                generation_id=handle.run_id if handle is not None else None,
-            )["current_generation_id"]
-        )
+            represented_generation_id = status["represented_generation_id"]
+            winner_views = read_winners(experiment, generation_id=represented_generation_id)
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )

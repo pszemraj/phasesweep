@@ -21,6 +21,7 @@ from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.state import (
     _generation_path,
     _generation_record_path,
+    _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
     _winner_path,
@@ -200,16 +201,29 @@ def test_read_status_counts_sqlite_trials_with_uri_filename(tmp_path: Path) -> N
 
 
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
-    """Publish an immutable, complete generation record and phase winner on disk."""
+    """Publish an immutable generation (summary + record + phase winner) on disk.
+
+    Pointer validation (:func:`phasesweep.engine.state._last_successful_generation_id`)
+    now reads back the generation's own immutable *summary*, not the
+    lifecycle record's state, so a summary naming this owner and id is
+    required for the pointer to resolve as published (review v0.5.15 /
+    blocker 3). The record is written too, purely as the informational,
+    post-commit artifact real publications also produce.
+    """
     _last_successful_generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
     _last_successful_generation_path(exp).write_text(
+        yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
+    )
+    summary_path = _generation_summary_path(exp, generation_id)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
         yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
     )
     record_path = _generation_record_path(exp, generation_id)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text(
         yaml.safe_dump(
-            {"experiment": exp.experiment, "generation_id": generation_id, "state": "complete"}
+            {"experiment": exp.experiment, "generation_id": generation_id, "state": "published"}
         )
     )
     winner_path = _generation_winner_path(exp, generation_id, phase_name)
@@ -251,21 +265,73 @@ def test_read_status_distinguishes_current_from_published_generation(tmp_path: P
     assert status["current_generation_id"] == "generation-failed"
     assert status["published_generation_id"] == "generation-good"
     assert status["current_generation_id"] != status["published_generation_id"]
-    # Winner/publication facts must come from the published generation, not the
+    # In default (non-pinned) mode, represented_generation_id is the captured
+    # published id, and winner/summary facts scope to it -- never the
     # failed/in-progress current one.
+    assert status["represented_generation_id"] == "generation-good"
+    assert status["is_published"] is True
     assert status["phases"][0]["winner_present"] is True
-    assert status["summary_present"] is False
+    assert status["summary_present"] is True
 
 
 def test_read_status_explicit_generation_id_is_self_scoped(tmp_path: Path) -> None:
-    """An explicit generation_id pins both identities to that one generation."""
+    """An explicit generation_id pins the represented identity to that one generation.
+
+    ``current_generation_id`` and ``published_generation_id`` always report
+    the *actual* pointers -- never forced to the pinned id (review v0.5.15 /
+    blocker 3, defect 2: "pinned reads lie"). Here no current-pointer file
+    exists at all, so ``current_generation_id`` is genuinely ``None`` even
+    though the pinned generation itself is fully published.
+    """
     exp = _experiment(tmp_path)
     _mark_generation_published(exp, "generation-good", "p")
 
     status = read_status(exp, generation_id="generation-good")
 
-    assert status["current_generation_id"] == "generation-good"
+    assert status["current_generation_id"] is None
     assert status["published_generation_id"] == "generation-good"
+    assert status["represented_generation_id"] == "generation-good"
+    assert status["is_published"] is True
+    assert status["phases"][0]["winner_present"] is True
+
+
+def test_read_status_pinned_read_of_unpublished_generation_is_not_marked_published(
+    tmp_path: Path,
+) -> None:
+    """Pinning a generation that never published reports is_published=False, not a lie."""
+    exp = _experiment(tmp_path)
+    _mark_generation_published(exp, "generation-good", "p")
+    # A second, never-published generation has its own (unpublished) winner.
+    other_winner = _generation_winner_path(exp, "generation-orphan", "p")
+    other_winner.parent.mkdir(parents=True, exist_ok=True)
+    other_winner.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 1,
+                "metric": {"loss": 0.2, "goal": "minimize"},
+                "params": {"lr": 0.002},
+                "effective_overrides": {"lr": 0.002},
+                "completion": {"incomplete": False},
+                "generation_id": "generation-orphan",
+                "winner_source": {
+                    "kind": "phase_trial",
+                    "phase": "p",
+                    "trial_number": 1,
+                    "generation_id": "generation-orphan",
+                    "attempt_id": None,
+                    "study": None,
+                },
+            }
+        )
+    )
+
+    status = read_status(exp, generation_id="generation-orphan")
+
+    assert status["published_generation_id"] == "generation-good"
+    assert status["represented_generation_id"] == "generation-orphan"
+    assert status["is_published"] is False
+    # The orphaned generation's own winner is still readable pinned.
     assert status["phases"][0]["winner_present"] is True
 
 

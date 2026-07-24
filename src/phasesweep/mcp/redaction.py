@@ -144,11 +144,16 @@ def status_payload(
     by the server - durations only, never timestamps of operator activity or
     anything path-shaped.
 
-    ``current_generation_id``/``published_generation_id`` follow the
-    current-vs-published split :func:`phasesweep.engine.read.read_status`
-    defines: ``attempts_launched_this_run``/``terminal_trials_this_run``
-    describe ``current_generation_id`` while ``winner_present``/
-    ``summary_present`` describe ``published_generation_id``.
+    ``current_generation_id``/``published_generation_id``/
+    ``represented_generation_id``/``is_published`` follow the identity
+    contract :func:`phasesweep.engine.read.read_status` defines:
+    ``attempts_launched_this_run``/``terminal_trials_this_run`` describe
+    ``current_generation_id`` in a live (non-pinned) read, or the pinned
+    generation itself for a run-scoped read; ``winner_present`` and the
+    top-level ``summary_present`` describe ``represented_generation_id``.
+    ``is_published`` says whether the represented generation is the actual
+    published one -- ``False`` for a pinned read of a failed-publication
+    generation, even though its winners still show.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
@@ -195,6 +200,8 @@ def status_payload(
         "result_source": result_source,
         "current_generation_id": status["current_generation_id"],
         "published_generation_id": status["published_generation_id"],
+        "represented_generation_id": status["represented_generation_id"],
+        "is_published": status["is_published"],
         "metric": status["metric"],
         "phases": phases,
         "summary_present": status["summary_present"],

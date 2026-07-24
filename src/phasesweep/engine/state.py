@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import logging
+import os
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,7 @@ import yaml
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
-from phasesweep.runtime.files import atomic_text_writer
+from phasesweep.runtime.files import atomic_text_writer, fsync_directory
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
 
@@ -304,49 +305,68 @@ def _read_pointer_target(
     return target_id
 
 
-def _record_is_complete(
-    record_path: Path,
+def _pointer_target_artifacts_are_published(
+    summary_path: Path,
     *,
     id_key: str,
     target_id: str,
     owner_key: str,
     owner_name: str,
 ) -> bool:
-    """Return whether a lifecycle record names itself correctly and is complete.
+    """Return whether a generation's own immutable summary confirms its identity.
 
-    :param Path record_path: Immutable lifecycle record YAML file to read.
-    :param str id_key: Record key holding the generation id.
-    :param str target_id: Generation id the record must name.
-    :param str owner_key: Record key naming the owning experiment or suite.
-    :param str owner_name: Expected owner name the record must carry.
-    :return bool: ``True`` only for a readable record whose owner, id, and
-        ``state == "complete"`` all match.
+    Replaces the old record-state check (``_record_is_complete``): the
+    per-generation lifecycle record is now informational and written *after*
+    the last-success pointer commit (review v0.5.15 / blocker 3), so requiring
+    ``state == "complete"``/``"published"`` on it would create a crash window
+    where a just-committed publication reads back as nothing-published. This
+    instead fails closed on the pointer target's own immutable *artifacts*:
+    the generation's summary must parse as a mapping naming this exact owner
+    and id. This is a crash-consistency check for a single-host,
+    operator-trusted workdir -- no hashes are computed, so a deliberate
+    content edit is out of scope; it only catches a torn or missing write.
+
+    :param Path summary_path: Immutable generation summary YAML file to read.
+    :param str id_key: Summary key holding the generation id.
+    :param str target_id: Generation id the summary must name.
+    :param str owner_key: Summary key naming the owning experiment or suite.
+    :param str owner_name: Expected owner name the summary must carry.
+    :return bool: ``True`` only for a readable summary whose owner and id both match.
     """
     try:
-        record = yaml.safe_load(record_path.read_text())
+        summary = yaml.safe_load(summary_path.read_text())
     except (OSError, yaml.YAMLError):
         return False
     return (
-        isinstance(record, dict)
-        and record.get(owner_key) == owner_name
-        and record.get(id_key) == target_id
-        and record.get("state") == "complete"
+        isinstance(summary, dict)
+        and summary.get(owner_key) == owner_name
+        and summary.get(id_key) == target_id
     )
 
 
 def _last_successful_generation_id(experiment: Experiment) -> str | None:
     """Read and validate the last-success pointer, failing closed on mismatch.
 
-    The pointer is authoritative only when its target still exists as an
-    immutable lifecycle record in state ``complete`` for this experiment
-    (review v0.5.14 / blocker 1). A malformed, tampered, or downgraded target
-    is treated as "nothing published" rather than trusted for path
-    construction or result reads.
+    The pointer is authoritative only when its target's own immutable summary
+    parses and names this exact experiment and generation (review v0.5.15 /
+    blocker 3) -- not when the per-generation lifecycle record says so, since
+    that record is now written *after* this pointer commits and would
+    otherwise create a crash window where a committed publication reads as
+    nothing-published. A malformed, tampered, or missing target is treated as
+    "nothing published" rather than trusted for path construction or result
+    reads.
+
+    Deliberately read-side-cheap: this checks only the generation's summary,
+    never its per-phase winner files. Per-phase winner identity is instead a
+    *pre-commit-only* check (see :func:`phasesweep.engine.run._validate_generation_publishable`,
+    item A) that runs once, at publication time -- re-parsing every phase's
+    winner file on every status/pointer read would multiply that cost across
+    every caller for a check that a generation's own publication has already made.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return str | None: The last-successful generation id, or ``None`` if the
-        pointer or its target record is missing, unreadable, malformed,
-        unsafely named, owned by another experiment, or not ``complete``.
+        pointer or its target summary is missing, unreadable, malformed,
+        unsafely named, or owned by another experiment.
     """
     generation_id = _read_pointer_target(
         _last_successful_generation_path(experiment),
@@ -356,8 +376,8 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     )
     if generation_id is None:
         return None
-    if not _record_is_complete(
-        _generation_record_path(experiment, generation_id),
+    if not _pointer_target_artifacts_are_published(
+        _generation_summary_path(experiment, generation_id),
         id_key="generation_id",
         target_id=generation_id,
         owner_key="experiment",
@@ -365,6 +385,35 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     ):
         return None
     return generation_id
+
+
+def _published_winner_path_for(
+    experiment: Experiment,
+    published_generation_id: str | None,
+    phase_name: str,
+) -> Path | None:
+    """Resolve the authoritative winner path from an already-captured published id.
+
+    Same legacy-fallback semantics as :func:`_published_winner_path`, but
+    takes the caller's already-resolved last-success id instead of re-reading
+    the pointer, so one status read that scopes several phases (or several
+    fields) from a single captured id can never mix identities from two
+    different pointer resolutions (review v0.5.15 / blocker 3).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str | None published_generation_id: Already-resolved
+        :func:`_last_successful_generation_id` result (or ``None``).
+    :param str phase_name: Phase name whose published winner path is requested.
+    :return Path | None: The generation-scoped winner path when
+        ``published_generation_id`` is given; the legacy compatibility winner
+        path when no generation has ever been published; ``None`` when a
+        generation exists but none has completed successfully yet.
+    """
+    if published_generation_id is not None:
+        return _generation_winner_path(experiment, published_generation_id, phase_name)
+    if _generation_path(experiment).is_file():
+        return None
+    return _winner_path(experiment, phase_name)
 
 
 def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | None:
@@ -382,12 +431,34 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
         has ever been published; ``None`` when a generation exists but none has
         completed successfully yet.
     """
-    generation_id = _last_successful_generation_id(experiment)
-    if generation_id is not None:
-        return _generation_winner_path(experiment, generation_id, phase_name)
+    return _published_winner_path_for(
+        experiment, _last_successful_generation_id(experiment), phase_name
+    )
+
+
+def _published_summary_path_for(
+    experiment: Experiment,
+    published_generation_id: str | None,
+) -> Path | None:
+    """Resolve the authoritative summary path from an already-captured published id.
+
+    Same legacy-fallback semantics as :func:`_published_summary_path`, but
+    takes the caller's already-resolved last-success id instead of re-reading
+    the pointer (review v0.5.15 / blocker 3).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str | None published_generation_id: Already-resolved
+        :func:`_last_successful_generation_id` result (or ``None``).
+    :return Path | None: The generation-scoped summary path when
+        ``published_generation_id`` is given; the legacy compatibility summary
+        path when no generation has ever been published; ``None`` when a
+        generation exists but none has completed successfully yet.
+    """
+    if published_generation_id is not None:
+        return _generation_summary_path(experiment, published_generation_id)
     if _generation_path(experiment).is_file():
         return None
-    return _winner_path(experiment, phase_name)
+    return _summary_path(experiment)
 
 
 def _published_summary_path(experiment: Experiment) -> Path | None:
@@ -399,12 +470,7 @@ def _published_summary_path(experiment: Experiment) -> Path | None:
         generation has ever been published; ``None`` when a generation exists
         but none has completed successfully yet.
     """
-    generation_id = _last_successful_generation_id(experiment)
-    if generation_id is not None:
-        return _generation_summary_path(experiment, generation_id)
-    if _generation_path(experiment).is_file():
-        return None
-    return _summary_path(experiment)
+    return _published_summary_path_for(experiment, _last_successful_generation_id(experiment))
 
 
 def _published_promotion_decision_path(
@@ -527,14 +593,15 @@ def _last_successful_suite_generation_path(suite: Suite) -> Path:
 def _last_successful_suite_generation_id(suite: Suite) -> str | None:
     """Read and validate the suite last-success pointer, failing closed on mismatch.
 
-    Applies the same publication protocol as
+    Applies the same artifact-validating protocol as
     :func:`_last_successful_generation_id`: the pointer is authoritative only
-    when its target still exists as a ``complete`` immutable suite lifecycle
-    record for this suite (review v0.5.14 / blocker 1).
+    when its target's own immutable summary parses and names this exact suite
+    and suite generation (review v0.5.15 / blocker 3), not when the
+    per-suite-generation lifecycle record says so.
 
     :param Suite suite: Suite config with artifact root details.
     :return str | None: The last-successful suite generation id, or ``None``
-        when the pointer or its target record fails validation.
+        when the pointer or its target summary fails validation.
     """
     generation_id = _read_pointer_target(
         _last_successful_suite_generation_path(suite),
@@ -544,8 +611,8 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
     )
     if generation_id is None:
         return None
-    if not _record_is_complete(
-        _suite_generation_record_path(suite, generation_id),
+    if not _pointer_target_artifacts_are_published(
+        _suite_generation_summary_path(suite, generation_id),
         id_key="suite_generation_id",
         target_id=generation_id,
         owner_key="suite",
@@ -589,6 +656,45 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     """
     with atomic_text_writer(path) as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
+    """Create a YAML document at ``path`` exactly once, never overwriting it.
+
+    Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
+    pointers), this is the create-exclusive primitive backing truly immutable
+    per-generation lifecycle records (review v0.5.15 / blocker 3): the file is
+    opened with ``O_CREAT | O_EXCL`` so a second call for an already-written
+    path can never clobber the first write, even a same-content rewrite. This
+    is a plain create-once-and-fsync, not a full atomic-rename dance like
+    :func:`atomic_text_writer` -- there is nothing to make atomic against a
+    concurrent *reader* here, only against a second *writer*, and ``O_EXCL``
+    already rules that out.
+
+    :param Path path: Destination path to create; the parent directory is
+        created if missing.
+    :param Any payload: YAML-serializable value to write.
+    :return bool: ``True`` when this call created and wrote the file;
+        ``False`` when the destination already existed and nothing was
+        written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(payload, sort_keys=False)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+    return True
 
 
 @contextlib.contextmanager

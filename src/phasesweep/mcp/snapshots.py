@@ -69,15 +69,21 @@ class PhaseStatusSnapshot(_SnapshotModel):
 class StatusSnapshot(_SnapshotModel):
     """Path-free terminal status view captured by the detached runner.
 
-    ``current_generation_id`` and ``published_generation_id`` are explicit and
-    may differ (e.g. a failed rerun after an earlier successful publication):
-    per-phase ``generation_trials`` are scoped to ``current_generation_id``
-    while ``winner_present``/``summary_present`` are scoped to
-    ``published_generation_id``. See :func:`phasesweep.engine.read.read_status`.
+    ``current_generation_id`` and ``published_generation_id`` are always the
+    actual mutable/last-success pointers and may differ from each other and
+    from ``represented_generation_id`` (e.g. a failed rerun, or a pinned
+    snapshot of a generation whose own publication failed).
+    ``represented_generation_id`` is the generation whose winner/summary facts
+    this snapshot shows, and ``is_published`` says whether that generation is
+    the actual published one -- a failed-publication generation's snapshot
+    correctly reports ``is_published: False`` while remaining fully readable.
+    See :func:`phasesweep.engine.read.read_status`.
     """
 
     current_generation_id: str | None = None
     published_generation_id: str | None = None
+    represented_generation_id: str | None = None
+    is_published: bool = False
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
@@ -200,6 +206,8 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
         status=StatusSnapshot(
             current_generation_id=None,
             published_generation_id=None,
+            represented_generation_id=None,
+            is_published=False,
             metric=MetricSnapshot(
                 name=experiment.metric.name,
                 goal=experiment.metric.goal,
@@ -234,6 +242,13 @@ def capture_result_snapshot(
     require_trial_data: bool = False,
 ) -> dict[str, Any]:
     """Capture one experiment's current path-free status and sampled winners.
+
+    When ``generation_id`` is given (the detached runner always pins its own
+    generation), the captured status's ``represented_generation_id`` equals
+    it and the frozen winners are read from that exact generation, regardless
+    of whether it ever became the actual last-success pointer -- so a
+    failed-publication generation's terminal snapshot still reports its own
+    (unpublished) partial results, correctly flagged ``is_published: False``.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
@@ -281,11 +296,17 @@ def capture_result_snapshot(
                         }
                     )
         phase_status["running_attempts"] = running_attempts
-    winners = read_winners(experiment, generation_id=status["current_generation_id"])
+    # Winners must be scoped to the generation this snapshot *represents*, not
+    # the (possibly different) true current pointer: a pinned capture wants
+    # exactly its own generation's winners even when a newer generation has
+    # since become current (review v0.5.15 / blocker 3).
+    winners = read_winners(experiment, generation_id=status["represented_generation_id"])
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=status["current_generation_id"],
             published_generation_id=status["published_generation_id"],
+            represented_generation_id=status["represented_generation_id"],
+            is_published=status["is_published"],
             metric=status["metric"],
             phases=status["phases"],
             summary_present=status["summary_present"],
@@ -336,7 +357,12 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
         phase.running = phase.trials["RUNNING"]
-        generation_id = parsed.status.current_generation_id
+        # generation_trials was captured scoped to represented_generation_id
+        # (the pinned id for a run snapshot), not current_generation_id, which
+        # is now always the actual mutable pointer and may be unrelated to --
+        # or absent for -- this snapshot's own generation (review v0.5.15 /
+        # blocker 3).
+        generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt
             for attempt in recovered

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import yaml
@@ -31,8 +32,9 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _parse_winner_source,
-    _published_summary_path,
+    _published_summary_path_for,
     _published_winner_path,
+    _published_winner_path_for,
 )
 from phasesweep.evidence.models import objective_evidence_assurance
 
@@ -67,9 +69,17 @@ def _phase_status_payloads(
     trial_counts: Mapping[str, dict[str, int]] | None = None,
     generation_trial_counts: Mapping[str, dict[str, int]] | None = None,
     trial_data_available: Mapping[str, bool] | None = None,
-    generation_id: str | None = None,
+    winner_scope_generation_id: str | None = None,
+    pinned: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
+
+    ``winner_scope_generation_id`` must already be resolved by the caller
+    exactly once (e.g. a single :func:`phasesweep.engine.state._last_successful_generation_id`
+    call, or a caller-pinned id) and is reused for every phase in this one
+    call -- this function never re-resolves the last-success pointer itself,
+    so one status object spanning several phases can never mix identities
+    from two different pointer resolutions (review v0.5.15 / blocker 3).
 
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
     :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
@@ -78,16 +88,28 @@ def _phase_status_payloads(
     :param Mapping[str, bool] | None trial_data_available: Optional storage-read
         availability keyed by phase name. Included only in the path-free status
         view consumed by MCP.
-    :param str | None generation_id: Optional generation whose winner files are represented.
+    :param str | None winner_scope_generation_id: Already-resolved generation id
+        whose winner files are represented. When ``pinned`` is ``False``
+        (default), this is treated as an already-captured last-success id and
+        legacy-fallback semantics apply when it is ``None``. When ``pinned``
+        is ``True``, this is a caller-known generation id read directly with
+        no legacy fallback.
+    :param bool pinned: Whether ``winner_scope_generation_id`` names an exact,
+        caller-pinned generation rather than an already-captured last-success id.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
-        winner_path = (
-            _published_winner_path(experiment, phase.name)
-            if generation_id is None
-            else _generation_winner_path(experiment, generation_id, phase.name)
-        )
+        winner_path: Path | None
+        if pinned:
+            assert winner_scope_generation_id is not None
+            winner_path = _generation_winner_path(
+                experiment, winner_scope_generation_id, phase.name
+            )
+        else:
+            winner_path = _published_winner_path_for(
+                experiment, winner_scope_generation_id, phase.name
+            )
         winner_present = winner_path is not None and winner_path.is_file()
         counts = (
             _phase_trial_stats(experiment, phase).counts
@@ -243,6 +265,30 @@ def read_winners(
     return [view for view in views if view is not None]
 
 
+def _current_pointer_generation_id(experiment: Experiment) -> str | None:
+    """Read the mutable current-generation pointer's own id, or ``None``.
+
+    Unlike the last-success pointer, the current pointer is not validated
+    against any artifact: it is progress bookkeeping, always the most recent
+    invocation's own claim, and may legitimately name a failed or
+    in-progress generation.
+
+    :param Experiment experiment: Experiment whose current pointer is read.
+    :return str | None: The recorded ``generation_id``, or ``None`` when the
+        pointer is missing, unreadable, malformed, or unsafely named.
+    """
+    try:
+        generation = yaml.safe_load(_generation_path(experiment).read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(generation, Mapping):
+        return None
+    raw_generation_id = generation.get("generation_id")
+    if isinstance(raw_generation_id, str) and SAFE_NAME_PATTERN.fullmatch(raw_generation_id):
+        return raw_generation_id
+    return None
+
+
 def read_status(experiment: Experiment, *, generation_id: str | None = None) -> dict[str, Any]:
     """Per-phase trial counts and winner presence, with no paths in the output.
 
@@ -253,71 +299,90 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
 
-    Winners and live trial counts can legitimately come from *different*
-    generations: after a failed rerun, ``current_generation_id`` names the
-    failed/in-progress attempt while ``published_generation_id`` still names
-    the older generation whose winners remain authoritative. The payload
-    always carries both identities explicitly rather than a single ambiguous
-    id, so callers can never mistake one generation's facts for the other's.
-    Every per-phase fact is attributed accordingly: ``generation_trials`` is
-    scoped to ``current_generation_id`` (live progress), while
-    ``winner_present`` and the top-level ``summary_present`` are scoped to
-    ``published_generation_id`` (publication state). ``trials``,
+    This resolves the current pointer and the last-success pointer *exactly
+    once each* and reuses those two captured ids for every downstream fact in
+    this call -- no helper reached from here re-resolves either pointer, so
+    one status object can never mix identities from two different pointer
+    reads (review v0.5.15 / blocker 3). Four identities are always reported,
+    and each is truthful independent of ``generation_id``:
+
+    - ``current_generation_id``: always the actual mutable current pointer
+      (the most recent invocation's own claim, whether failed, in-progress,
+      or a much older publication); *never* forced to equal a pinned
+      ``generation_id``.
+    - ``published_generation_id``: always the actual validated last-success
+      pointer; *never* forced to equal a pinned ``generation_id`` either. A
+      pinned read of a generation whose own publication failed correctly
+      reports the *older* generation here, not the pinned one.
+    - ``represented_generation_id``: the generation whose winner/summary
+      facts this payload actually shows -- ``generation_id`` itself when
+      pinned, otherwise the captured ``published_generation_id``.
+    - ``is_published``: ``True`` only when ``represented_generation_id`` is
+      not ``None`` and equals ``published_generation_id``. A pinned read of a
+      failed-publication generation is ``is_published: False`` while still
+      showing that generation's own (unpublished) winners.
+
+    Winner/summary facts (``winner_present``, top-level ``summary_present``)
+    scope to ``represented_generation_id``. ``generation_trials`` scopes to
+    ``current_generation_id`` in default mode (live progress of whatever is
+    currently running/most recent) but to the *pinned* id in pinned mode --
+    a pinned caller wants that specific generation's own trial counts, not
+    whatever else may be current by the time the read happens. ``trials``,
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
 
     Args:
         experiment: Parsed experiment config whose phases are inspected.
-        generation_id: Optional invocation identity to pin the whole read to a
-            single, self-contained generation: both ``current_generation_id``
-            and ``published_generation_id`` in the returned payload equal this
-            id, and winner/summary facts are read from that generation's own
-            immutable namespace rather than the last-success pointer. Used by
-            callers (e.g. MCP per-run reads) that already know which
-            generation they mean and want its own view of itself, not the
-            experiment-wide current/published split. When omitted (the
-            default), ``current_generation_id`` is discovered from the
-            mutable current-generation pointer (may be ``None``, failed, or
-            in-progress) and ``published_generation_id`` is the validated
-            last-success pointer (may be ``None``); these may differ.
+        generation_id: Optional invocation identity to pin the read's
+            *represented* generation: ``represented_generation_id`` and the
+            ``generation_trials``/winner/summary scope all equal this id,
+            while ``current_generation_id`` and ``published_generation_id``
+            remain the actual (possibly different) pointers. Used by callers
+            (e.g. MCP per-run reads) that already know which generation they
+            mean and want its own view of itself. When omitted (the
+            default), ``represented_generation_id`` is the captured
+            ``published_generation_id`` and ``generation_trials`` scopes to
+            the captured ``current_generation_id``.
 
     Returns:
-        A path-free mapping with the experiment name, explicit
-        ``current_generation_id``/``published_generation_id`` identities, the
-        metric descriptor, a per-phase list of trial counts plus winner
-        presence, and whether the experiment summary has been written.
+        A path-free mapping with the experiment name, the four identity
+        fields above, the metric descriptor, a per-phase list of trial counts
+        plus winner presence, and whether the represented summary has been written.
 
     """
+    current_generation_id = _current_pointer_generation_id(experiment)
+    published_generation_id = _last_successful_generation_id(experiment)
+
     if generation_id is None:
-        current_generation_id: str | None = None
-        try:
-            generation = yaml.safe_load(_generation_path(experiment).read_text())
-            if isinstance(generation, Mapping):
-                raw_generation_id = generation.get("generation_id")
-                if isinstance(raw_generation_id, str) and SAFE_NAME_PATTERN.fullmatch(
-                    raw_generation_id
-                ):
-                    current_generation_id = raw_generation_id
-        except (OSError, yaml.YAMLError):
-            pass
-        published_generation_id = _last_successful_generation_id(experiment)
-        winner_scope_generation_id = None  # resolved via the last-success pointer
+        represented_generation_id = published_generation_id
+        trial_scope_generation_id = current_generation_id
+        winner_scope_generation_id = published_generation_id
+        pinned = False
     else:
         _validate_safe_name("generation", generation_id)
-        current_generation_id = generation_id
-        published_generation_id = generation_id
+        represented_generation_id = generation_id
+        trial_scope_generation_id = generation_id
         winner_scope_generation_id = generation_id
+        pinned = True
+
+    is_published = (
+        represented_generation_id is not None
+        and represented_generation_id == published_generation_id
+    )
 
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
-    summary_path = (
-        _published_summary_path(experiment)
-        if winner_scope_generation_id is None
-        else _generation_summary_path(experiment, winner_scope_generation_id)
-    )
+    summary_path: Path | None
+    if pinned:
+        assert winner_scope_generation_id is not None
+        summary_path = _generation_summary_path(experiment, winner_scope_generation_id)
+    else:
+        summary_path = _published_summary_path_for(experiment, winner_scope_generation_id)
     return {
         "experiment": experiment.experiment,
         "current_generation_id": current_generation_id,
         "published_generation_id": published_generation_id,
+        "represented_generation_id": represented_generation_id,
+        "is_published": is_published,
         "metric": {
             "name": experiment.metric.name,
             "goal": experiment.metric.goal,
@@ -329,14 +394,15 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={
                 name: (
-                    stats.generation_counts.get(current_generation_id, {})
-                    if current_generation_id
+                    stats.generation_counts.get(trial_scope_generation_id, {})
+                    if trial_scope_generation_id
                     else {}
                 )
                 for name, stats in phase_stats.items()
             },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
-            generation_id=winner_scope_generation_id,
+            winner_scope_generation_id=winner_scope_generation_id,
+            pinned=pinned,
         ),
         "summary_present": summary_path is not None and summary_path.is_file(),
     }

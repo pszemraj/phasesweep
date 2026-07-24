@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_id,
     _last_successful_generation_path,
     _load_winner,
     _phase_dir,
@@ -165,10 +166,20 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
 
 
-def test_interrupted_first_publication_does_not_expose_partial_projection(
+def test_interrupted_first_publication_still_publishes_and_reads_resolve_correctly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A projection failure during the very first publication is diagnostic-only.
+
+    Legacy compatibility projections (root ``winner.yaml`` etc.) are a
+    best-effort, post-commit cache (review v0.5.15 / blocker 3): a failure
+    partway through them must not fail the run or block the pointer commit,
+    even on a generation's first-ever publication. Reads must still resolve
+    correctly via the generation-scoped artifacts regardless of which legacy
+    copies did or didn't complete -- there is no "partial projection" for a
+    read to be exposed to.
+    """
     trainer = write_constant_trainer(tmp_path)
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
     run_module = importlib.import_module("phasesweep.engine.run")
@@ -184,14 +195,17 @@ def test_interrupted_first_publication_does_not_expose_partial_projection(
 
     monkeypatch.setattr(run_module, "_copy_yaml_projection", interrupt_after_first_projection)
 
-    with pytest.raises(OSError, match="publication interrupted"):
-        run_experiment(experiment)
+    winners = run_experiment(experiment)
 
-    assert _winner_path(experiment, "arch").is_file()
-    assert not _last_successful_generation_path(experiment).exists()
-    assert read_winners(experiment) == []
-    with pytest.raises(FileNotFoundError, match="no generation has completed"):
-        _load_winner(experiment, experiment.phases[0], {})
+    assert set(winners) == {"arch", "lr"}
+    assert _last_successful_generation_path(experiment).is_file()
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    # The first (arch) legacy copy completed before the injected failure; the
+    # second one (lr, or the summary) did not. Either way, reads resolve via
+    # the generation-scoped artifact once any generation has published.
+    assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
+    assert _load_winner(experiment, experiment.phases[0], {}) is not None
 
 
 def test_fingerprint_changes_when_parent_winner_changes():

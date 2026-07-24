@@ -281,27 +281,32 @@ def _show_experiment_winners(experiment: Experiment) -> None:
 
 
 def _with_generation_identity(payload: dict, experiment: Experiment) -> dict:
-    """Insert explicit current/published generation identity into a status payload.
+    """Insert explicit generation identity into a status payload.
 
     ``config_status`` (engine.run) reports cumulative, all-time trial counts
     and the published winner path but never names which generation is
-    "current" (most recent; may be failed or in-progress) versus "published"
-    (the validated last-success pointer backing the winner files) - the same
-    ambiguity :func:`phasesweep.engine.read.read_status` fixes for MCP
-    callers. This mirrors that identity split onto the CLI's status view
-    without duplicating engine.run's trial-count logic: after a failed
-    rerun, the two ids differ and both are shown explicitly.
+    "current" (most recent; may be failed or in-progress), "published" (the
+    validated last-success pointer backing the winner files), or
+    "represented" (the generation whose winner facts this payload actually
+    shows) - the same identity split :func:`phasesweep.engine.read.read_status`
+    defines for MCP callers. This mirrors that split onto the CLI's status
+    view via one ``read_status`` call (which itself resolves each pointer
+    exactly once) without duplicating engine.run's trial-count logic: after a
+    failed rerun, ``current_generation_id`` and ``published_generation_id``
+    differ and both are shown explicitly, alongside ``represented_generation_id``
+    and ``is_published``.
 
     :param dict payload: Status payload produced by :func:`config_status` for an experiment.
     :param Experiment experiment: Same experiment config the payload describes.
-    :return dict: Payload with ``current_generation_id``/``published_generation_id``
-        inserted before ``phases``.
+    :return dict: Payload with the generation-identity fields inserted before ``phases``.
     """
     identity = read_status(experiment)
     enriched = dict(payload)
     phases = enriched.pop("phases", None)
     enriched["current_generation_id"] = identity["current_generation_id"]
     enriched["published_generation_id"] = identity["published_generation_id"]
+    enriched["represented_generation_id"] = identity["represented_generation_id"]
+    enriched["is_published"] = identity["is_published"]
     if phases is not None:
         enriched["phases"] = phases
     return enriched
