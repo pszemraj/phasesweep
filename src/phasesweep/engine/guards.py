@@ -644,12 +644,21 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
 
 def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
-    """Allow interrupted stateful runs, but reject a larger cross-invocation target.
+    """Reject any cross-process continuation of a partially complete stateful study.
+
+    TPE and CMA-ES suggestions depend on process-local RNG/optimizer state that
+    Optuna storage does not persist. Recreating a seeded sampler in a fresh
+    process restarts that stream, so a mid-target resume can exactly repeat
+    already-evaluated startup suggestions and spend the remaining budget on
+    duplicates. Until PhaseSweep persists real sampler continuation state, a
+    stateful phase is restartable only before its first terminal trial or after
+    reaching its accepted target.
 
     :param optuna.Study study: Existing study whose finished-trial count is checked.
     :param Phase phase: Phase config supplying the sampler type and trial target.
     :raises SamplerContinuationUnsupportedError: The phase uses a stateful sampler
-        (``tpe`` or ``cmaes``) and raises its previously accepted trial target.
+        (``tpe`` or ``cmaes``) and either raises its previously accepted trial
+        target or was interrupted before reaching it.
     """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
     if phase.sampler.type not in {"tpe", "cmaes"} or finished == 0:
@@ -663,14 +672,14 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
             "reproduce this sampler's process-local continuation state safely. Use a new "
             "experiment name, or run the full target in one invocation."
         )
-    if finished < phase.n_trials:
-        log.warning(
-            "phase=%s resuming %s sampler after interruption at %d/%d terminal trials; "
-            "the seeded suggestion sequence may differ from an uninterrupted run",
-            phase.name,
-            phase.sampler.type,
-            finished,
-            phase.n_trials,
+    if finished < accepted_target:
+        raise SamplerContinuationUnsupportedError(
+            f"Phase {phase.name!r} uses {phase.sampler.type!r} and was interrupted at "
+            f"{finished}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
+            "this sampler's exact process-local continuation state, so resuming could "
+            "re-evaluate identical suggestions and waste the remaining budget. Use a new "
+            "experiment name (optionally with a stateless random/grid sampler), or run the "
+            "full target in one uninterrupted invocation."
         )
 
 

@@ -431,11 +431,17 @@ phases:
         ),
     ],
 )
-def test_stateful_sampler_resumes_accepted_target_but_rejects_top_up(
+def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     tmp_path: Path,
     sampler: Sampler,
     search_space: dict,
 ) -> None:
+    """A partially complete TPE/CMA-ES study can be neither resumed nor topped up.
+
+    Optuna storage does not persist process-local sampler state, so a fresh
+    process would restart the seeded suggestion stream and could re-evaluate
+    identical startup suggestions (review v0.5.14 / blocker 3).
+    """
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     phase = Phase(
@@ -454,12 +460,16 @@ def test_stateful_sampler_resumes_accepted_target_but_rejects_top_up(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
-    write_constant_trainer(tmp_path)
-    run_experiment(experiment)
     study = optuna.load_study(study_name="t::p", storage=storage)
-    assert len(study.trials) == 3
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
-    winner_before = _winner_path(experiment, "p").read_bytes()
+    assert len(study.trials) == 1
+
+    write_constant_trainer(tmp_path)
+    with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert len(study.trials) == 1
 
     top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
     with pytest.raises(
@@ -469,8 +479,50 @@ def test_stateful_sampler_resumes_accepted_target_but_rejects_top_up(
         run_experiment(top_up)
 
     study = optuna.load_study(study_name="t::p", storage=storage)
-    assert len(study.trials) == 3
-    assert _winner_path(experiment, "p").read_bytes() == winner_before
+    assert len(study.trials) == 1
+
+
+@pytest.mark.parametrize(
+    ("sampler", "search_space"),
+    [
+        pytest.param(
+            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            {"x": IntParam(type="int", low=0, high=10)},
+            id="tpe",
+        ),
+        pytest.param(
+            Sampler(type="cmaes", seed=0),
+            {
+                "x": FloatParam(type="float", low=0.0, high=1.0),
+                "y": FloatParam(type="float", low=0.0, high=1.0),
+            },
+            id="cmaes",
+        ),
+    ],
+)
+def test_stateful_sampler_completed_target_reruns_as_noop(
+    tmp_path: Path,
+    sampler: Sampler,
+    search_space: dict,
+) -> None:
+    """A stateful study that reached its accepted target republishes without new trials."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    phase = Phase(name="p", n_trials=2, sampler=sampler, search_space=search_space)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[phase],
+    )
+    first = run_experiment(experiment)
+    rerun = run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert len(study.trials) == 2
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 2
+    assert rerun["p"].trial_number == first["p"].trial_number
+    assert rerun["p"].metric == first["p"].metric
 
 
 def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
