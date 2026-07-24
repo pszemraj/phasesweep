@@ -14,6 +14,7 @@ import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.runtime.files import atomic_text_writer
 
@@ -233,21 +234,96 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
 
+def _read_pointer_target(
+    pointer_path: Path,
+    *,
+    id_key: str,
+    owner_key: str,
+    owner_name: str,
+) -> str | None:
+    """Read one last-success pointer's target id, validating the pointer itself.
+
+    :param Path pointer_path: Pointer YAML file to read.
+    :param str id_key: Payload key holding the target generation id.
+    :param str owner_key: Payload key naming the owning experiment or suite.
+    :param str owner_name: Expected owner name the pointer must record.
+    :return str | None: A safe-name target id owned by ``owner_name``, or
+        ``None`` when the pointer is missing, unreadable, malformed, names
+        another owner, or carries an unsafe id.
+    """
+    try:
+        payload = yaml.safe_load(pointer_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(payload, dict) or payload.get(owner_key) != owner_name:
+        return None
+    target_id = payload.get(id_key)
+    if not isinstance(target_id, str) or not SAFE_NAME_PATTERN.fullmatch(target_id):
+        return None
+    return target_id
+
+
+def _record_is_complete(
+    record_path: Path,
+    *,
+    id_key: str,
+    target_id: str,
+    owner_key: str,
+    owner_name: str,
+) -> bool:
+    """Return whether a lifecycle record names itself correctly and is complete.
+
+    :param Path record_path: Immutable lifecycle record YAML file to read.
+    :param str id_key: Record key holding the generation id.
+    :param str target_id: Generation id the record must name.
+    :param str owner_key: Record key naming the owning experiment or suite.
+    :param str owner_name: Expected owner name the record must carry.
+    :return bool: ``True`` only for a readable record whose owner, id, and
+        ``state == "complete"`` all match.
+    """
+    try:
+        record = yaml.safe_load(record_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return False
+    return (
+        isinstance(record, dict)
+        and record.get(owner_key) == owner_name
+        and record.get(id_key) == target_id
+        and record.get("state") == "complete"
+    )
+
+
 def _last_successful_generation_id(experiment: Experiment) -> str | None:
-    """Read the last-success pointer, returning ``None`` for legacy layouts.
+    """Read and validate the last-success pointer, failing closed on mismatch.
+
+    The pointer is authoritative only when its target still exists as an
+    immutable lifecycle record in state ``complete`` for this experiment
+    (review v0.5.14 / blocker 1). A malformed, tampered, or downgraded target
+    is treated as "nothing published" rather than trusted for path
+    construction or result reads.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return str | None: The last-successful generation id, or ``None`` if the
-        pointer file is missing, unreadable, malformed, or has no valid id.
+        pointer or its target record is missing, unreadable, malformed,
+        unsafely named, owned by another experiment, or not ``complete``.
     """
-    try:
-        payload = yaml.safe_load(_last_successful_generation_path(experiment).read_text())
-    except (OSError, yaml.YAMLError):
+    generation_id = _read_pointer_target(
+        _last_successful_generation_path(experiment),
+        id_key="generation_id",
+        owner_key="experiment",
+        owner_name=experiment.experiment,
+    )
+    if generation_id is None:
         return None
-    if not isinstance(payload, dict):
+    if not _record_is_complete(
+        _generation_record_path(experiment, generation_id),
+        id_key="generation_id",
+        target_id=generation_id,
+        owner_key="experiment",
+        owner_name=experiment.experiment,
+    ):
         return None
-    generation_id = payload.get("generation_id")
-    return generation_id if isinstance(generation_id, str) and generation_id else None
+    return generation_id
 
 
 def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | None:
@@ -407,23 +483,49 @@ def _last_successful_suite_generation_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "last_successful_suite_generation.yaml"
 
 
+def _last_successful_suite_generation_id(suite: Suite) -> str | None:
+    """Read and validate the suite last-success pointer, failing closed on mismatch.
+
+    Applies the same publication protocol as
+    :func:`_last_successful_generation_id`: the pointer is authoritative only
+    when its target still exists as a ``complete`` immutable suite lifecycle
+    record for this suite (review v0.5.14 / blocker 1).
+
+    :param Suite suite: Suite config with artifact root details.
+    :return str | None: The last-successful suite generation id, or ``None``
+        when the pointer or its target record fails validation.
+    """
+    generation_id = _read_pointer_target(
+        _last_successful_suite_generation_path(suite),
+        id_key="suite_generation_id",
+        owner_key="suite",
+        owner_name=suite.suite,
+    )
+    if generation_id is None:
+        return None
+    if not _record_is_complete(
+        _suite_generation_record_path(suite, generation_id),
+        id_key="suite_generation_id",
+        target_id=generation_id,
+        owner_key="suite",
+        owner_name=suite.suite,
+    ):
+        return None
+    return generation_id
+
+
 def _published_suite_summary_path(suite: Suite) -> Path | None:
     """Return the authoritative last-success suite summary, with legacy fallback.
 
     :param Suite suite: Suite config with artifact root details.
     :return Path | None: The generation-scoped suite summary path when a
-        last-success pointer exists; the legacy compatibility summary path when
-        no suite generation has ever been published; ``None`` when a suite
-        generation exists but none has completed successfully yet.
+        validated last-success pointer exists; the legacy compatibility summary
+        path when no suite generation has ever been published; ``None`` when a
+        suite generation exists but none has completed successfully yet.
     """
-    try:
-        payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
-    except (OSError, yaml.YAMLError):
-        payload = None
-    if isinstance(payload, dict):
-        generation_id = payload.get("suite_generation_id")
-        if isinstance(generation_id, str) and generation_id:
-            return _suite_generation_summary_path(suite, generation_id)
+    generation_id = _last_successful_suite_generation_id(suite)
+    if generation_id is not None:
+        return _suite_generation_summary_path(suite, generation_id)
     if _suite_generation_path(suite).is_file():
         return None
     return _suite_summary_path(suite)

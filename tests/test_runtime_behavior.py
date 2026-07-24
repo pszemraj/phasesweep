@@ -426,10 +426,17 @@ def test_terminal_callback_preserves_failure_when_callback_raises(
     assert captured[0].failure_stage == "execution"
 
 
-def test_terminal_callback_failure_propagates_after_success(
+def test_terminal_callback_failure_cannot_fail_published_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A reporting callback is a diagnostic consumer, never an outcome authority.
+
+    By the time the callback runs, a successful generation is already
+    published as the last successful result; raising would present that
+    committed success as a caller-visible failure (review v0.5.14 / item C).
+    """
     experiment = make_experiment(workdir=tmp_path / "runs")
 
     class CallbackError(RuntimeError):
@@ -447,8 +454,10 @@ def test_terminal_callback_failure_propagates_after_success(
         lambda *_args, **_kwargs: {},
     )
 
-    with pytest.raises(CallbackError, match="snapshot failed"):
-        run_experiment(experiment, terminal_callback=fail_callback)
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+        assert run_experiment(experiment, terminal_callback=fail_callback) == {}
+
+    assert any("terminal callback failed" in record.message for record in caplog.records)
 
 
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):

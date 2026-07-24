@@ -25,6 +25,7 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import read_winner, run_experiment
+from phasesweep.engine.run import ExperimentRunOutcome
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
@@ -527,15 +528,14 @@ def test_failed_suite_rerun_preserves_previous_summary(
         attempt_id="attempt-one",
     )
 
-    def succeed(experiment: Experiment, **_kwargs: object) -> dict[str, Winner]:
-        pointer = (
-            Path(experiment.workdir) / experiment.experiment / "last_successful_generation.yaml"
+    def succeed(experiment: Experiment, **_kwargs: object) -> ExperimentRunOutcome:
+        return ExperimentRunOutcome(
+            generation_id="component-generation",
+            winners={"eval": winner},
+            phase_fingerprints={"eval": winner.phase_fingerprint},
         )
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text("generation_id: component-generation\n")
-        return {"eval": winner}
 
-    monkeypatch.setattr("phasesweep.engine.run.run_experiment", succeed)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_outcome", succeed)
 
     run_config(config)
     summary_path = tmp_path / "runs" / "stale_suite" / "suite_summary.yaml"
@@ -556,10 +556,10 @@ def test_failed_suite_rerun_preserves_previous_summary(
     assert first_summary["studies"][0]["phases"][0]["comment"] == ("original suite annotation")
     summary_before = summary_path.read_bytes()
 
-    def fail_rerun(*_args: object, **_kwargs: object) -> dict[str, Winner]:
+    def fail_rerun(*_args: object, **_kwargs: object) -> ExperimentRunOutcome:
         raise RuntimeError("later suite invocation failed")
 
-    monkeypatch.setattr("phasesweep.engine.run.run_experiment", fail_rerun)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_outcome", fail_rerun)
 
     with pytest.raises(RuntimeError, match="later suite invocation failed"):
         run_config(config)
