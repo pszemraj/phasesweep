@@ -136,6 +136,7 @@ def test_runner_persists_terminal_evidence_before_snapshot_finalization(
     assert observed["cleanup_confirmed"] is True
     assert "ended_at" in observed
     assert observed["result_snapshot_state"] == "pending"
+    assert observed["result_snapshot"] == {}
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "failed"
     assert final["result_snapshot_error"] == "RuntimeError"

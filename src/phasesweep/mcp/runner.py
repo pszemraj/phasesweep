@@ -241,6 +241,8 @@ def _write_status(
             "ended_at": utc_now_iso(),
             "result_snapshot_state": "pending",
         }
+        if result_snapshot is not None:
+            terminal["result_snapshot"] = result_snapshot
         try:
             write_status_file(status_path, terminal)
         except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
@@ -254,6 +256,7 @@ def _write_status(
                 result_snapshot,
             )
         except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
+            terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
             logging.getLogger("phasesweep.mcp.runner").exception(
