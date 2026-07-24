@@ -10,6 +10,8 @@ The top level of a single experiment describes identity, storage, the trial comm
 
 `storage` selects the Optuna backend. `null` creates an in-memory study, `sqlite:///path.db` provides persistence for sequential `n_jobs == 1` studies, `journal:///path.journal` supports same-host parallel work, and an Optuna-supported RDB URL such as `postgresql://...` provides external storage. SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Study reuse, top-ups, and `--from-phase` behavior are covered under [fingerprints and resume](runtime.md#fingerprints-and-resume).
 
+PhaseSweep's coordination (locks, generation pointers) is host-local-filesystem based, so an RDB `storage` URL is rejected at config validation unless `allow_unsafe_multihost: true` is also set. Set it only when every process that will ever touch this storage and workdir runs on a single host — see [multi-host storage](runtime.md#concurrency-model) for why a shared RDB backend does not make PhaseSweep safe to run from more than one host.
+
 Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
 
 `trial_command` is the command template for one trial. phasesweep validates the template at config load and shell-quotes rendered override values. The [config reference](config_reference.yaml) defines the supported placeholders; the parser boundary is explained under [override formats](#override-formats).

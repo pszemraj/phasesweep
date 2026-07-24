@@ -25,7 +25,7 @@ from phasesweep.config.search import (
     _validate_sampler_search_space,
 )
 from phasesweep.evidence.models import Extractor, Gate, ObjectiveExtractor
-from phasesweep.runtime.files import storage_backend
+from phasesweep.runtime.files import storage_backend, storage_is_in_memory
 
 
 class Metric(_Frozen):
@@ -372,10 +372,24 @@ class Experiment(_Frozen):
         default=None,
         description=(
             "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
-            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts. "
+            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
+            "(RDB backends additionally require allow_unsafe_multihost: true; see below). "
             "Null for non-resumable in-memory runs (not recommended). "
             "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
             "scheme intentionally so study identity stays stable across n_jobs changes."
+        ),
+    )
+    allow_unsafe_multihost: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge and accept the loss of PhaseSweep's coordination guarantees "
+            "when storage is a shared relational backend (e.g. postgresql://, mysql://). "
+            "PhaseSweep's locks and generation pointers are host-local-filesystem based; "
+            "pointing several hosts at one shared RDB storage silently breaks those "
+            "safety guarantees. Set this to true only when every process that will ever "
+            "touch this storage and workdir runs on a single host (i.e. you are using an "
+            "RDB backend for durable storage or dashboarding, not for multi-host "
+            "orchestration)."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
@@ -577,7 +591,10 @@ class Experiment(_Frozen):
 
             # Storage policy (blocker 6): SQLite + parallel writes deadlocks under
             # contention; we no longer auto-remap to JournalStorage. Tell the user.
-            _validate_storage_policy(self.storage, phase)
+            # Also enforces the single-host coordination boundary (review item D):
+            # shared RDB storage across hosts silently breaks lock/generation-pointer
+            # safety unless explicitly acknowledged.
+            _validate_storage_policy(self.storage, phase, self.allow_unsafe_multihost)
 
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
@@ -599,32 +616,53 @@ class Experiment(_Frozen):
         return self
 
 
-def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
-    """Reject SQLite storage with parallel ``n_jobs`` (review v0.5.2 / blocker 6).
+def _validate_storage_policy(
+    storage: str | None, phase: Phase, allow_unsafe_multihost: bool
+) -> None:
+    """Reject SQLite+parallel storage and unacknowledged multi-host RDB storage.
 
-    SQLite serializes writers; concurrent Optuna trials cause ``database is locked``
-    errors. Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
-    but that fragmented study identity behind a single URL — the same config could
-    point at two different studies depending on ``n_jobs``. Now we require the user
-    to pick the scheme explicitly.
+    Two independent policies are enforced here:
 
-    The check uses :func:`phasesweep.runtime.files.storage_backend` so all
-    SQLAlchemy SQLite dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...)
-    are rejected. Earlier versions only matched the bare ``sqlite:///`` prefix
-    and let driver-qualified URLs through unsafely (review v0.5.7 / blocker 1).
+    1. SQLite + parallel ``n_jobs`` (review v0.5.2 / blocker 6): SQLite serializes
+       writers; concurrent Optuna trials cause ``database is locked`` errors.
+       Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
+       but that fragmented study identity behind a single URL — the same config
+       could point at two different studies depending on ``n_jobs``. Now we
+       require the user to pick the scheme explicitly.
+    2. Unacknowledged multi-host-capable storage (review item D): PhaseSweep's
+       coordination (locks, generation pointers) is host-local-filesystem based.
+       Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
+       silently breaks those safety guarantees, so any backend other than
+       ``sqlite``/``journal`` is rejected unless the operator explicitly sets
+       ``allow_unsafe_multihost: true``. In-memory storage (``None`` or the
+       bare ``":memory:"``/URI-memory sentinels recognized by
+       :func:`phasesweep.runtime.files.storage_is_in_memory`) is exempt: it
+       cannot be shared across hosts in the first place.
+
+    Both checks use :func:`phasesweep.runtime.files.storage_backend` so all
+    SQLAlchemy dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...) are
+    classified consistently. Earlier versions only matched the bare
+    ``sqlite:///`` prefix and let driver-qualified URLs through unsafely
+    (review v0.5.7 / blocker 1).
 
     Args:
         storage: The experiment-level storage URL, or ``None`` (in-memory).
         phase: The phase being validated; its ``n_jobs`` decides whether the
-            SQLite restriction applies.
+            SQLite-parallel restriction applies.
+        allow_unsafe_multihost: Experiment-level acknowledgement that every
+            process touching this storage and workdir runs on a single host,
+            required to use any non-file-backed (RDB) storage.
 
     Raises:
-        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite.
+        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite, or
+            ``storage`` is not in-memory, resolves to a backend other than
+            ``sqlite``/``journal``, and ``allow_unsafe_multihost`` is not set.
 
     """
     if storage is None:
         return
-    if phase.n_jobs > 1 and storage_backend(storage) == "sqlite":
+    backend = storage_backend(storage)
+    if phase.n_jobs > 1 and backend == "sqlite":
         raise ValueError(
             f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage "
             f"({storage!r}). SQLite serializes writers and will deadlock under "
@@ -632,6 +670,22 @@ def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
             "single-host parallel sweep, or an RDB URL such as "
             "postgresql://... for durable storage and dashboard access from a "
             "single phasesweep orchestrator."
+        )
+    if (
+        not storage_is_in_memory(storage)
+        and backend not in {"sqlite", "journal"}
+        and not allow_unsafe_multihost
+    ):
+        raise ValueError(
+            f"storage {storage!r} resolves to backend {backend!r}, a shared "
+            "relational store. PhaseSweep's coordination (locks, generation "
+            "pointers) is host-local-filesystem based, so pointing multiple "
+            f"hosts at one shared {backend} storage silently breaks those safety "
+            "guarantees. Set allow_unsafe_multihost: true only when every "
+            "process that will ever touch this storage and workdir runs on a "
+            "single host; otherwise use storage: journal:///path.journal for a "
+            "single-host parallel sweep, or storage: sqlite:///path.db for "
+            "sequential n_jobs: 1 studies."
         )
 
 
@@ -786,6 +840,7 @@ class SuiteDefaults(_Frozen):
     """Shared defaults applied to every study in a suite."""
 
     storage: str | None = None
+    allow_unsafe_multihost: bool = False
     workdir: str = "./runs"
     trial_command: str | None = None
     provenance: dict[str, str] = Field(default_factory=dict)
@@ -803,6 +858,7 @@ class StudySpec(_Frozen):
     name: str
     depends_on: list[str] = Field(default_factory=list)
     storage: str | None = None
+    allow_unsafe_multihost: bool | None = None
     workdir: str | None = None
     trial_command: str | None = None
     provenance: dict[str, str] | None = None
@@ -918,6 +974,7 @@ class Suite(_Frozen):
         return Experiment(
             experiment=f"{self.suite}__{study.name}",
             storage=value("storage"),
+            allow_unsafe_multihost=value("allow_unsafe_multihost", required=True),
             workdir=value("workdir", required=True),
             trial_command=value("trial_command", required=True),
             provenance=value("provenance") or {},
