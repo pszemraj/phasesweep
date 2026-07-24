@@ -20,6 +20,7 @@ from phasesweep.engine.guards import (
     _reap_stale_trials,
     _record_trial_target,
     _validate_study_schema,
+    _validate_trial_target,
     _verify_fingerprint,
 )
 from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
@@ -182,7 +183,7 @@ def _run_phase(
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
-        _record_trial_target(study, phase)
+        _validate_trial_target(study, phase)
 
     completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)
@@ -197,6 +198,29 @@ def _run_phase(
 
     if dry_run:
         return _dry_run_phase(experiment, phase, inherited_winners, study, remaining)
+
+    if remaining == 0:
+        # A no-op invocation republishes the existing result. It must neither
+        # require launch resources (GPU discovery on a CPU-only host) nor
+        # mutate the durable accepted target (review v0.5.14 / blocker 4).
+        trials_after = study.get_trials(deepcopy=False)
+        return _select_phase_winner(
+            experiment,
+            phase,
+            inherited_winners,
+            study,
+            phase_fingerprint=phase_fingerprint,
+            completion={
+                "requested_trials": phase.n_trials,
+                "finished_trials": _finished_trial_count(trials_after),
+                "completed_trials": sum(
+                    1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE
+                ),
+                "incomplete": False,
+                "reason": None,
+                "timeout_scope": None,
+            },
+        )
 
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
@@ -458,43 +482,48 @@ def _run_phase(
 
     timeout_source: str | None = None
     optimize_deadline: float | None = None
-    if remaining > 0:
-        optimize_timeout = phase.timeout_seconds_per_phase
-        if optimize_timeout is not None:
-            timeout_source = "phase"
-        if run_deadline is not None:
-            remaining_run_seconds = max(0.0, run_deadline - time.monotonic())
-            if optimize_timeout is None or remaining_run_seconds <= optimize_timeout:
-                timeout_source = "run"
-            optimize_timeout = (
-                remaining_run_seconds
-                if optimize_timeout is None
-                else min(optimize_timeout, remaining_run_seconds)
-            )
-        if optimize_timeout is not None and optimize_timeout <= 0.0:
-            raise TimeoutError(
-                f"Run wallclock deadline reached before phase {phase.name!r} could launch."
-            )
-        if optimize_timeout is not None:
-            optimize_deadline = time.monotonic() + optimize_timeout
-        try:
-            study.optimize(
-                objective,
-                n_trials=remaining,
-                n_jobs=phase.n_jobs,
-                timeout=optimize_timeout,
-                gc_after_trial=True,
-                callbacks=[abort_callback],
-                catch=(TrialExecutionError,),
-            )
-        finally:
-            # Always snapshot trials.csv, even if ``study.optimize`` raises
-            # (n_jobs=1 hard-abort path) or some other transient backend
-            # error escapes. Forensic data must survive every exit path.
-            # Best-effort: a write failure here must not mask the actual
-            # exception from ``study.optimize``.
-            with contextlib.suppress(Exception):
-                _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+    optimize_timeout = phase.timeout_seconds_per_phase
+    if optimize_timeout is not None:
+        timeout_source = "phase"
+    if run_deadline is not None:
+        remaining_run_seconds = max(0.0, run_deadline - time.monotonic())
+        if optimize_timeout is None or remaining_run_seconds <= optimize_timeout:
+            timeout_source = "run"
+        optimize_timeout = (
+            remaining_run_seconds
+            if optimize_timeout is None
+            else min(optimize_timeout, remaining_run_seconds)
+        )
+    if optimize_timeout is not None and optimize_timeout <= 0.0:
+        raise TimeoutError(
+            f"Run wallclock deadline reached before phase {phase.name!r} could launch."
+        )
+    if optimize_timeout is not None:
+        optimize_deadline = time.monotonic() + optimize_timeout
+    # Accept the (possibly larger) durable target only after every launch
+    # prerequisite — GPU discovery above, wallclock budget here — has passed.
+    # Recording it earlier would strand the study at a target no invocation
+    # ever launched work toward, making the previously working config a
+    # rejected regression (review v0.5.14 / blocker 4).
+    _record_trial_target(study, phase)
+    try:
+        study.optimize(
+            objective,
+            n_trials=remaining,
+            n_jobs=phase.n_jobs,
+            timeout=optimize_timeout,
+            gc_after_trial=True,
+            callbacks=[abort_callback],
+            catch=(TrialExecutionError,),
+        )
+    finally:
+        # Always snapshot trials.csv, even if ``study.optimize`` raises
+        # (n_jobs=1 hard-abort path) or some other transient backend
+        # error escapes. Forensic data must survive every exit path.
+        # Best-effort: a write failure here must not mask the actual
+        # exception from ``study.optimize``.
+        with contextlib.suppress(Exception):
+            _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
     # Re-raise unsafe cleanup BEFORE the soft abort check. Optuna's threaded
     # n_jobs>1 optimize path can swallow non-caught objective exceptions when
@@ -537,19 +566,46 @@ def _run_phase(
             "terminal trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
-    completion = {
-        "requested_trials": phase.n_trials,
-        "finished_trials": finished_after,
-        "completed_trials": completed_after,
-        "incomplete": accepted_partial_timeout,
-        "reason": "timeout" if accepted_partial_timeout else None,
-        "timeout_scope": timeout_source if accepted_partial_timeout else None,
-    }
+    return _select_phase_winner(
+        experiment,
+        phase,
+        inherited_winners,
+        study,
+        phase_fingerprint=phase_fingerprint,
+        completion={
+            "requested_trials": phase.n_trials,
+            "finished_trials": finished_after,
+            "completed_trials": completed_after,
+            "incomplete": accepted_partial_timeout,
+            "reason": "timeout" if accepted_partial_timeout else None,
+            "timeout_scope": timeout_source if accepted_partial_timeout else None,
+        },
+    )
 
-    # Build the winner with the verified phase identity and composed overrides.
+
+def _select_phase_winner(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    study: optuna.Study,
+    *,
+    phase_fingerprint: str,
+    completion: dict[str, Any],
+) -> Winner:
+    """Select the phase winner and bind it to its verified execution identity.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: Phase whose winner is selected.
+    :param dict[str, Winner] inherited_winners: Winners from earlier phases in the chain.
+    :param optuna.Study study: Study whose terminal trials supply the winner.
+    :param str phase_fingerprint: Verified semantic fingerprint for the phase.
+    :param dict[str, Any] completion: Completion metadata persisted with the winner.
+    :raises NoFeasibleTrialError: Every terminal trial was infeasible.
+    :return Winner: The selected winner with composed overrides and source identity.
+    """
     selected = select_winner(study, experiment)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
-    winner = Winner(
+    return Winner(
         trial_number=selected.trial_number,
         params=selected.params,
         effective_overrides=effective,
@@ -568,7 +624,6 @@ def _run_phase(
             attempt_id=selected.attempt_id,
         ),
     )
-    return winner
 
 
 def _dry_run_phase(

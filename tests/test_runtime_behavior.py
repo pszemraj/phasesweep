@@ -26,6 +26,7 @@ from phasesweep.engine.optuna import _build_sampler, _create_phase_study
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    TRIAL_TARGET_ATTR,
     _last_successful_generation_path,
     _load_winner,
     _summary_path,
@@ -946,3 +947,98 @@ def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
 
     with pytest.raises(TimeoutError, match="run guard"):
         run_experiment(exp)
+
+
+def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed phase republishes from a host that cannot launch work.
+
+    Reading or republishing a finished GPU experiment from a CPU-only login
+    node must not require GPU discovery or mutate the durable accepted target
+    (review v0.5.14 / blocker 4).
+    """
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        p = argparse.ArgumentParser()
+        p.add_argument("--out")
+        p.add_argument("--x", type=int, default=0)
+        a, _ = p.parse_known_args()
+        print(f"x={a.x}")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+    )
+    first = run_experiment(experiment)
+
+    def _no_gpu_create(**_kwargs: object) -> None:
+        raise RuntimeError("simulated: no GPUs detected on this host")
+
+    monkeypatch.setattr("phasesweep.engine.phase.GpuPool.create", _no_gpu_create)
+    rerun = run_experiment(experiment)
+
+    assert rerun["p"].trial_number == first["p"].trial_number
+    assert rerun["p"].metric == first["p"].metric
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+    assert len(study.trials) == 1
+
+
+def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A top-up that cannot launch leaves the prior accepted target usable.
+
+    The larger target must only be durably accepted after launch prerequisites
+    (GPU discovery, wallclock budget) pass; otherwise a transient local GPU
+    problem permanently strands the study above its last working config
+    (review v0.5.14 / blocker 4).
+    """
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        p = argparse.ArgumentParser()
+        p.add_argument("--out")
+        p.add_argument("--x", type=int, default=0)
+        a, _ = p.parse_known_args()
+        print(f"x={a.x}")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[phase],
+    )
+    first = run_experiment(experiment)
+
+    def _no_gpu_create(**_kwargs: object) -> None:
+        raise RuntimeError("simulated: no GPUs detected on this host")
+
+    monkeypatch.setattr("phasesweep.engine.phase.GpuPool.create", _no_gpu_create)
+    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 2})]})
+    with pytest.raises(RuntimeError, match="no GPUs detected"):
+        run_experiment(top_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+    assert len(study.trials) == 1
+
+    rerun = run_experiment(experiment)
+    assert rerun["p"].metric == first["p"].metric
