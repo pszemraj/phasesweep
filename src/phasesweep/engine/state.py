@@ -442,9 +442,12 @@ def _published_summary_path_for(
 ) -> Path | None:
     """Resolve the authoritative summary path from an already-captured published id.
 
-    Same legacy-fallback semantics as :func:`_published_summary_path`, but
-    takes the caller's already-resolved last-success id instead of re-reading
-    the pointer (review v0.5.15 / blocker 3).
+    Resolves to the generation-scoped summary path once a generation has
+    published, falls back to the legacy compatibility summary path when none
+    ever has, and returns ``None`` when a generation exists but none has
+    completed successfully yet -- takes the caller's already-resolved
+    last-success id instead of re-reading the pointer (review v0.5.15 /
+    blocker 3).
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str | None published_generation_id: Already-resolved
@@ -459,18 +462,6 @@ def _published_summary_path_for(
     if _generation_path(experiment).is_file():
         return None
     return _summary_path(experiment)
-
-
-def _published_summary_path(experiment: Experiment) -> Path | None:
-    """Return the authoritative last-success summary, with legacy fallback.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path | None: The generation-scoped summary path when a last-success
-        pointer exists; the legacy compatibility summary path when no
-        generation has ever been published; ``None`` when a generation exists
-        but none has completed successfully yet.
-    """
-    return _published_summary_path_for(experiment, _last_successful_generation_id(experiment))
 
 
 def _published_promotion_decision_path(

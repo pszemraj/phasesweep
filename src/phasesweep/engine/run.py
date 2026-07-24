@@ -365,17 +365,17 @@ def _run_experiment_outcome(
             # "failed" write here would be refused for the record (write-once)
             # but would silently clobber the current pointer, which has no
             # monotonic guard within one invocation (review v0.5.15 / blocker 3).
-            if not _generation_record_path(experiment, failed_generation_id).is_file():
-                _persist_terminal_failure(
-                    lambda: _write_generation_state(
-                        experiment,
-                        generation_id=failed_generation_id,
-                        state="failed",
-                        from_phase=from_phase,
-                        publish_current=True,
-                        error_class=failed_error_class,
-                    )
-                )
+            _persist_failed_state_unless_recorded(
+                _generation_record_path(experiment, failed_generation_id),
+                lambda: _write_generation_state(
+                    experiment,
+                    generation_id=failed_generation_id,
+                    state="failed",
+                    from_phase=from_phase,
+                    publish_current=True,
+                    error_class=failed_error_class,
+                ),
+            )
             terminal_report = TerminalReport(
                 generation_id=generation_id,
                 primary_error=primary_error,
@@ -485,6 +485,9 @@ def _run_experiment_inner(
                         winners[phase.name],
                         generation_id=generation_id,
                     )
+                    # Safe to re-resolve the published pointer per phase here, unlike
+                    # status reads: this runs under _experiment_lock, and this
+                    # experiment's pointer only advances at this run's final publish.
                     prior_promotion = _published_promotion_decision_path(experiment, phase.name)
                     if prior_promotion is not None and prior_promotion.is_file():
                         _copy_yaml_projection(
@@ -593,6 +596,9 @@ def _preflight_skipped_winners(
         if phase.name == from_phase:
             return winners
         inherited = {parent: winners[parent] for parent in phase.inherits}
+        # Safe to re-resolve the published pointer per phase here, unlike status
+        # reads: this preflight runs under _experiment_lock, and this
+        # experiment's pointer only advances at this run's final publish.
         winners[phase.name] = _load_winner(experiment, phase, inherited)
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
@@ -795,6 +801,41 @@ def _persist_terminal_failure(write_state: Callable[[], None]) -> None:
         write_state()
     except BaseException:  # noqa: BLE001 - see docstring: primary exception must survive
         log.exception("failed to persist terminal failure state; preserving the original error")
+
+
+def _persist_failed_state_unless_recorded(
+    record_path: Path, write_failed: Callable[[], None]
+) -> None:
+    """Write the generic "failed" state, unless a more specific record already exists.
+
+    If a ``publication_failed`` record was already written for this
+    generation, the generic ``failed`` state write must not run: the current
+    pointer was already driven terminal with the more specific outcome, and
+    the write-once record must not be re-attempted on top of it.
+
+    :param Path record_path: Immutable per-generation record path to check.
+    :param Callable[[], None] write_failed: Zero-argument "failed" state
+        persistence action, run via :func:`_persist_terminal_failure`.
+    """
+    if not record_path.is_file():
+        _persist_terminal_failure(write_failed)
+
+
+def _log_on_failure(action: Callable[[], None], message: str) -> None:
+    """Run a post-commit best-effort action, logging instead of raising on failure.
+
+    Exists for the post-commit best-effort steps of the publication
+    transaction (record write, pointer refresh, compatibility projection):
+    once the authoritative pointer has committed, nothing after it may fail
+    the run, so each such step must log its own failure and never propagate it.
+
+    :param Callable[[], None] action: Zero-argument best-effort action.
+    :param str message: Message logged (with exception info) on failure.
+    """
+    try:
+        action()
+    except Exception:
+        log.exception(message)
 
 
 def _recorded_generation_state(record_path: Path) -> str | None:
@@ -1090,7 +1131,8 @@ def _publish_generation(
         )
         raise
 
-    try:
+    def _write_published_record() -> None:
+        """Step 4: write the immutable per-generation record once, state ``published``."""
         _write_generation_state(
             experiment,
             generation_id=generation_id,
@@ -1098,13 +1140,15 @@ def _publish_generation(
             from_phase=from_phase,
             publish_current=False,
         )
-    except Exception:
-        log.exception(
-            "failed to write the immutable generation record after publication; "
-            "the published result is unaffected"
-        )
 
-    try:
+    _log_on_failure(
+        _write_published_record,
+        "failed to write the immutable generation record after publication; "
+        "the published result is unaffected",
+    )
+
+    def _refresh_published_pointer_and_projections() -> None:
+        """Step 5: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
         _write_generation_state(
             experiment,
             generation_id=generation_id,
@@ -1134,11 +1178,12 @@ def _publish_generation(
             _generation_summary_path(experiment, generation_id),
             _summary_path(experiment),
         )
-    except Exception:
-        log.exception(
-            "failed to refresh the current-generation pointer or compatibility caches "
-            "after publication; the published result is unaffected"
-        )
+
+    _log_on_failure(
+        _refresh_published_pointer_and_projections,
+        "failed to refresh the current-generation pointer or compatibility caches "
+        "after publication; the published result is unaffected",
+    )
 
 
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
@@ -1273,7 +1318,8 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 )
                 raise
 
-            try:
+            def _write_published_suite_record() -> None:
+                """Step 4: write the immutable suite record once, state ``published``."""
                 _write_suite_generation_state(
                     suite,
                     generation_id=generation_id,
@@ -1282,13 +1328,15 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     ended_at=ended_at,
                     publish_current=False,
                 )
-            except Exception:
-                log.exception(
-                    "failed to write the immutable suite generation record after "
-                    "publication; the published result is unaffected"
-                )
 
-            try:
+            _log_on_failure(
+                _write_published_suite_record,
+                "failed to write the immutable suite generation record after "
+                "publication; the published result is unaffected",
+            )
+
+            def _refresh_published_suite_pointer_and_cache() -> None:
+                """Step 5: drive the pointer to ``published``, refresh the cache (best-effort)."""
                 _write_suite_generation_state(
                     suite,
                     generation_id=generation_id,
@@ -1298,11 +1346,12 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     write_record=False,
                 )
                 _copy_yaml_projection(immutable_summary, _suite_summary_path(suite))
-            except Exception:
-                log.exception(
-                    "failed to refresh the current suite-generation pointer or compatibility "
-                    "cache after publication; the published result is unaffected"
-                )
+
+            _log_on_failure(
+                _refresh_published_suite_pointer_and_cache,
+                "failed to refresh the current suite-generation pointer or compatibility "
+                "cache after publication; the published result is unaffected",
+            )
         except BaseException as exc:
             failed_error_class = type(exc).__name__
             # Mirrors the experiment-level guard in _run_experiment_outcome: if
@@ -1310,18 +1359,18 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             # (state "publication_failed") for this suite generation, it also
             # already drove the current pointer to that more specific state;
             # skip the generic write so it is not clobbered back to "failed".
-            if not _suite_generation_record_path(suite, generation_id).is_file():
-                _persist_terminal_failure(
-                    lambda: _write_suite_generation_state(
-                        suite,
-                        generation_id=generation_id,
-                        state="failed",
-                        started_at=started_at,
-                        ended_at=datetime.now(UTC).isoformat(),
-                        error_class=failed_error_class,
-                        publish_current=True,
-                    )
-                )
+            _persist_failed_state_unless_recorded(
+                _suite_generation_record_path(suite, generation_id),
+                lambda: _write_suite_generation_state(
+                    suite,
+                    generation_id=generation_id,
+                    state="failed",
+                    started_at=started_at,
+                    ended_at=datetime.now(UTC).isoformat(),
+                    error_class=failed_error_class,
+                    publish_current=True,
+                ),
+            )
             raise
     return results
 
