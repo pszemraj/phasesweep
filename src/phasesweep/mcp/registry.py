@@ -10,6 +10,11 @@ fails server startup.
 from __future__ import annotations
 
 import hashlib
+import os
+import shlex
+import stat
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -20,15 +25,40 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
+    UnsafePrivatePathError,
     file_url_path,
     sqlite_uri_filename_path,
     storage_backend,
     storage_is_in_memory,
 )
+from phasesweep.runtime.process import read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
+
+
+def _require_linux_mcp_host() -> None:
+    """Require Linux process identity semantics for autonomous MCP control.
+
+    :raises CatalogError: If the host cannot provide Linux ``/proc`` process
+        start times used to prevent PID-reuse mistakes during cancellation and
+        crash recovery.
+    """
+    if not sys.platform.startswith("linux"):
+        raise CatalogError(
+            "the phasesweep MCP server is supported only on Linux because safe "
+            "cancellation and crash recovery require /proc process identities",
+            suggestion="run the MCP server on Linux; the core phasesweep CLI remains POSIX-oriented",
+        )
+    if read_proc_starttime(os.getpid()) is None:
+        raise CatalogError(
+            "the phasesweep MCP server cannot read this process's Linux /proc start time, "
+            "which is required for PID-reuse-safe cancellation and crash recovery",
+            suggestion="mount /proc with process stat access for the MCP server process",
+        )
 
 
 class _CatalogModel(BaseModel):
@@ -59,7 +89,7 @@ class _Entry(_CatalogModel):
         default=None,
         description="Directory used as the detached runner working directory.",
     )
-    description: str = ""
+    description: str = Field(default="", max_length=500)
     allow: _Allow = Field(default_factory=_Allow)
     visible_params: VisibleParamsPolicy = Field(
         default="none",
@@ -85,7 +115,11 @@ class _Entry(_CatalogModel):
     @field_validator("visible_params")
     @classmethod
     def _valid_visible_params(cls, value: VisibleParamsPolicy) -> VisibleParamsPolicy:
-        """Validate sampled-parameter visibility policy."""
+        """Validate and normalize a sampled-parameter visibility policy.
+
+        :param VisibleParamsPolicy value: Policy string or parameter-name allowlist.
+        :return VisibleParamsPolicy: A valid policy string or deduplicated, stripped allowlist.
+        """
         if isinstance(value, str):
             if value not in {"none", "all"}:
                 raise ValueError("visible_params must be 'none', 'all', or a list of keys")
@@ -134,6 +168,24 @@ class RegisteredExperiment:
         """
         return [phase.name for phase in self.experiment.phases]
 
+    @property
+    def metric_payload(self) -> dict[str, Any]:
+        """Return the agent-visible optimization metric descriptor."""
+        return {
+            "name": self.experiment.metric.name,
+            "goal": self.experiment.metric.goal,
+            "objective_evidence": objective_evidence_assurance(self.experiment.metric.extractor),
+        }
+
+    @property
+    def capabilities(self) -> dict[str, bool]:
+        """Return the agent-visible catalog permissions for this experiment."""
+        return {
+            "launch": self.allow_launch,
+            "cancel": self.allow_cancel,
+            "resume_from_phase": self.allow_from_phase,
+        }
+
 
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
     """Resolve an operator path relative to the catalog file when not absolute.
@@ -149,24 +201,85 @@ def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
 
 
 def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
-    """Resolve an operator path and require that it names an existing directory."""
+    """Resolve an operator path and require that it names an existing directory.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored directory path.
+    :param str label: Operator-facing name for the path in validation errors.
+    :return Path: Absolute, resolved existing directory path.
+    :raises CatalogError: If the resolved path is not an existing directory.
+    """
     resolved = _resolve_catalog_relative_path(base, path)
     if not resolved.is_dir():
         raise CatalogError(f"{label} is not an existing directory: {resolved}")
     return resolved
 
 
-def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> None:
+def _prepare_state_dir(base: Path, path: Path) -> Path:
+    """Resolve and initialize the run-store directories used at server startup.
+
+    :param Path base: Directory containing the catalog file.
+    :param Path path: Operator-authored ``state_dir`` path.
+    :return Path: Absolute initialized state directory.
+    :raises CatalogError: If the run store cannot create or secure its directories.
+    """
+    resolved = _resolve_catalog_relative_path(base, path)
+    try:
+        RunStore(resolved)
+        for directory in (resolved, resolved / "runs", resolved / "logs"):
+            with tempfile.NamedTemporaryFile(dir=directory):
+                pass
+    except (OSError, UnsafePrivatePathError) as exc:
+        raise CatalogError(
+            f"state_dir is not usable: {resolved}: {exc}",
+            suggestion=_state_dir_remediation(resolved),
+        ) from exc
+    return resolved
+
+
+def _state_dir_remediation(state_dir: Path) -> str:
+    """Return an exact mode fix when an existing private directory is repairable.
+
+    Checks ``state_dir`` and its ``runs``/``logs`` subdirectories for one this
+    process owns whose mode is not ``0700``, and if found, suggests the exact
+    ``chmod`` command to fix it. Falls back to a generic suggestion when none
+    of those directories exist, none are owned by this process, or the
+    problem is something other than permissions (e.g. a file or symlink in
+    place of a directory).
+
+    :param Path state_dir: Operator-configured MCP state directory root.
+    :return str: Operator-facing suggestion for ``phasesweep mcp check``.
+    """
+    for directory in (state_dir, state_dir / "runs", state_dir / "logs"):
+        try:
+            info = os.stat(directory, follow_symlinks=False)
+        except OSError:
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and mode != 0o700:
+            return (
+                f"run chmod 700 {shlex.quote(str(directory))}, then retry "
+                f"(found uid {info.st_uid} and mode {mode:04o})"
+            )
+    return "set state_dir to a writable directory path (owner-only; not a file or symlink)"
+
+
+def _require_mcp_stable_paths(
+    experiment_id: str, experiment: Experiment, *, config_dir: Path
+) -> None:
     """Reject MCP configs whose filesystem targets depend on server CWD.
 
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
+    :param Path config_dir: Directory of the experiment config, used to compute
+        concrete fix suggestions for ``phasesweep mcp check``.
     """
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
         raise CatalogError(
-            f"{experiment_id!r}: MCP experiments require persistent storage; "
-            "in-memory storage cannot be monitored or resumed across processes"
+            f"{experiment_id!r}: storage must be persistent; "
+            "in-memory storage cannot be monitored or resumed across processes",
+            suggestion=_suggest_storage(config_dir),
         )
 
     workdir = Path(experiment.workdir).expanduser()
@@ -174,7 +287,8 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use an absolute workdir; "
             "relative workdir values depend on the server launch directory and "
-            "break restart/recovery semantics"
+            "break restart/recovery semantics",
+            suggestion=f"set workdir to an absolute path, e.g. {(config_dir / workdir).resolve()}",
         )
 
     backend = storage_backend(storage)
@@ -182,7 +296,8 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments currently support only local-node "
             "SQLite or JournalStorage file-backed Optuna storage; external RDB "
-            "storage is out of scope until multi-host cleanup semantics are supported"
+            "storage is out of scope until multi-host cleanup semantics are supported",
+            suggestion=_suggest_storage(config_dir),
         )
     raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
     raw_path = file_url_path(storage) if raw_path is None else raw_path
@@ -190,14 +305,160 @@ def _require_mcp_stable_paths(experiment_id: str, experiment: Experiment) -> Non
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use a non-empty absolute "
             f"{backend} storage path; empty file-backed storage URLs cannot be "
-            "monitored across detached processes"
+            "monitored across detached processes",
+            suggestion=_suggest_storage(config_dir),
         )
     if not Path(raw_path).expanduser().is_absolute():
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
             "storage path; relative storage URLs depend on the server launch "
-            "directory and can point at a different Optuna study after restart"
+            "directory and can point at a different Optuna study after restart",
+            suggestion=f"use an absolute path, e.g. {(config_dir / raw_path).resolve()}",
         )
+
+
+def _suggest_storage(config_dir: Path) -> str:
+    """Suggest a valid MCP storage URL near the config.
+
+    :param Path config_dir: Directory of the experiment config.
+    :return str: Operator-facing suggestion for ``phasesweep mcp check``.
+    """
+    return f"use a persistent local URL, e.g. storage: sqlite:///{config_dir / 'optuna.db'}"
+
+
+def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
+    """Read and schema-validate a catalog document.
+
+    :param Path catalog_path: Path to the operator-authored catalog YAML.
+    :return tuple[_Catalog, Path]: Parsed catalog and its base directory for
+        resolving relative entry paths.
+    """
+    try:
+        raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
+    try:
+        catalog = _Catalog.model_validate(raw)
+    except ValidationError as exc:
+        raise CatalogError(f"catalog {catalog_path}: {exc}") from exc
+    return catalog, catalog_path.resolve().parent
+
+
+def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
+    """Validate one catalog entry with the exact rules server startup applies.
+
+    :param Path base: Directory containing the catalog file.
+    :param _Entry entry: Schema-validated catalog entry to load.
+    :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
+    """
+    cfg_path = _resolve_catalog_relative_path(base, entry.config)
+    if not cfg_path.is_file():
+        raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
+    cwd = _resolve_existing_dir(
+        base,
+        entry.cwd if entry.cwd is not None else cfg_path.parent,
+        label=f"{entry.id!r}: cwd",
+    )
+    try:
+        config_bytes = cfg_path.read_bytes()
+        config = load_config_bytes(config_bytes, source=cfg_path)
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
+    if isinstance(config, Suite):
+        raise CatalogError(
+            f"{entry.id!r}: suite configs are not supported by the MCP layer "
+            "in this version; register single-experiment configs"
+        )
+    _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    return RegisteredExperiment(
+        id=entry.id,
+        config_path=cfg_path,
+        cwd=cwd,
+        config_sha256=config_sha256,
+        experiment=config,
+        description=entry.description,
+        allow_launch=entry.allow.launch,
+        allow_cancel=entry.allow.cancel,
+        allow_from_phase=entry.allow.from_phase,
+        visible_params=entry.visible_params,
+    )
+
+
+@dataclass(frozen=True)
+class CatalogCheckEntry:
+    """Operator-facing validation verdict for one catalog entry."""
+
+    experiment_id: str
+    error: str | None = None
+    suggestion: str | None = None
+    actions: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Whether the entry would load at server startup.
+
+        :return bool: True when the entry passed every validation rule.
+        """
+        return self.error is None
+
+
+@dataclass(frozen=True)
+class CatalogCheckReport:
+    """Operator-facing validation verdicts for a whole catalog."""
+
+    entries: tuple[CatalogCheckEntry, ...]
+
+    @property
+    def ok(self) -> bool:
+        """Whether the whole catalog would load at server startup.
+
+        :return bool: True when every entry passed validation.
+        """
+        return all(entry.ok for entry in self.entries)
+
+
+def check_catalog(catalog_path: Path) -> CatalogCheckReport:
+    """Validate every catalog entry, collecting per-entry verdicts.
+
+    Runs the same validation as :meth:`Registry.load` (shared per-entry code
+    path) but does not stop at the first failure, so ``phasesweep mcp check``
+    can report a full ok/FAIL table. Once every entry passes, it also runs the
+    exact state-directory provisioning and write probe used at server startup.
+    Catalog-level problems (unreadable file, schema errors, or unusable state)
+    still raise :class:`CatalogError`.
+
+    :param Path catalog_path: Path to the operator-authored catalog YAML.
+    :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
+    """
+    _require_linux_mcp_host()
+    catalog, base = _parse_catalog(catalog_path)
+    seen: set[str] = set()
+    entries: list[CatalogCheckEntry] = []
+    for entry in catalog.experiments:
+        if entry.id in seen:
+            entries.append(CatalogCheckEntry(entry.id, error=f"duplicate catalog id {entry.id!r}"))
+            continue
+        seen.add(entry.id)
+        try:
+            registered = _load_entry(base, entry)
+        except CatalogError as exc:
+            entries.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
+            continue
+        actions = tuple(
+            action
+            for action, allowed in (
+                ("launch", registered.allow_launch),
+                ("cancel", registered.allow_cancel),
+                ("from_phase", registered.allow_from_phase),
+            )
+            if allowed
+        )
+        entries.append(CatalogCheckEntry(entry.id, actions=actions))
+    report = CatalogCheckReport(entries=tuple(entries))
+    if report.ok:
+        _prepare_state_dir(base, catalog.state_dir)
+    return report
 
 
 class Registry:
@@ -236,59 +497,15 @@ class Registry:
             An immutable :class:`Registry`.
 
         """
-        try:
-            raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
-        except (OSError, ValueError, yaml.YAMLError) as exc:
-            raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
-        try:
-            catalog = _Catalog.model_validate(raw)
-        except ValidationError as exc:
-            raise CatalogError(f"catalog {catalog_path}: {exc}") from exc
-
-        base = catalog_path.resolve().parent
+        _require_linux_mcp_host()
+        catalog, base = _parse_catalog(catalog_path)
         items: dict[str, RegisteredExperiment] = {}
         for entry in catalog.experiments:
             if entry.id in items:
                 raise CatalogError(f"duplicate catalog id {entry.id!r}")
-            cfg_path = _resolve_catalog_relative_path(base, entry.config)
-            if not cfg_path.is_file():
-                raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
-            cwd = _resolve_existing_dir(
-                base,
-                entry.cwd if entry.cwd is not None else cfg_path.parent,
-                label=f"{entry.id!r}: cwd",
-            )
-            try:
-                config_bytes = cfg_path.read_bytes()
-                config = load_config_bytes(config_bytes, source=cfg_path)
-            except (ValueError, OSError, yaml.YAMLError) as exc:
-                raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
-            if isinstance(config, Suite):
-                raise CatalogError(
-                    f"{entry.id!r}: suite configs are not supported by the MCP layer "
-                    "in this version; register single-experiment configs"
-                )
-            if storage_is_in_memory(config.storage):
-                raise CatalogError(
-                    f"{entry.id!r}: storage must be persistent; in-memory studies "
-                    "cannot be monitored across processes"
-                )
-            _require_mcp_stable_paths(entry.id, config)
-            config_sha256 = hashlib.sha256(config_bytes).hexdigest()
-            items[entry.id] = RegisteredExperiment(
-                id=entry.id,
-                config_path=cfg_path,
-                cwd=cwd,
-                config_sha256=config_sha256,
-                experiment=config,
-                description=entry.description,
-                allow_launch=entry.allow.launch,
-                allow_cancel=entry.allow.cancel,
-                allow_from_phase=entry.allow.from_phase,
-                visible_params=entry.visible_params,
-            )
+            items[entry.id] = _load_entry(base, entry)
         return cls(
-            state_dir=_resolve_catalog_relative_path(base, catalog.state_dir),
+            state_dir=_prepare_state_dir(base, catalog.state_dir),
             items=items,
             max_concurrent_runs=catalog.max_concurrent_runs,
         )
@@ -314,10 +531,8 @@ class Registry:
                 "id": item.id,
                 "description": item.description,
                 "phases": item.phase_names,
-                "metric": {
-                    "name": item.experiment.metric.name,
-                    "goal": item.experiment.metric.goal,
-                },
+                "metric": item.metric_payload,
+                "capabilities": item.capabilities,
             }
             for item in self._items.values()
         ]

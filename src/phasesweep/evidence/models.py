@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from phasesweep.config.common import _Frozen, _validate_optional_bounds
 
@@ -74,6 +74,18 @@ class JsonExtractor(_TrialPathModel, _JsonKeyModel):
     key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
 
 
+class JsonEnvelopeExtractor(_TrialPathModel):
+    """Extract a scalar from a versioned, attempt-bound result envelope."""
+
+    type: Literal["json_envelope"]
+    path: str = Field(default="result.json", description="Path relative to trial_dir.")
+    objective_name: str = Field(min_length=1)
+    split: str = Field(min_length=1)
+    policy: str = Field(min_length=1)
+    checkpoint: str | None = Field(default=None, min_length=1)
+    expected_step: int | None = Field(default=None, ge=0)
+
+
 class LogRegexExtractor(_TrialPathModel):
     """Extract a scalar from a log file via regex with a named 'value' group."""
 
@@ -95,24 +107,131 @@ class LogRegexExtractor(_TrialPathModel):
 
 
 class WandbExtractor(_Frozen):
-    """Extract a scalar from a completed W&B run's summary."""
+    """Extract a scalar from this attempt's finished W&B run summary."""
 
     type: Literal["wandb"]
     entity: str
     project: str
-    run_name_template: str = Field(
-        default="{experiment}-{phase}-{trial_id}",
-        description=(
-            "Template the trial uses to name its W&B run. Available substitutions: "
-            "{experiment}, {phase}, {trial_id}, {run_name}."
-        ),
-    )
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
     poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=1.0)
 
 
-Extractor = JsonExtractor | LogRegexExtractor | WandbExtractor
+ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+Extractor = JsonExtractor | ObjectiveExtractor
+
+
+def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
+    """Describe which objective-evidence identities the extractor genuinely enforces.
+
+    Grounded in what ``phasesweep.evidence.evaluation._extract_json_envelope``
+    actually checks, not in the extractor's coarse type alone:
+
+    - ``objective_name``, ``split``, ``policy`` are required
+      :class:`JsonEnvelopeExtractor` fields (``min_length=1``) and are
+      unconditionally checked against the envelope's own reported
+      ``objective.name`` / ``objective.split`` / ``evaluation.policy``. They
+      are bound whenever the extractor kind is ``json_envelope`` at all.
+    - ``checkpoint`` and ``expected_step`` are *optional* extractor fields.
+      The envelope must always structurally report a non-empty checkpoint and
+      a non-negative step (or extraction fails), but that value is compared
+      against the configured value only when the config declares one
+      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``). Reporting
+      a coarse ``True`` regardless of whether either was declared overstates
+      what is actually enforced when they are left unset.
+    - ``log_regex`` and ``wandb`` extractors have no objective_name/split/
+      policy/checkpoint/expected_step concept at all, so every one of those
+      flags is ``False`` for them.
+    - A single coarse ``attempt_bound`` claim overstated weak extractors, so
+      it is split into three precise flags (review v0.5.15 / item C):
+
+      - ``attempt_location_scoped`` is ``True`` for every extractor kind:
+        each reads evidence from a location — a trial directory for
+        ``json_envelope``/``log_regex``, or a W&B run id for ``wandb`` —
+        that is uniquely scoped to this generation+attempt. Scoping alone is
+        weak: nothing in a ``log_regex`` file's *contents* identifies the
+        attempt that produced it, so a file misplaced or symlinked into the
+        wrong trial directory would be read as gospel.
+      - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
+        the envelope structurally echoes ``generation_id``/``attempt_id``/
+        ``overrides_sha256`` in its own body, and
+        ``_extract_json_envelope`` cross-checks those reported values
+        against the runtime's own identity before accepting the result.
+        ``log_regex`` has no identity fields to check at all, and ``wandb``
+        is keyed by run id rather than by any self-reported identity inside
+        the run summary, so both are ``False``.
+      - ``source_identity_keyed`` is ``True`` only for ``wandb``: the
+        evidence source itself — the W&B run — is addressed by the
+        immutable attempt identity (``WANDB_RUN_ID=attempt_id``) rather than
+        by filesystem location, so a wrong-attempt run cannot silently
+        appear at the right path the way a misplaced log file could.
+        ``json_envelope`` and ``log_regex`` read location-addressed files,
+        so this is ``False`` for both; the envelope's stronger guarantee is
+        already captured by ``attempt_identity_bound``.
+
+    :param ObjectiveExtractor extractor: Configured objective extractor to describe.
+    :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
+        plus per-field boolean flags describing exactly what the runtime
+        enforces. ``checkpoint_declared``/``expected_step_declared`` report
+        whether the config pinned a value; ``checkpoint_value_bound``/
+        ``expected_step_value_bound`` report whether the runtime actually
+        validates the envelope against that declared value (``True`` only
+        when the corresponding ``*_declared`` flag is also ``True``).
+    """
+    if isinstance(extractor, JsonEnvelopeExtractor):
+        checkpoint_declared = extractor.checkpoint is not None
+        expected_step_declared = extractor.expected_step is not None
+        return {
+            "kind": extractor.type,
+            "attempt_location_scoped": True,
+            "attempt_identity_bound": True,
+            "source_identity_keyed": False,
+            "objective_name_bound": True,
+            "split_bound": True,
+            "evaluation_policy_bound": True,
+            "checkpoint_declared": checkpoint_declared,
+            "checkpoint_value_bound": checkpoint_declared,
+            "expected_step_declared": expected_step_declared,
+            "expected_step_value_bound": expected_step_declared,
+        }
+    return {
+        "kind": extractor.type,
+        "attempt_location_scoped": True,
+        "attempt_identity_bound": False,
+        "source_identity_keyed": isinstance(extractor, WandbExtractor),
+        "objective_name_bound": False,
+        "split_bound": False,
+        "evaluation_policy_bound": False,
+        "checkpoint_declared": False,
+        "checkpoint_value_bound": False,
+        "expected_step_declared": False,
+        "expected_step_value_bound": False,
+    }
+
+
+class _ObjectiveEvidenceFields(BaseModel):
+    """Assurance-flag field set shared by MCP result payloads and persisted snapshots.
+
+    ``phasesweep.mcp.server.ObjectiveEvidencePayload`` and
+    ``phasesweep.mcp.snapshots.ObjectiveEvidenceSnapshot`` each subclass this
+    alongside their own strict base (``extra="forbid"``, and for snapshots also
+    ``allow_inf_nan=False``, inert here since every field below is a bool or
+    ``Literal``) so the identical field set is declared exactly once while each
+    site keeps its own class name and JSON schema entry. See
+    :func:`objective_evidence_assurance` for exactly what each flag means.
+    """
+
+    kind: Literal["json_envelope", "log_regex", "wandb"]
+    attempt_location_scoped: bool
+    attempt_identity_bound: bool
+    source_identity_keyed: bool
+    objective_name_bound: bool
+    split_bound: bool
+    evaluation_policy_bound: bool
+    checkpoint_declared: bool
+    checkpoint_value_bound: bool
+    expected_step_declared: bool
+    expected_step_value_bound: bool
 
 
 class RequiredFileGate(_TrialPathModel):
@@ -205,15 +324,14 @@ class Sha256Gate(_TrialPathModel):
 
 
 class WandbSummaryRequiredGate(_Frozen):
-    """Require keys to be present in a completed W&B run summary."""
+    """Require keys in this attempt's finished W&B run summary."""
 
     type: Literal["wandb_summary_required"]
     entity: str
     project: str
     keys: list[str] = Field(min_length=1)
-    run_name_template: str = "{experiment}-{phase}-{trial_id}"
     poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=0.0)
+    timeout_seconds: float = Field(default=120.0, ge=1.0)
 
 
 Gate = Annotated[

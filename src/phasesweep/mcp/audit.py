@@ -1,4 +1,4 @@
-"""Structured audit logging for MCP tool calls.
+"""Structured audit logging for state-changing MCP tool calls.
 
 Audit records are operator-facing JSON lines written under ``state_dir``. They
 intentionally log identifiers, counts, outcomes, and state transitions instead
@@ -23,7 +23,11 @@ MAX_AUDIT_STRING_LENGTH = 256
 
 
 def _compact_value(value: Any) -> Any:
-    """Return an audit-safe scalar with bounded string size."""
+    """Return an audit-safe scalar with bounded string size.
+
+    :param Any value: Scalar value to compact.
+    :return Any: The original value, or a truncated copy when it is an overlong string.
+    """
     if isinstance(value, str) and len(value) > MAX_AUDIT_STRING_LENGTH:
         return f"{value[: MAX_AUDIT_STRING_LENGTH - 3]}..."
     return value
@@ -42,7 +46,7 @@ def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
 
 @dataclass
 class AuditLogger:
-    """Append-only JSONL audit sink for MCP tool calls."""
+    """Append-only JSONL audit sink for MCP side effects."""
 
     path: Path
     actor: str = "local-stdio"

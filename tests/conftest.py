@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from phasesweep.config import (
     Constraint,
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -31,25 +32,57 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-wide test locks inside each test's temp directory."""
-    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "phasesweep-locks"))
+    lock_dir = tmp_path / "phasesweep-locks"
+    lock_dir.mkdir(mode=0o700)
+    lock_dir.chmod(0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_dir))
+
+
+@pytest.fixture(autouse=True)
+def isolate_signal_ownership_tokens() -> Iterator[None]:
+    """Snapshot and restore the process-lifetime signal-ownership tokens per test.
+
+    ``phasesweep.runtime.process._process_lifetime_owner`` and ``_scope_depth``
+    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
+    re-derived from OS ground truth the way the actual signal handlers are.
+    A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
+    in-process) would otherwise permanently flip ``_process_lifetime_owner``
+    for the rest of the pytest process, silently turning every later
+    ``signal_handler_scope()`` call into a no-op regardless of what OS-level
+    handlers that later test itself restores. This is a cheap attribute
+    save/restore, matching the existing convention in this suite of tests
+    manually restoring real signal handlers around themselves.
+    """
+    import phasesweep.runtime.process as process
+
+    prior_owner = process._process_lifetime_owner
+    prior_depth = process._scope_depth
+    try:
+        yield
+    finally:
+        process._process_lifetime_owner = prior_owner
+        process._scope_depth = prior_depth
 
 
 def copy_fake_train(tmp_path: Path) -> Path:
     trainer = tmp_path / "examples" / "fake_train.py"
     trainer.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(REPO / "examples" / "fake_train.py", trainer)
+    shutil.copy(REPO / "src" / "phasesweep" / "examples" / "fake_train.py", trainer)
     return trainer
 
 
 def make_experiment(
     *,
+    experiment: str = "t",
     workdir: str | Path | None = None,
     storage: str | None = None,
     trial_command: str = "echo {overrides}",
     override_format: str = "argparse",
+    metric: Metric | None = None,
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
+    provenance: dict[str, str] | None = None,
     **phase_overrides: Any,
 ) -> Experiment:
     """Build a minimal valid Experiment for testing.
@@ -68,16 +101,25 @@ def make_experiment(
         phases = [Phase(**base)]  # type: ignore[arg-type]
 
     kwargs: dict[str, Any] = dict(
-        experiment="t",
+        experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=metric
+        or Metric(
+            extractor=LogRegexExtractor(
+                type="log_regex",
+                pattern=r"x=(?P<value>[0-9.eE+-]+)",
+            )
+        ),
         phases=phases,
     )
     if workdir is not None:
         kwargs["workdir"] = str(workdir)
     if storage is not None:
         kwargs["storage"] = storage
+        kwargs["provenance"] = provenance or {"revision": "test-fixture-v1"}
+    elif provenance is not None:
+        kwargs["provenance"] = provenance
     if constraints is not None:
         kwargs["constraints"] = constraints
     if env is not None:
@@ -114,7 +156,7 @@ def write_trainer(path: Path, body: str) -> Path:
 
 
 def write_constant_trainer(tmp_path: Path) -> Path:
-    """Drop a minimal trainer that writes ``{"x": 0.5}`` to ``--out``.
+    """Drop a minimal trainer that writes and logs a constant objective.
 
     Cheap enough for tests that need a real subprocess run before mutating
     the parent config and re-running with ``--from-phase``.
@@ -130,6 +172,7 @@ def write_constant_trainer(tmp_path: Path) -> Path:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"x": 0.5}))
+        print("x=0.5")
         """,
     )
 
@@ -147,8 +190,11 @@ def make_trial_context(
         experiment=experiment,
         phase=phase,
         trial_id=trial_id,
+        generation_id="generation-test",
+        attempt_id="attempt-test",
+        overrides_sha256="a" * 64,
         trial_dir=tmp_path,
-        run_name=run_name or f"{experiment}-{phase}-{trial_id}",
+        run_name=run_name or f"{experiment}-{phase}-{trial_id}-attempt-test",
         return_code=0,
         duration_seconds=0.0,
     )

@@ -29,7 +29,7 @@ def _prep(tmp_path: Path) -> Path:
     runs_dir = tmp_path / "runs"
     text = text.replace("./runs/phases.db", str(runs_dir / "phases.db"))
     text = text.replace("./runs", str(runs_dir))
-    text = text.replace("examples/fake_train.py", str(trainer.resolve()))
+    text = text.replace("python -m phasesweep.examples.fake_train", f"python {trainer.resolve()}")
     yaml_path = tmp_path / "experiment.yaml"
     yaml_path.write_text(text)
     return yaml_path

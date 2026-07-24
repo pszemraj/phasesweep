@@ -4,18 +4,75 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import json
 import logging
-from collections.abc import Iterator
+import os
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import optuna
 import yaml
 
 from phasesweep.config import Experiment, Phase, Suite
-from phasesweep.runtime.files import atomic_text_writer
+from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+
+WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+
+
+@dataclass(frozen=True)
+class WinnerSource:
+    """Concrete trial that supplies an exposed winner."""
+
+    kind: WinnerSourceKind
+    phase: str
+    trial_number: int
+    generation_id: str | None
+    attempt_id: str | None
+    study: str | None = None
+
+
+def _parse_winner_source(
+    source_data: Mapping[str, Any], source_kind: WinnerSourceKind
+) -> WinnerSource:
+    """Reconstruct a persisted ``winner_source`` mapping into a :class:`WinnerSource`.
+
+    Shared by :func:`_load_winner` (state.py) and
+    :func:`phasesweep.engine.read.read_winner`, which differ only in what they
+    do when this raises: the former re-raises as a strict ``RuntimeError``, the
+    latter treats the winner as absent. Callers must validate ``source_kind``
+    against :data:`WinnerSourceKind` themselves before calling this, since each
+    site fails differently on an invalid kind.
+
+    :param Mapping[str, Any] source_data: Parsed ``winner_source`` block from a
+        persisted ``winner.yaml``.
+    :param WinnerSourceKind source_kind: The already-validated source kind.
+    :raises KeyError: A required field (``phase``, ``trial_number``) is missing.
+    :raises TypeError | ValueError: A field cannot be coerced to its expected type.
+    :return WinnerSource: The reconstructed source.
+    """
+    return WinnerSource(
+        kind=source_kind,
+        phase=str(source_data["phase"]),
+        trial_number=int(source_data["trial_number"]),
+        generation_id=(
+            str(source_data["generation_id"])
+            if isinstance(source_data.get("generation_id"), str) and source_data["generation_id"]
+            else None
+        ),
+        attempt_id=(
+            str(source_data["attempt_id"])
+            if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
+            else None
+        ),
+        study=(
+            str(source_data["study"])
+            if isinstance(source_data.get("study"), str) and source_data["study"]
+            else None
+        ),
+    )
 
 
 @dataclass
@@ -42,9 +99,18 @@ class Winner:
     completion: dict[str, Any] = field(default_factory=dict)
     promotion: dict[str, Any] | None = None
     phase_fingerprint: str | None = None
+    generation_id: str | None = None
+    attempt_id: str | None = None
+    source: WinnerSource | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
+GENERATION_ID_ATTR = "phasesweep_generation_id"
+ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
+PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
+STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
+STUDY_SCHEMA_VERSION = 1
+TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 RETURN_CODE_ATTR = "phasesweep_return_code"
@@ -102,15 +168,330 @@ def _run_log_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "run.log"
 
 
-def _trial_dir_for(experiment: Experiment, phase_name: str, trial_number: int) -> Path:
-    """Return the canonical per-trial directory.
+def _trial_dir_for(
+    experiment: Experiment,
+    phase_name: str,
+    trial_number: int,
+    *,
+    generation_id: str | None = None,
+    attempt_id: str | None = None,
+) -> Path:
+    """Return a trial directory, uniquely scoped when execution ids are supplied.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name containing the trial.
     :param int trial_number: Optuna trial number.
+    :param str | None generation_id: Current engine invocation id.
+    :param str | None attempt_id: Current subprocess attempt id.
     :return Path: Directory for the trial artifacts.
     """
-    return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
+    if generation_id is None and attempt_id is None:
+        return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
+    if generation_id is None or attempt_id is None:
+        raise ValueError("generation_id and attempt_id must be supplied together")
+    return _phase_dir(experiment, phase_name) / (
+        f"trial_{trial_number:05d}__generation_{generation_id}__attempt_{attempt_id}"
+    )
+
+
+def _generation_path(experiment: Experiment) -> Path:
+    """Return the current engine generation metadata path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the current generation YAML file.
+    """
+    return _experiment_dir(experiment) / "generation.yaml"
+
+
+def _generations_dir(experiment: Experiment) -> Path:
+    """Return the immutable generation-record root for an experiment.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Directory containing all immutable per-generation namespaces.
+    """
+    return _experiment_dir(experiment) / "generations"
+
+
+def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's immutable artifact namespace.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Directory scoped to the given generation.
+    """
+    return _generations_dir(experiment) / generation_id
+
+
+def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's lifecycle record path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's lifecycle record YAML file.
+    """
+    return _generation_dir(experiment, generation_id) / "generation.yaml"
+
+
+def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's summary path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's summary YAML file.
+    """
+    return _generation_dir(experiment, generation_id) / "summary.yaml"
+
+
+def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
+    """Return one generation's phase-winner path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :param str phase_name: Phase name whose generation-scoped winner path is requested.
+    :return Path: Path to the phase's winner YAML file within the generation namespace.
+    """
+    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "winner.yaml"
+
+
+def _generation_promotion_decision_path(
+    experiment: Experiment, generation_id: str, phase_name: str
+) -> Path:
+    """Return one generation's phase-promotion path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :param str phase_name: Phase name whose generation-scoped promotion path is requested.
+    :return Path: Path to the phase's promotion-decision YAML file within the
+        generation namespace.
+    """
+    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "promotion.yaml"
+
+
+def _last_successful_generation_path(experiment: Experiment) -> Path:
+    """Return the pointer to the last fully published generation.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Path to the YAML file recording the last-successful generation id.
+    """
+    return _experiment_dir(experiment) / "last_successful_generation.yaml"
+
+
+def _read_pointer_target(
+    pointer_path: Path,
+    *,
+    id_key: str,
+    owner_key: str,
+    owner_name: str,
+) -> str | None:
+    """Read one last-success pointer's target id, validating the pointer itself.
+
+    :param Path pointer_path: Pointer YAML file to read.
+    :param str id_key: Payload key holding the target generation id.
+    :param str owner_key: Payload key naming the owning experiment or suite.
+    :param str owner_name: Expected owner name the pointer must record.
+    :return str | None: A safe-name target id owned by ``owner_name``, or
+        ``None`` when the pointer is missing, unreadable, malformed, names
+        another owner, or carries an unsafe id.
+    """
+    try:
+        payload = yaml.safe_load(pointer_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(payload, dict) or payload.get(owner_key) != owner_name:
+        return None
+    target_id = payload.get(id_key)
+    if not isinstance(target_id, str) or not SAFE_NAME_PATTERN.fullmatch(target_id):
+        return None
+    return target_id
+
+
+def _pointer_target_artifacts_are_published(
+    summary_path: Path,
+    *,
+    id_key: str,
+    target_id: str,
+    owner_key: str,
+    owner_name: str,
+) -> bool:
+    """Return whether a generation's own immutable summary confirms its identity.
+
+    Replaces the old record-state check (``_record_is_complete``): the
+    per-generation lifecycle record is now informational and written *after*
+    the last-success pointer commit (review v0.5.15 / blocker 3), so requiring
+    ``state == "complete"``/``"published"`` on it would create a crash window
+    where a just-committed publication reads back as nothing-published. This
+    instead fails closed on the pointer target's own immutable *artifacts*:
+    the generation's summary must parse as a mapping naming this exact owner
+    and id. This is a crash-consistency check for a single-host,
+    operator-trusted workdir -- no hashes are computed, so a deliberate
+    content edit is out of scope; it only catches a torn or missing write.
+
+    :param Path summary_path: Immutable generation summary YAML file to read.
+    :param str id_key: Summary key holding the generation id.
+    :param str target_id: Generation id the summary must name.
+    :param str owner_key: Summary key naming the owning experiment or suite.
+    :param str owner_name: Expected owner name the summary must carry.
+    :return bool: ``True`` only for a readable summary whose owner and id both match.
+    """
+    try:
+        summary = yaml.safe_load(summary_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return False
+    return (
+        isinstance(summary, dict)
+        and summary.get(owner_key) == owner_name
+        and summary.get(id_key) == target_id
+    )
+
+
+def _last_successful_generation_id(experiment: Experiment) -> str | None:
+    """Read and validate the last-success pointer, failing closed on mismatch.
+
+    The pointer is authoritative only when its target's own immutable summary
+    parses and names this exact experiment and generation (review v0.5.15 /
+    blocker 3) -- not when the per-generation lifecycle record says so, since
+    that record is now written *after* this pointer commits and would
+    otherwise create a crash window where a committed publication reads as
+    nothing-published. A malformed, tampered, or missing target is treated as
+    "nothing published" rather than trusted for path construction or result
+    reads.
+
+    Deliberately read-side-cheap: this checks only the generation's summary,
+    never its per-phase winner files. Per-phase winner identity is instead a
+    *pre-commit-only* check (see :func:`phasesweep.engine.run._validate_generation_publishable`,
+    item A) that runs once, at publication time -- re-parsing every phase's
+    winner file on every status/pointer read would multiply that cost across
+    every caller for a check that a generation's own publication has already made.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return str | None: The last-successful generation id, or ``None`` if the
+        pointer or its target summary is missing, unreadable, malformed,
+        unsafely named, or owned by another experiment.
+    """
+    generation_id = _read_pointer_target(
+        _last_successful_generation_path(experiment),
+        id_key="generation_id",
+        owner_key="experiment",
+        owner_name=experiment.experiment,
+    )
+    if generation_id is None:
+        return None
+    if not _pointer_target_artifacts_are_published(
+        _generation_summary_path(experiment, generation_id),
+        id_key="generation_id",
+        target_id=generation_id,
+        owner_key="experiment",
+        owner_name=experiment.experiment,
+    ):
+        return None
+    return generation_id
+
+
+def _published_winner_path_for(
+    experiment: Experiment,
+    published_generation_id: str | None,
+    phase_name: str,
+) -> Path | None:
+    """Resolve the authoritative winner path from an already-captured published id.
+
+    Same legacy-fallback semantics as :func:`_published_winner_path`, but
+    takes the caller's already-resolved last-success id instead of re-reading
+    the pointer, so one status read that scopes several phases (or several
+    fields) from a single captured id can never mix identities from two
+    different pointer resolutions (review v0.5.15 / blocker 3).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str | None published_generation_id: Already-resolved
+        :func:`_last_successful_generation_id` result (or ``None``).
+    :param str phase_name: Phase name whose published winner path is requested.
+    :return Path | None: The generation-scoped winner path when
+        ``published_generation_id`` is given; the legacy compatibility winner
+        path when no generation has ever been published; ``None`` when a
+        generation exists but none has completed successfully yet.
+    """
+    if published_generation_id is not None:
+        return _generation_winner_path(experiment, published_generation_id, phase_name)
+    if _generation_path(experiment).is_file():
+        return None
+    return _winner_path(experiment, phase_name)
+
+
+def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | None:
+    """Return the authoritative last-success winner, with legacy fallback.
+
+    Compatibility projections are used only for layouts that predate generation
+    metadata. Once a generation has been published as current, the absence of a
+    last-success pointer means no result has been published yet; a partially
+    copied compatibility file must not become authoritative.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose published winner path is requested.
+    :return Path | None: The generation-scoped winner path when a last-success
+        pointer exists; the legacy compatibility winner path when no generation
+        has ever been published; ``None`` when a generation exists but none has
+        completed successfully yet.
+    """
+    return _published_winner_path_for(
+        experiment, _last_successful_generation_id(experiment), phase_name
+    )
+
+
+def _published_summary_path_for(
+    experiment: Experiment,
+    published_generation_id: str | None,
+) -> Path | None:
+    """Resolve the authoritative summary path from an already-captured published id.
+
+    Same legacy-fallback semantics as :func:`_published_summary_path`, but
+    takes the caller's already-resolved last-success id instead of re-reading
+    the pointer (review v0.5.15 / blocker 3).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str | None published_generation_id: Already-resolved
+        :func:`_last_successful_generation_id` result (or ``None``).
+    :return Path | None: The generation-scoped summary path when
+        ``published_generation_id`` is given; the legacy compatibility summary
+        path when no generation has ever been published; ``None`` when a
+        generation exists but none has completed successfully yet.
+    """
+    if published_generation_id is not None:
+        return _generation_summary_path(experiment, published_generation_id)
+    if _generation_path(experiment).is_file():
+        return None
+    return _summary_path(experiment)
+
+
+def _published_summary_path(experiment: Experiment) -> Path | None:
+    """Return the authoritative last-success summary, with legacy fallback.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path | None: The generation-scoped summary path when a last-success
+        pointer exists; the legacy compatibility summary path when no
+        generation has ever been published; ``None`` when a generation exists
+        but none has completed successfully yet.
+    """
+    return _published_summary_path_for(experiment, _last_successful_generation_id(experiment))
+
+
+def _published_promotion_decision_path(
+    experiment: Experiment,
+    phase_name: str,
+) -> Path | None:
+    """Return the authoritative last-success promotion decision, with legacy fallback.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str phase_name: Phase name whose published promotion-decision path is requested.
+    :return Path | None: The generation-scoped promotion-decision path when a
+        last-success pointer exists; the legacy compatibility path when no
+        generation has ever been published; ``None`` when a generation exists
+        but none has completed successfully yet.
+    """
+    generation_id = _last_successful_generation_id(experiment)
+    if generation_id is not None:
+        return _generation_promotion_decision_path(experiment, generation_id, phase_name)
+    if _generation_path(experiment).is_file():
+        return None
+    return _promotion_decision_path(experiment, phase_name)
 
 
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
@@ -152,6 +533,112 @@ def _suite_summary_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "suite_summary.yaml"
 
 
+def _suite_generation_path(suite: Suite) -> Path:
+    """Return the current suite-generation lifecycle path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the current suite-generation lifecycle YAML file.
+    """
+    return _suite_dir(suite) / "suite_generation.yaml"
+
+
+def _suite_generations_dir(suite: Suite) -> Path:
+    """Return the immutable suite-generation root.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Directory containing all immutable per-suite-generation namespaces.
+    """
+    return _suite_dir(suite) / "suite_generations"
+
+
+def _suite_generation_dir(suite: Suite, generation_id: str) -> Path:
+    """Return one immutable suite-generation directory.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Directory scoped to the given suite generation.
+    """
+    return _suite_generations_dir(suite) / generation_id
+
+
+def _suite_generation_record_path(suite: Suite, generation_id: str) -> Path:
+    """Return one suite generation's lifecycle record path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Path to the suite generation's lifecycle record YAML file.
+    """
+    return _suite_generation_dir(suite, generation_id) / "generation.yaml"
+
+
+def _suite_generation_summary_path(suite: Suite, generation_id: str) -> Path:
+    """Return one suite generation's immutable summary path.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str generation_id: Immutable suite-generation namespace identifier.
+    :return Path: Path to the suite generation's summary YAML file.
+    """
+    return _suite_generation_dir(suite, generation_id) / "summary.yaml"
+
+
+def _last_successful_suite_generation_path(suite: Suite) -> Path:
+    """Return the pointer to the last fully published suite generation.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path: Path to the YAML file recording the last-successful suite generation id.
+    """
+    return _suite_dir(suite) / "last_successful_suite_generation.yaml"
+
+
+def _last_successful_suite_generation_id(suite: Suite) -> str | None:
+    """Read and validate the suite last-success pointer, failing closed on mismatch.
+
+    Applies the same artifact-validating protocol as
+    :func:`_last_successful_generation_id`: the pointer is authoritative only
+    when its target's own immutable summary parses and names this exact suite
+    and suite generation (review v0.5.15 / blocker 3), not when the
+    per-suite-generation lifecycle record says so.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return str | None: The last-successful suite generation id, or ``None``
+        when the pointer or its target summary fails validation.
+    """
+    generation_id = _read_pointer_target(
+        _last_successful_suite_generation_path(suite),
+        id_key="suite_generation_id",
+        owner_key="suite",
+        owner_name=suite.suite,
+    )
+    if generation_id is None:
+        return None
+    if not _pointer_target_artifacts_are_published(
+        _suite_generation_summary_path(suite, generation_id),
+        id_key="suite_generation_id",
+        target_id=generation_id,
+        owner_key="suite",
+        owner_name=suite.suite,
+    ):
+        return None
+    return generation_id
+
+
+def _published_suite_summary_path(suite: Suite) -> Path | None:
+    """Return the authoritative last-success suite summary, with legacy fallback.
+
+    :param Suite suite: Suite config with artifact root details.
+    :return Path | None: The generation-scoped suite summary path when a
+        validated last-success pointer exists; the legacy compatibility summary
+        path when no suite generation has ever been published; ``None`` when a
+        suite generation exists but none has completed successfully yet.
+    """
+    generation_id = _last_successful_suite_generation_id(suite)
+    if generation_id is not None:
+        return _suite_generation_summary_path(suite, generation_id)
+    if _suite_generation_path(suite).is_file():
+        return None
+    return _suite_summary_path(suite)
+
+
 def _suite_log_path(suite: Suite) -> Path:
     """Path to a suite-level run log.
 
@@ -169,6 +656,45 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     """
     with atomic_text_writer(path) as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
+    """Create a YAML document at ``path`` exactly once, never overwriting it.
+
+    Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
+    pointers), this is the create-exclusive primitive backing truly immutable
+    per-generation lifecycle records (review v0.5.15 / blocker 3): the file is
+    opened with ``O_CREAT | O_EXCL`` so a second call for an already-written
+    path can never clobber the first write, even a same-content rewrite. This
+    is a plain create-once-and-fsync, not a full atomic-rename dance like
+    :func:`atomic_text_writer` -- there is nothing to make atomic against a
+    concurrent *reader* here, only against a second *writer*, and ``O_EXCL``
+    already rules that out.
+
+    :param Path path: Destination path to create; the parent directory is
+        created if missing.
+    :param Any payload: YAML-serializable value to write.
+    :return bool: ``True`` when this call created and wrote the file;
+        ``False`` when the destination already existed and nothing was
+        written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(payload, sort_keys=False)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+    return True
 
 
 @contextlib.contextmanager
@@ -198,17 +724,6 @@ def _file_log_handler(path: Path) -> Iterator[None]:
         logger.removeHandler(handler)
         handler.close()
         logger.setLevel(old_level)
-
-
-@contextlib.contextmanager
-def _run_log_handler(experiment: Experiment) -> Iterator[None]:
-    """Attach a durable file handler for one experiment run.
-
-    :param Experiment experiment: Experiment config whose run log is used.
-    :return Iterator[None]: Context manager for the experiment run log handler.
-    """
-    with _file_log_handler(_run_log_path(experiment)):
-        yield
 
 
 def _write_trials_csv(study: optuna.Study, path: Path) -> None:
@@ -252,32 +767,14 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
             writer.writerow(row)
 
 
-def _trial_gate_payload(study: optuna.Study, trial_number: int) -> list[dict[str, Any]]:
-    """Load persisted gate result payload for a selected trial.
-
-    :param optuna.Study study: Study containing the selected trial.
-    :param int trial_number: Trial number whose gate payload should be loaded.
-    :return list[dict[str, Any]]: Valid gate result dictionaries, or an empty
-        list when missing or malformed.
-    """
-    for trial in study.get_trials(deepcopy=False):
-        if trial.number != trial_number:
-            continue
-        raw = trial.user_attrs.get(GATES_ATTR)
-        if not isinstance(raw, str) or not raw:
-            return []
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(data, list):
-            return []
-        return [item for item in data if isinstance(item, dict)]
-    return []
-
-
-def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> None:
-    """Persist a phase winner.
+def _save_winner(
+    experiment: Experiment,
+    phase_name: str,
+    winner: Winner,
+    *,
+    generation_id: str,
+) -> None:
+    """Persist a phase winner into its immutable generation namespace.
 
     The phase fingerprint is included so ``_load_winner`` can refuse stale
     winners on ``--from-phase`` resume (review v0.5.6 / blocker 3). Real
@@ -288,24 +785,13 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         experiment: Parsed experiment config; supplies the metric name used
             in the persisted payload.
         phase_name: Name of the phase whose winner is being saved.
-        winner: The winning trial. Must have ``phase_fingerprint`` set.
-
-    Raises:
-        RuntimeError: ``winner.phase_fingerprint`` is ``None``. This is an
-            internal invariant; placeholder winners must not reach this path.
+        winner: The winning trial.
+        generation_id: Immutable generation namespace to write into. The
+            legacy compatibility projection is produced separately by
+            :func:`_copy_yaml_projection` once a generation is published.
 
     """
-    if winner.phase_fingerprint is None:
-        # Defense in depth: should not happen — _run_phase always sets
-        # this before calling _save_winner. Failing loudly here prevents a
-        # silently un-resumable winner from landing on disk.
-        raise RuntimeError(
-            f"Refusing to save winner for phase {phase_name!r} without a "
-            "phase_fingerprint. This is an internal invariant — please file "
-            "a bug."
-        )
-
-    path = _winner_path(experiment, phase_name)
+    path = _generation_winner_path(experiment, generation_id, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "phase": phase_name,
@@ -317,24 +803,60 @@ def _save_winner(experiment: Experiment, phase_name: str, winner: Winner) -> Non
         "gates": winner.gates,
         "completion": winner.completion,
         "phase_fingerprint": winner.phase_fingerprint,
+        "generation_id": winner.generation_id,
+        "attempt_id": winner.attempt_id,
+        "winner_source": _winner_source_payload(winner, phase_name),
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
     _write_yaml_atomic(path, payload)
 
 
+def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+    """Serialize the concrete source trial for an exposed winner.
+
+    :param Winner winner: Winner whose recorded ``source`` is serialized; when
+        unset, a ``phase_trial`` source is synthesized from the winner's own fields.
+    :param str phase_name: Phase name used to synthesize a fallback source when
+        ``winner.source`` is unset.
+    :return dict[str, Any]: JSON-serializable winner-source payload with
+        ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
+        and ``study`` keys.
+    """
+    source = winner.source or WinnerSource(
+        kind="phase_trial",
+        phase=phase_name,
+        trial_number=winner.trial_number,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+    )
+    return {
+        "kind": source.kind,
+        "phase": source.phase,
+        "trial_number": source.trial_number,
+        "generation_id": source.generation_id,
+        "attempt_id": source.attempt_id,
+        "study": source.study,
+    }
+
+
 def _save_promotion_decision(
     experiment: Experiment,
     phase_name: str,
     decision: dict[str, Any],
+    *,
+    generation_id: str,
 ) -> None:
-    """Persist a phase promotion decision independently of exposed winner state.
+    """Persist a phase promotion decision into its immutable generation namespace.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name whose promotion decision is being saved.
     :param dict[str, Any] decision: Promotion decision payload to persist.
+    :param str generation_id: Immutable generation namespace to write into. The
+        legacy compatibility projection is produced separately by
+        :func:`_copy_yaml_projection` once a generation is published.
     """
-    path = _promotion_decision_path(experiment, phase_name)
+    path = _generation_promotion_decision_path(experiment, generation_id, phase_name)
     _write_yaml_atomic(path, decision)
 
 
@@ -370,7 +892,11 @@ def _load_winner(
             fingerprint disagrees with the freshly computed one.
 
     """
-    path = _winner_path(experiment, phase.name)
+    path = _published_winner_path(experiment, phase.name)
+    if path is None:
+        raise FileNotFoundError(
+            f"Winner file missing for phase {phase.name!r}: no generation has completed."
+        )
     if not path.is_file():
         raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
 
@@ -401,7 +927,7 @@ def _load_winner(
         )
 
     if stored_fp != current_fp:
-        raise RuntimeError(
+        raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
             f"(stored fingerprint {stored_fp[:16]}... != current "
             f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "
@@ -420,8 +946,27 @@ def _load_winner(
             f"use it for skipped phase {phase.name!r} unless the current config "
             "sets allow_incomplete_on_timeout: true."
         )
+    generation_id = data.get("generation_id")
+    attempt_id = data.get("attempt_id")
+    if not isinstance(generation_id, str) or not generation_id:
+        raise RuntimeError(
+            f"Winner file {path} has no valid generation_id; refusing unscoped evidence."
+        )
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise RuntimeError(
+            f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
+        )
+    source_data = data.get("winner_source")
+    if not isinstance(source_data, dict):
+        raise RuntimeError(
+            f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
+        )
+    source_kind = source_data.get("kind")
+    if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+        raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
 
     try:
+        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
         return Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
@@ -432,6 +977,9 @@ def _load_winner(
             completion=dict(completion),
             promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
             phase_fingerprint=str(stored_fp),
+            generation_id=generation_id,
+            attempt_id=attempt_id,
+            source=source,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(

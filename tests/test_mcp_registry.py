@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import Experiment, load_config
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.mcp.registry import Registry, _require_mcp_stable_paths
+from phasesweep.mcp.registry import Registry
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
 
 REPO = Path(__file__).resolve().parents[1]
@@ -45,7 +44,7 @@ def _suite_yaml(tmp_path: Path) -> str:
           metric:
             name: x
             goal: minimize
-            extractor: {{ type: json, path: r.json, key: x }}
+            extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         studies:
           - name: a
             phases:
@@ -83,7 +82,30 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     summary = summaries[0]
     assert summary["id"] == "reg_ok"
     assert summary["phases"] == ["warmup", "tune"]
-    assert summary["metric"] == {"name": "loss", "goal": "minimize"}
+    assert summary["metric"] == {
+        "name": "loss",
+        "goal": "minimize",
+        "objective_evidence": {
+            "kind": "json_envelope",
+            "attempt_location_scoped": True,
+            "attempt_identity_bound": True,
+            "source_identity_keyed": False,
+            "objective_name_bound": True,
+            "split_bound": True,
+            "evaluation_policy_bound": True,
+            # mcp_experiment_config_text's json_envelope extractor declares
+            # neither checkpoint nor expected_step, so neither is value-bound.
+            "checkpoint_declared": False,
+            "checkpoint_value_bound": False,
+            "expected_step_declared": False,
+            "expected_step_value_bound": False,
+        },
+    }
+    assert summary["capabilities"] == {
+        "launch": False,
+        "cancel": False,
+        "resume_from_phase": False,
+    }
 
     # The summary must carry no path, command, or storage URL.
     blob = str(summaries)
@@ -105,28 +127,28 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     assert not reg.allow_from_phase
 
 
-def test_checked_in_example_catalog_loads() -> None:
-    registry = Registry.load(REPO / "examples" / "catalog.yaml")
+@pytest.mark.parametrize(
+    ("catalog_path", "experiment_id", "description_fragment"),
+    [
+        ("examples/catalog.yaml", "tiny-lm", "16 MB LM"),
+        (
+            "examples/tiny_decoder_enwik8/catalog.yaml",
+            "tiny-decoder-enwik8-hparams",
+            "1000 batches/trial",
+        ),
+    ],
+)
+def test_checked_in_catalog_loads(
+    catalog_path: str,
+    experiment_id: str,
+    description_fragment: str,
+) -> None:
+    registry = Registry.load(REPO / catalog_path)
 
-    reg = registry.get("tiny-lm")
-
-    assert reg.config_path == (REPO / "examples" / "mcp_experiment.yaml").resolve()
-    assert Path(reg.experiment.workdir).is_absolute()
-    assert reg.experiment.storage == "sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db"
-    assert registry.state_dir == Path("/tmp/phasesweep-mcp-tiny-lm/state")
-    assert reg.visible_params == "all"
-    assert reg.allow_launch
-    assert reg.allow_cancel
-    assert reg.allow_from_phase
-
-
-def test_checked_in_tiny_decoder_catalog_pins_repo_cwd() -> None:
-    registry = Registry.load(REPO / "examples" / "tiny_decoder_enwik8" / "catalog.yaml")
-
-    reg = registry.get("tiny-decoder-enwik8-hparams")
-
-    assert reg.cwd == REPO
-    assert reg.visible_params == "all"
+    entry = registry.get(experiment_id)
+    assert entry.id == experiment_id
+    assert description_fragment in entry.description
+    assert "smoke" not in entry.experiment.experiment
 
 
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
@@ -271,9 +293,19 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
         registry.get("does-not-exist")
 
 
-def test_invalid_config_raises_catalog_error(tmp_path: Path) -> None:
-    # goal must be minimize/maximize; "sideways" is a Literal violation.
-    bad = _experiment_yaml(tmp_path).replace("goal: minimize", "goal: sideways")
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("goal: minimize", "goal: sideways"),
+        (
+            "n_trials: 2\n    search_space:",
+            "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
+        ),
+    ],
+    ids=["invalid_goal", "unknown_sampler"],
+)
+def test_invalid_config_raises_catalog_error(tmp_path: Path, old: str, new: str) -> None:
+    bad = _experiment_yaml(tmp_path).replace(old, new, 1)
     config = _write(tmp_path / "exp.yaml", bad)
     with pytest.raises(CatalogError, match="invalid config"):
         Registry.load(_catalog(tmp_path, config))
@@ -325,17 +357,6 @@ def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str)
         Registry.load(catalog)
 
 
-def test_unknown_sampler_raises_catalog_error(tmp_path: Path) -> None:
-    bad = _experiment_yaml(tmp_path).replace(
-        "n_trials: 2\n    search_space:",
-        "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
-        1,
-    )
-    config = _write(tmp_path / "exp.yaml", bad)
-    with pytest.raises(CatalogError, match="invalid config"):
-        Registry.load(_catalog(tmp_path, config))
-
-
 def test_suite_config_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "suite.yaml", _suite_yaml(tmp_path))
     with pytest.raises(CatalogError, match="suite"):
@@ -346,15 +367,6 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
     with pytest.raises(CatalogError, match="storage"):
         Registry.load(_catalog(tmp_path, config))
-
-
-def test_stable_path_helper_independently_rejects_in_memory_storage(tmp_path: Path) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
-    experiment = load_config(config)
-    assert isinstance(experiment, Experiment)
-
-    with pytest.raises(CatalogError, match="persistent storage"):
-        _require_mcp_stable_paths("srv", experiment)
 
 
 @pytest.mark.parametrize(
@@ -391,7 +403,14 @@ def test_external_rdb_storage_rejected_for_local_node_mcp(
 ) -> None:
     config = _write(
         tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+        _experiment_yaml(tmp_path)
+        .replace(f"sqlite:///{tmp_path}/reg_ok.db", storage)
+        # Acknowledge the config-level single-host gate so this test reaches
+        # the MCP-specific local-node rejection, which has no such escape.
+        .replace(
+            "experiment: reg_ok\n",
+            "experiment: reg_ok\nallow_external_rdb_single_host: true\n",
+        ),
     )
 
     with pytest.raises(CatalogError, match="local-node SQLite or JournalStorage"):

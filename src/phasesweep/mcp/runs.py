@@ -11,26 +11,32 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
+    UnsafePrivatePathError,
     ensure_private_dir,
+    fsync_directory,
+    open_private_text,
     private_atomic_write_text,
     try_lock_file,
     unlock_file,
+    validate_private_dir,
 )
-from phasesweep.runtime.process import is_pid_zombie, is_same_process, reap_child
+from phasesweep.runtime.process import is_same_live_process, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
 
 __all__ = [
-    "CleanupUncertainMarker",
     "ProcessIdentity",
     "RunHandle",
     "RunLaunchState",
@@ -69,22 +75,8 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
-class CleanupUncertainMarker:
-    """Validated cleanup-uncertainty marker payload."""
-
-    run_id: str
-    config_sha256: str | None
-    identity: ProcessIdentity
-    cleanup_confirmed: bool = False
-
-
-@dataclass(frozen=True)
 class RunHandle:
-    """Immutable, on-disk identity of one detached sweep.
-
-    ``log_path`` and ``status_path`` are server-internal and never returned to
-    the agent.
-    """
+    """Immutable, on-disk identity of one detached sweep."""
 
     run_id: str
     experiment_id: str
@@ -93,25 +85,8 @@ class RunHandle:
     pgid: int | None
     pid_starttime: int | None  # /proc start time for PID-reuse-safe liveness; None off-Linux
     started_at: str  # ISO-8601 UTC
-    log_path: str  # server-internal; never returned to the agent
-    status_path: str  # server-internal
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
-
-    @classmethod
-    def from_json(cls, data: dict) -> RunHandle:
-        """Rehydrate a handle from its JSON dict (the inverse of ``asdict``).
-
-        :param dict data: JSON-decoded run handle payload.
-        :return RunHandle: Reconstructed immutable run handle.
-        """
-        return cls(
-            **{
-                **data,
-                "launch_state": data.get("launch_state", "spawned"),
-                "allow_cancel": data.get("allow_cancel", False),
-            }
-        )
 
 
 class RunStore:
@@ -122,12 +97,48 @@ class RunStore:
 
         :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
         """
+        self._set_paths(state_dir)
         ensure_private_dir(state_dir)
+        ensure_private_dir(self._runs_dir)
+        ensure_private_dir(self._logs_dir)
+
+    @classmethod
+    def open_existing(cls, state_dir: Path) -> RunStore:
+        """Open an existing run store without creating or chmodding any path.
+
+        This is the operator-recovery entry point. Recovery accepts a path on
+        the command line, so opening it must be observational: a typo must not
+        create a new state tree or change permissions on an unrelated
+        directory.
+
+        :param Path state_dir: Existing MCP state directory containing ``runs/``
+            and ``logs/`` subdirectories.
+        :return RunStore: Store bound to the recognized existing layout.
+        :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
+        """
+        store = cls.__new__(cls)
+        store._set_paths(state_dir)
+        missing = []
+        for path in (state_dir, store._runs_dir, store._logs_dir):
+            try:
+                validate_private_dir(path)
+            except (OSError, UnsafePrivatePathError):
+                missing.append(str(path))
+        if missing:
+            raise ValueError(
+                "not an existing MCP state directory; expected directories are missing: "
+                + ", ".join(missing)
+            )
+        return store
+
+    def _set_paths(self, state_dir: Path) -> None:
+        """Bind store paths without touching the filesystem.
+
+        :param Path state_dir: Root directory for the MCP run store.
+        """
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
-        ensure_private_dir(self._runs_dir)
-        ensure_private_dir(self._logs_dir)
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:
@@ -157,7 +168,7 @@ class RunStore:
         :param str experiment_id: Catalog id to include in the run id prefix.
         :return str: Newly generated safe run id.
         """
-        return f"{experiment_id}-{uuid4().hex[:12]}"
+        return f"{experiment_id}-{uuid4().hex}"
 
     def log_path(self, run_id: str) -> Path:
         """Path to the captured stdout/stderr log for a run.
@@ -199,12 +210,37 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
-    def save(self, handle: RunHandle) -> None:
-        """Persist a run handle as JSON under the runs dir.
+    def create(self, handle: RunHandle) -> None:
+        """Exclusively claim and persist a new run identity."""
+        target = self._runs_dir / f"{handle.run_id}.json"
+        payload = json.dumps(asdict(handle), indent=2)
+        with open_private_text(target, "x") as output:
+            output.write(payload + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        fsync_directory(target.parent)
 
-        Writes through a same-directory temp file and then replaces the target so
-        readers never observe a partially-written handle.
-        """
+    def update(self, handle: RunHandle) -> None:
+        """Persist the one legal launching-to-spawned identity transition."""
+        current = self.get(handle.run_id)
+        if current is None:
+            raise FileNotFoundError(f"Run {handle.run_id!r} has not been created.")
+        immutable_fields = (
+            "run_id",
+            "experiment_id",
+            "config_sha256",
+            "started_at",
+            "allow_cancel",
+        )
+        changed = [
+            name for name in immutable_fields if getattr(current, name) != getattr(handle, name)
+        ]
+        if changed:
+            raise ValueError(f"Run {handle.run_id!r} update changes immutable field(s): {changed}.")
+        if current == handle:
+            return
+        if current.launch_state != "launching" or handle.launch_state != "spawned":
+            raise ValueError(f"Run {handle.run_id!r} permits only a launching-to-spawned update.")
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
         private_atomic_write_text(target, payload + "\n")
@@ -249,7 +285,7 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(expected_run_id):
             return None
         try:
-            handle = RunHandle.from_json(json.loads(path.read_text()))
+            handle = RunHandle(**json.loads(path.read_text()))
         except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError):
             return None
         if handle.run_id != expected_run_id:
@@ -259,6 +295,8 @@ class RunStore:
         if type(handle.allow_cancel) is not bool:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
+            return None
+        if parse_utc_iso(handle.started_at) is None:
             return None
         if handle.launch_state == "launching":
             if (
@@ -276,20 +314,24 @@ class RunStore:
                 type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
             ):
                 return None
-        return replace(
-            handle,
-            log_path=str(self.log_path(handle.run_id)),
-            status_path=str(self.status_path(handle.run_id)),
-        )
+        return handle
 
     def state(self, handle: RunHandle) -> RunState:
         """Derive the current state from status.json and a live PID check.
 
-        status.json (written by the runner on every exit) is authoritative when
-        present: returncode 0 -> succeeded, a signalled code -> cancelled, any
-        other -> failed. With no status.json, a live (non-zombie) PID means
-        running; a dead or zombie PID with no status means the process died
-        without recording a cause (e.g. SIGKILL or OOM) and is reported as failed.
+        A finalized status.json (written by the runner on every exit) is
+        authoritative: returncode 0 with no explicit snapshot failure ->
+        succeeded, a signalled code -> cancelled, and any other return code or
+        failed result snapshot -> failed. Pending result snapshot capture
+        remains running so another launch cannot mutate shared result storage
+        before the snapshot is frozen. With no status.json, a live
+        (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
+        cannot prove that its separately-sessioned trial descendants are gone,
+        so it is marked cleanup-uncertain and remains ``running`` until
+        operator recovery records cleanup evidence. An unresolved pre-spawn
+        handle also remains ``running`` because a server restart cannot know
+        whether ``Popen`` completed before the crash; known launch failures
+        write terminal status explicitly.
 
         Args:
             handle: The run handle to evaluate.
@@ -304,7 +346,7 @@ class RunStore:
         if handle.pid is not None:
             reap_child(handle.pid)
         status = self._read_status(handle)
-        if self._cleanup_uncertain(handle):
+        if self.cleanup_uncertain(handle):
             if status is not None and status.get("cleanup_confirmed") is True:
                 with contextlib.suppress(OSError):
                     self.clear_cleanup_uncertain(handle)
@@ -313,30 +355,38 @@ class RunStore:
         if status is not None:
             if self._terminal_cleanup_uncertain(handle, status):
                 return "running"
+            if status.get("result_snapshot_state") == "pending":
+                return "running"
             rc = status.get("returncode")
             if rc == 0:
+                if status.get("result_snapshot_state") == "failed":
+                    return "failed"
                 return "succeeded"
             if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
                 return "cancelled"
             return "failed"
         if handle.launch_state == "launching" or handle.pid is None:
-            return "failed"
+            # The launching record is durable before Popen. After a server
+            # crash it cannot distinguish "not spawned" from "spawned but the
+            # child has not self-persisted yet", so reserve concurrency until
+            # a known launch error or operator recovery writes terminal status.
+            return "running"
+        if handle.pid_starttime is None:
+            if self._cleanup_recovered(handle):
+                return "failed"
+            self.mark_cleanup_uncertain(handle)
+            return "running"
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
-        # kill(pid, 0), so it must be filtered out or a dead run would report
-        # "running" forever and block relaunch.
-        if is_same_process(handle.pid, handle.pid_starttime) and not is_pid_zombie(handle.pid):
+        # kill(pid, 0), so filter it out of the genuinely-live path and enter
+        # cleanup-uncertain recovery below.
+        if is_same_live_process(handle.pid, handle.pid_starttime):
             return "running"
-        return "failed"
-
-    def has_recorded_status(self, handle: RunHandle) -> bool:
-        """Return whether the runner wrote a readable terminal status file.
-
-        :param RunHandle handle: Run handle whose status file should be checked.
-        :return bool: ``True`` when a valid runner-written status is present.
-        """
-        return self._read_status(handle) is not None
+        if self._cleanup_recovered(handle):
+            return "failed"
+        self.mark_cleanup_uncertain(handle)
+        return "running"
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
         """Return the runner-written terminal status payload, if readable.
@@ -356,16 +406,14 @@ class RunStore:
 
         :param RunHandle handle: Run handle whose cleanup is uncertain.
         """
-        existing = self._read_cleanup_uncertain_marker(handle)
+        existing = self._read_cleanup_identity(handle)
         candidate = ProcessIdentity(
             pid=handle.pid,
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
         )
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
-        identity = (
-            existing.identity if existing is not None and not candidate_has_identity else candidate
-        )
+        identity = existing if existing is not None and not candidate_has_identity else candidate
         payload = {
             "run_id": handle.run_id,
             "config_sha256": handle.config_sha256,
@@ -387,8 +435,12 @@ class RunStore:
         self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
 
     def cleanup_uncertain(self, handle: RunHandle) -> bool:
-        """Return whether a valid cleanup uncertainty marker exists for ``handle``."""
-        return self._cleanup_uncertain(handle)
+        """Return whether a valid cleanup uncertainty marker exists for ``handle``.
+
+        :param RunHandle handle: Run handle whose cleanup marker should be checked.
+        :return bool: Whether a valid cleanup uncertainty marker exists.
+        """
+        return self._read_cleanup_identity(handle) is not None
 
     def cleanup_identity(self, handle: RunHandle) -> ProcessIdentity:
         """Return the strongest runner identity available for cleanup.
@@ -400,11 +452,11 @@ class RunStore:
         :param RunHandle handle: Run handle whose runner identity is needed.
         :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
         """
-        marker = self._read_cleanup_uncertain_marker(handle)
-        if marker is not None and (
-            marker.identity.pid is not None or marker.identity.pgid is not None
+        marker_identity = self._read_cleanup_identity(handle)
+        if marker_identity is not None and (
+            marker_identity.pid is not None or marker_identity.pgid is not None
         ):
-            return marker.identity
+            return marker_identity
         return ProcessIdentity(
             pid=handle.pid,
             pgid=handle.pgid,
@@ -424,6 +476,27 @@ class RunStore:
                 return handle
         return None
 
+    def latest_run_for(self, experiment_id: str) -> RunHandle | None:
+        """Return the newest persisted handle for an experiment deterministically.
+
+        The result is computed from validated durable launch timestamps, with
+        ``run_id`` as a stable tie-breaker. This intentionally returns one
+        semantic answer rather than a list an agent would need to scan.
+
+        :param str experiment_id: Catalog id whose latest run should be found.
+        :return RunHandle | None: Newest persisted handle, or ``None`` when the
+            experiment has no recorded MCP runs.
+        """
+        matching = [
+            handle for handle in self.list_handles() if handle.experiment_id == experiment_id
+        ]
+        if not matching:
+            return None
+        return max(
+            matching,
+            key=lambda handle: (datetime.fromisoformat(handle.started_at), handle.run_id),
+        )
+
     def live_runs(self) -> list[RunHandle]:
         """Every currently-running handle across all experiments.
 
@@ -433,6 +506,84 @@ class RunStore:
         :return list[RunHandle]: All handles whose derived state is currently ``running``.
         """
         return [handle for handle in self.list_handles() if self.state(handle) == "running"]
+
+    def recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether operator cleanup or snapshot recovery is required.
+
+        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
+        :return bool: True when cleanup remains uncertain or terminal snapshot
+            finalization was interrupted after the runner exited.
+        """
+        status = self._read_status(handle)
+        launch_outcome_unknown = handle.launch_state == "launching" and status is None
+        return (
+            launch_outcome_unknown
+            or self.cleanup_recovery_required(handle)
+            or self.snapshot_recovery_required(handle)
+        )
+
+    def cleanup_recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether process cleanup still requires operator recovery.
+
+        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
+        :return bool: True when a server marker or terminal runner status still
+            records cleanup uncertainty without matching recovery evidence.
+        """
+        if self.cleanup_uncertain(handle):
+            return True
+        status = self._read_status(handle)
+        return status is not None and self._terminal_cleanup_uncertain(handle, status)
+
+    def cleanup_recovered_attempt_ids(self, handle: RunHandle) -> set[str]:
+        """Return exact reaped attempt IDs from valid runner and operator evidence.
+
+        :param RunHandle handle: Run whose cleanup recovery evidence should be read.
+        :return set[str]: Reaped attempt identities persisted for snapshot finalization.
+        """
+        attempt_ids: set[str] = set()
+        status = self._read_status(handle)
+        if status is not None:
+            attempt_ids.update(status.get("recovered_attempt_ids", []))
+        payload = self._read_cleanup_recovery(handle)
+        if payload is None:
+            return attempt_ids
+        values = payload.get("reaped_attempt_ids")
+        if isinstance(values, list):
+            attempt_ids.update(value for value in values if isinstance(value, str) and value)
+        return attempt_ids
+
+    def snapshot_recovery_required(self, handle: RunHandle) -> bool:
+        """Return whether a dead runner left snapshot finalization pending.
+
+        A live runner may legitimately expose the short durable ``pending``
+        interval between its two atomic status writes. Once its exact process
+        identity is gone, no writer can complete that status and operator
+        recovery must either finalize the embedded snapshot or record it as
+        unavailable.
+
+        :param RunHandle handle: Persisted run whose terminal status is checked.
+        :return bool: True only for an orphaned pending snapshot state.
+        """
+        status = self._read_status(handle)
+        return (
+            status is not None
+            and status.get("result_snapshot_state") == "pending"
+            and not self._runner_is_live(handle)
+        )
+
+    @staticmethod
+    def _runner_is_live(handle: RunHandle) -> bool:
+        """Return whether a spawned handle still identifies a live runner.
+
+        :param RunHandle handle: Persisted runner identity.
+        :return bool: True when PID and starttime still identify a non-zombie process.
+        """
+        return (
+            handle.launch_state == "spawned"
+            and handle.pid is not None
+            and handle.pid_starttime is not None
+            and is_same_live_process(handle.pid, handle.pid_starttime)
+        )
 
     def _read_status(self, handle: RunHandle) -> dict | None:
         """Read the runner-written terminal status payload.
@@ -459,42 +610,86 @@ class RunStore:
         error_class = payload.get("error_class")
         if error_class is not None and not isinstance(error_class, str):
             return None
+        failure = payload.get("failure")
+        if failure is not None and not isinstance(failure, dict):
+            return None
+        ended_at = payload.get("ended_at")
+        if ended_at is not None and not isinstance(ended_at, str):
+            return None
+        result_snapshot_state = payload.get("result_snapshot_state")
+        if result_snapshot_state is not None and result_snapshot_state not in {
+            "pending",
+            "complete",
+            "failed",
+        }:
+            return None
+        if result_snapshot_state == "complete" and not isinstance(
+            payload.get("result_snapshot"), dict
+        ):
+            return None
+        result_snapshot_error = payload.get("result_snapshot_error")
+        if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
+            return None
+        recovered_attempt_ids = payload.get("recovered_attempt_ids")
+        if recovered_attempt_ids is not None and (
+            not isinstance(recovered_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
+        ):
+            return None
         return payload
 
-    def _cleanup_uncertain(self, handle: RunHandle) -> bool:
-        """Return whether this run has a server-owned cleanup uncertainty marker.
-
-        :param RunHandle handle: Run handle whose cleanup marker should be checked.
-        :return bool: True when a prior cancel could not confirm cleanup.
-        """
-        return self._read_cleanup_uncertain_marker(handle) is not None
-
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
-        """Return whether a terminal status still needs operator cleanup recovery."""
+        """Return whether a terminal status still needs operator cleanup recovery.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be checked.
+        :param Mapping[str, object] status: Terminal runner status payload.
+        :return bool: Whether cleanup is uncertain and lacks recovery evidence.
+        """
         return status.get("cleanup_confirmed") is False and not self._cleanup_recovered(handle)
 
     def _cleanup_recovered(self, handle: RunHandle) -> bool:
-        """Return whether operator recovery evidence confirms cleanup for this run."""
+        """Return whether operator recovery evidence confirms cleanup for this run.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be checked.
+        :return bool: Whether valid recovery evidence confirms cleanup.
+        """
+        return self._read_cleanup_recovery(handle) is not None
+
+    def _read_cleanup_recovery(self, handle: RunHandle) -> dict[str, object] | None:
+        """Read matching operator cleanup evidence for a run handle.
+
+        :param RunHandle handle: Run handle whose recovery evidence should be read.
+        :return dict[str, object] | None: The recovery payload when the file
+            exists, parses as a JSON object, and its ``run_id``,
+            ``config_sha256``, and ``cleanup_confirmed`` fields match this
+            handle; ``None`` otherwise.
+        """
         path = self.cleanup_recovery_path(handle.run_id)
         if not path.is_file():
-            return False
+            return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return False
+            return None
         if not isinstance(payload, dict):
-            return False
-        return (
+            return None
+        if not (
             payload.get("run_id") == handle.run_id
             and payload.get("config_sha256") == handle.config_sha256
             and payload.get("cleanup_confirmed") is True
-        )
+        ):
+            return None
+        return payload
 
-    def _read_cleanup_uncertain_marker(
+    def _read_cleanup_identity(
         self,
         handle: RunHandle,
-    ) -> CleanupUncertainMarker | None:
-        """Read and validate this run's cleanup uncertainty marker."""
+    ) -> ProcessIdentity | None:
+        """Read and validate this run's cleanup uncertainty marker.
+
+        :param RunHandle handle: Run handle whose cleanup marker should be read.
+        :return ProcessIdentity | None: Valid marker identity, or ``None`` if unavailable.
+        """
         path = self.cleanup_uncertain_path(handle.run_id)
         if not path.is_file():
             return None
@@ -522,17 +717,17 @@ class RunStore:
         if not _valid_positive_optional_int(pid_starttime):
             return None
 
-        return CleanupUncertainMarker(
-            run_id=handle.run_id,
-            config_sha256=marker_hash if isinstance(marker_hash, str) else None,
-            identity=ProcessIdentity(
-                pid=pid,
-                pgid=pgid,
-                pid_starttime=pid_starttime,
-            ),
+        return ProcessIdentity(
+            pid=pid,
+            pgid=pgid,
+            pid_starttime=pid_starttime,
         )
 
 
 def _valid_positive_optional_int(value: object) -> bool:
-    """Return whether ``value`` is ``None`` or a positive non-bool ``int``."""
+    """Return whether ``value`` is ``None`` or a positive non-bool ``int``.
+
+    :param object value: Value to validate.
+    :return bool: Whether the value is ``None`` or a positive non-bool integer.
+    """
     return value is None or (type(value) is int and value > 0)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +30,10 @@ def _capture_launch_env(
         stderr: Any,
         timeout: float | None,
         trial_dir: Path,
+        attempt_id: str,
     ) -> ProcessResult:
         captured.update(env)
+        captured["run_supervised_attempt_id"] = attempt_id
         return ProcessResult(
             return_code=0,
             timed_out=False,
@@ -43,6 +46,8 @@ def _capture_launch_env(
         experiment=make_experiment(env=experiment_env),
         phase_name="p",
         trial_id=0,
+        generation_id="generation-test",
+        attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
         overrides={},
         timeout_seconds=None,
@@ -51,32 +56,46 @@ def _capture_launch_env(
     return captured
 
 
-def test_launch_trial_sets_cuda_device_order_for_leased_gpu(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    env = _capture_launch_env(tmp_path, monkeypatch)
-
-    assert env["CUDA_VISIBLE_DEVICES"] == "2"
-    assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
-
-
-def test_launch_trial_preserves_operator_cuda_device_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("experiment_env", "gpu_id", "expected_visible", "expected_order"),
+    [
+        pytest.param(None, 2, "2", "PCI_BUS_ID", id="numeric-default-order"),
+        pytest.param(
+            {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+            2,
+            "2",
+            "FASTEST_FIRST",
+            id="operator-device-order",
+        ),
+        pytest.param(
+            None,
+            "MIG-GPU-deadbeef/3/0",
+            "MIG-GPU-deadbeef/3/0",
+            "PCI_BUS_ID",
+            id="opaque-mig-token",
+        ),
+    ],
+)
+def test_launch_trial_cuda_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    experiment_env: dict[str, str] | None,
+    gpu_id: int | str,
+    expected_visible: str,
+    expected_order: str,
 ) -> None:
     env = _capture_launch_env(
         tmp_path,
         monkeypatch,
-        experiment_env={"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+        experiment_env=experiment_env,
+        gpu_id=gpu_id,
     )
 
-    assert env["CUDA_VISIBLE_DEVICES"] == "2"
-    assert env["CUDA_DEVICE_ORDER"] == "FASTEST_FIRST"
-
-
-def test_launch_trial_preserves_opaque_cuda_device_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    env = _capture_launch_env(tmp_path, monkeypatch, gpu_id="MIG-GPU-deadbeef/3/0")
-
-    assert env["CUDA_VISIBLE_DEVICES"] == "MIG-GPU-deadbeef/3/0"
-    assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert env["CUDA_VISIBLE_DEVICES"] == expected_visible
+    assert env["CUDA_DEVICE_ORDER"] == expected_order
+    assert env["PHASESWEEP_GENERATION_ID"] == "generation-test"
+    assert env["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
+    assert env["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
+    assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
+    assert env["WANDB_RUN_ID"] == "attempt-test"
+    assert env["run_supervised_attempt_id"] == "attempt-test"

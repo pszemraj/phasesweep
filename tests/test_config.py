@@ -6,9 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import (
-    Phase,
-)
+from phasesweep.config import Experiment, JsonExtractor, LogRegexExtractor, Metric, Phase
 from tests.conftest import write_yaml
 
 
@@ -18,11 +16,12 @@ def test_inherit_must_be_prior(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {trial_dir}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     inherits: [b]
@@ -43,11 +42,12 @@ def test_constraint_requires_bound(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 constraints:
   - name: bytes
     extractor: { type: json, path: r.json, key: bytes }
@@ -67,11 +67,12 @@ def test_metric_constraint_name_collision(tmp_path):
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 constraints:
   - name: loss
     max: 1
@@ -92,6 +93,31 @@ def test_phase_name_validation(name: str) -> None:
         Phase(name=name, n_trials=1, search_space={})
 
 
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"": "trainer-v1"},
+        {" ": "trainer-v1"},
+        {"revision": ""},
+        {"revision": " "},
+    ],
+)
+def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match="provenance keys and values must be nonempty"):
+        Experiment(
+            experiment="invalid_provenance",
+            trial_command="echo",
+            provenance=provenance,
+            metric=Metric(
+                extractor=LogRegexExtractor(
+                    type="log_regex",
+                    pattern=r"x=(?P<value>[0-9.]+)",
+                )
+            ),
+            phases=[Phase(name="p", n_trials=1)],
+        )
+
+
 # ---- migrated from version-named files ----
 
 
@@ -101,12 +127,13 @@ def test_phase_name_validation(name: str) -> None:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "first {overrides}"
 trial_command: "second {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -115,11 +142,12 @@ phases:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -130,11 +158,12 @@ phases:
         """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -150,15 +179,69 @@ def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str) -> None:
         load_experiment(write_yaml(tmp_path, body))
 
 
+def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
+    """Explicit keys may override values inherited through a YAML merge key."""
+    body = """
+experiment: t
+storage: ":memory:"
+provenance: {revision: test-fixture-v1}
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
+phases:
+  - &phase_defaults
+    name: baseline
+    n_trials: 1
+  - <<: *phase_defaults
+    name: tuned
+    n_trials: 2
+"""
+    exp = load_experiment(write_yaml(tmp_path, body))
+
+    assert [(phase.name, phase.n_trials) for phase in exp.phases] == [
+        ("baseline", 1),
+        ("tuned", 2),
+    ]
+
+
+def test_duplicate_yaml_merge_keys_rejected(tmp_path: Path) -> None:
+    body = """
+experiment: t
+storage: ":memory:"
+provenance: {revision: test-fixture-v1}
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
+phases:
+  - &first
+    name: first
+    n_trials: 1
+  - &second
+    name: second
+    n_trials: 2
+  - <<: *first
+    <<: *second
+    name: merged
+"""
+
+    with pytest.raises(ValueError, match=r"duplicate key '<<'"):
+        load_experiment(write_yaml(tmp_path, body))
+
+
 def test_n_jobs_default_is_one(tmp_path):
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -168,3 +251,8 @@ phases:
     assert exp.override_format == "argparse"
     assert exp.phases[0].n_jobs == 1
     assert exp.phases[0].max_consecutive_failures == 5
+
+
+def test_plain_json_extractor_is_not_a_primary_objective() -> None:
+    with pytest.raises(ValidationError, match="json_envelope"):
+        Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))

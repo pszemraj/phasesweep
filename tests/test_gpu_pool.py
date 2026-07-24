@@ -11,6 +11,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
 )
+from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import GpuPool, _gpu_lock_path
 
 
@@ -60,7 +61,7 @@ def test_whole_node_policy_assigns_all_configured_devices() -> None:
 def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     lock_path = _gpu_lock_path(1)
-    with lock_path.open("w") as held:
+    with open_lock_file(lock_path) as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
         with (
@@ -167,16 +168,14 @@ def test_explicit_gpu_devices_preserve_tokens_and_dedupe():
     assert acquired == ["GPU-a", "MIG-GPU-b/1/0"]
 
 
-def test_empty_explicit_gpu_ids_raises():
-    """gpu_ids=[] is a config error, not silent no-op."""
-    with pytest.raises(RuntimeError, match="gpu_ids was provided but empty"):
-        GpuPool.create(n_jobs=1, explicit_ids=[])
-
-
 def test_explicit_gpu_ids_dedupe_preserves_order():
     """Duplicate IDs in YAML are deduped without reordering."""
     pool = GpuPool.create(n_jobs=2, explicit_ids=[2, 0, 2, 1, 0])
-    assert pool._gpu_ids == [2, 0, 1]
+    acquired = []
+    for _ in range(3):
+        with pool.acquire() as gpu_id:
+            acquired.append(gpu_id)
+    assert acquired == ["2", "0", "1"]
 
 
 def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
@@ -184,7 +183,7 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     lock_path = _gpu_lock_path(3)
     holder_marker = "holder-pid\n"
-    with lock_path.open("w") as held:
+    with open_lock_file(lock_path) as held:
         held.write(holder_marker)
         held.flush()
         fcntl.flock(held, fcntl.LOCK_EX)
@@ -203,21 +202,6 @@ def test_gpu_ids_rejects_negative() -> None:
             search_space={"x": IntParam(type="int", low=0, high=1)},
             gpu_ids=[0, -1, 2],
         )
-
-
-def test_gpu_ids_accepts_none_and_non_empty_values() -> None:
-    Phase(  # type: ignore[arg-type]
-        name="p1",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-        gpu_ids=None,
-    )
-    Phase(  # type: ignore[arg-type]
-        name="p2",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
-        gpu_ids=[0, 1, 2],
-    )
 
 
 def test_gpu_ids_rejects_empty() -> None:

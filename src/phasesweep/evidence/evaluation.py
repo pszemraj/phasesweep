@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Extractor,
     Gate,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
     JsonScalarBoundGate,
@@ -26,9 +26,10 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.evidence.wandb import (
     WandbPollTimeout,
+    WandbRunTerminalError,
     poll_wandb_summary,
-    render_trial_run_name,
 )
+from phasesweep.runtime.json import strict_json_loads
 
 
 def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path, Any]:
@@ -42,7 +43,7 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
-    cur = json.loads(target.read_text())
+    cur = strict_json_loads(target.read_text(encoding="utf-8"))
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -52,17 +53,16 @@ def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path
 
 
 def json_float(value: Any, *, label: str) -> float:
-    """Coerce a JSON value to float with a keyed error message.
+    """Require a JSON number and convert it to float with a keyed error message.
 
     :param Any value: JSON scalar value to coerce.
     :param str label: Human-readable key or metric label for errors.
-    :raises ValueError: If ``value`` cannot be converted to ``float``.
+    :raises ValueError: If ``value`` is not an integer or float, excluding booleans.
     :return float: Coerced numeric value.
     """
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Value at {label!r} is not numeric: {value!r}") from exc
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"Value at {label!r} is not a JSON number: {value!r}")
+    return float(value)
 
 
 class ExtractorError(RuntimeError):
@@ -79,8 +79,11 @@ class TrialContext:
     experiment: str
     phase: str
     trial_id: int
+    generation_id: str
+    attempt_id: str
+    overrides_sha256: str
     trial_dir: Path
-    run_name: str  # "{experiment}-{phase}-{trial_id}"
+    run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
 
@@ -105,9 +108,15 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
         target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key)
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON file not found: {exc.args[0]}") from exc
-    except JSONDecodeError as exc:
+    except UnicodeError as exc:
+        target = ctx.trial_dir / cfg.path
+        raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
+    except (JSONDecodeError, ValueError) as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
+    except OSError as exc:
+        target = ctx.trial_dir / cfg.path
+        raise ExtractorError(f"Could not read JSON at {target}: {exc}") from exc
     except KeyError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(
@@ -118,6 +127,83 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
         return json_float(cur, label=cfg.key)
     except ValueError as exc:
         raise ExtractorError(str(exc)) from exc
+
+
+def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> float:
+    """Validate and extract an attempt-bound JSON result envelope.
+
+    :param TrialContext ctx: Current trial identity and resolved-overrides digest.
+    :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
+    :raises ExtractorError: If the envelope is missing, malformed, or belongs to
+        another execution attempt.
+    :return float: Validated objective value from the envelope.
+    """
+    target = ctx.trial_dir / cfg.path
+    try:
+        data = strict_json_loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ExtractorError(f"JSON envelope not found: {target}") from exc
+    except UnicodeError as exc:
+        raise ExtractorError(f"JSON envelope at {target} is not valid UTF-8: {exc}") from exc
+    except (JSONDecodeError, ValueError) as exc:
+        raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read JSON envelope at {target}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ExtractorError(f"JSON envelope at {target} must be an object.")
+    if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
+        raise ExtractorError(f"JSON envelope at {target} must use schema_version 1.")
+    if data.get("status") != "complete":
+        raise ExtractorError(f"JSON envelope at {target} must report status='complete'.")
+    if data.get("generation_id") != ctx.generation_id:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match generation {ctx.generation_id!r}."
+        )
+    if data.get("attempt_id") != ctx.attempt_id:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match attempt {ctx.attempt_id!r}."
+        )
+    if data.get("overrides_sha256") != ctx.overrides_sha256:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not match this attempt's resolved overrides."
+        )
+
+    objective = data.get("objective")
+    if not isinstance(objective, dict):
+        raise ExtractorError(f"JSON envelope at {target} has no objective object.")
+    if objective.get("name") != cfg.objective_name:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}."
+        )
+    if objective.get("split") != cfg.split:
+        raise ExtractorError(f"JSON envelope at {target} does not report split {cfg.split!r}.")
+
+    evaluation = data.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ExtractorError(f"JSON envelope at {target} has no evaluation object.")
+    if evaluation.get("policy") != cfg.policy:
+        raise ExtractorError(f"JSON envelope at {target} does not report policy {cfg.policy!r}.")
+    checkpoint = evaluation.get("checkpoint")
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise ExtractorError(f"JSON envelope at {target} has no checkpoint identity.")
+    if cfg.checkpoint is not None and checkpoint != cfg.checkpoint:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}."
+        )
+    step = evaluation.get("step")
+    if type(step) is not int or step < 0:
+        raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
+    if cfg.expected_step is not None and step != cfg.expected_step:
+        raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+
+    try:
+        value = json_float(objective.get("value"), label="objective.value")
+    except ValueError as exc:
+        raise ExtractorError(str(exc)) from exc
+    if not math.isfinite(value):
+        raise ExtractorError(f"JSON envelope at {target} has a non-finite objective value.")
+    return value
 
 
 def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
@@ -154,24 +240,29 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
     # Stream line-by-line to avoid 500 MB RSS on large training logs.
     result: float | None = None
     count = 0
-    with target.open() as fh:
-        for line in fh:
-            m = pattern.search(line)
-            if m is None:
-                continue
-            try:
-                v = float(m.group("value"))
-            except (TypeError, ValueError):
-                continue
-            count += 1
-            if cfg.select == "first":
-                return v
-            if cfg.select == "last":
-                result = v
-            elif cfg.select == "min":
-                result = v if result is None else min(result, v)
-            elif cfg.select == "max":
-                result = v if result is None else max(result, v)
+    try:
+        with target.open(encoding="utf-8") as fh:
+            for line in fh:
+                m = pattern.search(line)
+                if m is None:
+                    continue
+                try:
+                    v = float(m.group("value"))
+                except (TypeError, ValueError):
+                    continue
+                count += 1
+                if cfg.select == "first":
+                    return v
+                if cfg.select == "last":
+                    result = v
+                elif cfg.select == "min":
+                    result = v if result is None else min(result, v)
+                elif cfg.select == "max":
+                    result = v if result is None else max(result, v)
+    except UnicodeError as exc:
+        raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
     if count == 0:
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
@@ -180,28 +271,27 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
 
 
 def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
-    """Poll the W&B public API for a run by display name and return a summary metric.
+    """Poll the W&B public API for this attempt's run and return a summary metric.
 
     Args:
-        ctx: Trial context. ``experiment``/``phase``/``trial_id``/``run_name``
-            are substituted into ``cfg.run_name_template``.
-        cfg: ``WandbExtractor`` config: entity, project, run-name template,
-            metric key, poll cadence, and timeout.
+        ctx: Trial context containing the immutable attempt id assigned as
+            ``WANDB_RUN_ID`` before subprocess launch.
+        cfg: ``WandbExtractor`` config: entity, project, metric key, poll
+            cadence, and timeout.
 
     Returns:
-        The numeric value of ``cfg.metric_key`` on the finished/crashed/failed run.
+        The numeric value of ``cfg.metric_key`` on the finished run.
 
     Raises:
-        ExtractorError: ``wandb`` not installed, run not found before timeout,
-            or metric key missing on the finished run's summary.
+        ExtractorError: ``wandb`` not installed, the attempt's run failed, the
+            run was not ready before timeout, or the metric was missing or invalid.
 
     """
-    target_name = render_trial_run_name(cfg.run_name_template, ctx)
     try:
         summary = poll_wandb_summary(
             entity=cfg.entity,
             project=cfg.project,
-            run_name=target_name,
+            run_id=ctx.attempt_id,
             poll_seconds=cfg.poll_seconds,
             timeout_seconds=cfg.timeout_seconds,
             required_keys=[cfg.metric_key],
@@ -213,9 +303,14 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
             'python -m pip install "phasesweep[wandb] @ '
             'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
+    except WandbRunTerminalError as exc:
+        raise ExtractorError(
+            f"W&B run {ctx.attempt_id!r} ended in state {exc.state!r}; "
+            "only finished runs provide objective evidence."
+        ) from exc
     except WandbPollTimeout as exc:
         msg = (
-            f"W&B run {target_name!r} not found or metric {cfg.metric_key!r} "
+            f"W&B run {ctx.attempt_id!r} not found or metric {cfg.metric_key!r} "
             f"missing within {cfg.timeout_seconds}s."
         )
         if exc.last_error is not None:
@@ -223,8 +318,8 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
         raise ExtractorError(msg) from exc
 
     try:
-        return float(summary[cfg.metric_key])
-    except (TypeError, ValueError) as exc:
+        return json_float(summary[cfg.metric_key], label=cfg.metric_key)
+    except ValueError as exc:
         raise ExtractorError(
             f"Value at W&B metric {cfg.metric_key!r} is not numeric: {summary[cfg.metric_key]!r}"
         ) from exc
@@ -232,6 +327,7 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {
     JsonExtractor: _extract_json,
+    JsonEnvelopeExtractor: _extract_json_envelope,
     LogRegexExtractor: _extract_log_regex,
     WandbExtractor: _extract_wandb,
 }
@@ -243,7 +339,8 @@ def run_extractor(ctx: TrialContext, cfg: Extractor) -> float:
     Args:
         ctx: Trial context passed through to the chosen extractor.
         cfg: A concrete extractor config (one of :class:`JsonExtractor`,
-            :class:`LogRegexExtractor`, :class:`WandbExtractor`).
+            :class:`JsonEnvelopeExtractor`, :class:`LogRegexExtractor`,
+            :class:`WandbExtractor`).
 
     Returns:
         The numeric value the extractor pulled from this trial's outputs.
@@ -332,14 +429,20 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     """
     path = ctx.trial_dir / gate.path
     if gate.source == "file":
-        if not path.is_file():
-            return GateResult(gate.type, False, f"{gate.path} is not a file")
-        size = path.stat().st_size
+        try:
+            if not path.is_file():
+                return GateResult(gate.type, False, f"{gate.path} is not a file")
+            size = path.stat().st_size
+        except OSError as exc:
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} file size"
     elif gate.source == "directory":
-        if not path.is_dir():
-            return GateResult(gate.type, False, f"{gate.path} is not a directory")
-        size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        try:
+            if not path.is_dir():
+                return GateResult(gate.type, False, f"{gate.path} is not a directory")
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        except OSError as exc:
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} directory size"
     else:
         assert gate.key is not None
@@ -368,12 +471,15 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     path = ctx.trial_dir / gate.path
-    if not path.is_file():
-        return GateResult(gate.type, False, f"{gate.path} is missing")
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
+    try:
+        if not path.is_file():
+            return GateResult(gate.type, False, f"{gate.path} is missing")
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError as exc:
+        return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
     digest = hasher.hexdigest()
     if digest == gate.sha256:
         return GateResult(gate.type, True, f"{gate.path} sha256 matched")
@@ -383,24 +489,29 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
 def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -> GateResult:
     """Check that a finished W&B run summary contains required keys.
 
-    :param TrialContext ctx: Trial context used to render the W&B run name.
+    :param TrialContext ctx: Trial context containing the immutable W&B run id.
     :param WandbSummaryRequiredGate gate: Gate config for W&B lookup and keys.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    target_name = render_trial_run_name(gate.run_name_template, ctx)
     try:
         summary = poll_wandb_summary(
             entity=gate.entity,
             project=gate.project,
-            run_name=target_name,
+            run_id=ctx.attempt_id,
             poll_seconds=gate.poll_seconds,
             timeout_seconds=gate.timeout_seconds,
             wait_for_keys=False,
         )
     except ImportError:
         return GateResult(gate.type, False, "wandb package is not installed")
+    except WandbRunTerminalError as exc:
+        return GateResult(
+            gate.type,
+            False,
+            f"W&B run {ctx.attempt_id!r} ended in state {exc.state!r}",
+        )
     except WandbPollTimeout as exc:
-        detail = f"W&B run {target_name!r} not ready within {gate.timeout_seconds}s"
+        detail = f"W&B run {ctx.attempt_id!r} not ready within {gate.timeout_seconds}s"
         if exc.last_error is not None:
             detail += f"; last error: {exc.last_error}"
         return GateResult(gate.type, False, detail)

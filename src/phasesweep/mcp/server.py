@@ -8,26 +8,33 @@ redacted. serve() loads the catalog, builds the store, and serves over stdio.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import functools
 import hashlib
 import importlib.util
+import inspect
 import logging
+import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.config.io import load_config_bytes
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
+from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
+from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
+from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import (
     CatalogError,
     ConcurrencyLimitError,
@@ -38,15 +45,18 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    RunLaunchUnsettledError,
+    RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
     UnknownExperimentError,
     UnknownRunError,
 )
-from phasesweep.mcp.redaction import status_payload, winners_payload
+from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
-from phasesweep.mcp.runs import RunHandle, RunState, RunStore
-from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.files import open_private_text, private_atomic_write_bytes
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore, write_status_file
+from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
+from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
+from phasesweep.runtime.files import fsync_directory, open_private_text
 from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
 
 log = logging.getLogger("phasesweep.mcp.server")
@@ -54,14 +64,116 @@ log = logging.getLogger("phasesweep.mcp.server")
 SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 TOOL_LIST_EXPERIMENTS = "phasesweep_list_experiments"
 TOOL_VALIDATE_CONFIG = "phasesweep_validate_config"
+TOOL_GET_LATEST_RUN = "phasesweep_get_latest_run"
 TOOL_GET_STATUS = "phasesweep_get_status"
 TOOL_GET_WINNERS = "phasesweep_get_winners"
 TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
 TOOL_CANCEL_SWEEP = "phasesweep_cancel_sweep"
+TOOL_AWAIT_RUN = "phasesweep_await_run"
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
+# await_run blocks server-side so one call replaces dozens of polls; the cap
+# keeps a response inside common client tool timeouts.
+AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
+AWAIT_MIN_TIMEOUT_SECONDS = 5
+AWAIT_MAX_TIMEOUT_SECONDS = 600
+AWAIT_RECHECK_SECONDS = 30
+
+# Agent-facing tool descriptions. Descriptions are the one instruction channel
+# present on every call even when the user loads no prompt, so each one chains
+# to the next tool in the workflow by literal name.
+DESCRIPTION_LIST_EXPERIMENTS = (
+    "List the human-curated experiments this server can run: ids, descriptions, "
+    "phase names, optimization metric, and authorized capabilities. Read-only. Start here. If "
+    "next_cursor is non-null, call again with it. Then call "
+    f"{TOOL_VALIDATE_CONFIG} on the id you plan to use."
+)
+DESCRIPTION_VALIDATE_CONFIG = (
+    "Re-check that the cataloged config has not changed, then inspect it before launching: "
+    "authorized capabilities plus per-phase names, terminal-attempt targets, "
+    "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
+    "Call once while planning an experiment; "
+    f"{TOOL_LAUNCH_SWEEP} independently refuses a changed config, so unchanged "
+    "relaunches do not need another validation call."
+)
+DESCRIPTION_GET_LATEST_RUN = (
+    "Return the single most recently launched MCP run for one catalog experiment, or "
+    "found=false if none exists. Read-only. Use after reconnecting or when a prior run_id "
+    "was lost; this computes the newest run so you must not scan or rank a list. If found=false, "
+    "report that no prior run exists and ask the user before launching a replacement. Then use "
+    f"the returned run_id with {TOOL_AWAIT_RUN}, {TOOL_GET_STATUS}, or {TOOL_GET_WINNERS}."
+)
+DESCRIPTION_LAUNCH_SWEEP = (
+    "Start an experiment's sweep as a detached background run that survives this "
+    f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
+    f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
+    "only to resume when earlier phase winners already exist. The launch independently "
+    "re-checks config identity and refuses a config changed since server startup. A "
+    "permission refusal is deliberate catalog policy: report it to the user and do not "
+    "retry or work around it. "
+    "A concurrency-limit refusal is transient and names blocking run_ids: wait on one with "
+    f"{TOOL_AWAIT_RUN}, then retry this launch only after that run is terminal."
+)
+DESCRIPTION_GET_STATUS = (
+    "Per-phase trial progress and the run process state (running / succeeded / "
+    "failed / cancelled). If run.recovery_required is true, stop monitoring and report "
+    "it to the user: operator recovery is required, and the run will not become terminal "
+    "on its own. Provide exactly one of experiment_id or run_id; after a "
+    "launch, always use the run_id so catalog edits cannot redirect monitoring. "
+    "State counts are dense and explicitly split into cumulative, before-run, and this-run "
+    "dimensions; remaining_trials is already computed. "
+    "current_generation_id and published_generation_id are always the actual pointers, never "
+    "forced to a queried run_id; represented_generation_id is the generation whose winner_present "
+    "and summary_present this payload shows - a run_id itself when querying by run_id, otherwise "
+    "published_generation_id. is_published is true only when represented_generation_id is the "
+    "actual published one; a run_id whose own publication failed still reports its own "
+    "this-run counts and winners with is_published=false. "
+    "trial_data_available=false means zero counts are not trustworthy. result_source names "
+    "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
+    "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
+    f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
+    "instead, wait at least 30 seconds between calls. When terminal, call "
+    f"{TOOL_GET_WINNERS} with the same run_id."
+)
+DESCRIPTION_GET_WINNERS = (
+    "The end of the workflow: per completed phase, the concrete winner_source, "
+    "promotion context, metric value, policy-filtered sampled params, gate status, and "
+    "completeness. winner_source identifies the actual source phase and trial when "
+    "continue_baseline rejects a candidate. "
+    "Phases that completed still report winners when the run later failed or was "
+    "cancelled. Values shown as <redacted> are intentional catalog policy, not "
+    "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
+    "run_id); result_source identifies current versus frozen results, and missing_phases plus "
+    "all_phases_have_winners already compute completeness. Terminal run-id winners stay frozen "
+    "if the experiment is later resumed and never fall back to mutable results. This returns "
+    "winners, not search ranges or non-winning trial history: do not infer convergence, trends, "
+    "robustness, or boundary effects from it. Read-only."
+)
+DESCRIPTION_CANCEL_SWEEP = (
+    "Stop a launched run by run_id. Use only when the user asks or to prevent an "
+    "unwanted active sweep. If recovery_required is true, report it to the user; "
+    "recovery is operator-only and no MCP tool can clear it. Repeating a cancel "
+    "is safe but does not replace operator recovery."
+)
+DESCRIPTION_AWAIT_RUN = (
+    "Wait for a launched run to change. Blocks up to timeout_seconds (default "
+    f"{AWAIT_DEFAULT_TIMEOUT_SECONDS}, max {AWAIT_MAX_TIMEOUT_SECONDS}) and returns "
+    "early when operator recovery is required, the run reaches a terminal state, or a "
+    "phase gains a winner; "
+    "otherwise returns the current status at timeout — if the state is still "
+    "running, call again with the same run_id. Returns the same payload as "
+    f"{TOOL_GET_STATUS} plus changed and reason (recovery_required / terminal / "
+    f"phase_completed / timeout). If reason is recovery_required, stop waiting and "
+    "report it to the user: the run needs operator recovery and will not become terminal "
+    f"on its own. If reason is terminal, call {TOOL_GET_WINNERS} with the same run_id. "
+    f"If reason is phase_completed, call {TOOL_AWAIT_RUN} again with the same run_id. "
+    "At timeout, changed may still be true when trial counts advanced without another stop "
+    "condition; report that progress and call this tool again while the run is running. "
+    "Read-only. While waiting, status is rechecked at most once every "
+    f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
+)
 
 ExperimentId = Annotated[
     str,
@@ -115,6 +227,16 @@ MaybeCursor = Annotated[
         description="Opaque pagination cursor returned by a previous phasesweep_list_experiments call.",
     ),
 ]
+AwaitTimeoutSeconds = Annotated[
+    int,
+    Field(
+        description=(
+            "Seconds to block waiting for the run to change before returning its current status."
+        ),
+        ge=AWAIT_MIN_TIMEOUT_SECONDS,
+        le=AWAIT_MAX_TIMEOUT_SECONDS,
+    ),
+]
 
 
 class _ToolPayload(BaseModel):
@@ -123,11 +245,30 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ObjectiveEvidencePayload(_ToolPayload, _ObjectiveEvidenceFields):
+    """Assurance properties enforced by the configured objective extractor.
+
+    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
+    exactly what each flag means and which runtime checks back it.
+    """
+
+
 class MetricPayload(_ToolPayload):
     """Optimization metric descriptor."""
 
     name: str = Field(description="Metric key extracted from trial output.")
     goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
+    objective_evidence: ObjectiveEvidencePayload
+
+
+class CapabilitiesPayload(_ToolPayload):
+    """Catalog-authorized actions for one experiment."""
+
+    launch: bool = Field(description="Whether the agent may launch this experiment.")
+    cancel: bool = Field(description="Whether the agent may cancel its launched runs.")
+    resume_from_phase: bool = Field(
+        description="Whether launch may use from_phase after earlier winners exist."
+    )
 
 
 class ExperimentSummaryPayload(_ToolPayload):
@@ -137,6 +278,7 @@ class ExperimentSummaryPayload(_ToolPayload):
     description: str = Field(description="Operator-authored catalog description.")
     phases: list[PhaseName] = Field(description="Declared phases, in execution order.")
     metric: MetricPayload
+    capabilities: CapabilitiesPayload
 
 
 class ListExperimentsResult(_ToolPayload):
@@ -154,7 +296,12 @@ class PhaseValidationPayload(_ToolPayload):
     """Agent-safe phase structure."""
 
     name: PhaseName
-    n_trials: int = Field(ge=0, description="Number of trials configured for this phase.")
+    n_trials: int = Field(
+        ge=1,
+        description=(
+            "Target number of terminal attempts; COMPLETE, FAIL, and PRUNED trials all count."
+        ),
+    )
     sampler: str = Field(description="Sampler type only; sampler internals stay in the config.")
     inherits: list[PhaseName] = Field(description="Parent phases inherited by this phase.")
     search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")
@@ -165,7 +312,39 @@ class ValidateConfigResult(_ToolPayload):
 
     experiment_id: ExperimentId
     metric: MetricPayload
+    capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
+
+
+FailureCode = Literal[
+    "fingerprint_mismatch",
+    "study_schema_mismatch",
+    "storage_unavailable",
+    "sampler_continuation_unsupported",
+    "trial_target_regression",
+    "experiment_busy",
+    "trainer_failed",
+    "timeout",
+    "cleanup_uncertain",
+    "cancelled",
+    "internal_error",
+]
+
+
+class FailureCausePayload(_ToolPayload):
+    """Safe secondary cause retained beneath an actionable terminal failure."""
+
+    code: FailureCode
+    stage: Literal["preflight", "execution", "cleanup"]
+    retryable: bool
+    actor: Literal["agent", "operator"]
+    remediation: str
+
+
+class FailurePayload(FailureCausePayload):
+    """Path-free terminal failure category and recovery policy."""
+
+    cause: FailureCausePayload | None = None
 
 
 class RunPayload(_ToolPayload):
@@ -174,37 +353,167 @@ class RunPayload(_ToolPayload):
     run_id: RunId
     state: RunState
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
+    recovery_required: bool = Field(
+        description=(
+            "True when cleanup is uncertain and only the operator can run "
+            "phasesweep mcp recover-run; the run remains state=running until recovery."
+        )
+    )
+    failure: FailurePayload | None = Field(
+        default=None,
+        description="Safe terminal failure category and next action; null while running or successful.",
+    )
+
+
+class GetLatestRunResult(_ToolPayload):
+    """Newest durable run handle for one experiment."""
+
+    experiment_id: ExperimentId
+    found: bool = Field(description="Whether any MCP run is recorded for this experiment.")
+    run: RunPayload | None
 
 
 class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
     phase: PhaseName
-    trials: dict[str, int] = Field(description="Optuna trial counts by state.")
-    running: int = Field(ge=0, description="Number of currently running trials.")
+    trials: dict[Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"], int] = Field(
+        description="Dense cumulative study counts; every state key is always present."
+    )
+    running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")
+    target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
+    completed_trials_total: int = Field(ge=0, description="Cumulative COMPLETE study rows.")
+    terminal_trials_total: int = Field(
+        ge=0, description="Cumulative COMPLETE + PRUNED + FAIL study rows."
+    )
+    terminal_trials_before_run: int = Field(
+        ge=0, description="Terminal rows that predate the represented generation."
+    )
+    attempts_launched_this_run: int = Field(
+        ge=0, description="All attempts owned by the represented generation."
+    )
+    terminal_trials_this_run: int = Field(
+        ge=0, description="Terminal attempts owned by the represented generation."
+    )
+    remaining_trials: int = Field(
+        ge=0, description="Additional terminal trials needed to reach the configured target."
+    )
+    target_already_satisfied: bool = Field(
+        description="Whether pre-run terminal history already met the configured target."
+    )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
+    trial_data_available: bool = Field(
+        description=(
+            "Whether the backing study was readable; false means zero counts are not evidence "
+            "that no trials exist."
+        )
+    )
 
 
 class GetStatusResult(_ToolPayload):
     """Structured output for get_status."""
 
     experiment_id: ExperimentId
+    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    current_generation_id: str | None = Field(
+        description=(
+            "Most recent generation id known to this experiment; may be failed or "
+            "in-progress. Null when no generation has ever started. Always the actual "
+            "mutable pointer, never forced to a queried run_id."
+        )
+    )
+    published_generation_id: str | None = Field(
+        description=(
+            "Last successfully published generation id. Null when nothing has published "
+            "yet. Always the actual validated pointer, never forced to a queried run_id, "
+            "and may differ from represented_generation_id."
+        )
+    )
+    represented_generation_id: str | None = Field(
+        description=(
+            "The generation whose winner_present, summary_present, and this-run trial "
+            "counts this payload shows: the queried run_id itself when one was given, "
+            "otherwise published_generation_id."
+        )
+    )
+    is_published: bool = Field(
+        description=(
+            "True only when represented_generation_id is not null and equals "
+            "published_generation_id. A run_id whose own publication failed reports "
+            "false here while still showing that generation's own winners."
+        )
+    )
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload | None
+    elapsed_seconds: int | None = Field(
+        description=(
+            "Seconds since launch while running; total run duration once terminal; "
+            "null when no run is associated with this query."
+        )
+    )
+
+
+class AwaitRunResult(GetStatusResult):
+    """Structured output for await_run: get_status plus what ended the wait."""
+
+    changed: bool = Field(
+        description=(
+            "Whether run state, recovery requirement, phase progress, or winner presence "
+            "changed during the wait."
+        )
+    )
+    reason: Literal["recovery_required", "terminal", "phase_completed", "timeout"] = Field(
+        description=(
+            "Why the wait returned: operator recovery is required, the run reached a "
+            "terminal state, a phase gained a winner, or the timeout elapsed without one "
+            "of those stop conditions. At timeout, changed may still be true when trial "
+            "counts advanced."
+        )
+    )
+
+
+class WinnerSourcePayload(_ToolPayload):
+    """Concrete trial that supplies an exposed winner."""
+
+    kind: Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+    phase: PhaseName
+    trial_number: int = Field(ge=0)
+    study: str | None = None
+
+
+class PromotionOutcomePayload(_ToolPayload):
+    """Safe phase-promotion context for an exposed winner."""
+
+    action: Literal["promote", "continue_baseline"]
+    baseline_phase: PhaseName
+    candidate_trial_number: int = Field(ge=0)
+    candidate_metric: float
+    baseline_trial_number: int = Field(ge=0)
+    baseline_metric: float
+    min_delta: float
+    improvement: float | None
 
 
 class WinnerPhasePayload(_ToolPayload):
     """Agent-visible phase winner."""
 
     phase: PhaseName
-    trial_number: int = Field(ge=0)
+    winner_source: WinnerSourcePayload
+    winner_generation: Literal["current_generation", "prior_generation", "unknown"]
+    promotion: PromotionOutcomePayload | None = None
     metric: float
     params: dict[str, Any] = Field(
         description=(
             "Sampled winning hyperparameters only; fixed/inherited overrides are omitted. "
             "Values may be redacted by catalog visible_params policy."
+        )
+    )
+    params_redacted: bool = Field(
+        description=(
+            "True when any param value was withheld by catalog visible_params policy - "
+            "deliberate, not missing data."
         )
     )
     gates_passed: bool | None = Field(
@@ -217,7 +526,15 @@ class GetWinnersResult(_ToolPayload):
     """Structured output for get_winners."""
 
     experiment_id: ExperimentId
+    run_id: RunId | None
+    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    metric: MetricPayload
+    declared_phase_count: int = Field(ge=0)
+    winner_count: int = Field(ge=0)
+    missing_phases: list[PhaseName]
+    all_phases_have_winners: bool
     phases: list[WinnerPhasePayload]
+    failure: FailurePayload | None = None
 
 
 class LaunchSweepResult(_ToolPayload):
@@ -238,6 +555,9 @@ class CancelSweepResult(_ToolPayload):
         description=(
             "Whether runner cleanup was fully confirmed; null when the run was already terminal."
         ),
+    )
+    recovery_required: bool = Field(
+        description="Whether operator-only cleanup recovery is required after this call."
     )
 
 
@@ -262,6 +582,71 @@ def _cursor_offset(cursor: str | None) -> int:
     return offset
 
 
+def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
+    """Compute wall seconds for a run: launch-to-now while running, total when terminal.
+
+    Terminal runs use the runner-stamped ``ended_at`` in status.json. A
+    terminal run with no readable endpoint reports ``None`` rather than a guess.
+
+    :param RunStore store: Run store used to read the terminal status.
+    :param RunHandle handle: Persisted run whose duration is measured.
+    :param str state: Derived run state for ``handle``.
+    :return int | None: Non-negative whole seconds, or ``None`` when the
+        endpoints cannot be established.
+    """
+    started = parse_utc_iso(handle.started_at)
+    assert started is not None
+    ended: datetime | None
+    if state == "running":
+        ended = datetime.now(UTC)
+    else:
+        status = store.recorded_terminal_status(handle)
+        ended = parse_utc_iso(status.get("ended_at")) if status is not None else None
+    if ended is None:
+        return None
+    return max(0, round((ended - started).total_seconds()))
+
+
+def _await_snapshot(
+    state: str,
+    recovery_required: bool,
+    status: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Reduce a status read to the comparable facts await_run watches.
+
+    :param str state: Derived run state at read time.
+    :param bool recovery_required: Whether the run needs operator recovery.
+    :param dict[str, Any] status: Path-free ``read_status`` payload.
+    :return tuple[Any, ...]: Hashable snapshot of run state, recovery requirement,
+        and per-phase winner presence and dense trial-state counts.
+    """
+    return (
+        state,
+        recovery_required,
+        tuple(
+            (
+                phase["phase"],
+                phase["winner_present"],
+                tuple(sorted(phase["trials"].items())),
+            )
+            for phase in status["phases"]
+        ),
+    )
+
+
+def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -> bool:
+    """Return whether any phase gained a winner between two await snapshots.
+
+    :param tuple[Any, ...] baseline: Snapshot taken when the wait began.
+    :param tuple[Any, ...] snapshot: Snapshot from the latest recheck.
+    :return bool: ``True`` when a phase's winner artifact appeared mid-wait.
+    """
+    had_winner = {phase: winner for phase, winner, _counts in baseline[2]}
+    return any(
+        winner and not had_winner.get(phase, False) for phase, winner, _counts in snapshot[2]
+    )
+
+
 class PhaseSweepMCP:
     """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
 
@@ -272,11 +657,11 @@ class PhaseSweepMCP:
 
         :param Registry registry: Validated catalog registry.
         :param RunStore runs: Persistent detached-run store.
-        :param AuditLogger | None audit: Optional structured audit logger.
+        :param AuditLogger | None audit: Optional audit sink override; defaults to state_dir/audit.jsonl.
         """
         self._registry = registry
         self._runs = runs
-        self._audit = audit
+        self._audit = audit or AuditLogger(registry.state_dir / "audit.jsonl")
 
     def _audit_success(
         self,
@@ -288,7 +673,7 @@ class PhaseSweepMCP:
         state_after: dict[str, Any] | None = None,
         result_counts: dict[str, int] | None = None,
     ) -> None:
-        """Record a successful MCP tool call when audit logging is enabled.
+        """Record a successful state-changing tool call.
 
         :param str tool: MCP tool name.
         :param dict[str, Any] | None args: Safe agent-supplied arguments.
@@ -297,16 +682,15 @@ class PhaseSweepMCP:
         :param dict[str, Any] | None state_after: Safe state summary after the call.
         :param dict[str, int] | None result_counts: Result counts that avoid copying full payloads.
         """
-        if self._audit is not None:
-            self._audit.record(
-                tool=tool,
-                args=args,
-                outcome="success",
-                resolved=resolved,
-                state_before=state_before,
-                state_after=state_after,
-                result_counts=result_counts,
-            )
+        self._audit.record(
+            tool=tool,
+            args=args,
+            outcome="success",
+            resolved=resolved,
+            state_before=state_before,
+            state_after=state_after,
+            result_counts=result_counts,
+        )
 
     def _audit_error(
         self,
@@ -317,7 +701,7 @@ class PhaseSweepMCP:
         resolved: dict[str, Any] | None = None,
         state_before: dict[str, Any] | None = None,
     ) -> None:
-        """Record a failed MCP tool call when audit logging is enabled.
+        """Record a failed state-changing tool call.
 
         :param str tool: MCP tool name.
         :param dict[str, Any] | None args: Safe agent-supplied arguments.
@@ -325,9 +709,7 @@ class PhaseSweepMCP:
         :param dict[str, Any] | None resolved: Safe server-resolved identifiers known before failure.
         :param dict[str, Any] | None state_before: Safe state summary before the failure.
         """
-        if self._audit is None:
-            return
-        message = exc.safe_message if isinstance(exc, McpToolError) else "internal error"
+        message = str(exc) if isinstance(exc, McpToolError) else "internal error"
         self._audit.record(
             tool=tool,
             args=args,
@@ -350,31 +732,18 @@ class PhaseSweepMCP:
         :param str | None cursor: Optional pagination cursor returned by a prior call.
         :return dict[str, Any]: Catalog page safe for the agent.
         """
-        args = {"limit": limit, "cursor": cursor}
-        total_count = 0
-        page: list[dict[str, Any]] = []
-        try:
-            if limit < 1 or limit > MAX_LIST_LIMIT:
-                raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
-            offset = _cursor_offset(cursor)
-            experiments = self._registry.summaries()
-            total_count = len(experiments)
-            page = experiments[offset : offset + limit]
-            next_offset = offset + len(page)
-            result = {
-                "experiments": page,
-                "total_count": total_count,
-                "next_cursor": str(next_offset) if next_offset < total_count else None,
-            }
-        except Exception as exc:
-            self._audit_error(TOOL_LIST_EXPERIMENTS, args, exc)
-            raise
-        self._audit_success(
-            TOOL_LIST_EXPERIMENTS,
-            args,
-            result_counts={"experiments": len(page), "total_count": total_count},
-        )
-        return result
+        if limit < 1 or limit > MAX_LIST_LIMIT:
+            raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+        offset = _cursor_offset(cursor)
+        experiments = self._registry.summaries()
+        total_count = len(experiments)
+        page = experiments[offset : offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "experiments": page,
+            "total_count": total_count,
+            "next_cursor": str(next_offset) if next_offset < total_count else None,
+        }
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
         """Report an experiment's phase structure (never the command/env/storage).
@@ -382,77 +751,218 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog experiment id to inspect.
         :return dict[str, Any]: Path-free validation payload for the agent.
         """
-        args = {"experiment_id": experiment_id}
-        resolved: dict[str, Any] = {}
-        search_space_keys = 0
-        try:
-            reg = self._registry.get(experiment_id)
-            resolved["experiment_id"] = reg.id
-            exp = reg.experiment
-            search_space_keys = sum(len(p.search_space) for p in exp.phases)
-            phases = [
-                {
-                    "name": p.name,
-                    "n_trials": p.n_trials,
-                    "sampler": p.sampler.type,
-                    "inherits": p.inherits,
-                    "search_space": sorted(p.search_space),  # keys only, not ranges
-                }
-                for p in exp.phases
-            ]
-            # Already validated at startup; report the structure, never the command.
-            result = {
-                "experiment_id": reg.id,
-                "metric": {"name": exp.metric.name, "goal": exp.metric.goal},
-                "phases": phases,
+        reg = self._registry.get(experiment_id)
+        self._current_config_bytes(reg)
+        exp = reg.experiment
+        phases = [
+            {
+                "name": p.name,
+                "n_trials": p.n_trials,
+                "sampler": p.sampler.type,
+                "inherits": p.inherits,
+                "search_space": sorted(p.search_space),  # keys only, not ranges
             }
-        except Exception as exc:
-            self._audit_error(TOOL_VALIDATE_CONFIG, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_VALIDATE_CONFIG,
-            args,
-            resolved=resolved,
-            result_counts={
-                "phases": len(phases),
-                "search_space_keys": search_space_keys,
-            },
-        )
-        return result
+            for p in exp.phases
+        ]
+        return {
+            "experiment_id": reg.id,
+            "metric": reg.metric_payload,
+            "capabilities": reg.capabilities,
+            "phases": phases,
+        }
+
+    def latest_run(self, experiment_id: str) -> dict[str, Any]:
+        """Return the newest durable MCP run for one catalog experiment.
+
+        :param str experiment_id: Catalog id whose latest run should be resolved.
+        :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
+        """
+        reg = self._registry.get(experiment_id)
+        handle = self._runs.latest_run_for(reg.id)
+        run = self._run_payload(handle) if handle is not None else None
+        return {
+            "experiment_id": reg.id,
+            "found": run is not None,
+            "run": run,
+        }
+
+    def _run_payload(self, handle: RunHandle) -> dict[str, Any]:
+        """Build one agent-visible run state with explicit recovery metadata.
+
+        :param RunHandle handle: Persisted run handle to derive.
+        :return dict[str, Any]: Run id, state, launch timestamp, and recovery flag.
+        """
+        state = self._runs.state(handle)
+        return {
+            "run_id": handle.run_id,
+            "state": state,
+            "started_at": handle.started_at,
+            "recovery_required": self._runs.recovery_required(handle),
+            "failure": self._run_failure_payload(handle),
+        }
+
+    def _run_failure_payload(self, handle: RunHandle) -> dict[str, Any] | None:
+        """Return a validated safe terminal failure, never the raw exception text.
+
+        :param RunHandle handle: Run handle whose recorded terminal status
+            should be inspected.
+        :return dict[str, Any] | None: The run's ``failure`` payload validated
+            against :class:`FailurePayload` and dumped to JSON-safe types, or
+            ``None`` when there is no recorded terminal status, no failure was
+            recorded, or the stored failure fails schema validation.
+        """
+        terminal = self._runs.recorded_terminal_status(handle)
+        if terminal is None or terminal.get("failure") is None:
+            return None
+        try:
+            return FailurePayload.model_validate(terminal["failure"]).model_dump(
+                mode="json", exclude_none=True
+            )
+        except ValidationError:
+            return None
 
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
         """Per-phase trial counts and winner presence plus the run process state.
 
-        Provide either ``experiment_id`` (reports the live run, if any) or
-        ``run_id`` (reports that specific run). Raises if neither is given.
+        Provide either ``experiment_id`` (reports the current shared studies and
+        live run, if any) or ``run_id`` (reports that specific run, using its
+        frozen result snapshot once terminal). Raises if neither is given.
 
         :param str | None experiment_id: Optional catalog id for experiment-level status.
         :param str | None run_id: Optional detached run id for run-specific status.
         :return dict: Path-free status payload for the agent.
         """
-        args = {"experiment_id": experiment_id, "run_id": run_id}
-        resolved: dict[str, Any] = {}
-        state_after: dict[str, Any] = {}
-        try:
-            target_id, experiment, run, resolved = self._resolve_read_target(
-                experiment_id=experiment_id,
-                run_id=run_id,
-                include_run=True,
-            )
-            if run is not None:
-                state_after = {"run_state": run["state"]}
-            result = status_payload(target_id, read_status(experiment), run)
-        except Exception as exc:
-            self._audit_error(TOOL_GET_STATUS, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_GET_STATUS,
-            args,
-            resolved=resolved,
-            state_after=state_after or None,
-            result_counts={"phases": len(result["phases"]), "running_runs": int(run is not None)},
+        target_id, status, run, handle, result_source = self._read_status_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
         )
+        return self._status_result(target_id, status, run, handle, result_source)
+
+    async def await_run(
+        self,
+        run_id: str,
+        timeout_seconds: int = AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Wait until a launched run changes, then return its full status.
+
+        A bounded sleep-and-recheck loop over the same reads ``status`` does:
+        no new state, no side effects. Returns early when the run reaches a
+        terminal state, operator recovery is required, or a phase gains a
+        winner; otherwise returns the current status when the (clamped)
+        timeout elapses. Each recheck re-resolves the run from disk, so state
+        written while this request is active is observed. After a server
+        restart, a fresh call resumes from the same durable run.
+
+        :param str run_id: Detached run id to wait on.
+        :param int timeout_seconds: Requested wait, clamped to
+            [``AWAIT_MIN_TIMEOUT_SECONDS``, ``AWAIT_MAX_TIMEOUT_SECONDS``].
+        :return dict[str, Any]: ``status`` payload plus ``changed`` and
+            ``reason`` (``recovery_required`` / ``terminal`` /
+            ``phase_completed`` / ``timeout``).
+        """
+        timeout = min(
+            AWAIT_MAX_TIMEOUT_SECONDS, max(AWAIT_MIN_TIMEOUT_SECONDS, int(timeout_seconds))
+        )
+        deadline = time.monotonic() + timeout
+        baseline: tuple[Any, ...] | None = None
+        while True:
+            target_id, status, run, handle, result_source = await asyncio.to_thread(
+                self._read_status_target,
+                experiment_id=None,
+                run_id=run_id,
+            )
+            run = cast(dict[str, Any], run)
+            snapshot = _await_snapshot(
+                run["state"],
+                run["recovery_required"],
+                status,
+            )
+            if baseline is None:
+                baseline = snapshot
+            if run["recovery_required"]:
+                reason = "recovery_required"
+            elif run["state"] in ("succeeded", "failed", "cancelled"):
+                reason = "terminal"
+            elif _phase_gained_winner(baseline, snapshot):
+                reason = "phase_completed"
+            elif time.monotonic() >= deadline:
+                reason = "timeout"
+            else:
+                await asyncio.sleep(
+                    min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
+                )
+                continue
+            break
+        result = self._status_result(target_id, status, run, handle, result_source)
+        result["changed"] = snapshot != baseline
+        result["reason"] = reason
         return result
+
+    def _read_status_target(
+        self,
+        *,
+        experiment_id: str | None,
+        run_id: str | None,
+    ) -> tuple[
+        str,
+        dict[str, Any],
+        dict[str, Any] | None,
+        RunHandle | None,
+        ResultSource,
+    ]:
+        """Resolve a status target and read its current or frozen status payload.
+
+        :param str | None experiment_id: Catalog id for a current experiment read.
+        :param str | None run_id: Persisted run id for a run-specific read.
+        :return tuple: Target id, status data, optional run state and handle,
+            and result provenance.
+        """
+        target_id, experiment, run, handle = self._resolve_read_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            include_run=True,
+        )
+        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
+        status = (
+            snapshot.status_payload()
+            if snapshot is not None
+            else read_status(
+                experiment,
+                generation_id=handle.run_id if handle is not None else None,
+            )
+        )
+        result_source: ResultSource = (
+            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
+        )
+        return target_id, status, run, handle, result_source
+
+    def _status_result(
+        self,
+        target_id: str,
+        status: dict[str, Any],
+        run: dict[str, Any] | None,
+        handle: RunHandle | None,
+        result_source: ResultSource,
+    ) -> dict[str, Any]:
+        """Build the common path-free response for status and await_run.
+
+        :param str target_id: Experiment id represented by ``status``.
+        :param dict[str, Any] status: Current or frozen engine status payload.
+        :param dict[str, Any] | None run: Optional derived detached-run state.
+        :param RunHandle | None handle: Optional already-resolved detached-run handle.
+        :param ResultSource result_source: Current shared state or frozen run snapshot.
+        :return dict[str, Any]: Agent-safe status response.
+        """
+        elapsed_seconds = None
+        if run is not None and handle is not None:
+            elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+        return status_payload(
+            target_id,
+            status,
+            run,
+            result_source=result_source,
+            elapsed_seconds=elapsed_seconds,
+        )
 
     def _resolve_read_target(
         self,
@@ -460,45 +970,36 @@ class PhaseSweepMCP:
         experiment_id: str | None,
         run_id: str | None,
         include_run: bool,
-    ) -> tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]:
+    ) -> tuple[str, Experiment, dict[str, Any] | None, RunHandle | None]:
         """Resolve status/winner reads to the catalog config or immutable run snapshot.
 
         :param str | None experiment_id: Catalog id for current experiment-level reads.
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
-        :return tuple[str, Experiment, dict[str, Any] | None, dict[str, Any]]: Target id,
-            parsed experiment, optional run payload, and audit-safe resolved ids.
+        :return tuple: Target id, parsed experiment, optional run payload, and handle.
         """
         if (experiment_id is None) == (run_id is None):
-            raise McpToolError("provide exactly one of experiment_id or run_id")
+            provided = "neither" if experiment_id is None else "both"
+            raise McpToolError(
+                f"provide exactly one of experiment_id or run_id; you provided {provided}. "
+                "After a launch, prefer the run_id."
+            )
         if run_id is not None:
             handle = self._runs.get(run_id)
             if handle is None:
                 raise UnknownRunError(run_id)
-            resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             experiment = self._load_run_experiment(handle)
             run = None
             if include_run:
-                run = {
-                    "run_id": run_id,
-                    "state": self._runs.state(handle),
-                    "started_at": handle.started_at,
-                }
-            return handle.experiment_id, experiment, run, resolved
+                run = self._run_payload(handle)
+            return handle.experiment_id, experiment, run, handle
 
         assert experiment_id is not None
         reg = self._registry.get(experiment_id)
         live = self._runs.live_run_for(experiment_id)
-        resolved = {"experiment_id": reg.id}
-        if live is not None:
-            resolved["run_id"] = live.run_id
         experiment = self._load_run_experiment(live) if live is not None else reg.experiment
-        run = (
-            {"run_id": live.run_id, "state": "running", "started_at": live.started_at}
-            if include_run and live is not None
-            else None
-        )
-        return reg.id, experiment, run, resolved
+        run = self._run_payload(live) if include_run and live is not None else None
+        return reg.id, experiment, run, live
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -514,22 +1015,14 @@ class PhaseSweepMCP:
         """
         snapshot_path = self._runs.config_snapshot_path(handle.run_id)
         try:
-            data = snapshot_path.read_bytes()
-        except OSError as exc:
-            log.info("cannot read config snapshot for run=%s: %s", handle.run_id, exc)
-            raise RunSnapshotUnavailableError(handle.run_id) from None
-        if hashlib.sha256(data).hexdigest() != handle.config_sha256:
-            log.info("config snapshot hash mismatch for run=%s", handle.run_id)
-            raise RunSnapshotUnavailableError(handle.run_id)
-        try:
-            config = load_config_bytes(data, source=f"run snapshot {handle.run_id}")
-        except (ValueError, yaml.YAMLError) as exc:
+            return load_experiment_snapshot(
+                snapshot_path,
+                handle.config_sha256,
+                source=f"run snapshot {handle.run_id}",
+            )
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)
             raise RunSnapshotUnavailableError(handle.run_id) from None
-        if not isinstance(config, Experiment):
-            log.info("config snapshot for run=%s is not a single experiment", handle.run_id)
-            raise RunSnapshotUnavailableError(handle.run_id)
-        return config
 
     def winners(
         self, experiment_id: str | None = None, *, run_id: str | None = None
@@ -537,45 +1030,97 @@ class PhaseSweepMCP:
         """Return the winning hyperparameters per completed phase.
 
         Provide ``experiment_id`` for the current cataloged experiment, or ``run_id``
-        to read winners from the immutable config snapshot that run was launched
-        with. Run-specific reads must not drift when the cataloged config changes.
+        to read winners from the immutable config and terminal result snapshots
+        that run recorded. Run-specific reads must not drift when the cataloged
+        config changes or a later run resumes the shared studies.
 
         :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
         :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
-        args = {"experiment_id": experiment_id, "run_id": run_id}
-        resolved: dict[str, Any] = {}
-        try:
-            target_id, experiment, _run, resolved = self._resolve_read_target(
-                experiment_id=experiment_id,
-                run_id=run_id,
-                include_run=False,
-            )
-            try:
-                visible_params = self._registry.get(target_id).visible_params
-            except UnknownExperimentError:
-                if run_id is None:
-                    raise
-                # A run snapshot remains readable after the operator removes
-                # its catalog entry. Without a current visibility policy,
-                # default to the strict redacted posture.
-                visible_params = "none"
-            result = winners_payload(
-                target_id,
-                read_winners(experiment),
-                visible_params=visible_params,
-            )
-        except Exception as exc:
-            self._audit_error(TOOL_GET_WINNERS, args, exc, resolved=resolved)
-            raise
-        self._audit_success(
-            TOOL_GET_WINNERS,
-            args,
-            resolved=resolved,
-            result_counts={"phases": len(result["phases"])},
+        target_id, experiment, _run, handle = self._resolve_read_target(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            include_run=False,
         )
+        try:
+            visible_params = self._registry.get(target_id).visible_params
+        except UnknownExperimentError:
+            if run_id is None:
+                raise
+            # A run snapshot remains readable after the operator removes
+            # its catalog entry. Without a current visibility policy,
+            # default to the strict redacted posture.
+            visible_params = "none"
+        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
+        if snapshot is not None:
+            winner_views = snapshot.winner_views()
+            represented_generation_id = snapshot.status.represented_generation_id
+        else:
+            # Resolve the represented generation once via read_status, then
+            # reuse that exact id for read_winners: two independent pointer
+            # resolutions here could otherwise mix identities from different
+            # moments (review v0.5.15 / blocker 3). represented_generation_id
+            # is the queried run_id itself when pinned, else the captured
+            # published id -- never the live current pointer, which is what
+            # this used to (incorrectly) label winners with.
+            status = read_status(
+                experiment,
+                generation_id=handle.run_id if handle is not None else None,
+            )
+            represented_generation_id = status["represented_generation_id"]
+            winner_views = read_winners(experiment, generation_id=represented_generation_id)
+        result_source: ResultSource = (
+            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
+        )
+        result = winners_payload(
+            target_id,
+            winner_views,
+            metric={
+                "name": experiment.metric.name,
+                "goal": experiment.metric.goal,
+                "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+            },
+            declared_phases=[phase.name for phase in experiment.phases],
+            result_source=result_source,
+            run_id=run_id,
+            represented_generation_id=represented_generation_id,
+            visible_params=visible_params,
+        )
+        result["failure"] = self._run_failure_payload(handle) if handle is not None else None
         return result
+
+    def _terminal_result_snapshot(self, handle: RunHandle) -> RunResultSnapshot | None:
+        """Return a live run's current view or require its frozen terminal snapshot.
+
+        :param RunHandle handle: Resolved run whose terminal status should be inspected.
+        :return RunResultSnapshot | None: Validated snapshot, or ``None`` while
+            the run remains non-terminal.
+        :raises RunResultSnapshotUnavailableError: Terminal status exists but
+            its immutable result snapshot is absent or invalid.
+        """
+        terminal_status = self._runs.recorded_terminal_status(handle)
+        if terminal_status is None:
+            return None
+        snapshot = parse_result_snapshot(terminal_status)
+        if snapshot is not None:
+            return snapshot
+        if self._runs.state(handle) == "running":
+            return None
+        # The runner may have completed the second atomic status write between
+        # the first read and the state check. Re-read before declaring a
+        # terminal snapshot unavailable.
+        latest_status = self._runs.recorded_terminal_status(handle)
+        if latest_status is not None:
+            terminal_status = latest_status
+            snapshot = parse_result_snapshot(terminal_status)
+            if snapshot is not None:
+                return snapshot
+        finalization_state = terminal_status.get("result_snapshot_state")
+        raise RunResultSnapshotUnavailableError(
+            handle.run_id,
+            finalization_state if isinstance(finalization_state, str) else None,
+        )
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> dict[str, Any]:
         """Start the sweep as a detached background run; return its run_id.
@@ -616,52 +1161,67 @@ class PhaseSweepMCP:
                 if busy is not None:
                     raise ExperimentBusyError(experiment_id, busy.run_id)
                 if len(live) >= self._registry.max_concurrent_runs:
-                    raise ConcurrencyLimitError(len(live), self._registry.max_concurrent_runs)
-                run_id = self._runs.new_run_id(reg.id)
-                config_snapshot_path = self._snapshot_config(reg, run_id)
-                pending = self._pending_handle(reg, run_id)
-                self._runs.save(pending)
-                handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
-                try:
-                    self._runs.save(handle)
-                except Exception as save_exc:
-                    marker_written = False
+                    blocking_run_ids = [
+                        handle.run_id
+                        for handle in sorted(live, key=lambda item: (item.started_at, item.run_id))
+                    ]
+                    raise ConcurrencyLimitError(
+                        len(live),
+                        self._registry.max_concurrent_runs,
+                        blocking_run_ids,
+                    )
+                config_bytes = self._current_config_bytes(reg)
+                for _ in range(10):
+                    run_id = self._runs.new_run_id(reg.id)
+                    pending = self._pending_handle(reg, run_id)
                     try:
-                        self._runs.mark_cleanup_uncertain(handle)
-                        marker_written = True
-                    except Exception as marker_exc:
-                        log.error(
-                            "cleanup uncertain after failed handle save for run_id=%s pgid=%s, "
-                            "but failed to persist cleanup uncertainty marker; original save error: %r",
-                            handle.run_id,
-                            handle.pgid,
-                            save_exc,
-                            exc_info=(type(marker_exc), marker_exc, marker_exc.__traceback__),
-                        )
+                        config_snapshot_path = self._snapshot_config(reg, run_id, config_bytes)
+                    except FileExistsError:
+                        continue
                     try:
-                        assert handle.pgid is not None
-                        cleanup_confirmed = kill_stale_group(
-                            handle.pid,
-                            handle.pid_starttime,
-                            pgid=handle.pgid,
-                        )
+                        self._runs.create(pending)
+                    except FileExistsError:
+                        with contextlib.suppress(OSError):
+                            config_snapshot_path.unlink()
+                        continue
                     except Exception:
-                        log.exception(
-                            "failed to terminate unsaved runner run_id=%s pgid=%s",
-                            handle.run_id,
-                            handle.pgid,
-                        )
-                    else:
-                        if cleanup_confirmed:
-                            if marker_written:
-                                with contextlib.suppress(Exception):
-                                    self._runs.clear_cleanup_uncertain(handle)
-                        else:
-                            log.error(
-                                "cleanup uncertain after failed handle save for run_id=%s pgid=%s",
-                                handle.run_id,
-                                handle.pgid,
-                            )
+                        with contextlib.suppress(OSError):
+                            config_snapshot_path.unlink()
+                        raise
+                    break
+                else:
+                    raise RuntimeError("failed to mint an unused MCP run id")
+                resolved["run_id"] = run_id
+                try:
+                    handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
+                except Exception as spawn_exc:
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=True,
+                        error_class=type(spawn_exc).__name__,
+                    )
+                    raise
+                if handle.pid_starttime is None:
+                    launch_exc = RuntimeError(
+                        "spawned runner has no Linux /proc start time; refused launch because "
+                        "later cancellation could not distinguish PID reuse"
+                    )
+                    cleanup_confirmed = self._terminate_failed_spawn(handle, launch_exc)
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=cleanup_confirmed,
+                        error_class=type(launch_exc).__name__,
+                    )
+                    raise launch_exc
+                try:
+                    self._runs.update(handle)
+                except Exception as save_exc:
+                    cleanup_confirmed = self._terminate_failed_spawn(handle, save_exc)
+                    self._record_launch_failure(
+                        pending,
+                        cleanup_confirmed=cleanup_confirmed,
+                        error_class=type(save_exc).__name__,
+                    )
                     raise
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
@@ -709,45 +1269,54 @@ class PhaseSweepMCP:
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
             before = self._runs.state(handle)
-            state_before = {"run_state": before}
+            recovery_required = self._runs.recovery_required(handle)
+            state_before = {
+                "run_state": before,
+                "recovery_required": recovery_required,
+            }
+            if before == "running" and handle.launch_state == "launching":
+                # No PID/PGID is durable yet. Signalling an empty identity and
+                # returning would let the launch continue immediately after a
+                # misleading cancellation response from a second server.
+                raise RunLaunchUnsettledError(run_id)
+            after: RunState
             if before != "running":
-                result = {"run_id": run_id, "state": before}  # already terminal
-                self._audit_success(
-                    TOOL_CANCEL_SWEEP,
-                    args,
-                    resolved=resolved,
-                    state_before=state_before,
-                    state_after={"run_state": before},
-                    result_counts={"runs": 1},
+                after = before
+                confirmed: bool | None = None
+            else:
+                # Keep the run live before signalling. In the force-kill/no-status
+                # case state() could otherwise briefly derive "failed" while trial
+                # descendants still hold resources.
+                self._runs.mark_cleanup_uncertain(handle)
+                # SIGTERM -> grace -> SIGKILL on the runner's process group. A
+                # runner-written status is useful only when it includes explicit
+                # cleanup evidence from the engine shutdown handler. If the server
+                # had to force-kill the runner first, or the handler reported
+                # uncertainty, child trial PGIDs may still live, so keep the run
+                # counted as live and fail closed.
+                identity = self._runs.cleanup_identity(handle)
+                runner_group_gone = kill_stale_group(
+                    identity.pid,
+                    identity.pid_starttime,
+                    pgid=identity.pgid,
+                    grace_seconds=30.0,
                 )
-                return result
-            # Keep the run live before signalling. In the force-kill/no-status
-            # case state() could otherwise briefly derive "failed" while trial
-            # descendants still hold resources.
-            self._runs.mark_cleanup_uncertain(handle)
-            # SIGTERM -> grace -> SIGKILL on the runner's process group. A
-            # runner-written status is useful only when it includes explicit
-            # cleanup evidence from the engine shutdown handler. If the server
-            # had to force-kill the runner first, or the handler reported
-            # uncertainty, child trial PGIDs may still live, so keep the run
-            # counted as live and fail closed.
-            identity = self._runs.cleanup_identity(handle)
-            runner_group_gone = kill_stale_group(
-                identity.pid,
-                identity.pid_starttime,
-                pgid=identity.pgid,
-                grace_seconds=30.0,
-            )
-            terminal_status = self._runs.recorded_terminal_status(handle)
-            confirmed = (
-                runner_group_gone
-                and terminal_status is not None
-                and terminal_status.get("cleanup_confirmed") is True
-            )
-            if confirmed:
-                self._runs.clear_cleanup_uncertain(handle)
-            after = self._runs.state(handle)
-            result = {"run_id": run_id, "state": after, "cleanup_confirmed": confirmed}
+                terminal_status = self._runs.recorded_terminal_status(handle)
+                confirmed = (
+                    runner_group_gone
+                    and terminal_status is not None
+                    and terminal_status.get("cleanup_confirmed") is True
+                )
+                if confirmed:
+                    self._runs.clear_cleanup_uncertain(handle)
+                after = self._runs.state(handle)
+                recovery_required = self._runs.recovery_required(handle)
+            result = {
+                "run_id": run_id,
+                "state": after,
+                "cleanup_confirmed": confirmed,
+                "recovery_required": recovery_required,
+            }
         except Exception as exc:
             self._audit_error(
                 TOOL_CANCEL_SWEEP,
@@ -757,12 +1326,18 @@ class PhaseSweepMCP:
                 state_before=state_before,
             )
             raise
+        state_after = {
+            "run_state": after,
+            "recovery_required": recovery_required,
+        }
+        if confirmed is not None:
+            state_after["cleanup_confirmed"] = confirmed
         self._audit_success(
             TOOL_CANCEL_SWEEP,
             args,
             resolved=resolved,
             state_before=state_before,
-            state_after={"run_state": after, "cleanup_confirmed": confirmed},
+            state_after=state_after,
             result_counts={"runs": 1},
         )
         return result
@@ -803,12 +1378,42 @@ class PhaseSweepMCP:
                     reason="has no compatible winner for the current config",
                 ) from None
 
-    def _snapshot_config(self, reg: RegisteredExperiment, run_id: str) -> Path:
-        """Write the immutable per-run config snapshot after hash verification.
+    def _snapshot_config(
+        self,
+        reg: RegisteredExperiment,
+        run_id: str,
+        data: bytes | None = None,
+    ) -> Path:
+        """Exclusively create the immutable config snapshot before publishing its run.
 
         :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
         :param str run_id: Run id whose snapshot path should be used.
+        :param bytes | None data: Already-verified config bytes, if available.
         :return Path: Written config snapshot path consumed by the detached runner.
+        """
+        if data is None:
+            data = self._current_config_bytes(reg)
+        snapshot_path = self._runs.config_snapshot_path(run_id)
+        try:
+            with open_private_text(snapshot_path, "x") as output:
+                output.write(data.decode("utf-8"))
+                output.flush()
+                os.fsync(output.fileno())
+            fsync_directory(snapshot_path.parent)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
+            raise RuntimeError("failed to create run config snapshot") from None
+        return snapshot_path
+
+    @staticmethod
+    def _current_config_bytes(reg: RegisteredExperiment) -> bytes:
+        """Read a cataloged config only when it still matches startup validation.
+
+        :param RegisteredExperiment reg: Frozen catalog entry to verify.
+        :return bytes: Current config bytes when their SHA-256 matches startup.
+        :raises ConfigChangedError: If the file is unreadable or changed.
         """
         try:
             data = reg.config_path.read_bytes()
@@ -817,13 +1422,7 @@ class PhaseSweepMCP:
             raise ConfigChangedError(reg.id) from None
         if hashlib.sha256(data).hexdigest() != reg.config_sha256:
             raise ConfigChangedError(reg.id)
-        snapshot_path = self._runs.config_snapshot_path(run_id)
-        try:
-            private_atomic_write_bytes(snapshot_path, data)
-        except OSError as exc:
-            log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
-            raise RuntimeError("failed to create run config snapshot") from None
-        return snapshot_path
+        return data
 
     def _pending_handle(self, reg: RegisteredExperiment, run_id: str) -> RunHandle:
         """Build the pre-spawn handle persisted before ``Popen``.
@@ -840,11 +1439,91 @@ class PhaseSweepMCP:
             pgid=None,
             pid_starttime=None,
             started_at=utc_now_iso(),
-            log_path=str(self._runs.log_path(run_id)),
-            status_path=str(self._runs.status_path(run_id)),
             launch_state="launching",
             allow_cancel=reg.allow_cancel,
         )
+
+    def _record_launch_failure(
+        self,
+        pending: RunHandle,
+        *,
+        cleanup_confirmed: bool,
+        error_class: str,
+    ) -> None:
+        """Finalize a known failed launch without masking its original error.
+
+        :param RunHandle pending: Durable pre-spawn handle to finalize.
+        :param bool cleanup_confirmed: Whether any spawned runner group is confirmed gone.
+        :param str error_class: Operator-facing class of the original launch failure.
+        """
+        try:
+            write_status_file(
+                self._runs.status_path(pending.run_id),
+                {
+                    "run_id": pending.run_id,
+                    "returncode": 1,
+                    "error_class": error_class,
+                    "cleanup_confirmed": cleanup_confirmed,
+                    "ended_at": utc_now_iso(),
+                    "result_snapshot_state": "failed",
+                    "result_snapshot_error": "LaunchDidNotProduceSnapshot",
+                },
+            )
+        except Exception:
+            # The unresolved launching handle remains a fail-closed concurrency
+            # reservation when even terminal bookkeeping cannot be persisted.
+            log.exception("failed to finalize launch error for run_id=%s", pending.run_id)
+
+    def _terminate_failed_spawn(
+        self,
+        handle: RunHandle,
+        original_error: BaseException,
+    ) -> bool:
+        """Terminate a spawned runner whose durable bookkeeping failed.
+
+        :param RunHandle handle: Spawned runner identity available in memory.
+        :param BaseException original_error: Launch failure preserved for diagnostics.
+        :return bool: Whether the runner process group is confirmed gone.
+        """
+        marker_written = False
+        try:
+            self._runs.mark_cleanup_uncertain(handle)
+            marker_written = True
+        except Exception as marker_exc:
+            log.error(
+                "cleanup uncertain after failed runner launch bookkeeping for "
+                "run_id=%s pgid=%s, but failed to persist cleanup uncertainty marker; "
+                "original error: %r",
+                handle.run_id,
+                handle.pgid,
+                original_error,
+                exc_info=(type(marker_exc), marker_exc, marker_exc.__traceback__),
+            )
+        try:
+            assert handle.pgid is not None
+            cleanup_confirmed = kill_stale_group(
+                handle.pid,
+                handle.pid_starttime,
+                pgid=handle.pgid,
+            )
+        except Exception:
+            log.exception(
+                "failed to terminate untracked runner run_id=%s pgid=%s",
+                handle.run_id,
+                handle.pgid,
+            )
+            return False
+        if cleanup_confirmed:
+            if marker_written:
+                with contextlib.suppress(Exception):
+                    self._runs.clear_cleanup_uncertain(handle)
+        else:
+            log.error(
+                "cleanup uncertain after failed runner launch bookkeeping for run_id=%s pgid=%s",
+                handle.run_id,
+                handle.pgid,
+            )
+        return cleanup_confirmed
 
     def _spawn(
         self,
@@ -898,7 +1577,7 @@ class PhaseSweepMCP:
                 start_new_session=True,  # own session/pgid; survives restart; signal as a group
                 cwd=str(reg.cwd),
             )
-        return RunHandle(
+        handle = RunHandle(
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
@@ -908,14 +1587,17 @@ class PhaseSweepMCP:
             pgid=proc.pid,
             pid_starttime=read_proc_starttime(proc.pid),
             started_at=pending.started_at,
-            log_path=str(log_path),
-            status_path=str(status_path),
             launch_state="spawned",
             allow_cancel=reg.allow_cancel,
         )
+        return handle
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether MCP cancellation is permitted for this persisted run."""
+        """Return whether the current catalog or launch handle permits cancellation.
+
+        :param RunHandle handle: Run handle whose cancellation permission should be checked.
+        :return bool: Current catalog permission, or the launch-time permission if unregistered.
+        """
         try:
             return self._registry.get(handle.experiment_id).allow_cancel
         except UnknownExperimentError:
@@ -923,6 +1605,25 @@ class PhaseSweepMCP:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _raise_safe_tool_error(tool_name: str, exc: Exception) -> NoReturn:
+    """Translate one implementation exception into an agent-safe tool error.
+
+    :param str tool_name: Tool function used in the generic error message.
+    :param Exception exc: Exception raised by the implementation.
+    :raises ValueError: Always, with either a domain message or generic text.
+    """
+    if isinstance(exc, McpToolError):
+        # Immediate invocation failures use MCP's isError text channel. Durable
+        # run failures are separate successful status reads with FailurePayload;
+        # FastMCP 1.27 does not attach structured content to raised tool errors.
+        raise ValueError(str(exc)) from None
+    log.exception("unhandled error in tool %s", tool_name, exc_info=exc)
+    raise ValueError(
+        f"internal server error in {tool_name}; report it to the operator "
+        "and do not retry immediately"
+    ) from None
 
 
 def _safe_tool(fn: F) -> F:
@@ -938,10 +1639,26 @@ def _safe_tool(fn: F) -> F:
     :param F fn: Tool implementation to wrap.
     :return F: Wrapped function that raises only safe tool errors.
     """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            """Invoke an async tool and redact any exception.
+
+            :param Any args: Positional arguments passed through to the wrapped tool.
+            :param Any kwargs: Keyword arguments passed through to the wrapped tool.
+            :return Any: Awaited tool result.
+            """
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                _raise_safe_tool_error(fn.__name__, exc)
+
+        return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        """Invoke the wrapped tool and redact any exception.
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        """Invoke a synchronous tool and redact any exception.
 
         :param Any args: Positional arguments passed through to the wrapped tool.
         :param Any kwargs: Keyword arguments passed through to the wrapped tool.
@@ -949,61 +1666,37 @@ def _safe_tool(fn: F) -> F:
         """
         try:
             return fn(*args, **kwargs)
-        except McpToolError as exc:
-            raise ValueError(exc.safe_message) from None
-        except Exception:
-            log.exception("unhandled error in tool %s", fn.__name__)
-            raise ValueError("internal error") from None
+        except Exception as exc:
+            _raise_safe_tool_error(fn.__name__, exc)
 
-    return wrapper  # type: ignore[return-value]
+    return sync_wrapper  # type: ignore[return-value]
 
 
-def _read_annotations(title: str) -> Any:
-    """Return MCP annotations for read-only, idempotent tools.
+def _tool_annotations(
+    title: str,
+    *,
+    read_only: bool = True,
+    destructive: bool = False,
+    idempotent: bool = True,
+    open_world: bool = False,
+) -> Any:
+    """Return MCP annotations for one tool's side-effect contract.
 
     :param str title: Human-readable tool title.
+    :param bool read_only: Whether the tool leaves server state unchanged.
+    :param bool destructive: Whether the tool can perform destructive side effects.
+    :param bool idempotent: Whether repeated calls have the same side effects.
+    :param bool open_world: Whether the tool interacts beyond the local server boundary.
     :return Any: MCP ``ToolAnnotations`` instance.
     """
     from mcp.types import ToolAnnotations
 
     return ToolAnnotations(
         title=title,
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    )
-
-
-def _launch_annotations() -> Any:
-    """Return MCP annotations for the side-effecting launch tool.
-
-    :return Any: MCP ``ToolAnnotations`` instance.
-    """
-    from mcp.types import ToolAnnotations
-
-    return ToolAnnotations(
-        title="Launch Sweep",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
-    )
-
-
-def _cancel_annotations() -> Any:
-    """Return MCP annotations for the process-terminating cancel tool.
-
-    :return Any: MCP ``ToolAnnotations`` instance.
-    """
-    from mcp.types import ToolAnnotations
-
-    return ToolAnnotations(
-        title="Cancel Sweep",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=False,
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=open_world,
     )
 
 
@@ -1049,24 +1742,6 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
             raise RuntimeError(f"MCP tool {tool_name!r} lost its exactly-one-of schema")
 
 
-def _run_and_monitor_prompt_text() -> str:
-    """Return the reusable agent workflow prompt served over MCP.
-
-    :return str: Safe run-and-monitor instructions for MCP clients that support prompts.
-    """
-    return """You have access to a local phasesweep MCP server. Use it to operate only the human-curated experiment catalog exposed by the server.
-
-Start by calling phasesweep_list_experiments, then call phasesweep_validate_config for the experiment id you plan to use. Do not ask for config paths, storage URLs, workdirs, commands, environment variables, or run-control settings; the catalog is the authority for those.
-
-If asked to run a sweep, call phasesweep_launch_sweep with the catalog experiment id. Use from_phase only when explicitly asked to resume from a phase or when earlier phase winners are already confirmed. After launch, poll phasesweep_get_status by run_id until the run is succeeded, failed, or cancelled.
-
-Use phasesweep_get_winners with the same run_id to summarize completed phase winners after a launched sweep. Treat returned metric values as experiment summaries and sampled params as user-visible only when their values are not <redacted>; redacted values are intentionally withheld by catalog policy. Do not inspect raw datasets, target/dependent-variable columns, validation labels, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories unless explicitly asked for that separate work.
-
-When recommending a next manual experiment, base the recommendation on MCP outputs: catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted. Do not change the objective metric, extractor, trainer command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless explicitly asked for config-authoring help.
-
-Use phasesweep_cancel_sweep only when explicitly asked to stop a run, or when stopping is clearly necessary to prevent an unwanted active sweep."""
-
-
 def build_server(app: PhaseSweepMCP) -> Any:
     """Construct the FastMCP server.
 
@@ -1078,11 +1753,12 @@ def build_server(app: PhaseSweepMCP) -> Any:
     """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("phasesweep")
+    mcp = FastMCP("phasesweep", instructions=agent_prompt_text(strip=True))
 
     @mcp.tool(
         name=TOOL_LIST_EXPERIMENTS,
-        annotations=_read_annotations("List Experiments"),
+        description=DESCRIPTION_LIST_EXPERIMENTS,
+        annotations=_tool_annotations("List Experiments"),
         structured_output=True,
     )
     @_safe_tool
@@ -1102,25 +1778,46 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
     @mcp.tool(
         name=TOOL_VALIDATE_CONFIG,
-        annotations=_read_annotations("Validate Config"),
+        description=DESCRIPTION_VALIDATE_CONFIG,
+        annotations=_tool_annotations("Validate Config"),
         structured_output=True,
     )
     @_safe_tool
-    def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
+    async def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
         :return ValidateConfigResult: Structured validation payload.
         """
-        return ValidateConfigResult.model_validate(app.validate(experiment_id))
+        return ValidateConfigResult.model_validate(
+            await asyncio.to_thread(app.validate, experiment_id)
+        )
 
     @mcp.tool(
-        name=TOOL_GET_STATUS,
-        annotations=_read_annotations("Get Status"),
+        name=TOOL_GET_LATEST_RUN,
+        description=DESCRIPTION_GET_LATEST_RUN,
+        annotations=_tool_annotations("Get Latest Run"),
         structured_output=True,
     )
     @_safe_tool
-    def get_status(
+    async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
+        """Return the newest recorded MCP run for one experiment, already selected by launch time.
+
+        :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
+        :return GetLatestRunResult: One computed run handle or ``found=false``.
+        """
+        return GetLatestRunResult.model_validate(
+            await asyncio.to_thread(app.latest_run, experiment_id)
+        )
+
+    @mcp.tool(
+        name=TOOL_GET_STATUS,
+        description=DESCRIPTION_GET_STATUS,
+        annotations=_tool_annotations("Get Status"),
+        structured_output=True,
+    )
+    @_safe_tool
+    async def get_status(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetStatusResult:
@@ -1131,16 +1828,38 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :return GetStatusResult: Structured status payload.
         """
         return GetStatusResult.model_validate(
-            app.status(experiment_id=experiment_id, run_id=run_id)
+            await asyncio.to_thread(app.status, experiment_id=experiment_id, run_id=run_id)
+        )
+
+    @mcp.tool(
+        name=TOOL_AWAIT_RUN,
+        description=DESCRIPTION_AWAIT_RUN,
+        annotations=_tool_annotations("Await Run"),
+        structured_output=True,
+    )
+    @_safe_tool
+    async def await_run(
+        run_id: RunId,
+        timeout_seconds: AwaitTimeoutSeconds = AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    ) -> AwaitRunResult:
+        """Block until a launched run changes or the timeout elapses, then return its status. Read-only.
+
+        :param RunId run_id: Detached run id to wait on.
+        :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current status.
+        :return AwaitRunResult: Structured status payload plus changed and reason.
+        """
+        return AwaitRunResult.model_validate(
+            await app.await_run(run_id, timeout_seconds=timeout_seconds)
         )
 
     @mcp.tool(
         name=TOOL_GET_WINNERS,
-        annotations=_read_annotations("Get Winners"),
+        description=DESCRIPTION_GET_WINNERS,
+        annotations=_tool_annotations("Get Winners"),
         structured_output=True,
     )
     @_safe_tool
-    def get_winners(
+    async def get_winners(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
     ) -> GetWinnersResult:
@@ -1151,16 +1870,23 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :return GetWinnersResult: Structured winners payload.
         """
         return GetWinnersResult.model_validate(
-            app.winners(experiment_id=experiment_id, run_id=run_id)
+            await asyncio.to_thread(app.winners, experiment_id=experiment_id, run_id=run_id)
         )
 
     @mcp.tool(
         name=TOOL_LAUNCH_SWEEP,
-        annotations=_launch_annotations(),
+        description=DESCRIPTION_LAUNCH_SWEEP,
+        annotations=_tool_annotations(
+            "Launch Sweep",
+            read_only=False,
+            destructive=True,
+            idempotent=False,
+            open_world=True,
+        ),
         structured_output=True,
     )
     @_safe_tool
-    def launch_sweep(
+    async def launch_sweep(
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
     ) -> LaunchSweepResult:
@@ -1170,21 +1896,31 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param MaybePhaseName from_phase: Optional phase to resume from.
         :return LaunchSweepResult: Structured launch result.
         """
-        return LaunchSweepResult.model_validate(app.launch(experiment_id, from_phase=from_phase))
+        return LaunchSweepResult.model_validate(
+            await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
+        )
 
     @mcp.tool(
         name=TOOL_CANCEL_SWEEP,
-        annotations=_cancel_annotations(),
+        description=DESCRIPTION_CANCEL_SWEEP,
+        annotations=_tool_annotations(
+            "Cancel Sweep",
+            read_only=False,
+            destructive=True,
+        ),
         structured_output=True,
     )
     @_safe_tool
-    def cancel_sweep(run_id: RunId) -> CancelSweepResult:
+    async def cancel_sweep(run_id: RunId) -> CancelSweepResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
 
         :param RunId run_id: Detached run id to cancel.
         :return CancelSweepResult: Structured cancellation result.
         """
-        return CancelSweepResult.model_validate(app.cancel(run_id))
+        # MCP 1.27 invokes synchronous tool functions on the event-loop
+        # thread. Cancellation may spend its 30-second grace period waiting
+        # for a process group, so isolate it from concurrent await/status calls.
+        return CancelSweepResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
     @mcp.resource(
         CATALOG_RESOURCE_URI,
@@ -1214,17 +1950,18 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
         :return str: Prompt text.
         """
-        return _run_and_monitor_prompt_text()
+        return agent_prompt_text(strip=True)
 
     _strict_tool_inputs(mcp)
     return mcp
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the six tools over stdio.
+    """Load the catalog, build the run store, and serve the eight tools over stdio.
 
     :param Path catalog: Operator-authored catalog file.
-    :return int: Process exit code, where 2 means catalog load failure.
+    :return int: Process exit code, where 2 means a startup prerequisite or
+        catalog validation failed before the server could run.
     """
     # stdio transport owns stdout for JSON-RPC. All logging goes to stderr.
     logging.basicConfig(
@@ -1252,16 +1989,7 @@ def serve(catalog: Path) -> int:
         RunStore(registry.state_dir),
         audit=AuditLogger(registry.state_dir / "audit.jsonl"),
     )
-    try:
-        build_server(app).run(transport="stdio")
-    except ModuleNotFoundError as exc:
-        if exc.name == "mcp":
-            print(
-                "phasesweep mcp: MCP support is not installed; install with `pip install 'phasesweep[mcp]'`.",
-                file=sys.stderr,
-            )
-            return 2
-        raise
+    build_server(app).run(transport="stdio")
     return 0
 
 

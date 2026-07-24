@@ -1,148 +1,137 @@
 # MCP agent setup
 
-Use `phasesweep-mcp` or `phasesweep mcp` with an MCP client by installing the MCP extra, writing a catalog, and adding a stdio server entry. This version supports local-node control only: the server, detached runner, cleanup recovery, and GPU/process locks assume one machine. Tool behavior and security boundaries are in [MCP server](mcp.md).
+Install the extra, create a catalog, connect a client, verify the connection, and give the agent its operating instructions. Tool behavior, catalog rules, and the security model are covered in [MCP server](mcp.md).
 
-## Install
+## Prerequisites
 
-Install the MCP extra in the Python environment that your MCP client will use:
+- The MCP [platform requirements](runtime.md#platform-support).
+- Python 3.11 or newer.
+- At least one phasesweep experiment config that passes `phasesweep validate` and uses the restart-stable MCP paths described in step 2.
+- A coding client with local stdio MCP support. Local use requires no API key or OAuth credential.
+
+## 1. Install
+
+Install the MCP extra in the Python environment your MCP client will use:
 
 ```bash
 python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
-From a local checkout:
+Or from a local checkout:
 
 ```bash
 python -m pip install -e ".[mcp]"
 ```
 
-If your MCP client runs outside your shell environment, prefer an absolute path to the environment's `phasesweep-mcp` executable in the client config.
-
-## Create a catalog
-
-Write a catalog that maps stable ids to reviewed experiment configs:
-
-```yaml
-state_dir: /abs/path/to/project/runs/.mcp
-max_concurrent_runs: 1
-experiments:
-  - id: tiny-lm
-    config: /abs/path/to/project/examples/mcp_experiment.yaml
-    description: "16 MB LM: pick depth, then lr, then regularization"
-    allow:
-      launch: true
-      cancel: true
-      from_phase: true
-```
-
-Catalog validation, path rules, side-effect permissions, and the security model are described in [the catalog](mcp.md#the-catalog) and [security model](mcp.md#security-model). Start entries read-only, expose only reviewed configs, and enable `allow` actions deliberately. The checked-in example is [examples/catalog.yaml](../examples/catalog.yaml), which points at [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) and writes scratch artifacts under `/tmp/phasesweep-mcp-tiny-lm`.
-
-## Test the server
-
-Run this from any working directory:
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry remains bound to this Python environment; see [Troubleshooting](#troubleshooting) if it moves.
 
 ```bash
-phasesweep-mcp --catalog /abs/path/to/project/examples/catalog.yaml
+which phasesweep-mcp
 ```
 
-The server speaks JSON-RPC over stdio, so it will appear to wait for input. Stop it with `Ctrl-C` after confirming it starts without a catalog error.
+## 2. Create a catalog
 
-## MCP client config
+Scaffold a catalog next to your project:
 
-Paste this into any stdio MCP-compatible client config, replacing the catalog path:
+```bash
+phasesweep mcp init-catalog --from ./experiment.yaml   # add --from per experiment; -o to name the file
+```
+
+An ordinary CLI config with relative `workdir` or storage can pass `phasesweep validate` but is not restart-stable enough for MCP. Use an absolute `workdir` and an absolute local SQLite or Journal storage path; [examples/mcp_experiment.yaml](../examples/mcp_experiment.yaml) shows the MCP variant of the toy config.
+
+This stages an annotated `catalog.yaml`, validates it through the server startup path, provisions its private state directories, and publishes it only after validation succeeds without overwriting an existing file. Each generated entry pins the detached trainer working directory to the catalog directory; change `cwd` if its relative `trial_command` normally starts elsewhere. Entries begin with side effects disabled and winner values redacted. Fill in each description, review the generated paths, enable only the actions and parameter values the agent should receive, then run the `phasesweep mcp check` command printed in the scaffold. See [the catalog](mcp.md#the-catalog) for its fields and operational constraints. [examples/catalog.yaml](../examples/catalog.yaml) is a working catalog for the toy MCP config.
+
+Confirm the catalog loads before touching any client config:
+
+```bash
+phasesweep mcp check --catalog /abs/path/to/catalog.yaml
+```
+
+Fix every reported failure before connecting a client. The command exits 0 only when the catalog entries satisfy the same schema, config, storage, and path rules used at server startup and the configured state, runs, and logs directories have been provisioned and write-probed through the startup path. It does not start the MCP server or launch a sweep.
+
+## 3. Connect your client
+
+One command writes the MCP server entry and, where the client supports project instructions, the step-5 agent instructions as a marker-fenced block. Project scope is used wherever the client supports it.
+
+```bash
+phasesweep mcp install                        # interactive: select agents, review the plan, apply
+phasesweep mcp install --agent claude --yes   # unattended; repeat --agent for more
+phasesweep mcp install --agent claude --dry-run  # validate and show planned client-file edits
+phasesweep mcp install --agent codex --yes --allow-user-scope  # explicit user-scope acknowledgement
+```
+
+Without `--agent`, interactive installs preselect detected clients in one menu while leaving undetected clients selectable; unattended `--yes` installs select every detected client. The installer validates the catalog, provisions its state layout, prints every target path, confirms once, and reports each edit. `--dry-run` shows the same client-file plan and outcomes without editing client files; its catalog preflight may still create or secure the state directories. A missing catalog is never created implicitly: the command prints the exact `init-catalog` step so you can review permissions before connecting a client. Supported agents are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode.
+
+Use `--type mcp|instructions` to install one integration and `--project DIR` to target another project root. The catalog defaults to that project's `catalog.yaml`; pass `--catalog PATH` for another location. `uninstall` accepts the same agent/type/project selectors and needs no catalog.
+
+An instructions-only install (`--type instructions`) needs neither a catalog nor the optional MCP dependency and remains available outside the MCP runtime's [platform requirements](runtime.md#platform-support).
+
+Claude Desktop and Codex MCP entries are user-scoped, so those clients see the server from every project. The plan flags this. Interactive installs require confirmation; unattended `--yes` installs additionally require `--allow-user-scope`.
+
+By default the generated entry pins the absolute `phasesweep-mcp` executable from the Python environment that ran `install`; if that environment is later moved, recreated, or deleted, the entry breaks (see [Troubleshooting](#troubleshooting)). Pass `--launcher uvx` to instead pin a `uvx --from phasesweep[mcp]==<installed version> phasesweep-mcp` invocation, resolved fresh by [uvx](https://docs.astral.sh/uv/) on every launch instead of bound to this environment's path. Prefer the default for a normal local dev environment you intend to keep; prefer `--launcher uvx` when the environment running `install` is disposable or expected to be rebuilt (a container, a throwaway venv, a CI-provisioned tool). The uvx mode requires `uvx` on the path that will actually launch the client's subprocess, and a real installed phasesweep version to pin (not an unbuilt source checkout) - `install` refuses to write the entry, unchanged, when either is missing. Both modes write the same client files and `uninstall` reverses either one; switching modes is just re-running `install` for the same agent.
+
+Restart the client after any config change.
+
+<details>
+<summary>What automatic edits preserve</summary>
+
+Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed, and project-scoped symlinks are followed only when their resolved target remains inside the selected project. Each edit pins that physical target, serializes with other PhaseSweep installers, and is refused if the file changes before replacement. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+
+Marker-fenced edits preserve all bytes outside the managed block. Strict JSON edits re-serialize the document while retaining key order, detected indentation and newline style, final-newline state, and permissions; compact whitespace and numeric spellings may be normalized. Duplicate keys, non-finite or overflowing numbers, comments, and JSON5 are refused. `uninstall` leaves empty files and containers in place because whole-file creation ownership is not persisted. Shared instruction blocks remain until their last installed agent owner is removed.
+
+</details>
+
+<details>
+<summary>Manual setup (any client)</summary>
+
+Every stdio client launches the same server. Use absolute paths for both values:
 
 ```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "phasesweep-mcp",
-      "args": ["--catalog", "/abs/path/to/project/examples/catalog.yaml"]
-    }
-  }
-}
+"command": "/abs/path/to/python-env/bin/phasesweep-mcp",
+"args": ["--catalog", "/abs/path/to/catalog.yaml"]
 ```
 
-If the client cannot find `phasesweep-mcp`, use absolute paths:
+Client schemas and config paths differ. Run `phasesweep mcp install --dry-run` for the exact target, or use the manual snippet printed when an edit is skipped.
 
-```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "/abs/path/to/venv/bin/phasesweep-mcp",
-      "args": ["--catalog", "/abs/path/to/project/examples/catalog.yaml"]
-    }
-  }
-}
-```
+</details>
 
-For clients that can launch through `uvx`, use the Git install directly:
+## 4. Verify
 
-```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "uvx",
-      "args": ["--from", "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git", "phasesweep-mcp", "--catalog", "/abs/path/to/project/examples/catalog.yaml"]
-    }
-  }
-}
-```
-
-You can also use the main CLI or run the module directly:
-
-```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "/abs/path/to/venv/bin/phasesweep",
-      "args": ["mcp", "--catalog", "/abs/path/to/project/examples/catalog.yaml"]
-    }
-  }
-}
-```
-
-```json
-{
-  "mcpServers": {
-    "phasesweep": {
-      "command": "/abs/path/to/venv/bin/python",
-      "args": ["-m", "phasesweep.mcp.server", "--catalog", "/abs/path/to/project/examples/catalog.yaml"]
-    }
-  }
-}
-```
-
-Restart the MCP client after changing the config.
-
-If your client supports MCP prompts, load `phasesweep_run_and_monitor` instead of pasting instructions. If it supports MCP resources, `phasesweep://catalog` exposes the first catalog page; use `phasesweep_list_experiments` for pagination. Tool behavior, catalog validation, run state, and exposed fields are described in [MCP server](mcp.md).
-
-## Paste this to your agent
-
-When prompts are unavailable, paste this into the agent's project instructions or chat before asking it to run a sweep:
+Restart the client, then ask the agent:
 
 ```text
-Use the local phasesweep MCP server only through the exposed catalog.
-Start with phasesweep_list_experiments and phasesweep_validate_config.
-Launch only by catalog experiment id. After launch, poll phasesweep_get_status by run_id until terminal, then call phasesweep_get_winners with the same run_id.
-Do not ask for or infer config paths, storage URLs, workdirs, commands, environment variables, run-control settings, raw datasets, labels, predictions, logs, result files, dashboards, or per-trial histories unless I explicitly ask for separate filesystem or dashboard work.
-Base recommendations on catalog descriptions, phase shape, status counts, exposed winner metrics, and sampled params that are not redacted by catalog policy. Treat `<redacted>` sampled param values as intentional, not as missing data. Do not change the objective, extractor, command, search space, constraints, gates, storage, workdir, environment, or safety waivers unless I ask for config-authoring help.
-Cancel only when I ask or when stopping is necessary to prevent an unwanted active sweep.
+List the available phasesweep experiments.
 ```
 
-## Useful agent requests
+A working setup returns catalog ids, operator-authored descriptions, phase names, and the metric without dedicated config-path, command, storage, environment, or workdir fields. If the tool is missing or the call fails, see [Troubleshooting](#troubleshooting).
+
+To check without asking the agent, or to audit every configured client at once, run the read-only:
+
+```bash
+phasesweep mcp check-install                    # every supported agent
+phasesweep mcp check-install --agent claude     # one agent; repeat --agent for more
+```
+
+For each configured entry it reports the launcher command and whether it resolves: the absolute path exists and is executable (default mode), or `uvx` is on `PATH` (`--launcher uvx` mode). It never edits a client file. Agents with no phasesweep entry are reported `not configured`; entries this installer did not write are reported `unmanaged` and left unexamined. Exit code 0 means every configured launcher resolves; exit code 1 means at least one needs the repair guidance printed above it.
+
+## 5. Instruct the agent
+
+If step 3 ran with instructions enabled, the client already received the [agent instructions](../src/phasesweep/mcp/agent_prompt.md) in its project instructions file. The server also sends the same workflow in its MCP initialization instructions, and clients with MCP prompt support can load `phasesweep_run_and_monitor`. If the client honors none of those channels, copy the linked instructions into the agent's project instructions or the chat before asking it to run a sweep.
+
+## Requests that work well
 
 - `List the available phasesweep experiments and validate the tiny LM example.`
 - `Launch the tiny-lm sweep, monitor it until completion, then summarize each phase winner.`
 - `Check whether run <run_id> is still active and show phase-level trial counts.`
-- `Read the current winners for <experiment_id> and suggest a next manual experiment using only MCP outputs.`
+- `Read the current winners for <experiment_id>, separate observations from hypotheses, and tell me what additional evidence is needed before choosing the next manual experiment.`
 
 ## Troubleshooting
 
-- `action 'launch' is not permitted`: set `allow.launch: true` for that catalog entry and restart the MCP client.
-- `action 'cancel' is not permitted`: set `allow.cancel: true` for that catalog entry and restart the MCP client.
-- `concurrency limit reached`: wait for an active MCP run to finish, cancel it, or raise `max_concurrent_runs` for hosts that can safely run multiple sweeps.
-- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: inspect the host for leftover runner/trial process groups, then run `phasesweep mcp-recover-run --state-dir <state_dir> --run-id <run_id>` and repeat with `--confirm` only if the command reports confirmed cleanup.
-- `storage must be persistent`, an empty file-backed storage error, or an external RDB storage error: use a persistent Optuna storage URL with a non-empty absolute SQLite/Journal path; MCP catalogs are intentionally local-node only in this version.
-- The client cannot find `phasesweep-mcp`: use the absolute path to the virtualenv or conda environment executable in the MCP client config.
-- Relative path rejected at startup: catalog `state_dir`, `config`, and `cwd` paths may be relative to the catalog file, but experiment `workdir` and file-backed SQLite/Journal storage paths must be non-empty and absolute for MCP.
+- The client cannot find `phasesweep-mcp`: run `phasesweep mcp check-install` to confirm which configured executable is missing without guessing. A default-mode entry points to the Python environment that ran the installer; if that environment moved, was deleted, or was recreated, install the MCP extra in its replacement, rerun the same `phasesweep mcp install` command (`--dry-run` previews the repair), and restart the client, or switch that agent to `phasesweep mcp install --launcher uvx` so future environment churn doesn't break it again. For a manual config, update `command` to the new absolute path from `which phasesweep-mcp`. A uvx-mode entry instead needs `uvx` on the launching `PATH`; install [uv](https://docs.astral.sh/uv/) and restart the client.
+- `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
+- `concurrency limit reached`: the refusal names up to five blocking run IDs. Await one directly and retry the refused launch after it becomes terminal, ask the user before cancelling it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
+- `terminal result snapshot ... unavailable`: follow [run state and recovery](mcp.md#run-state-and-recovery); historical results are never rebuilt from mutable experiment state.
+- `launch outcome is unresolved`: wait briefly and retry `recover-run`. If it persists after a server crash, automated recovery cannot distinguish a pre-spawn crash from a not-yet-registered runner; inspect the host and keep the run reserved until a matching runner is ruled out.
+- Path or storage rejected at startup: follow the MCP [path and working-directory rules](mcp.md#paths-and-the-working-directory); catalogs support local-node SQLite and Journal storage, not in-memory or external RDB storage.
+- A cancelled or failed run stays `running` with `cleanup_confirmed: false`: follow the operator procedure under [run state and recovery](mcp.md#run-state-and-recovery).
 - Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.

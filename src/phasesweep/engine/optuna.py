@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
@@ -21,7 +24,70 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
+from phasesweep.engine.state import GENERATION_ID_ATTR
 from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage_backend
+
+
+@dataclass(frozen=True)
+class _PhaseTrialStats:
+    """One read-only storage snapshot for phase counts."""
+
+    counts: dict[str, int]
+    available: bool
+    generation_counts: dict[str, dict[str, int]]
+
+
+class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
+    """Seeded random sampler whose draws survive process-local RNG restarts."""
+
+    def __init__(self, *, seed: int) -> None:
+        """Store the caller's seed without handing it to the base sampler.
+
+        The base ``RandomSampler`` is constructed with ``seed=None`` because
+        this sampler never draws through it directly; ``seed`` is instead
+        mixed into a fresh per-draw seed by :meth:`sample_independent`, so
+        continuation across process restarts stays deterministic.
+
+        Args:
+            seed: Base seed supplied by the phase's sampler config.
+
+        """
+        super().__init__(seed=None)
+        self._base_seed = seed
+
+    def sample_independent(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        param_name: str,
+        param_distribution: optuna.distributions.BaseDistribution,
+    ) -> Any:
+        """Sample from a deterministic stream position owned by the durable trial.
+
+        Derives a fresh per-parameter seed from the base seed, study name,
+        trial number, and parameter name, so the same (trial, param) pair
+        always draws the same value regardless of process restarts or call
+        ordering.
+
+        Args:
+            study: The active Optuna study (contributes ``study_name`` to the
+                derived seed).
+            trial: The trial being sampled for (contributes ``trial.number``).
+            param_name: Name of the parameter being sampled.
+            param_distribution: The parameter's Optuna distribution.
+
+        Returns:
+            The sampled value, drawn from a fresh :class:`optuna.samplers.RandomSampler`
+            seeded deterministically from ``(base_seed, study_name, trial.number, param_name)``.
+
+        """
+        material = json.dumps(
+            [self._base_seed, study.study_name, trial.number, param_name],
+            separators=(",", ":"),
+        ).encode()
+        derived_seed = int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+        sampler = optuna.samplers.RandomSampler(seed=derived_seed)
+        return sampler.sample_independent(study, trial, param_name, param_distribution)
 
 
 def _build_sampler(
@@ -31,8 +97,8 @@ def _build_sampler(
 
     Args:
         cfg: Parsed sampler config (type, seed, startup-trials, etc.).
-        search_space: The phase's search space, used to build the GridSampler
-            grid and to defend against categorical+CmaEs combinations.
+        search_space: The phase's validated search space, used to build the
+            ``GridSampler`` grid.
         n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
             when ``n_jobs > 1``.
 
@@ -40,8 +106,7 @@ def _build_sampler(
         A configured :class:`optuna.samplers.BaseSampler` subclass instance.
 
     Raises:
-        ValueError: Sampler type incompatible with the search space (e.g. log
-            scale on grid int, categorical on cmaes) or an unknown sampler type.
+        ValueError: The validated grid search space cannot be enumerated.
 
     """
     if cfg.type == "tpe":
@@ -57,23 +122,14 @@ def _build_sampler(
                 constant_liar=(n_jobs > 1),
             )
     if cfg.type == "random":
-        return optuna.samplers.RandomSampler(seed=cfg.seed)
+        if cfg.seed is None:
+            return optuna.samplers.RandomSampler()
+        return _TrialNumberRandomSampler(seed=cfg.seed)
     if cfg.type == "grid":
         return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":
-        # Defense in depth. ``_validate_sampler_search_space`` already rejects
-        # categorical-on-cmaes at config-load and import-checks the cmaes
-        # package; we re-check categoricals here because direct callers of
-        # ``_build_sampler`` (tests, future internal use) bypass that path
-        # and Optuna's ``CmaEsSampler`` silently fails every trial with a
-        # categorical param trying to cast strings to float.
-        if any(isinstance(p, CategoricalParam) for p in search_space.values()):
-            raise ValueError(
-                "sampler.type='cmaes' does not support categorical parameters. "
-                "Use sampler.type='tpe' or remove categorical params from this phase."
-            )
         return optuna.samplers.CmaEsSampler(seed=cfg.seed)
-    raise ValueError(f"Unknown sampler {cfg.type!r}")  # pragma: no cover
+    assert_never(cfg.type)
 
 
 def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
@@ -94,7 +150,7 @@ def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
         return trial.suggest_int(name, p.low, p.high, step=p.step, log=p.log)
     if isinstance(p, CategoricalParam):
         return trial.suggest_categorical(name, p.choices)
-    raise ValueError(f"Unhandled param: {p!r}")  # pragma: no cover
+    assert_never(p)
 
 
 log = logging.getLogger("phasesweep.engine.optuna")
@@ -243,8 +299,8 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
         return None
 
 
-def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
-    """Return trial-state counts from a SQLite Optuna DB without creating schema.
+def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+    """Return trial-state counts in one SQLite read.
 
     Status polling must be read-only. Passing a fresh SQLite URL through
     Optuna's storage constructor can create the database/schema and race the
@@ -254,51 +310,74 @@ def _sqlite_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
-    :return dict[str, int]: Trial counts keyed by Optuna state name, or an empty dict when the backing DB cannot be read safely.
+    :return _PhaseTrialStats: Counts and an availability flag; counts are empty
+        and availability false when the DB cannot be read safely.
     """
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
     if uri is None:
-        return {}
+        return _PhaseTrialStats({}, False, {})
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
                 """
-                SELECT trials.state, COUNT(*)
+                SELECT trials.state, attrs.value_json, COUNT(*)
                 FROM trials
                 JOIN studies ON trials.study_id = studies.study_id
+                LEFT JOIN trial_user_attributes AS attrs
+                  ON trials.trial_id = attrs.trial_id AND attrs.key = ?
                 WHERE studies.study_name = ?
-                GROUP BY trials.state
+                GROUP BY trials.state, attrs.value_json
                 """,
-                (_phase_study_name(experiment, phase),),
+                (GENERATION_ID_ATTR, _phase_study_name(experiment, phase)),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return {}
-    return {str(state): int(count) for state, count in rows}
+        return _PhaseTrialStats({}, False, {})
+    counts: dict[str, int] = {}
+    generation_counts: dict[str, dict[str, int]] = {}
+    for state, value_json, count in rows:
+        state_name = str(state)
+        counts[state_name] = counts.get(state_name, 0) + int(count)
+        if value_json is None:
+            continue
+        try:
+            generation_id = json.loads(value_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(generation_id, str):
+            states = generation_counts.setdefault(generation_id, {})
+            states[state_name] = states.get(state_name, 0) + int(count)
+    return _PhaseTrialStats(counts, True, generation_counts)
 
 
-def _phase_trial_counts(experiment: Experiment, phase: Phase) -> dict[str, int]:
-    """Return Optuna trial counts by state without creating a missing study.
+def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+    """Read counts without creating a missing study.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
-    :return dict[str, int]: Counts keyed by Optuna trial-state name.
+    :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.storage is None:
-        return {}
+        return _PhaseTrialStats({}, False, {})
     backend = storage_backend(experiment.storage)
     if backend == "sqlite":
-        return _sqlite_trial_counts(experiment, phase)
+        return _sqlite_phase_trial_stats(experiment, phase)
     if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return {}
+        return _PhaseTrialStats({}, False, {})
     try:
         study = _load_phase_study(experiment, phase)
+        trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
-        return {}
+        return _PhaseTrialStats({}, False, {})
     counts: dict[str, int] = {}
-    for trial in study.get_trials(deepcopy=False):
+    generation_counts: dict[str, dict[str, int]] = {}
+    for trial in trials:
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
-    return counts
+        generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
+        if isinstance(generation_id, str):
+            states = generation_counts.setdefault(generation_id, {})
+            states[trial.state.name] = states.get(trial.state.name, 0) + 1
+    return _PhaseTrialStats(counts, True, generation_counts)

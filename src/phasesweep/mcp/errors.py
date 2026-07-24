@@ -3,29 +3,34 @@
 Two audiences, two trees:
 
 * ``McpToolError`` and subclasses are returned to the (untrusted) agent. Their
-  ``safe_message`` is built only from the experiment id and the kind of failure
-  - never a path, command, env value, or storage URL.
+  messages use only the experiment id and kind of failure - never a path,
+  command, environment value, or storage URL.
 * ``CatalogError`` is raised at startup to the operator who launched the server
   and may reference paths.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+_MAX_CAPACITY_BLOCKING_RUN_IDS = 5
+
 
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Fatal at startup, operator-facing."""
 
+    def __init__(self, message: str, *, suggestion: str | None = None) -> None:
+        """Create an operator-facing catalog error.
+
+        :param str message: Failure description; may reference paths.
+        :param str | None suggestion: Optional concrete fix, surfaced by ``phasesweep mcp check``.
+        """
+        super().__init__(message)
+        self.suggestion = suggestion
+
 
 class McpToolError(Exception):
-    """Base for agent-facing tool failures. Carries a redacted message."""
-
-    @property
-    def safe_message(self) -> str:
-        """Message safe to return to the agent (no paths/commands/secrets).
-
-        :return str: Redacted message suitable for an MCP tool error.
-        """
-        return str(self)
+    """Base for agent-facing tool failures with redacted messages."""
 
 
 class UnknownExperimentError(McpToolError):
@@ -36,7 +41,10 @@ class UnknownExperimentError(McpToolError):
 
         :param str experiment_id: Agent-supplied catalog id that was not registered.
         """
-        super().__init__(f"unknown experiment id {experiment_id!r}")
+        super().__init__(
+            f"unknown experiment id {experiment_id!r}; call "
+            "phasesweep_list_experiments and use an id from its response"
+        )
 
 
 class UnknownRunError(McpToolError):
@@ -47,7 +55,11 @@ class UnknownRunError(McpToolError):
 
         :param str run_id: Agent-supplied run id that did not match a persisted handle.
         """
-        super().__init__(f"unknown run id {run_id!r}")
+        super().__init__(
+            f"unknown run id {run_id!r}; use the exact run_id returned by "
+            "phasesweep_launch_sweep. If it was lost, call phasesweep_get_latest_run "
+            "with the experiment id instead of launching a replacement."
+        )
 
 
 class InvalidPhaseError(McpToolError):
@@ -59,7 +71,10 @@ class InvalidPhaseError(McpToolError):
         :param str experiment_id: Catalog id whose phase list was checked.
         :param str phase: Agent-supplied phase name that was not declared.
         """
-        super().__init__(f"phase {phase!r} is not a phase of experiment {experiment_id!r}")
+        super().__init__(
+            f"phase {phase!r} is not a phase of experiment {experiment_id!r}; call "
+            "phasesweep_validate_config and use a phase name from its response"
+        )
 
 
 class PermissionDeniedError(McpToolError):
@@ -71,7 +86,12 @@ class PermissionDeniedError(McpToolError):
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
         """
-        super().__init__(f"action {action!r} is not permitted for experiment {experiment_id!r}")
+        super().__init__(
+            f"action {action!r} is not permitted for experiment {experiment_id!r}; "
+            "this is deliberate catalog policy. Report it to the user - only the "
+            f"operator can enable it (allow.{action}: true) and restart the server. "
+            "Do not retry."
+        )
 
 
 class ConfigChangedError(McpToolError):
@@ -84,7 +104,7 @@ class ConfigChangedError(McpToolError):
         """
         super().__init__(
             f"cataloged config for experiment {experiment_id!r} changed since server startup; "
-            "restart the server to reload and validate it"
+            "the operator must restart the MCP server to reload and validate it. Do not retry."
         )
 
 
@@ -98,7 +118,27 @@ class RunSnapshotUnavailableError(McpToolError):
         """
         super().__init__(
             f"saved config snapshot for run {run_id!r} is unavailable or invalid; "
-            "the run cannot be monitored safely"
+            "the run cannot be monitored safely. Report this to the operator; do not "
+            "substitute experiment-level results."
+        )
+
+
+class RunResultSnapshotUnavailableError(McpToolError):
+    """Raised when a terminal run lacks its immutable result snapshot."""
+
+    def __init__(self, run_id: str, finalization_state: str | None = None) -> None:
+        """Create a terminal-result-snapshot tool error.
+
+        :param str run_id: MCP run id whose terminal result snapshot is unusable.
+        :param str | None finalization_state: Persisted snapshot finalization state, if known.
+        """
+        state = f" (finalization state: {finalization_state})" if finalization_state else ""
+        super().__init__(
+            f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
+            "retry once after a short delay only if finalization is still pending. "
+            "If the error persists, report it to the operator; a missing historical "
+            "snapshot cannot be rebuilt from mutable shared results; do not substitute "
+            "experiment-level results."
         )
 
 
@@ -113,22 +153,31 @@ class ExperimentBusyError(McpToolError):
         """
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
-            f"(run_id {run_id!r}); cancel it or wait for it to finish"
+            f"(run_id {run_id!r}). If you just launched and lost the response, this is "
+            "likely that run; monitor it with phasesweep_await_run using "
+            f"run_id {run_id!r}. Cancel it only if the user wants to stop it."
         )
 
 
 class ConcurrencyLimitError(McpToolError):
     """Raised when launching would exceed the server's max concurrent runs."""
 
-    def __init__(self, running: int, limit: int) -> None:
+    def __init__(self, running: int, limit: int, blocking_run_ids: Sequence[str]) -> None:
         """Create a concurrency-limit tool error.
 
         :param int running: Number of currently live runs.
         :param int limit: Configured maximum number of concurrent runs.
+        :param Sequence[str] blocking_run_ids: Live run ids the agent can await.
         """
+        shown = list(dict.fromkeys(blocking_run_ids))[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
+        blockers = ", ".join(repr(run_id) for run_id in shown)
+        omitted = max(0, running - len(shown))
+        omitted_note = f" ({omitted} more active)" if omitted else ""
         super().__init__(
-            f"server is already running {running} sweep(s) (limit {limit}); "
-            "wait for one to finish or cancel it"
+            f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
+            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. Call "
+            "phasesweep_await_run with one of these run_ids, then retry this launch only "
+            "after that run is terminal. Ask the user before cancelling a blocking run."
         )
 
 
@@ -144,6 +193,22 @@ class LaunchInProgressError(McpToolError):
     def __init__(self) -> None:
         """Create a transient launch-in-progress tool error."""
         super().__init__("another launch is in progress on this server; retry in a moment")
+
+
+class RunLaunchUnsettledError(McpToolError):
+    """Raised when cancellation has no verified runner identity to target."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create an unsettled-launch cancellation error.
+
+        :param str run_id: Run id whose launch has not published process identity.
+        """
+        super().__init__(
+            f"run {run_id!r} has not finished publishing a verified runner identity, so "
+            "cancellation cannot target it safely. Retry once after a short delay. If "
+            "phasesweep_get_status reports recovery_required, stop retrying and tell the "
+            "user that operator recovery is required."
+        )
 
 
 class ResumeNotReadyError(McpToolError):
@@ -165,5 +230,6 @@ class ResumeNotReadyError(McpToolError):
         """
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} {reason}"
+            f"earlier phase {missing_phase!r} {reason}. Call phasesweep_get_winners "
+            "for the experiment and resume only after every earlier phase has a winner."
         )

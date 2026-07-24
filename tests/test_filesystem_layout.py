@@ -9,7 +9,7 @@ import pytest
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
@@ -22,20 +22,14 @@ from phasesweep.engine.state import (
 from tests.conftest import make_experiment, write_constant_trainer
 
 
-def test_experiment_dir_is_namespaced_by_experiment_name(tmp_path: Path) -> None:
-    """``<workdir>/<experiment>/...`` is the v0.5.7 output layout."""
+def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> None:
+    """Experiment, phase, and summary artifacts share one namespaced root."""
     exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _experiment_dir(exp) == (tmp_path / "runs" / exp.experiment).resolve()
+    root = (tmp_path / "runs" / exp.experiment).resolve()
 
-
-def test_phase_dir_lives_under_experiment_dir(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _phase_dir(exp, "p") == _experiment_dir(exp) / "p"
-
-
-def test_summary_path_lives_under_experiment_dir(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=str(tmp_path / "runs"))
-    assert _summary_path(exp) == _experiment_dir(exp) / "summary.yaml"
+    assert _experiment_dir(exp) == root
+    assert _phase_dir(exp, "p") == root / "p"
+    assert _summary_path(exp) == root / "summary.yaml"
 
 
 def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
@@ -86,7 +80,9 @@ def test_experiment_name_rejected(bad_name: str) -> None:
         Experiment(
             experiment=bad_name,
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",
@@ -102,7 +98,9 @@ def test_experiment_name_accepts_valid() -> None:
     Experiment(
         experiment="tiny_lm-16mb",
         trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(  # type: ignore[arg-type]
                 name="p",
@@ -111,3 +109,16 @@ def test_experiment_name_accepts_valid() -> None:
             )
         ],
     )
+
+
+@pytest.mark.parametrize("generation_id", ["../escape", "/tmp/escape", ""])
+def test_run_experiment_rejects_unsafe_generation_id_before_writing_state(
+    tmp_path: Path,
+    generation_id: str,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="generation name"):
+        run_experiment(experiment, generation_id=generation_id)
+
+    assert not _experiment_dir(experiment).exists()

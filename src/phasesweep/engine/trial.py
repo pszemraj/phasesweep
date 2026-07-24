@@ -7,6 +7,7 @@ Split into two phases:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -113,6 +114,8 @@ def launch_trial(
     experiment: Experiment,
     phase_name: str,
     trial_id: int,
+    generation_id: str,
+    attempt_id: str,
     trial_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
@@ -131,6 +134,8 @@ def launch_trial(
             ``override_format``, and ``env``.
         phase_name: Name of the running phase (used in ``run_name`` and logs).
         trial_id: Optuna's numeric trial number.
+        generation_id: Identity of the current engine invocation.
+        attempt_id: Immutable identity of this subprocess attempt.
         trial_dir: Resolved per-trial directory; created if missing.
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
         timeout_seconds: Wall-clock timeout passed to :func:`run_supervised`,
@@ -145,8 +150,20 @@ def launch_trial(
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
+    # This file and the other three orchestrator-created per-trial artifacts
+    # below (command.txt, stdout.log, stderr.log) use plain Path.write_text /
+    # .open("w") rather than runtime.files' O_NOFOLLOW private helpers.
+    # ``workdir`` is an operator-trusted location (the configured experiment
+    # workdir), not the owner-only 0700 directory those helpers require and
+    # validate; forcing trial dirs private would break normal operator/tool
+    # visibility into logs and resolved overrides. Private control/state
+    # paths (process_identity.json, lock files) go through the hardened
+    # no-follow helpers instead — see docs/runtime.md's trust-boundary note
+    # (review v0.5.15 / item F).
+    resolved_overrides_path = workdir / "overrides_resolved.json"
+    resolved_overrides_path.write_text(_json_dump_overrides(overrides), encoding="utf-8")
 
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}"
+    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     cmd = render_command(
         experiment.trial_command,
         overrides,
@@ -157,7 +174,14 @@ def launch_trial(
         run_name=run_name,
     )
 
-    (workdir / "overrides_resolved.json").write_text(_json_dump_overrides(overrides))
+    evidence_overrides_path = (
+        workdir / "overrides.json"
+        if experiment.override_format == "json_file"
+        else resolved_overrides_path
+    )
+    overrides_sha256 = hashlib.sha256(evidence_overrides_path.read_bytes()).hexdigest()
+    # Orchestrator-created trial artifact, not symlink-hardened by design (see
+    # the trust-boundary comment above).
     (workdir / "command.txt").write_text(cmd + "\n")
 
     env = os.environ.copy()
@@ -166,6 +190,10 @@ def launch_trial(
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name
     env["PHASESWEEP_RUN_NAME"] = run_name
+    env["PHASESWEEP_GENERATION_ID"] = generation_id
+    env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
+    env["PHASESWEEP_OVERRIDES_SHA256"] = overrides_sha256
+    env["WANDB_RUN_ID"] = attempt_id
 
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -174,6 +202,8 @@ def launch_trial(
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 
+    # Orchestrator-created trial artifacts, not symlink-hardened by design
+    # (see the trust-boundary comment above).
     with (workdir / "stdout.log").open("w") as fout, (workdir / "stderr.log").open("w") as ferr:
         proc_result = run_supervised(
             cmd,
@@ -182,12 +212,16 @@ def launch_trial(
             stderr=ferr,
             timeout=timeout_seconds,
             trial_dir=workdir,
+            attempt_id=attempt_id,
         )
 
     ctx = TrialContext(
         experiment=experiment.experiment,
         phase=phase_name,
         trial_id=trial_id,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
+        overrides_sha256=overrides_sha256,
         trial_dir=workdir,
         run_name=run_name,
         return_code=proc_result.return_code,
@@ -211,8 +245,8 @@ def extract_trial_result(
       * non-zero return code from the subprocess
       * metric extractor raised ExtractorError
       * metric extractor returned a non-finite value
-      * any constraint extractor raised ExtractorError (review item #2)
-      * any constraint extractor returned a non-finite value (review item #3)
+      * any constraint extractor raised ExtractorError (review v0.5.2 / item 2)
+      * any constraint extractor returned a non-finite value (review v0.5.2 / item 3)
 
     A trial that produced a finite metric and finite constraint values but violated
     a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation

@@ -18,14 +18,14 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO
 
+from phasesweep.config.models import GpuPolicy
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
-GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,11 @@ class _GpuAcquisition:
 
 
 def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
-    """Normalize a CUDA device token into :class:`GpuDevice`."""
+    """Normalize a CUDA device token into :class:`GpuDevice`.
+
+    :param GpuDevice | int | str device: CUDA device token to normalize.
+    :return GpuDevice: Existing device instance or a device wrapping the stringified token.
+    """
     if isinstance(device, GpuDevice):
         return device
     return GpuDevice(str(device))
@@ -151,9 +155,6 @@ class GpuPool:
         self._devices = devices
         self._whole_node = whole_node
         self._whole_node_in_use = False
-        self._gpu_ids = [
-            int(device.visible_token) for device in devices if device.visible_token.isdigit()
-        ]
         self._available: list[GpuDevice] = []
         self._condition = threading.Condition()
 
@@ -191,41 +192,22 @@ class GpuPool:
             non-``None`` IDs) iff a GPU list is in play.
 
         Raises:
-            RuntimeError: ``explicit_ids`` was provided but empty; or
-                ``explicit_devices`` was provided but empty; or no GPUs are
-                visible and ``n_jobs > 1`` without ``allow_no_gpu``.
+            RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
+                ``allow_no_gpu``.
 
         """
-        if policy not in {"single_per_trial", "whole_node", "none"}:
-            raise RuntimeError(f"unknown gpu_policy: {policy!r}")
-        if policy == "whole_node" and n_jobs != 1:
-            raise RuntimeError("gpu_policy='whole_node' requires n_jobs=1.")
         if policy == "none":
-            if explicit_ids is not None or explicit_devices is not None:
-                raise RuntimeError(
-                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices."
-                )
-            if n_jobs > 1 and not allow_no_gpu:
-                raise RuntimeError(
-                    "gpu_policy='none' with n_jobs > 1 requires allow_no_gpu_isolation."
-                )
             log.info("GPU isolation disabled by gpu_policy='none'.")
             return cls(devices=[])
 
-        if explicit_ids is not None and explicit_devices is not None:
-            raise RuntimeError("gpu_ids and gpu_devices are mutually exclusive.")
         # Explicit IDs always win, even at n_jobs==1.
         if explicit_ids is not None:
             ids = list(dict.fromkeys(explicit_ids))
-            if not ids:
-                raise RuntimeError("gpu_ids was provided but empty.")
             devices = [GpuDevice(str(gpu_id)) for gpu_id in ids]
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
         if explicit_devices is not None:
             devices = _dedupe_devices(explicit_devices)
-            if not devices:
-                raise RuntimeError("gpu_devices was provided but empty.")
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 
@@ -314,7 +296,12 @@ class GpuPool:
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire every configured device token as one assignment."""
+        """Acquire every configured device token as one assignment.
+
+        :param float | None deadline: Optional ``time.monotonic()`` deadline for waiting.
+        :raises TimeoutError: If the deadline expires before all devices can be leased.
+        :return _GpuAcquisition | None: Whole-node assignment, or ``None`` if inactive.
+        """
         if not self._devices:
             return None
         while True:
@@ -350,7 +337,12 @@ class GpuPool:
             )
 
     def _acquire(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
-        """Acquire a GPU assignment according to the configured policy."""
+        """Acquire a GPU assignment according to the configured policy.
+
+        :param float | None deadline: Optional ``time.monotonic()`` deadline for waiting.
+        :raises TimeoutError: If the deadline expires before an assignment can be leased.
+        :return _GpuAcquisition | None: GPU assignment, or ``None`` if the pool is inactive.
+        """
         if self._whole_node:
             return self._acquire_whole_node(deadline=deadline)
         return self._acquire_single(deadline=deadline)
@@ -400,7 +392,11 @@ class GpuPool:
 
 
 def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
-    """Deduplicate non-empty CUDA device tokens while preserving order."""
+    """Deduplicate non-empty CUDA device tokens while preserving order.
+
+    :param list[str] tokens: CUDA device tokens to normalize and deduplicate.
+    :return list[GpuDevice]: Unique non-empty devices in their original order.
+    """
     devices: list[GpuDevice] = []
     seen: set[str] = set()
     for raw in tokens:
@@ -413,7 +409,12 @@ def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
 
 
 def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
-    """Parse CUDA_VISIBLE_DEVICES as opaque tokens."""
+    """Parse CUDA_VISIBLE_DEVICES as opaque tokens.
+
+    :param str value: Comma-separated CUDA visibility value to parse.
+    :raises RuntimeError: If ``-1`` is mixed with visible device tokens.
+    :return list[GpuDevice]: Parsed, deduplicated devices, or an empty list for ``-1``.
+    """
     raw = [token.strip() for token in value.split(",") if token.strip()]
     if raw == ["-1"]:
         return []
@@ -423,7 +424,12 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:
-    """Log whether configured/available CUDA devices cover requested parallelism."""
+    """Log whether configured/available CUDA devices cover requested parallelism.
+
+    :param int n_jobs: Requested number of parallel jobs.
+    :param list[str] tokens: Configured or detected CUDA device tokens.
+    :param str source: Description of the token source included in warnings.
+    """
     if n_jobs > len(tokens):
         log.warning(
             "n_jobs=%d but only %d GPU device(s) %s (%s). Excess trials will queue for a GPU.",

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -15,14 +18,24 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.guards import _reap_stale_trials
-from phasesweep.engine.state import TRIAL_DIR_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
+    StaleProcessIdentity,
     _defer_shutdown_signals,
+    _kill_group,
+    _process_group_alive_with_members,
     _shutdown_handler,
+    _spawn_blocked_supervisor,
     _terminate_process_group,
-    _tracked_process_group_alive,
+    cleanup_stale_trial_process,
+    is_pid_alive,
+    is_pid_zombie,
+    read_stale_process_identity,
     reap_child,
     run_supervised,
 )
@@ -46,17 +59,24 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    """Patch ``signal_handler_scope`` so tests can observe whether it was entered.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace the scope.
+    :return dict[str, bool]: Mutable probe; ``"called"`` flips to ``True`` on entry.
+    """
     installed = {"called": False}
 
-    def fake_install() -> None:
+    @contextlib.contextmanager
+    def fake_scope():
         installed["called"] = True
+        yield
 
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    monkeypatch.setattr("phasesweep.engine.run.signal_handler_scope", fake_scope)
     return installed
 
 
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
-    """Failing trials leave pid + pgid + starttime files for forensic recovery."""
+    """Failing trials leave one complete atomic identity for forensic recovery."""
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
 
@@ -70,15 +90,21 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="failure-attempt",
         )
     assert result.return_code != 0
-    assert (trial_dir / "pid").is_file(), "pid file must persist on failure"
-    assert (trial_dir / "pgid").is_file(), "pgid file must persist on failure"
-    assert (trial_dir / "pid_starttime").is_file(), "starttime file must persist on failure"
+    identity = read_stale_process_identity(
+        trial_dir,
+        expected_attempt_id="failure-attempt",
+    )
+    assert identity.pid == result.pid
+    assert identity.pgid == result.pid
+    assert identity.proc_starttime is not None
+    assert identity.boot_id is not None
 
 
 def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None:
-    """Clean exit removes all three identity files."""
+    """Clean exit removes the durable process identity."""
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
 
@@ -92,44 +118,439 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="success-attempt",
         )
     assert result.return_code == 0
-    for name in ("pid", "pgid", "pid_starttime"):
-        assert not (trial_dir / name).exists(), f"{name} should be cleaned up on success"
+    assert result.duration_seconds >= 0.0
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
 def test_run_supervised_terminates_child_when_identity_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A metadata write failure after Popen must not leave the child running."""
+    """A metadata write failure after Popen must not leave the child running.
+
+    Looped ~30 times (review v0.5.15 / blocker 4): pre-fix, ``_kill_group``
+    only reaped the direct child when a single nonblocking ``poll()`` already
+    observed it exited, so a child that died right after ``poll()`` returned
+    ``None`` could remain an unreaped zombie despite ``cleanup_confirmed``
+    being reported ``True``. The bounded, unconditional ``wait()`` fix reaps
+    deterministically; the loop guards against a single lucky run masking a
+    reintroduced race.
+    """
     import phasesweep.runtime.process as process
 
     real_atomic_write_text = process.atomic_write_text
 
     def fail_pid_write(path: Path, text: str) -> None:
-        if path.name == "pid":
+        if path.name == PROCESS_IDENTITY_FILE:
             raise OSError("identity disk full")
         real_atomic_write_text(path, text)
 
     monkeypatch.setattr("phasesweep.runtime.process.atomic_write_text", fail_pid_write)
 
+    for i in range(30):
+        trial_dir = tmp_path / f"trial_{i}"
+        trial_dir.mkdir()
+        trainer_started = tmp_path / f"trainer-started-{i}"
+        with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+            result = run_supervised(
+                f'{sys.executable} -c "from pathlib import Path; '
+                f"Path({str(trainer_started)!r}).write_text('started')\"",
+                env=os.environ.copy(),
+                stdout=fout,
+                stderr=ferr,
+                timeout=None,
+                trial_dir=trial_dir,
+                attempt_id=f"identity-write-failure-{i}",
+            )
+
+        assert result.cleanup_confirmed is True, i
+        assert "failed to persist process identity" in (result.failure_reason or ""), i
+        assert not trainer_started.exists(), i
+        with pytest.raises(ProcessLookupError):
+            os.kill(result.pid, 0)
+
+
+def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct child that never reaps within the bounded wait must report cleanup
+    as unconfirmed, not silently ``True`` (review v0.5.15 / blocker 4)."""
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._terminate_process_group",
+        lambda pgid, *, grace_seconds: True,
+    )
+
+    class _NeverReapsProc:
+        pid = 424243
+        returncode = None
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
+
+    assert _kill_group(999999, _NeverReapsProc()) is False  # type: ignore[arg-type]
+
+
+def test_hard_parent_death_before_identity_commit_never_starts_trainer(tmp_path: Path) -> None:
+    """The supervisor exits on acknowledgement-pipe EOF without execing the trainer."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
+    trainer_started = tmp_path / "trainer-started"
+    command = (
+        f'{sys.executable} -c "from pathlib import Path; '
+        f"Path({str(trainer_started)!r}).write_text('started')\""
+    )
+    parent_code = f"""
+import os
+import time
+from pathlib import Path
+import phasesweep.runtime.process as process
+
+def stall_identity_write(path: Path, text: str) -> None:
+    print(text, flush=True)
+    while True:
+        time.sleep(1)
+
+process.atomic_write_text = stall_identity_write
+env = os.environ.copy()
+env["PHASESWEEP_TRIAL_DIR"] = {str(trial_dir)!r}
+with open(os.devnull, "w") as output:
+    process.run_supervised(
+        {command!r},
+        env=env,
+        stdout=output,
+        stderr=output,
+        timeout=None,
+        trial_dir=Path({str(trial_dir)!r}),
+        attempt_id="pre-commit-attempt",
+    )
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    supervisor_pid: int | None = None
+    try:
+        assert parent.stdout is not None
+        readable, _, _ = select.select([parent.stdout], [], [], 10.0)
+        assert readable, f"identity write was not reached; parent returncode={parent.poll()}"
+        supervisor_pid = json.loads(parent.stdout.readline())["pid"]
+
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        deadline = time.time() + 5
+        while (
+            is_pid_alive(supervisor_pid)
+            and not is_pid_zombie(supervisor_pid)
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+
+        assert not trainer_started.exists()
+        assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+        assert not is_pid_alive(supervisor_pid) or is_pid_zombie(supervisor_pid)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+        if supervisor_pid is not None and is_pid_alive(supervisor_pid):
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(supervisor_pid, signal.SIGKILL)
+
+
+def test_hard_parent_death_after_ack_leaves_recoverable_identity(tmp_path: Path) -> None:
+    """Once the trainer starts, a complete identity exists and can reap its group."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    trainer_started = tmp_path / "trainer-started"
+    command = (
+        f'{sys.executable} -c "from pathlib import Path; import time; '
+        f"Path({str(trainer_started)!r}).write_text('started'); time.sleep(60)\""
+    )
+    parent_code = f"""
+import os
+from pathlib import Path
+from phasesweep.runtime.process import run_supervised
+
+env = os.environ.copy()
+env["PHASESWEEP_TRIAL_DIR"] = {str(trial_dir)!r}
+with open(os.devnull, "w") as output:
+    run_supervised(
+        {command!r},
+        env=env,
+        stdout=output,
+        stderr=output,
+        timeout=None,
+        trial_dir=Path({str(trial_dir)!r}),
+        attempt_id="post-ack-attempt",
+    )
+"""
+    parent = subprocess.Popen([sys.executable, "-c", parent_code])
+    identity = None
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if trainer_started.exists() and (trial_dir / PROCESS_IDENTITY_FILE).exists():
+                identity = read_stale_process_identity(
+                    trial_dir,
+                    expected_attempt_id="post-ack-attempt",
+                )
+                break
+            if parent.poll() is not None:
+                pytest.fail(f"launch parent exited early with code {parent.returncode}")
+            time.sleep(0.05)
+        assert identity is not None
+
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        assert cleanup_stale_trial_process(identity, grace_seconds=0.2) is True
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+        if identity is not None and is_pid_alive(identity.pid):
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(identity.pgid, signal.SIGKILL)
+
+
+def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Wrap ``_write_process_identity`` so a test can prove it ran, without disturbing it.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to wrap the writer.
+    :return list[bool]: Appended to (a single ``True``) once the real writer
+        has completed.
+    """
+    import phasesweep.runtime.process as process
+
+    real_write_identity = process._write_process_identity
+    written: list[bool] = []
+
+    def spy(path: Path, identity: StaleProcessIdentity) -> None:
+        real_write_identity(path, identity)
+        written.append(True)
+
+    monkeypatch.setattr(process, "_write_process_identity", spy)
+    return written
+
+
+def test_supervisor_never_imports_poisoned_phasesweep_from_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poisoned PYTHONPATH on the trainer env must never reach the supervisor.
+
+    Pre-fix (review v0.5.15 / blocker 1), the supervisor ran ``-m
+    phasesweep.runtime.supervisor`` under the FULL trainer environment,
+    including any ``PYTHONPATH`` composed from ``experiment.env``. A
+    shadowed/poisoned ``phasesweep`` package on that path would execute at
+    import time, before ``process_identity.json`` exists. The fix launches a
+    stdlib-only script directly under a sanitized ``{"PATH": ...}``
+    environment, so the poisoned package must never even be importable.
+    """
+    poison_root = tmp_path / "poison"
+    package_dir = poison_root / "phasesweep"
+    package_dir.mkdir(parents=True)
+    marker = tmp_path / "poison-marker"
+    (package_dir / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
+    )
+
+    written = _spy_write_process_identity(monkeypatch)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(poison_root)
     with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
         result = run_supervised(
-            f"{sys.executable} -c 'import time; time.sleep(60)'",
-            env=os.environ.copy(),
+            "true",
+            env=env,
             stdout=fout,
             stderr=ferr,
             timeout=None,
             trial_dir=trial_dir,
+            attempt_id="poison-pythonpath",
         )
 
-    assert result.cleanup_confirmed is True
-    assert "failed to persist process identity" in (result.failure_reason or "")
-    with pytest.raises(ProcessLookupError):
-        os.kill(result.pid, 0)
+    assert result.return_code == 0
+    assert not marker.exists(), "supervisor imported the poisoned phasesweep package"
+    assert written == [True], "process_identity.json was never written before exec"
+
+
+def test_supervisor_never_imports_poisoned_sitecustomize_from_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``-S`` must keep site initialization (and thus ``sitecustomize``) off pre-ACK.
+
+    Even without an ``-m phasesweep...`` import, a bare ``python`` invocation
+    still runs ``sitecustomize``/``usercustomize`` during site initialization
+    when their directory is importable at process start — e.g. via a
+    ``PYTHONPATH`` composed into the trainer environment. ``-S`` disables
+    that (review v0.5.15 / blocker 1).
+    """
+    poison_root = tmp_path / "site-poison"
+    poison_root.mkdir()
+    marker = tmp_path / "sitecustomize-marker"
+    (poison_root / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
+    )
+
+    written = _spy_write_process_identity(monkeypatch)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(poison_root)
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            "true",
+            env=env,
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="poison-sitecustomize",
+        )
+
+    assert result.return_code == 0
+    assert not marker.exists(), "supervisor ran a poisoned sitecustomize.py"
+    assert written == [True], "process_identity.json was never written before exec"
+
+
+def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None:
+    """The framed ack payload must still deliver the full trainer environment
+    to the exec'd command (review v0.5.15 / blocker 1)."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    out_path = tmp_path / "env-var.txt"
+    env = os.environ.copy()
+    env["PHASESWEEP_TEST_MARKER"] = "trial-env-value"
+    cmd = (
+        f'{sys.executable} -c "import os, pathlib; '
+        f"pathlib.Path({str(out_path)!r}).write_text(os.environ['PHASESWEEP_TEST_MARKER'])\""
+    )
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        result = run_supervised(
+            cmd,
+            env=env,
+            stdout=fout,
+            stderr=ferr,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="env-flow-attempt",
+        )
+
+    assert result.return_code == 0
+    assert out_path.read_text() == "trial-env-value"
+
+
+def test_spawn_blocked_supervisor_launch_argv_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_spawn_blocked_supervisor`` must launch the stdlib script directly under
+    ``-I -S`` with a minimal sanitized environment; the trainer command must
+    never appear in argv (review v0.5.15 / blocker 1)."""
+    import phasesweep.runtime.process as process
+
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    def spy_popen(argv: list[str], **kwargs: object) -> subprocess.Popen:
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs.get("env") or {})  # type: ignore[arg-type]
+        return real_popen(argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(process.subprocess, "Popen", spy_popen)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        proc, pgid, ack_write = _spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+    try:
+        argv = captured["argv"]
+        assert isinstance(argv, list)
+        assert len(argv) == 6
+        assert argv[:4] == [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(supervisor.__file__).resolve()),
+        ]
+        # Last two elements are the dynamic ready/ack pipe fd numbers; the
+        # trainer command must never appear anywhere in argv.
+        assert all(fd.isdigit() for fd in argv[4:])
+        assert set(captured["env"]) == {"PATH"}
+    finally:
+        os.close(ack_write)
+        _kill_group(pgid, proc)
+        process._unregister(pgid)
+
+
+def test_supervisor_main_exits_without_exec_on_ack_pipe_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent death before the ack payload must not let the supervisor exec anything.
+
+    Adapts the old three-arg pre-ack contract test to the new two-arg
+    ready/ack protocol (review v0.5.15 / blocker 1): with the ack pipe closed
+    before any payload is sent (simulating parent death), ``main()`` must
+    return 75 without ever calling ``os.execve``.
+    """
+    exec_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    os.close(ack_write)  # Simulate parent death: EOF with no payload ever sent.
+
+    exit_code = supervisor.main([str(ready_write), str(ack_read)])
+
+    assert os.read(ready_read, 1) == b"R"  # Readiness was still signaled first.
+    assert exit_code == 75
+    assert exec_calls == []
+    os.close(ready_read)
+
+
+def _frame(body: bytes) -> bytes:
+    """Build one length-prefixed supervisor payload frame for test fixtures."""
+    return f"{len(body):010d}".encode("ascii") + body
+
+
+@pytest.mark.parametrize(
+    "raw_payload",
+    [
+        pytest.param(b"NOTALENGTH", id="bad_header"),
+        pytest.param(f"{10:010d}".encode("ascii") + b"{}", id="truncated_body"),
+        pytest.param(_frame(b"[1, 2, 3]"), id="non_dict_json"),
+        pytest.param(
+            _frame(json.dumps({"cmd": "true", "env": {"X": 1}}).encode("utf-8")),
+            id="non_str_env_value",
+        ),
+    ],
+)
+def test_supervisor_main_rejects_malformed_payload(
+    monkeypatch: pytest.MonkeyPatch, raw_payload: bytes
+) -> None:
+    """Any payload shape violation must return 75 without ever execing (review
+    v0.5.15 / blocker 1)."""
+    exec_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    os.write(ack_write, raw_payload)
+    os.close(ack_write)
+
+    exit_code = supervisor.main([str(ready_write), str(ack_read)])
+
+    assert exit_code == 75
+    assert exec_calls == []
+    os.close(ready_read)
 
 
 def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,6 +618,7 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
             stderr=err,
             timeout=2.0,
             trial_dir=trial_dir,
+            attempt_id="timeout-attempt",
         )
 
     assert result.timed_out, "trial should have hit the configured timeout"
@@ -253,15 +675,15 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
             stderr=err,
             timeout=10.0,
             trial_dir=trial_dir,
+            attempt_id="descendant-attempt",
         )
 
     # Must be flagged as a lifecycle failure, not a clean exit.
     assert result.failure_reason is not None
     assert "still had live descendants" in result.failure_reason
 
-    # Identity files must be preserved for forensics.
-    assert (trial_dir / "pid").exists()
-    assert (trial_dir / "pgid").exists()
+    # The atomic identity must be preserved for forensics.
+    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
     # Descendant must be dead.
     assert marker.exists(), "child PID marker was never written; test setup broken"
@@ -325,7 +747,42 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     assert excinfo.value.report.child_pgids == (1234,)
 
 
-def test_tracked_process_group_alive_uses_cached_members(
+def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first shutdown signal owns cleanup evidence until its pass completes."""
+    active: dict[int, object] = {1234: object(), 5678: object()}
+    terminated: list[int] = []
+    reentered = False
+
+    monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
+
+    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
+        nonlocal reentered
+        terminated.append(pgid)
+        if not reentered:
+            reentered = True
+            assert _shutdown_handler(signal.SIGINT, None) is None
+        return True
+
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
+
+    with pytest.raises(PhaseSweepShutdown) as excinfo:
+        _shutdown_handler(signal.SIGTERM, None)
+
+    assert terminated == [1234, 5678]
+    assert excinfo.value.signum == signal.SIGTERM
+    assert excinfo.value.report.signum == signal.SIGTERM
+    assert excinfo.value.report.cleanup_confirmed is True
+    assert excinfo.value.report.child_pgids == (1234, 5678)
+
+    active.clear()
+    with pytest.raises(PhaseSweepShutdown) as subsequent:
+        _shutdown_handler(signal.SIGINT, None)
+    assert subsequent.value.signum == signal.SIGINT
+
+
+def test_process_group_alive_uses_cached_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
@@ -335,10 +792,10 @@ def test_tracked_process_group_alive_uses_cached_members(
     )
     monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: True)
 
-    assert _tracked_process_group_alive(1234, {11}) is True
+    assert _process_group_alive_with_members(1234, {11}) is True
 
 
-def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
+def test_process_group_alive_refreshes_when_cached_members_are_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     member_sets: list[set[int]] = []
@@ -359,7 +816,7 @@ def test_tracked_process_group_alive_refreshes_when_cached_members_are_gone(
 
     member_pids = {11}
 
-    assert _tracked_process_group_alive(1234, member_pids) is True
+    assert _process_group_alive_with_members(1234, member_pids) is True
     assert member_pids == {22}
     assert scans == [1234]
     assert member_sets == [{11}, {22}]
@@ -376,7 +833,7 @@ def test_terminate_process_group_reports_cleanup_status(
 
         mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
         mp.setattr(
-            "phasesweep.runtime.process._tracked_process_group_alive",
+            "phasesweep.runtime.process._process_group_alive_with_members",
             lambda pgid, member_pids: True,
         )
 
@@ -421,14 +878,19 @@ def test_reaper_raises_when_cleanup_uncertain(
     """
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards.read_stale_process_identity",
-        lambda trial_dir: __import__(
-            "phasesweep.runtime.process", fromlist=["StaleProcessIdentity"]
-        ).StaleProcessIdentity(pid=99999, pgid=99999, starttime=12345),
+        "phasesweep.engine.guards._read_trial_process_identity",
+        lambda *_args, **_kwargs: StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id="uncertain-attempt",
+            pid=99999,
+            pgid=99999,
+            proc_starttime=12345,
+            boot_id="test-boot",
+        ),
     )
     monkeypatch.setattr(
-        "phasesweep.engine.guards.kill_stale_group",
-        lambda pid, starttime, *, pgid: False,
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: False,
     )
 
     exp = make_experiment(workdir=tmp_path / "runs")
@@ -436,6 +898,7 @@ def test_reaper_raises_when_cleanup_uncertain(
 
     # Inject one RUNNING trial so the reaper has something to chew on.
     trial = study.ask()
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "uncertain-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
@@ -443,7 +906,7 @@ def test_reaper_raises_when_cleanup_uncertain(
         _reap_stale_trials(study, exp, exp.phases[0].name)
 
 
-def test_public_run_experiment_installs_signal_handlers(
+def test_public_run_experiment_enters_signal_handler_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -451,14 +914,8 @@ def test_public_run_experiment_installs_signal_handlers(
     contract as CLI callers."""
     installed = _install_signal_probe(monkeypatch)
 
-    # Minimal trial_command that writes the metric file the JsonExtractor expects.
-    # Avoid {} literals in the script so the override-template parser doesn't
-    # mistake them for placeholders.
-    script = (
-        "import json, pathlib, sys; "
-        "trial_dir = sys.argv[1].split('=', 1)[1]; "
-        "pathlib.Path(trial_dir, 'r.json').write_text(json.dumps(dict(x=1)))"
-    )
+    # Minimal trial_command that emits the metric captured by the log extractor.
+    script = "print('x=1')"
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f'{sys.executable} -c "{script}" trial_dir={{trial_dir}} {{overrides}}',
@@ -467,7 +924,7 @@ def test_public_run_experiment_installs_signal_handlers(
     assert installed["called"] is True
 
 
-def test_dry_run_does_not_install_signal_handlers(
+def test_dry_run_does_not_enter_signal_handler_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dry-run launches no children, so it must not perturb the signal mask."""
@@ -610,6 +1067,70 @@ print("post-context", flush=True)
         assert proc.returncode == 128 + signal.SIGTERM, case
 
 
+def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocking() -> None:
+    """A signal tripped by a non-main thread mid-window must defer, not deadlock.
+
+    Kernel masking in ``_defer_shutdown_signals`` only covers the main thread.
+    Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
+    unblocked, so a process-directed SIGTERM sent during the masked launch
+    window is delivered to one of them — and CPython then runs the Python
+    handler in the main thread anyway, mid-critical-section. Pre-fix the
+    handler re-acquired ``_launch_lock`` held by that same thread and hung
+    until the MCP server's 30s grace SIGKILLed the runner with no status.json
+    written (the flaky-cancel e2e failures). The handler must record the signal
+    and let the window exit service it.
+    """
+    code = r"""
+import os, signal, threading, time
+import phasesweep.runtime.process as proc_mod
+from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
+
+install_signal_handlers()
+
+# Stand-in for a BLAS pool worker: SIGTERM stays unblocked here, so the kernel
+# delivers the process-directed signal to this thread while the main thread is
+# masked inside the launch window.
+ready = threading.Event()
+def helper():
+    ready.set()
+    threading.Event().wait(30)
+threading.Thread(target=helper, daemon=True).start()
+assert ready.wait(5)
+
+with _defer_shutdown_signals(), _launch_lock:
+    os.kill(os.getpid(), signal.SIGTERM)
+    deadline = time.time() + 5
+    while proc_mod._deferred_shutdown_signum is None and time.time() < deadline:
+        time.sleep(0.005)
+    print("recorded-mid-window" if proc_mod._deferred_shutdown_signum is not None
+          else "never-recorded", flush=True)
+print("post-context", flush=True)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        timeout=15.0,
+        check=False,
+    )
+    assert "recorded-mid-window" in proc.stdout, proc.stdout + proc.stderr
+    assert "post-context" not in proc.stdout  # window exit must raise the shutdown
+    assert proc.returncode == 128 + signal.SIGTERM
+
+
+def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
+    """A shutdown recorded mid-window fires only when the outermost window exits."""
+    inner_exited = False
+    with pytest.raises(PhaseSweepShutdown) as excinfo, _defer_shutdown_signals():
+        with _defer_shutdown_signals():
+            # Emulates CPython invoking the handler in the main thread
+            # after a worker-thread delivery: it must record and return.
+            _shutdown_handler(signal.SIGTERM, None)
+        inner_exited = True
+    assert inner_exited, "inner window exit must not service the deferred shutdown"
+    assert excinfo.value.code == 128 + signal.SIGTERM
+
+
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,13 +1155,13 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
             stderr=stderr,
             timeout=0.1,
             trial_dir=tmp_path,
+            attempt_id="uncertain-attempt",
         )
 
     assert result.timed_out is True
     assert result.cleanup_confirmed is False
-    # Identity files must be preserved for forensics.
-    assert (tmp_path / "pid").exists()
-    assert (tmp_path / "pgid").exists()
+    # The atomic identity must be preserved for forensics.
+    assert (tmp_path / PROCESS_IDENTITY_FILE).exists()
 
 
 def test_uncertain_cleanup_aborts_optimization_not_just_trial(
@@ -708,20 +1229,20 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
 
         # The queued second worker must have pruned before launch. If the
         # GPU was reused or hard_abort was checked too late, a second
-        # ``trial_*/pid`` file would exist.
-        launched_pid_files = sorted(phase_dir.glob("trial_*/pid"))
-        assert len(launched_pid_files) == 1, (
+        # ``trial_*/process_identity.json`` record would exist.
+        launched_identities = sorted(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
+        assert len(launched_identities) == 1, (
             f"A queued parallel trial launched after unsafe cleanup. "
-            f"Found pid files: {[p.parent.name for p in launched_pid_files]}. "
+            f"Found identities: {[p.parent.name for p in launched_identities]}. "
             "Unsafe cleanup must hard-abort BEFORE the GPU lease is released "
             "to a queued worker."
         )
     finally:
         # Defense in depth: if the fake cleanup is ever changed to actually
         # leak, kill the surviving group here so we don't pollute the host.
-        for pgid_file in phase_dir.glob("trial_*/pgid"):
+        for identity_file in phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"):
             with _contextlib.suppress(Exception):
-                os.killpg(int(pgid_file.read_text().strip()), signal.SIGKILL)
+                os.killpg(json.loads(identity_file.read_text())["pgid"], signal.SIGKILL)
 
 
 def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
@@ -765,6 +1286,6 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
         # The failed trial should be recorded as FAIL, not lost.
         assert "FAIL" in content, f"CSV missing FAIL row for hard-aborted trial: {content!r}"
     finally:
-        for pgid_file in phase_dir.glob("trial_*/pgid"):
+        for identity_file in phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"):
             with _contextlib.suppress(Exception):
-                os.killpg(int(pgid_file.read_text().strip()), signal.SIGKILL)
+                os.killpg(json.loads(identity_file.read_text())["pgid"], signal.SIGKILL)

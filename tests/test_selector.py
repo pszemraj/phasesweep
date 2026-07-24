@@ -8,11 +8,17 @@ from phasesweep.config import (
     Experiment,
     IntParam,
     JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
 )
 from phasesweep.engine.selection import WINNER_TIE_EPS, NoFeasibleTrialError, select_winner
-from phasesweep.engine.state import FEASIBLE_ATTR, constraint_attr
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FEASIBLE_ATTR,
+    GENERATION_ID_ATTR,
+    constraint_attr,
+)
 from tests.conftest import make_experiment
 
 
@@ -36,7 +42,11 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
     for k, v in (params or {}).items():
         distributions[k] = optuna.distributions.IntDistribution(low=int(v), high=int(v))
         pvals[k] = int(v)
-    user_attrs = {FEASIBLE_ATTR: feasible}
+    user_attrs = {
+        FEASIBLE_ATTR: feasible,
+        GENERATION_ID_ATTR: "generation-test",
+        ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
+    }
     for cn, cv in (constraint_vals or {}).items():
         user_attrs[constraint_attr(cn)] = cv
     trial = optuna.trial.create_trial(
@@ -110,26 +120,24 @@ def test_tie_break_lower_trial_number():
     assert w.params == {"x": 1}
 
 
-def test_near_tie_within_eps_prefers_lower_trial_number_minimize():
-    exp = _make_exp()
+@pytest.mark.parametrize(
+    ("goal", "first_delta", "expected_x"),
+    [
+        pytest.param("minimize", WINNER_TIE_EPS / 2, 1, id="minimize-within-epsilon"),
+        pytest.param("minimize", WINNER_TIE_EPS * 2, 2, id="minimize-beyond-epsilon"),
+        pytest.param("maximize", -(WINNER_TIE_EPS / 2), 1, id="maximize-within-epsilon"),
+        pytest.param("maximize", -(WINNER_TIE_EPS * 2), 2, id="maximize-beyond-epsilon"),
+    ],
+)
+def test_metric_tie_epsilon(goal: str, first_delta: float, expected_x: int) -> None:
+    exp = _make_exp(goal=goal)
     study = _make_study()
-    _add_trial(study, 0.1 + (WINNER_TIE_EPS / 2), params={"x": 1})
+    _add_trial(study, 0.1 + first_delta, params={"x": 1})
     _add_trial(study, 0.1, params={"x": 2})
 
-    w = select_winner(study, exp)
+    winner = select_winner(study, exp)
 
-    assert w.params == {"x": 1}
-
-
-def test_metric_difference_beyond_eps_wins_minimize():
-    exp = _make_exp()
-    study = _make_study()
-    _add_trial(study, 0.1 + (WINNER_TIE_EPS * 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 2}
+    assert winner.params == {"x": expected_x}
 
 
 def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
@@ -146,28 +154,6 @@ def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
     assert w.params == {"x": 1}
 
 
-def test_near_tie_within_eps_prefers_lower_trial_number_maximize():
-    exp = _make_exp(goal="maximize")
-    study = _make_study()
-    _add_trial(study, 0.1 - (WINNER_TIE_EPS / 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 1}
-
-
-def test_metric_difference_beyond_eps_wins_maximize():
-    exp = _make_exp(goal="maximize")
-    study = _make_study()
-    _add_trial(study, 0.1 - (WINNER_TIE_EPS * 2), params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    w = select_winner(study, exp)
-
-    assert w.params == {"x": 2}
-
-
 def test_rejects_nan_constraint_values_defensively(tmp_path):
     """If a NaN somehow made it into user_attrs (legacy study), selector must reject."""
     db = tmp_path / "s.db"
@@ -177,19 +163,25 @@ def test_rejects_nan_constraint_values_defensively(tmp_path):
     # Trial 0: clean, feasible.
     t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     t0.set_user_attr(FEASIBLE_ATTR, True)
+    t0.set_user_attr(GENERATION_ID_ATTR, "generation-test")
+    t0.set_user_attr(ATTEMPT_ID_ATTR, "attempt-0")
     t0.set_user_attr(constraint_attr("size"), 100.0)
     study.tell(t0, 0.5)
 
     # Trial 1: legacy NaN constraint value but mistakenly marked feasible.
     t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     t1.set_user_attr(FEASIBLE_ATTR, True)
+    t1.set_user_attr(GENERATION_ID_ATTR, "generation-test")
+    t1.set_user_attr(ATTEMPT_ID_ATTR, "attempt-1")
     t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric, but invalid.
 
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         constraints=[
             Constraint(
                 name="size",

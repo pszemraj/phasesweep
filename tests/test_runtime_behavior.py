@@ -3,18 +3,54 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import threading
 import time
 from pathlib import Path
 
 import optuna
 import pytest
 
-from phasesweep import load_experiment, run_experiment
-from phasesweep.config import Experiment, JsonExtractor, Metric, Phase
+from phasesweep import load_config, load_experiment, run_experiment, run_suite
+from phasesweep.config import (
+    CategoricalParam,
+    Constraint,
+    Experiment,
+    IntParam,
+    JsonExtractor,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
+from phasesweep.engine import TerminalReport, read_status, read_winner
+from phasesweep.engine.optuna import _build_sampler, _create_phase_study
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import _load_winner
-from tests.conftest import copy_fake_train, write_trainer, write_yaml
+from phasesweep.engine.state import (
+    TRIAL_TARGET_ATTR,
+    _last_successful_generation_path,
+    _load_winner,
+    _summary_path,
+    _winner_path,
+)
+from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+from phasesweep.evidence import TrialContext
+from phasesweep.runtime import process as runtime_process
+from phasesweep.runtime.process import (
+    ProcessResult,
+    SignalOwnershipUnavailableError,
+    install_signal_handlers,
+    signal_handler_scope,
+)
+from tests.conftest import (
+    copy_fake_train,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+    write_yaml,
+)
 
 
 def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
@@ -29,10 +65,154 @@ def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
     assert throttle.should_write(finished=12, now=150.0)
 
 
+def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) -> None:
+    """Seeded random draws depend on durable trial identity, not process lifetime."""
+    phase = Phase(
+        name="p",
+        n_trials=4,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": CategoricalParam(type="categorical", choices=list(range(100)))},
+    )
+
+    def sampled(storage: Path, batches: list[int]) -> list[int]:
+        for n_trials in batches:
+            study = optuna.create_study(
+                study_name="stable-random::p",
+                storage=f"sqlite:///{storage}",
+                sampler=_build_sampler(phase.sampler, phase.search_space),
+                load_if_exists=True,
+            )
+            study.optimize(
+                lambda trial: float(trial.suggest_categorical("x", list(range(100)))),
+                n_trials=n_trials,
+            )
+        loaded = optuna.load_study(
+            study_name="stable-random::p",
+            storage=f"sqlite:///{storage}",
+        )
+        return [int(trial.params["x"]) for trial in loaded.trials]
+
+    expected = sampled(tmp_path / "single.db", [4])
+    assert expected == sampled(tmp_path / "ones.db", [1, 1, 1, 1])
+    assert expected == sampled(tmp_path / "uneven.db", [1, 3])
+    assert expected == sampled(tmp_path / "mixed.db", [2, 1, 1])
+
+
+def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
+    """A reconstructed GridSampler continues through its stored grid assignments."""
+    search_space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])}
+    sampler = Sampler(type="grid", seed=0)
+    storage = f"sqlite:///{tmp_path / 'grid.db'}"
+
+    for _ in range(2):
+        study = optuna.create_study(
+            study_name="stable-grid::p",
+            storage=storage,
+            sampler=_build_sampler(sampler, search_space),
+            load_if_exists=True,
+        )
+        study.optimize(
+            lambda trial: float(trial.suggest_categorical("x", [1, 2, 3, 4])), n_trials=2
+        )
+
+    loaded = optuna.load_study(study_name="stable-grid::p", storage=storage)
+    assert len(loaded.trials) == 4
+    assert {trial.params["x"] for trial in loaded.trials} == {1, 2, 3, 4}
+
+
+@pytest.mark.parametrize(
+    ("sampler", "search_space", "n_trials", "expected_type"),
+    [
+        pytest.param(
+            Sampler(type="random", seed=0),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            1,
+            "_TrialNumberRandomSampler",
+            id="random",
+        ),
+        pytest.param(
+            Sampler(type="grid", seed=0),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            2,
+            "GridSampler",
+            id="grid",
+        ),
+        pytest.param(
+            Sampler(type="tpe", seed=0, n_startup_trials=3),
+            {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            1,
+            "TPESampler",
+            id="tpe",
+        ),
+        pytest.param(
+            Sampler(type="cmaes", seed=0),
+            {"x": IntParam(type="int", low=1, high=2)},
+            1,
+            "CmaEsSampler",
+            id="cmaes",
+        ),
+    ],
+)
+def test_persistent_execution_reattaches_configured_sampler_and_pruner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sampler: Sampler,
+    search_space: dict,
+    n_trials: int,
+    expected_type: str,
+) -> None:
+    """A validation-only load cannot supply Optuna defaults to execution."""
+
+    class OptimizeObserved(RuntimeError):
+        pass
+
+    phase = Phase(
+        name="p",
+        n_trials=n_trials,
+        n_jobs=2 if sampler.type == "tpe" else 1,
+        gpu_policy="none" if sampler.type == "tpe" else "single_per_trial",
+        allow_no_gpu_isolation=sampler.type == "tpe",
+        allow_partial_grid=sampler.type == "grid",
+        sampler=sampler,
+        search_space=search_space,
+    )
+    storage = (
+        f"journal:///{tmp_path / 'tpe.journal'}"
+        if sampler.type == "tpe"
+        else f"sqlite:///{tmp_path / f'{sampler.type}.db'}"
+    )
+    exp = make_experiment(
+        experiment=f"sampler_{sampler.type}",
+        storage=storage,
+        workdir=tmp_path / "runs",
+        phases=[phase],
+    )
+    _create_phase_study(exp, phase)
+    observed: dict[str, object] = {}
+
+    def inspect_optimize(study: optuna.Study, objective, **kwargs) -> None:
+        observed["sampler"] = type(study.sampler).__name__
+        observed["pruner"] = type(study.pruner).__name__
+        observed["n_startup_trials"] = getattr(study.sampler, "_n_startup_trials", None)
+        observed["constant_liar"] = getattr(study.sampler, "_constant_liar", None)
+        raise OptimizeObserved
+
+    monkeypatch.setattr(optuna.Study, "optimize", inspect_optimize)
+    with pytest.raises(OptimizeObserved):
+        run_experiment(exp)
+
+    assert observed["sampler"] == expected_type
+    assert observed["pruner"] == "NopPruner"
+    if sampler.type == "tpe":
+        assert observed["n_startup_trials"] == 3
+        assert observed["constant_liar"] is True
+
+
 def _sleeping_score_experiment(
     tmp_path: Path,
     *,
     experiment: str,
+    n_trials: int = 3,
     timeout_seconds_per_phase: float | None = None,
     timeout_seconds_per_run: float | None = None,
     allow_incomplete_on_timeout: bool = False,
@@ -44,21 +224,24 @@ def _sleeping_score_experiment(
         ap = argparse.ArgumentParser()
         ap.add_argument("--out", required=True)
         args, _ = ap.parse_known_args()
-        time.sleep(0.15)
+        time.sleep(0.5)
         with open(args.out, "w") as f:
             json.dump({"x": 1.0}, f)
+        print("x=1.0")
         """,
     )
     return Experiment(
         experiment=experiment,
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         timeout_seconds_per_run=timeout_seconds_per_run,
         phases=[
             Phase(
                 name="p",
-                n_trials=3,
+                n_trials=n_trials,
                 timeout_seconds_per_phase=timeout_seconds_per_phase,
                 allow_incomplete_on_timeout=allow_incomplete_on_timeout,
                 search_space={},
@@ -69,8 +252,8 @@ def _sleeping_score_experiment(
 
 def test_parallel_trials_e2e(tmp_path):
     """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
-    - JournalFileStorage via explicit journal:/// URL (B3, v0.5.2 / blocker 6)
-    - constant_liar on TPE (B4)
+    - JournalFileStorage via explicit journal:/// URL (review v0.5.2 / blocker 6)
+    - constant_liar on TPE
     - concurrent subprocess execution
     - no database-locked errors
     """
@@ -80,12 +263,13 @@ def test_parallel_trials_e2e(tmp_path):
     yaml_text = f"""
 experiment: parallel_test
 storage: journal:///{journal_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: lr_sweep
     n_trials: 8
@@ -119,12 +303,13 @@ def test_failed_trials_marked_fail_not_complete(tmp_path):
     yaml_text = f"""
 experiment: fail_state_test
 storage: sqlite:///{db_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "false {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: a
     n_trials: 3
@@ -145,6 +330,155 @@ phases:
         )
 
 
+def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good_results(
+    tmp_path: Path,
+) -> None:
+    success = write_trainer(
+        tmp_path / "success.py",
+        """
+        import json, pathlib, sys
+        pathlib.Path(sys.argv[1]).write_text(json.dumps({"x": 0.123}))
+        print("x=0.123")
+        """,
+    )
+    no_result = write_trainer(tmp_path / "no_result.py", "pass")
+    workdir = tmp_path / "runs"
+    first = make_experiment(
+        workdir=workdir,
+        trial_command=f"python {success} {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+
+    winner = run_experiment(first)["p"]
+    assert winner.metric == pytest.approx(0.123)
+    phase_dir = workdir / "t" / "p"
+    first_trial_dir = next(phase_dir.glob("trial_*"))
+    assert (first_trial_dir / "r.json").is_file()
+    protected = {
+        path: path.read_bytes()
+        for path in (
+            _winner_path(first, "p"),
+            _summary_path(first),
+            _last_successful_generation_path(first),
+        )
+    }
+
+    second = first.model_copy(
+        update={"trial_command": f"python {no_result} {{trial_dir}}/r.json {{overrides}}"}
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(second)
+
+    published_winner = read_winner(second, "p")
+    status = read_status(second)
+    assert published_winner is not None
+    # The failed rerun (second) claimed a new current generation, but the
+    # winner published on disk still comes from the first, successful one -
+    # the two identities must be reported distinctly, never conflated.
+    assert status["current_generation_id"] != published_winner.generation_id
+    assert status["published_generation_id"] == published_winner.generation_id
+    assert status["phases"][0]["winner_present"] is True
+
+    trial_dirs = sorted(phase_dir.glob("trial_*"))
+    assert len(trial_dirs) == 2
+    assert first_trial_dir in trial_dirs
+    second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
+    assert not (second_trial_dir / "r.json").exists()
+    assert {path: path.read_bytes() for path in protected} == protected
+
+
+def test_terminal_callback_reports_success_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    captured: list[TerminalReport] = []
+
+    def preflight(_experiment, *, cleanup_report):
+        cleanup_report.uncertain_attempt_ids.add("attempt-uncertain")
+        return {}
+
+    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr(
+        "phasesweep.engine.run._run_experiment_inner",
+        lambda *_args, **_kwargs: {},
+    )
+
+    assert run_experiment(experiment, terminal_callback=captured.append) == {}
+    assert len(captured) == 1
+    report = captured[0]
+    assert report.primary_error is None
+    assert report.failure_stage is None
+    assert report.uncertain_attempt_ids == frozenset({"attempt-uncertain"})
+
+
+def test_terminal_callback_preserves_failure_when_callback_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    primary_error = NoFeasibleTrialError("phase failed")
+    captured: list[TerminalReport] = []
+
+    class CallbackError(RuntimeError):
+        pass
+
+    def fail_run(*_args, **_kwargs):
+        raise primary_error
+
+    def fail_callback(report: TerminalReport) -> None:
+        captured.append(report)
+        raise CallbackError("snapshot failed")
+
+    monkeypatch.setattr(
+        "phasesweep.engine.run._preflight_existing_studies",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+
+    with pytest.raises(NoFeasibleTrialError) as exc_info:
+        run_experiment(experiment, terminal_callback=fail_callback)
+
+    assert exc_info.value is primary_error
+    assert len(captured) == 1
+    assert captured[0].primary_error is primary_error
+    assert captured[0].failure_stage == "execution"
+
+
+def test_terminal_callback_failure_cannot_fail_published_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reporting callback is a diagnostic consumer, never an outcome authority.
+
+    By the time the callback runs, a successful generation is already
+    published as the last successful result; raising would present that
+    committed success as a caller-visible failure (review v0.5.14 / item C).
+    """
+    experiment = make_experiment(workdir=tmp_path / "runs")
+
+    class CallbackError(RuntimeError):
+        pass
+
+    def fail_callback(_report: TerminalReport) -> None:
+        raise CallbackError("snapshot failed")
+
+    monkeypatch.setattr(
+        "phasesweep.engine.run._preflight_existing_studies",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.run._run_experiment_inner",
+        lambda *_args, **_kwargs: {},
+    )
+
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+        assert run_experiment(experiment, terminal_callback=fail_callback) == {}
+
+    assert any("terminal callback failed" in record.message for record in caplog.records)
+
+
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     """Missing constraint output -> TrialState.FAIL, not COMPLETE+infeasible."""
     trainer = tmp_path / "trainer.py"
@@ -158,6 +492,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
         # Write metric only — constraint extractor will fail to find param_bytes.
         with open(args.out, 'w') as f:
             json.dump({'eval_loss': 1.0}, f)
+        print('eval_loss=1.0')
         """,
     )
 
@@ -165,12 +500,13 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     yaml_text = f"""
 experiment: c2
 storage: sqlite:///{db}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
 constraints:
   - name: param_bytes
     extractor: {{ type: json, path: result.json, key: param_bytes }}
@@ -200,71 +536,71 @@ phases:
 
 
 @pytest.mark.parametrize(
-    ("trainer_payload", "constraints_yaml", "exp_name"),
+    ("extracted_values", "failure_reason"),
     [
-        # Constraint extractor returns NaN
-        (
-            "{'eval_loss': 1.0, 'param_bytes': float('nan')}",
-            "constraints:\n  - name: param_bytes\n    extractor: { type: json, path: result.json, key: param_bytes }\n    max: 1000\n",
-            "nan_c",
+        pytest.param(
+            [float("inf")],
+            "metric extractor returned non-finite value: inf",
+            id="inf_metric",
         ),
-        # Metric extractor returns +inf
-        (
-            "{'eval_loss': float('inf')}",
-            "",
-            "inf_m",
+        pytest.param(
+            [1.0, float("nan")],
+            "constraint extractor 'param_bytes' returned non-finite value: nan",
+            id="nan_constraint",
         ),
     ],
-    ids=["nan_constraint", "inf_metric"],
 )
-def test_non_finite_extracted_value_marks_trial_fail(
-    tmp_path, trainer_payload: str, constraints_yaml: str, exp_name: str
-):
-    """A non-finite metric or constraint value is a malformed trial — FAIL,
-    not COMPLETE-with-sentinel. Both the metric path and the constraint path
-    must surface the failure the same way; one parametrized test exercises
-    both routes through the same end-to-end pipeline."""
-    trainer = tmp_path / "trainer.py"
-    write_trainer(
-        trainer,
-        f"""
-        import json, sys, argparse, math
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, 'w') as f:
-            json.dump({trainer_payload}, f)
-        """,
+def test_non_finite_extracted_value_returns_failed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extracted_values: list[float],
+    failure_reason: str,
+) -> None:
+    """Non-finite extractor returns reach both engine-level finite-value guards."""
+    experiment = make_experiment(
+        constraints=[
+            Constraint(
+                name="param_bytes",
+                extractor=JsonExtractor(
+                    type="json",
+                    path="result.json",
+                    key="param_bytes",
+                ),
+                max=1000,
+            )
+        ]
+    )
+    values = iter(extracted_values)
+    monkeypatch.setattr(
+        "phasesweep.engine.trial.run_extractor",
+        lambda *_args, **_kwargs: next(values),
+    )
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=0,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(
+            return_code=0,
+            timed_out=False,
+            pid=123,
+            duration_seconds=0.1,
+        ),
     )
 
-    db = tmp_path / "phases.db"
-    yaml_text = f"""
-experiment: {exp_name}
-storage: sqlite:///{db}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
-{constraints_yaml}
-phases:
-  - name: a
-    n_trials: 2
-    max_consecutive_failures: 10
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    p = tmp_path / "exp.yaml"
-    p.write_text(yaml_text)
-    exp = load_experiment(p)
-    from phasesweep.engine.selection import NoFeasibleTrialError
+    result = extract_trial_result(experiment=experiment, executed=executed)
 
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(exp)
-
-    study = optuna.load_study(study_name=f"{exp_name}::a", storage=f"sqlite:///{db}")
-    for trial in study.get_trials():
-        assert trial.state == optuna.trial.TrialState.FAIL
+    assert result.metric is None
+    assert result.feasible is False
+    assert result.failure_reason == failure_reason
 
 
 def test_abort_after_gpu_acquire_prevents_queued_trials(tmp_path: Path) -> None:
@@ -290,7 +626,7 @@ trial_command: "python {trainer} {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, objective_name: eval_loss, split: test, policy: test }}
 phases:
   - name: p
     n_trials: 16
@@ -345,6 +681,17 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
     logging.getLogger().handlers.clear()
 
 
+def test_runtime_rejects_unexplained_trial_budget_shortfall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sampler that stops early cannot publish a falsely complete winner."""
+    exp = _sleeping_score_experiment(tmp_path, experiment="budget_shortfall", n_trials=1)
+    monkeypatch.setattr(optuna.Study, "optimize", lambda self, objective, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials"):
+        run_experiment(exp)
+
+
 def test_runtime_platform_guard_feature_checks_and_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -377,12 +724,13 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
     body = f"""
 experiment: platform_check
 storage: sqlite:///{tmp_path}/platform.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "echo {{overrides}}"
 metric:
   name: x
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: x }}
+  extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
 phases:
   - name: p
     n_trials: 1
@@ -405,12 +753,13 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     body = f"""
 experiment: failtest
 storage: sqlite:///{tmp_path}/fail.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "false {{overrides}}"
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
 phases:
   - name: a
     n_trials: 100
@@ -463,21 +812,23 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
-    assert not (tmp_path / "runs" / "phase_timeout_hard" / "p" / "trial_00000" / "r.json").exists()
+    phase_dir = tmp_path / "runs" / "phase_timeout_hard" / "p"
+    assert list(phase_dir.glob("trial_00000__*/r.json")) == []
 
 
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_allowed",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=3.0,
         allow_incomplete_on_timeout=True,
     )
 
     winners = run_experiment(exp)
 
     completion = winners["p"].completion
-    assert completion["requested_trials"] == 3
+    assert completion["requested_trials"] == 10
     assert 1 <= completion["completed_trials"] < completion["requested_trials"]
     assert completion["completed_trials"] <= completion["finished_trials"]
     assert completion["finished_trials"] <= completion["requested_trials"]
@@ -502,6 +853,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
             with open(args.out, "w") as f:
                 json.dump({"x": 1.0}, f)
+            print("x=1.0")
         else:
             time.sleep(5.0)
         """,
@@ -510,12 +862,14 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         experiment="phase_timeout_all_terminal",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(
                 name="p",
                 n_trials=2,
-                timeout_seconds_per_phase=0.8,
+                timeout_seconds_per_phase=3.0,
                 allow_incomplete_on_timeout=allow_incomplete_on_timeout,
                 search_space={},
             )
@@ -552,21 +906,24 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
             with open(args.out, "w") as f:
                 json.dump({"x": 1.0}, f)
+            print("x=1.0")
         else:
-            time.sleep(1.0)
+            time.sleep(10.0)
         """,
     )
     exp = Experiment(
         experiment="phase_timeout_allowed_abort_counter",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
         phases=[
             Phase(
                 name="p",
                 n_trials=3,
                 max_consecutive_failures=1,
-                timeout_seconds_per_phase=0.5,
+                timeout_seconds_per_phase=3.0,
                 allow_incomplete_on_timeout=True,
                 search_space={},
             )
@@ -593,7 +950,8 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     accepted = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=3.0,
         allow_incomplete_on_timeout=True,
     )
     run_experiment(accepted)
@@ -601,7 +959,8 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
     current = _sleeping_score_experiment(
         tmp_path,
         experiment="phase_timeout_resume_guard",
-        timeout_seconds_per_phase=0.2,
+        n_trials=10,
+        timeout_seconds_per_phase=3.0,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
         _load_winner(current, current.phases[0], {})
@@ -616,3 +975,389 @@ def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
 
     with pytest.raises(TimeoutError, match="run guard"):
         run_experiment(exp)
+
+
+def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed phase republishes from a host that cannot launch work.
+
+    Reading or republishing a finished GPU experiment from a CPU-only login
+    node must not require GPU discovery or mutate the durable accepted target
+    (review v0.5.14 / blocker 4).
+    """
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        p = argparse.ArgumentParser()
+        p.add_argument("--out")
+        p.add_argument("--x", type=int, default=0)
+        a, _ = p.parse_known_args()
+        print(f"x={a.x}")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+    )
+    first = run_experiment(experiment)
+
+    def _no_gpu_create(**_kwargs: object) -> None:
+        raise RuntimeError("simulated: no GPUs detected on this host")
+
+    monkeypatch.setattr("phasesweep.engine.phase.GpuPool.create", _no_gpu_create)
+    rerun = run_experiment(experiment)
+
+    assert rerun["p"].trial_number == first["p"].trial_number
+    assert rerun["p"].metric == first["p"].metric
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+    assert len(study.trials) == 1
+
+
+def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A top-up that cannot launch leaves the prior accepted target usable.
+
+    The larger target must only be durably accepted after launch prerequisites
+    (GPU discovery, wallclock budget) pass; otherwise a transient local GPU
+    problem permanently strands the study above its last working config
+    (review v0.5.14 / blocker 4).
+    """
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        p = argparse.ArgumentParser()
+        p.add_argument("--out")
+        p.add_argument("--x", type=int, default=0)
+        a, _ = p.parse_known_args()
+        print(f"x={a.x}")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[phase],
+    )
+    first = run_experiment(experiment)
+
+    def _no_gpu_create(**_kwargs: object) -> None:
+        raise RuntimeError("simulated: no GPUs detected on this host")
+
+    monkeypatch.setattr("phasesweep.engine.phase.GpuPool.create", _no_gpu_create)
+    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 2})]})
+    with pytest.raises(RuntimeError, match="no GPUs detected"):
+        run_experiment(top_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+    assert len(study.trials) == 1
+
+    rerun = run_experiment(experiment)
+    assert rerun["p"].metric == first["p"].metric
+
+
+def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
+    tmp_path: Path,
+) -> None:
+    """run_experiment restores the host's prior signal handlers and mask on every exit path.
+
+    A library that leaves its own SIGTERM/SIGINT/SIGHUP handlers and unblocked
+    mask installed after returning steals the embedding process's own
+    shutdown handling permanently (review v0.5.14 / blocker 6). This must be
+    undone whether the run succeeds or raises.
+    """
+
+    def host_handler(_signum: int, _frame: object) -> None:
+        raise AssertionError("host handler should never fire during this test")
+
+    def assert_host_state_active() -> None:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is host_handler
+        current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert set(runtime_process._SHUTDOWN_SIGNALS) <= current_mask
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_process._SHUTDOWN_SIGNALS))
+
+        trainer = write_constant_trainer(tmp_path)
+        experiment = make_experiment(
+            workdir=tmp_path / "runs",
+            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            n_trials=1,
+        )
+        run_experiment(experiment)
+        assert_host_state_active()
+
+        failing_trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+        failing_experiment = make_experiment(
+            experiment="fails",
+            workdir=tmp_path / "runs",
+            trial_command=f"python {failing_trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            n_trials=1,
+            max_consecutive_failures=1,
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(failing_experiment)
+        assert_host_state_active()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
+    """A signal pending at scope-exit must reach the restored HOST handler, not
+    ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
+
+    Pre-fix, the mask was restored before the host handlers, so a pending
+    SIGTERM fired while ``_shutdown_handler`` was still installed for it,
+    raising ``PhaseSweepShutdown`` out of the cleanup path and leaving some
+    host handlers unrestored. The fixed order is: block, then restore
+    handlers, then restore the mask.
+    """
+    if not hasattr(signal, "pthread_sigmask"):
+        pytest.skip("pthread_sigmask not available")
+
+    received: list[int] = []
+
+    def host_handler(signum: int, _frame: object) -> None:
+        received.append(signum)
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+
+        with signal_handler_scope():
+            # Block SIGTERM ourselves so the kill below queues instead of
+            # firing immediately (the scope's own entry unblocks it).
+            signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert received == [], "signal fired before scope exit"
+
+        # Scope exit order: block -> restore handlers -> restore mask. The
+        # pending SIGTERM is delivered on the final unblock, by which point
+        # the HOST handler (not phasesweep's) is installed. CPython only
+        # invokes the Python-level handler at the next eval-breaker check,
+        # not necessarily synchronously with the unblocking call, so poll
+        # briefly instead of asserting immediately.
+        deadline = time.monotonic() + 2.0
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert received == [signal.SIGTERM]
+        assert signal.getsignal(signal.SIGTERM) is host_handler
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed ``signal.signal`` restore must not abort the rest of the loop.
+
+    Every other prior handler must still be restored, and the first
+    restoration error surfaces once the scope body itself did not already
+    raise (review v0.5.15 / blocker 2A).
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+
+        def make_sentinel(tag: int):
+            def handler(signum: int, frame: object) -> None:
+                return None
+
+            handler.__name__ = f"sentinel_{tag}"
+            return handler
+
+        sentinel_handlers = {sig: make_sentinel(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+        for sig, handler in sentinel_handlers.items():
+            signal.signal(sig, handler)
+
+        first_signal = runtime_process._SHUTDOWN_SIGNALS[0]
+        real_signal = signal.signal
+        failed_once: set[int] = set()
+
+        def flaky_signal(signalnum: int, handler: object) -> object:
+            if signalnum == first_signal and signalnum not in failed_once:
+                failed_once.add(signalnum)
+                raise OSError("simulated restore failure")
+            return real_signal(signalnum, handler)
+
+        with pytest.raises(OSError, match="simulated restore failure"), signal_handler_scope():
+            # Patch only after the scope's own entry-time installation
+            # (which uses the real signal.signal) has already happened.
+            monkeypatch.setattr(signal, "signal", flaky_signal)
+
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            if sig == first_signal:
+                # Restoration failed for this one; phasesweep's handler is
+                # still installed until manual cleanup below.
+                assert signal.getsignal(sig) is runtime_process._shutdown_handler
+                continue
+            assert signal.getsignal(sig) is sentinel_handlers[sig]
+    finally:
+        monkeypatch.undo()
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_run_suite_installs_signal_handlers_once_for_all_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A multi-study suite installs shutdown handlers once, not once per component.
+
+    Each component experiment enters its own nested ``signal_handler_scope()``
+    call; because the suite's outer scope already owns the shutdown signals,
+    every nested entry must be a reentrant no-op (review v0.5.14 / blocker 6)
+    — exactly one install and one restore for the whole suite, never one pair
+    per study.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        # Clean slate: nothing already owns the shutdown signals here,
+        # regardless of what an earlier test in this session left installed.
+        # install_signal_handlers() now checks OS ground truth, so resetting
+        # the actual handlers is sufficient to make it see "not installed".
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, signal.SIG_DFL)
+
+        signal_calls: list[int] = []
+        original_signal = signal.signal
+
+        def counting_signal(signalnum: int, handler: object) -> object:
+            signal_calls.append(signalnum)
+            return original_signal(signalnum, handler)
+
+        monkeypatch.setattr(runtime_process.signal, "signal", counting_signal)
+
+        trainer = write_constant_trainer(tmp_path)
+        config = load_config(
+            write_yaml(
+                tmp_path,
+                f"""
+                suite: nesting_suite
+                defaults:
+                  workdir: {tmp_path}/runs
+                  trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+                  metric:
+                    name: x
+                    goal: minimize
+                    extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+                studies:
+                  - name: one
+                    phases:
+                      - name: p
+                        n_trials: 1
+                        search_space: {{}}
+                  - name: two
+                    phases:
+                      - name: p
+                        n_trials: 1
+                        search_space: {{}}
+                """,
+            )
+        )
+
+        run_suite(config)
+
+        # One install (len(_SHUTDOWN_SIGNALS) calls) and one restore (another
+        # len(_SHUTDOWN_SIGNALS) calls) for the whole suite — never doubled by
+        # the two nested per-study scopes.
+        assert len(signal_calls) == 2 * len(runtime_process._SHUTDOWN_SIGNALS)
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> None:
+    """Off the main thread, with nothing already owning shutdown signals, the scope refuses.
+
+    ``signal.signal`` only works on the main thread, so a scope entered from a
+    worker thread with no enclosing install cannot safely take ownership; it
+    must raise a typed error instead of silently running unprotected.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            if signal.getsignal(sig) is runtime_process._shutdown_handler:
+                signal.signal(sig, signal.SIG_DFL)
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                with signal_handler_scope():
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], SignalOwnershipUnavailableError)
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals() -> None:
+    """A process-lifetime ``install_signal_handlers()`` call is never undone by a nested scope.
+
+    Entry points (CLI, MCP server) install shutdown handlers once for the
+    whole process. A later ``signal_handler_scope()`` — even from a worker
+    thread, where taking ownership from scratch would be impossible — must
+    see that ownership is already established and do nothing, on entry or
+    exit.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        install_signal_handlers()
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                with signal_handler_scope():
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert errors == []
+        # Entry-point ownership persists: the nested scope did not tear it down.
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)

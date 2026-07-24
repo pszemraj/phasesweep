@@ -32,7 +32,12 @@ def _stringify(value: Any) -> str:
 
 
 def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar."""
+    """Render a value for Hydra/OmegaConf override grammar.
+
+    :param Any value: Scalar or list-like value to render.
+    :raises TypeError: If the value cannot be represented by the supported grammar.
+    :return str: Hydra-compatible representation of the value.
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -138,8 +143,8 @@ def render_command(
             ``overrides.json`` file when ``fmt == "json_file"``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
         phase: Phase name, used for ``{phase}``.
-        run_name: Composite ``<experiment>-<phase>-<trial_id>`` identifier used
-            for ``{run_name}``.
+        run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
+            identifier used for ``{run_name}``.
         write_files: When ``False``, render paths without writing
             ``overrides.json``. Used by dry-run previews so they are
             filesystem-pure.

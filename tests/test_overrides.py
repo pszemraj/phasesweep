@@ -10,19 +10,16 @@ from phasesweep.runtime.commands import format_argparse, format_hydra, render_co
 from tests.conftest import copy_fake_train, write_yaml
 
 
-def test_hydra_basic():
-    s = format_hydra({"n_layers": 8, "lr": 3e-4})
-    assert s == "n_layers=8 lr=0.0003"
-
-
-def test_hydra_dotted():
-    s = format_hydra({"model.n_layers": 12})
-    assert s == "model.n_layers=12"
-
-
-def test_hydra_bool():
-    s = format_hydra({"flag": True, "off": False})
-    assert s == "flag=true off=false"
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({"n_layers": 8, "lr": 3e-4}, "n_layers=8 lr=0.0003", id="basic"),
+        pytest.param({"model.n_layers": 12}, "model.n_layers=12", id="dotted-key"),
+        pytest.param({"flag": True, "off": False}, "flag=true off=false", id="booleans"),
+    ],
+)
+def test_hydra_scalar_rendering(overrides: dict[str, object], expected: str) -> None:
+    assert format_hydra(overrides) == expected
 
 
 def test_hydra_quotes_string_values_for_hydra_grammar():
@@ -86,7 +83,7 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -110,12 +107,13 @@ def test_effective_overrides_include_fixed(tmp_path):
     yaml_text = f"""
 experiment: eff_override_test
 storage: sqlite:///{db_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: arch
     fixed_overrides:
@@ -155,7 +153,7 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: arch
             n_trials: 1
@@ -188,7 +186,7 @@ def test_multi_parent_collision_unresolved_errors(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: a
             n_trials: 1
@@ -220,7 +218,7 @@ def test_multi_parent_collision_resolved_by_fixed_override(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: a
             n_trials: 1

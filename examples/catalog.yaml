@@ -1,5 +1,5 @@
 # Example MCP catalog. Start the server with:
-#   phasesweep mcp --catalog examples/catalog.yaml
+#   phasesweep mcp serve --catalog examples/catalog.yaml
 #
 # The MCP-specific config below uses absolute scratch paths under /tmp. The regular CLI example in experiment.yaml intentionally keeps relative paths for checkout-local runs.
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a config, or reach trial_command / env / storage / workdir. You curate which experiments exist by editing this file (same trust as the experiment YAML).

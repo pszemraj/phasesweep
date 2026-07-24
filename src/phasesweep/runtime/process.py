@@ -9,15 +9,31 @@ Design:
     can kill the whole tree with os.killpg, not just the shell.
   - A global registry of live children lets us clean up on orchestrator death.
   - PID files in each trial_dir let operators identify orphans manually.
+
+Launch barrier (review v0.5.15 / blocker 1): every trial launches through a
+two-phase supervisor. Before the parent acknowledges, the supervisor is a
+stdlib-only helper script (``phasesweep.runtime.supervisor``) run directly
+(never ``-m``) under ``python -I -S`` with a minimal sanitized environment —
+just ``PATH``. It cannot import the phasesweep package, a poisoned/shadowed
+package from the trainer's ``PYTHONPATH``, or a trainer-composed
+``sitecustomize``, and it starts in ~30ms instead of paying phasesweep's
+package-import cost. Only after this process durably persists
+``process_identity.json`` does it send the trainer's shell command and full
+environment to the supervisor as a framed JSON payload; the supervisor then
+``execve``s ``/bin/sh -c cmd`` under that environment, replacing itself as
+the same PID/process group already registered here.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
+import select
 import signal
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -25,11 +41,44 @@ from pathlib import Path
 from types import FrameType
 from typing import IO
 
+from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
+from phasesweep.runtime.json import strict_json_loads
 
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
+_DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
+# With the -I -S stdlib-only launch (review v0.5.15 / blocker 1), supervisor
+# startup no longer pays phasesweep's package-import cost (~0.55s pre-fix) —
+# real-world readiness lands in ~30ms. 10s stays generous headroom for a
+# loaded host, not a tight bound.
+_SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
+PROCESS_IDENTITY_FILE = "process_identity.json"
+PROCESS_IDENTITY_SCHEMA_VERSION = 1
+
+
+def _supervisor_script_path() -> str:
+    """Return the absolute on-disk path to the stdlib-only supervisor script.
+
+    Importing :mod:`phasesweep.runtime.supervisor` here (in the PARENT) is
+    safe — the parent already has the full ``phasesweep`` package loaded.
+    Only the supervisor *subprocess* must stay import-free before the
+    ready/ack barrier (review v0.5.15 / blocker 1); this import never runs in
+    that subprocess, which launches the file directly via its path instead.
+
+    :return str: Absolute path to ``supervisor.py`` on disk.
+    :raises RuntimeError: If the imported module has no ``__file__`` (e.g. a
+        namespace package or frozen build), making a subprocess launch by
+        path impossible.
+    """
+    module_file = _supervisor.__file__
+    if module_file is None:
+        raise RuntimeError("phasesweep.runtime.supervisor has no __file__; cannot launch it.")
+    return str(Path(module_file).resolve())
+
+
+_SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 
 # ---------------------------------------------------------------------------
 # Global child registry + signal handler
@@ -37,7 +86,6 @@ _KILL_GRACE_SECONDS = 10.0
 
 _lock = threading.Lock()
 _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
-_installed = False
 
 # The launch lock guards the Popen() -> _register() critical section so the
 # shutdown handler cannot snapshot _active_children while a child has been
@@ -45,6 +93,7 @@ _installed = False
 # acquires the same lock before snapshotting, which forces it to wait until
 # every in-flight launch has either registered its PGID or failed.
 _launch_lock = threading.Lock()
+_shutdown_handler_lock = threading.Lock()
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
     sig
     for sig in (
@@ -65,22 +114,43 @@ class ShutdownCleanupReport:
     child_pgids: tuple[int, ...]
 
 
+class SignalOwnershipUnavailableError(RuntimeError):
+    """Raised when shutdown-signal ownership is needed but cannot be taken here."""
+
+
 class PhaseSweepShutdown(SystemExit):
     """SystemExit carrying child process-group cleanup evidence."""
 
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
-        """Create a POSIX-style signaled exit with structured cleanup evidence."""
+        """Create a POSIX-style signaled exit with structured cleanup evidence.
+
+        Args:
+            signum: Shutdown signal that triggered the exit; the exit code is
+                ``128 + signum`` per the POSIX signaled-exit convention.
+            report: Cleanup evidence captured by the shutdown handler for the
+                child process groups it terminated.
+
+        """
         super().__init__(128 + signum)
         self.signum = signum
         self.report = report
 
 
-_last_shutdown_cleanup_report: ShutdownCleanupReport | None = None
-
-
-def last_shutdown_cleanup_report() -> ShutdownCleanupReport | None:
-    """Return the most recent shutdown cleanup report in this process, if any."""
-    return _last_shutdown_cleanup_report
+# Python-level shutdown deferral. Kernel signal masks are per-thread, but
+# CPython runs Python signal handlers only in the main thread — and it does so
+# whenever ANY thread's C-level handler tripped the pending flag, regardless of
+# the main thread's kernel mask. Library thread pools (e.g. BLAS workers pulled
+# in via numpy/optuna) keep shutdown signals unblocked, so a signal sent while
+# the main thread is inside a ``_defer_shutdown_signals()`` window can still
+# execute ``_shutdown_handler`` in the main thread mid-critical-section, where
+# re-acquiring ``_launch_lock``/``_lock`` self-deadlocks. These state variables
+# extend the deferral to the Python level: while the main thread is inside a
+# window, the handler records the signal and returns; the outermost window exit
+# services it. Both are touched only from the main thread (window bookkeeping
+# by construction, the handler by CPython's main-thread guarantee), so no lock
+# is needed.
+_deferred_shutdown_signum: int | None = None
+_main_thread_defer_depth = 0
 
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
@@ -101,9 +171,19 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
     The handler also acquires ``_launch_lock`` before snapshotting (review
     v0.5.7 / blocker 3) so a child that was just ``Popen()``-ed but not yet
-    ``_register()``-ed cannot escape the snapshot. The launch path holds
-    ``_launch_lock`` across both calls; this handler will block until the
-    launch site releases it, then see the new PGID in ``_active_children``.
+    ``_register()``-ed cannot escape the snapshot. When the launcher is a
+    worker thread, this handler (main thread) blocks until the launch site
+    releases the lock, then sees the new PGID in ``_active_children``. When
+    the launcher IS the main thread, blocking on the lock would self-deadlock:
+    kernel masking cannot prevent that (a signal delivered to any unblocked
+    library thread still runs this handler in the main thread), so if a
+    main-thread ``_defer_shutdown_signals()`` window is open the handler
+    records the signal and returns; the window exit re-invokes it.
+
+    A second signal delivered while this handler is already running returns
+    immediately. The first invocation remains responsible for the complete
+    PGID snapshot and its cleanup evidence instead of re-entering the
+    non-reentrant registry locks or interrupting the kill loop.
 
     Args:
         signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
@@ -112,52 +192,71 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             but required by the ``signal.signal`` handler protocol.
 
     Raises:
-        SystemExit: Always, with exit code ``128 + signum`` (POSIX
-            ``signaled-exit`` convention).
+        SystemExit: With exit code ``128 + signum`` (POSIX ``signaled-exit``
+            convention) — always, except when deferred mid-critical-section
+            or ignored during an active handler invocation as described above.
 
     """
-    global _last_shutdown_cleanup_report  # noqa: PLW0603
+    global _deferred_shutdown_signum  # noqa: PLW0603
 
-    with _launch_lock, _lock:
-        pgids = tuple(_active_children)
+    # Python signal handlers can interrupt an earlier invocation of this
+    # handler. Let the first signal finish the authoritative cleanup pass;
+    # re-entering could deadlock on the non-reentrant registry locks or replace
+    # the first signal's cleanup evidence partway through the kill loop.
+    if not _shutdown_handler_lock.acquire(blocking=False):
+        return
 
-    log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
+    try:
+        if _main_thread_defer_depth > 0:
+            # The main thread is inside a launch/unregister critical section and
+            # may already hold the locks below. Record and return; the outermost
+            # window exit services the shutdown.
+            _deferred_shutdown_signum = signum
+            return
+        # Any recorded-but-unserviced signal is superseded by this invocation.
+        _deferred_shutdown_signum = None
 
-    confirmed_by_pgid: dict[int, bool] = {}
-    for pgid in pgids:
-        try:
-            confirmed_by_pgid[pgid] = _terminate_process_group(
-                pgid,
-                grace_seconds=_KILL_GRACE_SECONDS,
-            )
-        except Exception:
-            log.exception(
-                "Failed while cleaning child process group %d after signal %d", pgid, signum
-            )
-            confirmed_by_pgid[pgid] = False
+        with _launch_lock, _lock:
+            pgids = tuple(_active_children)
 
-    cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
-    report = ShutdownCleanupReport(
-        signum=signum,
-        cleanup_confirmed=cleanup_confirmed,
-        child_pgids=pgids,
-    )
-    _last_shutdown_cleanup_report = report
-    if cleanup_confirmed:
-        log.warning(
-            "Received signal %d; confirmed cleanup for %d child group(s)",
-            signum,
-            len(pgids),
+        log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
+
+        confirmed_by_pgid: dict[int, bool] = {}
+        for pgid in pgids:
+            try:
+                confirmed_by_pgid[pgid] = _terminate_process_group(
+                    pgid,
+                    grace_seconds=_KILL_GRACE_SECONDS,
+                )
+            except Exception:
+                log.exception(
+                    "Failed while cleaning child process group %d after signal %d", pgid, signum
+                )
+                confirmed_by_pgid[pgid] = False
+
+        cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
+        report = ShutdownCleanupReport(
+            signum=signum,
+            cleanup_confirmed=cleanup_confirmed,
+            child_pgids=pgids,
         )
-    else:
-        uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
-        log.error(
-            "Received signal %d; cleanup is uncertain for child group(s): %s",
-            signum,
-            uncertain,
-        )
+        if cleanup_confirmed:
+            log.warning(
+                "Received signal %d; confirmed cleanup for %d child group(s)",
+                signum,
+                len(pgids),
+            )
+        else:
+            uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
+            log.error(
+                "Received signal %d; cleanup is uncertain for child group(s): %s",
+                signum,
+                uncertain,
+            )
 
-    raise PhaseSweepShutdown(signum, report)
+        raise PhaseSweepShutdown(signum, report)
+    finally:
+        _shutdown_handler_lock.release()
 
 
 def _unblock_shutdown_signals() -> None:
@@ -169,58 +268,245 @@ def _unblock_shutdown_signals() -> None:
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
 
 
+# Explicit shutdown-signal ownership tokens (review v0.5.15 / blocker 2B),
+# replacing inference from ``signal.getsignal(sig) is _shutdown_handler``.
+# That inference could not distinguish "this call's own enclosing scope" from
+# "an unrelated concurrent top-level run in another thread" — both look like
+# "the shutdown handler is already installed" — so the first of two
+# concurrent top-level runs to finish would tear down handlers the second
+# run still depends on (false nesting). Both globals are mutated only from
+# the main thread (``install_signal_handlers`` and ``signal_handler_scope``'s
+# install/restore branch both run there; the main thread is where
+# ``signal.signal`` is even callable), so no lock is needed — CPython's GIL
+# already makes a single attribute assignment atomic, and there is never a
+# writer to race against a writer.
+_process_lifetime_owner = False
+_scope_depth = 0
+
+
 def install_signal_handlers() -> None:
     """Install shutdown handlers that clean up child process groups.
 
     Handles SIGTERM/SIGINT and SIGHUP where the platform exposes it. Safe to
-    call multiple times; only installs once. The main thread's shutdown signals
-    are unblocked on each call so an inherited signal mask cannot prevent the
-    handlers from running. Must be called from the main thread.
+    call multiple times; only installs once. Idempotence is checked against
+    the OS ground truth (every shutdown signal already dispatching to
+    ``_shutdown_handler``) rather than a separate flag, so an external reset
+    of a handler is never masked by stale bookkeeping. The main thread's
+    shutdown signals are unblocked on each call so an inherited signal mask
+    cannot prevent the handlers from running. Must be called from the main
+    thread.
+
+    On success — including the idempotent already-installed path — this
+    takes process-lifetime ownership of the shutdown signals: every later
+    :func:`signal_handler_scope` call, on any thread, becomes a no-op for the
+    rest of the process (review v0.5.15 / blocker 2B). Ownership is NOT taken
+    when installation fails because this was called off the main thread.
     """
-    global _installed  # noqa: PLW0603
+    global _process_lifetime_owner  # noqa: PLW0603
     _unblock_shutdown_signals()
-    if _installed:
+    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
+        _process_lifetime_owner = True
         return
     try:
         signal.signal(signal.SIGTERM, _shutdown_handler)
         signal.signal(signal.SIGINT, _shutdown_handler)
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _shutdown_handler)
-        _installed = True
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")
+        return
+    _process_lifetime_owner = True
+
+
+@contextlib.contextmanager
+def signal_handler_scope() -> Iterator[None]:
+    """Own shutdown signals for the duration of one outermost run, then restore the host.
+
+    A library must not leave its shutdown handlers and unblocked signal mask
+    installed after it returns control — that permanently steals the
+    embedding process's own SIGTERM/SIGINT/SIGHUP handling (review v0.5.14 /
+    blocker 6). This context manager scopes ownership to one call tree,
+    tracked with explicit tokens rather than handler-identity inference
+    (review v0.5.15 / blocker 2B). Ownership contract:
+
+      1. A process-lifetime :func:`install_signal_handlers` call (CLI/MCP
+         entry points) owns the shutdown signals for the rest of the
+         process; every scope call afterward, on any thread, is a no-op.
+      2. Absent that, the MAIN THREAD may take temporary ownership for one
+         call tree: the outermost call installs and restores; lexically
+         nested calls on that same thread share the ownership and touch
+         nothing.
+      3. A call from a thread that is neither the main thread nor covered by
+         (1) raises :class:`SignalOwnershipUnavailableError` instead of
+         silently running unprotected, because ``signal.signal`` only works
+         on the main thread.
+
+    Restoration on exit (the outermost main-thread call only) happens in a
+    fixed order — re-block, then restore handlers, then restore the mask
+    (review v0.5.15 / blocker 2A) — so a shutdown signal pending at exit
+    cannot fire against a handler that is mid-restoration: pre-fix, restoring
+    the mask before the handlers let a pending signal invoke
+    ``_shutdown_handler`` while it was still installed, raising
+    ``PhaseSweepShutdown`` out of this cleanup path and leaving some host
+    handlers unrestored. Restoration continues past an individual
+    ``signal.signal`` failure instead of aborting the loop, and the first
+    such error is raised only when the scope body itself did not already
+    raise (see the ``finally`` block below).
+
+    Raises:
+        SignalOwnershipUnavailableError: Called from a non-main thread while
+            no enclosing scope or explicit :func:`install_signal_handlers`
+            call already owns the shutdown signals.
+
+    Yields:
+        ``None``. Use as ``with signal_handler_scope(): ...`` around the
+        outermost run whose child processes must be cleaned up on shutdown.
+
+    """
+    global _scope_depth  # noqa: PLW0603
+
+    if _process_lifetime_owner:
+        # An entry point (CLI/MCP) already owns shutdown signals for the
+        # whole process. Nothing to install or restore, on any thread.
+        yield
+        return
+
+    if threading.current_thread() is not threading.main_thread():
+        raise SignalOwnershipUnavailableError(
+            "Shutdown-signal handlers are not installed on this process, and "
+            "this thread is not the main thread, so they cannot be installed "
+            "here (signal.signal only works on the main thread). Call "
+            "install_signal_handlers() from the main thread at process "
+            "start, or run this from the main thread."
+        )
+
+    if _scope_depth > 0:
+        # True lexical nesting on the main thread: an enclosing scope call
+        # already installed the handlers and mask. Just track depth so only
+        # the outermost exit restores anything.
+        _scope_depth += 1
+        try:
+            yield
+        finally:
+            _scope_depth -= 1
+        return
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
+    prior_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        # An empty-set SIG_BLOCK call changes nothing; it is a pure read that
+        # returns the mask already in effect, for restoration later.
+        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    _scope_depth = 1
+    try:
+        for sig in _SHUTDOWN_SIGNALS:
+            signal.signal(sig, _shutdown_handler)
+        _unblock_shutdown_signals()
+        yield
+    finally:
+        _scope_depth = 0
+        # Ordering matters (review v0.5.15 / blocker 2A): block first, THEN
+        # restore handlers, THEN restore the mask. Restoring the mask before
+        # the handlers would deliver a pending shutdown signal while
+        # ``_shutdown_handler`` is still installed for it.
+        if hasattr(signal, "pthread_sigmask"):
+            signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+        restoration_error: Exception | None = None
+        for sig, handler in prior_handlers.items():
+            if handler is None:
+                log.warning(
+                    "Signal %d had no Python-level handler before this scope "
+                    "(a C-level default phasesweep cannot reinstall); leaving "
+                    "phasesweep's shutdown handler installed for it.",
+                    sig,
+                )
+                continue
+            try:
+                signal.signal(sig, handler)
+            except Exception as exc:  # noqa: BLE001 - continue past one bad restore
+                log.exception(
+                    "Failed to restore the prior handler for signal %d after scope exit", sig
+                )
+                if restoration_error is None:
+                    restoration_error = exc
+        if prior_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        if restoration_error is not None:
+            if sys.exc_info()[1] is None:
+                raise restoration_error
+            log.error(
+                "Signal handler restoration failed while another exception was already "
+                "propagating out of this scope; not overriding it: %s",
+                restoration_error,
+            )
 
 
 @contextlib.contextmanager
 def _defer_shutdown_signals() -> Iterator[None]:
-    """Temporarily block shutdown signals in the calling thread.
+    """Defer shutdown handling while the calling thread is in a critical section.
 
     Used to keep the ``Popen() -> _register()`` window atomic from the
     perspective of the signal handler (review v0.5.7 / blocker 3). CPython
-    delivers signals to the main thread, so when ``n_jobs == 1`` the same
-    thread is both the launcher and the handler target — taking
-    ``_launch_lock`` from the handler would deadlock against the launcher's
-    own lock acquisition. Blocking the signal at the kernel level instead
-    queues it until the launcher exits the critical section.
+    runs Python signal handlers in the main thread, so when the launcher is
+    the main thread, taking ``_launch_lock`` from the handler would deadlock
+    against the launcher's own lock acquisition. Two layers close that:
 
-    For worker threads (``n_jobs > 1``) the handler still runs on the main
-    thread, so the signal-mask state of the worker is irrelevant. The
-    ``_launch_lock`` acquired by the launcher closes the race in that case.
+    1. Kernel mask: the calling thread blocks shutdown signals, so a signal
+       aimed at it queues until the critical section ends.
+    2. Python-level deferral (main thread only): the kernel mask is per-thread
+       and cannot stop a signal delivered to some other unblocked thread (e.g.
+       a BLAS pool worker) from tripping CPython's pending flag — the Python
+       handler then runs in the main thread mid-window anyway. While a
+       main-thread window is open, ``_shutdown_handler`` records the signal
+       and returns; the outermost window exit re-invokes it after the kernel
+       mask is restored.
 
-    No-op on platforms without ``signal.pthread_sigmask`` (Windows).
+    For worker-thread launchers (``n_jobs > 1``) the handler still runs on the
+    main thread, which is NOT inside the window, so it simply blocks on
+    ``_launch_lock`` until the worker finishes registration — the designed
+    behavior, with no self-deadlock possible.
+
+    Kernel masking is skipped on platforms without ``signal.pthread_sigmask``
+    (Windows); the Python-level deferral still applies.
 
     Yields:
         ``None``. Use as ``with _defer_shutdown_signals(): ...``.
 
     """
+    global _main_thread_defer_depth  # noqa: PLW0603
+    is_main = threading.current_thread() is threading.main_thread()
+    old_mask = None
     if hasattr(signal, "pthread_sigmask"):
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
-        try:
-            yield
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-    else:
+    if is_main:
+        _main_thread_defer_depth += 1
+    try:
         yield
+    finally:
+        if is_main:
+            _main_thread_defer_depth -= 1
+        if old_mask is not None:
+            # Restoring the mask delivers any kernel-queued signal right here;
+            # its handler runs normally (depth is already back to zero) and
+            # clears any deferred marker before raising.
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
+            _service_deferred_shutdown()
+
+
+def _service_deferred_shutdown() -> None:
+    """Run the shutdown handler for a signal recorded mid-critical-section.
+
+    Raises:
+        PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup
+            evidence for the recorded signal.
+
+    """
+    global _deferred_shutdown_signum  # noqa: PLW0603
+    signum = _deferred_shutdown_signum
+    _deferred_shutdown_signum = None
+    if signum is not None:
+        _shutdown_handler(signum, None)
 
 
 def _register(proc: subprocess.Popen) -> int:
@@ -264,21 +550,45 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     propagate uncertainty so the orchestrator can refuse to schedule more work
     onto a potentially-leaked GPU (review v0.5.9 / blocker 3).
 
+    Pre-v0.5.15 this only reaped the direct child (``proc``) when a single
+    nonblocking ``poll()`` already observed it exited — a race where the
+    child died right after ``poll()`` returned ``None`` left it an unreaped
+    zombie despite ``cleanup_confirmed`` being reported ``True`` (review
+    v0.5.15 / blocker 4). Once :func:`_terminate_process_group` confirms every
+    group member is gone, this now unconditionally does one bounded blocking
+    ``wait`` on the direct child so it is provably reaped (or cleanup is
+    reported unconfirmed) before returning. This never calls ``proc.wait()``
+    from ``_shutdown_handler`` itself — that path documents why it must not
+    block (see :func:`_shutdown_handler`); this function only runs on normal
+    (non-signal-handler) cleanup paths.
+
     Args:
         pgid: Process-group ID of the trial subprocess.
-        proc: The root subprocess's :class:`subprocess.Popen` handle. Used
-            for a final non-blocking ``wait`` to reap the zombie root.
+        proc: The root subprocess's :class:`subprocess.Popen` handle. Reaped
+            via a bounded ``wait`` once the group is confirmed terminated.
 
     Returns:
         ``True`` if every process in the group is gone after the SIGTERM →
-        SIGKILL escalation; ``False`` if at least one survived or cleanup
-        status was inconclusive.
+        SIGKILL escalation AND the direct child was reaped within
+        ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one
+        group member survived, cleanup status was inconclusive, or the direct
+        child failed to reap in time.
 
     """
     cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
-    if proc.poll() is not None:
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=0)
+    try:
+        proc.wait(timeout=_DIRECT_CHILD_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        log.error(
+            "Direct child PID %d (pgid %d) did not reap within %.1fs after group "
+            "termination; treating cleanup as unconfirmed",
+            proc.pid,
+            pgid,
+            _DIRECT_CHILD_REAP_TIMEOUT_SECONDS,
+        )
+        cleanup_confirmed = False
+    except ChildProcessError:
+        pass  # Already reaped elsewhere (e.g. a concurrent wait()).
     return cleanup_confirmed
 
 
@@ -299,6 +609,214 @@ class ProcessResult:
     cleanup_confirmed: bool = True
 
 
+@dataclass(frozen=True)
+class StaleProcessIdentity:
+    """Durable identity of one launched trial process group."""
+
+    schema_version: int
+    attempt_id: str
+    pid: int
+    pgid: int
+    proc_starttime: int | None
+    boot_id: str | None
+
+
+def read_boot_id() -> str | None:
+    """Return the current Linux boot identity, or ``None`` when unavailable."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _trial_process_identity(
+    *,
+    attempt_id: str,
+    pid: int,
+    pgid: int,
+) -> StaleProcessIdentity:
+    """Build the identity persisted before a blocked supervisor may exec the trainer.
+
+    Args:
+        attempt_id: Immutable attempt identity already persisted in Optuna;
+            binds this identity record to exactly one attempt so a later
+            reader cannot mistake it for a different trial's process.
+        pid: PID of the just-launched supervisor process.
+        pgid: Process-group ID the supervisor was registered under.
+
+    Returns:
+        A :class:`StaleProcessIdentity` combining the given fields with the
+        current schema version, this process's ``/proc`` start time (``None``
+        off-Linux or if unreadable), and the current boot id (``None`` when
+        unavailable).
+
+    """
+    return StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id=attempt_id,
+        pid=pid,
+        pgid=pgid,
+        proc_starttime=read_proc_starttime(pid),
+        boot_id=read_boot_id(),
+    )
+
+
+def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
+    """Atomically persist one complete process identity record.
+
+    Args:
+        path: Destination ``process_identity.json`` path under the trial dir.
+        identity: Complete identity record to serialize as sorted-key JSON.
+
+    """
+    atomic_write_text(
+        path,
+        json.dumps(
+            {
+                "schema_version": identity.schema_version,
+                "attempt_id": identity.attempt_id,
+                "pid": identity.pid,
+                "pgid": identity.pgid,
+                "proc_starttime": identity.proc_starttime,
+                "boot_id": identity.boot_id,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def _sanitized_supervisor_env() -> dict[str, str]:
+    """Build the minimal environment for the pre-ACK supervisor interpreter.
+
+    Only ``PATH`` is passed through. Everything else — the full trainer
+    environment, ``PYTHONPATH``/``PYTHONHOME``, and any ``CUDA_*`` var
+    composed for this trial — is intentionally withheld: the interpreter
+    that runs ``supervisor.py`` has not yet passed the ready/ack barrier, so
+    it must not see anything a trainer-composed environment could use to
+    execute code before phasesweep's process identity is durable (review
+    v0.5.15 / blocker 1). The trainer environment is delivered separately,
+    over the ack pipe, only after identity persistence succeeds.
+
+    :return dict[str, str]: ``{"PATH": ...}`` using the parent's ``PATH``, or
+        a conservative fallback when the parent has none.
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def _encode_launch_payload(cmd: str, env: dict[str, str]) -> bytes:
+    """Frame the trainer command and environment for the supervisor's ack pipe.
+
+    :param str cmd: Shell command string the supervisor execs with ``/bin/sh``.
+    :param dict[str, str] env: Full trainer process environment.
+    :return bytes: A 10-ASCII-digit decimal length header (byte length of the
+        UTF-8 JSON body) immediately followed by that many body bytes.
+    """
+    body = json.dumps({"cmd": cmd, "env": env}).encode("utf-8")
+    return f"{len(body):010d}".encode("ascii") + body
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, looping past partial pipe writes.
+
+    :param int fd: Open file descriptor to write to.
+    :param bytes data: Bytes to write in full.
+    :raises OSError: If the underlying ``os.write`` call fails.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _spawn_blocked_supervisor(
+    *,
+    stdout: IO[str],
+    stderr: IO[str],
+) -> tuple[subprocess.Popen, int, int]:
+    """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
+
+    Launches the stdlib-only ``phasesweep.runtime.supervisor`` script
+    directly (never ``-m phasesweep.runtime.supervisor``) under
+    ``python -I -S`` with a minimal sanitized environment — see
+    :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
+    acknowledgement pipe. Blocks (via ``select``) until the supervisor
+    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses, then
+    registers the new process group. On any failure — timeout, an unexpected
+    readiness byte, or an exception from ``Popen`` itself — any spawned
+    process group is killed and unregistered before the exception propagates.
+
+    Args:
+        stdout: Already-open file handle that receives the subprocess stdout.
+        stderr: Already-open file handle that receives the subprocess stderr.
+
+    Returns:
+        A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
+        its registered process-group id, and the write end of the
+        acknowledgement pipe. The caller owns ``ack_write`` and must send the
+        framed launch payload (see :func:`_encode_launch_payload`) and close
+        it once the trial's process identity is durably persisted.
+
+    Raises:
+        RuntimeError: If the supervisor does not signal readiness within
+            ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
+            than ``b"R"``.
+
+    """
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                _SUPERVISOR_SCRIPT_PATH,
+                str(ready_write),
+                str(ack_read),
+            ],
+            env=_sanitized_supervisor_env(),
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+            pass_fds=(ready_write, ack_read),
+        )
+        os.close(ready_write)
+        ready_write = -1
+        os.close(ack_read)
+        ack_read = -1
+
+        pgid = _register(proc)
+        readable, _, _ = select.select(
+            [ready_read],
+            [],
+            [],
+            _SUPERVISOR_READY_TIMEOUT_SECONDS,
+        )
+        if not readable or os.read(ready_read, 1) != b"R":
+            raise RuntimeError("trial supervisor did not become ready before launch")
+        os.close(ready_read)
+        ready_read = -1
+        return proc, pgid, ack_write
+    except Exception:
+        if ack_write >= 0:
+            os.close(ack_write)
+            ack_write = -1
+        if proc is not None:
+            target_pgid = pgid if pgid is not None else proc.pid
+            _kill_group(target_pgid, proc)
+        if pgid is not None:
+            _unregister(pgid)
+        raise
+    finally:
+        for fd in (ready_read, ready_write, ack_read):
+            if fd >= 0:
+                os.close(fd)
+
+
 def run_supervised(
     cmd: str,
     *,
@@ -307,35 +825,36 @@ def run_supervised(
     stderr: IO[str],
     timeout: float | None,
     trial_dir: Path,
+    attempt_id: str,
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
-    On launch, writes three identity files into ``trial_dir``:
+    Launches a small stdlib-only supervisor first (see module docstring for
+    the pre-ACK/post-ACK launch boundary; review v0.5.15 / blocker 1). The
+    supervisor waits on an inherited acknowledgement pipe while the parent
+    atomically persists ``process_identity.json``. Only after the identity is
+    durable does the parent send the trainer command and full trainer
+    environment to the supervisor as a framed JSON payload, which the
+    supervisor then execs the trainer command under. If the parent dies
+    before delivering that payload, pipe EOF makes the supervisor exit
+    without starting training.
 
-    * ``pid`` — root subprocess PID, for forensic identification.
-    * ``pgid`` — process-group ID, used by the stale reaper as a fallback when
-      the root PID has exited but descendants are still alive (review v0.5.2 /
-      blocker 7). Without this, a reaper that only knows the root PID cannot
-      recover the PGID via ``os.getpgid`` once the shell has exited.
-    * ``pid_starttime`` — ``/proc/<pid>/stat`` field 22, used to detect PID
-      reuse so the reaper never kills an unrelated process that recycled the PID.
-
-    Identity files are removed only on a fully clean exit: root returned 0
+    The identity record is removed only on a fully clean exit: root returned 0
     **and** no descendant processes were left alive. If the root exits cleanly
     but leaves GPU-holding descendants running, we treat that as a lifecycle
-    failure, kill the group, and preserve identity files for forensics (review
+    failure, kill the group, and preserve the identity record for forensics (review
     v0.5.5 / blocker 1).
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
     Args:
-        cmd: Shell command string to execute (passed to ``Popen(shell=True)``).
+        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
         env: Full process environment for the subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
         timeout: Wall-clock timeout in seconds, or ``None`` for no timeout.
-        trial_dir: Per-trial directory; identity files (``pid``, ``pgid``,
-            ``pid_starttime``) are written here.
+        trial_dir: Per-trial directory where ``process_identity.json`` is written.
+        attempt_id: Immutable attempt identity already persisted in Optuna.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
@@ -346,9 +865,9 @@ def run_supervised(
     """
     import time
 
-    started = time.time()
+    started = time.monotonic()
 
-    # The launch + register + identity-file writes must be atomic from the
+    # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
     # SIGTERM/SIGINT cannot land between ``_launch_lock`` acquisition and
     # signal masking (review v0.5.9 / blocker 2). Reversing the order
@@ -365,51 +884,55 @@ def run_supervised(
     # released, so the handler can safely acquire it.
     proc: subprocess.Popen | None = None
     pgid: int | None = None
-    pid_path = trial_dir / "pid"
-    pgid_path = trial_dir / "pgid"
-    starttime_path = trial_dir / "pid_starttime"
+    ack_write: int | None = None
+    identity_path = trial_dir / PROCESS_IDENTITY_FILE
 
     try:
         with _defer_shutdown_signals(), _launch_lock:
-            proc = subprocess.Popen(
-                cmd,
-                shell=True,  # noqa: S602
-                env=env,
+            proc, pgid, ack_write = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,
-                start_new_session=True,
             )
-
-            # Register in the global child registry immediately so the signal handler
-            # can reach this group even if we haven't written files yet.
-            pgid = _register(proc)
-
-            atomic_write_text(pid_path, f"{proc.pid}\n")
-            atomic_write_text(pgid_path, f"{pgid}\n")
-
-            starttime = read_proc_starttime(proc.pid)
-            if starttime is not None:
-                atomic_write_text(starttime_path, f"{starttime}\n")
+            identity = _trial_process_identity(
+                attempt_id=attempt_id,
+                pid=proc.pid,
+                pgid=pgid,
+            )
+            _write_process_identity(identity_path, identity)
+            # Only now does the trainer command and full trainer environment
+            # cross into the supervisor — after identity is durable, over the
+            # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
+            _write_all(ack_write, _encode_launch_payload(cmd, env))
+            os.close(ack_write)
+            ack_write = None
     except Exception as exc:
+        if ack_write is not None:
+            os.close(ack_write)
         if proc is None:
             raise
         target_pgid = pgid if pgid is not None else proc.pid
-        identity_failure_reason = f"failed to persist process identity: {exc}"
+        # Covers both a failed identity write and a failed payload delivery;
+        # the substring "failed to persist process identity" is kept stable
+        # because it is asserted on by existing tests.
+        launch_failure_reason = (
+            f"failed to persist process identity or deliver launch payload: {exc}"
+        )
         log.exception(
-            "Trial PID %d (pgid %d) launched but identity persistence failed; terminating group",
+            "Trial PID %d (pgid %d) launched but identity persistence or launch payload "
+            "delivery failed; terminating group",
             proc.pid,
             target_pgid,
         )
         cleanup_confirmed = _kill_group(target_pgid, proc)
         if pgid is not None:
             _unregister(pgid)
-        duration = time.time() - started
+        duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
             timed_out=False,
             pid=proc.pid,
             duration_seconds=duration,
-            failure_reason=identity_failure_reason,
+            failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
         )
 
@@ -450,13 +973,12 @@ def run_supervised(
     finally:
         _unregister(pgid)
 
-        # Only clean identity files when the trial exited cleanly AND no
+        # Only clean the identity record when the trial exited cleanly AND no
         # descendant cleanup was required.
         if failure_reason is None and proc.returncode == 0:
-            for path in (pid_path, pgid_path, starttime_path):
-                path.unlink(missing_ok=True)
+            identity_path.unlink(missing_ok=True)
 
-    duration = time.time() - started
+    duration = time.monotonic() - started
     return ProcessResult(
         return_code=proc.returncode if proc.returncode is not None else -9,
         timed_out=timed_out,
@@ -546,8 +1068,9 @@ def is_pid_alive(pid: int) -> bool:
 def is_same_process(pid: int, saved_starttime: int | None) -> bool:
     """Check whether `pid` is the same process that recorded `saved_starttime`.
 
-    If starttime verification is unavailable (non-Linux, or no saved starttime),
-    falls back to pid-alive check only (the pre-v0.4 behavior).
+    When no starttime was recorded, this falls back to a PID-alive check. When
+    a starttime was recorded but the current proc entry is unreadable, identity
+    is unknown and this fails closed instead of treating the PID as a match.
 
     Args:
         pid: PID read from a stale ``trial_dir/pid`` file.
@@ -557,7 +1080,7 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
     Returns:
         ``True`` if ``pid`` is alive AND (no saved starttime, OR the current
         ``/proc`` starttime matches the saved value). ``False`` if the PID is
-        dead or has been reused by an unrelated process.
+        dead, has been reused by an unrelated process, or cannot be verified.
 
     """
     if not is_pid_alive(pid):
@@ -567,8 +1090,7 @@ def is_same_process(pid: int, saved_starttime: int | None) -> bool:
         return True
     current_starttime = read_proc_starttime(pid)
     if current_starttime is None:
-        # Can't read /proc — non-Linux or proc vanished. Fall back.
-        return True
+        return False
     return current_starttime == saved_starttime
 
 
@@ -593,6 +1115,16 @@ def is_pid_zombie(pid: int) -> bool:
     """
     stat = _read_proc_stat(Path("/proc") / str(pid))
     return stat is not None and stat.state == "Z"
+
+
+def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
+    """Return whether a PID identifies the same live, non-zombie process.
+
+    :param int | None pid: Process identifier, if one was recorded.
+    :param int | None saved_starttime: Recorded Linux process start time.
+    :return bool: Whether the identity still names a live non-zombie process.
+    """
+    return pid is not None and is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
 
 
 def reap_child(pid: int) -> bool:
@@ -621,53 +1153,136 @@ def reap_child(pid: int) -> bool:
     return waited == pid
 
 
-@dataclass
-class StaleProcessIdentity:
-    """Forensic identity files left in a trial directory after launch.
-
-    Persisted by ``run_supervised`` and read by the orchestrator's stale-trial
-    reaper (review v0.5.2 / blocker 7). PGID is the fallback when the root PID
-    has exited but descendants are still alive.
-    """
-
-    pid: int | None
-    pgid: int | None
-    starttime: int | None
-
-
-def read_stale_process_identity(trial_dir: Path) -> StaleProcessIdentity:
-    """Load all available identity files for a possibly-stale trial.
+def read_stale_process_identity(
+    trial_dir: Path,
+    *,
+    expected_attempt_id: str,
+) -> StaleProcessIdentity:
+    """Load and validate the atomic identity for a possibly-stale trial.
 
     Args:
-        trial_dir: A trial directory possibly containing ``pid``, ``pgid``,
-            and ``pid_starttime`` files written by :func:`run_supervised`.
+        trial_dir: Trial directory containing ``process_identity.json``.
+        expected_attempt_id: Attempt identity stored on the Optuna trial.
 
     Returns:
-        :class:`StaleProcessIdentity` with whichever fields could be read.
-        Missing or malformed files surface as ``None`` on the respective
-        attributes; this is the input the stale reaper uses to decide
-        whether to kill the group.
+        A complete, attempt-bound :class:`StaleProcessIdentity`.
+
+    Raises:
+        OSError: The identity record is missing or unreadable.
+        ValueError: The identity record is malformed or belongs to another attempt.
 
     """
-    pid: int | None = None
-    pgid: int | None = None
-    starttime: int | None = None
+    path = trial_dir / PROCESS_IDENTITY_FILE
+    try:
+        payload = strict_json_loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"Malformed trial process identity at {path}.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Trial process identity at {path} must be a JSON object.")
+    required_fields = {
+        "schema_version",
+        "attempt_id",
+        "pid",
+        "pgid",
+        "proc_starttime",
+        "boot_id",
+    }
+    if not required_fields.issubset(payload):
+        raise ValueError(f"Trial process identity at {path} is partial.")
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int or schema_version != PROCESS_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported trial process identity schema at {path}.")
+    attempt_id = payload.get("attempt_id")
+    if attempt_id != expected_attempt_id:
+        raise ValueError(f"Trial process identity at {path} belongs to another attempt.")
 
-    pid_file = trial_dir / "pid"
-    pgid_file = trial_dir / "pgid"
-    starttime_file = trial_dir / "pid_starttime"
+    def positive_int(field: str) -> int:
+        """Validate and return one required positive-int identity field.
 
-    if pid_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            pid = int(pid_file.read_text().strip())
-    if pgid_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            pgid = int(pgid_file.read_text().strip())
-    if starttime_file.is_file():
-        with contextlib.suppress(ValueError, OSError):
-            starttime = int(starttime_file.read_text().strip())
+        Args:
+            field: Name of the top-level identity field to validate, used
+                only to build the error message.
 
-    return StaleProcessIdentity(pid=pid, pgid=pgid, starttime=starttime)
+        Returns:
+            The field's value, guaranteed to be a non-bool ``int`` greater
+            than zero.
+
+        Raises:
+            ValueError: If the field is missing, not an ``int`` (or is a
+                ``bool``), or not strictly positive.
+
+        """
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Trial process identity field {field!r} is invalid at {path}.")
+        return value
+
+    proc_starttime = payload.get("proc_starttime")
+    if proc_starttime is not None and (
+        isinstance(proc_starttime, bool)
+        or not isinstance(proc_starttime, int)
+        or proc_starttime <= 0
+    ):
+        raise ValueError(f"Trial process identity field 'proc_starttime' is invalid at {path}.")
+    boot_id = payload.get("boot_id")
+    if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
+        raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
+    return StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id=attempt_id,
+        pid=positive_int("pid"),
+        pgid=positive_int("pgid"),
+        proc_starttime=proc_starttime,
+        boot_id=boot_id,
+    )
+
+
+def cleanup_stale_trial_process(
+    identity: StaleProcessIdentity,
+    *,
+    grace_seconds: float = _KILL_GRACE_SECONDS,
+) -> bool:
+    """Safely clean a stale trial group using boot- and process-bound identity.
+
+    Refuses to act when ``identity`` lacks a recorded boot id or start time, or
+    the current boot id cannot be read, since PID-reuse safety cannot be
+    verified in that case. When ``identity.boot_id`` differs from the current
+    boot id, the host has rebooted since launch, so no process from that boot
+    can still be alive and cleanup is trivially complete. Otherwise delegates
+    to :func:`kill_stale_group` with the identity's ``pid``/``pgid``/starttime.
+
+    Args:
+        identity: Durable process identity read from ``process_identity.json``.
+        grace_seconds: Seconds to wait after SIGTERM before escalating to
+            SIGKILL; forwarded to :func:`kill_stale_group`.
+
+    Returns:
+        ``True`` when it is safe to mark the trial ``FAIL`` (nothing to clean,
+        the host rebooted, or cleanup was confirmed). ``False`` when identity
+        cannot be verified or :func:`kill_stale_group` reports cleanup is
+        uncertain; callers must not advance state in that case.
+
+    """
+    current_boot_id = read_boot_id()
+    if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
+        log.warning(
+            "Refusing automatic cleanup for attempt %s because robust process-birth identity "
+            "is unavailable on this platform.",
+            identity.attempt_id,
+        )
+        return False
+    if identity.boot_id != current_boot_id:
+        log.warning(
+            "Attempt %s belongs to an earlier host boot; no process from that boot remains.",
+            identity.attempt_id,
+        )
+        return True
+    return kill_stale_group(
+        identity.pid,
+        identity.proc_starttime,
+        pgid=identity.pgid,
+        grace_seconds=grace_seconds,
+    )
 
 
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
@@ -707,7 +1322,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     member_pids = set(_group_member_pids(pgid))
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _tracked_process_group_alive(pgid, member_pids):
+        if not _process_group_alive_with_members(pgid, member_pids):
             return True
         time.sleep(0.1)
 
@@ -724,7 +1339,7 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     # "marked FAIL" state means cleanup completed, not requested.
     kill_deadline = time.monotonic() + 2.0
     while time.monotonic() < kill_deadline:
-        if not _tracked_process_group_alive(pgid, member_pids):
+        if not _process_group_alive_with_members(pgid, member_pids):
             return True
         time.sleep(0.05)
 
@@ -772,28 +1387,25 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool:
-    """Return whether ``pgid`` appears to identify a new group leader.
+def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool | None:
+    """Return whether ``pgid`` identifies a new group leader, or is unverifiable.
 
     A PGID number can later be reused as an ordinary PID in another process
     group; that does not make ``killpg(pgid, ...)`` unsafe because the process
     is not a member of the target group. The unsafe case is narrower: a live
     ``/proc/<pgid>`` entry belongs to process group ``pgid`` but has a different
     starttime, meaning the saved group ID is now led by an unrelated process.
+
+    :param int pgid: Stored process-group ID whose leader identity is checked.
+    :param int saved_starttime: Starttime recorded for the original group leader.
+    :return bool | None: ``True`` for a reused leader, ``False`` when no live
+        leader exists or its identity is compatible, and ``None`` when a live
+        leader's proc identity is unreadable.
     """
     stat = _read_proc_stat(Path("/proc") / str(pgid))
-    return stat is not None and stat.pgrp == pgid and stat.starttime != saved_starttime
-
-
-def _tracked_process_group_alive(pgid: int, member_pids: set[int]) -> bool:
-    """Check group liveness using a cached PID set, refreshing only if needed.
-
-    :param int pgid: Process-group ID to probe.
-    :param set[int] member_pids: Cached group member PIDs, refreshed in place on apparent
-        death.
-    :return bool: ``True`` when any non-zombie group member still appears live.
-    """
-    return _process_group_alive_with_members(pgid, member_pids)
+    if stat is None:
+        return None if is_pid_alive(pgid) else False
+    return stat.pgrp == pgid and stat.starttime != saved_starttime
 
 
 def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -> bool:
@@ -884,18 +1496,16 @@ def kill_stale_group(
        cleanup is complete. If the PGID still exists, use it only when the
        reused PID is not the leader of that group; otherwise fail closed to
        avoid killing an unrelated process group.
-    3. ``pid`` is unrecoverable (dead or never recorded) but ``pgid`` was
-       persisted at launch: best-effort PGID kill with a loud warning. The
-       root PID may have exited (``shell=True`` shells often do) while
-       descendants are still holding GPU memory.
+    3. ``pid`` is dead but its verified same-boot identity includes ``pgid``:
+       use the group only when its leader identity has not been reused. The
+       root shell may have exited while descendants still hold GPU memory.
     4. No PID and no PGID: nothing to clean up, return ``True``.
 
     Args:
-        pid: Root PID read from ``trial_dir/pid``, or ``None`` if unrecorded.
-        saved_starttime: Starttime read from ``trial_dir/pid_starttime``, or
-            ``None`` if unavailable / non-Linux.
-        pgid: Process-group ID read from ``trial_dir/pgid`` (the fallback
-            target when ``pid`` cannot be trusted).
+        pid: Root PID from a durable process identity, or ``None`` if absent.
+        saved_starttime: Saved Linux process start time, or ``None`` when identity
+            cannot be verified. A live PID/PGID is never signalled in that case.
+        pgid: Process-group ID from the same durable identity.
         grace_seconds: Seconds to wait after SIGTERM before escalating to
             SIGKILL; passed through to :func:`_terminate_process_group`.
 
@@ -907,8 +1517,32 @@ def kill_stale_group(
     """
     target_pgid: int | None = None
 
+    if saved_starttime is None:
+        pid_alive = pid is not None and is_pid_alive(pid)
+        pgid_alive = pgid is not None and _process_group_exists(pgid)
+        if pid_alive or pgid_alive:
+            log.warning(
+                "Refusing to signal stale pid=%s pgid=%s without a saved process start time.",
+                pid,
+                pgid,
+            )
+            return False
+        return True
+
     if pid is not None:
-        if is_same_process(pid, saved_starttime):
+        pid_alive = is_pid_alive(pid)
+        same_process = False
+        if pid_alive:
+            current_starttime = read_proc_starttime(pid)
+            if current_starttime is None:
+                log.warning(
+                    "PID %d is alive but its /proc start time is unreadable; "
+                    "refusing cleanup because process identity is unknown.",
+                    pid,
+                )
+                return False
+            same_process = current_starttime == saved_starttime
+        if same_process:
             try:
                 target_pgid = os.getpgid(pid)
             except ProcessLookupError:
@@ -916,7 +1550,7 @@ def kill_stale_group(
             except (PermissionError, OSError) as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
-        elif is_pid_alive(pid) and saved_starttime is not None:
+        elif pid_alive:
             # PID reuse detected. A persisted PGID can still prove cleanup is
             # complete (group gone) or target original descendants (group alive
             # but not led by the reused PID). Refuse only when the stored PGID
@@ -938,7 +1572,15 @@ def kill_stale_group(
                     pid,
                 )
                 return False
-            if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+            pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
+            if pgid_reused is None:
+                log.warning(
+                    "Stored PGID %d has a live but unreadable leader; refusing "
+                    "PGID fallback because process identity is unknown.",
+                    pgid,
+                )
+                return False
+            if pgid_reused:
                 log.warning(
                     "PID %d is alive but starttime does not match saved value; "
                     "stored PGID %d is led by a different process. Refusing "
@@ -951,7 +1593,15 @@ def kill_stale_group(
     if target_pgid is None and pgid is not None and saved_starttime is not None:
         if not _process_group_exists(pgid):
             return True
-        if _stored_pgid_is_reused_group_leader(pgid, saved_starttime):
+        pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
+        if pgid_reused is None:
+            log.warning(
+                "Stored PGID %d has a live but unreadable leader; refusing PGID "
+                "fallback because process identity is unknown.",
+                pgid,
+            )
+            return False
+        if pgid_reused:
             log.warning(
                 "Stored PGID %d is now led by a different process. Refusing "
                 "PGID fallback to avoid killing an unrelated process group "
@@ -977,23 +1627,3 @@ def kill_stale_group(
 
     log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
     return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)
-
-
-def terminate_group(pgid: int, *, grace_seconds: float = _KILL_GRACE_SECONDS) -> bool:
-    """Public SIGTERM -> grace -> SIGKILL of a process group; confirm it is gone.
-
-    Thin wrapper over the internal escalation used by trial cleanup, exposed so
-    callers outside ``runtime`` (the MCP cancel path) do not reach into a
-    private helper. Same contract: returns ``True`` only when the group is
-    confirmed dead (already gone, died in the SIGTERM grace, or died within 2s
-    of SIGKILL), ``False`` when cleanup is uncertain.
-
-    Args:
-        pgid: Target process-group ID.
-        grace_seconds: Seconds to wait after SIGTERM before escalating.
-
-    Returns:
-        Whether the group is confirmed gone.
-
-    """
-    return _terminate_process_group(pgid, grace_seconds=grace_seconds)

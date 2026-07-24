@@ -7,13 +7,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from phasesweep import load_experiment
+from phasesweep import load_config, load_experiment
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
+    Suite,
 )
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
@@ -45,7 +46,13 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert result is None, case
 
 
-def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path:
+def _storage_policy_config(
+    tmp_path: Path,
+    *,
+    storage: str,
+    n_jobs: int,
+    allow_external_rdb_single_host: bool | None = None,
+) -> Path:
     parallel = (
         f"""
             n_jobs: {n_jobs}
@@ -53,17 +60,24 @@ def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path
         if n_jobs > 1
         else ""
     )
+    external_rdb_single_host = (
+        f"\n        allow_external_rdb_single_host: "
+        f"{'true' if allow_external_rdb_single_host else 'false'}"
+        if allow_external_rdb_single_host is not None
+        else ""
+    )
     return write_yaml(
         tmp_path,
         f"""
         experiment: t
-        storage: {storage}
+        storage: {storage}{external_rdb_single_host}
+        provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         phases:
           - name: p
             n_trials: 1{parallel}
@@ -98,6 +112,142 @@ def test_validate_storage_parallel_policy(
         load_experiment(p)
 
 
+@pytest.mark.parametrize(
+    ("storage", "allow_external_rdb_single_host", "raises"),
+    [
+        ("postgresql://user:pass@host/db", None, True),
+        ("postgresql://user:pass@host/db", False, True),
+        ("postgresql://user:pass@host/db", True, False),
+        ("mysql+pymysql://user:pass@host/db", None, True),
+        ("mysql+pymysql://user:pass@host/db", True, False),
+        ("sqlite:///{tmp}/phases.db", None, False),
+        ("sqlite:///{tmp}/phases.db", False, False),
+        ("journal:///{tmp}/phases.journal", None, False),
+    ],
+    ids=[
+        "postgres_default_rejected",
+        "postgres_explicit_false_rejected",
+        "postgres_acknowledged_ok",
+        "mysql_default_rejected",
+        "mysql_acknowledged_ok",
+        "sqlite_unaffected_default",
+        "sqlite_unaffected_explicit_false",
+        "journal_unaffected",
+    ],
+)
+def test_validate_storage_external_rdb_single_host_policy(
+    tmp_path: Path,
+    storage: str,
+    allow_external_rdb_single_host: bool | None,
+    raises: bool,
+) -> None:
+    """A storage backend other than sqlite/journal requires an explicit
+    allow_external_rdb_single_host: true acknowledgement (review v0.5.15 / item E,
+    renamed from allow_unsafe_multihost per review v0.5.14 / item D); sqlite and
+    journal storage are unaffected regardless of the flag's value."""
+    p = _storage_policy_config(
+        tmp_path,
+        storage=storage.format(tmp=tmp_path),
+        n_jobs=1,
+        allow_external_rdb_single_host=allow_external_rdb_single_host,
+    )
+    if raises:
+        with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+            load_experiment(p)
+    else:
+        load_experiment(p)
+
+
+def test_external_rdb_storage_error_is_actionable() -> None:
+    """The rejection must name the detected backend, state that PhaseSweep's
+    coordination is single-host, and say how to acknowledge the risk."""
+    with pytest.raises(ValueError) as exc_info:
+        Experiment(
+            experiment="t",
+            storage="postgresql://user:pass@host/db",
+            provenance={"revision": "test-fixture-v1"},
+            trial_command="echo {overrides}",
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
+            phases=[
+                Phase(  # type: ignore[arg-type]
+                    name="p",
+                    n_trials=2,
+                    search_space={"x": IntParam(type="int", low=0, high=1)},
+                )
+            ],
+        )
+    message = str(exc_info.value)
+    assert "postgresql" in message
+    assert "host-local-filesystem" in message
+    assert "allow_external_rdb_single_host: true" in message
+    assert "single host" in message
+
+
+def test_external_rdb_storage_allowed_when_acknowledged() -> None:
+    """Setting allow_external_rdb_single_host: true permits shared RDB storage."""
+    experiment = Experiment(
+        experiment="t",
+        storage="postgresql://user:pass@host/db",
+        allow_external_rdb_single_host=True,
+        provenance={"revision": "test-fixture-v1"},
+        trial_command="echo {overrides}",
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
+        phases=[
+            Phase(  # type: ignore[arg-type]
+                name="p",
+                n_trials=2,
+                search_space={"x": IntParam(type="int", low=0, high=1)},
+            )
+        ],
+    )
+    assert experiment.allow_external_rdb_single_host is True
+    assert experiment.storage == "postgresql://user:pass@host/db"
+
+
+def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
+    """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
+    study's Experiment exactly like ``storage`` and other defaulted fields
+    (see ``Suite.experiment_for_study``); a study can still opt out and hit
+    the same Experiment-level rejection as a standalone config."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: external_rdb_suite
+            defaults:
+              storage: postgresql://user:pass@host/db
+              allow_external_rdb_single_host: true
+              trial_command: "echo"
+              provenance: {revision: default-v1}
+              metric:
+                name: x
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
+            studies:
+              - name: inherited
+                phases: [{name: p, n_trials: 1}]
+              - name: opted_out
+                allow_external_rdb_single_host: false
+                phases: [{name: p, n_trials: 1}]
+            """,
+        )
+    )
+
+    assert isinstance(config, Suite)
+    inherited_study, opted_out_study = config.studies
+
+    inherited = config.experiment_for_study(inherited_study)
+    assert inherited.storage == "postgresql://user:pass@host/db"
+    assert inherited.allow_external_rdb_single_host is True
+
+    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+        config.experiment_for_study(opted_out_study)
+
+
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     """File-based backends resolve to absolute paths so equivalent URL spellings
     (relative paths, ``..`` segments) produce one stable lock identity. None
@@ -129,8 +279,11 @@ def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
         Experiment(
             experiment="t",
             storage="sqlite:///test.db",
+            provenance={"revision": "test-fixture-v1"},
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",
