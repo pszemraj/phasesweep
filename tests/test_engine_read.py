@@ -16,6 +16,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.state import (
@@ -126,7 +127,9 @@ def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: st
     assert status["phases"][0]["trial_data_available"] is False
     assert status["metric"]["objective_evidence"] == {
         "kind": "log_regex",
-        "attempt_bound": True,
+        "attempt_location_scoped": True,
+        "attempt_identity_bound": False,
+        "source_identity_keyed": False,
         "objective_name_bound": False,
         "split_bound": False,
         "evaluation_policy_bound": False,
@@ -360,7 +363,9 @@ def test_objective_evidence_assurance_json_envelope_without_declared_checkpoint(
 
     assert status["metric"]["objective_evidence"] == {
         "kind": "json_envelope",
-        "attempt_bound": True,
+        "attempt_location_scoped": True,
+        "attempt_identity_bound": True,
+        "source_identity_keyed": False,
         "objective_name_bound": True,
         "split_bound": True,
         "evaluation_policy_bound": True,
@@ -398,7 +403,9 @@ def test_objective_evidence_assurance_json_envelope_with_declared_checkpoint(
 
     assert status["metric"]["objective_evidence"] == {
         "kind": "json_envelope",
-        "attempt_bound": True,
+        "attempt_location_scoped": True,
+        "attempt_identity_bound": True,
+        "source_identity_keyed": False,
         "objective_name_bound": True,
         "split_bound": True,
         "evaluation_policy_bound": True,
@@ -407,3 +414,56 @@ def test_objective_evidence_assurance_json_envelope_with_declared_checkpoint(
         "expected_step_declared": True,
         "expected_step_value_bound": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("extractor", "expected_triple"),
+    [
+        pytest.param(
+            JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="result.json",
+                objective_name="loss",
+                split="test",
+                policy="test",
+            ),
+            (True, True, False),
+            id="json_envelope",
+        ),
+        pytest.param(
+            LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+            (True, False, False),
+            id="log_regex",
+        ),
+        pytest.param(
+            WandbExtractor(type="wandb", entity="acme", project="proj", metric_key="eval/loss"),
+            (True, False, True),
+            id="wandb",
+        ),
+    ],
+)
+def test_objective_evidence_assurance_attempt_triple_by_kind(
+    tmp_path: Path,
+    extractor: JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor,
+    expected_triple: tuple[bool, bool, bool],
+) -> None:
+    """Each extractor kind reports its own (location, identity, source-key) triple.
+
+    ``json_envelope`` structurally echoes and cross-checks the attempt
+    identity; ``wandb`` is keyed by an immutable run id that IS the attempt
+    id; ``log_regex`` is merely read from an attempt-scoped location with
+    nothing in its contents tying it to that attempt (review v0.5.15 / item C).
+    """
+    exp = _experiment(tmp_path)
+    exp = exp.model_copy(
+        update={"metric": Metric(name="loss", goal="minimize", extractor=extractor)}
+    )
+
+    status = read_status(exp)
+    evidence = status["metric"]["objective_evidence"]
+
+    assert (
+        evidence["attempt_location_scoped"],
+        evidence["attempt_identity_bound"],
+        evidence["source_identity_keyed"],
+    ) == expected_triple

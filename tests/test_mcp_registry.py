@@ -87,7 +87,9 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
         "goal": "minimize",
         "objective_evidence": {
             "kind": "json_envelope",
-            "attempt_bound": True,
+            "attempt_location_scoped": True,
+            "attempt_identity_bound": True,
+            "source_identity_keyed": False,
             "objective_name_bound": True,
             "split_bound": True,
             "evaluation_policy_bound": True,

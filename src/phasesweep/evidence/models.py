@@ -142,11 +142,32 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
     - ``log_regex`` and ``wandb`` extractors have no objective_name/split/
       policy/checkpoint/expected_step concept at all, so every one of those
       flags is ``False`` for them.
-    - ``attempt_bound`` is ``True`` for every extractor kind: each reads
-      evidence from a trial directory (or, for ``wandb``, a run id) that is
-      uniquely scoped to this generation+attempt, and ``json_envelope``
-      additionally cross-checks ``generation_id``/``attempt_id``/
-      ``overrides_sha256`` against the envelope's own reported values.
+    - A single coarse ``attempt_bound`` claim overstated weak extractors, so
+      it is split into three precise flags (review v0.5.15 / item C):
+
+      - ``attempt_location_scoped`` is ``True`` for every extractor kind:
+        each reads evidence from a location — a trial directory for
+        ``json_envelope``/``log_regex``, or a W&B run id for ``wandb`` —
+        that is uniquely scoped to this generation+attempt. Scoping alone is
+        weak: nothing in a ``log_regex`` file's *contents* identifies the
+        attempt that produced it, so a file misplaced or symlinked into the
+        wrong trial directory would be read as gospel.
+      - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
+        the envelope structurally echoes ``generation_id``/``attempt_id``/
+        ``overrides_sha256`` in its own body, and
+        ``_extract_json_envelope`` cross-checks those reported values
+        against the runtime's own identity before accepting the result.
+        ``log_regex`` has no identity fields to check at all, and ``wandb``
+        is keyed by run id rather than by any self-reported identity inside
+        the run summary, so both are ``False``.
+      - ``source_identity_keyed`` is ``True`` only for ``wandb``: the
+        evidence source itself — the W&B run — is addressed by the
+        immutable attempt identity (``WANDB_RUN_ID=attempt_id``) rather than
+        by filesystem location, so a wrong-attempt run cannot silently
+        appear at the right path the way a misplaced log file could.
+        ``json_envelope`` and ``log_regex`` read location-addressed files,
+        so this is ``False`` for both; the envelope's stronger guarantee is
+        already captured by ``attempt_identity_bound``.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
     :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
@@ -162,7 +183,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         expected_step_declared = extractor.expected_step is not None
         return {
             "kind": extractor.type,
-            "attempt_bound": True,
+            "attempt_location_scoped": True,
+            "attempt_identity_bound": True,
+            "source_identity_keyed": False,
             "objective_name_bound": True,
             "split_bound": True,
             "evaluation_policy_bound": True,
@@ -173,7 +196,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         }
     return {
         "kind": extractor.type,
-        "attempt_bound": True,
+        "attempt_location_scoped": True,
+        "attempt_identity_bound": False,
+        "source_identity_keyed": isinstance(extractor, WandbExtractor),
         "objective_name_bound": False,
         "split_bound": False,
         "evaluation_policy_bound": False,
@@ -197,7 +222,9 @@ class _ObjectiveEvidenceFields(BaseModel):
     """
 
     kind: Literal["json_envelope", "log_regex", "wandb"]
-    attempt_bound: bool
+    attempt_location_scoped: bool
+    attempt_identity_bound: bool
+    source_identity_keyed: bool
     objective_name_bound: bool
     split_bound: bool
     evaluation_policy_bound: bool
