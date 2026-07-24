@@ -51,6 +51,7 @@ from phasesweep.mcp.install.targets import (
     TOML_START,
     AgentTarget,
     Launcher,
+    _entry_argv,
     agent_targets,
     codex_toml_content,
     is_managed_mcp_entry,
@@ -895,6 +896,24 @@ def run(
 
 # --- check-install: read-only verification (review v0.5.15 / item G) ---
 
+# CheckStatus vocabulary printed by `phasesweep mcp check-install` (see
+# check_install() and docs/mcp_setup.md's check-install section, kept in sync
+# with this table):
+#
+#   status           triggered when                                    attention?
+#   ---------------  -------------------------------------------------  ----------
+#   ok               launcher executable resolves (path is executable,  no
+#                     or `uvx` is on PATH in --launcher uvx mode)
+#   missing          launcher path no longer exists, or `uvx` is not     yes
+#                     on PATH
+#   not-executable   launcher path exists but lacks the execute bit      yes
+#   unmanaged        an entry exists but was not written by this         no
+#                     installer (foreign shape); left unprobed
+#   not-configured   no phasesweep MCP entry exists for this target      no
+#   unreadable       config path/entry could not be safely resolved,     yes
+#                     read, or parsed
+#
+# _CHECK_ATTENTION_STATUSES below is the authoritative needs-attention set.
 CheckStatus: TypeAlias = Literal[
     "ok",
     "missing",
@@ -911,8 +930,6 @@ _CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset({"missing", "not-executabl
 class LauncherCheck:
     """Verification outcome for one target's configured phasesweep MCP launcher."""
 
-    target_id: str
-    display_name: str
     config_path: Path | None
     executable: str | None
     args: tuple[str, ...]
@@ -969,8 +986,6 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         edit_path = spec.path.resolve(strict=False)
     except (OSError, RuntimeError):
         return LauncherCheck(
-            target.id,
-            target.display_name,
             spec.path,
             None,
             (),
@@ -981,8 +996,6 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     snapshot = _read_editable_text(edit_path)
     if snapshot is None:
         return LauncherCheck(
-            target.id,
-            target.display_name,
             spec.path,
             None,
             (),
@@ -990,15 +1003,13 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             "config path is not a readable regular UTF-8 file",
         )
     if not snapshot.existed or not snapshot.text.strip():
-        return LauncherCheck(target.id, target.display_name, spec.path, None, (), "not-configured")
+        return LauncherCheck(spec.path, None, (), "not-configured")
 
     if spec.format == "toml":
         try:
             parsed = tomllib.loads(snapshot.text)
         except tomllib.TOMLDecodeError as exc:
             return LauncherCheck(
-                target.id,
-                target.display_name,
                 spec.path,
                 None,
                 (),
@@ -1007,27 +1018,23 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         entry = _toml_mcp_entry(parsed)
         if entry is None:
-            return LauncherCheck(
-                target.id, target.display_name, spec.path, None, (), "not-configured"
-            )
+            return LauncherCheck(spec.path, None, (), "not-configured")
         if not is_managed_mcp_entry("stdio", entry) or not isinstance(entry, dict):
             return LauncherCheck(
-                target.id,
-                target.display_name,
                 spec.path,
                 None,
                 (),
                 "unmanaged",
                 f"an unmanaged {_CODEX_TABLE_HEADER} table exists; not installer-verified",
             )
-        command, args = entry["command"], entry["args"]
+        argv = _entry_argv("stdio", entry)
+        assert argv is not None  # is_managed_mcp_entry already validated this shape
+        command, args = argv[0], argv[1:]
     else:
         try:
             data = strict_json_loads(snapshot.text, finite_floats=True)
         except ValueError:
             return LauncherCheck(
-                target.id,
-                target.display_name,
                 spec.path,
                 None,
                 (),
@@ -1036,8 +1043,6 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         if not isinstance(data, dict):
             return LauncherCheck(
-                target.id,
-                target.display_name,
                 spec.path,
                 None,
                 (),
@@ -1047,29 +1052,21 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         container = data.get(spec.key)
         member = container.get(SERVER_NAME) if isinstance(container, dict) else None
         if member is None:
-            return LauncherCheck(
-                target.id, target.display_name, spec.path, None, (), "not-configured"
-            )
+            return LauncherCheck(spec.path, None, (), "not-configured")
         if not is_managed_mcp_entry(spec.style, member) or not isinstance(member, dict):
             return LauncherCheck(
-                target.id,
-                target.display_name,
                 spec.path,
                 None,
                 (),
                 "unmanaged",
                 "an unmanaged phasesweep entry exists; not installer-verified",
             )
-        if spec.style == "opencode":
-            argv = member["command"]
-            command, args = argv[0], argv[1:]
-        else:
-            command, args = member["command"], member["args"]
+        argv = _entry_argv(spec.style, member)
+        assert argv is not None  # is_managed_mcp_entry already validated this shape
+        command, args = argv[0], argv[1:]
 
     status, detail = _probe_launcher_executable(command)
-    return LauncherCheck(
-        target.id, target.display_name, spec.path, command, tuple(args), status, detail
-    )
+    return LauncherCheck(spec.path, command, tuple(args), status, detail)
 
 
 def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
@@ -1108,7 +1105,7 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
         result = _check_target_launcher(target)
         click.echo(f"  {target.display_name}")
         if result.status == "not-configured":
-            click.echo("    mcp           not configured")
+            click.echo(f"    mcp           {result.status:<13}")
             continue
         configured += 1
         if result.status == "unmanaged":

@@ -405,23 +405,16 @@ def test_detection_uses_binary_or_config_dir(fake_home, tmp_path):
 
 
 def test_server_command_prefers_running_python_environment(tmp_path, monkeypatch):
-    env_bin = tmp_path / "env" / "bin"
-    env_bin.mkdir(parents=True)
-    command = env_bin / "phasesweep-mcp"
-    command.write_text("#!/bin/sh\n")
-    command.chmod(0o755)
-    monkeypatch.setattr(installer.sys, "executable", str(env_bin / "python"))
+    command = _executable(tmp_path)
+    monkeypatch.setattr(installer.sys, "executable", str(command.parent / "python"))
     monkeypatch.setattr(installer.shutil, "which", lambda _name: "/other/bin/phasesweep-mcp")
 
     assert installer.resolve_server_command() == str(command.resolve())
 
 
 def test_server_command_preserves_lexical_symlink_name(tmp_path, monkeypatch):
-    env_bin = tmp_path / "env" / "bin"
-    env_bin.mkdir(parents=True)
-    target = env_bin / "shared-launcher"
-    target.write_text("#!/bin/sh\n")
-    target.chmod(0o755)
+    target = _executable(tmp_path, name="shared-launcher")
+    env_bin = target.parent
     command = env_bin / "phasesweep-mcp"
     command.symlink_to(target.name)
     monkeypatch.setattr(installer.sys, "executable", str(env_bin / "python"))
@@ -612,8 +605,9 @@ def test_installer_refuses_uvx_launcher_before_edits_when_unresolvable(
 # --- check-install (review v0.5.15 / item G) ---
 
 
-def _claude_target(project):
-    return next(t for t in agent_targets(project) if t.id == "claude")
+def _target(project, agent_id):
+    """Look up one agent's resolved target for a project directory."""
+    return next(t for t in agent_targets(project) if t.id == agent_id)
 
 
 def _write_json_entry(target, entry):
@@ -634,7 +628,7 @@ def test_check_install_reports_healthy_path_launcher(fake_home, tmp_path, capsys
     project = tmp_path / "proj"
     project.mkdir()
     script = _executable(tmp_path)
-    claude = _claude_target(project)
+    claude = _target(project, "claude")
     _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
 
     code = installer.check_install(project, ["claude"])
@@ -649,7 +643,7 @@ def test_check_install_reports_missing_executable_with_repair_guidance(fake_home
     project = tmp_path / "proj"
     project.mkdir()
     missing = tmp_path / "gone" / "phasesweep-mcp"
-    claude = _claude_target(project)
+    claude = _target(project, "claude")
     _write_json_entry(claude, mcp_entry("stdio", str(missing), Path("/proj/catalog.yaml")))
 
     code = installer.check_install(project, ["claude"])
@@ -667,7 +661,7 @@ def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
     project.mkdir()
     script = _executable(tmp_path)
     script.chmod(0o644)
-    claude = _claude_target(project)
+    claude = _target(project, "claude")
     _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
 
     code = installer.check_install(project, ["claude"])
@@ -681,7 +675,7 @@ def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
 def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
-    claude = _claude_target(project)
+    claude = _target(project, "claude")
     entry = mcp_entry(
         "stdio",
         "uvx",
@@ -706,12 +700,12 @@ def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, 
 def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
-    claude = _claude_target(project)
+    claude = _target(project, "claude")
 
     code = installer.check_install(project, ["claude"])
     output = capsys.readouterr().out
     assert code == 0
-    assert "not configured" in output
+    assert "not-configured" in output
 
     _write_json_entry(claude, {"command": "custom-server"})
     code = installer.check_install(project, ["claude"])
@@ -803,7 +797,7 @@ def test_installer_supports_symlinked_user_config(
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
-    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    target = _target(project, agent_id)
     config = target.mcp.path
     managed = fake_home / "dotfiles" / agent_id
     if symlink_kind == "directory":
@@ -1118,7 +1112,7 @@ def test_installer_preserves_unmanaged_json_entry(fake_home, tmp_path, capsys, a
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
-    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    target = _target(project, agent_id)
     target.mcp.path.parent.mkdir(parents=True, exist_ok=True)
     unmanaged_entry = {"command": "custom-server"}
     if agent_id == "claude":
@@ -1362,7 +1356,7 @@ def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
-    target = next(item for item in agent_targets(project) if item.id == agent_id)
+    target = _target(project, agent_id)
     args = [
         "mcp",
         "install",

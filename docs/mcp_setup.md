@@ -112,7 +112,16 @@ phasesweep mcp check-install                    # every supported agent
 phasesweep mcp check-install --agent claude     # one agent; repeat --agent for more
 ```
 
-For each configured entry it reports the launcher command and whether it resolves: the absolute path exists and is executable (default mode), or `uvx` is on `PATH` (`--launcher uvx` mode). It never edits a client file. Agents with no phasesweep entry are reported `not configured`; entries this installer did not write are reported `unmanaged` and left unexamined. Exit code 0 means every configured launcher resolves; exit code 1 means at least one needs the repair guidance printed above it.
+It never edits a client file. Each target is reported with one of six statuses:
+
+- `ok` - the launcher resolves: the absolute path exists and is executable (default mode), or `uvx` is on `PATH` (`--launcher uvx` mode).
+- `missing` - the launcher no longer resolves: the absolute path is gone, or `uvx` is not on `PATH`.
+- `not-executable` - the launcher path exists but lacks the execute bit.
+- `unmanaged` - an entry exists but was not written by this installer; left unexamined.
+- `not-configured` - no phasesweep MCP entry exists for this target.
+- `unreadable` - the config file or entry could not be safely resolved, read, or parsed.
+
+Exit code 0 means every configured launcher resolves; exit code 1 means at least one is `missing`, `not-executable`, or `unreadable` (see the repair guidance printed above it). `unmanaged` and `not-configured` are informational only and do not affect the exit code.
 
 ## 5. Instruct the agent
 

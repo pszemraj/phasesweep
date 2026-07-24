@@ -142,12 +142,12 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     if style == "opencode":
         if set(value) != {"type", "command", "enabled"}:
             return False
-        command = value.get("command")
+        argv = _entry_argv(style, value)
         return (
             value.get("type") == "local"
             and value.get("enabled") is True
-            and isinstance(command, list)
-            and _is_phasesweep_argv(command)
+            and argv is not None
+            and _is_phasesweep_argv(argv)
         )
 
     expected_keys = {"command", "args"}
@@ -157,10 +157,42 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
             return False
     if set(value) != expected_keys:
         return False
-    args = value.get("args")
-    if not isinstance(args, list):
-        return False
-    return _is_phasesweep_argv([value.get("command"), *args])
+    argv = _entry_argv(style, value)
+    return argv is not None and _is_phasesweep_argv(argv)
+
+
+def _entry_argv(style: EntryStyle, value: dict[str, object]) -> list[str] | None:
+    """Recover the flat launcher argv from a style-tagged entry value.
+
+    opencode packs the entire argv into one ``command`` list; every other
+    style splits the executable into ``command`` and the rest into ``args``.
+    This is the single place that knows how to recover a flat argv from a
+    style-tagged config value - new EntryStyles must be handled here.
+
+    :param EntryStyle style: Client entry dialect the value is tagged with.
+    :param dict[str, object] value: Entry value already known to be a ``dict``.
+    :return list[str] | None: Flat argv (executable first), or None when the
+        argv-bearing field has the wrong shape for this style or contains a
+        non-string element (no launcher shape accepts one, so callers get a
+        properly typed argv or nothing).
+    """
+    raw: list[object]
+    if style == "opencode":
+        command = value.get("command")
+        if not isinstance(command, list):
+            return None
+        raw = command
+    else:
+        args = value.get("args")
+        if not isinstance(args, list):
+            return None
+        raw = [value.get("command"), *args]
+    argv: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return None
+        argv.append(item)
+    return argv
 
 
 def _is_phasesweep_argv(argv: object) -> bool:
