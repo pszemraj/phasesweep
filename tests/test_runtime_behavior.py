@@ -1136,13 +1136,13 @@ def test_run_suite_installs_signal_handlers_once_for_all_components(
     per study.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
-    prior_installed = runtime_process._installed
     try:
         # Clean slate: nothing already owns the shutdown signals here,
         # regardless of what an earlier test in this session left installed.
+        # install_signal_handlers() now checks OS ground truth, so resetting
+        # the actual handlers is sufficient to make it see "not installed".
         for sig in runtime_process._SHUTDOWN_SIGNALS:
             signal.signal(sig, signal.SIG_DFL)
-        runtime_process._installed = False
 
         signal_calls: list[int] = []
         original_signal = signal.signal
@@ -1190,7 +1190,6 @@ def test_run_suite_installs_signal_handlers_once_for_all_components(
     finally:
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
-        runtime_process._installed = prior_installed
 
 
 def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> None:
@@ -1236,7 +1235,6 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
     exit.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
-    prior_installed = runtime_process._installed
     try:
         install_signal_handlers()
         for sig in runtime_process._SHUTDOWN_SIGNALS:
@@ -1262,4 +1260,3 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
     finally:
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
-        runtime_process._installed = prior_installed

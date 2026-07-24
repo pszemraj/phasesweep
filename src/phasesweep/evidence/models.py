@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from phasesweep.config.common import _Frozen, _validate_optional_bounds
 
@@ -182,6 +182,29 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         "expected_step_declared": False,
         "expected_step_value_bound": False,
     }
+
+
+class _ObjectiveEvidenceFields(BaseModel):
+    """Assurance-flag field set shared by MCP result payloads and persisted snapshots.
+
+    ``phasesweep.mcp.server.ObjectiveEvidencePayload`` and
+    ``phasesweep.mcp.snapshots.ObjectiveEvidenceSnapshot`` each subclass this
+    alongside their own strict base (``extra="forbid"``, and for snapshots also
+    ``allow_inf_nan=False``, inert here since every field below is a bool or
+    ``Literal``) so the identical field set is declared exactly once while each
+    site keeps its own class name and JSON schema entry. See
+    :func:`objective_evidence_assurance` for exactly what each flag means.
+    """
+
+    kind: Literal["json_envelope", "log_regex", "wandb"]
+    attempt_bound: bool
+    objective_name_bound: bool
+    split_bound: bool
+    evaluation_policy_bound: bool
+    checkpoint_declared: bool
+    checkpoint_value_bound: bool
+    expected_step_declared: bool
+    expected_step_value_bound: bool
 
 
 class RequiredFileGate(_TrialPathModel):

@@ -31,7 +31,7 @@ from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, _load_winner
-from phasesweep.evidence.models import objective_evidence_assurance
+from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
@@ -242,22 +242,12 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ObjectiveEvidencePayload(_ToolPayload):
+class ObjectiveEvidencePayload(_ToolPayload, _ObjectiveEvidenceFields):
     """Assurance properties enforced by the configured objective extractor.
 
     See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
     exactly what each flag means and which runtime checks back it.
     """
-
-    kind: Literal["json_envelope", "log_regex", "wandb"]
-    attempt_bound: bool
-    objective_name_bound: bool
-    split_bound: bool
-    evaluation_policy_bound: bool
-    checkpoint_declared: bool
-    checkpoint_value_bound: bool
-    expected_step_declared: bool
-    expected_step_value_bound: bool
 
 
 class MetricPayload(_ToolPayload):

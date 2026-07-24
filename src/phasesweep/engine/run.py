@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +16,7 @@ import optuna
 import yaml
 
 from phasesweep._metadata import __version__
-from phasesweep.config import Config, Experiment, Suite
+from phasesweep.config import Config, Experiment, Phase, Suite
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.guards import (
@@ -510,6 +510,7 @@ def _run_experiment_inner(
             if promotion_decision is not None:
                 promotion_decision["generation_id"] = generation_id
                 promotion_decisions[phase.name] = promotion_decision
+                assert generation_id is not None
                 _save_promotion_decision(
                     experiment,
                     phase.name,
@@ -588,6 +589,30 @@ def _preflight_skipped_winners(
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
 
 
+def _phases_from(experiment: Experiment, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
+    """Yield ``(index, phase)`` pairs from ``from_phase`` (or the start) onward.
+
+    Shared reached-from-phase iteration prologue for
+    :func:`_reject_bound_descendant_topups` and
+    :func:`_reject_unsupported_sampler_topups`.
+
+    :param Experiment experiment: Parsed experiment whose phase chain is scanned.
+    :param str | None from_phase: Optional resume point; phases before it are
+        skipped. ``None`` reaches every phase from the start.
+
+    Yields:
+        ``(index, phase)``: Each reached phase paired with its declaration index.
+
+    """
+    reached = from_phase is None
+    for index, phase in enumerate(experiment.phases):
+        if phase.name == from_phase:
+            reached = True
+        if not reached:
+            continue
+        yield index, phase
+
+
 def _reject_bound_descendant_topups(
     experiment: Experiment,
     *,
@@ -605,12 +630,7 @@ def _reject_bound_descendant_topups(
         top-up trials remaining while a descendant phase's study is already
         bound to a published winner fingerprint.
     """
-    reached = from_phase is None
-    for index, phase in enumerate(experiment.phases):
-        if phase.name == from_phase:
-            reached = True
-        if not reached:
-            continue
+    for index, phase in _phases_from(experiment, from_phase):
         study = existing_studies.get(phase.name)
         if study is None:
             continue
@@ -656,12 +676,7 @@ def _reject_unsupported_sampler_topups(
         safely continue with its configured stateful sampler; delegated to
         :func:`_validate_sampler_continuation`.
     """
-    reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
-        if not reached:
-            continue
+    for _index, phase in _phases_from(experiment, from_phase):
         study = existing_studies.get(phase.name)
         if study is not None:
             _validate_sampler_continuation(study, phase)
@@ -790,6 +805,50 @@ def _recorded_generation_state(record_path: Path) -> str | None:
     return state if isinstance(state, str) else None
 
 
+def _write_terminal_guarded_record(
+    *,
+    record_path: Path,
+    current_path: Path | None,
+    generation_id: str,
+    state: str,
+    payload: dict[str, Any],
+    label: str,
+) -> None:
+    """Write one lifecycle record, refreshing its current pointer, unless it is terminal.
+
+    Shared guard+write core for :func:`_write_generation_state` and
+    :func:`_write_suite_generation_state`. Lifecycle transitions are monotonic:
+    once a record reaches a terminal state (``complete`` or ``failed``) it is
+    immutable, so late bookkeeping (e.g. a failure raised after publication)
+    can never downgrade a published generation into a failed one (review
+    v0.5.14 / blocker 1). A same-state rewrite remains allowed so publication
+    can refresh the current pointer.
+
+    :param Path record_path: Immutable per-generation lifecycle record path.
+    :param Path | None current_path: Mutable current-pointer path to also
+        overwrite, or ``None`` to skip that projection.
+    :param str generation_id: Immutable generation (or suite generation)
+        namespace being recorded; used only for the refusal log message.
+    :param str state: Lifecycle state label being written.
+    :param dict[str, Any] payload: Full record payload to persist.
+    :param str label: Human label identifying the record kind in the refusal
+        log message (e.g. ``"generation"``, ``"suite generation"``).
+    """
+    existing_state = _recorded_generation_state(record_path)
+    if existing_state in _TERMINAL_GENERATION_STATES and existing_state != state:
+        log.warning(
+            "Refusing to rewrite terminal %s %s state %r as %r",
+            label,
+            generation_id,
+            existing_state,
+            state,
+        )
+        return
+    _write_yaml_atomic(record_path, payload)
+    if current_path is not None:
+        _write_yaml_atomic(current_path, payload)
+
+
 def _write_generation_state(
     experiment: Experiment,
     *,
@@ -801,11 +860,9 @@ def _write_generation_state(
 ) -> None:
     """Write one generation lifecycle record and optionally its current pointer.
 
-    Lifecycle transitions are monotonic: once a record reaches a terminal
-    state (``complete`` or ``failed``) it is immutable, so late bookkeeping
-    (e.g. a failure raised after publication) can never downgrade a published
-    generation into a failed one (review v0.5.14 / blocker 1). A same-state
-    rewrite remains allowed so publication can refresh the current pointer.
+    See :func:`_write_terminal_guarded_record` for the monotonic terminal-state
+    guard shared with :func:`_write_suite_generation_state` (review v0.5.14 /
+    blocker 1).
 
     :param Experiment experiment: Experiment whose generation record is written.
     :param str generation_id: Immutable generation namespace being recorded.
@@ -817,16 +874,6 @@ def _write_generation_state(
     :param str | None error_class: Optional exception class name to record for
         a failed state.
     """
-    record_path = _generation_record_path(experiment, generation_id)
-    existing_state = _recorded_generation_state(record_path)
-    if existing_state in _TERMINAL_GENERATION_STATES and existing_state != state:
-        log.warning(
-            "Refusing to rewrite terminal generation %s state %r as %r",
-            generation_id,
-            existing_state,
-            state,
-        )
-        return
     payload = {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -835,9 +882,14 @@ def _write_generation_state(
         "error_class": error_class,
         "phasesweep_version": __version__,
     }
-    _write_yaml_atomic(record_path, payload)
-    if publish_current:
-        _write_yaml_atomic(_generation_path(experiment), payload)
+    _write_terminal_guarded_record(
+        record_path=_generation_record_path(experiment, generation_id),
+        current_path=_generation_path(experiment) if publish_current else None,
+        generation_id=generation_id,
+        state=state,
+        payload=payload,
+        label="generation",
+    )
 
 
 def _copy_yaml_projection(source: Path, destination: Path) -> None:
@@ -850,6 +902,59 @@ def _copy_yaml_projection(source: Path, destination: Path) -> None:
     _write_yaml_atomic(destination, payload)
 
 
+def _validate_complete_terminal_record(
+    *,
+    record_path: Path,
+    summary_path: Path,
+    owner_key: str,
+    owner_value: str,
+    id_key: str,
+    id_value: str,
+    label: str,
+) -> None:
+    """Parse back a terminal lifecycle record before its last-success pointer commit.
+
+    Shared validation core for :func:`_validate_complete_generation` and
+    :func:`_validate_complete_suite_generation`: read terminal record, confirm
+    it is a mapping naming the expected owner and id with ``state ==
+    "complete"``, then confirm the immutable summary exists.
+
+    :param Path record_path: Immutable lifecycle record YAML path to read back.
+    :param Path summary_path: Immutable summary YAML path that must exist.
+    :param str owner_key: Record key naming the owning experiment or suite.
+    :param str owner_value: Expected owner name the record must carry.
+    :param str id_key: Record key holding the generation (or suite generation) id.
+    :param str id_value: Expected id the record must name.
+    :param str label: Human label for error text (e.g. ``"Generation"``,
+        ``"Suite generation"``).
+    :raises RuntimeError: The record or immutable summary cannot be read back
+        as a complete, correctly named record; the last-success pointer must
+        not advance to it.
+    """
+    try:
+        record = yaml.safe_load(record_path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"{label} {id_value!r} lifecycle record could not be read back; "
+            "refusing to advance the last-success pointer."
+        ) from exc
+    if (
+        not isinstance(record, dict)
+        or record.get(owner_key) != owner_value
+        or record.get(id_key) != id_value
+        or record.get("state") != "complete"
+    ):
+        raise RuntimeError(
+            f"{label} {id_value!r} lifecycle record failed publication validation; "
+            "refusing to advance the last-success pointer."
+        )
+    if not summary_path.is_file():
+        raise RuntimeError(
+            f"{label} {id_value!r} has no immutable summary; "
+            "refusing to advance the last-success pointer."
+        )
+
+
 def _validate_complete_generation(experiment: Experiment, generation_id: str) -> None:
     """Parse back the terminal record before the last-success pointer commit.
 
@@ -859,28 +964,15 @@ def _validate_complete_generation(experiment: Experiment, generation_id: str) ->
         as a complete, correctly named generation; the last-success pointer
         must not advance to it.
     """
-    try:
-        record = yaml.safe_load(_generation_record_path(experiment, generation_id).read_text())
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(
-            f"Generation {generation_id!r} lifecycle record could not be read back; "
-            "refusing to advance the last-success pointer."
-        ) from exc
-    if (
-        not isinstance(record, dict)
-        or record.get("experiment") != experiment.experiment
-        or record.get("generation_id") != generation_id
-        or record.get("state") != "complete"
-    ):
-        raise RuntimeError(
-            f"Generation {generation_id!r} lifecycle record failed publication validation; "
-            "refusing to advance the last-success pointer."
-        )
-    if not _generation_summary_path(experiment, generation_id).is_file():
-        raise RuntimeError(
-            f"Generation {generation_id!r} has no immutable summary; "
-            "refusing to advance the last-success pointer."
-        )
+    _validate_complete_terminal_record(
+        record_path=_generation_record_path(experiment, generation_id),
+        summary_path=_generation_summary_path(experiment, generation_id),
+        owner_key="experiment",
+        owner_value=experiment.experiment,
+        id_key="generation_id",
+        id_value=generation_id,
+        label="Generation",
+    )
 
 
 def _publish_generation(
@@ -1130,28 +1222,15 @@ def _validate_complete_suite_generation(suite: Suite, generation_id: str) -> Non
         as a complete, correctly named suite generation; the last-success
         pointer must not advance to it.
     """
-    try:
-        record = yaml.safe_load(_suite_generation_record_path(suite, generation_id).read_text())
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(
-            f"Suite generation {generation_id!r} lifecycle record could not be read back; "
-            "refusing to advance the last-success pointer."
-        ) from exc
-    if (
-        not isinstance(record, dict)
-        or record.get("suite") != suite.suite
-        or record.get("suite_generation_id") != generation_id
-        or record.get("state") != "complete"
-    ):
-        raise RuntimeError(
-            f"Suite generation {generation_id!r} lifecycle record failed publication "
-            "validation; refusing to advance the last-success pointer."
-        )
-    if not _suite_generation_summary_path(suite, generation_id).is_file():
-        raise RuntimeError(
-            f"Suite generation {generation_id!r} has no immutable summary; "
-            "refusing to advance the last-success pointer."
-        )
+    _validate_complete_terminal_record(
+        record_path=_suite_generation_record_path(suite, generation_id),
+        summary_path=_suite_generation_summary_path(suite, generation_id),
+        owner_key="suite",
+        owner_value=suite.suite,
+        id_key="suite_generation_id",
+        id_value=generation_id,
+        label="Suite generation",
+    )
 
 
 def _write_suite_generation_state(
@@ -1182,16 +1261,6 @@ def _write_suite_generation_state(
     :param bool publish_current: If ``True``, also overwrite the suite's
         current-generation pointer with this record.
     """
-    record_path = _suite_generation_record_path(suite, generation_id)
-    existing_state = _recorded_generation_state(record_path)
-    if existing_state in _TERMINAL_GENERATION_STATES and existing_state != state:
-        log.warning(
-            "Refusing to rewrite terminal suite generation %s state %r as %r",
-            generation_id,
-            existing_state,
-            state,
-        )
-        return
     payload = {
         "schema_version": 1,
         "suite": suite.suite,
@@ -1203,9 +1272,14 @@ def _write_suite_generation_state(
         "error_class": error_class,
         "phasesweep_version": __version__,
     }
-    _write_yaml_atomic(record_path, payload)
-    if publish_current:
-        _write_yaml_atomic(_suite_generation_path(suite), payload)
+    _write_terminal_guarded_record(
+        record_path=_suite_generation_record_path(suite, generation_id),
+        current_path=_suite_generation_path(suite) if publish_current else None,
+        generation_id=generation_id,
+        state=state,
+        payload=payload,
+        label="suite generation",
+    )
 
 
 def _suite_summary_payload(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -31,6 +31,47 @@ class WinnerSource:
     generation_id: str | None
     attempt_id: str | None
     study: str | None = None
+
+
+def _parse_winner_source(
+    source_data: Mapping[str, Any], source_kind: WinnerSourceKind
+) -> WinnerSource:
+    """Reconstruct a persisted ``winner_source`` mapping into a :class:`WinnerSource`.
+
+    Shared by :func:`_load_winner` (state.py) and
+    :func:`phasesweep.engine.read.read_winner`, which differ only in what they
+    do when this raises: the former re-raises as a strict ``RuntimeError``, the
+    latter treats the winner as absent. Callers must validate ``source_kind``
+    against :data:`WinnerSourceKind` themselves before calling this, since each
+    site fails differently on an invalid kind.
+
+    :param Mapping[str, Any] source_data: Parsed ``winner_source`` block from a
+        persisted ``winner.yaml``.
+    :param WinnerSourceKind source_kind: The already-validated source kind.
+    :raises KeyError: A required field (``phase``, ``trial_number``) is missing.
+    :raises TypeError | ValueError: A field cannot be coerced to its expected type.
+    :return WinnerSource: The reconstructed source.
+    """
+    return WinnerSource(
+        kind=source_kind,
+        phase=str(source_data["phase"]),
+        trial_number=int(source_data["trial_number"]),
+        generation_id=(
+            str(source_data["generation_id"])
+            if isinstance(source_data.get("generation_id"), str) and source_data["generation_id"]
+            else None
+        ),
+        attempt_id=(
+            str(source_data["attempt_id"])
+            if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
+            else None
+        ),
+        study=(
+            str(source_data["study"])
+            if isinstance(source_data.get("study"), str) and source_data["study"]
+            else None
+        ),
+    )
 
 
 @dataclass
@@ -625,9 +666,9 @@ def _save_winner(
     phase_name: str,
     winner: Winner,
     *,
-    generation_id: str | None = None,
+    generation_id: str,
 ) -> None:
-    """Persist a phase winner.
+    """Persist a phase winner into its immutable generation namespace.
 
     The phase fingerprint is included so ``_load_winner`` can refuse stale
     winners on ``--from-phase`` resume (review v0.5.6 / blocker 3). Real
@@ -639,15 +680,12 @@ def _save_winner(
             in the persisted payload.
         phase_name: Name of the phase whose winner is being saved.
         winner: The winning trial.
-        generation_id: Optional immutable generation namespace. ``None`` writes
-            the compatibility projection.
+        generation_id: Immutable generation namespace to write into. The
+            legacy compatibility projection is produced separately by
+            :func:`_copy_yaml_projection` once a generation is published.
 
     """
-    path = (
-        _winner_path(experiment, phase_name)
-        if generation_id is None
-        else _generation_winner_path(experiment, generation_id, phase_name)
-    )
+    path = _generation_winner_path(experiment, generation_id, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "phase": phase_name,
@@ -701,20 +739,18 @@ def _save_promotion_decision(
     phase_name: str,
     decision: dict[str, Any],
     *,
-    generation_id: str | None = None,
+    generation_id: str,
 ) -> None:
-    """Persist a phase promotion decision independently of exposed winner state.
+    """Persist a phase promotion decision into its immutable generation namespace.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name whose promotion decision is being saved.
     :param dict[str, Any] decision: Promotion decision payload to persist.
-    :param str | None generation_id: Optional immutable generation namespace.
+    :param str generation_id: Immutable generation namespace to write into. The
+        legacy compatibility projection is produced separately by
+        :func:`_copy_yaml_projection` once a generation is published.
     """
-    path = (
-        _promotion_decision_path(experiment, phase_name)
-        if generation_id is None
-        else _generation_promotion_decision_path(experiment, generation_id, phase_name)
-    )
+    path = _generation_promotion_decision_path(experiment, generation_id, phase_name)
     _write_yaml_atomic(path, decision)
 
 
@@ -824,27 +860,7 @@ def _load_winner(
         raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
 
     try:
-        source = WinnerSource(
-            kind=cast(WinnerSourceKind, source_kind),
-            phase=str(source_data["phase"]),
-            trial_number=int(source_data["trial_number"]),
-            generation_id=(
-                str(source_data["generation_id"])
-                if isinstance(source_data.get("generation_id"), str)
-                and source_data["generation_id"]
-                else None
-            ),
-            attempt_id=(
-                str(source_data["attempt_id"])
-                if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
-                else None
-            ),
-            study=(
-                str(source_data["study"])
-                if isinstance(source_data.get("study"), str) and source_data["study"]
-                else None
-            ),
-        )
+        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
         return Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),

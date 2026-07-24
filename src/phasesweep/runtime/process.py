@@ -44,7 +44,6 @@ PROCESS_IDENTITY_SCHEMA_VERSION = 1
 
 _lock = threading.Lock()
 _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
-_installed = False
 
 # The launch lock guards the Popen() -> _register() critical section so the
 # shutdown handler cannot snapshot _active_children while a child has been
@@ -231,20 +230,22 @@ def install_signal_handlers() -> None:
     """Install shutdown handlers that clean up child process groups.
 
     Handles SIGTERM/SIGINT and SIGHUP where the platform exposes it. Safe to
-    call multiple times; only installs once. The main thread's shutdown signals
-    are unblocked on each call so an inherited signal mask cannot prevent the
-    handlers from running. Must be called from the main thread.
+    call multiple times; only installs once. Idempotence is checked against
+    the OS ground truth (every shutdown signal already dispatching to
+    ``_shutdown_handler``) rather than a separate flag, so an external reset
+    of a handler is never masked by stale bookkeeping. The main thread's
+    shutdown signals are unblocked on each call so an inherited signal mask
+    cannot prevent the handlers from running. Must be called from the main
+    thread.
     """
-    global _installed  # noqa: PLW0603
     _unblock_shutdown_signals()
-    if _installed:
+    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
         return
     try:
         signal.signal(signal.SIGTERM, _shutdown_handler)
         signal.signal(signal.SIGINT, _shutdown_handler)
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _shutdown_handler)
-        _installed = True
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")
 

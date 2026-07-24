@@ -30,6 +30,7 @@ from phasesweep.engine.state import (
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_id,
+    _parse_winner_source,
     _published_summary_path,
     _published_winner_path,
 )
@@ -185,27 +186,7 @@ def read_winner(
         source_kind = source_data.get("kind")
         if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
             return None
-        source = WinnerSource(
-            kind=cast(WinnerSourceKind, source_kind),
-            phase=str(source_data["phase"]),
-            trial_number=int(source_data["trial_number"]),
-            generation_id=(
-                str(source_data["generation_id"])
-                if isinstance(source_data.get("generation_id"), str)
-                and source_data["generation_id"]
-                else None
-            ),
-            attempt_id=(
-                str(source_data["attempt_id"])
-                if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
-                else None
-            ),
-            study=(
-                str(source_data["study"])
-                if isinstance(source_data.get("study"), str) and source_data["study"]
-                else None
-            ),
-        )
+        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=int(data["trial_number"]),

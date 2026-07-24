@@ -17,7 +17,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _generation_record_path,
 )
-from phasesweep.evidence.models import objective_evidence_assurance
+from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -28,22 +28,12 @@ class _SnapshotModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
-class ObjectiveEvidenceSnapshot(_SnapshotModel):
+class ObjectiveEvidenceSnapshot(_SnapshotModel, _ObjectiveEvidenceFields):
     """Assurance properties of the configured objective extractor.
 
     See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
     exactly what each flag means and which runtime checks back it.
     """
-
-    kind: Literal["json_envelope", "log_regex", "wandb"]
-    attempt_bound: bool
-    objective_name_bound: bool
-    split_bound: bool
-    evaluation_policy_bound: bool
-    checkpoint_declared: bool
-    checkpoint_value_bound: bool
-    expected_step_declared: bool
-    expected_step_value_bound: bool
 
 
 class MetricSnapshot(_SnapshotModel):

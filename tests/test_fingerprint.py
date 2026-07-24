@@ -904,8 +904,8 @@ def test_save_winner_replace_failure_preserves_existing_file(
         attempt_id="attempt-replacement",
     )
 
-    _save_winner(exp, phase.name, original)
-    path = _winner_path(exp, phase.name)
+    _save_winner(exp, phase.name, original, generation_id="generation-original")
+    path = _generation_winner_path(exp, "generation-original", phase.name)
     before = path.read_text()
 
     def fail_replace(_src: Path | str, _dst: Path | str) -> None:
@@ -914,7 +914,7 @@ def test_save_winner_replace_failure_preserves_existing_file(
     monkeypatch.setattr("phasesweep.runtime.files.os.replace", fail_replace)
 
     with pytest.raises(OSError, match="replace failed"):
-        _save_winner(exp, phase.name, replacement)
+        _save_winner(exp, phase.name, replacement, generation_id="generation-original")
 
     assert path.read_text() == before
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
