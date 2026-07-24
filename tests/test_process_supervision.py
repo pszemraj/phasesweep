@@ -75,6 +75,31 @@ def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     return installed
 
 
+def _run_supervised(
+    trial_dir: Path,
+    cmd: str,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    attempt_id: str,
+):
+    """Open ``trial_dir``'s out/err logs and delegate to ``run_supervised``.
+
+    Collapses the repeated "open two log files, call run_supervised"
+    boilerplate shared by most call sites in this module.
+    """
+    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
+        return run_supervised(
+            cmd,
+            env=env if env is not None else os.environ.copy(),
+            stdout=fout,
+            stderr=ferr,
+            timeout=timeout,
+            trial_dir=trial_dir,
+            attempt_id=attempt_id,
+        )
+
+
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
     """Failing trials leave one complete atomic identity for forensic recovery."""
     if not Path("/proc/self/stat").exists():
@@ -82,16 +107,7 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            "false",
-            env=os.environ.copy(),
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="failure-attempt",
-        )
+    result = _run_supervised(trial_dir, "false", timeout=None, attempt_id="failure-attempt")
     assert result.return_code != 0
     identity = read_stale_process_identity(
         trial_dir,
@@ -110,16 +126,7 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            "true",
-            env=os.environ.copy(),
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="success-attempt",
-        )
+    result = _run_supervised(trial_dir, "true", timeout=None, attempt_id="success-attempt")
     assert result.return_code == 0
     assert result.duration_seconds >= 0.0
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
@@ -154,17 +161,13 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
         trial_dir = tmp_path / f"trial_{i}"
         trial_dir.mkdir()
         trainer_started = tmp_path / f"trainer-started-{i}"
-        with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-            result = run_supervised(
-                f'{sys.executable} -c "from pathlib import Path; '
-                f"Path({str(trainer_started)!r}).write_text('started')\"",
-                env=os.environ.copy(),
-                stdout=fout,
-                stderr=ferr,
-                timeout=None,
-                trial_dir=trial_dir,
-                attempt_id=f"identity-write-failure-{i}",
-            )
+        result = _run_supervised(
+            trial_dir,
+            f'{sys.executable} -c "from pathlib import Path; '
+            f"Path({str(trainer_started)!r}).write_text('started')\"",
+            timeout=None,
+            attempt_id=f"identity-write-failure-{i}",
+        )
 
         assert result.cleanup_confirmed is True, i
         assert "failed to persist process identity" in (result.failure_reason or ""), i
@@ -365,16 +368,9 @@ def test_supervisor_never_imports_poisoned_phasesweep_from_pythonpath(
     trial_dir.mkdir()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(poison_root)
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            "true",
-            env=env,
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="poison-pythonpath",
-        )
+    result = _run_supervised(
+        trial_dir, "true", env=env, timeout=None, attempt_id="poison-pythonpath"
+    )
 
     assert result.return_code == 0
     assert not marker.exists(), "supervisor imported the poisoned phasesweep package"
@@ -406,16 +402,9 @@ def test_supervisor_never_imports_poisoned_sitecustomize_from_pythonpath(
     trial_dir.mkdir()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(poison_root)
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            "true",
-            env=env,
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="poison-sitecustomize",
-        )
+    result = _run_supervised(
+        trial_dir, "true", env=env, timeout=None, attempt_id="poison-sitecustomize"
+    )
 
     assert result.return_code == 0
     assert not marker.exists(), "supervisor ran a poisoned sitecustomize.py"
@@ -434,16 +423,7 @@ def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None
         f'{sys.executable} -c "import os, pathlib; '
         f"pathlib.Path({str(out_path)!r}).write_text(os.environ['PHASESWEEP_TEST_MARKER'])\""
     )
-    with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        result = run_supervised(
-            cmd,
-            env=env,
-            stdout=fout,
-            stderr=ferr,
-            timeout=None,
-            trial_dir=trial_dir,
-            attempt_id="env-flow-attempt",
-        )
+    result = _run_supervised(trial_dir, cmd, env=env, timeout=None, attempt_id="env-flow-attempt")
 
     assert result.return_code == 0
     assert out_path.read_text() == "trial-env-value"
@@ -511,6 +491,7 @@ def test_supervisor_main_exits_without_exec_on_ack_pipe_eof(
     exit_code = supervisor.main([str(ready_write), str(ack_read)])
 
     assert os.read(ready_read, 1) == b"R"  # Readiness was still signaled first.
+    # 75 = supervisor's malformed/EOF-payload exit -- see supervisor.main() docstring.
     assert exit_code == 75
     assert exec_calls == []
     os.close(ready_read)
@@ -548,6 +529,7 @@ def test_supervisor_main_rejects_malformed_payload(
 
     exit_code = supervisor.main([str(ready_write), str(ack_read)])
 
+    # 75 = supervisor's malformed/EOF-payload exit -- see supervisor.main() docstring.
     assert exit_code == 75
     assert exec_calls == []
     os.close(ready_read)
@@ -580,6 +562,37 @@ def test_reap_child_reports_when_it_reaped(monkeypatch: pytest.MonkeyPatch) -> N
     assert reap_child(12345) is True
 
 
+# Both duplicate-victim tests below spawn a background child that ignores
+# SIGTERM, so ``run_supervised`` must escalate to SIGKILL against the whole
+# process group rather than stopping once the root process is gone.
+_SIGTERM_IGNORING_CHILD_SCRIPT = (
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+)
+
+
+def _assert_descendant_dies(
+    pid: int, *, deadline_seconds: float = 5.0, on_timeout_msg: str
+) -> None:
+    """Poll until ``pid`` is gone; if it outlives the deadline, SIGKILL it and fail.
+
+    :param int pid: Descendant PID expected to be reaped by supervisor cleanup.
+    :param float deadline_seconds: How long to poll before giving up.
+    :param str on_timeout_msg: ``pytest.fail`` message used if still alive at the deadline.
+    """
+    deadline = time.time() + deadline_seconds
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return  # success
+        time.sleep(0.05)
+
+    # Cleanup before failing so we don't leak a python process across the test run.
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    pytest.fail(on_timeout_msg)
+
+
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
     """Root shell exits cleanly on SIGTERM, but child ignores it.
 
@@ -592,12 +605,9 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     marker = tmp_path / "child_pid.txt"
 
     # Inline Python child + parent so the test is self-contained.
-    child_script = (
-        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
-    )
     parent_script = (
         f"import os, subprocess, sys, time; "
-        f"p = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        f"p = subprocess.Popen([sys.executable, '-c', {_SIGTERM_IGNORING_CHILD_SCRIPT!r}]); "
         f"open({str(marker)!r}, 'w').write(str(p.pid)); "
         f"sys.stdout.flush(); "
         # Parent exits cleanly (and immediately) on SIGTERM, abandoning child.
@@ -607,19 +617,10 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     )
     cmd = f"python -c {parent_script!r}"
 
-    with (trial_dir / "stdout.log").open("w") as out, (trial_dir / "stderr.log").open("w") as err:
-        # Wait for child PID file before timeout fires.
-        # Use a thread to write the marker check; simpler: just timeout=2.0
-        # and confirm the marker was written (child started).
-        result = run_supervised(
-            cmd,
-            env=os.environ.copy(),
-            stdout=out,
-            stderr=err,
-            timeout=2.0,
-            trial_dir=trial_dir,
-            attempt_id="timeout-attempt",
-        )
+    # Wait for child PID file before timeout fires.
+    # Use a thread to write the marker check; simpler: just timeout=2.0
+    # and confirm the marker was written (child started).
+    result = _run_supervised(trial_dir, cmd, timeout=2.0, attempt_id="timeout-attempt")
 
     assert result.timed_out, "trial should have hit the configured timeout"
     assert marker.exists(), "child PID marker was never written; test setup is wrong"
@@ -628,18 +629,9 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
 
     # The child must be dead within a reasonable window after run_supervised returns.
     # If _kill_group only waited for the root, the child would still be alive here.
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            return  # success
-        time.sleep(0.05)
-
-    # Cleanup before failing so we don't leak a python process across the test run.
-    with __import__("contextlib").suppress(ProcessLookupError):
-        os.kill(child_pid, signal.SIGKILL)
-    pytest.fail(f"timeout left descendant process {child_pid} alive")
+    _assert_descendant_dies(
+        child_pid, on_timeout_msg=f"timeout left descendant process {child_pid} alive"
+    )
 
 
 def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
@@ -654,12 +646,9 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     trial_dir.mkdir()
     marker = tmp_path / "child_pid.txt"
 
-    child_script = (
-        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
-    )
     parent_script = (
         "import os, subprocess, sys; "
-        f"p = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        f"p = subprocess.Popen([sys.executable, '-c', {_SIGTERM_IGNORING_CHILD_SCRIPT!r}]); "
         f"open({str(marker)!r}, 'w').write(str(p.pid)); "
         "sys.stdout.flush(); "
         "os._exit(0)"
@@ -667,16 +656,7 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
 
     cmd = f"python -c {parent_script!r}"
 
-    with (trial_dir / "stdout.log").open("w") as out, (trial_dir / "stderr.log").open("w") as err:
-        result = run_supervised(
-            cmd,
-            env=os.environ.copy(),
-            stdout=out,
-            stderr=err,
-            timeout=10.0,
-            trial_dir=trial_dir,
-            attempt_id="descendant-attempt",
-        )
+    result = _run_supervised(trial_dir, cmd, timeout=10.0, attempt_id="descendant-attempt")
 
     # Must be flagged as a lifecycle failure, not a clean exit.
     assert result.failure_reason is not None
@@ -688,17 +668,9 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     # Descendant must be dead.
     assert marker.exists(), "child PID marker was never written; test setup broken"
     child_pid = int(marker.read_text().strip())
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            return  # success
-        time.sleep(0.05)
-
-    with __import__("contextlib").suppress(ProcessLookupError):
-        os.kill(child_pid, signal.SIGKILL)
-    pytest.fail(f"background descendant {child_pid} survived root exit")
+    _assert_descendant_dies(
+        child_pid, on_timeout_msg=f"background descendant {child_pid} survived root exit"
+    )
 
 
 def test_shutdown_handler_uses_initial_pgid_snapshot(
@@ -1144,19 +1116,12 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     # rest of the test run (review v0.5.11).
     _report_uncertain_after_real_terminate(monkeypatch)
 
-    with (
-        (tmp_path / "stdout.log").open("w") as stdout,
-        (tmp_path / "stderr.log").open("w") as stderr,
-    ):
-        result = run_supervised(
-            f"{sys.executable} -c 'import time; time.sleep(60)'",
-            env=os.environ.copy(),
-            stdout=stdout,
-            stderr=stderr,
-            timeout=0.1,
-            trial_dir=tmp_path,
-            attempt_id="uncertain-attempt",
-        )
+    result = _run_supervised(
+        tmp_path,
+        f"{sys.executable} -c 'import time; time.sleep(60)'",
+        timeout=0.1,
+        attempt_id="uncertain-attempt",
+    )
 
     assert result.timed_out is True
     assert result.cleanup_confirmed is False

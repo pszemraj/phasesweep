@@ -34,7 +34,9 @@ from phasesweep.engine.state import (
     _last_successful_generation_id,
     _last_successful_generation_path,
     _last_successful_suite_generation_id,
+    _suite_generation_path,
     _suite_generation_record_path,
+    _suite_summary_path,
 )
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import make_experiment, write_trainer, write_yaml
@@ -75,6 +77,12 @@ def _current_pointer_state(experiment) -> str | None:
 def _record_state(experiment, generation_id: str) -> str | None:
     """Read one generation's immutable record ``state`` label."""
     payload = yaml.safe_load(_generation_record_path(experiment, generation_id).read_text())
+    return payload.get("state") if isinstance(payload, dict) else None
+
+
+def _suite_record_state(suite: Suite, generation_id: str) -> str | None:
+    """Read one suite generation's immutable record ``state`` label."""
+    payload = yaml.safe_load(_suite_generation_record_path(suite, generation_id).read_text())
     return payload.get("state") if isinstance(payload, dict) else None
 
 
@@ -559,12 +567,11 @@ def test_suite_precommit_validation_failure_keeps_prior_publication(
     with pytest.raises(RuntimeError, match="simulated suite validation failure"):
         run_suite(suite)
 
-    second_generation = yaml.safe_load(
-        (tmp_path / "runs" / "pub_suite" / "suite_generation.yaml").read_text()
-    )["suite_generation_id"]
+    second_generation = yaml.safe_load(_suite_generation_path(suite).read_text())[
+        "suite_generation_id"
+    ]
     assert second_generation != first_generation
-    record = yaml.safe_load(_suite_generation_record_path(suite, second_generation).read_text())
-    assert record["state"] == "publication_failed"
+    assert _suite_record_state(suite, second_generation) == "publication_failed"
     assert _last_successful_suite_generation_id(suite) == first_generation
 
 
@@ -591,8 +598,7 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
     second_generation = _last_successful_suite_generation_id(suite)
     assert second_generation is not None
     assert second_generation != first_generation
-    record = yaml.safe_load(_suite_generation_record_path(suite, second_generation).read_text())
-    assert record["state"] == "published"
+    assert _suite_record_state(suite, second_generation) == "published"
     assert any(
         "failed to refresh the current suite-generation pointer or compatibility cache" in r.message
         for r in caplog.records
@@ -667,8 +673,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
     monkeypatch.setattr(engine_run, "_apply_study_promotion", interleave)
     results = run_suite(config)
 
-    summary_path = tmp_path / "runs" / "provenance_suite" / "suite_summary.yaml"
-    summary = yaml.safe_load(summary_path.read_text())
+    summary = yaml.safe_load(_suite_summary_path(config).read_text())
     recorded = summary["studies"][0]["experiment_generation_id"]
     current = _last_successful_generation_id(component)
 
