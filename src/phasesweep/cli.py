@@ -441,6 +441,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
             reaped = 0
             reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
+            persisted_reaped_attempts = len(reaped_attempt_ids)
             cleanup_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
@@ -464,7 +465,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     else:
                         cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
                         reaped += _inspect_stale_running_trials(study, config, phase.name)
-            cleanup_evidence_count = reaped + cleanup_recovered
+            cleanup_evidence_count = persisted_reaped_attempts + reaped + cleanup_recovered
             if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
                 if inspected_studies == 0:
                     detail = (

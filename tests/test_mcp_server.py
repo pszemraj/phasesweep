@@ -24,7 +24,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint
+from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint, _reap_stale_trials
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -1330,7 +1330,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
                 generation_id=generation_id,
                 primary_error=primary,
                 cleanup_confirmed=False,
-                recovered_attempt_ids=frozenset(),
+                recovered_attempt_ids=frozenset({"attempt-reconciled"}),
                 uncertain_attempt_ids=frozenset({"attempt-1"}),
                 cleanup_error=ProcessCleanupUncertainError("cleanup uncertain"),
             )
@@ -1366,6 +1366,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["returncode"] == 1
     assert status["error_class"] == "ProcessCleanupUncertainError"
     assert status["cleanup_confirmed"] is False
+    assert status["recovered_attempt_ids"] == ["attempt-reconciled"]
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["stage"] == "cleanup"
     assert status["failure"]["retryable"] is False
@@ -2174,6 +2175,167 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert recovered_status["terminal_trials_this_run"] == 1
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
+
+
+def test_operator_recovery_uses_runner_reconciliation_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    run_id = "srv-runner-reconciled"
+    trial_number = _write_stale_running_trial(
+        config,
+        cleanup_confirmed=False,
+        generation_id=run_id,
+    )
+    attempt_id = f"stale-attempt-{trial_number}"
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    study = _load_first_phase_study(config)
+    reconciled_attempt_ids: set[str] = set()
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    assert (
+        _reap_stale_trials(
+            study,
+            experiment,
+            experiment.phases[0].name,
+            recovered_attempt_ids=reconciled_attempt_ids,
+        )
+        == 1
+    )
+    assert reconciled_attempt_ids == {attempt_id}
+
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="cancelled",
+        cleanup_confirmed=False,
+        recovered_attempt_ids=sorted(reconciled_attempt_ids),
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment),
+    )
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
+    assert recovery["reaped_running_trials"] == 0
+    assert recovery["cleanup_uncertain_terminal_trials"] == 0
+    assert store.state(handle) == "cancelled"
+    assert store.live_runs() == []
+
+
+def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    run_id = "srv-cleanup-recovery-retry"
+    trial_number = _write_stale_running_trial(
+        config,
+        cleanup_confirmed=False,
+        generation_id=run_id,
+    )
+    attempt_id = f"stale-attempt-{trial_number}"
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="cancelled",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment),
+    )
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    real_clear = RunStore.clear_cleanup_uncertain
+    clear_calls = 0
+
+    def interrupt_first_clear(candidate_store: RunStore, candidate: RunHandle) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise RuntimeError("interrupted before clearing cleanup marker")
+        real_clear(candidate_store, candidate)
+
+    monkeypatch.setattr(RunStore, "clear_cleanup_uncertain", interrupt_first_clear)
+    command = [
+        "mcp",
+        "recover-run",
+        "--state-dir",
+        str(registry.state_dir),
+        "--run-id",
+        run_id,
+        "--confirm",
+    ]
+    runner = CliRunner()
+
+    first = runner.invoke(cli_main, command)
+
+    assert first.exit_code != 0
+    assert "interrupted before clearing cleanup marker" in first.output
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
+
+    retry = runner.invoke(cli_main, command)
+
+    assert retry.exit_code == 0, retry.output
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
+    assert recovery["reaped_running_trials"] == 0
+    terminal = json.loads(store.status_path(run_id).read_text())
+    phase = terminal["result_snapshot"]["status"]["phases"][0]
+    assert phase["trials"]["RUNNING"] == 0
+    assert phase["trials"]["FAIL"] == 1
+    assert store.state(handle) == "cancelled"
+    assert store.live_runs() == []
 
 
 def test_operator_recovery_consumes_terminal_cleanup_evidence(

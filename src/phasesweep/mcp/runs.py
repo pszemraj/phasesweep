@@ -535,18 +535,22 @@ class RunStore:
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
 
     def cleanup_recovered_attempt_ids(self, handle: RunHandle) -> set[str]:
-        """Return exact reaped attempt IDs from valid operator recovery evidence.
+        """Return exact reaped attempt IDs from valid runner and operator evidence.
 
         :param RunHandle handle: Run whose cleanup recovery evidence should be read.
         :return set[str]: Reaped attempt identities persisted for snapshot finalization.
         """
+        attempt_ids: set[str] = set()
+        status = self._read_status(handle)
+        if status is not None:
+            attempt_ids.update(status.get("recovered_attempt_ids", []))
         payload = self._read_cleanup_recovery(handle)
         if payload is None:
-            return set()
+            return attempt_ids
         values = payload.get("reaped_attempt_ids")
-        if not isinstance(values, list):
-            return set()
-        return {value for value in values if isinstance(value, str) and value}
+        if isinstance(values, list):
+            attempt_ids.update(value for value in values if isinstance(value, str) and value)
+        return attempt_ids
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
@@ -625,6 +629,12 @@ class RunStore:
             return None
         result_snapshot_error = payload.get("result_snapshot_error")
         if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
+            return None
+        recovered_attempt_ids = payload.get("recovered_attempt_ids")
+        if recovered_attempt_ids is not None and (
+            not isinstance(recovered_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
+        ):
             return None
         return payload
 

@@ -399,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
             nonlocal result_snapshot, result_snapshot_error, terminal_report
             terminal_report = report
             status["cleanup_confirmed"] = report.cleanup_confirmed
+            status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
             if report.primary_error is not None:
                 status["failure"] = (
                     _cleanup_failure_payload(
