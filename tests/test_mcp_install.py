@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import math
 import os
@@ -459,6 +460,275 @@ def test_entry_styles_and_codex_toml(tmp_path):
         "command": "/tools/🚀/phasesweep-mcp",
         "args": ["--catalog", str(unicode_catalog)],
     }
+
+
+# --- uvx pinned launcher (review v0.5.15 / item G) ---
+
+UVX_LAUNCHER_ARGS = ["--from", "phasesweep[mcp]==1.2.3", "phasesweep-mcp"]
+
+
+def test_uvx_launcher_entries_are_recognized_managed(tmp_path):
+    catalog = Path("/proj/catalog.yaml")
+
+    stdio = mcp_entry("stdio", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
+    assert stdio == {
+        "command": "uvx",
+        "args": [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"],
+    }
+    assert is_managed_mcp_entry("stdio", stdio)
+
+    typed = mcp_entry("stdio-typed", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
+    assert is_managed_mcp_entry("stdio-typed", typed)
+
+    opencode = mcp_entry("opencode", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
+    assert opencode["command"] == [
+        "uvx",
+        *UVX_LAUNCHER_ARGS,
+        "--catalog",
+        "/proj/catalog.yaml",
+    ]
+    assert is_managed_mcp_entry("opencode", opencode)
+
+    toml_parsed = tomllib.loads(codex_toml_content("uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS))
+    codex_entry = toml_parsed["mcp_servers"]["phasesweep"]
+    assert codex_entry["args"] == [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"]
+    assert is_managed_mcp_entry("stdio", codex_entry)
+
+
+@pytest.mark.parametrize(
+    "launcher_args",
+    [
+        ["--from", "phasesweep[mcp]==1.2.3", "other-entrypoint"],  # wrong entrypoint
+        ["--from", "other-package[mcp]==1.2.3", "phasesweep-mcp"],  # wrong package
+        ["--from", "phasesweep[mcp]==", "phasesweep-mcp"],  # empty version
+        ["--from", "phasesweep==1.2.3", "phasesweep-mcp"],  # missing [mcp] extra
+    ],
+)
+def test_uvx_launcher_entries_reject_malformed_pins(launcher_args):
+    catalog = Path("/proj/catalog.yaml")
+    entry = mcp_entry("stdio", "uvx", catalog, launcher_args=launcher_args)
+    assert not is_managed_mcp_entry("stdio", entry)
+
+
+def test_resolve_uvx_launcher_pins_installed_version(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: "9.9.9")
+
+    command, args = installer.resolve_uvx_launcher()
+
+    assert command == "uvx"
+    assert args == ["--from", "phasesweep[mcp]==9.9.9", "phasesweep-mcp"]
+
+
+def test_resolve_uvx_launcher_requires_uvx_on_path(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+
+    with pytest.raises(FileNotFoundError, match="cannot find 'uvx'"):
+        installer.resolve_uvx_launcher()
+
+
+def test_resolve_uvx_launcher_requires_installed_distribution(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def missing_version(_name):
+        raise importlib.metadata.PackageNotFoundError("phasesweep")
+
+    monkeypatch.setattr(installer.importlib.metadata, "version", missing_version)
+
+    with pytest.raises(LookupError, match="not an installed distribution"):
+        installer.resolve_uvx_launcher()
+
+
+def test_installer_uvx_launcher_round_trip_across_json_and_toml(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def fake_uvx_launcher():
+        return "uvx", ["--from", "phasesweep[mcp]==7.7.7", "phasesweep-mcp"]
+
+    monkeypatch.setattr(installer, "resolve_uvx_launcher", fake_uvx_launcher)
+    code = installer.run(
+        "install",
+        project,
+        catalog,
+        ["claude", "codex", "opencode"],
+        "mcp",
+        yes=True,
+        allow_user_scope=True,
+        launcher="uvx",
+    )
+    assert code == 0, capsys.readouterr().out
+
+    claude_entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
+    assert claude_entry["command"] == "uvx"
+    assert claude_entry["args"] == [
+        "--from",
+        "phasesweep[mcp]==7.7.7",
+        "phasesweep-mcp",
+        "--catalog",
+        str(catalog),
+    ]
+
+    opencode_entry = json.loads((project / "opencode.json").read_text())["mcp"]["phasesweep"]
+    assert opencode_entry["command"][0] == "uvx"
+    assert "phasesweep[mcp]==7.7.7" in opencode_entry["command"]
+
+    codex_config = fake_home / ".codex" / "config.toml"
+    codex_parsed = tomllib.loads(codex_config.read_text())
+    assert codex_parsed["mcp_servers"]["phasesweep"]["command"] == "uvx"
+    assert "phasesweep[mcp]==7.7.7" in codex_parsed["mcp_servers"]["phasesweep"]["args"]
+
+    assert (
+        installer.run("uninstall", project, None, ["claude", "codex", "opencode"], "mcp", yes=True)
+        == 0
+    )
+    assert "phasesweep" not in json.loads((project / ".mcp.json").read_text())["mcpServers"]
+    assert "phasesweep" not in json.loads((project / "opencode.json").read_text())["mcp"]
+    assert "mcp_servers" not in tomllib.loads(codex_config.read_text())
+
+
+def test_installer_refuses_uvx_launcher_before_edits_when_unresolvable(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def missing_uvx():
+        raise FileNotFoundError("cannot find 'uvx' on PATH")
+
+    monkeypatch.setattr(installer, "resolve_uvx_launcher", missing_uvx)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True, launcher="uvx")
+
+    assert code == 1
+    assert "no client config was touched" in capsys.readouterr().err
+    assert not (project / ".mcp.json").exists()
+
+
+# --- check-install (review v0.5.15 / item G) ---
+
+
+def _claude_target(project):
+    return next(t for t in agent_targets(project) if t.id == "claude")
+
+
+def _write_json_entry(target, entry):
+    path = target.mcp.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({target.mcp.key: {"phasesweep": entry}}, indent=2) + "\n")
+
+
+def _executable(tmp_path, name="phasesweep-mcp"):
+    script = tmp_path / "env" / "bin" / name
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    return script
+
+
+def test_check_install_reports_healthy_path_launcher(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    claude = _claude_target(project)
+    _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
+
+    code = installer.check_install(project, ["claude"])
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert str(script) in output
+    assert "every configured phasesweep MCP launcher resolves" in output
+
+
+def test_check_install_reports_missing_executable_with_repair_guidance(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    missing = tmp_path / "gone" / "phasesweep-mcp"
+    claude = _claude_target(project)
+    _write_json_entry(claude, mcp_entry("stdio", str(missing), Path("/proj/catalog.yaml")))
+
+    code = installer.check_install(project, ["claude"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "missing" in captured.out
+    assert "no longer exists" in captured.out
+    assert "--launcher uvx" in captured.out
+    assert "need attention" in captured.err
+
+
+def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    script.chmod(0o644)
+    claude = _claude_target(project)
+    _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
+
+    code = installer.check_install(project, ["claude"])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "not-executable" in output
+    assert "not executable" in output
+
+
+def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = _claude_target(project)
+    entry = mcp_entry(
+        "stdio",
+        "uvx",
+        Path("/proj/catalog.yaml"),
+        launcher_args=["--from", "phasesweep[mcp]==1.0.0", "phasesweep-mcp"],
+    )
+    _write_json_entry(claude, entry)
+
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+    missing_code = installer.check_install(project, ["claude"])
+    missing_output = capsys.readouterr().out
+    assert missing_code == 1
+    assert "not on PATH" in missing_output
+
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+    healthy_code = installer.check_install(project, ["claude"])
+    healthy_output = capsys.readouterr().out
+    assert healthy_code == 0
+    assert "uvx" in healthy_output
+
+
+def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = _claude_target(project)
+
+    code = installer.check_install(project, ["claude"])
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "not configured" in output
+
+    _write_json_entry(claude, {"command": "custom-server"})
+    code = installer.check_install(project, ["claude"])
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "unmanaged" in output
+    assert "not installer-verified" in output
+
+
+def test_check_install_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    code = installer.check_install(project, ["unknown"])
+
+    assert code == 2
+    assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
 
 
 # --- installer orchestration ---

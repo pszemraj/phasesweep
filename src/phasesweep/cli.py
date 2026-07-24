@@ -884,6 +884,17 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 @click.option(
     "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
 )
+@click.option(
+    "--launcher",
+    type=click.Choice(["path", "uvx"]),
+    default="path",
+    show_default=True,
+    help=(
+        "'path' pins the absolute phasesweep-mcp executable from this environment; 'uvx' "
+        "writes a pinned `uvx --from phasesweep[mcp]==<version>` launcher that survives "
+        "moving or recreating that environment (requires uvx on PATH)."
+    ),
+)
 @click.pass_context
 def install(
     ctx: click.Context,
@@ -894,6 +905,7 @@ def install(
     yes: bool,
     allow_user_scope: bool,
     dry_run: bool,
+    launcher: str,
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
 
@@ -909,6 +921,9 @@ def install(
     :param bool yes: Skip every confirmation prompt.
     :param bool allow_user_scope: Acknowledge unattended user-scoped MCP config writes.
     :param bool dry_run: Preview installer verdicts without changing client files.
+    :param str launcher: ``path`` (absolute executable) or ``uvx`` (pinned
+        version launcher) for the written MCP server command (review
+        v0.5.15 / item G).
     """
     project = project_dir.resolve()
     catalog_path: Path | None = None
@@ -955,6 +970,7 @@ def install(
             yes,
             dry_run,
             allow_user_scope,
+            launcher=launcher,  # type: ignore[arg-type]
         )
     )
 
@@ -1024,6 +1040,45 @@ def uninstall(
             dry_run,
         )
     )
+
+
+@mcp.command(
+    name="check-install",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Verify each coding agent's configured phasesweep MCP launcher still resolves: the "
+        "absolute executable exists and is executable, or (uvx mode) 'uvx' is on PATH. "
+        "Read-only; prints repair guidance for anything broken."
+    ),
+    short_help="Verify configured MCP launchers.",
+)
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    type=click.Choice(agent_ids()),
+    help="Agent to check explicitly; repeat for more. Default: every supported agent.",
+)
+@click.option(
+    "--project",
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("."),
+    show_default="current directory",
+    help="Project root for project-scoped client files.",
+)
+@click.pass_context
+def check_install_cmd(ctx: click.Context, agents: tuple[str, ...], project_dir: Path) -> None:
+    """Verify configured MCP launchers resolve, for the operator.
+
+    Read-only repair guidance for stale installs (review v0.5.15 / item G):
+    reports each configured launcher's health without editing any client file.
+
+    :param click.Context ctx: Active Click context used for the exit code.
+    :param tuple[str, ...] agents: Explicit agent ids, or empty for all.
+    :param Path project_dir: Project root for project-scoped client files.
+    """
+    ctx.exit(mcp_installer.check_install(project_dir.resolve(), list(agents) or None))
 
 
 def _format_status(status_obj: dict) -> str:

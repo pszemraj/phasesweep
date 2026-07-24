@@ -18,19 +18,35 @@ July 2026; quirks worth keeping in mind:
 - Claude Desktop's Linux config path follows XDG convention but is not yet
   documented by the official Linux beta; detection gates on the directory
   actually existing.
+
+Two launcher modes render the same entry shapes with a different executable
+and leading argv (review v0.5.15 / item G): the default binds an absolute
+``phasesweep-mcp`` path from the running environment; the opt-in ``uvx`` mode
+instead writes a pinned ``uvx --from phasesweep[mcp]==<version>
+phasesweep-mcp`` invocation that survives that environment being moved or
+recreated, at the cost of requiring ``uvx`` on the client's ``PATH`` at
+launch time. :func:`is_managed_mcp_entry` recognizes entries written in
+either mode so uninstall and re-install stay reversible regardless of which
+mode created the entry.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 SERVER_NAME = "phasesweep"
+# PyPI distribution name backing the ``uvx`` pinned launcher (review v0.5.15 / item G).
+# Coincides with SERVER_NAME today but is tracked separately since one names the MCP
+# server entry and the other names a package on PyPI.
+PACKAGE_NAME = "phasesweep"
 
 MARKDOWN_START = "<!-- PHASESWEEP_START -->"
 MARKDOWN_END = "<!-- PHASESWEEP_END -->"
@@ -39,6 +55,12 @@ TOML_END = "# PHASESWEEP_END"
 
 Scope = Literal["project", "user"]
 EntryStyle = Literal["stdio", "stdio-typed", "opencode"]
+Launcher = Literal["path", "uvx"]
+
+# Matches the pinned uvx requirement this installer writes, e.g. "phasesweep[mcp]==1.2.3".
+_UVX_PIN_PATTERN = re.compile(
+    rf"^{re.escape(PACKAGE_NAME)}\[mcp\]==(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -75,21 +97,31 @@ class AgentTarget:
         return bool(self.config_dir and self.config_dir.exists())
 
 
-def mcp_entry(style: EntryStyle, command: str, catalog: Path) -> dict[str, object]:
+def mcp_entry(
+    style: EntryStyle,
+    command: str,
+    catalog: Path,
+    *,
+    launcher_args: Sequence[str] = (),
+) -> dict[str, object]:
     """Render one client's JSON server entry for the phasesweep server.
 
     :param EntryStyle style: Client entry dialect.
-    :param str command: Absolute ``phasesweep-mcp`` executable path.
+    :param str command: Launcher executable: an absolute ``phasesweep-mcp`` path
+        (default mode), or ``"uvx"`` (pinned uvx launcher mode).
     :param Path catalog: Absolute catalog path passed as ``--catalog``.
+    :param Sequence[str] launcher_args: Extra argv placed before ``--catalog``;
+        empty for the default mode, the pinned uvx invocation otherwise.
     :return dict[str, object]: Entry value to store under the server name.
     """
+    args = [*launcher_args, "--catalog", str(catalog)]
     if style == "opencode":
         return {
             "type": "local",
-            "command": [command, "--catalog", str(catalog)],
+            "command": [command, *args],
             "enabled": True,
         }
-    entry: dict[str, object] = {"command": command, "args": ["--catalog", str(catalog)]}
+    entry: dict[str, object] = {"command": command, "args": args}
     if style == "stdio-typed":
         return {"type": "stdio", **entry}
     return entry
@@ -97,6 +129,9 @@ def mcp_entry(style: EntryStyle, command: str, catalog: Path) -> dict[str, objec
 
 def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     """Return whether a JSON member has exactly the shape this installer writes.
+
+    Recognizes both launcher modes this installer can write: the default
+    absolute-path launcher and the pinned ``uvx`` launcher.
 
     :param EntryStyle style: Client entry dialect expected for the member.
     :param object value: JSON member value to inspect.
@@ -112,10 +147,7 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
             value.get("type") == "local"
             and value.get("enabled") is True
             and isinstance(command, list)
-            and len(command) == 3
-            and _is_phasesweep_command(command[0])
-            and command[1] == "--catalog"
-            and _is_absolute_path(command[2])
+            and _is_phasesweep_argv(command)
         )
 
     expected_keys = {"command", "args"}
@@ -126,16 +158,43 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     if set(value) != expected_keys:
         return False
     args = value.get("args")
-    return (
-        _is_phasesweep_command(value.get("command"))
-        and isinstance(args, list)
-        and len(args) == 2
-        and args[0] == "--catalog"
-        and _is_absolute_path(args[1])
-    )
+    if not isinstance(args, list):
+        return False
+    return _is_phasesweep_argv([value.get("command"), *args])
 
 
-def _is_phasesweep_command(value: object) -> bool:
+def _is_phasesweep_argv(argv: object) -> bool:
+    """Return whether a full command argv matches one recognized launcher shape.
+
+    :param object argv: Candidate argv, executable first, as written by ``mcp_entry``.
+    :return bool: True for the 3-element absolute-path launcher
+        (``phasesweep-mcp --catalog PATH``) or the 6-element pinned uvx launcher
+        (``uvx --from phasesweep[mcp]==VERSION phasesweep-mcp --catalog PATH``).
+    """
+    if not isinstance(argv, list):
+        return False
+    if len(argv) == 3:
+        command, flag, catalog = argv
+        return (
+            _is_absolute_phasesweep_command(command)
+            and flag == "--catalog"
+            and _is_absolute_path(catalog)
+        )
+    if len(argv) == 6:
+        command, from_flag, pin, entrypoint, flag, catalog = argv
+        return (
+            command == "uvx"
+            and from_flag == "--from"
+            and isinstance(pin, str)
+            and _UVX_PIN_PATTERN.match(pin) is not None
+            and entrypoint == "phasesweep-mcp"
+            and flag == "--catalog"
+            and _is_absolute_path(catalog)
+        )
+    return False
+
+
+def _is_absolute_phasesweep_command(value: object) -> bool:
     """Return whether ``value`` is an absolute phasesweep MCP executable path.
 
     :param object value: Candidate command value.
@@ -157,20 +216,30 @@ def _is_absolute_path(value: object) -> bool:
     return isinstance(value, str) and bool(value) and Path(value).is_absolute()
 
 
-def codex_toml_content(command: str, catalog: Path) -> str:
+def codex_toml_content(
+    command: str,
+    catalog: Path,
+    *,
+    launcher_args: Sequence[str] = (),
+) -> str:
     """Render the Codex ``config.toml`` table body for the phasesweep server.
 
-    :param str command: Absolute ``phasesweep-mcp`` executable path.
+    :param str command: Launcher executable: an absolute ``phasesweep-mcp`` path
+        (default mode), or ``"uvx"`` (pinned uvx launcher mode).
     :param Path catalog: Absolute catalog path passed as ``--catalog``.
+    :param Sequence[str] launcher_args: Extra argv placed before ``--catalog``;
+        empty for the default mode, the pinned uvx invocation otherwise.
     :return str: TOML table text placed between the installer markers.
     """
     # JSON and TOML basic strings share escaping for valid Unicode. Keeping
     # non-ASCII characters literal avoids JSON's non-BMP UTF-16 surrogate pairs,
     # which TOML rejects because each \u escape must be a Unicode scalar value.
+    args = [*launcher_args, "--catalog", str(catalog)]
+    args_literal = ", ".join(json.dumps(arg, ensure_ascii=False) for arg in args)
     return (
         f"[mcp_servers.{SERVER_NAME}]\n"
         f"command = {json.dumps(command, ensure_ascii=False)}\n"
-        f'args = ["--catalog", {json.dumps(str(catalog), ensure_ascii=False)}]'
+        f"args = [{args_literal}]"
     )
 
 

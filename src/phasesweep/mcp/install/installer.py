@@ -6,11 +6,17 @@ server entry and the marker-fenced instructions block per target. Every step
 reports one of the edit :data:`~phasesweep.mcp.install.edits.Action` verdicts;
 ``skipped``/``error`` steps print the snippet to merge manually and make the
 command exit nonzero so scripts notice.
+
+:func:`check_install` is the read-only counterpart (review v0.5.15 / item G):
+it never edits a client file, only inspects whichever phasesweep MCP entry is
+already configured and reports whether its launcher executable resolves.
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
+import shlex
 import shutil
 import sys
 import tomllib
@@ -18,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeAlias
 
 import click
 
@@ -29,6 +35,7 @@ from phasesweep.mcp.install.edits import (
     _EditLockUnavailable,
     _locked_editable_text,
     _marked_span,
+    _read_editable_text,
     manual_json_snippet,
     merge_json_member,
     remove_json_member,
@@ -38,15 +45,18 @@ from phasesweep.mcp.install.edits import (
 from phasesweep.mcp.install.targets import (
     MARKDOWN_END,
     MARKDOWN_START,
+    PACKAGE_NAME,
     SERVER_NAME,
     TOML_END,
     TOML_START,
     AgentTarget,
+    Launcher,
     agent_targets,
     codex_toml_content,
     is_managed_mcp_entry,
     mcp_entry,
 )
+from phasesweep.runtime.json import strict_json_loads
 
 Mode = Literal["install", "uninstall"]
 Integration = Literal["mcp", "instructions"]
@@ -101,6 +111,37 @@ def resolve_server_command() -> str:
     )
 
 
+def resolve_uvx_launcher() -> tuple[str, list[str]]:
+    """Resolve the pinned ``uvx`` launcher for the installed phasesweep version.
+
+    An alternative to :func:`resolve_server_command` (review v0.5.15 / item G):
+    instead of binding an absolute path in the current environment, this pins
+    a ``uvx --from phasesweep[mcp]==<version> phasesweep-mcp`` invocation that
+    ``uvx`` resolves fresh at launch time, so it keeps working after this
+    environment is moved or recreated. Requires ``uvx`` on ``PATH`` now (the
+    client may run on a different ``PATH`` later, but this is still the
+    earliest useful check) and a resolvable installed version to pin.
+
+    :return tuple[str, list[str]]: ``"uvx"`` and its argv prefix before ``--catalog``.
+    :raises FileNotFoundError: If ``uvx`` is not on ``PATH``.
+    :raises LookupError: If the running phasesweep is not an installed
+        distribution with a resolvable version (e.g. an unbuilt source checkout).
+    """
+    if shutil.which("uvx") is None:
+        raise FileNotFoundError(
+            "cannot find 'uvx' on PATH; install uv (https://docs.astral.sh/uv/) or omit "
+            "--launcher uvx"
+        )
+    try:
+        version = importlib.metadata.version(PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise LookupError(
+            "phasesweep is not an installed distribution, so there is no version to pin; "
+            "install it normally or omit --launcher uvx"
+        ) from exc
+    return "uvx", ["--from", f"{PACKAGE_NAME}[mcp]=={version}", "phasesweep-mcp"]
+
+
 def _project_path_is_contained(path: Path, project: Path) -> bool:
     """Return whether resolving ``path`` stays beneath the project root.
 
@@ -133,17 +174,25 @@ def _apply_toml_mcp(
     command: str,
     catalog: Path | None,
     dry_run: bool,
+    launcher_args: Sequence[str] = (),
 ) -> StepResult:
     """Apply one Codex TOML edit as a locked, semantically checked transaction.
 
     :param Path path: Codex config path.
     :param Mode mode: ``install`` or ``uninstall``.
-    :param str command: Absolute lexical MCP launcher path.
+    :param str command: Launcher executable: an absolute path (default mode)
+        or ``"uvx"`` (pinned uvx launcher mode).
     :param Path | None catalog: Absolute catalog path for installs.
     :param bool dry_run: Compute the verdict without committing the candidate.
+    :param Sequence[str] launcher_args: Extra argv before ``--catalog``; empty
+        for the default mode, the pinned uvx invocation otherwise.
     :return StepResult: Safe edit or manual-attention verdict.
     """
-    content = codex_toml_content(command, catalog) if catalog is not None else ""
+    content = (
+        codex_toml_content(command, catalog, launcher_args=launcher_args)
+        if catalog is not None
+        else ""
+    )
 
     with _locked_editable_text(path) as loaded:
         if isinstance(loaded, _EditLockUnavailable):
@@ -228,7 +277,7 @@ def _apply_toml_mcp(
             return StepResult("mcp", path, action, note=note)
 
         assert catalog is not None  # narrowed by the install-only guard above
-        expected = mcp_entry("stdio", command, catalog)
+        expected = mcp_entry("stdio", command, catalog, launcher_args=launcher_args)
         if span is None and current is not None:
             return StepResult(
                 "mcp",
@@ -296,15 +345,19 @@ def _apply_mcp(
     catalog: Path | None,
     project: Path,
     dry_run: bool,
+    launcher_args: Sequence[str] = (),
 ) -> StepResult:
     """Apply or remove the MCP server entry for one target.
 
     :param AgentTarget target: Client being configured.
     :param Mode mode: ``install`` or ``uninstall``.
-    :param str command: Absolute ``phasesweep-mcp`` executable path.
+    :param str command: Launcher executable: an absolute ``phasesweep-mcp``
+        path (default mode), or ``"uvx"`` (pinned uvx launcher mode).
     :param Path | None catalog: Absolute catalog path; required for install.
     :param Path project: Project root that must contain project-scoped writes.
     :param bool dry_run: Compute the edit verdict without changing client files.
+    :param Sequence[str] launcher_args: Extra argv before ``--catalog``; empty
+        for the default mode, the pinned uvx invocation otherwise.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
@@ -329,7 +382,7 @@ def _apply_mcp(
     if spec.format == "toml":
         if edit_path.exists() and not edit_path.is_file():
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-        result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run)
+        result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run, launcher_args)
         return StepResult(
             result.integration,
             spec.path,
@@ -367,7 +420,7 @@ def _apply_mcp(
     assert catalog is not None
     if edit_path.exists() and not edit_path.is_file():
         return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-    entry = mcp_entry(spec.style, command, catalog)
+    entry = mcp_entry(spec.style, command, catalog, launcher_args=launcher_args)
     managed = partial(is_managed_mcp_entry, spec.style)
     action = merge_json_member(
         edit_path,
@@ -734,6 +787,7 @@ def run(
     yes: bool,
     dry_run: bool = False,
     allow_user_scope: bool = False,
+    launcher: Launcher = "path",
 ) -> int:
     """Run the installer or uninstaller end to end.
 
@@ -746,6 +800,11 @@ def run(
     :param bool yes: Skip every confirmation prompt.
     :param bool dry_run: Report planned edit verdicts without changing client files.
     :param bool allow_user_scope: Explicitly authorize unattended user-scoped MCP writes.
+    :param Launcher launcher: ``"path"`` (default) pins the absolute
+        ``phasesweep-mcp`` executable in the running environment; ``"uvx"``
+        (review v0.5.15 / item G) instead writes a pinned ``uvx --from
+        phasesweep[mcp]==<version> phasesweep-mcp`` launcher that survives
+        that environment being moved or recreated. Ignored for ``uninstall``.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
     """
@@ -773,10 +832,15 @@ def run(
         return 2
 
     command = ""
+    launcher_args: tuple[str, ...] = ()
     if mode == "install" and "mcp" in integrations:
         try:
-            command = resolve_server_command()
-        except FileNotFoundError as exc:
+            if launcher == "uvx":
+                command, launcher_args_list = resolve_uvx_launcher()
+                launcher_args = tuple(launcher_args_list)
+            else:
+                command = resolve_server_command()
+        except (FileNotFoundError, LookupError) as exc:
             click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
             return 1
     attention = 0
@@ -785,7 +849,7 @@ def run(
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog, project, dry_run)
+                result = _apply_mcp(target, mode, command, catalog, project, dry_run, launcher_args)
             else:
                 result = _apply_instructions(
                     target,
@@ -826,4 +890,247 @@ def run(
         )
     else:
         click.echo("done. Restart your MCP client to drop the phasesweep server.")
+    return 0
+
+
+# --- check-install: read-only verification (review v0.5.15 / item G) ---
+
+CheckStatus: TypeAlias = Literal[
+    "ok",
+    "missing",
+    "not-executable",
+    "unmanaged",
+    "not-configured",
+    "unreadable",
+]
+
+_CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset({"missing", "not-executable", "unreadable"})
+
+
+@dataclass(frozen=True)
+class LauncherCheck:
+    """Verification outcome for one target's configured phasesweep MCP launcher."""
+
+    target_id: str
+    display_name: str
+    config_path: Path | None
+    executable: str | None
+    args: tuple[str, ...]
+    status: CheckStatus
+    detail: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """Whether this check needs no further operator action.
+
+        :return bool: True unless the launcher is missing, not executable, or unreadable.
+        """
+        return self.status not in _CHECK_ATTENTION_STATUSES
+
+
+def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
+    """Probe whether one configured launcher executable actually resolves.
+
+    :param str command: Launcher executable token: ``"uvx"`` or an absolute path.
+    :return tuple[CheckStatus, str | None]: ``("ok", None)``, or a status
+        needing attention with actionable repair guidance.
+    """
+    if command == "uvx":
+        if shutil.which("uvx") is None:
+            return "missing", (
+                "'uvx' is not on PATH; install uv (https://docs.astral.sh/uv/) so this pinned "
+                "launcher can run, or run `phasesweep mcp install` again without --launcher uvx"
+            )
+        return "ok", None
+    path = Path(command)
+    if not path.is_file():
+        return "missing", (
+            f"{command} no longer exists; rerun `phasesweep mcp install` from the correct "
+            "Python environment (--dry-run previews the repair), or reinstall with "
+            "--launcher uvx for a pinned launcher that survives moving this environment"
+        )
+    if not os.access(path, os.X_OK):
+        return "not-executable", f"{command} exists but is not executable; check its permissions"
+    return "ok", None
+
+
+def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
+    """Read one target's configured phasesweep MCP entry and probe its launcher.
+
+    Read-only counterpart to :func:`_apply_mcp`: recognizes entries written by
+    either launcher mode, reports an entry this installer does not own as
+    ``unmanaged`` without probing it, and never edits the client file.
+
+    :param AgentTarget target: Client to inspect.
+    :return LauncherCheck: Verification outcome for this target.
+    """
+    spec = target.mcp
+    try:
+        edit_path = spec.path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return LauncherCheck(
+            target.id,
+            target.display_name,
+            spec.path,
+            None,
+            (),
+            "unreadable",
+            "config path could not be resolved",
+        )
+
+    snapshot = _read_editable_text(edit_path)
+    if snapshot is None:
+        return LauncherCheck(
+            target.id,
+            target.display_name,
+            spec.path,
+            None,
+            (),
+            "unreadable",
+            "config path is not a readable regular UTF-8 file",
+        )
+    if not snapshot.existed or not snapshot.text.strip():
+        return LauncherCheck(target.id, target.display_name, spec.path, None, (), "not-configured")
+
+    if spec.format == "toml":
+        try:
+            parsed = tomllib.loads(snapshot.text)
+        except tomllib.TOMLDecodeError as exc:
+            return LauncherCheck(
+                target.id,
+                target.display_name,
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                f"config contains invalid TOML ({exc})",
+            )
+        entry = _toml_mcp_entry(parsed)
+        if entry is None:
+            return LauncherCheck(
+                target.id, target.display_name, spec.path, None, (), "not-configured"
+            )
+        if not is_managed_mcp_entry("stdio", entry) or not isinstance(entry, dict):
+            return LauncherCheck(
+                target.id,
+                target.display_name,
+                spec.path,
+                None,
+                (),
+                "unmanaged",
+                f"an unmanaged {_CODEX_TABLE_HEADER} table exists; not installer-verified",
+            )
+        command, args = entry["command"], entry["args"]
+    else:
+        try:
+            data = strict_json_loads(snapshot.text, finite_floats=True)
+        except ValueError:
+            return LauncherCheck(
+                target.id,
+                target.display_name,
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "config is not strict JSON",
+            )
+        if not isinstance(data, dict):
+            return LauncherCheck(
+                target.id,
+                target.display_name,
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "config top level is not a JSON object",
+            )
+        container = data.get(spec.key)
+        member = container.get(SERVER_NAME) if isinstance(container, dict) else None
+        if member is None:
+            return LauncherCheck(
+                target.id, target.display_name, spec.path, None, (), "not-configured"
+            )
+        if not is_managed_mcp_entry(spec.style, member) or not isinstance(member, dict):
+            return LauncherCheck(
+                target.id,
+                target.display_name,
+                spec.path,
+                None,
+                (),
+                "unmanaged",
+                "an unmanaged phasesweep entry exists; not installer-verified",
+            )
+        if spec.style == "opencode":
+            argv = member["command"]
+            command, args = argv[0], argv[1:]
+        else:
+            command, args = member["command"], member["args"]
+
+    status, detail = _probe_launcher_executable(command)
+    return LauncherCheck(
+        target.id, target.display_name, spec.path, command, tuple(args), status, detail
+    )
+
+
+def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
+    """Verify each target's configured phasesweep MCP launcher still resolves.
+
+    Read-only counterpart to ``install``/``uninstall`` (review v0.5.15 / item
+    G): for every selected target, inspects whatever phasesweep MCP entry is
+    already on disk (written by either launcher mode, or by hand), reports
+    whether it is installer-managed and whether its launcher executable
+    resolves, and prints repair guidance for anything broken. Never edits a
+    client file.
+
+    :param Path project: Project root anchoring project-scoped paths.
+    :param Sequence[str] | None agent_ids: Explicit target ids, or ``None`` to
+        check every supported target.
+    :return int: ``0`` when every configured launcher resolves, ``1`` when at
+        least one needs attention, ``2`` for an unknown agent id.
+    """
+    targets = agent_targets(project)
+    if agent_ids is not None:
+        by_id = {target.id: target for target in targets}
+        selected_ids = list(dict.fromkeys(agent_ids))
+        unknown = [agent_id for agent_id in selected_ids if agent_id not in by_id]
+        if unknown:
+            click.echo(
+                f"unknown coding agent id(s): {', '.join(unknown)} (choices: {', '.join(by_id)})",
+                err=True,
+            )
+            return 2
+        targets = [by_id[agent_id] for agent_id in selected_ids]
+
+    click.echo("\ncheck-install report:")
+    attention = 0
+    configured = 0
+    for target in targets:
+        result = _check_target_launcher(target)
+        click.echo(f"  {target.display_name}")
+        if result.status == "not-configured":
+            click.echo("    mcp           not configured")
+            continue
+        configured += 1
+        if result.status == "unmanaged":
+            click.echo(f"    mcp           unmanaged     {result.config_path}")
+        else:
+            assert result.executable is not None
+            invocation = shlex.join([result.executable, *result.args])
+            click.echo(f"    mcp           {result.status:<13} {invocation}")
+        if result.detail:
+            for line in result.detail.splitlines():
+                click.echo(f"      {line}")
+        if not result.ok:
+            attention += 1
+    click.echo("")
+    if attention:
+        click.echo(
+            f"{attention} configured launcher(s) need attention (see above).",
+            err=True,
+        )
+        return 1
+    if configured == 0:
+        click.echo("no configured phasesweep MCP launchers found.")
+    else:
+        click.echo("every configured phasesweep MCP launcher resolves.")
     return 0
