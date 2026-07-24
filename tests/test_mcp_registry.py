@@ -405,7 +405,10 @@ def test_external_rdb_storage_rejected_for_local_node_mcp(
         .replace(f"sqlite:///{tmp_path}/reg_ok.db", storage)
         # Acknowledge the config-level single-host gate so this test reaches
         # the MCP-specific local-node rejection, which has no such escape.
-        .replace("experiment: reg_ok\n", "experiment: reg_ok\nallow_unsafe_multihost: true\n"),
+        .replace(
+            "experiment: reg_ok\n",
+            "experiment: reg_ok\nallow_external_rdb_single_host: true\n",
+        ),
     )
 
     with pytest.raises(CatalogError, match="local-node SQLite or JournalStorage"):

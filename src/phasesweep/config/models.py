@@ -373,13 +373,18 @@ class Experiment(_Frozen):
         description=(
             "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
             "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
-            "(RDB backends additionally require allow_unsafe_multihost: true; see below). "
+            "(RDB backends additionally require allow_external_rdb_single_host: true; "
+            "see below). "
             "Null for non-resumable in-memory runs (not recommended). "
             "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
             "scheme intentionally so study identity stays stable across n_jobs changes."
         ),
     )
-    allow_unsafe_multihost: bool = Field(
+    # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
+    # read as "enables multi-host operation," but the flag actually acknowledges the
+    # opposite — that this external relational-DB storage is still coordinated
+    # host-locally, with every process confined to ONE host.
+    allow_external_rdb_single_host: bool = Field(
         default=False,
         description=(
             "Acknowledge the loss of PhaseSweep's host-local-filesystem-based "
@@ -591,7 +596,7 @@ class Experiment(_Frozen):
             # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
             # shared RDB storage across hosts silently breaks lock/generation-pointer
             # safety unless explicitly acknowledged.
-            _validate_storage_policy(self.storage, phase, self.allow_unsafe_multihost)
+            _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
 
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
@@ -614,7 +619,7 @@ class Experiment(_Frozen):
 
 
 def _validate_storage_policy(
-    storage: str | None, phase: Phase, allow_unsafe_multihost: bool
+    storage: str | None, phase: Phase, allow_external_rdb_single_host: bool
 ) -> None:
     """Reject SQLite+parallel storage and unacknowledged multi-host RDB storage.
 
@@ -631,7 +636,7 @@ def _validate_storage_policy(
        Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
        silently breaks those safety guarantees, so any backend other than
        ``sqlite``/``journal`` is rejected unless the operator explicitly sets
-       ``allow_unsafe_multihost: true``. In-memory storage (``None`` or the
+       ``allow_external_rdb_single_host: true``. In-memory storage (``None`` or the
        bare ``":memory:"``/URI-memory sentinels recognized by
        :func:`phasesweep.runtime.files.storage_is_in_memory`) is exempt: it
        cannot be shared across hosts in the first place.
@@ -646,14 +651,14 @@ def _validate_storage_policy(
         storage: The experiment-level storage URL, or ``None`` (in-memory).
         phase: The phase being validated; its ``n_jobs`` decides whether the
             SQLite-parallel restriction applies.
-        allow_unsafe_multihost: Experiment-level acknowledgement that every
+        allow_external_rdb_single_host: Experiment-level acknowledgement that every
             process touching this storage and workdir runs on a single host,
             required to use any non-file-backed (RDB) storage.
 
     Raises:
         ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite, or
             ``storage`` is not in-memory, resolves to a backend other than
-            ``sqlite``/``journal``, and ``allow_unsafe_multihost`` is not set.
+            ``sqlite``/``journal``, and ``allow_external_rdb_single_host`` is not set.
 
     """
     if storage is None:
@@ -671,18 +676,19 @@ def _validate_storage_policy(
     if (
         not storage_is_in_memory(storage)
         and backend not in {"sqlite", "journal"}
-        and not allow_unsafe_multihost
+        and not allow_external_rdb_single_host
     ):
         raise ValueError(
             f"storage {storage!r} resolves to backend {backend!r}, a shared "
             "relational store. PhaseSweep's coordination (locks, generation "
             "pointers) is host-local-filesystem based, so pointing multiple "
             f"hosts at one shared {backend} storage silently breaks those safety "
-            "guarantees. Set allow_unsafe_multihost: true only when every "
+            "guarantees. Set allow_external_rdb_single_host: true only when every "
             "process that will ever touch this storage and workdir runs on a "
-            "single host; otherwise use storage: journal:///path.journal for a "
-            "single-host parallel sweep, or storage: sqlite:///path.db for "
-            "sequential n_jobs: 1 studies."
+            "single host — this acknowledges the storage is external, not that "
+            "coordination is distributed; otherwise use storage: "
+            "journal:///path.journal for a single-host parallel sweep, or "
+            "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
         )
 
 
@@ -837,7 +843,7 @@ class SuiteDefaults(_Frozen):
     """Shared defaults applied to every study in a suite."""
 
     storage: str | None = None
-    allow_unsafe_multihost: bool = False
+    allow_external_rdb_single_host: bool = False
     workdir: str = "./runs"
     trial_command: str | None = None
     provenance: dict[str, str] = Field(default_factory=dict)
@@ -855,7 +861,7 @@ class StudySpec(_Frozen):
     name: str
     depends_on: list[str] = Field(default_factory=list)
     storage: str | None = None
-    allow_unsafe_multihost: bool | None = None
+    allow_external_rdb_single_host: bool | None = None
     workdir: str | None = None
     trial_command: str | None = None
     provenance: dict[str, str] | None = None
@@ -971,7 +977,7 @@ class Suite(_Frozen):
         return Experiment(
             experiment=f"{self.suite}__{study.name}",
             storage=value("storage"),
-            allow_unsafe_multihost=value("allow_unsafe_multihost", required=True),
+            allow_external_rdb_single_host=value("allow_external_rdb_single_host", required=True),
             workdir=value("workdir", required=True),
             trial_command=value("trial_command", required=True),
             provenance=value("provenance") or {},

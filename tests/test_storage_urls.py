@@ -51,7 +51,7 @@ def _storage_policy_config(
     *,
     storage: str,
     n_jobs: int,
-    allow_unsafe_multihost: bool | None = None,
+    allow_external_rdb_single_host: bool | None = None,
 ) -> Path:
     parallel = (
         f"""
@@ -60,16 +60,17 @@ def _storage_policy_config(
         if n_jobs > 1
         else ""
     )
-    unsafe_multihost = (
-        f"\n        allow_unsafe_multihost: {'true' if allow_unsafe_multihost else 'false'}"
-        if allow_unsafe_multihost is not None
+    external_rdb_single_host = (
+        f"\n        allow_external_rdb_single_host: "
+        f"{'true' if allow_external_rdb_single_host else 'false'}"
+        if allow_external_rdb_single_host is not None
         else ""
     )
     return write_yaml(
         tmp_path,
         f"""
         experiment: t
-        storage: {storage}{unsafe_multihost}
+        storage: {storage}{external_rdb_single_host}
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
@@ -112,7 +113,7 @@ def test_validate_storage_parallel_policy(
 
 
 @pytest.mark.parametrize(
-    ("storage", "allow_unsafe_multihost", "raises"),
+    ("storage", "allow_external_rdb_single_host", "raises"),
     [
         ("postgresql://user:pass@host/db", None, True),
         ("postgresql://user:pass@host/db", False, True),
@@ -134,29 +135,30 @@ def test_validate_storage_parallel_policy(
         "journal_unaffected",
     ],
 )
-def test_validate_storage_multihost_policy(
+def test_validate_storage_external_rdb_single_host_policy(
     tmp_path: Path,
     storage: str,
-    allow_unsafe_multihost: bool | None,
+    allow_external_rdb_single_host: bool | None,
     raises: bool,
 ) -> None:
     """A storage backend other than sqlite/journal requires an explicit
-    allow_unsafe_multihost: true acknowledgement (review v0.5.14 / item D); sqlite and
+    allow_external_rdb_single_host: true acknowledgement (review v0.5.15 / item E,
+    renamed from allow_unsafe_multihost per review v0.5.14 / item D); sqlite and
     journal storage are unaffected regardless of the flag's value."""
     p = _storage_policy_config(
         tmp_path,
         storage=storage.format(tmp=tmp_path),
         n_jobs=1,
-        allow_unsafe_multihost=allow_unsafe_multihost,
+        allow_external_rdb_single_host=allow_external_rdb_single_host,
     )
     if raises:
-        with pytest.raises(ValidationError, match="allow_unsafe_multihost"):
+        with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
             load_experiment(p)
     else:
         load_experiment(p)
 
 
-def test_multihost_storage_error_is_actionable() -> None:
+def test_external_rdb_storage_error_is_actionable() -> None:
     """The rejection must name the detected backend, state that PhaseSweep's
     coordination is single-host, and say how to acknowledge the risk."""
     with pytest.raises(ValueError) as exc_info:
@@ -179,16 +181,16 @@ def test_multihost_storage_error_is_actionable() -> None:
     message = str(exc_info.value)
     assert "postgresql" in message
     assert "host-local-filesystem" in message
-    assert "allow_unsafe_multihost: true" in message
+    assert "allow_external_rdb_single_host: true" in message
     assert "single host" in message
 
 
-def test_multihost_storage_allowed_when_acknowledged() -> None:
-    """Setting allow_unsafe_multihost: true permits shared RDB storage."""
+def test_external_rdb_storage_allowed_when_acknowledged() -> None:
+    """Setting allow_external_rdb_single_host: true permits shared RDB storage."""
     experiment = Experiment(
         experiment="t",
         storage="postgresql://user:pass@host/db",
-        allow_unsafe_multihost=True,
+        allow_external_rdb_single_host=True,
         provenance={"revision": "test-fixture-v1"},
         trial_command="echo {overrides}",
         metric=Metric(
@@ -202,12 +204,12 @@ def test_multihost_storage_allowed_when_acknowledged() -> None:
             )
         ],
     )
-    assert experiment.allow_unsafe_multihost is True
+    assert experiment.allow_external_rdb_single_host is True
     assert experiment.storage == "postgresql://user:pass@host/db"
 
 
-def test_suite_allow_unsafe_multihost_flows_from_defaults(tmp_path: Path) -> None:
-    """``allow_unsafe_multihost`` flows from Suite defaults into each compiled
+def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
+    """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
     study's Experiment exactly like ``storage`` and other defaulted fields
     (see ``Suite.experiment_for_study``); a study can still opt out and hit
     the same Experiment-level rejection as a standalone config."""
@@ -215,10 +217,10 @@ def test_suite_allow_unsafe_multihost_flows_from_defaults(tmp_path: Path) -> Non
         write_yaml(
             tmp_path,
             """
-            suite: multihost_suite
+            suite: external_rdb_suite
             defaults:
               storage: postgresql://user:pass@host/db
-              allow_unsafe_multihost: true
+              allow_external_rdb_single_host: true
               trial_command: "echo"
               provenance: {revision: default-v1}
               metric:
@@ -229,7 +231,7 @@ def test_suite_allow_unsafe_multihost_flows_from_defaults(tmp_path: Path) -> Non
               - name: inherited
                 phases: [{name: p, n_trials: 1}]
               - name: opted_out
-                allow_unsafe_multihost: false
+                allow_external_rdb_single_host: false
                 phases: [{name: p, n_trials: 1}]
             """,
         )
@@ -240,9 +242,9 @@ def test_suite_allow_unsafe_multihost_flows_from_defaults(tmp_path: Path) -> Non
 
     inherited = config.experiment_for_study(inherited_study)
     assert inherited.storage == "postgresql://user:pass@host/db"
-    assert inherited.allow_unsafe_multihost is True
+    assert inherited.allow_external_rdb_single_host is True
 
-    with pytest.raises(ValidationError, match="allow_unsafe_multihost"):
+    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
         config.experiment_for_study(opted_out_study)
 
 

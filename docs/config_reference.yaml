@@ -13,10 +13,10 @@
 
 # storage: str | None = null
 # `null` creates fresh in-memory studies and restarts trial numbers on every invocation. Trial directories remain generation/attempt-scoped, but study state and the current winner/summary view restart; use persistent storage for resumable work.
-# `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs (RDB backends such as postgresql:// or mysql://) pass through to Optuna but are rejected at config validation unless allow_unsafe_multihost: true is also set.
+# `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs (RDB backends such as postgresql:// or mysql://) pass through to Optuna but are rejected at config validation unless allow_external_rdb_single_host: true is also set.
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
 
-# allow_unsafe_multihost: bool = false
+# allow_external_rdb_single_host: bool = false
 # Acknowledges the loss of PhaseSweep's host-local-filesystem-based coordination (locks, generation pointers) when using a shared RDB storage backend. Set true only when every process that will ever touch this storage and workdir runs on a single host.
 
 # workdir: str = "./runs"
@@ -284,7 +284,7 @@
 # defaults: SuiteDefaults = {}
 # SuiteDefaults object keys:
 #   storage: str | None = null
-#   allow_unsafe_multihost: bool = false
+#   allow_external_rdb_single_host: bool = false
 #   workdir: str = "./runs"
 #   trial_command: str | None = null
 #   provenance: dict[str, str] = {}
@@ -309,8 +309,8 @@
 # storage: str | None = null
 # If omitted, inherits defaults.storage; explicit null clears a persistent default and selects in-memory storage.
 
-# allow_unsafe_multihost: bool | None = null
-# If omitted, inherits defaults.allow_unsafe_multihost. Follows the Experiment contract once resolved.
+# allow_external_rdb_single_host: bool | None = null
+# If omitted, inherits defaults.allow_external_rdb_single_host. Follows the Experiment contract once resolved.
 
 # workdir: str | None = null
 # If omitted, inherits defaults.workdir; explicit null blocks fallback and fails compilation because Experiment.workdir is required after resolution.
