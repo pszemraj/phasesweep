@@ -73,6 +73,10 @@ class ShutdownCleanupReport:
     child_pgids: tuple[int, ...]
 
 
+class SignalOwnershipUnavailableError(RuntimeError):
+    """Raised when shutdown-signal ownership is needed but cannot be taken here."""
+
+
 class PhaseSweepShutdown(SystemExit):
     """SystemExit carrying child process-group cleanup evidence."""
 
@@ -243,6 +247,83 @@ def install_signal_handlers() -> None:
         _installed = True
     except ValueError:
         log.debug("Cannot install signal handlers (not on main thread)")
+
+
+@contextlib.contextmanager
+def signal_handler_scope() -> Iterator[None]:
+    """Own shutdown signals for the duration of one outermost run, then restore the host.
+
+    A library must not leave its shutdown handlers and unblocked signal mask
+    installed after it returns control — that permanently steals the
+    embedding process's own SIGTERM/SIGINT/SIGHUP handling (review v0.5.14 /
+    blocker 6). This context manager scopes ownership to one call tree instead:
+
+    - If ``_shutdown_handler`` is already installed for every shutdown signal
+      (an enclosing scope, or a process-lifetime :func:`install_signal_handlers`
+      call by an entry point such as the CLI or MCP server), this is a no-op:
+      it neither touches the handlers/mask nor restores anything on exit. This
+      makes the scope reentrant and lets entry points keep explicit ownership
+      for the whole process lifetime.
+    - Otherwise, on the main thread, it snapshots the prior handlers and mask,
+      installs ``_shutdown_handler``, unblocks the shutdown signals, and
+      restores the snapshot in ``finally`` — on every exit path, success or
+      exception.
+    - Otherwise (not the main thread, and nothing installed yet), signal
+      ownership cannot be established here at all: ``signal.signal`` only
+      works on the main thread, so this raises rather than silently running
+      unprotected.
+
+    Raises:
+        SignalOwnershipUnavailableError: Called from a non-main thread while
+            no enclosing scope or explicit :func:`install_signal_handlers`
+            call already owns the shutdown signals.
+
+    Yields:
+        ``None``. Use as ``with signal_handler_scope(): ...`` around the
+        outermost run whose child processes must be cleaned up on shutdown.
+
+    """
+    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
+        # Reentrant no-op: an enclosing scope (or a process-lifetime
+        # install_signal_handlers() call) already owns the shutdown signals.
+        # Nesting must install once and restore once, so the inner call
+        # touches nothing.
+        yield
+        return
+
+    if threading.current_thread() is not threading.main_thread():
+        raise SignalOwnershipUnavailableError(
+            "Shutdown-signal handlers are not installed on this process, and "
+            "this thread is not the main thread, so they cannot be installed "
+            "here (signal.signal only works on the main thread). Call "
+            "install_signal_handlers() from the main thread at process "
+            "start, or run this from the main thread."
+        )
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
+    prior_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        # An empty-set SIG_BLOCK call changes nothing; it is a pure read that
+        # returns the mask already in effect, for restoration later.
+        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in _SHUTDOWN_SIGNALS:
+            signal.signal(sig, _shutdown_handler)
+        _unblock_shutdown_signals()
+        yield
+    finally:
+        if prior_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            if handler is None:
+                log.warning(
+                    "Signal %d had no Python-level handler before this scope "
+                    "(a C-level default phasesweep cannot reinstall); leaving "
+                    "phasesweep's shutdown handler installed for it.",
+                    sig,
+                )
+                continue
+            signal.signal(sig, handler)
 
 
 @contextlib.contextmanager

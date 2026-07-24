@@ -69,7 +69,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import require_posix_runtime
-from phasesweep.runtime.process import PhaseSweepShutdown, install_signal_handlers
+from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
 
 
 @dataclass(frozen=True)
@@ -241,13 +241,21 @@ def _run_experiment_outcome(
     :return ExperimentRunOutcome: Winners bound to the publishing generation id.
     """
     require_posix_runtime()
-    install_signal_handlers()
 
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
-    with _file_log_handler(_run_log_path(experiment)), _experiment_lock(experiment):
+    # signal_handler_scope() is the outermost context manager so shutdown-signal
+    # ownership is scoped to this call tree and restored on every exit path,
+    # not left installed on the host process forever (review v0.5.14 /
+    # blocker 6). A run_suite caller has already entered its own scope, so
+    # this one is a reentrant no-op that installs and restores nothing.
+    with (
+        signal_handler_scope(),
+        _file_log_handler(_run_log_path(experiment)),
+        _experiment_lock(experiment),
+    ):
         generation_id = _claim_generation(experiment, requested_generation_id)
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
@@ -982,7 +990,15 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
 
     require_posix_runtime()
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
-    with _suite_lock(suite), _file_log_handler(_suite_log_path(suite)):
+    # See _run_experiment_outcome: signal_handler_scope() is the outermost
+    # context manager here too, so a suite installs shutdown handlers once for
+    # the whole component sequence and each component's own scope (entered
+    # inside _run_experiment_outcome) is a no-op nested inside this one.
+    with (
+        signal_handler_scope(),
+        _suite_lock(suite),
+        _file_log_handler(_suite_log_path(suite)),
+    ):
         generation_id = _claim_suite_generation(suite)
         started_at = datetime.now(UTC).isoformat()
         _write_suite_generation_state(

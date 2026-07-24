@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 import time
 from pathlib import Path
 
 import optuna
 import pytest
 
-from phasesweep import load_experiment, run_experiment
+from phasesweep import load_config, load_experiment, run_experiment, run_suite
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
@@ -34,8 +36,20 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.evidence import TrialContext
-from phasesweep.runtime.process import ProcessResult
-from tests.conftest import copy_fake_train, make_experiment, write_trainer, write_yaml
+from phasesweep.runtime import process as runtime_process
+from phasesweep.runtime.process import (
+    ProcessResult,
+    SignalOwnershipUnavailableError,
+    install_signal_handlers,
+    signal_handler_scope,
+)
+from tests.conftest import (
+    copy_fake_train,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+    write_yaml,
+)
 
 
 def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
@@ -1051,3 +1065,197 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
 
     rerun = run_experiment(experiment)
     assert rerun["p"].metric == first["p"].metric
+
+
+def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
+    tmp_path: Path,
+) -> None:
+    """run_experiment restores the host's prior signal handlers and mask on every exit path.
+
+    A library that leaves its own SIGTERM/SIGINT/SIGHUP handlers and unblocked
+    mask installed after returning steals the embedding process's own
+    shutdown handling permanently (review v0.5.14 / blocker 6). This must be
+    undone whether the run succeeds or raises.
+    """
+
+    def host_handler(_signum: int, _frame: object) -> None:
+        raise AssertionError("host handler should never fire during this test")
+
+    def assert_host_state_active() -> None:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is host_handler
+        current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert set(runtime_process._SHUTDOWN_SIGNALS) <= current_mask
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_process._SHUTDOWN_SIGNALS))
+
+        trainer = write_constant_trainer(tmp_path)
+        experiment = make_experiment(
+            workdir=tmp_path / "runs",
+            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            n_trials=1,
+        )
+        run_experiment(experiment)
+        assert_host_state_active()
+
+        failing_trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+        failing_experiment = make_experiment(
+            experiment="fails",
+            workdir=tmp_path / "runs",
+            trial_command=f"python {failing_trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            n_trials=1,
+            max_consecutive_failures=1,
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(failing_experiment)
+        assert_host_state_active()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_run_suite_installs_signal_handlers_once_for_all_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A multi-study suite installs shutdown handlers once, not once per component.
+
+    Each component experiment enters its own nested ``signal_handler_scope()``
+    call; because the suite's outer scope already owns the shutdown signals,
+    every nested entry must be a reentrant no-op (review v0.5.14 / blocker 6)
+    — exactly one install and one restore for the whole suite, never one pair
+    per study.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_installed = runtime_process._installed
+    try:
+        # Clean slate: nothing already owns the shutdown signals here,
+        # regardless of what an earlier test in this session left installed.
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, signal.SIG_DFL)
+        runtime_process._installed = False
+
+        signal_calls: list[int] = []
+        original_signal = signal.signal
+
+        def counting_signal(signalnum: int, handler: object) -> object:
+            signal_calls.append(signalnum)
+            return original_signal(signalnum, handler)
+
+        monkeypatch.setattr(runtime_process.signal, "signal", counting_signal)
+
+        trainer = write_constant_trainer(tmp_path)
+        config = load_config(
+            write_yaml(
+                tmp_path,
+                f"""
+                suite: nesting_suite
+                defaults:
+                  workdir: {tmp_path}/runs
+                  trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+                  metric:
+                    name: x
+                    goal: minimize
+                    extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+                studies:
+                  - name: one
+                    phases:
+                      - name: p
+                        n_trials: 1
+                        search_space: {{}}
+                  - name: two
+                    phases:
+                      - name: p
+                        n_trials: 1
+                        search_space: {{}}
+                """,
+            )
+        )
+
+        run_suite(config)
+
+        # One install (len(_SHUTDOWN_SIGNALS) calls) and one restore (another
+        # len(_SHUTDOWN_SIGNALS) calls) for the whole suite — never doubled by
+        # the two nested per-study scopes.
+        assert len(signal_calls) == 2 * len(runtime_process._SHUTDOWN_SIGNALS)
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+        runtime_process._installed = prior_installed
+
+
+def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> None:
+    """Off the main thread, with nothing already owning shutdown signals, the scope refuses.
+
+    ``signal.signal`` only works on the main thread, so a scope entered from a
+    worker thread with no enclosing install cannot safely take ownership; it
+    must raise a typed error instead of silently running unprotected.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            if signal.getsignal(sig) is runtime_process._shutdown_handler:
+                signal.signal(sig, signal.SIG_DFL)
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                with signal_handler_scope():
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], SignalOwnershipUnavailableError)
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals() -> None:
+    """A process-lifetime ``install_signal_handlers()`` call is never undone by a nested scope.
+
+    Entry points (CLI, MCP server) install shutdown handlers once for the
+    whole process. A later ``signal_handler_scope()`` — even from a worker
+    thread, where taking ownership from scratch would be impossible — must
+    see that ownership is already established and do nothing, on entry or
+    exit.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_installed = runtime_process._installed
+    try:
+        install_signal_handlers()
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                with signal_handler_scope():
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert errors == []
+        # Entry-point ownership persists: the nested scope did not tear it down.
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+        runtime_process._installed = prior_installed

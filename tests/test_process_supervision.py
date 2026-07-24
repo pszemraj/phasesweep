@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import select
@@ -55,12 +56,19 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    """Patch ``signal_handler_scope`` so tests can observe whether it was entered.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace the scope.
+    :return dict[str, bool]: Mutable probe; ``"called"`` flips to ``True`` on entry.
+    """
     installed = {"called": False}
 
-    def fake_install() -> None:
+    @contextlib.contextmanager
+    def fake_scope():
         installed["called"] = True
+        yield
 
-    monkeypatch.setattr("phasesweep.engine.run.install_signal_handlers", fake_install)
+    monkeypatch.setattr("phasesweep.engine.run.signal_handler_scope", fake_scope)
     return installed
 
 
@@ -629,7 +637,7 @@ def test_reaper_raises_when_cleanup_uncertain(
         _reap_stale_trials(study, exp, exp.phases[0].name)
 
 
-def test_public_run_experiment_installs_signal_handlers(
+def test_public_run_experiment_enters_signal_handler_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -647,7 +655,7 @@ def test_public_run_experiment_installs_signal_handlers(
     assert installed["called"] is True
 
 
-def test_dry_run_does_not_install_signal_handlers(
+def test_dry_run_does_not_enter_signal_handler_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dry-run launches no children, so it must not perturb the signal mask."""
