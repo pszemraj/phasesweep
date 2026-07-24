@@ -28,6 +28,7 @@ from phasesweep.engine.state import (
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_id,
     _published_summary_path,
     _published_winner_path,
 )
@@ -270,22 +271,43 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
 
+    Winners and live trial counts can legitimately come from *different*
+    generations: after a failed rerun, ``current_generation_id`` names the
+    failed/in-progress attempt while ``published_generation_id`` still names
+    the older generation whose winners remain authoritative. The payload
+    always carries both identities explicitly rather than a single ambiguous
+    id, so callers can never mistake one generation's facts for the other's.
+    Every per-phase fact is attributed accordingly: ``generation_trials`` is
+    scoped to ``current_generation_id`` (live progress), while
+    ``winner_present`` and the top-level ``summary_present`` are scoped to
+    ``published_generation_id`` (publication state). ``trials``,
+    ``running``, ``completed``, and ``trial_data_available`` are cumulative,
+    all-time counts for the phase's study and are not generation-scoped.
+
     Args:
         experiment: Parsed experiment config whose phases are inspected.
-        generation_id: Optional invocation identity whose trial counts should
-            be separated from cumulative study history and whose immutable
-            artifacts should be inspected. When omitted, counts use the current
-            invocation while winner presence uses the last successfully
-            published generation.
+        generation_id: Optional invocation identity to pin the whole read to a
+            single, self-contained generation: both ``current_generation_id``
+            and ``published_generation_id`` in the returned payload equal this
+            id, and winner/summary facts are read from that generation's own
+            immutable namespace rather than the last-success pointer. Used by
+            callers (e.g. MCP per-run reads) that already know which
+            generation they mean and want its own view of itself, not the
+            experiment-wide current/published split. When omitted (the
+            default), ``current_generation_id`` is discovered from the
+            mutable current-generation pointer (may be ``None``, failed, or
+            in-progress) and ``published_generation_id`` is the validated
+            last-success pointer (may be ``None``); these may differ.
 
     Returns:
-        A path-free mapping with the experiment name, metric descriptor, a
-        per-phase list of trial counts plus winner presence and whether the
-        experiment summary has been written.
+        A path-free mapping with the experiment name, explicit
+        ``current_generation_id``/``published_generation_id`` identities, the
+        metric descriptor, a per-phase list of trial counts plus winner
+        presence, and whether the experiment summary has been written.
 
     """
-    requested_generation_id = generation_id
     if generation_id is None:
+        current_generation_id: str | None = None
         try:
             generation = yaml.safe_load(_generation_path(experiment).read_text())
             if isinstance(generation, Mapping):
@@ -293,20 +315,27 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
                 if isinstance(raw_generation_id, str) and SAFE_NAME_PATTERN.fullmatch(
                     raw_generation_id
                 ):
-                    generation_id = raw_generation_id
+                    current_generation_id = raw_generation_id
         except (OSError, yaml.YAMLError):
             pass
+        published_generation_id = _last_successful_generation_id(experiment)
+        winner_scope_generation_id = None  # resolved via the last-success pointer
     else:
         _validate_safe_name("generation", generation_id)
+        current_generation_id = generation_id
+        published_generation_id = generation_id
+        winner_scope_generation_id = generation_id
+
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
     summary_path = (
         _published_summary_path(experiment)
-        if generation_id is None
-        else _generation_summary_path(experiment, generation_id)
+        if winner_scope_generation_id is None
+        else _generation_summary_path(experiment, winner_scope_generation_id)
     )
     return {
         "experiment": experiment.experiment,
-        "generation_id": generation_id,
+        "current_generation_id": current_generation_id,
+        "published_generation_id": published_generation_id,
         "metric": {
             "name": experiment.metric.name,
             "goal": experiment.metric.goal,
@@ -317,11 +346,15 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
             include_winner_path=False,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={
-                name: stats.generation_counts.get(generation_id, {}) if generation_id else {}
+                name: (
+                    stats.generation_counts.get(current_generation_id, {})
+                    if current_generation_id
+                    else {}
+                )
                 for name, stats in phase_stats.items()
             },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
-            generation_id=requested_generation_id,
+            generation_id=winner_scope_generation_id,
         ),
         "summary_present": summary_path is not None and summary_path.is_file(),
     }

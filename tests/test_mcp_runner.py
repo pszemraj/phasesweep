@@ -344,7 +344,8 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
     assert status["result_snapshot_state"] == "complete"
     snapshot = status["result_snapshot"]
-    assert snapshot["status"]["generation_id"] is None
+    assert snapshot["status"]["current_generation_id"] is None
+    assert snapshot["status"]["published_generation_id"] is None
     assert snapshot["winners"] == []
     assert all(phase["trial_data_available"] is False for phase in snapshot["status"]["phases"])
 
@@ -534,7 +535,8 @@ def test_failed_fingerprint_preflight_preserves_current_generation_and_results(
 
     assert len(callback_generations) == 1
     assert len(captured) == 1
-    assert captured[0]["status"]["generation_id"] == callback_generations[0]  # type: ignore[index]
+    assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
+    assert captured[0]["status"]["published_generation_id"] == callback_generations[0]  # type: ignore[index]
     assert captured[0]["status"]["summary_present"] is False  # type: ignore[index]
     assert all(
         phase["generation_trials"] == {}

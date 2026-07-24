@@ -116,8 +116,15 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         assert winners["metric"]["objective_evidence"] == {
             "kind": "json_envelope",
             "attempt_bound": True,
-            "checkpoint_bound": True,
+            "objective_name_bound": True,
+            "split_bound": True,
             "evaluation_policy_bound": True,
+            # _chained_config's json_envelope extractor declares neither
+            # checkpoint nor expected_step, so neither is value-bound.
+            "checkpoint_declared": False,
+            "checkpoint_value_bound": False,
+            "expected_step_declared": False,
+            "expected_step_value_bound": False,
         }
         assert winners["all_phases_have_winners"] is True
         assert winners["missing_phases"] == []

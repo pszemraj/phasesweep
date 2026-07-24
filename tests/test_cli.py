@@ -7,6 +7,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
@@ -325,3 +326,9 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "status_test" in result.output
     assert "COMPLETE: 1" in result.output
+
+    # The published generation now backs the phase's winner; current and
+    # published identity must both be shown explicitly, never one unlabeled id.
+    status_obj = yaml.safe_load(result.output)
+    assert status_obj["current_generation_id"] is not None
+    assert status_obj["published_generation_id"] == status_obj["current_generation_id"]

@@ -144,6 +144,12 @@ def status_payload(
     by the server - durations only, never timestamps of operator activity or
     anything path-shaped.
 
+    ``current_generation_id`` and ``published_generation_id`` are always
+    surfaced explicitly and may differ (e.g. a failed rerun after an earlier
+    successful publication): ``attempts_launched_this_run``/
+    ``terminal_trials_this_run`` describe ``current_generation_id`` while
+    ``winner_present``/``summary_present`` describe ``published_generation_id``.
+
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
     :param dict[str, Any] | None run: Optional path-free detached-run state.
@@ -187,6 +193,8 @@ def status_payload(
     return {
         "experiment_id": experiment_id,
         "result_source": result_source,
+        "current_generation_id": status["current_generation_id"],
+        "published_generation_id": status["published_generation_id"],
         "metric": status["metric"],
         "phases": phases,
         "summary_present": status["summary_present"],

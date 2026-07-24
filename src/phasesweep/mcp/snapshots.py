@@ -29,12 +29,21 @@ class _SnapshotModel(BaseModel):
 
 
 class ObjectiveEvidenceSnapshot(_SnapshotModel):
-    """Assurance properties of the configured objective extractor."""
+    """Assurance properties of the configured objective extractor.
+
+    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
+    exactly what each flag means and which runtime checks back it.
+    """
 
     kind: Literal["json_envelope", "log_regex", "wandb"]
     attempt_bound: bool
-    checkpoint_bound: bool
+    objective_name_bound: bool
+    split_bound: bool
     evaluation_policy_bound: bool
+    checkpoint_declared: bool
+    checkpoint_value_bound: bool
+    expected_step_declared: bool
+    expected_step_value_bound: bool
 
 
 class MetricSnapshot(_SnapshotModel):
@@ -68,9 +77,17 @@ class PhaseStatusSnapshot(_SnapshotModel):
 
 
 class StatusSnapshot(_SnapshotModel):
-    """Path-free terminal status view captured by the detached runner."""
+    """Path-free terminal status view captured by the detached runner.
 
-    generation_id: str | None = None
+    ``current_generation_id`` and ``published_generation_id`` are explicit and
+    may differ (e.g. a failed rerun after an earlier successful publication):
+    per-phase ``generation_trials`` are scoped to ``current_generation_id``
+    while ``winner_present``/``summary_present`` are scoped to
+    ``published_generation_id``. See :func:`phasesweep.engine.read.read_status`.
+    """
+
+    current_generation_id: str | None = None
+    published_generation_id: str | None = None
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
@@ -191,7 +208,8 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
     zero_counts = {state: 0 for state in ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")}
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
-            generation_id=None,
+            current_generation_id=None,
+            published_generation_id=None,
             metric=MetricSnapshot(
                 name=experiment.metric.name,
                 goal=experiment.metric.goal,
@@ -273,10 +291,11 @@ def capture_result_snapshot(
                         }
                     )
         phase_status["running_attempts"] = running_attempts
-    winners = read_winners(experiment, generation_id=status["generation_id"])
+    winners = read_winners(experiment, generation_id=status["current_generation_id"])
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
-            generation_id=status["generation_id"],
+            current_generation_id=status["current_generation_id"],
+            published_generation_id=status["published_generation_id"],
             metric=status["metric"],
             phases=status["phases"],
             summary_present=status["summary_present"],
@@ -327,7 +346,7 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
         phase.running = phase.trials["RUNNING"]
-        generation_id = parsed.status.generation_id
+        generation_id = parsed.status.current_generation_id
         generation_recovered = [
             attempt
             for attempt in recovered

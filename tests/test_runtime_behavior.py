@@ -371,7 +371,11 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     published_winner = read_winner(second, "p")
     status = read_status(second)
     assert published_winner is not None
-    assert status["generation_id"] != published_winner.generation_id
+    # The failed rerun (second) claimed a new current generation, but the
+    # winner published on disk still comes from the first, successful one -
+    # the two identities must be reported distinctly, never conflated.
+    assert status["current_generation_id"] != published_winner.generation_id
+    assert status["published_generation_id"] == published_winner.generation_id
     assert status["phases"][0]["winner_present"] is True
 
     trial_dirs = sorted(phase_dir.glob("trial_*"))

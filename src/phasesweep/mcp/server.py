@@ -124,6 +124,9 @@ DESCRIPTION_GET_STATUS = (
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
     "State counts are dense and explicitly split into cumulative, before-run, and this-run "
     "dimensions; remaining_trials is already computed. "
+    "current_generation_id and published_generation_id are reported explicitly and can differ "
+    "(e.g. after a failed rerun): this-run counts describe current_generation_id, while "
+    "winner_present and summary_present describe published_generation_id. "
     "trial_data_available=false means zero counts are not trustworthy. result_source names "
     "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
     "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
@@ -240,12 +243,21 @@ class _ToolPayload(BaseModel):
 
 
 class ObjectiveEvidencePayload(_ToolPayload):
-    """Assurance properties enforced by the configured objective extractor."""
+    """Assurance properties enforced by the configured objective extractor.
+
+    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
+    exactly what each flag means and which runtime checks back it.
+    """
 
     kind: Literal["json_envelope", "log_regex", "wandb"]
     attempt_bound: bool
-    checkpoint_bound: bool
+    objective_name_bound: bool
+    split_bound: bool
     evaluation_policy_bound: bool
+    checkpoint_declared: bool
+    checkpoint_value_bound: bool
+    expected_step_declared: bool
+    expected_step_value_bound: bool
 
 
 class MetricPayload(_ToolPayload):
@@ -410,6 +422,20 @@ class GetStatusResult(_ToolPayload):
 
     experiment_id: ExperimentId
     result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    current_generation_id: str | None = Field(
+        description=(
+            "Most recent generation id known to this experiment; may be failed or "
+            "in-progress. Null when no generation has ever started. attempts_launched_this_run "
+            "and terminal_trials_this_run describe this generation."
+        )
+    )
+    published_generation_id: str | None = Field(
+        description=(
+            "Last successfully published generation id. Null when nothing has published "
+            "yet. winner_present and summary_present describe this generation, which may "
+            "differ from current_generation_id (e.g. after a failed rerun)."
+        )
+    )
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
@@ -1029,12 +1055,12 @@ class PhaseSweepMCP:
             )
         )
         represented_generation_id = (
-            snapshot.status.generation_id
+            snapshot.status.current_generation_id
             if snapshot is not None
             else read_status(
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
-            )["generation_id"]
+            )["current_generation_id"]
         )
         result_source: ResultSource = (
             "frozen_run_snapshot" if snapshot is not None else "current_shared_study"

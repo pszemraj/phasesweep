@@ -122,20 +122,65 @@ Extractor = JsonExtractor | ObjectiveExtractor
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
-    """Describe which objective-evidence identities the extractor enforces.
+    """Describe which objective-evidence identities the extractor genuinely enforces.
+
+    Grounded in what ``phasesweep.evidence.evaluation._extract_json_envelope``
+    actually checks, not in the extractor's coarse type alone:
+
+    - ``objective_name``, ``split``, ``policy`` are required
+      :class:`JsonEnvelopeExtractor` fields (``min_length=1``) and are
+      unconditionally checked against the envelope's own reported
+      ``objective.name`` / ``objective.split`` / ``evaluation.policy``. They
+      are bound whenever the extractor kind is ``json_envelope`` at all.
+    - ``checkpoint`` and ``expected_step`` are *optional* extractor fields.
+      The envelope must always structurally report a non-empty checkpoint and
+      a non-negative step (or extraction fails), but that value is compared
+      against the configured value only when the config declares one
+      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``). Reporting
+      a coarse ``True`` regardless of whether either was declared overstates
+      what is actually enforced when they are left unset.
+    - ``log_regex`` and ``wandb`` extractors have no objective_name/split/
+      policy/checkpoint/expected_step concept at all, so every one of those
+      flags is ``False`` for them.
+    - ``attempt_bound`` is ``True`` for every extractor kind: each reads
+      evidence from a trial directory (or, for ``wandb``, a run id) that is
+      uniquely scoped to this generation+attempt, and ``json_envelope``
+      additionally cross-checks ``generation_id``/``attempt_id``/
+      ``overrides_sha256`` against the envelope's own reported values.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
     :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
-        and boolean flags for whether it binds evidence to the attempt (always
-        ``True``) and to a specific checkpoint/evaluation policy (``True`` only
-        for ``json_envelope`` extractors).
+        plus per-field boolean flags describing exactly what the runtime
+        enforces. ``checkpoint_declared``/``expected_step_declared`` report
+        whether the config pinned a value; ``checkpoint_value_bound``/
+        ``expected_step_value_bound`` report whether the runtime actually
+        validates the envelope against that declared value (``True`` only
+        when the corresponding ``*_declared`` flag is also ``True``).
     """
-    envelope = extractor.type == "json_envelope"
+    if isinstance(extractor, JsonEnvelopeExtractor):
+        checkpoint_declared = extractor.checkpoint is not None
+        expected_step_declared = extractor.expected_step is not None
+        return {
+            "kind": extractor.type,
+            "attempt_bound": True,
+            "objective_name_bound": True,
+            "split_bound": True,
+            "evaluation_policy_bound": True,
+            "checkpoint_declared": checkpoint_declared,
+            "checkpoint_value_bound": checkpoint_declared,
+            "expected_step_declared": expected_step_declared,
+            "expected_step_value_bound": expected_step_declared,
+        }
     return {
         "kind": extractor.type,
         "attempt_bound": True,
-        "checkpoint_bound": envelope,
-        "evaluation_policy_bound": envelope,
+        "objective_name_bound": False,
+        "split_bound": False,
+        "evaluation_policy_bound": False,
+        "checkpoint_declared": False,
+        "checkpoint_value_bound": False,
+        "expected_step_declared": False,
+        "expected_step_value_bound": False,
     }
 
 

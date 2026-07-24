@@ -16,7 +16,7 @@ import click
 import yaml
 
 from phasesweep.config import Experiment, Suite, load_config
-from phasesweep.engine import config_status, run_config
+from phasesweep.engine import config_status, read_status, run_config
 from phasesweep.engine.guards import (
     _experiment_lock,
     _inspect_cleanup_uncertain_trials,
@@ -280,6 +280,33 @@ def _show_experiment_winners(experiment: Experiment) -> None:
             _render_phase_comment(p.comment, prefix="# ")
 
 
+def _with_generation_identity(payload: dict, experiment: Experiment) -> dict:
+    """Insert explicit current/published generation identity into a status payload.
+
+    ``config_status`` (engine.run) reports cumulative, all-time trial counts
+    and the published winner path but never names which generation is
+    "current" (most recent; may be failed or in-progress) versus "published"
+    (the validated last-success pointer backing the winner files) - the same
+    ambiguity :func:`phasesweep.engine.read.read_status` fixes for MCP
+    callers. This mirrors that identity split onto the CLI's status view
+    without duplicating engine.run's trial-count logic: after a failed
+    rerun, the two ids differ and both are shown explicitly.
+
+    :param dict payload: Status payload produced by :func:`config_status` for an experiment.
+    :param Experiment experiment: Same experiment config the payload describes.
+    :return dict: Payload with ``current_generation_id``/``published_generation_id``
+        inserted before ``phases``.
+    """
+    identity = read_status(experiment)
+    enriched = dict(payload)
+    phases = enriched.pop("phases", None)
+    enriched["current_generation_id"] = identity["current_generation_id"]
+    enriched["published_generation_id"] = identity["published_generation_id"]
+    if phases is not None:
+        enriched["phases"] = phases
+    return enriched
+
+
 @main.command(
     context_settings=CONTEXT_SETTINGS,
     help="Print read-only trial counts and phase state for a phasesweep experiment or suite.",
@@ -289,7 +316,10 @@ def _show_experiment_winners(experiment: Experiment) -> None:
 def status(config_path: Path) -> None:
     """Print read-only run status for ``config_path``."""
     config = load_config(config_path)
-    click.echo(_format_status(config_status(config)))
+    payload = config_status(config)
+    if isinstance(config, Experiment):
+        payload = _with_generation_identity(payload, config)
+    click.echo(_format_status(payload))
 
 
 @main.group(
