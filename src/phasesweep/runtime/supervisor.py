@@ -24,6 +24,9 @@ import json
 import os
 import sys
 
+# Single source of truth for the wire frame's header width:
+# phasesweep.runtime.process._encode_launch_payload reads this constant
+# directly (the parent already imports this module).
 _HEADER_LEN = 10
 
 
@@ -52,6 +55,10 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str]] | None:
     The wire format is ``_HEADER_LEN`` ASCII decimal bytes giving the byte
     length of a UTF-8 JSON body, immediately followed by that many body
     bytes. The body must decode to ``{"cmd": <str>, "env": {<str>: <str>}}``.
+
+    Encoded on the other end by ``phasesweep.runtime.process._encode_launch_payload``
+    (prose reference only — this module is stdlib-only and must never import
+    phasesweep); keep both sides in sync if the wire format changes.
 
     :param int ack_fd: Read end of the acknowledgement pipe.
     :return tuple[str, dict[str, str]] | None: ``(cmd, env)`` on a well-formed
@@ -106,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
     ack_fd = int(args[1])
 
     try:
+        # Checked by phasesweep.runtime.process._spawn_blocked_supervisor's
+        # `os.read(ready_read, 1) != b"R"` readiness gate.
         os.write(ready_fd, b"R")
     finally:
         os.close(ready_fd)

@@ -91,7 +91,11 @@ _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
 # shutdown handler cannot snapshot _active_children while a child has been
 # spawned but not yet registered (review v0.5.7 / blocker 3). The handler
 # acquires the same lock before snapshotting, which forces it to wait until
-# every in-flight launch has either registered its PGID or failed.
+# every in-flight launch has either registered its PGID or failed. Cost: if
+# _spawn_blocked_supervisor's except-block runs _kill_group while this lock is
+# still held (run_supervised's caller holds it across the whole spawn), that
+# one failing launch can delay the shutdown handler's snapshot — and thus
+# global shutdown response — by up to ~17s worst case (see _kill_group).
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
@@ -562,6 +566,15 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     block (see :func:`_shutdown_handler`); this function only runs on normal
     (non-signal-handler) cleanup paths.
 
+    Worst case this blocks for roughly ``_KILL_GRACE_SECONDS`` (10s) SIGTERM
+    grace + ~2s SIGKILL confirm inside :func:`_terminate_process_group`, plus
+    ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS`` (5s) for the direct-child reap
+    above — up to ~17s total. One caller, ``_spawn_blocked_supervisor``'s
+    except-block, invokes this while ``run_supervised`` still holds
+    ``_launch_lock`` with shutdown signals deferred, so that path can delay
+    the global shutdown handler by the same amount (see the ``_launch_lock``
+    comment block).
+
     Args:
         pgid: Process-group ID of the trial subprocess.
         proc: The root subprocess's :class:`subprocess.Popen` handle. Reaped
@@ -589,6 +602,34 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
         cleanup_confirmed = False
     except ChildProcessError:
         pass  # Already reaped elsewhere (e.g. a concurrent wait()).
+    return cleanup_confirmed
+
+
+def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
+    """Kill and unregister a subprocess whose launch failed before hand-off.
+
+    Shared by both launch-failure paths — the readiness-wait failure in
+    :func:`_spawn_blocked_supervisor` and the identity/payload-delivery
+    failure in :func:`run_supervised` — which otherwise ran this identical
+    three-step sequence independently. Resolves the target process group
+    (the registered ``pgid``, or the bare PID when registration never
+    happened), kills it, and unregisters it from the global registry if it
+    was registered.
+
+    Args:
+        proc: The subprocess whose launch is being aborted.
+        pgid: The process-group ID it was registered under, or ``None`` if
+            registration never completed.
+
+    Returns:
+        Whatever :func:`_kill_group` returns for the resolved target group —
+        ``True`` only if the group is confirmed terminated.
+
+    """
+    target_pgid = pgid if pgid is not None else proc.pid
+    cleanup_confirmed = _kill_group(target_pgid, proc)
+    if pgid is not None:
+        _unregister(pgid)
     return cleanup_confirmed
 
 
@@ -708,13 +749,20 @@ def _sanitized_supervisor_env() -> dict[str, str]:
 def _encode_launch_payload(cmd: str, env: dict[str, str]) -> bytes:
     """Frame the trainer command and environment for the supervisor's ack pipe.
 
+    Decoded on the other end by
+    :func:`phasesweep.runtime.supervisor._read_launch_payload` (via
+    ``_read_exact``); keep both sides in sync if the wire format changes.
+
     :param str cmd: Shell command string the supervisor execs with ``/bin/sh``.
     :param dict[str, str] env: Full trainer process environment.
-    :return bytes: A 10-ASCII-digit decimal length header (byte length of the
-        UTF-8 JSON body) immediately followed by that many body bytes.
+    :return bytes: An ASCII decimal length header (byte length of the UTF-8
+        JSON body) immediately followed by that many body bytes.
     """
     body = json.dumps({"cmd": cmd, "env": env}).encode("utf-8")
-    return f"{len(body):010d}".encode("ascii") + body
+    # supervisor.py's _HEADER_LEN is the single source of truth for the frame
+    # header width; derive the format width from it rather than hardcoding
+    # the digit count here.
+    return f"{len(body):0{_supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -796,6 +844,7 @@ def _spawn_blocked_supervisor(
             [],
             _SUPERVISOR_READY_TIMEOUT_SECONDS,
         )
+        # Written by phasesweep.runtime.supervisor.main's os.write(ready_fd, b"R").
         if not readable or os.read(ready_read, 1) != b"R":
             raise RuntimeError("trial supervisor did not become ready before launch")
         os.close(ready_read)
@@ -806,10 +855,7 @@ def _spawn_blocked_supervisor(
             os.close(ack_write)
             ack_write = -1
         if proc is not None:
-            target_pgid = pgid if pgid is not None else proc.pid
-            _kill_group(target_pgid, proc)
-        if pgid is not None:
-            _unregister(pgid)
+            _abort_launch(proc, pgid)
         raise
     finally:
         for fd in (ready_read, ready_write, ack_read):
@@ -923,9 +969,7 @@ def run_supervised(
             proc.pid,
             target_pgid,
         )
-        cleanup_confirmed = _kill_group(target_pgid, proc)
-        if pgid is not None:
-            _unregister(pgid)
+        cleanup_confirmed = _abort_launch(proc, pgid)
         duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
