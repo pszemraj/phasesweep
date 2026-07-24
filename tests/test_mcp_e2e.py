@@ -79,6 +79,17 @@ phases:
 
 
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
+    """Exercise the real list -> validate -> launch -> poll -> winners pipeline.
+
+    Exact payload shapes are pinned by cheaper unit tests, not here: the
+    ``metric.objective_evidence`` dict shape by
+    tests/test_engine_read.py::test_objective_evidence_assurance_json_envelope_without_declared_checkpoint,
+    and the ``all_phases_have_winners``/``missing_phases``/``winner_generation``
+    computation by
+    tests/test_mcp_redaction.py::test_winners_payload_computes_phase_completeness_and_provenance.
+    This test only asserts structural wiring: winners are non-empty, phases are
+    complete and in order, expected keys are present, and redaction is applied.
+    """
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"e2e_lm": _chained_config(tmp_path)},
@@ -113,25 +124,12 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
         winners = app.winners(run_id=run_id)
         assert winners["result_source"] == "frozen_run_snapshot"
-        assert winners["metric"]["objective_evidence"] == {
-            "kind": "json_envelope",
-            "attempt_bound": True,
-            "objective_name_bound": True,
-            "split_bound": True,
-            "evaluation_policy_bound": True,
-            # _chained_config's json_envelope extractor declares neither
-            # checkpoint nor expected_step, so neither is value-bound.
-            "checkpoint_declared": False,
-            "checkpoint_value_bound": False,
-            "expected_step_declared": False,
-            "expected_step_value_bound": False,
-        }
-        assert winners["all_phases_have_winners"] is True
-        assert winners["missing_phases"] == []
+        assert "objective_evidence" in winners["metric"]
         phases = winners["phases"]
+        assert phases  # winners were actually produced
         assert [p["phase"] for p in phases] == ["depth", "lr"]
         for p in phases:
-            assert p["winner_generation"] == "current_generation"
+            assert "winner_generation" in p
             assert isinstance(p["metric"], float)
             assert p["metric"] == p["metric"]  # not NaN
             assert "params" in p

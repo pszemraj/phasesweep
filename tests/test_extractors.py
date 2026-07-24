@@ -339,13 +339,16 @@ def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
-@pytest.mark.parametrize("timeout_seconds", [0.0, 0.05, 0.999])
-def test_wandb_timeouts_require_whole_second_transport_budget(model, timeout_seconds):
+def test_wandb_timeouts_require_whole_second_transport_budget(model):
+    """Both wandb extractor models share one pydantic ``ge=1.0`` constraint on
+    ``timeout_seconds``; any sub-1.0 value hits the same validation branch, so a
+    single boundary-adjacent value (0.999) pins it without repeating instances.
+    """
     common = {
         "type": "wandb" if model is WandbExtractor else "wandb_summary_required",
         "entity": "me",
         "project": "proj",
-        "timeout_seconds": timeout_seconds,
+        "timeout_seconds": 0.999,
     }
     if model is WandbExtractor:
         common["metric_key"] = "eval/loss"
@@ -385,8 +388,12 @@ def test_wandb_request_timeout_shrinks_with_poll_budget(
     assert timeouts == [10, 3]
 
 
-@pytest.mark.parametrize("state", ["failed", "crashed", "killed"])
-def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path, state):
+def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path):
+    """WandbExtractor rejects any terminal state via one
+    ``run.state in {"crashed", "failed", "killed"}`` set-membership check; one
+    representative value (``"failed"``) pins that single branch.
+    """
+    state = "failed"
     fake_wandb(lambda _path: _FakeRun(state=state, summary={"eval/loss": 99.0}))
     cfg = WandbExtractor(
         type="wandb",
