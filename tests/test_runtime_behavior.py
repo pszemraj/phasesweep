@@ -251,8 +251,8 @@ def _sleeping_score_experiment(
 
 def test_parallel_trials_e2e(tmp_path):
     """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
-    - JournalFileStorage via explicit journal:/// URL (B3, v0.5.2 / blocker 6)
-    - constant_liar on TPE (B4)
+    - JournalFileStorage via explicit journal:/// URL (review v0.5.2 / blocker 6)
+    - constant_liar on TPE
     - concurrent subprocess execution
     - no database-locked errors
     """

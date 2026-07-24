@@ -102,7 +102,7 @@ Numeric tokens keep numeric lock names; opaque UUID/MIG tokens use sanitized, ha
 > [!WARNING]
 > Multi-host writers against one shared study are unsupported. The stale-trial reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
 >
-> This is now enforced at config validation, not just documented: an `Experiment.storage` URL that resolves to any backend other than SQLite or Journal (an RDB URL such as `postgresql://...` or `mysql://...`) is rejected unless `allow_unsafe_multihost: true` is also set. Set that acknowledgement only when every process that will ever touch the configured `storage` and `workdir` runs on a single host — e.g. using an RDB backend for durable storage or dashboard access from one phasesweep orchestrator, not for actual multi-host coordination.
+> An `Experiment.storage` URL that resolves to any backend other than SQLite or Journal (an RDB URL such as `postgresql://...` or `mysql://...`) is rejected unless `allow_unsafe_multihost: true` is also set. Set that acknowledgement only when every process that will ever touch the configured `storage` and `workdir` runs on a single host — e.g. using an RDB backend for durable storage or dashboard access from one phasesweep orchestrator, not for actual multi-host coordination.
 
 ## Fingerprints and resume
 

@@ -231,8 +231,8 @@ def extract_trial_result(
       * non-zero return code from the subprocess
       * metric extractor raised ExtractorError
       * metric extractor returned a non-finite value
-      * any constraint extractor raised ExtractorError (review item #2)
-      * any constraint extractor returned a non-finite value (review item #3)
+      * any constraint extractor raised ExtractorError (review v0.5.2 / item 2)
+      * any constraint extractor returned a non-finite value (review v0.5.2 / item 3)
 
     A trial that produced a finite metric and finite constraint values but violated
     a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation

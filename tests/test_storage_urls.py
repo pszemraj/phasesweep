@@ -141,7 +141,7 @@ def test_validate_storage_multihost_policy(
     raises: bool,
 ) -> None:
     """A storage backend other than sqlite/journal requires an explicit
-    allow_unsafe_multihost: true acknowledgement (review item D); sqlite and
+    allow_unsafe_multihost: true acknowledgement (review v0.5.14 / item D); sqlite and
     journal storage are unaffected regardless of the flag's value."""
     p = _storage_policy_config(
         tmp_path,

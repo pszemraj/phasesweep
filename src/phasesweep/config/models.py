@@ -466,11 +466,11 @@ class Experiment(_Frozen):
 
         Each phase is checked for:
           * local fixed/sampled key collision (review v0.5.2 / blocker 5)
-          * transitive inherited locked-key collisions (v0.5 review item #4)
-          * unresolved multi-parent locked-key collisions (v0.5 review item #5)
-          * sampler / search-space compatibility (v0.5.2 / blocker 2)
-          * grid divisibility for float params (v0.5.2 / blocker 4)
-          * SQLite + parallel n_jobs (v0.5.2 / blocker 6)
+          * transitive inherited locked-key collisions (review v0.5.2 / item 4)
+          * unresolved multi-parent locked-key collisions (review v0.5.2 / item 5)
+          * sampler / search-space compatibility (review v0.5.2 / blocker 2)
+          * grid divisibility for float params (review v0.5.2 / blocker 4)
+          * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
 
         Returns:
             Self, unchanged. Pydantic post-init validator protocol; raises
@@ -500,7 +500,7 @@ class Experiment(_Frozen):
                     f"{phase.promotion.min_delta_vs!r}, which is not a prior phase."
                 )
 
-            # Local same-phase collision (blocker 5): sampling a key that the
+            # Local same-phase collision (review v0.5.2 / blocker 5): sampling a key that the
             # same phase also lists as fixed silently lets sampled win — that's
             # not "fixed" in any meaningful sense.
             local_collisions = set(phase.fixed_overrides) & set(phase.search_space)
@@ -585,13 +585,13 @@ class Experiment(_Frozen):
                     "inheritance chain."
                 )
 
-            # Sampler/search-space compatibility (blocker 2): catch at config-load
+            # Sampler/search-space compatibility (review v0.5.2 / blocker 2): catch at config-load
             # so `phasesweep validate` is meaningful, not at first trial launch.
             _validate_sampler_search_space(phase)
 
-            # Storage policy (blocker 6): SQLite + parallel writes deadlocks under
+            # Storage policy (review v0.5.2 / blocker 6): SQLite + parallel writes deadlocks under
             # contention; we no longer auto-remap to JournalStorage. Tell the user.
-            # Also enforces the single-host coordination boundary (review item D):
+            # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
             # shared RDB storage across hosts silently breaks lock/generation-pointer
             # safety unless explicitly acknowledged.
             _validate_storage_policy(self.storage, phase, self.allow_unsafe_multihost)
@@ -629,7 +629,7 @@ def _validate_storage_policy(
        but that fragmented study identity behind a single URL — the same config
        could point at two different studies depending on ``n_jobs``. Now we
        require the user to pick the scheme explicitly.
-    2. Unacknowledged multi-host-capable storage (review item D): PhaseSweep's
+    2. Unacknowledged multi-host-capable storage (review v0.5.14 / item D): PhaseSweep's
        coordination (locks, generation pointers) is host-local-filesystem based.
        Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
        silently breaks those safety guarantees, so any backend other than

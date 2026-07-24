@@ -89,7 +89,7 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         if not isinstance(attempt_id, str) or not attempt_id:
             continue
         # Re-verify constraints from user_attrs in case rules changed or stored
-        # values are non-finite (defense in depth — review item #3).
+        # values are non-finite (defense in depth — review v0.5.2 / item 3).
         ok = True
         for name, c in constraints_by_name.items():
             v = t.user_attrs.get(constraint_attr(name))

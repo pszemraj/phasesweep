@@ -1,9 +1,10 @@
 """Read-only views of experiment results for status and winner reporting.
 
 This module is the single public surface for *reading* run state without
-launching anything or reaching into engine-private path helpers. The CLI may
-adopt it later; the MCP layer consumes it now, so winner and status shapes
-have exactly one definition.
+launching anything or reaching into engine-private path helpers. The MCP
+layer is the primary consumer; the CLI consumes a narrow slice of it (see
+``_with_generation_identity`` in ``cli.py``) for its generation-identity
+split, so winner and status shapes have exactly one definition.
 
 Reads here are intentionally permissive. They report whatever is on disk -
 including partial runs - and never raise on a missing winner. They do NOT
