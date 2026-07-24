@@ -582,6 +582,24 @@ def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_pa
     assert not (project / ".cursor" / "mcp.json").exists()
 
     capsys.readouterr()
+    assert (
+        installer.run(
+            "uninstall",
+            project,
+            None,
+            ["cursor", "codex"],
+            "instructions",
+            yes=True,
+            dry_run=True,
+        )
+        == 0
+    )
+    preview = capsys.readouterr().out
+    assert preview.count("would-update") == 1
+    assert preview.count("would-remove") == 1
+    assert "retained for: codex" in preview
+    assert instructions.read_text() == installed
+
     assert installer.run("uninstall", project, None, ["cursor"], "instructions", yes=True) == 0
     assert "retained for: codex" in capsys.readouterr().out
     assert instructions.read_text() == installed.replace(

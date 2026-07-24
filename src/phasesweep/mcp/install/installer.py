@@ -458,6 +458,7 @@ def _apply_instructions(
     mode: Mode,
     project: Path,
     dry_run: bool,
+    dry_run_state: dict[Path, str] | None = None,
 ) -> StepResult:
     """Apply or remove the instructions marker block for one target.
 
@@ -465,6 +466,8 @@ def _apply_instructions(
     :param Mode mode: ``install`` or ``uninstall``.
     :param Path project: Project root used to contain project-scoped writes.
     :param bool dry_run: Compute the edit verdict without changing the instructions file.
+    :param dict[Path, str] | None dry_run_state: Planned text from earlier dry-run
+        steps, keyed by resolved instructions path.
     :return StepResult: Edit verdict for the instructions file.
     """
     path = target.instructions_path
@@ -511,8 +514,13 @@ def _apply_instructions(
                 "error",
                 note="instructions path is not a readable regular UTF-8 file",
             )
+        staged_text = (
+            dry_run_state.get(edit_path) if dry_run and dry_run_state is not None else None
+        )
+        existing_text = staged_text if staged_text is not None else loaded.text
+        existed = loaded.existed or staged_text is not None
         try:
-            block = _read_instruction_block(loaded.text, valid_owner_ids)
+            block = _read_instruction_block(existing_text, valid_owner_ids)
         except ValueError as exc:
             return StepResult(
                 "instructions",
@@ -534,12 +542,14 @@ def _apply_instructions(
             owners.remove(target.id)
             if owners:
                 candidate = updated_marked_text(
-                    loaded.text,
+                    existing_text,
                     _owned_instruction_content(owners, installed_prompt),
                     start=MARKDOWN_START,
                     end=MARKDOWN_END,
                 )
                 if dry_run:
+                    if dry_run_state is not None:
+                        dry_run_state[edit_path] = candidate
                     action: Action = "updated"
                 else:
                     write_result = _atomic_write_text(edit_path, candidate, expected=loaded)
@@ -551,12 +561,14 @@ def _apply_instructions(
                 )
                 return StepResult("instructions", path, action, note=retained_note)
             removal_candidate = removed_marked_text(
-                loaded.text,
+                existing_text,
                 start=MARKDOWN_START,
                 end=MARKDOWN_END,
             )
             assert removal_candidate is not None
             if dry_run:
+                if dry_run_state is not None:
+                    dry_run_state[edit_path] = removal_candidate
                 return StepResult("instructions", path, "removed")
             write_result = _atomic_write_text(edit_path, removal_candidate, expected=loaded)
             action = "removed" if write_result == "written" else "error"
@@ -565,18 +577,20 @@ def _apply_instructions(
 
         owners.add(target.id)
         candidate = updated_marked_text(
-            loaded.text,
+            existing_text,
             _owned_instruction_content(owners, agent_prompt_text()),
             start=MARKDOWN_START,
             end=MARKDOWN_END,
         )
-        if candidate == loaded.text:
+        if candidate == existing_text:
             return StepResult("instructions", path, "unchanged")
         if dry_run:
+            if dry_run_state is not None:
+                dry_run_state[edit_path] = candidate
             return StepResult(
                 "instructions",
                 path,
-                "updated" if loaded.existed else "created",
+                "updated" if existed else "created",
             )
         write_result = _atomic_write_text(edit_path, candidate, expected=loaded)
         action = (
@@ -766,13 +780,20 @@ def run(
             click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
             return 1
     attention = 0
+    instruction_dry_run_state: dict[Path, str] | None = {} if dry_run else None
     for target in targets:
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
                 result = _apply_mcp(target, mode, command, catalog, project, dry_run)
             else:
-                result = _apply_instructions(target, mode, project, dry_run)
+                result = _apply_instructions(
+                    target,
+                    mode,
+                    project,
+                    dry_run,
+                    dry_run_state=instruction_dry_run_state,
+                )
             if result.action is None:
                 click.echo(f"    {result.integration:<13} not supported")
                 continue
