@@ -588,6 +588,13 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     Terminal runs use the runner-stamped ``ended_at`` in status.json. A
     terminal run with no readable endpoint reports ``None`` rather than a guess.
 
+    ``RunStore`` refuses to load a handle whose ``started_at`` does not parse,
+    so the start endpoint is established for every handle that reaches here.
+    It is still re-checked rather than asserted: an assertion would be
+    compiled out under ``python -O`` and the unparsed ``None`` would surface
+    as a ``TypeError`` from the subtraction below instead of the documented
+    "endpoints unknown" answer.
+
     :param RunStore store: Run store used to read the terminal status.
     :param RunHandle handle: Persisted run whose duration is measured.
     :param str state: Derived run state for ``handle``.
@@ -595,7 +602,8 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
         endpoints cannot be established.
     """
     started = parse_utc_iso(handle.started_at)
-    assert started is not None
+    if started is None:
+        return None
     ended: datetime | None
     if state == "running":
         ended = datetime.now(UTC)

@@ -1361,3 +1361,45 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
     finally:
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
+
+
+def test_install_signal_handlers_inside_open_scope_survives_that_scope_exit() -> None:
+    """An ``install_signal_handlers()`` call inside an open scope must outlive the scope.
+
+    ``install_signal_handlers()`` recognizes an already-installed handler set
+    as its own idempotent path, so calling it while a
+    ``signal_handler_scope()`` is open took process-lifetime ownership on the
+    strength of the *scope's* installation. The scope then restored the host's
+    handlers on exit while ownership stayed claimed, so every later scope
+    no-opped with nothing installed and child process groups leaked on
+    shutdown. The scope now hands its installation over instead of restoring.
+    """
+
+    def host_handler(_signum: int, _frame: object) -> None:
+        raise AssertionError("host handler should never fire during this test")
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_process._SHUTDOWN_SIGNALS))
+
+        with signal_handler_scope():
+            install_signal_handlers()
+
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+        assert not set(runtime_process._SHUTDOWN_SIGNALS) & signal.pthread_sigmask(
+            signal.SIG_BLOCK, set()
+        )
+
+        # The ownership claim is now truthful, so a later no-op scope is safe.
+        with signal_handler_scope():
+            pass
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is runtime_process._shutdown_handler
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)

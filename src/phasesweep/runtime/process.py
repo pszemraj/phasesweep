@@ -35,11 +35,11 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import IO
+from typing import IO, Any
 
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
@@ -305,6 +305,15 @@ def install_signal_handlers() -> None:
     :func:`signal_handler_scope` call, on any thread, becomes a no-op for the
     rest of the process (review v0.5.15 / blocker 2B). Ownership is NOT taken
     when installation fails because this was called off the main thread.
+
+    Calling this while a :func:`signal_handler_scope` is open is a valid
+    handover, not a conflict: the scope's exit sees the ownership claim and
+    leaves the handlers and mask in place instead of restoring the host's.
+    Without that handover the idempotent path above would take ownership on
+    the strength of the *scope's* installation, the scope would then tear
+    that installation down on exit, and every later scope would no-op with
+    no handler installed at all — silently disabling child-group cleanup for
+    the rest of the process.
     """
     global _process_lifetime_owner  # noqa: PLW0603
     _unblock_shutdown_signals()
@@ -322,6 +331,53 @@ def install_signal_handlers() -> None:
     _process_lifetime_owner = True
 
 
+def _restore_host_signal_state(
+    prior_handlers: dict[int, Any],
+    prior_mask: Collection[int] | None,
+) -> Exception | None:
+    """Give the embedding process its shutdown handlers and signal mask back.
+
+    Ordering matters (review v0.5.15 / blocker 2A): block first, THEN restore
+    handlers, THEN restore the mask. Restoring the mask before the handlers
+    would deliver a pending shutdown signal while ``_shutdown_handler`` is
+    still installed for it, raising :class:`PhaseSweepShutdown` out of this
+    cleanup path and leaving the remaining handlers unrestored.
+
+    Restoration continues past an individual ``signal.signal`` failure rather
+    than aborting the loop, so one bad signal cannot strand the others.
+
+    :param dict[int, Any] prior_handlers: Handlers captured before the scope
+        installed its own, keyed by signal number. A ``None`` value means the
+        signal had a C-level default that Python cannot reinstall.
+    :param Collection[int] | None prior_mask: Thread signal mask captured
+        before the scope unblocked shutdown signals, or ``None`` on platforms
+        without ``signal.pthread_sigmask``.
+    :return Exception | None: The first restoration failure, or ``None`` when
+        every handler was restored.
+    """
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    restoration_error: Exception | None = None
+    for sig, handler in prior_handlers.items():
+        if handler is None:
+            log.warning(
+                "Signal %d had no Python-level handler before this scope "
+                "(a C-level default phasesweep cannot reinstall); leaving "
+                "phasesweep's shutdown handler installed for it.",
+                sig,
+            )
+            continue
+        try:
+            signal.signal(sig, handler)
+        except Exception as exc:  # noqa: BLE001 - continue past one bad restore
+            log.exception("Failed to restore the prior handler for signal %d after scope exit", sig)
+            if restoration_error is None:
+                restoration_error = exc
+    if prior_mask is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    return restoration_error
+
+
 @contextlib.contextmanager
 def signal_handler_scope() -> Iterator[None]:
     """Own shutdown signals for the duration of one outermost run, then restore the host.
@@ -336,6 +392,9 @@ def signal_handler_scope() -> Iterator[None]:
       1. A process-lifetime :func:`install_signal_handlers` call (CLI/MCP
          entry points) owns the shutdown signals for the rest of the
          process; every scope call afterward, on any thread, is a no-op.
+         An open scope that sees that call happen inside its body hands its
+         installation over and skips restoration on exit, so the ownership
+         the entry point just claimed is the ownership that survives.
       2. Absent that, the MAIN THREAD may take temporary ownership for one
          call tree: the outermost call installs and restores; lexically
          nested calls on that same thread share the ownership and touch
@@ -345,17 +404,12 @@ def signal_handler_scope() -> Iterator[None]:
          silently running unprotected, because ``signal.signal`` only works
          on the main thread.
 
-    Restoration on exit (the outermost main-thread call only) happens in a
-    fixed order — re-block, then restore handlers, then restore the mask
-    (review v0.5.15 / blocker 2A) — so a shutdown signal pending at exit
-    cannot fire against a handler that is mid-restoration: pre-fix, restoring
-    the mask before the handlers let a pending signal invoke
-    ``_shutdown_handler`` while it was still installed, raising
-    ``PhaseSweepShutdown`` out of this cleanup path and leaving some host
-    handlers unrestored. Restoration continues past an individual
-    ``signal.signal`` failure instead of aborting the loop, and the first
-    such error is raised only when the scope body itself did not already
-    raise (see the ``finally`` block below).
+    Only the outermost main-thread call restores anything, and only when no
+    :func:`install_signal_handlers` call took process-lifetime ownership
+    while the body ran; it delegates to
+    :func:`_restore_host_signal_state` for the ordering that makes
+    restoration safe. The first restoration error is raised only when the
+    scope body itself did not already raise (see the ``finally`` block).
 
     Raises:
         SignalOwnershipUnavailableError: Called from a non-main thread while
@@ -395,7 +449,7 @@ def signal_handler_scope() -> Iterator[None]:
             _scope_depth -= 1
         return
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
+    prior_handlers: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
     prior_mask = None
     if hasattr(signal, "pthread_sigmask"):
         # An empty-set SIG_BLOCK call changes nothing; it is a pure read that
@@ -409,32 +463,9 @@ def signal_handler_scope() -> Iterator[None]:
         yield
     finally:
         _scope_depth = 0
-        # Ordering matters (review v0.5.15 / blocker 2A): block first, THEN
-        # restore handlers, THEN restore the mask. Restoring the mask before
-        # the handlers would deliver a pending shutdown signal while
-        # ``_shutdown_handler`` is still installed for it.
-        if hasattr(signal, "pthread_sigmask"):
-            signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
         restoration_error: Exception | None = None
-        for sig, handler in prior_handlers.items():
-            if handler is None:
-                log.warning(
-                    "Signal %d had no Python-level handler before this scope "
-                    "(a C-level default phasesweep cannot reinstall); leaving "
-                    "phasesweep's shutdown handler installed for it.",
-                    sig,
-                )
-                continue
-            try:
-                signal.signal(sig, handler)
-            except Exception as exc:  # noqa: BLE001 - continue past one bad restore
-                log.exception(
-                    "Failed to restore the prior handler for signal %d after scope exit", sig
-                )
-                if restoration_error is None:
-                    restoration_error = exc
-        if prior_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        if not _process_lifetime_owner:
+            restoration_error = _restore_host_signal_state(prior_handlers, prior_mask)
         if restoration_error is not None:
             if sys.exc_info()[1] is None:
                 raise restoration_error
