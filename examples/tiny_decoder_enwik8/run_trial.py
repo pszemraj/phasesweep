@@ -18,8 +18,6 @@ from typing import Any
 
 import yaml
 
-from phasesweep.runtime.files import atomic_write_text
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "upstream"
 
@@ -145,6 +143,13 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
             val_loss_sum += loss_unreduced.sum().item()
             val_tokens += targets.numel()
 
+    if val_tokens == 0:
+        raise ValueError(
+            f"{checkpoint_path} evaluated no validation tokens "
+            f"(val_batches={config.get('val_batches', 50)}); "
+            "the objective would not be computed from any data"
+        )
+
     return {
         "checkpoint": checkpoint_path.name,
         "device_type": device_type,
@@ -155,8 +160,23 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically publish one JSON artifact in its destination directory."""
-    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    """Atomically publish one JSON artifact in its destination directory.
+
+    Deliberately stdlib-only. The envelope is a contract about the *bytes* a
+    trainer writes, so any trainer in any language can satisfy it; importing a
+    phasesweep helper here would make this example a worse template than the
+    contract it demonstrates.
+    """
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_result(
