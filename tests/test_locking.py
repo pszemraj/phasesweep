@@ -353,6 +353,42 @@ def test_private_atomic_write_keeps_opened_parent_during_path_swap(
     assert outside_status.read_text() == "outside"
 
 
+def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown raised mid-walk must propagate, not become EBADF.
+
+    ``_shutdown_handler`` raises ``PhaseSweepShutdown`` from a Python signal
+    handler, so an exception can land on any bytecode boundary in the
+    component walk. The descriptor swap used to close the old fd before
+    storing the new one, leaving ``current_fd`` naming a closed descriptor;
+    the cleanup path then closed it again and the real shutdown surfaced as
+    ``OSError: [Errno 9] Bad file descriptor``.
+    """
+
+    class InjectedShutdown(BaseException):
+        """Stands in for the shutdown a signal handler raises at this point."""
+
+    target = tmp_path / "nested" / "dir"
+    target.mkdir(parents=True)
+    real_close = os.close
+    fired = False
+
+    def close_then_shutdown(fd: int) -> None:
+        nonlocal fired
+        real_close(fd)
+        if not fired:
+            fired = True
+            raise InjectedShutdown
+
+    monkeypatch.setattr(os, "close", close_then_shutdown)
+
+    with pytest.raises(InjectedShutdown):
+        runtime_files.open_directory_fd(target, create=False, private_final=False)
+    assert fired
+
+
 def test_run_lock_blocks_even_when_processes_target_different_phases(
     tmp_path: Path,
 ) -> None:

@@ -487,8 +487,17 @@ def open_directory_fd(
                 raise UnsafePrivatePathError(
                     f"Private path component {component_path} changed while it was opened."
                 )
-            os.close(current_fd)
+            # Hand ownership to ``next_fd`` BEFORE closing the old descriptor.
+            # ``_shutdown_handler`` raises ``PhaseSweepShutdown`` from a Python
+            # signal handler, so an exception can land on any bytecode boundary
+            # in this loop. Closing first left ``current_fd`` naming a closed
+            # descriptor until the very next store, and the ``finally`` below
+            # then closed it again -- turning a shutdown into ``OSError: [Errno
+            # 9] Bad file descriptor`` and masking the real cause. In this
+            # order every boundary leaves ``current_fd`` open and closed once.
+            previous_fd = current_fd
             current_fd = next_fd
+            os.close(previous_fd)
             if created and not umask_created_dirs:
                 os.fchmod(current_fd, PRIVATE_DIR_MODE)
                 _validate_private_dir_info(absolute, os.fstat(current_fd))
