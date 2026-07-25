@@ -37,7 +37,7 @@ from phasesweep.mcp.snapshots import (
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
-    _defer_shutdown_signals,
+    defer_shutdown_signals,
     install_signal_handlers,
     read_proc_starttime,
 )
@@ -235,7 +235,7 @@ def _write_status(
     # A catchable shutdown may arrive after the durable pending write. Defer it
     # until the complete/failed replacement is durable so cancellation cannot
     # strand an otherwise terminal run in the intermediate state.
-    with _defer_shutdown_signals():
+    with defer_shutdown_signals():
         terminal = {
             **payload,
             "ended_at": utc_now_iso(),

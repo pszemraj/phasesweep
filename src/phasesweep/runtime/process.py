@@ -145,7 +145,7 @@ class PhaseSweepShutdown(SystemExit):
 # whenever ANY thread's C-level handler tripped the pending flag, regardless of
 # the main thread's kernel mask. Library thread pools (e.g. BLAS workers pulled
 # in via numpy/optuna) keep shutdown signals unblocked, so a signal sent while
-# the main thread is inside a ``_defer_shutdown_signals()`` window can still
+# the main thread is inside a ``defer_shutdown_signals()`` window can still
 # execute ``_shutdown_handler`` in the main thread mid-critical-section, where
 # re-acquiring ``_launch_lock``/``_lock`` self-deadlocks. These state variables
 # extend the deferral to the Python level: while the main thread is inside a
@@ -181,7 +181,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     the launcher IS the main thread, blocking on the lock would self-deadlock:
     kernel masking cannot prevent that (a signal delivered to any unblocked
     library thread still runs this handler in the main thread), so if a
-    main-thread ``_defer_shutdown_signals()`` window is open the handler
+    main-thread ``defer_shutdown_signals()`` window is open the handler
     records the signal and returns; the window exit re-invokes it.
 
     A second signal delivered while this handler is already running returns
@@ -446,7 +446,7 @@ def signal_handler_scope() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _defer_shutdown_signals() -> Iterator[None]:
+def defer_shutdown_signals() -> Iterator[None]:
     """Defer shutdown handling while the calling thread is in a critical section.
 
     Used to keep the ``Popen() -> _register()`` window atomic from the
@@ -474,7 +474,7 @@ def _defer_shutdown_signals() -> Iterator[None]:
     (Windows); the Python-level deferral still applies.
 
     Yields:
-        ``None``. Use as ``with _defer_shutdown_signals(): ...``.
+        ``None``. Use as ``with defer_shutdown_signals(): ...``.
 
     """
     global _main_thread_defer_depth  # noqa: PLW0603
@@ -542,7 +542,7 @@ def _unregister(pgid: int) -> None:
             currently registered is silently ignored.
 
     """
-    with _defer_shutdown_signals(), _lock:
+    with defer_shutdown_signals(), _lock:
         _active_children.pop(pgid, None)
 
 
@@ -917,7 +917,7 @@ def run_supervised(
     # signal handler's perspective. Signal deferral MUST come first so that
     # SIGTERM/SIGINT cannot land between ``_launch_lock`` acquisition and
     # signal masking (review v0.5.9 / blocker 2). Reversing the order
-    # (``_launch_lock`` first, then ``_defer_shutdown_signals()``) creates
+    # (``_launch_lock`` first, then ``defer_shutdown_signals()``) creates
     # two deadlock windows:
     #
     # 1. Signal lands after lock acquired but before mask set: handler runs
@@ -934,7 +934,7 @@ def run_supervised(
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
 
     try:
-        with _defer_shutdown_signals(), _launch_lock:
+        with defer_shutdown_signals(), _launch_lock:
             proc, pgid, ack_write = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,

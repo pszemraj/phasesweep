@@ -34,11 +34,11 @@ from typing import IO, Literal, TypeAlias
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
     UnsafePrivatePathError,
-    _absolute_path,
-    _leaf_name,
-    _nofollow_flag,
-    _open_directory_fd,
+    absolute_path,
+    leaf_name,
     lock_dir,
+    nofollow_flag,
+    open_directory_fd,
     open_lock_file,
 )
 from phasesweep.runtime.json import strict_json_loads
@@ -147,7 +147,7 @@ def _edit_lock_path(path: Path) -> Path:
     :param Path path: User config path whose transactions must serialize.
     :return Path: Persistent lock file in the shared host-local lock directory.
     """
-    absolute = str(_absolute_path(path))
+    absolute = str(absolute_path(path))
     digest = hashlib.sha256(os.fsencode(absolute)).hexdigest()
     return lock_dir() / f"installer-{digest}.lock"
 
@@ -190,7 +190,7 @@ def _read_editable_text_at(parent_fd: int, leaf: str) -> _TextSnapshot | None:
     :return _TextSnapshot | None: Stable snapshot, missing-file description,
         or ``None`` when the leaf is unsafe or unreadable.
     """
-    flags = os.O_RDONLY | os.O_CLOEXEC | _nofollow_flag() | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | os.O_CLOEXEC | nofollow_flag() | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(leaf, flags, dir_fd=parent_fd)
     except FileNotFoundError:
@@ -243,7 +243,7 @@ def _new_temporary_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
     :return tuple[int, str]: Open descriptor and temporary filename.
     :raises FileExistsError: If ten random temporary names all collide.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
     for _ in range(10):
         temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
         try:
@@ -270,13 +270,13 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
     parent_fd = -1
     temporary: str | None = None
     try:
-        parent_fd = _open_directory_fd(
+        parent_fd = open_directory_fd(
             path.parent,
             create=True,
             private_final=False,
             umask_created_dirs=True,
         )
-        leaf = _leaf_name(path)
+        leaf = leaf_name(path)
         create_mode = expected.mode if expected.mode is not None else 0o666
         fd, temporary = _new_temporary_fd(parent_fd, leaf, create_mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:

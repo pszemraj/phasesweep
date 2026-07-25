@@ -113,7 +113,7 @@ def lock_dir() -> Path:
 def _lock_policy(path: Path) -> _LockPolicy:
     """Open, validate, and classify a lock directory as private or shared.
 
-    Walks ``path`` with :func:`_open_directory_fd` (no ``O_NOFOLLOW`` bypass,
+    Walks ``path`` with :func:`open_directory_fd` (no ``O_NOFOLLOW`` bypass,
     directory not created) and hands the resulting descriptor to
     :func:`_lock_policy_for_info` for the ownership/mode check; the
     descriptor is always closed before returning.
@@ -126,7 +126,7 @@ def _lock_policy(path: Path) -> _LockPolicy:
         check.
     """
     try:
-        fd = _open_directory_fd(path, create=False, private_final=False)
+        fd = open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
             f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}."
@@ -204,13 +204,13 @@ def open_lock_file(path: Path) -> IO[str]:
     if nofollow is None:
         raise UnsafeLockPathError("This platform cannot safely open lock files without symlinks.")
     try:
-        parent_fd = _open_directory_fd(path.parent, create=False, private_final=False)
+        parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
         raise UnsafeLockPathError(f"Lock directory {path.parent} is not safe to open.") from exc
     try:
         policy = _lock_policy_for_info(path.parent, os.fstat(parent_fd))
         try:
-            leaf = _leaf_name(path)
+            leaf = leaf_name(path)
         except UnsafePrivatePathError as exc:
             raise UnsafeLockPathError(f"Lock path {path} has no safe filename.") from exc
         flags = os.O_RDWR | os.O_CLOEXEC | nofollow
@@ -318,7 +318,7 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _nofollow_flag() -> int:
+def nofollow_flag() -> int:
     """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -328,13 +328,13 @@ def _nofollow_flag() -> int:
     return nofollow
 
 
-def _absolute_path(path: Path) -> Path:
+def absolute_path(path: Path) -> Path:
     """Return a lexical absolute path without resolving symlinks.
 
     Anchors a relative path at the current working directory, then collapses
     ``.`` and ``..`` components purely by name, matching
     :func:`posixpath.normpath`. This must not touch the filesystem: callers
-    such as :func:`_open_directory_fd` walk the resulting components with
+    such as :func:`open_directory_fd` walk the resulting components with
     ``O_NOFOLLOW`` specifically to detect symlinks, so resolving them here
     would defeat that check.
 
@@ -356,7 +356,7 @@ def _absolute_path(path: Path) -> Path:
     return Path(anchored.parts[0], *collapsed)
 
 
-def _leaf_name(path: Path) -> str:
+def leaf_name(path: Path) -> str:
     """Return the final path component, refusing names with no fixed identity.
 
     :param Path path: Path whose final component is extracted.
@@ -392,7 +392,7 @@ def _validate_private_dir_info(path: Path, info: os.stat_result) -> None:
         )
 
 
-def _open_directory_fd(
+def open_directory_fd(
     path: Path,
     *,
     create: bool,
@@ -440,11 +440,11 @@ def _open_directory_fd(
         pre-open stat and the open, or the final component fails the
         private policy when ``private_final`` is true.
     """
-    absolute = _absolute_path(path)
+    absolute = absolute_path(path)
     parts = absolute.parts[1:]
     if not parts:
         raise UnsafePrivatePathError("The filesystem root cannot be a private directory.")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | _nofollow_flag()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow_flag()
     current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for index, component in enumerate(parts):
@@ -508,13 +508,13 @@ def ensure_private_dir(path: Path) -> None:
     :param Path path: Directory that must be accessible only by the owner.
     :raises UnsafePrivatePathError: If a component is a link or the final mode/owner is unsafe.
     """
-    fd = _open_directory_fd(path, create=True, private_final=True)
+    fd = open_directory_fd(path, create=True, private_final=True)
     os.close(fd)
 
 
 def validate_private_dir(path: Path) -> None:
     """Validate an existing owner-only directory without changing it."""
-    fd = _open_directory_fd(path, create=False, private_final=True)
+    fd = open_directory_fd(path, create=False, private_final=True)
     os.close(fd)
 
 
@@ -576,9 +576,9 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     """
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
-    parent_fd = _open_directory_fd(path.parent, create=True, private_final=True)
-    leaf = _leaf_name(path)
-    flags = os.O_WRONLY | os.O_CLOEXEC | _nofollow_flag()
+    parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
+    leaf = leaf_name(path)
+    flags = os.O_WRONLY | os.O_CLOEXEC | nofollow_flag()
     if mode == "a":
         flags |= os.O_APPEND
     created = False
@@ -645,7 +645,7 @@ def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
         relative to ``parent_fd``.
     :raises FileExistsError: If 10 consecutive random names all collide.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
     for _ in range(10):
         temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
         try:
@@ -687,8 +687,8 @@ def _private_atomic_writer(
         ``binary``) on the temporary file, open for the caller to populate
         before the atomic replace.
     """
-    parent_fd = _open_directory_fd(path.parent, create=True, private_final=True)
-    leaf = _leaf_name(path)
+    parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
+    leaf = leaf_name(path)
     fd = -1
     temporary: str | None = None
     replaced = False

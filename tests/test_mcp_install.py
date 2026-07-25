@@ -1198,7 +1198,7 @@ def test_installer_refuses_project_parent_symlink_swap(fake_home, tmp_path, caps
     original = '{"outside": true}\n'
     outside_config.write_text(original)
     config_parent = project / ".cursor"
-    real_open_directory_fd = install_edits._open_directory_fd
+    realopen_directory_fd = install_edits.open_directory_fd
     swapped = False
 
     def swap_before_open(path, **kwargs):
@@ -1206,9 +1206,9 @@ def test_installer_refuses_project_parent_symlink_swap(fake_home, tmp_path, caps
         if path == config_parent and not swapped:
             swapped = True
             config_parent.symlink_to(outside, target_is_directory=True)
-        return real_open_directory_fd(path, **kwargs)
+        return realopen_directory_fd(path, **kwargs)
 
-    monkeypatch.setattr(install_edits, "_open_directory_fd", swap_before_open)
+    monkeypatch.setattr(install_edits, "open_directory_fd", swap_before_open)
 
     code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
 

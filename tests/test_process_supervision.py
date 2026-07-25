@@ -26,13 +26,13 @@ from phasesweep.runtime.process import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
     StaleProcessIdentity,
-    _defer_shutdown_signals,
     _kill_group,
     _process_group_alive_with_members,
     _shutdown_handler,
     _spawn_blocked_supervisor,
     _terminate_process_group,
     cleanup_stale_trial_process,
+    defer_shutdown_signals,
     is_pid_alive,
     is_pid_zombie,
     read_stale_process_identity,
@@ -907,7 +907,7 @@ def test_dry_run_does_not_enter_signal_handler_scope(
     assert installed["called"] is False
 
 
-def test_defer_shutdown_signals_blocks_and_restores() -> None:
+def testdefer_shutdown_signals_blocks_and_restores() -> None:
     """The context manager must add SIGTERM/SIGINT to the thread mask on entry
     and restore the original mask on exit."""
     if not hasattr(signal, "pthread_sigmask"):
@@ -915,7 +915,7 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
 
     before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     try:
-        with _defer_shutdown_signals():
+        with defer_shutdown_signals():
             inside = signal.pthread_sigmask(signal.SIG_BLOCK, set())
             assert signal.SIGTERM in inside
             assert signal.SIGINT in inside
@@ -932,10 +932,10 @@ def test_install_signal_handlers_unblocks_inherited_shutdown_mask() -> None:
 
     code = r"""
 import os, signal
-from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals
+from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals
 signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
 install_signal_handlers()
-with _defer_shutdown_signals():
+with defer_shutdown_signals():
     print("queued", flush=True)
     os.kill(os.getpid(), signal.SIGTERM)
 print("post-context", flush=True)
@@ -1003,9 +1003,9 @@ def test_pending_sigterm_inside_signal_deferred_sections_does_not_deadlock() -> 
             "queued",
             r"""
 import os, signal
-from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
+from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _launch_lock
 install_signal_handlers()
-with _defer_shutdown_signals(), _launch_lock:
+with defer_shutdown_signals(), _launch_lock:
     print("queued", flush=True)
     os.kill(os.getpid(), signal.SIGTERM)
 print("post-context", flush=True)
@@ -1016,9 +1016,9 @@ print("post-context", flush=True)
             "locked",
             r"""
 import os, signal
-from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _lock
+from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _lock
 install_signal_handlers()
-with _defer_shutdown_signals():
+with defer_shutdown_signals():
     with _lock:
         print("locked", flush=True)
         os.kill(os.getpid(), signal.SIGTERM)
@@ -1042,7 +1042,7 @@ print("post-context", flush=True)
 def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocking() -> None:
     """A signal tripped by a non-main thread mid-window must defer, not deadlock.
 
-    Kernel masking in ``_defer_shutdown_signals`` only covers the main thread.
+    Kernel masking in ``defer_shutdown_signals`` only covers the main thread.
     Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
     unblocked, so a process-directed SIGTERM sent during the masked launch
     window is delivered to one of them — and CPython then runs the Python
@@ -1055,7 +1055,7 @@ def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocki
     code = r"""
 import os, signal, threading, time
 import phasesweep.runtime.process as proc_mod
-from phasesweep.runtime.process import install_signal_handlers, _defer_shutdown_signals, _launch_lock
+from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _launch_lock
 
 install_signal_handlers()
 
@@ -1069,7 +1069,7 @@ def helper():
 threading.Thread(target=helper, daemon=True).start()
 assert ready.wait(5)
 
-with _defer_shutdown_signals(), _launch_lock:
+with defer_shutdown_signals(), _launch_lock:
     os.kill(os.getpid(), signal.SIGTERM)
     deadline = time.time() + 5
     while proc_mod._deferred_shutdown_signum is None and time.time() < deadline:
@@ -1093,8 +1093,8 @@ print("post-context", flush=True)
 def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
     """A shutdown recorded mid-window fires only when the outermost window exits."""
     inner_exited = False
-    with pytest.raises(PhaseSweepShutdown) as excinfo, _defer_shutdown_signals():
-        with _defer_shutdown_signals():
+    with pytest.raises(PhaseSweepShutdown) as excinfo, defer_shutdown_signals():
+        with defer_shutdown_signals():
             # Emulates CPython invoking the handler in the main thread
             # after a worker-thread delivery: it must record and return.
             _shutdown_handler(signal.SIGTERM, None)
