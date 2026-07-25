@@ -2,7 +2,7 @@
 
 A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and provides the evidence that configured extractors read.
 
-For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml).
+For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml). If a config that used to load now fails validation, see [upgrading existing configs](#upgrading-existing-configs).
 
 ## Experiment keys
 
@@ -125,6 +125,74 @@ For a phase promotion failure, `stop` raises an error, `skip` ends the remaining
 ## Suites
 
 Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`; study `provenance` replaces default `provenance` when supplied, and explicit `null` clears it. See the [worked configs](../examples/).
+
+## Upgrading existing configs
+
+Config models are strict (`extra="forbid"`), so each change below is a load-time failure, not a warning: `phasesweep validate <config>` reports it before any trial runs. Fix them in the order listed - the first one is the only change that also touches trainer code.
+
+### `metric.extractor` no longer accepts `type: json`
+
+```text
+metric.extractor
+  Input tag 'json' found using 'type' does not match any of the expected tags: 'json_envelope', 'log_regex', 'wandb'
+```
+
+A primary objective read from a local JSON file must now use `json_envelope`. Plain `json` is unchanged for `constraints`, which are not the objective and do not carry attempt identity.
+
+**This is not a YAML-only edit.** `json_envelope` requires the trainer to publish the [result envelope](#result-envelope), echoing `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` from its environment; PhaseSweep verifies all three plus the objective name, split, and evaluation policy before accepting a value. Update the trainer first, then the config:
+
+```yaml
+# before
+metric:
+  extractor: {type: json, path: result.json, key: val_loss}
+
+# after
+metric:
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+```
+
+[examples/tiny_decoder_enwik8/run_trial.py](../examples/tiny_decoder_enwik8/run_trial.py) is a worked trainer-side implementation. If you cannot change the trainer, `log_regex` remains available for an objective, at the weakest assurance tier - see the assurance flags under [experiment keys](#experiment-keys).
+
+### `provenance` is required whenever `storage` is set
+
+```text
+Value error, Persistent storage requires a nonempty provenance mapping that identifies
+the trainer, data, and dependency revision used by this experiment.
+```
+
+Persistent storage means results outlive the process that produced them, so PhaseSweep now requires the inputs the command string cannot describe to be declared. Add at least one nonempty key/value pair; every entry participates in the phase fingerprint, so declaring a value you will change frequently will invalidate resume.
+
+```yaml
+storage: sqlite:///runs.db
+provenance:
+  trainer_rev: a1b2c3d
+  dataset: enwik8-2011-09-01
+```
+
+### RDB storage requires an explicit single-host acknowledgement
+
+```text
+Value error, storage 'postgresql://...' resolves to backend 'postgresql', a shared
+relational store. ... Set allow_external_rdb_single_host: true ...
+```
+
+PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+
+### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
+
+```text
+metric.extractor.wandb.run_name_template
+  Extra inputs are not permitted
+metric.extractor.wandb.timeout_seconds
+  Input should be greater than or equal to 1
+```
+
+Both apply to the `wandb` extractor and the `wandb_summary_required` gate. W&B evidence is addressed by the immutable `WANDB_RUN_ID` (set to the attempt ID), so a name template can no longer affect which run is read - delete the key. `PHASESWEEP_RUN_NAME` is still injected if you want a human-readable display name, which the trainer sets itself. A `timeout_seconds` under 1 could expire before a single poll, reporting missing evidence for a run that was merely still uploading; raise it to at least `1`.
 
 Suite-level `run.log` and the compatibility projection `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Every invocation claims an immutable `suite_generations/<id>/` namespace. Its summary binds the compiled study graph, resolved component experiments, promotion rules, historical phase comments, component experiment generation IDs and phase fingerprints, timestamps, and PhaseSweep version under one `suite_fingerprint`; `last_successful_suite_generation.yaml` selects the authoritative result. A failed first run publishes none, and a failed rerun preserves the prior last-successful exposed result. `show-winners` reads the immutable selected summary, prints promotion decisions separately from exposed winners, and renders only the comments stored with that result. If the current compiled suite differs, it labels the result historical instead of decorating old evidence with current config text.
 
