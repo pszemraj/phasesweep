@@ -38,7 +38,7 @@ from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import agent_ids
 from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
-from phasesweep.mcp.runs import RunStore, write_status_file
+from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
 from phasesweep.mcp.time import utc_now_iso
@@ -474,12 +474,23 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         return
 
     identity = store.cleanup_identity(handle)
-    if cleanup_recovery_needed and identity.pid is not None and identity.pid_starttime is None:
+    # PID + /proc start time are unique only within one boot. A recorded boot
+    # id from an earlier boot proves the runner and every descendant are gone:
+    # without this guard a post-reboot PID recycle could fake liveness (blocking
+    # recovery forever) or absorb the group signal below (review v0.5.17 /
+    # finding E follow-up).
+    earlier_boot = identity_from_earlier_boot(identity.boot_id)
+    if (
+        cleanup_recovery_needed
+        and not earlier_boot
+        and identity.pid is not None
+        and identity.pid_starttime is None
+    ):
         raise click.ClickException(
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
-    if is_same_live_process(identity.pid, identity.pid_starttime):
+    if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
         raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
@@ -502,13 +513,18 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             # using this exact output/storage namespace. Re-check runner liveness
             # only after acquiring the lock, then keep it through every signal,
             # study mutation, and recovery-state write.
-            if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
+            if (
+                confirm
+                and not earlier_boot
+                and is_same_live_process(identity.pid, identity.pid_starttime)
+            ):
                 raise click.ClickException(
                     "runner still appears live; use phasesweep_cancel_sweep first"
                 )
             if (
                 cleanup_recovery_needed
                 and confirm
+                and not earlier_boot
                 and not kill_stale_group(
                     identity.pid,
                     identity.pid_starttime,

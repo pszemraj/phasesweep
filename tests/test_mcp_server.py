@@ -2043,6 +2043,68 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PID recycled after a reboot must not fake runner liveness or absorb
+    the recovery group signal: a recorded boot id from an earlier boot proves
+    the runner and its descendants are gone (review v0.5.17 / finding E).
+
+    The handle deliberately records this test process's own live PID and start
+    time — the strongest possible "looks live" collision — under a foreign
+    boot id.
+    """
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-earlier-boot"
+    handle = replace(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+        ),
+        boot_id="00000000-0000-0000-0000-000000000000",
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+
+    signalled: list[object] = []
+
+    def spy_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        signalled.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", spy_kill_stale_group)
+
+    runner = CliRunner()
+    dry = runner.invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+    assert dry.exit_code == 0, dry.output
+    assert "still appears live" not in dry.output
+
+    confirmed = runner.invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "Cleared cleanup uncertainty" in confirmed.output
+    assert signalled == []
+    assert not store.cleanup_uncertain_path(run_id).exists()
+
+
 def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
