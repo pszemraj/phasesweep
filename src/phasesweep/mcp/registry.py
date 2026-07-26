@@ -25,11 +25,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.engine.state import _experiment_dir
 from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
+    canonical_storage_identity,
     file_url_path,
     sqlite_uri_filename_path,
     storage_backend,
@@ -516,10 +518,39 @@ class Registry:
         _require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
         items: dict[str, RegisteredExperiment] = {}
+        # Two catalog ids must never govern one engine experiment: the MCP
+        # busy guard keys on the id string while the engine's locks key on
+        # the output namespace and storage identity, so two entries sharing
+        # a resource would race each other's launches and split the run
+        # history across ids (review v0.5.17 gap hunt).
+        namespace_owners: dict[str, str] = {}
+        storage_owners: dict[str, str] = {}
         for entry in catalog.experiments:
             if entry.id in items:
                 raise CatalogError(f"duplicate catalog id {entry.id!r}")
-            items[entry.id] = _load_entry(base, entry)
+            loaded = _load_entry(base, entry)
+            namespace = str(_experiment_dir(loaded.experiment))
+            other = namespace_owners.get(namespace)
+            if other is not None:
+                raise CatalogError(
+                    f"catalog ids {other!r} and {entry.id!r} resolve to the same "
+                    f"experiment output namespace ({namespace}); one engine "
+                    "experiment must be governed by exactly one catalog entry."
+                )
+            namespace_owners[namespace] = entry.id
+            storage_identity = canonical_storage_identity(loaded.experiment.storage)
+            if storage_identity is not None:
+                storage_key = f"{storage_identity}::{loaded.experiment.experiment}"
+                other = storage_owners.get(storage_key)
+                if other is not None:
+                    raise CatalogError(
+                        f"catalog ids {other!r} and {entry.id!r} resolve to the same "
+                        f"Optuna study namespace ({loaded.experiment.experiment!r} on "
+                        f"{storage_identity}); one engine experiment must be governed "
+                        "by exactly one catalog entry."
+                    )
+                storage_owners[storage_key] = entry.id
+            items[entry.id] = loaded
         return cls(
             state_dir=_prepare_state_dir(base, catalog.state_dir),
             items=items,

@@ -119,7 +119,7 @@ Two caveats. If `nvidia-smi` cannot be read (missing binary, timeout, nonzero ex
 
 Upgrade note: builds before UUID canonicalization locked numeric devices under `gpu_<index>.lock`; this build locks the same card under its UUID-derived name, so the two lock namespaces do not exclude each other. Running an old and a new phasesweep concurrently on one host can therefore double-book a GPU — the exact failure canonicalization prevents within one version. Upgrade every phasesweep on a host together; leftover `gpu_<index>.lock` files from old builds are inert and safe to delete.
 
-When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
+When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order. That default is what keeps a numeric `CUDA_VISIBLE_DEVICES` token pointing at the card whose UUID the lock was taken on (`nvidia-smi` enumerates by PCI bus). Explicitly overriding the order (for example `FASTEST_FIRST`) while using numeric tokens decouples the locked card from the card the trainer actually occupies — use UUID tokens if you must override the ordering.
 
 > [!WARNING]
 > Multi-host writers against one shared study are unsupported. The stale-trial reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.

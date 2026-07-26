@@ -113,6 +113,19 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
         assert needle not in blob
 
 
+def test_two_catalog_ids_cannot_govern_one_experiment(tmp_path: Path) -> None:
+    """Two entries resolving to one engine experiment must fail catalog load.
+
+    The MCP busy guard keys on the id string while the engine locks key on
+    the output namespace and storage identity; two ids over one resource
+    would race launches and split run history (review v0.5.17 gap hunt)."""
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog = write_mcp_catalog(tmp_path, {"first": config, "second": config})
+
+    with pytest.raises(CatalogError, match="same experiment output namespace"):
+        Registry.load(catalog)
+
+
 def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
     registry = Registry.load(_catalog(tmp_path, config))

@@ -219,6 +219,7 @@
 # type: Literal["wandb"] (required)
 # entity: str (required)
 # project: str (required)
+# Both must be nonempty and slash-free; they address the W&B API path directly.
 # metric_key: str (required)
 # Key in wandb.run.summary; the value must be a finite number, not a string or boolean.
 # poll_seconds: float = 2.0 (> 0)
@@ -262,6 +263,7 @@
 # type: Literal["wandb_summary_required"] (required)
 # entity: str (required)
 # project: str (required)
+# Both must be nonempty and slash-free; they address the W&B API path directly.
 # keys: list[str] (required; min length 1)
 # poll_seconds: float = 2.0 (> 0)
 # timeout_seconds: float = 120.0 (>= 1)

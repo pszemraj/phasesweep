@@ -13,6 +13,11 @@ instead of double-booking the card (review v0.5.17 / blocker 6).
 MIG limitation: a ``MIG-...`` token locks on the MIG instance itself. phasesweep
 does not bind a MIG instance to its parent GPU, so a run holding a MIG instance
 and a run holding the whole parent device do not exclude each other.
+
+Scope caveat: "host-wide" throughout this module means "every orchestrator that
+resolves the same phasesweep lock directory". The default lock directory is
+per-user (``~/.cache/phasesweep/locks``); coordinating across users or launch
+surfaces with different ``HOME``s requires a shared ``PHASESWEEP_LOCK_DIR``.
 """
 
 from __future__ import annotations
@@ -188,7 +193,12 @@ def _detect_gpu_uuid_map() -> dict[str, str]:
     for line in out.stdout.strip().splitlines():
         index, _, uuid = line.partition(",")
         index, uuid = index.strip(), uuid.strip()
-        if index.isdigit() and uuid:
+        # Require a real device-identity shape. Restricted drivers (vGPU,
+        # locked-down containers) report "[N/A]"/"[Not Supported]" for every
+        # index; accepting those would map ALL indices to one identity and
+        # silently collapse a multi-GPU pool to a single lock (review
+        # v0.5.17 gap hunt).
+        if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
     return uuid_map
 
@@ -209,12 +219,31 @@ def _nvidia_driver_reports_gpus() -> bool:
         return False
 
 
+_FULL_GPU_UUID_LENGTH = len("GPU-") + 36
+
+
+def _is_abbreviated_gpu_uuid(token: str) -> bool:
+    """Return whether ``token`` is a shortened ``GPU-`` UUID prefix.
+
+    CUDA accepts unambiguous UUID prefixes in ``CUDA_VISIBLE_DEVICES``, so a
+    ``GPU-`` token shorter than a full canonical UUID names the same card as
+    its full spelling and needs resolution before locking (review v0.5.17
+    gap hunt). Full-length tokens are treated as already canonical.
+
+    :param str token: Configured CUDA device token.
+    :return bool: ``True`` for a shortened ``GPU-`` UUID prefix.
+    """
+    return token.startswith("GPU-") and len(token) < _FULL_GPU_UUID_LENGTH
+
+
 def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
     """Bind each device to the canonical physical GPU its host lock keys on.
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
     same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two (review v0.5.17 / blocker 6). Opaque tokens
+    one host lock instead of two (review v0.5.17 / blocker 6). Abbreviated
+    ``GPU-`` UUID prefixes — which CUDA accepts when unambiguous — resolve to
+    the full UUID the same way (review v0.5.17 gap hunt). Full opaque tokens
     (``GPU-...`` UUIDs, ``MIG-...`` instances) are already canonical and lock on
     themselves; phasesweep does not bind a MIG instance to its parent device.
 
@@ -233,14 +262,15 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
 
     """
     numeric = [device for device in devices if device.visible_token.isdigit()]
-    if not numeric:
-        # All-opaque token sets are already canonical: no probe, no ambiguity.
+    abbreviated = [device for device in devices if _is_abbreviated_gpu_uuid(device.visible_token)]
+    if not numeric and not abbreviated:
+        # Full opaque token sets are already canonical: no probe, no ambiguity.
         return _dedupe_by_lock_identity(devices)
 
     uuid_map = _detect_gpu_uuid_map()
     if not uuid_map:
         opaque = [device.visible_token for device in devices if not device.visible_token.isdigit()]
-        if opaque:
+        if numeric and opaque:
             raise RuntimeError(
                 "Cannot resolve canonical GPU identity: this device set mixes numeric "
                 f"indices ({[device.visible_token for device in numeric]}) with opaque "
@@ -249,6 +279,15 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
                 "double-book it. Use one convention for every device on this host "
                 "(all indices or all UUID/MIG tokens), or fix nvidia-smi."
             )
+        if abbreviated:
+            log.warning(
+                "nvidia-smi UUID resolution is unavailable; abbreviated GPU UUID "
+                "prefix(es) %s lock on the prefix spelling and would not exclude a "
+                "concurrent run using the full UUID for the same card. Use full "
+                "UUIDs, or fix nvidia-smi.",
+                [device.visible_token for device in abbreviated],
+            )
+            return _dedupe_by_lock_identity(devices)
         # No map and one consistent spelling: indices remain their own identity,
         # which still collides with itself across runs on this host — but NOT
         # with a concurrent run whose nvidia-smi probe succeeded and locked the
@@ -268,14 +307,25 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
     for device in devices:
         token = device.visible_token
         if not token.isdigit():
+            # Canonicalize an abbreviated UUID prefix to the full UUID when
+            # the readable map matches exactly one device; ambiguous or
+            # unmatched prefixes stay their own identity.
+            if _is_abbreviated_gpu_uuid(token):
+                matches = [
+                    uuid for uuid in uuid_map.values() if uuid.lower().startswith(token.lower())
+                ]
+                if len(matches) == 1:
+                    resolved.append(GpuDevice(visible_token=token, lock_token=matches[0]))
+                    continue
             resolved.append(device)
             continue
         uuid = uuid_map.get(token)
         if uuid is None:
             raise RuntimeError(
-                f"Configured CUDA device index {token} does not exist on this host: "
-                f"nvidia-smi reports indices {sorted(uuid_map, key=int)}. Fix gpu_ids, "
-                "gpu_devices, or CUDA_VISIBLE_DEVICES."
+                f"Configured CUDA device index {token} does not exist on this host, or "
+                f"nvidia-smi reported no usable GPU/MIG UUID for it (resolvable indices: "
+                f"{sorted(uuid_map, key=int)}). Fix gpu_ids, gpu_devices, or "
+                "CUDA_VISIBLE_DEVICES."
             )
         resolved.append(GpuDevice(visible_token=token, lock_token=uuid))
     return _dedupe_by_lock_identity(resolved)

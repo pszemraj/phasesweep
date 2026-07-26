@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import shutil
 import time
 
@@ -343,6 +344,53 @@ def test_resolved_uuid_lock_names_stay_path_safe(tmp_path, monkeypatch) -> None:
         assert len(locks) == 1
         assert "/" not in locks[0].name
         assert locks[0].name.startswith("gpu_GPU-dead_beef_0_")
+
+
+def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
+    """Driver placeholders like "[N/A]" must not become device identities.
+
+    Restricted drivers (vGPU, locked-down containers) report the same
+    placeholder for every index; accepting it would map ALL indices to one
+    identity and silently collapse a multi-GPU pool to a single lock
+    (review v0.5.17 gap hunt)."""
+
+    class _Out:
+        returncode = 0
+        stdout = "0, [N/A]\n1, [Not Supported]\n2, GPU-abc123\n3, MIG-def456\n"
+
+    monkeypatch.setattr("phasesweep.runtime.gpu.subprocess.run", lambda *args, **kwargs: _Out())
+
+    assert _real_detect_gpu_uuid_map() == {"2": "GPU-abc123", "3": "MIG-def456"}
+
+
+def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
+    """CUDA accepts unambiguous UUID prefixes, so "GPU-2b23" and index 0 must
+    lock the same card as the full UUID spelling (review v0.5.17 gap hunt)."""
+    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
+    index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
+    full_pool = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
+
+    prefix_lock = _gpu_lock_path(prefix_pool._devices[0])
+    assert prefix_lock == _gpu_lock_path(index_pool._devices[0])
+    assert prefix_lock == _gpu_lock_path(full_pool._devices[0])
+    # The trainer still sees the configured spelling.
+    assert prefix_pool._devices[0].visible_token == "GPU-2b23"
+
+
+def test_abbreviated_uuid_prefix_without_map_degrades_loudly(tmp_path, monkeypatch, caplog) -> None:
+    """An unresolvable abbreviated prefix keeps its own lock identity and warns."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
+
+    assert pool._devices[0].lock_identity == "GPU-2b23"
+    assert any("abbreviated GPU UUID" in record.message for record in caplog.records)
 
 
 @pytest.mark.skipif(shutil.which("nvidia-smi") is None, reason="nvidia-smi is not installed")
