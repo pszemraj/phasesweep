@@ -566,6 +566,130 @@ def test_successful_publication_never_logs_a_record_refusal(
 
 
 # --------------------------------------------------------------------------
+# The generation manifest (summary schema v2) is validated as a complete
+# result graph before the pointer may commit, and again on reads.
+# --------------------------------------------------------------------------
+
+
+def test_publication_refuses_missing_winner_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A summary that claims a winner whose artifact is gone must not publish.
+
+    Review v0.5.16 / blocker 3 reproduction: the old validator looped the
+    current config and silently ``continue``-d past a missing winner file, so
+    deleting the artifact immediately before validation still published an
+    officially successful generation with no winner.
+    """
+    experiment = _stored_experiment(tmp_path)
+
+    original = engine_run._validate_generation_publishable
+
+    def delete_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
+        _generation_winner_path(exp, generation_id, "p").unlink()
+        original(exp, generation_id)
+
+    monkeypatch.setattr(engine_run, "_validate_generation_publishable", delete_winner_then_validate)
+
+    with pytest.raises(RuntimeError, match="missing or unreadable"):
+        run_experiment(experiment)
+
+    assert _last_successful_generation_id(experiment) is None
+    assert _current_pointer_state(experiment) == "publication_failed"
+
+
+def test_publication_refuses_tampered_winner_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A winner artifact whose content no longer hashes to the manifest must not publish."""
+    experiment = _stored_experiment(tmp_path)
+
+    original = engine_run._validate_generation_publishable
+
+    def tamper_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
+        winner_path = _generation_winner_path(exp, generation_id, "p")
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["metric"]["x"] = -999.0
+        winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+        original(exp, generation_id)
+
+    monkeypatch.setattr(engine_run, "_validate_generation_publishable", tamper_winner_then_validate)
+
+    with pytest.raises(RuntimeError, match="does not match its recorded hash"):
+        run_experiment(experiment)
+
+    assert _last_successful_generation_id(experiment) is None
+    assert _current_pointer_state(experiment) == "publication_failed"
+
+
+def test_read_side_rejects_generation_with_altered_winner_artifact(tmp_path: Path) -> None:
+    """A published generation whose winner artifact was altered fails closed on read."""
+    from phasesweep.engine import state as engine_state
+
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    winner["metric"]["x"] = -999.0
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    engine_state._VALIDATED_MANIFESTS.clear()
+
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
+
+
+def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> None:
+    """A pre-manifest summary (no schema_version) keeps the identity-only gate."""
+    from phasesweep.engine import state as engine_state
+
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
+        summary.pop(key, None)
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    engine_state._VALIDATED_MANIFESTS.clear()
+
+    assert _last_successful_generation_id(experiment) == generation_id
+    assert read_winner(experiment, "p") is not None
+
+
+def test_suite_publication_refuses_broken_component_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suite must not publish when a recorded component's manifest no longer validates."""
+    suite = _stored_suite_config(tmp_path)
+    component = suite.experiment_for_study(suite.studies[0])
+
+    original = engine_run._validate_suite_generation_publishable
+
+    def break_component_then_validate(suite_arg, generation_id: str) -> None:  # noqa: ANN001
+        component_generation = _last_successful_generation_id(component)
+        assert component_generation is not None
+        _generation_winner_path(component, component_generation, "p").unlink()
+        original(suite_arg, generation_id)
+
+    monkeypatch.setattr(
+        engine_run, "_validate_suite_generation_publishable", break_component_then_validate
+    )
+
+    with pytest.raises(RuntimeError, match="component manifest is invalid"):
+        run_suite(suite)
+
+    assert _last_successful_suite_generation_id(suite) is None
+
+
+# --------------------------------------------------------------------------
 # Pointer validation moved from record state to artifact identity.
 # --------------------------------------------------------------------------
 

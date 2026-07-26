@@ -30,6 +30,7 @@ from phasesweep.engine.state import (
     Winner,
     _generation_path,
     _generation_promotion_decision_path,
+    _generation_summary_path,
     _last_successful_generation_path,
     _promotion_decision_path,
     _trial_dir_for,
@@ -529,6 +530,19 @@ def test_failed_suite_rerun_preserves_previous_summary(
     )
 
     def succeed(experiment: Experiment, **_kwargs: object) -> ExperimentRunOutcome:
+        # Suite publication now chases each recorded component generation to
+        # its own summary (review v0.5.16 / blocker 3), so this stubbed
+        # component run must leave a readable (legacy-shaped) summary behind.
+        summary_path = _generation_summary_path(experiment, "component-generation")
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            yaml.safe_dump(
+                {
+                    "experiment": experiment.experiment,
+                    "generation_id": "component-generation",
+                }
+            )
+        )
         return ExperimentRunOutcome(
             generation_id="component-generation",
             winners={"eval": winner},

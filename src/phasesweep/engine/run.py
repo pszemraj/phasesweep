@@ -21,6 +21,7 @@ from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.guards import (
     _experiment_lock,
+    _experiment_semantic_fingerprint,
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _suite_fingerprint,
@@ -36,10 +37,13 @@ from phasesweep.engine.selection import (
     _winner_summary_item,
 )
 from phasesweep.engine.state import (
+    GENERATION_SUMMARY_SCHEMA_VERSION,
     PHASE_FINGERPRINT_ATTR,
+    SUITE_SUMMARY_SCHEMA_VERSION,
     Winner,
     _experiment_dir,
     _file_log_handler,
+    _generation_artifact_manifest,
     _generation_dir,
     _generation_path,
     _generation_promotion_decision_path,
@@ -53,6 +57,7 @@ from phasesweep.engine.state import (
     _load_winner,
     _promotion_decision_path,
     _published_promotion_decision_path,
+    _read_pointer_target_summary,
     _run_log_path,
     _save_promotion_decision,
     _save_winner,
@@ -65,11 +70,13 @@ from phasesweep.engine.state import (
     _suite_log_path,
     _suite_summary_path,
     _summary_path,
+    _validate_generation_manifest,
     _winner_path,
     _write_yaml_atomic,
     _write_yaml_exclusive,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.runtime.files import require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -567,12 +574,29 @@ def _run_experiment_inner(
     assert generation_id is not None
     summary_path = _generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+    # The summary is the generation's versioned result manifest (review
+    # v0.5.16 / blockers 3+4): it lists every artifact with its content hash
+    # so publication can validate the complete result graph, and it freezes
+    # the config semantics (metric, phase plan, config fingerprint) that give
+    # those numbers meaning so later reads never reinterpret them through
+    # whatever config happens to be loaded.
     summary = {
+        "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         "generation_id": generation_id,
-        "metric": {"name": experiment.metric.name, "goal": experiment.metric.goal},
+        "phasesweep_version": __version__,
+        "config_fingerprint": _experiment_semantic_fingerprint(experiment),
+        "metric": {
+            "name": experiment.metric.name,
+            "goal": experiment.metric.goal,
+            "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+        },
+        "phase_plan": [
+            {"name": phase.name, "comment": phase.comment} for phase in experiment.phases
+        ],
         "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
+        "artifacts": _generation_artifact_manifest(experiment, generation_id),
     }
     _write_yaml_atomic(summary_path, summary)
     _publish_generation(experiment, generation_id, from_phase=from_phase)
@@ -984,7 +1008,7 @@ def _validate_publishable_summary(
     id_key: str,
     id_value: str,
     label: str,
-) -> None:
+) -> dict[str, Any]:
     """Parse back one generation's own immutable summary before its publication commit.
 
     Shared pre-commit validation core (item A, review v0.5.15) for
@@ -993,11 +1017,8 @@ def _validate_publishable_summary(
     last-success pointer commits and before the per-generation lifecycle
     record is ever written for this generation, so it cannot check that
     record (it does not exist yet); it instead confirms the immutable summary
-    itself parses as a mapping naming the expected owner and id. This is a
-    crash-consistency check for a single-host, operator-trusted workdir --
-    catching a torn or partial write left behind by a crash mid-run -- not
-    tamper-proofing: no hashes are computed, and a deliberate content edit is
-    out of scope for this trust model.
+    itself parses as a mapping naming the expected owner and id, and returns
+    it so the caller can validate the complete manifest without re-reading.
 
     :param Path summary_path: Immutable summary YAML path to read back.
     :param str owner_key: Summary key naming the owning experiment or suite.
@@ -1008,6 +1029,7 @@ def _validate_publishable_summary(
         ``"Suite generation"``).
     :raises RuntimeError: The summary cannot be read back as a correctly
         named mapping; the last-success pointer must not advance to it.
+    :return dict[str, Any]: The parsed summary payload.
     """
     try:
         summary = yaml.safe_load(summary_path.read_text())
@@ -1025,33 +1047,31 @@ def _validate_publishable_summary(
             f"{label} {id_value!r} summary failed publication validation; "
             "refusing to advance the last-success pointer."
         )
+    return summary
 
 
 def _validate_generation_publishable(experiment: Experiment, generation_id: str) -> None:
-    """Parse back a generation's own immutable artifacts before its publication commit.
+    """Validate a generation's complete result manifest before its publication commit.
 
-    Item A (review v0.5.15): checks the generation's immutable summary names
-    this exact experiment and generation id, then -- for every phase whose
-    immutable winner file exists in this generation's namespace -- parses it
-    back and checks it has the well-formed ``generation_id`` field the winner
-    schema requires (see :func:`phasesweep.engine.read.read_winner` /
-    :func:`phasesweep.engine.state._load_winner`). This deliberately does
-    *not* require that field to equal ``generation_id``: a winner is
-    legitimately carried forward from whichever generation actually produced
-    the best trial (e.g. a re-run whose target trial count was already
-    satisfied), so its own ``generation_id`` field names that *earlier*
-    generation, not the one currently publishing it. The check here is
-    structural crash-consistency only -- catching a torn or empty write left
-    by a crash mid-``_save_winner`` -- not an identity match, and not
-    tamper-proofing (no hashes).
+    Checks the generation's immutable summary names this exact experiment and
+    generation id, then validates the versioned artifact manifest end to end
+    (:func:`phasesweep.engine.state._validate_generation_manifest`, review
+    v0.5.16 / blocker 3): every winner and promotion artifact the summary
+    claims must exist, hash to its recorded content, parse, and cross-check
+    against the summary's own winner facts (trial number, metric name, value,
+    goal, source identity fields, completion metadata) — and the namespace
+    must hold nothing the manifest does not list. A winner's own
+    ``generation_id`` is deliberately *not* required to equal
+    ``generation_id``: a winner is legitimately carried forward from
+    whichever generation actually produced the best trial, so the field is
+    checked for well-formedness only.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to validate.
-    :raises RuntimeError: The summary cannot be read back as correctly named,
-        or a present winner file is unreadable or missing its required
-        ``generation_id`` field; the last-success pointer must not advance.
+    :raises RuntimeError: The summary or any manifest-listed artifact fails
+        validation; the last-success pointer must not advance.
     """
-    _validate_publishable_summary(
+    summary = _validate_publishable_summary(
         summary_path=_generation_summary_path(experiment, generation_id),
         owner_key="experiment",
         owner_value=experiment.experiment,
@@ -1059,23 +1079,11 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
         id_value=generation_id,
         label="Generation",
     )
-    for phase in experiment.phases:
-        winner_path = _generation_winner_path(experiment, generation_id, phase.name)
-        if not winner_path.is_file():
-            continue
-        try:
-            winner = yaml.safe_load(winner_path.read_text())
-        except (OSError, yaml.YAMLError) as exc:
-            raise RuntimeError(
-                f"Generation {generation_id!r} winner for phase {phase.name!r} could not be "
-                "read back; refusing to advance the last-success pointer."
-            ) from exc
-        winner_generation_id = winner.get("generation_id") if isinstance(winner, dict) else None
-        if not isinstance(winner_generation_id, str) or not winner_generation_id:
-            raise RuntimeError(
-                f"Generation {generation_id!r} winner for phase {phase.name!r} has no valid "
-                "generation_id; refusing to advance the last-success pointer."
-            )
+    _validate_generation_manifest(
+        _generation_dir(experiment, generation_id),
+        generation_id,
+        summary,
+    )
 
 
 def _publish_generation(
@@ -1452,21 +1460,24 @@ def _claim_suite_generation(suite: Suite) -> str:
 
 
 def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> None:
-    """Parse back a suite generation's own immutable summary before its publication commit.
+    """Validate a suite generation's summary and component references before its commit.
 
-    Item A (review v0.5.15), suite mirror of
-    :func:`_validate_generation_publishable`. Suite-level validation only
-    inspects the suite's own summary: each component experiment already
-    validated and published its own generation (via its own
-    :func:`_publish_generation` call) before contributing to this suite run,
-    so there is no separate per-study winner file to check here.
+    Suite mirror of :func:`_validate_generation_publishable` (review v0.5.16
+    / blocker 3). Beyond the suite's own summary identity, every recorded
+    component reference is chased: each study in the summary must name a
+    study in the compiled plan, its recorded component experiment and
+    generation id must resolve to that component's own immutable summary,
+    and that component summary's complete artifact manifest must validate.
+    This runs at publication time, while the current config is by definition
+    the config that just produced the components, so chasing them through
+    ``suite.experiment_for_study`` cannot be confused by later config drift.
 
     :param Suite suite: Suite whose generation is being published.
     :param str generation_id: Immutable suite-generation namespace to validate.
-    :raises RuntimeError: The summary cannot be read back as correctly named;
-        the last-success pointer must not advance to it.
+    :raises RuntimeError: The summary, a component reference, or a component
+        manifest fails validation; the last-success pointer must not advance.
     """
-    _validate_publishable_summary(
+    summary = _validate_publishable_summary(
         summary_path=_suite_generation_summary_path(suite, generation_id),
         owner_key="suite",
         owner_value=suite.suite,
@@ -1474,6 +1485,59 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         id_value=generation_id,
         label="Suite generation",
     )
+
+    def _fail(reason: str) -> RuntimeError:
+        return RuntimeError(
+            f"Suite generation {generation_id!r} failed publication validation: {reason}; "
+            "refusing to advance the last-success pointer."
+        )
+
+    studies_by_name = {study.name: study for study in suite.studies}
+    records = summary.get("studies")
+    if not isinstance(records, list):
+        raise _fail("summary has no study records")
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("name"), str):
+            raise _fail("summary study record is malformed")
+        name = str(record["name"])
+        if name in seen or name not in studies_by_name:
+            raise _fail(f"summary study record {name!r} is duplicated or unknown")
+        seen.add(name)
+        component = suite.experiment_for_study(studies_by_name[name])
+        if record.get("experiment") != component.experiment:
+            raise _fail(f"study {name!r} names a different component experiment")
+        component_generation = record.get("experiment_generation_id")
+        if not isinstance(component_generation, str) or not component_generation:
+            raise _fail(f"study {name!r} has no component generation id")
+        _validate_safe_name("generation", component_generation)
+        component_summary = _read_pointer_target_summary(
+            _generation_summary_path(component, component_generation),
+            id_key="generation_id",
+            target_id=component_generation,
+            owner_key="experiment",
+            owner_name=component.experiment,
+        )
+        if component_summary is None:
+            raise _fail(
+                f"study {name!r} component generation {component_generation!r} "
+                "has no readable summary"
+            )
+        if "schema_version" not in component_summary:
+            # Pre-manifest legacy component summary: identity gate only,
+            # mirroring the read-side rule in _last_successful_generation_id.
+            continue
+        try:
+            _validate_generation_manifest(
+                _generation_dir(component, component_generation),
+                component_generation,
+                component_summary,
+            )
+        except RuntimeError as exc:
+            raise _fail(f"study {name!r} component manifest is invalid ({exc})") from exc
+    missing = set(studies_by_name) - seen
+    if missing:
+        raise _fail(f"summary is missing study record(s) {sorted(missing)}")
 
 
 def _write_suite_generation_state(
@@ -1593,7 +1657,7 @@ def _suite_summary_payload(
         )
     fingerprint = _suite_fingerprint(suite)
     return {
-        "schema_version": 1,
+        "schema_version": SUITE_SUMMARY_SCHEMA_VERSION,
         "suite": suite.suite,
         "suite_generation_id": generation_id,
         "suite_fingerprint": fingerprint,

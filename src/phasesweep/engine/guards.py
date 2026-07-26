@@ -275,6 +275,53 @@ _RUN_CONTROL_KEYS = frozenset(
 )
 FINGERPRINT_SCHEMA_VERSION = 2
 SUITE_FINGERPRINT_SCHEMA_VERSION = 1
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 1
+
+
+def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
+    """Hash the experiment semantics that give a published result its meaning.
+
+    Stamped into each generation's summary manifest so reads can tell
+    whether the config supplied *today* still matches the config that
+    produced a published result (review v0.5.16 / blocker 4) — metric
+    name/goal/extractor, constraints, trial command, env, provenance, and
+    every phase's ordered semantic identity all contribute. Run-control
+    fields (``n_trials`` top-ups, throughput knobs, comments) are excluded
+    for the same reason :data:`_RUN_CONTROL_KEYS` excludes them from phase
+    fingerprints: they never change what the published numbers mean, so they
+    must not flag a published result as reinterpreted.
+
+    :param Experiment experiment: Parsed experiment config to fingerprint.
+    :return str: SHA-256 hex digest (64 characters) of the canonicalised
+        semantic payload.
+    """
+    payload = {
+        "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        "experiment": experiment.experiment,
+        "trial_command": experiment.trial_command,
+        "override_format": experiment.override_format,
+        "env": dict(sorted(experiment.env.items())),
+        "provenance": dict(sorted(experiment.provenance.items())),
+        "metric": experiment.metric.model_dump(mode="json"),
+        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        "contracts": {
+            name: contract.model_dump(mode="json")
+            for name, contract in sorted(experiment.contracts.items())
+        },
+        "phases": [
+            {
+                "name": phase.name,
+                **{
+                    key: value
+                    for key, value in phase.model_dump(mode="json").items()
+                    if key not in _RUN_CONTROL_KEYS
+                },
+            }
+            for phase in experiment.phases
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _suite_fingerprint(suite: Suite) -> str:

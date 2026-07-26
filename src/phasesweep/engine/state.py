@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import logging
 import os
 from collections.abc import Iterator, Mapping
@@ -18,6 +19,8 @@ from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+
+log = logging.getLogger("phasesweep.engine.state")
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
 
@@ -276,6 +279,226 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
 
+GENERATION_SUMMARY_SCHEMA_VERSION = 2
+SUITE_SUMMARY_SCHEMA_VERSION = 2
+_MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
+_ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
+
+# Successful whole-manifest validations, keyed by (generation dir, generation
+# id). A published generation's namespace is immutable by design (exclusively
+# claimed at birth, write-once record, validated before the pointer ever names
+# it), so one successful validation holds for the life of the process; the
+# cache keeps hot status paths from re-hashing every artifact on every pointer
+# read (review v0.5.16 / blocker 3). Failures are never cached: readers can
+# race a publication only *before* the pointer commits, and a failed read must
+# re-check rather than pin a transient state.
+_VALIDATED_MANIFESTS: set[tuple[str, str]] = set()
+
+
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of one file's bytes.
+
+    :param Path path: File to hash.
+    :return str: 64-character hex digest.
+    :raises OSError: The file cannot be read.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _generation_artifact_manifest(
+    experiment: Experiment, generation_id: str
+) -> list[dict[str, str]]:
+    """List and hash every result artifact in one generation's namespace.
+
+    Scans the namespace itself rather than reconstructing the set from
+    in-memory bookkeeping so the manifest cannot omit an artifact the run
+    actually wrote (e.g. a prior promotion decision projected for a skipped
+    phase). The namespace is exclusively claimed by this invocation, so
+    everything present is this run's own output.
+
+    :param Experiment experiment: Experiment whose generation is summarized.
+    :param str generation_id: Immutable generation namespace to scan.
+    :return list[dict[str, str]]: One ``{"kind", "phase", "sha256"}`` entry
+        per winner/promotion artifact, ordered by phase then kind.
+    """
+    phases_dir = _generation_dir(experiment, generation_id) / "phases"
+    items: list[dict[str, str]] = []
+    if not phases_dir.is_dir():
+        return items
+    for phase_dir in sorted(phases_dir.iterdir()):
+        if not phase_dir.is_dir():
+            continue
+        for kind in ("winner", "promotion"):
+            artifact = phase_dir / _ARTIFACT_FILENAMES[kind]
+            if artifact.is_file():
+                items.append(
+                    {"kind": kind, "phase": phase_dir.name, "sha256": _file_sha256(artifact)}
+                )
+    return items
+
+
+def _validate_generation_manifest(
+    generation_dir: Path,
+    generation_id: str,
+    summary: Mapping[str, Any],
+) -> None:
+    """Validate one generation's complete result graph against its summary manifest.
+
+    "Published" must mean the immutable result is internally complete
+    (review v0.5.16 / blocker 3): every artifact the summary claims exists,
+    hashes to the recorded content, parses, and cross-checks against the
+    summary's own winner facts — and the namespace holds nothing the
+    manifest does not list. Runs both pre-commit (before the last-success
+    pointer may advance) and read-side (before a pointer target is trusted),
+    with results cached per immutable generation via
+    :func:`_generation_manifest_is_valid`.
+
+    :param Path generation_dir: The generation's immutable namespace directory.
+    :param str generation_id: Generation id the summary must belong to (used
+        only for error text; ownership is checked by the caller).
+    :param Mapping[str, Any] summary: Parsed generation summary payload.
+    :raises RuntimeError: The manifest is missing, malformed, or any artifact
+        is absent, altered, unparsable, or inconsistent with the summary.
+    """
+
+    def _fail(reason: str) -> RuntimeError:
+        return RuntimeError(f"Generation {generation_id!r} manifest validation failed: {reason}")
+
+    if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
+        raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
+    metric = summary.get("metric")
+    if (
+        not isinstance(metric, Mapping)
+        or not isinstance(metric.get("name"), str)
+        or metric.get("goal") not in ("minimize", "maximize")
+    ):
+        raise _fail("summary metric block is malformed")
+
+    raw_artifacts = summary.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise _fail("summary has no artifact manifest")
+    listed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for entry in raw_artifacts:
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("kind") not in _MANIFEST_ARTIFACT_KINDS
+            or not isinstance(entry.get("phase"), str)
+            or not isinstance(entry.get("sha256"), str)
+        ):
+            raise _fail("summary artifact entry is malformed")
+        key = (str(entry["kind"]), str(entry["phase"]))
+        if key in listed:
+            raise _fail(f"duplicate artifact entry for {key}")
+        listed[key] = entry
+
+    raw_phases = summary.get("phases")
+    if not isinstance(raw_phases, list):
+        raise _fail("summary has no phase winner list")
+    phase_items: dict[str, Mapping[str, Any]] = {}
+    for item in raw_phases:
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            raise _fail("summary phase winner entry is malformed")
+        name = str(item["name"])
+        if name in phase_items:
+            raise _fail(f"duplicate phase winner entry {name!r}")
+        phase_items[name] = item
+        if ("winner", name) not in listed:
+            raise _fail(f"phase {name!r} winner is not listed in the artifact manifest")
+
+    raw_decisions = summary.get("promotion_decisions")
+    if not isinstance(raw_decisions, list):
+        raise _fail("summary has no promotion decision list")
+    decision_items: dict[str, Mapping[str, Any]] = {}
+    for decision in raw_decisions:
+        if not isinstance(decision, Mapping) or not isinstance(decision.get("phase"), str):
+            raise _fail("summary promotion decision entry is malformed")
+        name = str(decision["phase"])
+        decision_items[name] = decision
+        if ("promotion", name) not in listed:
+            raise _fail(f"phase {name!r} promotion decision is not listed in the artifact manifest")
+
+    for kind, name in listed:
+        if kind == "winner" and name not in phase_items:
+            raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
+
+    for (kind, name), entry in listed.items():
+        artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
+        try:
+            content = artifact_path.read_bytes()
+        except OSError as exc:
+            raise _fail(f"{kind} artifact for phase {name!r} is missing or unreadable") from exc
+        if hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            raise _fail(f"{kind} artifact for phase {name!r} does not match its recorded hash")
+        try:
+            payload = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise _fail(f"{kind} artifact for phase {name!r} is not parseable") from exc
+        if not isinstance(payload, Mapping):
+            raise _fail(f"{kind} artifact for phase {name!r} is not a mapping")
+        if payload.get("phase") != name:
+            raise _fail(f"{kind} artifact for phase {name!r} names a different phase")
+        if kind == "winner":
+            item = phase_items[name]
+            if payload.get("trial_number") != item.get("trial_number"):
+                raise _fail(f"winner for phase {name!r} disagrees with the summary trial number")
+            metric_block = payload.get("metric")
+            if not isinstance(metric_block, Mapping) or metric_block.get("goal") != metric["goal"]:
+                raise _fail(f"winner for phase {name!r} has a mismatched metric goal")
+            value = metric_block.get(metric["name"])
+            if not isinstance(value, (int, float)) or float(value) != item.get("metric"):
+                raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
+            # A winner is legitimately carried forward from an earlier
+            # generation, so its own generation_id may name that earlier
+            # generation — the check is well-formedness, not equality.
+            for id_field in ("generation_id", "attempt_id"):
+                recorded = payload.get(id_field)
+                if not isinstance(recorded, str) or not recorded:
+                    raise _fail(f"winner for phase {name!r} has no valid {id_field}")
+            if not isinstance(payload.get("completion"), Mapping):
+                raise _fail(f"winner for phase {name!r} has no completion metadata")
+        elif name in decision_items:
+            if payload.get("action") != decision_items[name].get("action"):
+                raise _fail(
+                    f"promotion decision for phase {name!r} disagrees with the summary action"
+                )
+
+    phases_dir = generation_dir / "phases"
+    if phases_dir.is_dir():
+        for phase_dir in phases_dir.iterdir():
+            if not phase_dir.is_dir():
+                continue
+            for kind, filename in _ARTIFACT_FILENAMES.items():
+                if (phase_dir / filename).is_file() and (kind, phase_dir.name) not in listed:
+                    raise _fail(
+                        f"namespace contains an unlisted {kind} artifact "
+                        f"for phase {phase_dir.name!r}"
+                    )
+
+
+def _generation_manifest_is_valid(
+    generation_dir: Path,
+    generation_id: str,
+    summary: Mapping[str, Any],
+) -> bool:
+    """Validate a generation manifest read-side, caching per immutable generation.
+
+    :param Path generation_dir: The generation's immutable namespace directory.
+    :param str generation_id: Generation id the summary claims.
+    :param Mapping[str, Any] summary: Parsed generation summary payload.
+    :return bool: Whether the manifest validated (possibly from cache).
+    """
+    cache_key = (str(generation_dir), generation_id)
+    if cache_key in _VALIDATED_MANIFESTS:
+        return True
+    try:
+        _validate_generation_manifest(generation_dir, generation_id, summary)
+    except RuntimeError as exc:
+        log.warning("%s", exc)
+        return False
+    _VALIDATED_MANIFESTS.add(cache_key)
+    return True
+
+
 def _read_pointer_target(
     pointer_path: Path,
     *,
@@ -305,43 +528,47 @@ def _read_pointer_target(
     return target_id
 
 
-def _pointer_target_artifacts_are_published(
+def _read_pointer_target_summary(
     summary_path: Path,
     *,
     id_key: str,
     target_id: str,
     owner_key: str,
     owner_name: str,
-) -> bool:
-    """Return whether a generation's own immutable summary confirms its identity.
+) -> dict[str, Any] | None:
+    """Read a pointer target's own immutable summary and confirm its identity.
 
     Replaces the old record-state check (``_record_is_complete``): the
     per-generation lifecycle record is now informational and written *after*
     the last-success pointer commit (review v0.5.15 / blocker 3), so requiring
     ``state == "complete"``/``"published"`` on it would create a crash window
     where a just-committed publication reads back as nothing-published. This
-    instead fails closed on the pointer target's own immutable *artifacts*:
-    the generation's summary must parse as a mapping naming this exact owner
-    and id. This is a crash-consistency check for a single-host,
-    operator-trusted workdir -- no hashes are computed, so a deliberate
-    content edit is out of scope; it only catches a torn or missing write.
+    fails closed on the pointer target's own immutable *summary*: it must
+    parse as a mapping naming this exact owner and id. Callers holding a
+    schema-versioned summary additionally validate the complete artifact
+    manifest (:func:`_generation_manifest_is_valid`; review v0.5.16 /
+    blocker 3) — this helper only performs the identity gate common to
+    experiment and suite pointers.
 
     :param Path summary_path: Immutable generation summary YAML file to read.
     :param str id_key: Summary key holding the generation id.
     :param str target_id: Generation id the summary must name.
     :param str owner_key: Summary key naming the owning experiment or suite.
     :param str owner_name: Expected owner name the summary must carry.
-    :return bool: ``True`` only for a readable summary whose owner and id both match.
+    :return dict[str, Any] | None: The parsed summary when readable and
+        correctly named; ``None`` otherwise.
     """
     try:
         summary = yaml.safe_load(summary_path.read_text())
     except (OSError, yaml.YAMLError):
-        return False
-    return (
+        return None
+    if (
         isinstance(summary, dict)
         and summary.get(owner_key) == owner_name
         and summary.get(id_key) == target_id
-    )
+    ):
+        return summary
+    return None
 
 
 def _last_successful_generation_id(experiment: Experiment) -> str | None:
@@ -356,17 +583,19 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     "nothing published" rather than trusted for path construction or result
     reads.
 
-    Deliberately read-side-cheap: this checks only the generation's summary,
-    never its per-phase winner files. Per-phase winner identity is instead a
-    *pre-commit-only* check (see :func:`phasesweep.engine.run._validate_generation_publishable`,
-    item A) that runs once, at publication time -- re-parsing every phase's
-    winner file on every status/pointer read would multiply that cost across
-    every caller for a check that a generation's own publication has already made.
+    For schema-versioned summaries the target's complete artifact manifest is
+    additionally validated -- every listed winner/promotion artifact must
+    exist, hash to its recorded content, and cross-check against the summary
+    (review v0.5.16 / blocker 3). One successful validation is cached for the
+    life of the process per immutable generation, so hot status paths pay the
+    full artifact walk once, not per read. Pre-manifest legacy summaries keep
+    the identity-only gate.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return str | None: The last-successful generation id, or ``None`` if the
         pointer or its target summary is missing, unreadable, malformed,
-        unsafely named, or owned by another experiment.
+        unsafely named, owned by another experiment, or fails manifest
+        validation.
     """
     generation_id = _read_pointer_target(
         _last_successful_generation_path(experiment),
@@ -376,13 +605,23 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     )
     if generation_id is None:
         return None
-    if not _pointer_target_artifacts_are_published(
+    summary = _read_pointer_target_summary(
         _generation_summary_path(experiment, generation_id),
         id_key="generation_id",
         target_id=generation_id,
         owner_key="experiment",
         owner_name=experiment.experiment,
+    )
+    if summary is None:
+        return None
+    if "schema_version" in summary and not _generation_manifest_is_valid(
+        _generation_dir(experiment, generation_id),
+        generation_id,
+        summary,
     ):
+        # A versioned summary must validate its complete artifact manifest
+        # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
+        # the identity-only gate above; see docs/config.md's upgrade notes.
         return None
     return generation_id
 
@@ -602,14 +841,25 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
     )
     if generation_id is None:
         return None
-    if not _pointer_target_artifacts_are_published(
+    summary = _read_pointer_target_summary(
         _suite_generation_summary_path(suite, generation_id),
         id_key="suite_generation_id",
         target_id=generation_id,
         owner_key="suite",
         owner_name=suite.suite,
-    ):
+    )
+    if summary is None:
         return None
+    if summary.get("schema_version") not in (None, 1, SUITE_SUMMARY_SCHEMA_VERSION):
+        # A summary from a newer schema must not be silently misread.
+        return None
+    # Component-generation manifests are validated at suite publication time
+    # (see engine.run._validate_suite_generation_publishable), where the
+    # config in hand is by definition the one that produced them. Read-side
+    # validation stops at the suite summary's identity: chasing component
+    # artifacts through the CURRENT compiled plan would fail legitimate
+    # historical reads after any suite edit, which the suite fingerprint
+    # already surfaces explicitly.
     return generation_id
 
 
