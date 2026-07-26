@@ -19,6 +19,8 @@ from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.guards import (
     _reap_stale_trials,
     _record_trial_target,
+    _register_active_attempt,
+    _retire_active_attempt,
     _validate_study_schema,
     _validate_trial_target,
     _verify_fingerprint,
@@ -418,6 +420,20 @@ def _run_phase(
                 trial.number,
                 attempt_id,
             )
+        # Experiment-level registration is what keeps this attempt visible to
+        # recovery even if the phase is later renamed/removed or the storage
+        # URL changes (review v0.5.17 / blocker 3). Retired by the post-trial
+        # callback once Optuna's terminal state is durable; preflight GCs
+        # entries the callback never reached.
+        _register_active_attempt(
+            experiment,
+            attempt_id=attempt_id,
+            phase_name=phase.name,
+            study_name=study.study_name,
+            trial_number=trial.number,
+            trial_dir=trial_dir,
+            generation_id=generation_id,
+        )
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
@@ -551,12 +567,19 @@ def _run_phase(
 
         Args:
             study: The running Optuna study (used to call ``study.stop``).
-            _trial: The just-finished trial; unused.
+            _trial: The just-finished trial; supplies the attempt id whose
+                registry entry is retired.
 
         """
         if abort["flag"]:
             with contextlib.suppress(Exception):
                 study.stop()
+        # The trial is durably terminal once callbacks run, so its registry
+        # entry can be retired (review v0.5.17 / blocker 3). Best-effort:
+        # preflight GCs entries this misses.
+        finished_attempt = _trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        if isinstance(finished_attempt, str) and finished_attempt:
+            _retire_active_attempt(experiment, finished_attempt)
         finished = _finished_trial_count(study.get_trials(deepcopy=False))
         now = time.monotonic()
         if csv_throttle.should_write(finished, now):

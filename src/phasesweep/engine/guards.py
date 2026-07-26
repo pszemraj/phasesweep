@@ -33,12 +33,14 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
+    _attempts_dir,
     _experiment_dir,
     _suite_dir,
     _trial_dir_for,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
+    atomic_write_text,
     canonical_storage_identity,
     exclusive_lock,
     try_lock_file,
@@ -47,6 +49,7 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
+from phasesweep.runtime.json import strict_json_loads
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
     AttemptLifecycle,
@@ -558,6 +561,275 @@ def _read_trial_process_identity(
         ) from exc
 
 
+ATTEMPT_REGISTRY_SCHEMA_VERSION = 1
+_ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "experiment",
+        "phase",
+        "study_name",
+        "storage",
+        "trial_number",
+        "trial_dir",
+        "generation_id",
+    }
+)
+
+
+def _register_active_attempt(
+    experiment: Experiment,
+    *,
+    attempt_id: str,
+    phase_name: str,
+    study_name: str,
+    trial_number: int,
+    trial_dir: Path,
+    generation_id: str,
+) -> None:
+    """Best-effort durable registration of a newly allocated attempt.
+
+    The entry binds the attempt to the *producing* phase name, study name,
+    and storage URL, so preflight can find and resolve it even after the
+    phase was renamed or removed, or the storage URL changed (review
+    v0.5.17 / blocker 3). A write failure only loses that cross-config
+    coverage for this attempt — the per-phase reaper still recovers it under
+    the same config — so it is logged, not raised.
+
+    Args:
+        experiment: Parsed experiment config (supplies the registry root).
+        attempt_id: Immutable attempt identity; also the entry filename.
+        phase_name: Phase the attempt belongs to, as configured *now*.
+        study_name: Fully qualified Optuna study name.
+        trial_number: Optuna trial number bound to this attempt.
+        trial_dir: Resolved per-trial directory holding lifecycle/identity.
+        generation_id: Engine invocation identity.
+
+    """
+    entry = {
+        "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "experiment": experiment.experiment,
+        "phase": phase_name,
+        "study_name": study_name,
+        "storage": experiment.storage,
+        "trial_number": trial_number,
+        "trial_dir": str(trial_dir),
+        "generation_id": generation_id,
+    }
+    try:
+        attempts_dir = _attempts_dir(experiment)
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            attempts_dir / f"{attempt_id}.json",
+            json.dumps(entry, sort_keys=True) + "\n",
+        )
+    except OSError:
+        log.warning(
+            "Could not register active attempt %s in the experiment attempt "
+            "registry; recovery after a phase rename/removal will not see it.",
+            attempt_id,
+        )
+
+
+def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
+    """Best-effort removal of a registry entry whose trial is durably terminal.
+
+    Args:
+        experiment: Parsed experiment config (supplies the registry root).
+        attempt_id: Attempt whose Optuna trial reached a terminal state.
+
+    """
+    with contextlib.suppress(OSError):
+        (_attempts_dir(experiment) / f"{attempt_id}.json").unlink(missing_ok=True)
+
+
+def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
+    """Load and validate one attempt registry entry.
+
+    :param Path entry_path: Registry entry file to parse.
+    :return dict[str, Any]: The validated entry payload.
+    :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
+        — recovery cannot know whether a process from it is still alive.
+    """
+    try:
+        payload = strict_json_loads(entry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} is unreadable or malformed. "
+            "Recovery cannot prove whether a process from this attempt is still "
+            "alive. Investigate the attempt's trial directory, then delete the "
+            "entry file if you are certain nothing is running."
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
+        or payload.get("schema_version") != ATTEMPT_REGISTRY_SCHEMA_VERSION
+        or not isinstance(payload.get("attempt_id"), str)
+        or not isinstance(payload.get("trial_dir"), str)
+        or not isinstance(payload.get("study_name"), str)
+        or type(payload.get("trial_number")) is not int
+    ):
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has an unsupported or partial "
+            "schema. Delete the entry file only if you are certain no process "
+            "from this attempt is running."
+        )
+    return payload
+
+
+def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Path) -> None:
+    """Prove no live process can remain from one registered attempt.
+
+    Mirrors :func:`_resolve_attempt_for_reaping` but works from the registry
+    entry instead of Optuna user attrs, so it needs neither the producing
+    phase to still exist in the config nor the producing storage to be
+    reachable.
+
+    :param dict[str, Any] entry: Validated registry entry payload.
+    :param Path entry_path: Entry file, used only for diagnostics.
+    :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
+    """
+    attempt_id = entry["attempt_id"]
+    trial_dir = Path(entry["trial_dir"])
+    if not trial_dir.is_dir():
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} points at a missing trial "
+            f"directory {trial_dir}; its process state cannot be verified. "
+            "Delete the entry file only if you are certain nothing is running."
+        )
+    try:
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has a malformed lifecycle record in {trial_dir}."
+        ) from exc
+    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+        return
+    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+        return
+    try:
+        identity = read_stale_process_identity(trial_dir, expected_attempt_id=attempt_id)
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has a missing or malformed "
+            f"process identity in {trial_dir}."
+        ) from exc
+    if not cleanup_stale_trial_process(identity):
+        raise ProcessCleanupUncertainError(
+            f"Registered attempt {attempt_id} (phase {entry['phase']!r}, from "
+            f"{entry_path}) may still have a live process group. "
+            f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}. "
+            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
+            "re-run phasesweep."
+        )
+    log.warning(
+        "Cleared orphaned group for registered attempt %s (pid=%s pgid=%s)",
+        attempt_id,
+        identity.pid,
+        identity.pgid,
+    )
+
+
+def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) -> str:
+    """Mark the entry's Optuna trial FAIL through its *recorded* storage.
+
+    Uses the study name and storage URL captured at allocation, not the
+    current config, so a renamed phase or changed storage URL still reaches
+    the right study.
+
+    :param dict[str, Any] entry: Validated registry entry payload.
+    :param Path entry_path: Entry file, used only for diagnostics.
+    :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
+        ``"terminal"`` when nothing needed to change (trial already terminal,
+        study gone, or in-memory storage), or ``"unreachable"`` when the
+        recorded storage could not be reached and the entry must be retained
+        for a later retry.
+    """
+    storage_url = entry["storage"]
+    if storage_url is None:
+        # In-memory storage died with its orchestrator; nothing to update.
+        return "terminal"
+    from phasesweep.engine.optuna import _resolve_storage
+
+    try:
+        study = optuna.load_study(
+            study_name=entry["study_name"],
+            storage=_resolve_storage(storage_url),
+        )
+    except KeyError:
+        # The study no longer exists; there is no RUNNING trial to fix.
+        return "terminal"
+    except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
+        log.warning(
+            "Attempt registry entry %s references storage that cannot be "
+            "reached right now; the stale trial will be retried on a later run.",
+            entry_path,
+        )
+        return "unreachable"
+    trials = study.get_trials(deepcopy=False)
+    trial = next((t for t in trials if t.number == entry["trial_number"]), None)
+    if trial is None or trial.state != optuna.trial.TrialState.RUNNING:
+        return "terminal"
+    if trial.user_attrs.get(ATTEMPT_ID_ATTR) != entry["attempt_id"]:
+        # The RUNNING trial belongs to a different attempt than this entry;
+        # leave it for that attempt's own recovery evidence.
+        return "terminal"
+    try:
+        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
+            f"but its stale RUNNING trial {trial.number} in study "
+            f"{entry['study_name']!r} could not be marked FAIL. Refusing to "
+            "continue with an inconsistent study."
+        ) from exc
+    log.warning(
+        "Reaped stale RUNNING trial %d in study %s via the attempt registry",
+        trial.number,
+        entry["study_name"],
+    )
+    return "reaped"
+
+
+def _preflight_active_attempts(
+    experiment: Experiment,
+    report: _PreflightCleanupReport,
+) -> None:
+    """Resolve every registered nonterminal attempt before any launch.
+
+    Runs before the per-phase study loop and is deliberately independent of
+    the current phase graph: a stale attempt whose phase was renamed or
+    removed, or whose storage URL changed, is still discovered, its process
+    group verified/cleaned, and its recorded study repaired (review v0.5.17 /
+    blocker 3).
+
+    :param Experiment experiment: Parsed experiment whose registry is scanned.
+    :param _PreflightCleanupReport report: Shared cleanup-evidence collector.
+    :raises ProcessCleanupUncertainError: A registered attempt could not be
+        proven safe.
+    """
+    attempts_dir = _attempts_dir(experiment)
+    if not attempts_dir.is_dir():
+        return
+    for entry_path in sorted(attempts_dir.glob("*.json")):
+        entry = _load_attempt_entry(entry_path)
+        attempt_id = entry["attempt_id"]
+        try:
+            _registry_attempt_process_is_resolved(entry, entry_path)
+        except ProcessCleanupUncertainError as exc:
+            report.uncertain_attempt_ids.add(attempt_id)
+            report.mark_uncertain(exc)
+            raise
+        outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+        if outcome == "reaped":
+            report.recovered_attempt_ids.add(attempt_id)
+        if outcome != "unreachable":
+            with contextlib.suppress(OSError):
+                entry_path.unlink(missing_ok=True)
+
+
 def _attempt_lifecycle_for_reaping(
     trial: optuna.trial.FrozenTrial,
     trial_dir: Path,
@@ -864,6 +1136,14 @@ def _preflight_existing_studies(
     report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
+    # The registry scan runs FIRST and is independent of the declared phase
+    # list, so attempts from renamed/removed phases or changed storage URLs
+    # are recovered before any current-config validation or launch (review
+    # v0.5.17 / blocker 3).
+    try:
+        _preflight_active_attempts(experiment, report)
+    except Exception as exc:
+        errors.append(exc)
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)

@@ -28,6 +28,7 @@ from phasesweep.engine.guards import (
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _reap_stale_trials,
+    _register_active_attempt,
 )
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
@@ -1158,3 +1159,130 @@ def test_missing_lifecycle_and_identity_still_fails_closed(tmp_path: Path) -> No
 
     with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
         _reap_stale_trials(study, exp, "p")
+
+
+def _fabricate_registered_attempt(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    attempt_id: str,
+) -> tuple[optuna.Study, Path, int]:
+    """Fabricate a stale RUNNING trial plus its attempt registry entry."""
+    study, trial_dir, number = _fabricate_stale_running_trial(
+        experiment, phase_name, attempt_id=attempt_id
+    )
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase_name,
+        study_name=study.study_name,
+        trial_number=number,
+        trial_dir=trial_dir,
+        generation_id="old-generation",
+    )
+    return study, trial_dir, number
+
+
+def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
+    """The attempt registry finds stale work whose phase left the config.
+
+    Reviewer repro (review v0.5.17 / blocker 3): kill the orchestrator while a
+    trainer is alive, rename the phase in the YAML, run again. Recovery used to
+    walk only the *current* phase list, so the old trainer stayed alive and
+    overlapped the new sweep. The registry scan is phase-graph-independent.
+    """
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    storage = f"sqlite:///{tmp_path / 'r.db'}"
+
+    def _exp(phase_name: str) -> Experiment:
+        return make_experiment(
+            experiment="rename",
+            workdir=tmp_path / "runs",
+            storage=storage,
+            trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            phases=[
+                Phase(
+                    name=phase_name,
+                    n_trials=1,
+                    search_space={"x": IntParam(type="int", low=0, high=10)},
+                )
+            ],
+        )
+
+    old_exp = _exp("old_phase")
+    old_study, trial_dir, stale_number = _fabricate_registered_attempt(
+        old_exp, "old_phase", attempt_id="renamed-attempt"
+    )
+    stale = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        starttime = read_proc_starttime(stale.pid)
+        assert starttime is not None
+        _write_test_process_identity(
+            trial_dir,
+            attempt_id="renamed-attempt",
+            pid=stale.pid,
+            pgid=os.getpgid(stale.pid),
+            starttime=starttime,
+        )
+
+        winners = run_experiment(_exp("new_phase"))
+
+        assert "new_phase" in winners
+        assert stale.poll() is not None, "the renamed phase's trainer must be reaped"
+        assert (
+            old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+        )
+        assert not list((tmp_path / "runs" / "rename" / "attempts").glob("*.json"))
+    finally:
+        if stale.poll() is None:
+            os.killpg(stale.pid, signal.SIGKILL)
+        stale.wait(timeout=5)
+
+
+def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) -> None:
+    """A registered attempt is repaired through its *recorded* storage URL.
+
+    The current config points at a different storage; the registry entry keeps
+    the producing study reachable so its RUNNING trial is still failed
+    (review v0.5.17 / blocker 3).
+    """
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+
+    def _exp(db_name: str) -> Experiment:
+        return make_experiment(
+            experiment="movedstorage",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / db_name}",
+            trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            n_trials=1,
+        )
+
+    old_exp = _exp("old.db")
+    old_study, trial_dir, stale_number = _fabricate_registered_attempt(
+        old_exp, "p", attempt_id="moved-attempt"
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
+
+    winners = run_experiment(_exp("new.db"))
+
+    assert "p" in winners
+    assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+    assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
+
+
+def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:
+    """A healthy run leaves no active-attempt registry entries behind."""
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        experiment="healthy",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'h.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        n_trials=2,
+    )
+
+    winners = run_experiment(exp)
+
+    assert "p" in winners
+    attempts_dir = tmp_path / "runs" / "healthy" / "attempts"
+    assert not list(attempts_dir.glob("*.json"))

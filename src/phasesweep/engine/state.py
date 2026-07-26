@@ -202,6 +202,21 @@ def _trial_dir_for(
     )
 
 
+def _attempts_dir(experiment: Experiment) -> Path:
+    """Return the experiment-level active-attempt registry directory.
+
+    One JSON entry per nonterminal attempt, written at allocation and
+    retired once the attempt's Optuna trial is durably terminal. Recovery
+    scans this registry *independently of the current phase graph*, so a
+    renamed or removed phase cannot hide a stale attempt from preflight
+    (review v0.5.17 / blocker 3).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Directory containing active-attempt registry entries.
+    """
+    return _experiment_dir(experiment) / "attempts"
+
+
 def _generation_path(experiment: Experiment) -> Path:
     """Return the current engine generation metadata path.
 
