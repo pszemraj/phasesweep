@@ -962,6 +962,7 @@ def _validate_suite_summary_integrity(
         )
 
     component_winners: set[tuple[Any, ...]] = set()
+    legacy_component_studies: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping) or not isinstance(record.get("name"), str):
             raise _fail("summary study record is malformed")
@@ -1001,6 +1002,13 @@ def _validate_suite_summary_integrity(
             or payload.get("generation_id") != component_generation
         ):
             raise _fail(f"study {name!r} component summary names a different identity")
+        if "schema_version" not in payload:
+            # Pre-manifest legacy component summary: identity + hash anchor
+            # only, mirroring the legacy rule in the publication-time
+            # component-manifest chase. Its winners cannot be indexed for the
+            # membership check below.
+            legacy_component_studies.add(name)
+            continue
         phases = payload.get("phases")
         if not isinstance(phases, list):
             raise _fail(f"study {name!r} component summary has no phase list")
@@ -1010,6 +1018,8 @@ def _validate_suite_summary_integrity(
 
     for record in records:
         name = str(record["name"])
+        if name in legacy_component_studies:
+            continue
         phases = record.get("phases")
         if not isinstance(phases, list):
             raise _fail(f"study {name!r} has no phase list")

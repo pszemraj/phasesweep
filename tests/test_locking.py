@@ -564,6 +564,40 @@ def test_in_memory_run_lock_does_not_collide_for_different_workdirs(
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 
+def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
+    """A symlinked experiment leaf must share the target's output lock.
+
+    ``_experiment_dir`` resolves only the workdir prefix before appending the
+    experiment name, so ``runs/expA -> runs/expB`` previously minted a second
+    lock identity for one physical namespace — the second orchestrator's
+    preflight would then reap the first one's live trials (review v0.5.17 gap
+    hunt).
+    """
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "real").mkdir()
+    (runs / "alias").symlink_to(runs / "real")
+
+    exp_real = make_experiment(workdir=str(runs)).model_copy(update={"experiment": "real"})
+    exp_alias = make_experiment(workdir=str(runs)).model_copy(update={"experiment": "alias"})
+
+    assert set(_run_lock_paths(exp_real)) == set(_run_lock_paths(exp_alias))
+
+
+def test_in_memory_url_spellings_take_no_storage_lock(tmp_path: Path) -> None:
+    """Every in-memory storage spelling yields only the output lock.
+
+    ``sqlite:///:memory:``-style URLs previously produced a storage lock
+    naming a backend that does not exist, so two unrelated in-memory runs
+    sharing an experiment name (but nothing else) contended spuriously
+    (review v0.5.17 gap hunt).
+    """
+    for storage in ("sqlite://", "sqlite:///:memory:", "sqlite+pysqlite:///:memory:"):
+        exp = make_experiment(workdir=str(tmp_path / "runs"), storage="sqlite:///u.db")
+        exp = exp.model_copy(update={"storage": storage})
+        assert len(_run_lock_paths(exp)) == 1, storage
+
+
 def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> None:
     """A second concurrent ``run_experiment`` against the same experiment
     fails fast with the expected error while the run lock is held.

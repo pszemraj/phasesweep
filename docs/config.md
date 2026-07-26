@@ -235,6 +235,14 @@ Results published by older builds (summaries without `schema_version`) remain re
 
 Suite summaries got the same treatment one revision later (`schema_version: 3`): each study record now carries the path and SHA-256 of its component generation summary, and reads refuse a suite summary whose exposed winners are not anchored to those hash-verified components. Suite results published at schema 1/2 stay readable through the identity-only check; the next successful `run_suite` republishes at schema 3 with the anchors in place.
 
+### `whole_node` phases require an explicit device set
+
+```text
+gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices list
+```
+
+Under `whole_node` the device set is the trainer's world size — it changes the global batch size and therefore the loss — so it can no longer be left to ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` detection. Add the explicit list. The set's *size* now also joins the phase fingerprint (its spelling does not), so an existing `whole_node` study resumes only with the same device count.
+
 ### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
 
 ```text

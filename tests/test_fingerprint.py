@@ -369,9 +369,37 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             "gpu_policy",
             lambda: (
                 make_experiment(gpu_policy="single_per_trial"),
-                make_experiment(gpu_policy="whole_node"),
+                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
             ),
             False,
+        ),
+        # Under whole_node the device-set SIZE is the trainer's world size —
+        # semantic — while its spelling stays run-control, and under
+        # single_per_trial the whole list stays run-control (review v0.5.17
+        # gap hunt).
+        (
+            "whole_node_device_count",
+            lambda: (
+                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
+                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1, 2, 3]),
+            ),
+            False,
+        ),
+        (
+            "whole_node_device_spelling",
+            lambda: (
+                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1]),
+                make_experiment(gpu_policy="whole_node", gpu_devices=["GPU-a", "GPU-b"]),
+            ),
+            True,
+        ),
+        (
+            "single_per_trial_gpu_ids_are_run_control",
+            lambda: (
+                make_experiment(gpu_ids=[0]),
+                make_experiment(gpu_ids=[0, 1, 2, 3]),
+            ),
+            True,
         ),
     ]
 

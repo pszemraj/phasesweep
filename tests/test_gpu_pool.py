@@ -414,6 +414,18 @@ def test_gpu_policy_whole_node_requires_single_job() -> None:
         )
 
 
+def test_gpu_policy_whole_node_requires_explicit_device_set() -> None:
+    """whole_node's device set is the trainer's world size — a semantic input —
+    so leaving it to ambient detection is rejected (review v0.5.17 gap hunt)."""
+    with pytest.raises(ValueError, match="whole_node.*explicit gpu_ids or gpu_devices"):
+        Phase(  # type: ignore[arg-type]
+            name="p",
+            n_trials=1,
+            gpu_policy="whole_node",
+            search_space={"x": IntParam(type="int", low=0, high=1)},
+        )
+
+
 def test_gpu_policy_none_parallel_requires_explicit_no_isolation_opt_in() -> None:
     with pytest.raises(ValueError, match="gpu_policy='none'.*allow_no_gpu_isolation"):
         Phase(  # type: ignore[arg-type]

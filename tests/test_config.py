@@ -346,3 +346,23 @@ phases:
 def test_plain_json_extractor_is_not_a_primary_objective() -> None:
     with pytest.raises(ValidationError, match="json_envelope"):
         Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
+
+
+def test_suite_and_study_names_reject_double_underscore() -> None:
+    """'<suite>__<study>' compilation is injective only when neither part can
+    contain the separator: suite 'sweep' / study 'bert__lr' and suite
+    'sweep__bert' / study 'lr' would otherwise share one artifact namespace,
+    study identity, and fingerprint (review v0.5.17 gap hunt)."""
+    from phasesweep.config import IntParam, StudySpec
+
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+
+    with pytest.raises(ValidationError, match="must not contain '__'"):
+        StudySpec(name="bert__lr", phases=[phase])
+
+    with pytest.raises(ValidationError, match="must not contain '__'"):
+        Suite(suite="sweep__bert", studies=[StudySpec(name="lr", phases=[phase])])

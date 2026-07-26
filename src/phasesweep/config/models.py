@@ -143,9 +143,10 @@ class Phase(_Frozen):
         default="single_per_trial",
         description=(
             "CUDA visibility policy for trial subprocesses. single_per_trial leases "
-            "one visible CUDA token per trial. whole_node requires n_jobs=1 and "
-            "leases every configured or detected visible token for the trial. none "
-            "disables phasesweep CUDA isolation and GPU host locks."
+            "one visible CUDA token per trial. whole_node requires n_jobs=1 plus an "
+            "explicit gpu_ids or gpu_devices list and leases every configured token "
+            "for the trial. none disables phasesweep CUDA isolation and GPU host "
+            "locks."
         ),
     )
     gpu_ids: list[int] | None = Field(
@@ -222,6 +223,13 @@ class Phase(_Frozen):
             raise ValueError(
                 "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
                 "the full configured CUDA-visible device set."
+            )
+        if self.gpu_policy == "whole_node" and self.gpu_ids is None and self.gpu_devices is None:
+            raise ValueError(
+                "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
+                "list: the whole-node device set is the trainer's world size — a "
+                "semantic input, not a throughput knob — so it cannot be left to "
+                "ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection."
             )
         if self.gpu_policy == "none":
             if self.gpu_ids is not None or self.gpu_devices is not None:
@@ -1048,9 +1056,16 @@ class StudySpec(_Frozen):
         """Validate study names used as experiment-name suffixes and path components.
 
         :param str value: Candidate study name.
-        :raises ValueError: If ``value`` is not a safe name.
+        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated study name, unchanged.
         """
+        if "__" in value:
+            raise ValueError(
+                f"Study name {value!r} must not contain '__': the compiled component "
+                "experiment is named '<suite>__<study>', so a double underscore inside "
+                "either part makes two different suite/study pairs share one artifact "
+                "namespace, study identity, and fingerprint."
+            )
         return _validate_safe_name("Study", value)
 
 
@@ -1067,9 +1082,16 @@ class Suite(_Frozen):
         """Validate suite names used as output path and experiment-name prefixes.
 
         :param str value: Candidate suite name.
-        :raises ValueError: If ``value`` is not a safe name.
+        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated suite name, unchanged.
         """
+        if "__" in value:
+            raise ValueError(
+                f"Suite name {value!r} must not contain '__': the compiled component "
+                "experiment is named '<suite>__<study>', so a double underscore inside "
+                "either part makes two different suite/study pairs share one artifact "
+                "namespace, study identity, and fingerprint."
+            )
         return _validate_safe_name("Suite", value)
 
     @model_validator(mode="after")

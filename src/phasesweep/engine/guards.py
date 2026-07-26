@@ -44,6 +44,7 @@ from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
     exclusive_lock,
+    storage_is_in_memory,
     try_lock_file,
     unlock_file,
 )
@@ -94,12 +95,18 @@ def _lock_digest(material: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def _lock_path_from_material(experiment: Experiment, material: dict[str, str], label: str) -> Path:
+def _lock_path_from_material(name: str, material: dict[str, str], label: str) -> Path:
     """Lock path under the configured host lock directory.
 
+    ``name`` is part of the lock *filename*, so two configs whose material
+    hashes identically still miss each other unless their name components
+    match too. Callers must therefore derive it from the same identity the
+    material keys on — the resolved output namespace for the output lock —
+    not from an arbitrary spelling of it (review v0.5.17 gap hunt).
+
     Args:
-        experiment: Parsed experiment config; the experiment name is part of
-            the filename for human readability.
+        name: Human-readable identity prefix, derived from the lock material's
+            own identity.
         material: Lock-material dict produced by :func:`_lock_material` or
             similar; hashed into the digest segment.
         label: A short human-readable label (``"output"``, ``"storage"``,
@@ -110,7 +117,7 @@ def _lock_path_from_material(experiment: Experiment, material: dict[str, str], l
         created here; ``open(...).flock()`` does that lazily).
 
     """
-    return _lock_dir() / f"{experiment.experiment}__{label}__{_lock_digest(material)}.lock"
+    return _lock_dir() / f"{name}__{label}__{_lock_digest(material)}.lock"
 
 
 def _output_lock_material(experiment: Experiment) -> dict[str, str]:
@@ -129,7 +136,13 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
         Lock-material dict keyed on the resolved experiment directory.
 
     """
-    return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment))}
+    # Resolve the FULL directory, leaf included: _experiment_dir resolves only
+    # the workdir prefix before appending the experiment name, so a symlinked
+    # experiment leaf (runs/expA -> runs/expB) would otherwise mint a second
+    # lock identity for one physical namespace — and the second orchestrator's
+    # preflight would reap the first one's live trials (review v0.5.17 gap
+    # hunt). A leaf that does not exist yet resolves to itself.
+    return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment).resolve())}
 
 
 def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
@@ -147,6 +160,13 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
         when storage is in-memory.
 
     """
+    if storage_is_in_memory(experiment.storage):
+        # In-memory URLs (``sqlite:///:memory:`` and spellings thereof) have
+        # no shared backend to guard; locking their canonical identity would
+        # make two unrelated in-memory runs that share an experiment name
+        # contend on a lock naming a backend that does not exist (review
+        # v0.5.17 gap hunt).
+        return None
     storage_identity = canonical_storage_identity(experiment.storage)
     if storage_identity is None:
         return None
@@ -174,16 +194,22 @@ def _run_lock_paths(experiment: Experiment) -> list[Path]:
         in-memory storage, 2 (output + storage) otherwise.
 
     """
-    materials: list[tuple[str, dict[str, str]]] = [
-        ("output", _output_lock_material(experiment)),
+    # The output lock's filename prefix comes from the RESOLVED namespace
+    # leaf, not the configured experiment name: a symlinked experiment leaf
+    # spells the same physical directory differently, and a prefix mismatch
+    # alone would split the lock even with identical material (review
+    # v0.5.17 gap hunt).
+    paths = [
+        _lock_path_from_material(
+            _experiment_dir(experiment).resolve().name,
+            _output_lock_material(experiment),
+            "output",
+        )
     ]
     storage_material = _storage_run_lock_material(experiment)
     if storage_material is not None:
-        materials.append(("storage", storage_material))
-    return sorted(
-        (_lock_path_from_material(experiment, m, label) for label, m in materials),
-        key=str,
-    )
+        paths.append(_lock_path_from_material(experiment.experiment, storage_material, "storage"))
+    return sorted(paths, key=str)
 
 
 @contextlib.contextmanager
@@ -282,8 +308,10 @@ _RUN_CONTROL_KEYS = frozenset(
 )
 # v3 / v2 / v2: the execution contract (resolved trainer cwd + declared
 # env-inheritance) joined every semantic fingerprint (review v0.5.17 /
-# blocker 4). Existing populated studies from earlier schemas fail the
-# fingerprint check on resume; see docs/config.md's upgrade section.
+# blocker 4), and whole_node phases additionally fingerprint their configured
+# device-set size — the trainer's world size (review v0.5.17 gap hunt).
+# Existing populated studies from earlier schemas fail the fingerprint check
+# on resume; see docs/config.md's upgrade section.
 FINGERPRINT_SCHEMA_VERSION = 3
 SUITE_FINGERPRINT_SCHEMA_VERSION = 2
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 2
@@ -348,19 +376,32 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
             for name, contract in sorted(experiment.contracts.items())
         },
         "phases": [
-            {
-                "name": phase.name,
-                **{
-                    key: value
-                    for key, value in phase.model_dump(mode="json").items()
-                    if key not in _RUN_CONTROL_KEYS
-                },
-            }
-            for phase in experiment.phases
+            {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
         ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
+    """Return one phase's model dump reduced to its semantic fields.
+
+    ``gpu_ids``/``gpu_devices`` are run-control (which card runs a trial does
+    not change its meaning) — except under ``whole_node``, where the configured
+    device-set SIZE is the trainer's world size and therefore semantic: a
+    4-GPU DDP evaluation and a 1-GPU evaluation of the same phase must not
+    share a study (review v0.5.17 gap hunt). Only the count joins the
+    fingerprint, so respelling the same set (indices vs UUIDs) or moving
+    hosts does not invalidate a study.
+
+    :param Phase phase: Phase whose semantic payload is being built.
+    :return dict[str, Any]: JSON-serializable semantic phase payload.
+    """
+    dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
+    if phase.gpu_policy == "whole_node":
+        tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
+        dump["whole_node_device_count"] = len(tokens or [])
+    return dump
 
 
 def _suite_fingerprint(suite: Suite) -> str:
@@ -419,8 +460,7 @@ def _phase_semantic_payload(
         operator-declared external provenance.
 
     """
-    phase_dump = phase.model_dump(mode="json")
-    semantic_phase = {k: v for k, v in phase_dump.items() if k not in _RUN_CONTROL_KEYS}
+    semantic_phase = _semantic_phase_dump(phase)
     return {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         "trial_command": experiment.trial_command,

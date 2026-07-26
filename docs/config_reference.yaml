@@ -97,8 +97,8 @@
 
 # gpu_policy: Literal["single_per_trial", "whole_node", "none"] = "single_per_trial"
 # `single_per_trial` leases one detected/configured CUDA-visible token per active trainer; a single-job phase with no visible GPU runs without isolation.
-# `whole_node` requires n_jobs: 1 and leases all visible tokens for the trainer. `none` acquires no GPU locks, forbids gpu_ids/gpu_devices, and with n_jobs > 1 requires allow_no_gpu_isolation: true.
-# gpu_policy is semantic: changing it invalidates reuse of an existing persistent phase study.
+# `whole_node` requires n_jobs: 1 plus an explicit gpu_ids or gpu_devices list, and leases every configured token for the trainer. `none` acquires no GPU locks, forbids gpu_ids/gpu_devices, and with n_jobs > 1 requires allow_no_gpu_isolation: true.
+# gpu_policy is semantic: changing it invalidates reuse of an existing persistent phase study. Under whole_node the device-set SIZE is semantic too (it is the trainer's world size); which tokens spell the set remains run-control.
 
 # gpu_ids: list[int] | None = null
 # If set, a nonempty list of non-negative CUDA indices. Mutually exclusive with gpu_devices and forbidden by gpu_policy: "none"; duplicates are removed in first-seen order.
@@ -287,7 +287,7 @@
 # A suite compiles each study into an Experiment named `<suite>__<study>` and runs studies in declaration order. Suite defaults use the Experiment key contracts above.
 
 # suite: str (required)
-# Nonempty ASCII `[A-Za-z0-9_-]+`; used in suite output paths and compiled experiment names.
+# Nonempty ASCII `[A-Za-z0-9_-]+` without `__`; used in suite output paths and compiled experiment names. The `__` ban keeps `<suite>__<study>` parseable as exactly one pair.
 
 # defaults: SuiteDefaults = {}
 # SuiteDefaults object keys:
@@ -310,7 +310,7 @@
 # Study names must be unique. Each Study object accepts the following keys.
 
 # name: str (required)
-# Nonempty ASCII `[A-Za-z0-9_-]+`; appended to the suite name for paths and Optuna study names.
+# Nonempty ASCII `[A-Za-z0-9_-]+` without `__`; appended to the suite name for paths and Optuna study names.
 
 # depends_on: list[str] = []
 # Prior study names that must have exposed results before this study starts. This neither reorders studies nor passes winner overrides into the dependent study.

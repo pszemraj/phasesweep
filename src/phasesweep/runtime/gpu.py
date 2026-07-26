@@ -193,6 +193,22 @@ def _detect_gpu_uuid_map() -> dict[str, str]:
     return uuid_map
 
 
+def _nvidia_driver_reports_gpus() -> bool:
+    """Return whether the NVIDIA kernel driver lists any GPUs on this host.
+
+    Distinguishes a genuinely CPU-only host from a GPU host whose
+    ``nvidia-smi`` probe failed (missing from a minimal PATH, wedged, or
+    timing out): ``/proc/driver/nvidia/gpus`` holds one directory per card
+    the kernel driver knows about, independent of userspace tooling.
+
+    :return bool: ``True`` when the driver procfs lists at least one GPU.
+    """
+    try:
+        return any(Path("/proc/driver/nvidia/gpus").iterdir())
+    except OSError:
+        return False
+
+
 def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
     """Bind each device to the canonical physical GPU its host lock keys on.
 
@@ -234,7 +250,18 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
                 "(all indices or all UUID/MIG tokens), or fix nvidia-smi."
             )
         # No map and one consistent spelling: indices remain their own identity,
-        # which still collides with itself across runs on this host.
+        # which still collides with itself across runs on this host — but NOT
+        # with a concurrent run whose nvidia-smi probe succeeded and locked the
+        # UUID form. Lock-identity resolution must succeed or fail the same way
+        # for every orchestrator on a host (watch systemd/cron units with a
+        # minimal PATH), so make the degradation loud instead of silent.
+        log.warning(
+            "nvidia-smi index-to-UUID resolution is unavailable; GPU host locks for %s "
+            "fall back to index-form names. A concurrent run that CAN resolve UUIDs "
+            "would lock the same cards under different names and could double-book "
+            "them. Fix nvidia-smi (PATH, driver) for every orchestrator on this host.",
+            [device.visible_token for device in numeric],
+        )
         return _dedupe_by_lock_identity(devices)
 
     resolved: list[GpuDevice] = []
@@ -366,7 +393,19 @@ class GpuPool:
             devices = [GpuDevice(str(gpu_id)) for gpu_id in _detect_gpu_ids()]
         if not devices:
             if n_jobs <= 1:
-                log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
+                if _nvidia_driver_reports_gpus():
+                    # The kernel driver knows about GPUs, so the empty probe is
+                    # a broken nvidia-smi, not a CPU-only host: this phase will
+                    # run with no CUDA_VISIBLE_DEVICES binding and hold zero
+                    # GPU host locks while real cards sit on the host
+                    # (review v0.5.17 gap hunt).
+                    log.warning(
+                        "nvidia-smi detected no GPUs but /proc/driver/nvidia/gpus lists "
+                        "hardware; running WITHOUT CUDA isolation or GPU host locks. Fix "
+                        "nvidia-smi or set gpu_ids/gpu_devices explicitly."
+                    )
+                else:
+                    log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
                 return cls(devices=[])
             if allow_no_gpu:
                 log.warning(
