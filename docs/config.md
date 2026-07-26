@@ -183,6 +183,12 @@ relational store. ... Set allow_external_rdb_single_host: true ...
 
 PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
 
+### Generation summaries are now versioned result manifests
+
+This is a workdir-artifact change, not a config-load failure. New publications write `summary.yaml` with `schema_version: 2`: an artifact list with SHA-256 content hashes, the metric name/goal/objective-evidence, the ordered phase plan with comments, and a config fingerprint. Publication refuses to advance `last_successful_generation.yaml` unless every listed artifact exists, hashes correctly, and cross-checks against the summary; reads validate the same manifest before trusting the pointer.
+
+Results published by older builds (summaries without `schema_version`) remain readable through the previous identity-only check — nothing to migrate. But note the interpretation change: status and winner reads now report a published result under the metric name, goal, and phase comments *it* recorded, and add `published_config_matches_current` so an edited config is flagged instead of silently relabeling historical evidence. Editing run-control fields (`n_trials` top-ups, comments, throughput knobs) does not flag drift; editing the metric, extractor, search spaces, phase names/order, or inheritance does.
+
 ### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
 
 ```text

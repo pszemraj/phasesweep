@@ -340,3 +340,51 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     status_obj = yaml.safe_load(result.output)
     assert status_obj["current_generation_id"] is not None
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
+
+
+def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: Path) -> None:
+    """A published result keeps its own comments and is labeled historical on drift.
+
+    Review v0.5.16 / blocker 4: the experiment CLI used to decorate a
+    historical winner with the *current* phase comments; it now mirrors the
+    suite CLI's historical rendering — saved annotations, plus an explicit
+    marker when the current config no longer matches the published one.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        'parser.add_argument("--out")\n'
+        'parser.add_argument("--x", type=int, default=0)\n'
+        "args, _ = parser.parse_known_args()\n"
+        'print(f"x={args.x}")\n',
+    )
+
+    def config_text(comment: str, metric_name: str) -> str:
+        return f"""
+        experiment: drift_cli
+        workdir: {tmp_path}/runs
+        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        metric:
+          name: {metric_name}
+          goal: minimize
+          extractor: {{ type: log_regex, pattern: '{metric_name}=(?P<value>[0-9.eE+-]+)' }}
+        phases:
+          - name: p
+            comment: {comment}
+            n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
+            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+        """
+
+    config_path = write_yaml(tmp_path, config_text("original hypothesis", "x"))
+    run_experiment(load_experiment(config_path))
+
+    # Semantic drift (metric rename) plus a new comment on the same phase.
+    config_path.write_text(textwrap.dedent(config_text("new hypothesis", "y")).lstrip())
+
+    result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
+    assert result.exit_code == 0
+    assert "Historical experiment result" in result.output
+    assert "# original hypothesis" in result.output
+    assert "new hypothesis" not in result.output

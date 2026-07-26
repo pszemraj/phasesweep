@@ -23,6 +23,7 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
+from phasesweep.engine.guards import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import (
     WinnerSource,
@@ -60,6 +61,12 @@ class PhaseWinnerView:
     attempt_id: str | None = None
     source: WinnerSource | None = None
     promotion: dict[str, Any] | None = None
+    # The metric semantics the winner itself recorded (review v0.5.16 /
+    # blocker 4): a persisted winner is historical evidence, so its value is
+    # reported under the name and goal it was optimized for, never relabeled
+    # by whatever metric the current config declares.
+    metric_name: str | None = None
+    metric_goal: str | None = None
 
 
 def _phase_status_payloads(
@@ -154,8 +161,11 @@ def read_winner(
     """Read a single phase's persisted winner, or ``None`` if not yet written.
 
     Args:
-        experiment: Parsed experiment config; supplies the metric name used to
-            pull the scalar out of the ``metric`` block of ``winner.yaml``.
+        experiment: Parsed experiment config; supplies the artifact roots.
+            The metric value is extracted under the name the winner file
+            itself recorded, so a historical winner is never reinterpreted
+            through the currently configured metric (review v0.5.16 /
+            blocker 4).
         phase_name: Phase whose ``winner.yaml`` to read.
         generation_id: Optional generation whose immutable winner should be read.
 
@@ -187,11 +197,19 @@ def read_winner(
             data = loaded
         else:
             return None
-        # winner.yaml stores metric as {<metric_name>: value, "goal": ...}; pull
-        # the value by the configured metric name rather than positionally.
+        # winner.yaml stores metric as {<metric_name>: value, "goal": ...}. The
+        # winner is historical evidence: pull the value by the name the file
+        # itself recorded, NOT the currently configured metric name — reading
+        # a published x/minimize result through a config renamed to y used to
+        # silently drop the winner entirely (review v0.5.16 / blocker 4).
         metric_block = data.get("metric") or {}
         if not isinstance(metric_block, Mapping):
             return None
+        stored_metric_names = [key for key in metric_block if key != "goal"]
+        if len(stored_metric_names) != 1:
+            return None
+        stored_metric_name = str(stored_metric_names[0])
+        stored_goal = metric_block.get("goal")
         gates = [g for g in (data.get("gates") or []) if isinstance(g, dict)]
         completion = data.get("completion") or {}
         if not isinstance(completion, Mapping):
@@ -212,7 +230,9 @@ def read_winner(
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=int(data["trial_number"]),
-            metric=float(metric_block[experiment.metric.name]),
+            metric=float(metric_block[stored_metric_name]),
+            metric_name=stored_metric_name,
+            metric_goal=str(stored_goal) if isinstance(stored_goal, str) else None,
             params=dict(params),
             effective_overrides=dict(effective_overrides),
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
@@ -263,6 +283,22 @@ def read_winners(
         for phase in experiment.phases
     )
     return [view for view in views if view is not None]
+
+
+def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None:
+    """Read a represented generation's summary for historical interpretation.
+
+    :param Path | None summary_path: Already-resolved summary path, or ``None``.
+    :return Mapping[str, Any] | None: Parsed summary mapping, or ``None`` when
+        absent, unreadable, or not a mapping.
+    """
+    if summary_path is None:
+        return None
+    try:
+        payload = yaml.safe_load(summary_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
 
 
 def _current_pointer_generation_id(experiment: Experiment) -> str | None:
@@ -347,7 +383,17 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
     Returns:
         A path-free mapping with the experiment name, the four identity
         fields above, the metric descriptor, a per-phase list of trial counts
-        plus winner presence, and whether the represented summary has been written.
+        plus winner presence, and whether the represented summary has been
+        written. The metric descriptor is the *represented generation's own*
+        recorded metric whenever its summary declares one
+        (``result_context: "represented_generation"``), falling back to the
+        current config only when no summary semantics exist
+        (``result_context: "current_config"``) — a published x/minimize
+        result is never relabeled by a config edited to y/maximize (review
+        v0.5.16 / blocker 4). ``published_config_matches_current`` compares
+        the summary's recorded config fingerprint against the current
+        config's semantic fingerprint; ``None`` when the represented summary
+        records no fingerprint.
 
     """
     current_generation_id = _current_pointer_generation_id(experiment)
@@ -377,17 +423,55 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
         summary_path = _generation_summary_path(experiment, winner_scope_generation_id)
     else:
         summary_path = _published_summary_path_for(experiment, winner_scope_generation_id)
+
+    # The represented generation's winner/summary facts are historical
+    # evidence, so the metric they are reported under must be the one that
+    # generation actually optimized — never the metric the config supplied
+    # today (review v0.5.16 / blocker 4). The generation's own summary is the
+    # source of that interpretation; only when it records none (nothing
+    # published yet, or a pre-manifest legacy summary without semantics) does
+    # the current config describe the result.
+    metric_payload = {
+        "name": experiment.metric.name,
+        "goal": experiment.metric.goal,
+        "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+    }
+    result_context = "current_config"
+    published_config_matches_current: bool | None = None
+    summary_payload = _read_summary_payload(summary_path)
+    if summary_payload is not None:
+        stored_metric = summary_payload.get("metric")
+        if (
+            isinstance(stored_metric, Mapping)
+            and isinstance(stored_metric.get("name"), str)
+            and stored_metric.get("goal") in ("minimize", "maximize")
+        ):
+            stored_evidence = stored_metric.get("objective_evidence")
+            metric_payload = {
+                "name": stored_metric["name"],
+                "goal": stored_metric["goal"],
+                "objective_evidence": (
+                    dict(stored_evidence)
+                    if isinstance(stored_evidence, Mapping)
+                    else metric_payload["objective_evidence"]
+                ),
+            }
+            result_context = "represented_generation"
+        stored_fingerprint = summary_payload.get("config_fingerprint")
+        if isinstance(stored_fingerprint, str) and stored_fingerprint:
+            published_config_matches_current = (
+                stored_fingerprint == _experiment_semantic_fingerprint(experiment)
+            )
+
     return {
         "experiment": experiment.experiment,
         "current_generation_id": current_generation_id,
         "published_generation_id": published_generation_id,
         "represented_generation_id": represented_generation_id,
         "is_published": is_published,
-        "metric": {
-            "name": experiment.metric.name,
-            "goal": experiment.metric.goal,
-            "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
-        },
+        "result_context": result_context,
+        "published_config_matches_current": published_config_matches_current,
+        "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
             include_winner_path=False,

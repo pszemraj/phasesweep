@@ -9,13 +9,16 @@ import pytest
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
+from phasesweep import run_experiment
 from phasesweep.config import (
     Experiment,
     FloatParam,
+    IntParam,
     JsonEnvelopeExtractor,
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
@@ -27,7 +30,7 @@ from phasesweep.engine.state import (
     _last_successful_generation_path,
     _winner_path,
 )
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, write_trainer
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -467,3 +470,120 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
         evidence["attempt_identity_bound"],
         evidence["source_identity_keyed"],
     ) == expected_triple
+
+
+# --------------------------------------------------------------------------
+# Published results are rendered under their own historical semantics, never
+# reinterpreted through whatever config is loaded today (review v0.5.16 /
+# blocker 4).
+# --------------------------------------------------------------------------
+
+_DRIFT_TRAINER = """
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--out")
+parser.add_argument("--x", type=int, default=0)
+args, _ = parser.parse_known_args()
+print(f"x={args.x}")
+"""
+
+
+def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
+    trainer = write_trainer(tmp_path / "trainer.py", _DRIFT_TRAINER)
+    defaults: dict[str, object] = dict(
+        experiment="drift_t",
+        workdir=tmp_path / "wd",
+        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(
+            name="x",
+            goal="minimize",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                comment="original hypothesis",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+        ],
+    )
+    defaults.update(overrides)
+    return make_experiment(**defaults)  # type: ignore[arg-type]
+
+
+def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
+    """Review v0.5.16 / blocker 4 reproduction: publish x/minimize, reload as y/maximize.
+
+    Pre-fix, status labeled the official generation with the *current*
+    metric name and inverted goal, and winner parsing silently dropped the
+    actual winner because the current metric key was absent from the
+    historical file.
+    """
+    published = _drift_experiment(tmp_path)
+    run_experiment(published)
+
+    drifted = _drift_experiment(
+        tmp_path,
+        metric=Metric(
+            name="y",
+            goal="maximize",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"y=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                comment="new hypothesis",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=100, high=110)},
+            )
+        ],
+    )
+
+    status = read_status(drifted)
+    assert status["is_published"] is True
+    assert status["metric"]["name"] == "x"
+    assert status["metric"]["goal"] == "minimize"
+    assert status["result_context"] == "represented_generation"
+    assert status["published_config_matches_current"] is False
+    assert status["phases"][0]["winner_present"] is True
+
+    winners = read_winners(drifted)
+    assert len(winners) == 1
+    assert winners[0].metric_name == "x"
+    assert winners[0].metric_goal == "minimize"
+
+
+def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None:
+    """A top-up or comment edit is not semantic drift for a published result."""
+    published = _drift_experiment(tmp_path)
+    run_experiment(published)
+
+    topped_up = _drift_experiment(
+        tmp_path,
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                comment="reworded documentation",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+        ],
+    )
+
+    status = read_status(topped_up)
+    assert status["published_config_matches_current"] is True
+    assert status["metric"]["name"] == "x"
+
+
+def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:
+    """With nothing published there is no historical context to render."""
+    experiment = _drift_experiment(tmp_path)
+    status = read_status(experiment)
+    assert status["result_context"] == "current_config"
+    assert status["published_config_matches_current"] is None
+    assert status["metric"]["name"] == "x"

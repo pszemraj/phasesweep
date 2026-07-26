@@ -19,6 +19,7 @@ from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import config_status, read_status, run_config
 from phasesweep.engine.guards import (
     _experiment_lock,
+    _experiment_semantic_fingerprint,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
     _reap_stale_trials,
@@ -26,7 +27,12 @@ from phasesweep.engine.guards import (
     _suite_fingerprint,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import _published_suite_summary_path, _published_winner_path
+from phasesweep.engine.state import (
+    _generation_summary_path,
+    _last_successful_generation_id,
+    _published_suite_summary_path,
+    _published_winner_path_for,
+)
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
@@ -266,18 +272,56 @@ def _show_suite_winners(suite: Suite) -> None:
 
 
 def _show_experiment_winners(experiment: Experiment) -> None:
-    """Print winner files for one experiment."""
-    for p in experiment.phases:
-        wpath = _published_winner_path(experiment, p.name)
+    """Print winner files for one experiment.
+
+    A published result is rendered against the phase plan and comments its
+    own generation summary recorded, mirroring the suite path (review
+    v0.5.16 / blocker 4): old evidence must never be decorated with the
+    current config's annotations, and a config that has drifted since
+    publication is labeled historical instead of silently reinterpreted.
+    """
+    generation_id = _last_successful_generation_id(experiment)
+    phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
+    if generation_id is not None:
+        try:
+            summary = yaml.safe_load(
+                _generation_summary_path(experiment, generation_id).read_text()
+            )
+        except (OSError, yaml.YAMLError):
+            summary = None
+        if isinstance(summary, dict):
+            stored_plan = summary.get("phase_plan")
+            if isinstance(stored_plan, list) and all(
+                isinstance(item, dict) and isinstance(item.get("name"), str) for item in stored_plan
+            ):
+                phase_plan = [
+                    (
+                        str(item["name"]),
+                        item["comment"] if isinstance(item.get("comment"), str) else None,
+                    )
+                    for item in stored_plan
+                ]
+            stored_fingerprint = summary.get("config_fingerprint")
+            if isinstance(
+                stored_fingerprint, str
+            ) and stored_fingerprint != _experiment_semantic_fingerprint(experiment):
+                click.echo(
+                    "# Historical experiment result: published generation "
+                    f"{generation_id} does not match the current config."
+                )
+                click.echo("# Rendering the saved phase plan and annotations.")
+
+    for name, comment in phase_plan:
+        wpath = _published_winner_path_for(experiment, generation_id, name)
         if wpath is not None and wpath.is_file():
-            click.echo(f"=== {p.name} ===")
+            click.echo(f"=== {name} ===")
             # Show design-intent before numerical results so the reader frames
             # them against the original hypothesis instead of the other way around.
-            _render_phase_comment(p.comment, prefix="# ")
+            _render_phase_comment(comment, prefix="# ")
             click.echo(wpath.read_text())
         else:
-            click.echo(f"=== {p.name} === (no winner yet)")
-            _render_phase_comment(p.comment, prefix="# ")
+            click.echo(f"=== {name} === (no winner yet)")
+            _render_phase_comment(comment, prefix="# ")
 
 
 def _with_generation_identity(payload: dict, experiment: Experiment) -> dict:
