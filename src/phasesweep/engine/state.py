@@ -114,6 +114,11 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 STUDY_SCHEMA_VERSION = 1
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
+# Durable phase-abort record (review v0.5.17 / blockers 1+7). Set atomically
+# with the abort decision so a restarted orchestrator cannot reinterpret the
+# same terminal trials as a completed phase; cleared only when new work
+# reaches winner selection.
+PHASE_ABORT_ATTR = "phasesweep_phase_abort"
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 RETURN_CODE_ATTR = "phasesweep_return_code"

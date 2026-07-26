@@ -25,10 +25,11 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import TerminalReport, read_status, read_winner
-from phasesweep.engine.optuna import _build_sampler, _create_phase_study
+from phasesweep.engine.optuna import _build_sampler, _create_phase_study, _resolve_storage
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    PHASE_ABORT_ATTR,
     TRIAL_TARGET_ATTR,
     _last_successful_generation_path,
     _load_winner,
@@ -779,6 +780,137 @@ phases:
     n = conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
     conn.close()
     assert n < 30, f"expected early abort, got {n} trials"
+
+
+def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) -> None:
+    """A durable abort survives restart: the identical no-op re-run stays failed.
+
+    First invocation: one success, then failures reach the threshold with every
+    trial terminal. Before review v0.5.17 / blocker 1, a second identical
+    invocation saw ``remaining == 0`` and published the lone COMPLETE trial as
+    a completed phase — converting a recorded failure into a success with no
+    new work.
+    """
+    marker = tmp_path / "succeeded_once"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import pathlib, sys
+        marker = pathlib.Path({str(marker)!r})
+        if marker.exists():
+            sys.exit(1)
+        marker.touch()
+        print("x=0.25")
+        """,
+    )
+    db = tmp_path / "abort.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db}",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=3,
+        max_consecutive_failures=2,
+        sampler={"type": "random", "seed": 7},
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    record = study.user_attrs[PHASE_ABORT_ATTR]
+    assert record["policy"] == "max_consecutive_failures"
+    assert record["consecutive_failures"] == 2
+
+    # Identical retry: no new work is schedulable (3/3 terminal trials), so the
+    # durable abort must keep the phase failed instead of publishing.
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
+
+
+def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
+    """Raising n_trials after an abort is the explicit resume path.
+
+    The top-up schedules genuinely new attempts; reaching a successful winner
+    selection consumes the durable abort record (review v0.5.17 / blocker 1).
+    """
+    flag = tmp_path / "resume_enabled"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import pathlib, sys
+        if not pathlib.Path({str(flag)!r}).exists():
+            sys.exit(1)
+        print("x=0.5")
+        """,
+    )
+    db = tmp_path / "abort.db"
+
+    def _exp(n_trials: int):
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=f"python {trainer} {{overrides}}",
+            n_trials=n_trials,
+            max_consecutive_failures=2,
+            sampler={"type": "random", "seed": 7},
+        )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(_exp(3))
+
+    flag.touch()
+    winners = run_experiment(_exp(6))
+
+    assert winners["p"].metric == pytest.approx(0.5)
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+
+
+def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> None:
+    """Two fast failures trip the abort before a slow later success can reset it.
+
+    Before review v0.5.17 / blocker 7, the threshold was evaluated by a
+    post-trial callback reading a mutable aggregate counter, so a success
+    finishing between two failures' callbacks could erase them. The decision
+    now happens in the objective's completion-order critical section: with the
+    success still sleeping, the abort must be tripped at completion sequence 2.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os, sys, time
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "2":
+            time.sleep(8)
+            print("x=0.5")
+        else:
+            sys.exit(1)
+        """,
+    )
+    db = tmp_path / "parallel.journal"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{db}",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=3,
+        n_jobs=3,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        max_consecutive_failures=2,
+        sampler={"type": "random", "seed": 7},
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    record = study.user_attrs[PHASE_ABORT_ATTR]
+    # The abort was decided when the second failure recorded its outcome —
+    # before the sleeping success could reset the consecutive counter.
+    assert record["completion_sequence"] == 2
+    assert record["consecutive_failures"] == 2
+    states = sorted(t.state.name for t in study.get_trials(deepcopy=False))
+    assert states == ["COMPLETE", "FAIL", "FAIL"]
 
 
 def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:

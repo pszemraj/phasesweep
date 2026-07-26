@@ -34,6 +34,7 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
+    PHASE_ABORT_ATTR,
     RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
@@ -203,6 +204,25 @@ def _run_phase(
         # A no-op invocation republishes the existing result. It must neither
         # require launch resources (GPU discovery on a CPU-only host) nor
         # mutate the durable accepted target (review v0.5.14 / blocker 4).
+        # It must also consult the durable abort record: the same terminal
+        # trial set that previously ended in an abort must not be
+        # reinterpreted as a completed phase merely because the in-memory
+        # abort flag died with the aborting process (review v0.5.17 /
+        # blocker 1). Publishing again requires new work — a top-up that
+        # reaches winner selection clears the record.
+        abort_record = study.user_attrs.get(PHASE_ABORT_ATTR)
+        if abort_record is not None:
+            cause = (
+                abort_record.get("cause")
+                if isinstance(abort_record, dict)
+                else f"malformed abort record {abort_record!r}"
+            )
+            raise NoFeasibleTrialError(
+                f"Phase {phase.name!r} previously aborted: {cause} "
+                "An identical re-run cannot convert that abort into a published "
+                "result. Raise n_trials to schedule new attempts, or use a new "
+                "experiment name."
+            )
         trials_after = study.get_trials(deepcopy=False)
         return _select_phase_winner(
             experiment,
@@ -232,6 +252,7 @@ def _run_phase(
 
     _failure_lock = threading.Lock()
     _consecutive_failures = 0
+    _completion_sequence = 0
     # ``abort["flag"]`` is the soft-abort flag, set by max_consecutive_failures
     # and (for defense in depth) by ``_record_hard_abort`` below. Queued
     # objectives check it inside the GPU lease and prune before launching.
@@ -278,6 +299,60 @@ def _run_phase(
             message = hard_abort["message"]
         if message is not None:
             raise UnsafeProcessCleanupError(message)
+
+    def _record_outcome(*, failed: bool) -> None:
+        """Record one terminal trial outcome in orchestrator completion order.
+
+        "Consecutive" means consecutive in the order outcomes are recorded
+        here — the order objective threads pass through ``_failure_lock`` —
+        not trial-number order. The threshold decision, the abort flag flip,
+        and the durable abort record are all made inside the same critical
+        section, so a later success can never reset the counter between two
+        earlier failures and their policy evaluation, and a crash after the
+        trip can never lose the abort (review v0.5.17 / blockers 1+7).
+
+        The durable write is best-effort *within* the critical section: a
+        storage failure is loudly logged but must not mask the in-memory
+        abort, which still fails this invocation.
+        """
+        nonlocal _consecutive_failures, _completion_sequence
+        with _failure_lock:
+            _completion_sequence += 1
+            if failed:
+                _consecutive_failures += 1
+            else:
+                _consecutive_failures = 0
+            tripped = (not abort["flag"]) and (
+                _consecutive_failures >= phase.max_consecutive_failures
+            )
+            if not tripped:
+                return
+            abort["flag"] = True
+            record = {
+                "policy": "max_consecutive_failures",
+                "threshold": phase.max_consecutive_failures,
+                "consecutive_failures": _consecutive_failures,
+                "completion_sequence": _completion_sequence,
+                "cause": (
+                    f"{_consecutive_failures} consecutive failed/infeasible trials "
+                    f"reached max_consecutive_failures={phase.max_consecutive_failures}."
+                ),
+            }
+            try:
+                study.set_user_attr(PHASE_ABORT_ATTR, record)
+            except Exception:  # noqa: BLE001 - durability failure must not mask the abort
+                log.exception(
+                    "phase=%s could not persist the durable abort record; "
+                    "an identical no-op re-run of this phase may not see the abort",
+                    phase.name,
+                )
+        log.error(
+            "phase=%s ABORTED after %d consecutive failed/infeasible trials",
+            phase.name,
+            record["consecutive_failures"],
+        )
+        with contextlib.suppress(Exception):
+            study.stop()
 
     def objective(trial: optuna.Trial) -> float:
         """Optuna objective: sample, launch trial subprocess, extract, return metric.
@@ -436,43 +511,34 @@ def _run_phase(
         # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf (#4).
         if result.failure_reason:
             trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
-            with _failure_lock:
-                _consecutive_failures += 1
+            _record_outcome(failed=True)
             raise TrialExecutionError(result.failure_reason)
 
         for cname, cval in result.constraints.items():
             trial.set_user_attr(constraint_attr(cname), cval)
 
-        with _failure_lock:
-            if result.feasible:
-                _consecutive_failures = 0
-            else:
-                _consecutive_failures += 1
+        _record_outcome(failed=not result.feasible)
 
         assert result.metric is not None  # guaranteed when failure_reason is None
         return result.metric
 
     def abort_callback(study: optuna.Study, _trial: optuna.trial.FrozenTrial) -> None:
-        """Post-trial callback: trip the soft abort flag if ``max_consecutive_failures`` reached.
+        """Post-trial callback: re-assert a tripped abort and snapshot ``trials.csv``.
+
+        The threshold decision itself lives in ``_record_outcome``, inside the
+        objective's completion-order critical section — a callback observing a
+        mutable aggregate counter is race-prone under ``n_jobs > 1`` (review
+        v0.5.17 / blocker 7). This callback only repeats ``study.stop()`` in
+        case the tripping thread's stop call failed transiently.
 
         Args:
             study: The running Optuna study (used to call ``study.stop``).
-            _trial: The just-finished trial; unused (we read the shared
-                ``_consecutive_failures`` counter instead, which the objective
-                maintains under ``_failure_lock``).
+            _trial: The just-finished trial; unused.
 
         """
-        with _failure_lock:
-            count = _consecutive_failures
-        if count >= phase.max_consecutive_failures:
-            if not abort["flag"]:
-                log.error(
-                    "phase=%s ABORTED after %d consecutive failed/infeasible trials",
-                    phase.name,
-                    count,
-                )
-            abort["flag"] = True
-            study.stop()
+        if abort["flag"]:
+            with contextlib.suppress(Exception):
+                study.stop()
         finished = _finished_trial_count(study.get_trials(deepcopy=False))
         now = time.monotonic()
         if csv_throttle.should_write(finished, now):
@@ -567,7 +633,7 @@ def _run_phase(
             "an incomplete winner."
         )
     try:
-        return _select_phase_winner(
+        winner = _select_phase_winner(
             experiment,
             phase,
             inherited_winners,
@@ -593,6 +659,13 @@ def _run_phase(
                 "before any feasible trial could complete; no winner can be selected."
             ) from exc
         raise
+    if study.user_attrs.get(PHASE_ABORT_ATTR) is not None:
+        # This invocation ran new work (the no-op path raises on an abort
+        # record) and reached a successful selection, so the durable abort
+        # no longer describes the study's terminal state (review v0.5.17 /
+        # blocker 1). ``None`` reads back as "absent" through ``.get``.
+        study.set_user_attr(PHASE_ABORT_ATTR, None)
+    return winner
 
 
 def _select_phase_winner(
