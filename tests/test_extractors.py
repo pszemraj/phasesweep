@@ -397,6 +397,38 @@ def test_provenance_log_regex_records_selected_line_and_whole_file_digest(tmp_pa
         assert source["match_count"] == expected_count, select
 
 
+def test_log_regex_splits_carriage_return_progress_lines(tmp_path):
+    """Lone carriage returns are line boundaries, matching the historical
+    text-mode universal-newline reader — tqdm-style progress logs separate
+    updates with bare "\\r" (review v0.5.17 / finding F follow-up)."""
+    text = "eval_loss=2.5\reval_loss=1.9\reval_loss=2.1\nfinal eval_loss=2.2\r\n"
+    raw = text.encode("utf-8")
+    (tmp_path / "stdout.log").write_bytes(raw)
+
+    for select, expected_value, expected_line, expected_count in [
+        # 1.9 sits mid-"\r"-run: only reachable when "\r" splits lines.
+        ("min", 1.9, 2, 4),
+        ("max", 2.5, 1, 4),
+        ("last", 2.2, 4, 4),
+        ("first", 2.5, 1, 1),
+    ]:
+        cfg = LogRegexExtractor(
+            type="log_regex",
+            file="stdout.log",
+            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
+            select=select,
+        )
+        provenance: dict = {}
+        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+        assert value == expected_value, select
+        source = provenance["source"]
+        # The digest still covers the exact on-disk bytes, "\r"s included.
+        assert source["sha256"] == hashlib.sha256(raw).hexdigest(), select
+        assert source["size_bytes"] == len(raw), select
+        assert source["matched_line"] == expected_line, select
+        assert source["match_count"] == expected_count, select
+
+
 def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):
     fake_wandb(lambda path: _FakeRun(state="finished", summary={"eval/loss": 0.123, "extra": 9}))
     cfg = WandbExtractor(
