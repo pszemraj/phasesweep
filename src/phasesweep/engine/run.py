@@ -71,7 +71,12 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import require_posix_runtime
-from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    absorb_shutdown_signals,
+    service_pending_shutdown,
+    signal_handler_scope,
+)
 
 
 @dataclass(frozen=True)
@@ -412,14 +417,19 @@ def _run_experiment_outcome(
                             failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
-                except Exception:
+                except BaseException:  # noqa: BLE001 - see comment: outcome authority
                     # A reporting callback is a diagnostic consumer of the
                     # outcome, never an authority over it. On the success path
                     # the generation is already published as the last
                     # successful result, so raising here would present a
                     # committed success as a caller-visible failure; on the
                     # failure path it would replace the engine's original
-                    # error (review v0.5.14 / item C).
+                    # error (review v0.5.14 / item C). BaseException on
+                    # purpose (review v0.5.16 / blocker 1): a
+                    # KeyboardInterrupt/SystemExit escaping the callback must
+                    # not rewrite the engine outcome either — real shutdown
+                    # signals are honored separately by the signal handler,
+                    # not by exceptions leaking out of a diagnostic consumer.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
 
@@ -827,14 +837,20 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
     Exists for the post-commit best-effort steps of the publication
     transaction (record write, pointer refresh, compatibility projection):
     once the authoritative pointer has committed, nothing after it may fail
-    the run, so each such step must log its own failure and never propagate it.
+    the run, so each such step must log its own failure and never propagate
+    it. Catching ``BaseException`` is intentional (review v0.5.16 / blocker
+    1): a ``KeyboardInterrupt``/``SystemExit`` escaping one of these steps
+    would propagate into the caller's terminal-failure handler and reclassify
+    an already-committed publication as failed. Real shutdown *signals* are
+    additionally kept out of these steps entirely by the enclosing
+    :func:`phasesweep.runtime.process.absorb_shutdown_signals` window.
 
     :param Callable[[], None] action: Zero-argument best-effort action.
     :param str message: Message logged (with exception info) on failure.
     """
     try:
         action()
-    except Exception:
+    except BaseException:  # noqa: BLE001 - see docstring: commit outcome must survive
         log.exception(message)
 
 
@@ -1105,85 +1121,106 @@ def _publish_generation(
     Steps 4 and 5 each independently log and swallow their own failure so one
     cannot prevent the other from running.
 
+    The whole transaction runs inside an
+    :func:`phasesweep.runtime.process.absorb_shutdown_signals` window (review
+    v0.5.16 / blocker 1): a shutdown signal that arrives after the pointer
+    commit must not reclassify the committed publication as failed or
+    cancelled. The race has a deterministic winner — a shutdown delivered
+    before this window opens cancels the run with nothing published; one
+    delivered inside it is absorbed until the publication is durably
+    classified and then honored at the next checkpoint (the suite loop, the
+    next trial launch, or the MCP runner's terminal status write) before any
+    new work starts.
+
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.
     :param str | None from_phase: Resume point recorded on the lifecycle state.
     :raises Exception: Whatever step 2 or step 3 raised, after best-effort
         "publication_failed" bookkeeping.
     """
-    try:
-        _validate_generation_publishable(experiment, generation_id)
-        _write_yaml_atomic(
-            _last_successful_generation_path(experiment),
-            {"experiment": experiment.experiment, "generation_id": generation_id},
-        )
-    except BaseException as exc:
-        error_class = type(exc).__name__
-        _persist_terminal_failure(
-            lambda: _write_generation_state(
+    with absorb_shutdown_signals() as absorbed:
+        try:
+            _validate_generation_publishable(experiment, generation_id)
+            _write_yaml_atomic(
+                _last_successful_generation_path(experiment),
+                {"experiment": experiment.experiment, "generation_id": generation_id},
+            )
+        except BaseException as exc:
+            error_class = type(exc).__name__
+            _persist_terminal_failure(
+                lambda: _write_generation_state(
+                    experiment,
+                    generation_id=generation_id,
+                    state="publication_failed",
+                    from_phase=from_phase,
+                    publish_current=True,
+                    error_class=error_class,
+                )
+            )
+            raise
+
+        def _write_published_record() -> None:
+            """Step 4: write the immutable per-generation record once, state ``published``."""
+            _write_generation_state(
                 experiment,
                 generation_id=generation_id,
-                state="publication_failed",
+                state="published",
+                from_phase=from_phase,
+                publish_current=False,
+            )
+
+        _log_on_failure(
+            _write_published_record,
+            "failed to write the immutable generation record after publication; "
+            "the published result is unaffected",
+        )
+
+        def _refresh_published_pointer_and_projections() -> None:
+            """Step 5: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
+            _write_generation_state(
+                experiment,
+                generation_id=generation_id,
+                state="published",
                 from_phase=from_phase,
                 publish_current=True,
-                error_class=error_class,
+                write_record=False,
             )
-        )
-        raise
+            for phase in experiment.phases:
+                source_winner = _generation_winner_path(experiment, generation_id, phase.name)
+                projected_winner = _winner_path(experiment, phase.name)
+                if source_winner.is_file():
+                    _copy_yaml_projection(source_winner, projected_winner)
+                else:
+                    projected_winner.unlink(missing_ok=True)
 
-    def _write_published_record() -> None:
-        """Step 4: write the immutable per-generation record once, state ``published``."""
-        _write_generation_state(
-            experiment,
-            generation_id=generation_id,
-            state="published",
-            from_phase=from_phase,
-            publish_current=False,
-        )
+                source_promotion = _generation_promotion_decision_path(
+                    experiment, generation_id, phase.name
+                )
+                projected_promotion = _promotion_decision_path(experiment, phase.name)
+                if source_promotion.is_file():
+                    _copy_yaml_projection(source_promotion, projected_promotion)
+                else:
+                    projected_promotion.unlink(missing_ok=True)
 
-    _log_on_failure(
-        _write_published_record,
-        "failed to write the immutable generation record after publication; "
-        "the published result is unaffected",
-    )
-
-    def _refresh_published_pointer_and_projections() -> None:
-        """Step 5: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
-        _write_generation_state(
-            experiment,
-            generation_id=generation_id,
-            state="published",
-            from_phase=from_phase,
-            publish_current=True,
-            write_record=False,
-        )
-        for phase in experiment.phases:
-            source_winner = _generation_winner_path(experiment, generation_id, phase.name)
-            projected_winner = _winner_path(experiment, phase.name)
-            if source_winner.is_file():
-                _copy_yaml_projection(source_winner, projected_winner)
-            else:
-                projected_winner.unlink(missing_ok=True)
-
-            source_promotion = _generation_promotion_decision_path(
-                experiment, generation_id, phase.name
+            _copy_yaml_projection(
+                _generation_summary_path(experiment, generation_id),
+                _summary_path(experiment),
             )
-            projected_promotion = _promotion_decision_path(experiment, phase.name)
-            if source_promotion.is_file():
-                _copy_yaml_projection(source_promotion, projected_promotion)
-            else:
-                projected_promotion.unlink(missing_ok=True)
 
-        _copy_yaml_projection(
-            _generation_summary_path(experiment, generation_id),
-            _summary_path(experiment),
+        _log_on_failure(
+            _refresh_published_pointer_and_projections,
+            "failed to refresh the current-generation pointer or compatibility caches "
+            "after publication; the published result is unaffected",
         )
 
-    _log_on_failure(
-        _refresh_published_pointer_and_projections,
-        "failed to refresh the current-generation pointer or compatibility caches "
-        "after publication; the published result is unaffected",
-    )
+    if absorbed.signum is not None:
+        log.warning(
+            "Shutdown signal %d arrived during the publication transaction for "
+            "generation %s; the committed publication wins and the shutdown is "
+            "honored at the next checkpoint before any new work starts.",
+            absorbed.signum,
+            generation_id,
+        )
 
 
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
@@ -1247,6 +1284,11 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         component_records: dict[str, dict[str, Any]] = {}
         try:
             for study_spec in suite.studies:
+                # A shutdown absorbed by a component's publication transaction
+                # (review v0.5.16 / blocker 1) must stop the suite before the
+                # next study starts: the committed component publication wins
+                # its own race, but no new work may begin afterward.
+                service_pending_shutdown()
                 for dep in study_spec.depends_on:
                     if dep not in results:
                         raise RuntimeError(
@@ -1297,61 +1339,75 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             # v0.5.15 / blocker 3): pre-commit validation, then the pointer
             # commit as the single final authoritative event; the record and
             # compatibility cache both move to best-effort, post-commit steps.
-            try:
-                _validate_suite_generation_publishable(suite, generation_id)
-                _write_yaml_atomic(
-                    _last_successful_suite_generation_path(suite),
-                    {"suite": suite.suite, "suite_generation_id": generation_id},
-                )
-            except BaseException as exc:
-                error_class = type(exc).__name__
-                _persist_terminal_failure(
-                    lambda: _write_suite_generation_state(
+            # The same absorb window applies (review v0.5.16 / blocker 1): a
+            # shutdown arriving mid-transaction must not reclassify the
+            # committed suite publication.
+            with absorb_shutdown_signals() as absorbed:
+                try:
+                    _validate_suite_generation_publishable(suite, generation_id)
+                    _write_yaml_atomic(
+                        _last_successful_suite_generation_path(suite),
+                        {"suite": suite.suite, "suite_generation_id": generation_id},
+                    )
+                except BaseException as exc:
+                    error_class = type(exc).__name__
+                    _persist_terminal_failure(
+                        lambda: _write_suite_generation_state(
+                            suite,
+                            generation_id=generation_id,
+                            state="publication_failed",
+                            started_at=started_at,
+                            ended_at=ended_at,
+                            error_class=error_class,
+                            publish_current=True,
+                        )
+                    )
+                    raise
+
+                def _write_published_suite_record() -> None:
+                    """Step 4: write the immutable suite record once, state ``published``."""
+                    _write_suite_generation_state(
                         suite,
                         generation_id=generation_id,
-                        state="publication_failed",
+                        state="published",
                         started_at=started_at,
                         ended_at=ended_at,
-                        error_class=error_class,
-                        publish_current=True,
+                        publish_current=False,
                     )
-                )
-                raise
 
-            def _write_published_suite_record() -> None:
-                """Step 4: write the immutable suite record once, state ``published``."""
-                _write_suite_generation_state(
-                    suite,
-                    generation_id=generation_id,
-                    state="published",
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    publish_current=False,
+                _log_on_failure(
+                    _write_published_suite_record,
+                    "failed to write the immutable suite generation record after "
+                    "publication; the published result is unaffected",
                 )
 
-            _log_on_failure(
-                _write_published_suite_record,
-                "failed to write the immutable suite generation record after "
-                "publication; the published result is unaffected",
-            )
+                def _refresh_published_suite_pointer_and_cache() -> None:
+                    """Step 5: drive the pointer to ``published``, refresh the cache (best-effort)."""
+                    _write_suite_generation_state(
+                        suite,
+                        generation_id=generation_id,
+                        state="published",
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        write_record=False,
+                    )
+                    _copy_yaml_projection(immutable_summary, _suite_summary_path(suite))
 
-            def _refresh_published_suite_pointer_and_cache() -> None:
-                """Step 5: drive the pointer to ``published``, refresh the cache (best-effort)."""
-                _write_suite_generation_state(
-                    suite,
-                    generation_id=generation_id,
-                    state="published",
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    write_record=False,
+                _log_on_failure(
+                    _refresh_published_suite_pointer_and_cache,
+                    "failed to refresh the current suite-generation pointer or compatibility "
+                    "cache after publication; the published result is unaffected",
                 )
-                _copy_yaml_projection(immutable_summary, _suite_summary_path(suite))
 
-            _log_on_failure(
-                _refresh_published_suite_pointer_and_cache,
-                "failed to refresh the current suite-generation pointer or compatibility "
-                "cache after publication; the published result is unaffected",
-            )
+            if absorbed.signum is not None:
+                log.warning(
+                    "Shutdown signal %d arrived during the suite publication "
+                    "transaction for suite generation %s; the committed "
+                    "publication wins and the shutdown is honored at the next "
+                    "checkpoint.",
+                    absorbed.signum,
+                    generation_id,
+                )
         except BaseException as exc:
             failed_error_class = type(exc).__name__
             # Mirrors the experiment-level guard in _run_experiment_outcome: if

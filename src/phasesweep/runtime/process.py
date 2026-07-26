@@ -593,6 +593,98 @@ def _service_deferred_shutdown() -> None:
         _shutdown_handler(signum, None)
 
 
+def service_pending_shutdown() -> None:
+    """Deliver a shutdown signal absorbed by an earlier one-way commit window.
+
+    Explicit checkpoint counterpart to :func:`absorb_shutdown_signals`: a
+    caller that must not start new work after an absorbed shutdown (e.g. the
+    suite loop before its next study) calls this at its decision point. A
+    no-op when nothing is pending.
+
+    Raises:
+        PhaseSweepShutdown: Via ``_shutdown_handler``, when an absorbed
+            shutdown signal is still pending.
+
+    """
+    _service_deferred_shutdown()
+
+
+@dataclass
+class AbsorbedShutdown:
+    """Outcome of one :func:`absorb_shutdown_signals` window."""
+
+    signum: int | None = None
+
+
+@contextlib.contextmanager
+def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
+    """Make a one-way commit window win any race against a shutdown signal.
+
+    :func:`defer_shutdown_signals` delays a shutdown only to *service* it at
+    window exit — correct for launch bookkeeping, but wrong for a publication
+    transaction: once the last-success pointer has committed, a shutdown
+    delivered at window exit would propagate as a failure for work that is
+    already durably successful (review v0.5.16 / blocker 1). This window
+    instead *absorbs* the signal: the transaction runs to completion, the
+    window exit reports the absorbed signal on the yielded
+    :class:`AbsorbedShutdown` instead of raising, and the signal stays
+    recorded in the module's deferred-shutdown marker so a later checkpoint
+    (:func:`service_pending_shutdown`, or any :func:`defer_shutdown_signals`
+    exit, e.g. the next trial launch) still honors it before new work starts.
+
+    Deterministic race outcome: a shutdown that arrives before this window
+    opens raises normally and no publication happens; one that arrives inside
+    the window loses to the commit and is delivered afterward.
+
+    Signals kernel-queued to this thread during the window are drained
+    synchronously via ``signal.sigtimedwait`` while still blocked, so they can
+    never fire as an exception at window exit. On platforms without
+    ``sigtimedwait``, a queued thread-directed signal is delivered after the
+    window closes (razor-thin race); the on-disk outcome is still protected by
+    the write-once terminal record. Signals routed through another unblocked
+    thread run the Python handler mid-window, which records them via the
+    Python-level deferral exactly like :func:`defer_shutdown_signals`.
+
+    Yields:
+        AbsorbedShutdown: ``signum`` is the absorbed shutdown signal, or
+        ``None`` when no shutdown arrived during the window.
+
+    """
+    global _main_thread_defer_depth  # noqa: PLW0603
+    global _deferred_shutdown_signum  # noqa: PLW0603
+    absorbed = AbsorbedShutdown()
+    is_main = threading.current_thread() is threading.main_thread()
+    old_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    if is_main:
+        _main_thread_defer_depth += 1
+    try:
+        yield absorbed
+    finally:
+        drained: int | None = None
+        if old_mask is not None and hasattr(signal, "sigtimedwait"):
+            # Consume any kernel-queued shutdown signal for this thread while
+            # it is still blocked, so restoring the mask cannot deliver it as
+            # an asynchronous exception after the window closes.
+            while True:
+                info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
+                if info is None:
+                    break
+                drained = info.si_signo
+        if old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if is_main:
+            _main_thread_defer_depth -= 1
+            recorded = _deferred_shutdown_signum
+            absorbed.signum = recorded if recorded is not None else drained
+            if recorded is None and drained is not None:
+                # Keep the drained signal pending for the next checkpoint.
+                _deferred_shutdown_signum = drained
+        else:
+            absorbed.signum = drained
+
+
 def _register(proc: subprocess.Popen) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 

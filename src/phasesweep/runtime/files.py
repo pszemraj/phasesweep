@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import logging
 import os
 import secrets
 import stat
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, cast
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+
+log = logging.getLogger("phasesweep.runtime.files")
 
 POSIX_RUNTIME_ERROR = (
     "phasesweep execution currently requires a POSIX platform. It relies on "
@@ -307,13 +310,30 @@ def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
 
 
 def fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory after an atomic replace."""
+    """Best-effort fsync for a directory after an atomic replace or create.
+
+    Never raises. By the time this runs, the caller's rename or exclusive
+    create has already changed the destination, so a directory-durability
+    failure here must not be reported as a failed commit: a caller reacting
+    to the exception would wrongly reclassify an already-authoritative write
+    (e.g. a committed last-success pointer marked ``publication_failed``,
+    review v0.5.16 / blocker 1). The failure is logged as a durability
+    warning instead — the commit stands; only its crash-durability is
+    uncertain.
+    """
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:
         return
     try:
         os.fsync(fd)
+    except OSError:
+        log.warning(
+            "Directory fsync failed after an atomic write in %s; the write is "
+            "committed but its durability across a crash is uncertain.",
+            path,
+            exc_info=True,
+        )
     finally:
         os.close(fd)
 

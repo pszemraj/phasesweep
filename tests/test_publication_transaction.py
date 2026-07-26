@@ -15,7 +15,9 @@ failures must never replace the primary exception.
 from __future__ import annotations
 
 import logging
+import os
 import signal
+import stat
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,7 @@ from phasesweep.engine.state import (
     _suite_generation_record_path,
     _suite_summary_path,
 )
+from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import make_experiment, write_trainer, write_yaml
 
@@ -246,6 +249,210 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     published = read_winner(experiment, "p")
     assert published is not None
     assert published.generation_id == first_generation
+
+
+def test_directory_fsync_failure_after_pointer_rename_still_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory-fsync failure after the pointer rename cannot fail the publication.
+
+    ``os.replace`` is the commit; the directory fsync after it is durability
+    bookkeeping. Pre-fix, an fsync error surfaced as an exception from the
+    pointer write and the already-committed publication was rewritten as
+    ``publication_failed`` (review v0.5.16 / blocker 1, window 1).
+    """
+    experiment = _stored_experiment(tmp_path)
+
+    real_fsync = os.fsync
+
+    def flaky_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr("phasesweep.runtime.files.os.fsync", flaky_fsync)
+
+    winners = run_experiment(experiment)
+
+    assert set(winners) == {"p"}
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    assert _record_state(experiment, generation_id) == "published"
+    assert _current_pointer_state(experiment) == "published"
+
+
+def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A KeyboardInterrupt escaping a post-commit step must not reclassify the publication.
+
+    ``_log_on_failure`` used to catch only ``Exception``; a control-flow
+    exception from the record write propagated into the outer terminal
+    handler and rewrote the committed publication as ``failed`` (review
+    v0.5.16 / blocker 1, window 2).
+    """
+    experiment = _stored_experiment(tmp_path)
+
+    def interrupt_record_write(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(engine_run, "_write_generation_record_once", interrupt_record_write)
+
+    winners = run_experiment(experiment)
+
+    assert set(winners) == {"p"}
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    # The record write itself was interrupted, but the current pointer still
+    # reached "published" via step 5 and nothing rewrote the outcome.
+    assert _current_pointer_state(experiment) == "published"
+
+
+def test_terminal_callback_control_flow_exception_cannot_replace_success(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic callback raising KeyboardInterrupt cannot fail a published run."""
+    experiment = _stored_experiment(tmp_path)
+
+    def interrupting_callback(_report: TerminalReport) -> None:
+        raise KeyboardInterrupt("diagnostic consumer interrupted")
+
+    winners = run_experiment(experiment, terminal_callback=interrupting_callback)
+
+    assert set(winners) == {"p"}
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    assert _record_state(experiment, generation_id) == "published"
+
+
+def test_terminal_callback_control_flow_exception_cannot_replace_failure(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic callback raising KeyboardInterrupt cannot mask the primary error."""
+    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        max_consecutive_failures=1,
+    )
+
+    def interrupting_callback(_report: TerminalReport) -> None:
+        raise KeyboardInterrupt("diagnostic consumer interrupted")
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment, terminal_callback=interrupting_callback)
+
+
+def test_shutdown_signal_during_publication_is_absorbed_until_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown signal racing the publication transaction loses to the commit.
+
+    The signal lands mid-transaction (during pre-commit validation); the
+    publication must still commit, the run must return success, and the
+    shutdown must be delivered at the next checkpoint — never rewritten into
+    a ``failed``/``publication_failed`` state for the committed generation
+    (review v0.5.16 / blocker 1, window 2).
+    """
+    experiment = _stored_experiment(tmp_path)
+
+    original_validate = engine_run._validate_generation_publishable
+
+    def validate_then_signal(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+
+    try:
+        winners = run_experiment(experiment)
+
+        assert set(winners) == {"p"}
+        generation_id = _last_successful_generation_id(experiment)
+        assert generation_id is not None
+        assert _record_state(experiment, generation_id) == "published"
+        assert _current_pointer_state(experiment) == "published"
+
+        # The absorbed shutdown is still honored before any new work starts.
+        with pytest.raises(PhaseSweepShutdown) as exc_info:
+            runtime_process.service_pending_shutdown()
+        assert exc_info.value.signum == signal.SIGTERM
+    finally:
+        runtime_process._deferred_shutdown_signum = None
+
+
+def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_study(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown that loses to a component's publication still stops the suite.
+
+    The committed component publication wins its own race, but the absorbed
+    shutdown must be serviced before the next study starts — the suite must
+    not keep launching new work after the operator asked it to stop.
+    """
+    trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            f"""
+            suite: absorb_suite
+            defaults:
+              workdir: {tmp_path}/runs
+              storage: sqlite:///{tmp_path}/suite.db
+              provenance: {{revision: test-v1}}
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            studies:
+              - name: one
+                phases:
+                  - name: p
+                    n_trials: 1
+                    sampler: {{ type: random, seed: 0 }}
+                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+              - name: two
+                phases:
+                  - name: p
+                    n_trials: 1
+                    sampler: {{ type: random, seed: 0 }}
+                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+            """,
+        )
+    )
+    assert isinstance(config, Suite)
+
+    original_validate = engine_run._validate_generation_publishable
+    signalled = {"done": False}
+
+    def validate_then_signal(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        if not signalled["done"]:
+            signalled["done"] = True
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+
+    try:
+        with pytest.raises(PhaseSweepShutdown) as exc_info:
+            run_suite(config)
+        assert exc_info.value.signum == signal.SIGTERM
+
+        # Study one's component publication committed and survived.
+        component_one = config.experiment_for_study(config.studies[0])
+        assert _last_successful_generation_id(component_one) is not None
+        # Study two never started: no generation namespace was ever claimed.
+        component_two = config.experiment_for_study(config.studies[1])
+        assert _last_successful_generation_id(component_two) is None
+        assert not _generation_path(component_two).is_file()
+    finally:
+        runtime_process._deferred_shutdown_signum = None
 
 
 # --------------------------------------------------------------------------

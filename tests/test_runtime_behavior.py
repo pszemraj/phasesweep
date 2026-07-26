@@ -1451,6 +1451,47 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
             signal.signal(sig, handler)
 
 
+def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint() -> None:
+    """A shutdown inside an absorb window is reported, not raised — then honored later.
+
+    The publication transaction uses this to win its race against a shutdown
+    signal deterministically (review v0.5.16 / blocker 1): the window exit
+    reports the absorbed signal on the yielded object instead of raising, and
+    the next ``defer_shutdown_signals()`` exit (e.g. the next trial launch)
+    still delivers the shutdown before new work starts.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        install_signal_handlers()
+
+        with runtime_process.absorb_shutdown_signals() as absorbed:
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Give an unblocked sibling thread's delivery path (if any) a
+            # chance to run the Python-level handler; either delivery route
+            # must end up recorded, never raised, inside the window.
+            time.sleep(0.05)
+
+        assert absorbed.signum == signal.SIGTERM
+
+        # The absorbed signal is still pending: the next deferral checkpoint
+        # delivers it before any new work could start.
+        with (
+            pytest.raises(runtime_process.PhaseSweepShutdown) as exc_info,
+            runtime_process.defer_shutdown_signals(),
+        ):
+            pass
+        assert exc_info.value.signum == signal.SIGTERM
+    finally:
+        runtime_process._deferred_shutdown_signum = None
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_service_pending_shutdown_is_noop_without_absorbed_signal() -> None:
+    """The explicit checkpoint does nothing when no shutdown was absorbed."""
+    runtime_process.service_pending_shutdown()
+
+
 def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
     """A scope entered under a stale ownership claim reinstalls the OS handlers.
 
