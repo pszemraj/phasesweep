@@ -49,6 +49,7 @@ from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
     _process_group_alive,
+    read_boot_id,
 )
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import slow_mcp_config_text
@@ -110,6 +111,24 @@ def _claim_runner_handle(
             launch_state="launching",
         )
     )
+
+
+def _run_main_in_project(argv: list[str], *, cwd: Path) -> int:
+    """Invoke the runner in-process with the project cwd it now requires.
+
+    The real runner is spawned in the server's state directory and enters
+    ``--cwd`` itself, so an in-process call must supply one and put the
+    interpreter back where it started.
+
+    :param list[str] argv: Runner arguments excluding ``--cwd``.
+    :param Path cwd: Project directory to pass as ``--cwd``.
+    :return int: The runner's exit code.
+    """
+    original = Path.cwd()
+    try:
+        return mcp_runner.main([*argv, "--cwd", str(cwd)])
+    finally:
+        os.chdir(original)
 
 
 def test_runner_persists_terminal_evidence_before_snapshot_finalization(
@@ -320,7 +339,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
         _experiment_lock(experiment),
         pytest.raises(ExperimentLockBusyError),
     ):
-        mcp_runner.main(
+        _run_main_in_project(
             [
                 "--run-id",
                 run_id,
@@ -336,7 +355,8 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
                 "cancel_me",
                 "--started-at",
                 started_at,
-            ]
+            ],
+            cwd=tmp_path,
         )
 
     status = json.loads(status_path.read_text())
@@ -559,7 +579,7 @@ phases:
     status_path = store.status_path(run_id)
 
     assert (
-        mcp_runner.main(
+        _run_main_in_project(
             [
                 "--run-id",
                 run_id,
@@ -575,7 +595,8 @@ phases:
                 "record_fail",
                 "--started-at",
                 started_at,
-            ]
+            ],
+            cwd=tmp_path,
         )
         == 0
     )
@@ -876,6 +897,122 @@ def test_runner_refuses_to_persist_handle_without_linux_process_identity(
     assert RunStore(tmp_path / "state").get("r0") is None
 
 
+def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    started_at = utc_now_iso()
+    _claim_runner_handle(
+        store,
+        run_id="r-boot",
+        config_sha256="a" * 64,
+        started_at=started_at,
+    )
+
+    mcp_runner._persist_spawned_handle(
+        state_dir=tmp_path / "state",
+        run_id="r-boot",
+        experiment_id="cancel_me",
+        config_sha256="a" * 64,
+        started_at=started_at,
+        allow_cancel=False,
+    )
+
+    handle = store.get("r-boot")
+    assert handle is not None
+    assert handle.boot_id is not None
+    assert handle.boot_id == read_boot_id()
+
+
+def _runner_argv(store: RunStore, *, run_id: str, config: Path, started_at: str) -> list[str]:
+    """Build the runner argv the server constructs, minus ``--cwd``."""
+    return [
+        "--run-id",
+        run_id,
+        "--config",
+        str(config),
+        "--config-sha256",
+        "a" * 64,
+        "--status-path",
+        str(store.status_path(run_id)),
+        "--state-dir",
+        str(store.log_path(run_id).parent.parent),
+        "--experiment-id",
+        "cancel_me",
+        "--started-at",
+        started_at,
+    ]
+
+
+def test_runner_enters_the_project_directory_after_its_identity_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--cwd`` replaces the ambient cwd the server used to hand the child.
+
+    The chdir happens after ``_persist_spawned_handle``, so the first thing
+    that can observe the project directory already has a durable identity the
+    server can find and terminate.
+    """
+    store = RunStore(tmp_path / "state")
+    project = tmp_path / "project"
+    project.mkdir()
+    started_at = utc_now_iso()
+    _claim_runner_handle(store, run_id="r-cwd", config_sha256="a" * 64, started_at=started_at)
+    observed: dict[str, object] = {}
+
+    def record_cwd(*_args: object, **_kwargs: object) -> None:
+        observed["cwd"] = Path.cwd()
+        observed["handle"] = store.get("r-cwd")
+        raise ValueError("stop once the project directory is in effect")
+
+    monkeypatch.setattr(mcp_runner, "load_experiment_snapshot", record_cwd)
+
+    with pytest.raises(RuntimeError, match="stop once the project directory"):
+        _run_main_in_project(
+            _runner_argv(
+                store,
+                run_id="r-cwd",
+                config=tmp_path / "unread.yaml",
+                started_at=started_at,
+            ),
+            cwd=project,
+        )
+
+    assert observed["cwd"] == project.resolve()
+    handle = observed["handle"]
+    assert handle is not None and handle.launch_state == "spawned"
+
+
+def test_runner_persists_identity_even_when_the_project_directory_is_gone(
+    tmp_path: Path,
+) -> None:
+    """An unusable ``--cwd`` must not cost the run its durable identity.
+
+    If the chdir ran before the handle write, this failure would leave a
+    ``launching`` handle that only operator recovery could retire.
+    """
+    store = RunStore(tmp_path / "state")
+    started_at = utc_now_iso()
+    _claim_runner_handle(store, run_id="r-nocwd", config_sha256="a" * 64, started_at=started_at)
+
+    with pytest.raises(FileNotFoundError):
+        _run_main_in_project(
+            _runner_argv(
+                store,
+                run_id="r-nocwd",
+                config=tmp_path / "unread.yaml",
+                started_at=started_at,
+            ),
+            cwd=tmp_path / "does-not-exist",
+        )
+
+    handle = store.get("r-nocwd")
+    assert handle is not None
+    assert handle.launch_state == "spawned"
+    status = json.loads(store.status_path("r-nocwd").read_text())
+    assert status["returncode"] == 1
+    assert status["error_class"] == "FileNotFoundError"
+
+
 def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     store = RunStore(tmp_path / "state")
@@ -908,6 +1045,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         "cancel_me",
         "--started-at",
         started_at,
+        "--cwd",
+        str(tmp_path),
     ]
     with open_private_text(log_path, "w") as log_file:
         proc = subprocess.Popen(
@@ -983,6 +1122,8 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
         "cancel_me",
         "--started-at",
         started_at,
+        "--cwd",
+        str(tmp_path),
     ]
     with open_private_text(log_path, "w") as log_file:
         proc = subprocess.Popen(

@@ -16,12 +16,24 @@ import pytest
 
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.process import is_pid_zombie, read_proc_starttime
+from phasesweep.runtime.process import is_pid_zombie, read_boot_id, read_proc_starttime
 from tests.mcp_helpers import make_run_handle, write_run_status
 
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
+
+
+def _earlier_boot_id() -> str:
+    """Return a boot id that cannot be this host's current one.
+
+    :return str: Boot id differing from ``read_boot_id()``.
+    """
+    current = read_boot_id()
+    if current is None:
+        pytest.skip("boot id unavailable on this platform")
+    other = "0" * len(current)
+    return other if other != current else "1" * len(current)
 
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
@@ -198,6 +210,8 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
         ("launch_state", "bogus"),
         ("started_at", "not-a-timestamp"),
         ("started_at", "2026-07-17T12:00:00"),
+        ("boot_id", ""),
+        ("boot_id", 12345),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
@@ -210,7 +224,10 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
     assert store.list_handles() == []
 
 
-@pytest.mark.parametrize("field,value", [("pid", os.getpid()), ("pgid", os.getpid())])
+@pytest.mark.parametrize(
+    "field,value",
+    [("pid", os.getpid()), ("pgid", os.getpid()), ("boot_id", "a-boot-id")],
+)
 def test_launching_handle_cannot_have_process_identity(
     tmp_path: Path, field: str, value: object
 ) -> None:
@@ -500,6 +517,128 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
     assert marker["pid_starttime"] == 111
     identity = store.cleanup_identity(pending)
     assert (identity.pid, identity.pgid, identity.pid_starttime) == (4242, 4242, 111)
+
+
+def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    boot_id = read_boot_id() or "test-boot-id"
+    handle = replace(make_run_handle(run_id="exp-1", pid=4242, starttime=111), boot_id=boot_id)
+
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+
+    loaded = store.get("exp-1")
+    assert loaded == handle
+    assert loaded.boot_id == boot_id
+    assert json.loads(store.cleanup_uncertain_path("exp-1").read_text())["boot_id"] == boot_id
+    assert store.cleanup_identity(loaded).boot_id == boot_id
+
+
+@pytest.mark.parametrize("boot_id", ["", 12345, True])
+def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64, pid=999999, starttime=111)
+    store.create(handle)
+    private_atomic_write_text(
+        store.cleanup_uncertain_path("exp-1"),
+        json.dumps(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": boot_id,
+            }
+        ),
+    )
+
+    assert not store.cleanup_uncertain(handle)
+
+
+def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) -> None:
+    # PID and starttime are this live process's, so only the boot id can prove
+    # the runner is gone. It does: nothing survives a reboot, so the run derives
+    # terminal instead of parking in cleanup-uncertain recovery, and no signal
+    # is ever aimed at whatever inherited those numbers after the reboot.
+    store = RunStore(tmp_path / "state")
+    starttime = read_proc_starttime(os.getpid())
+    if starttime is None:
+        pytest.skip("/proc starttime unavailable (non-Linux)")
+    handle = replace(
+        make_run_handle(run_id="exp-1", pid=os.getpid(), starttime=starttime),
+        boot_id=_earlier_boot_id(),
+    )
+    store.create(handle)
+
+    assert store.state(handle) == "failed"
+    assert not store.cleanup_uncertain(handle)
+    assert not store.cleanup_recovery_required(handle)
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+
+
+def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path: Path) -> None:
+    # Same identity as the boot-mismatch case minus the boot id: an older
+    # persisted handle cannot rule out PID reuse, so it must still fail closed.
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    assert handle.boot_id is None
+    store.create(handle)
+
+    assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+
+
+def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = replace(
+        make_run_handle(run_id="exp-1", pid=999999, starttime=111),
+        boot_id=_earlier_boot_id(),
+    )
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+
+    assert store.cleanup_uncertain(handle)
+    assert store.state(handle) == "failed"
+    assert not store.cleanup_uncertain_path("exp-1").exists()
+
+
+def test_earlier_boot_resolves_terminal_cleanup_uncertain_status(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = replace(
+        make_run_handle(run_id="exp-1", experiment_id="exp", pid=999999, starttime=111),
+        boot_id=_earlier_boot_id(),
+    )
+    store.create(handle)
+    write_run_status(
+        store,
+        "exp-1",
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    assert store.state(handle) == "failed"
+    assert not store.cleanup_recovery_required(handle)
+    assert store.live_run_for("exp") is None
+
+
+def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> None:
+    # Liveness, not just cleanup: a live PID+starttime match must not be read
+    # as a live runner once the recorded boot differs from this one.
+    store = RunStore(tmp_path / "state")
+    starttime = read_proc_starttime(os.getpid())
+    if starttime is None:
+        pytest.skip("/proc starttime unavailable (non-Linux)")
+    handle = replace(
+        make_run_handle(run_id="exp-1", pid=os.getpid(), starttime=starttime),
+        boot_id=_earlier_boot_id(),
+    )
+    store.create(handle)
+    write_run_status(store, "exp-1", returncode=0, result_snapshot_state="pending")
+
+    assert store.snapshot_recovery_required(handle)
+    assert not store.snapshot_recovery_required(replace(handle, boot_id=None))
 
 
 def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:

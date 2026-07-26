@@ -8,8 +8,12 @@ import json
 import logging
 import os
 import stat
+import subprocess
+import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
@@ -45,7 +49,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runner import main as runner_main
+from phasesweep.mcp.runner import main as _runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
@@ -87,6 +91,25 @@ def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None)
         allow=allow,
         filename="srv.catalog.yaml",
     )
+
+
+def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
+    """Invoke the detached runner in-process with the project cwd it requires.
+
+    The real runner is spawned in the server's state directory and enters its
+    ``--cwd`` argument itself, so an in-process call must supply one and put
+    the interpreter back where it started.
+
+    :param list[str] argv: Runner arguments excluding ``--cwd``.
+    :param Path | None cwd: Project directory to pass; defaults to this
+        process's own directory, which is where the runner used to start.
+    :return int: The runner's exit code.
+    """
+    original = Path.cwd()
+    try:
+        return _runner_main([*argv, "--cwd", str(original if cwd is None else cwd)])
+    finally:
+        os.chdir(original)
 
 
 def _claim_runner_handle(
@@ -833,14 +856,106 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
 
 
-def test_launch_spawns_runner_with_registered_cwd(
+def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Capture the full child process contract, including its environment.
+
+    ``patch_popen_capture`` records only argv and cwd; the pre-identity trust
+    boundary is also enforced through ``env``.
+
+    :param pytest.MonkeyPatch monkeypatch: Patcher used to replace ``Popen``.
+    :return dict[str, Any]: Dict populated with ``cmd``, ``cwd``, and ``env``.
+    """
+    captured: dict[str, Any] = {}
+
+    class DummyProc:
+        pid = os.getppid()
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> DummyProc:
+        captured["cmd"] = cmd
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
+        return DummyProc()
+
+    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    return captured
+
+
+def _launch_with_poison_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
+    """Launch against a project dir seeded with import-time code and capture the spawn.
+
+    The project directory holds every hook that runs before the runner's first
+    statement: a ``phasesweep`` shadow package (found when the cwd is on
+    ``sys.path``), a ``sitecustomize`` (imported by ``site`` when it is
+    importable at all), and a ``PYTHONSTARTUP``/``PYTHONPATH`` pair exported
+    into the server's own environment. Each writes a marker file naming itself.
+
+    The patches are undone before returning so callers can spawn real children:
+    patching ``phasesweep.mcp.server.subprocess.Popen`` patches the one shared
+    ``subprocess`` module.
+
+    :param Path tmp_path: Test-scoped directory.
+    :param pytest.MonkeyPatch monkeypatch: Patcher for env and ``Popen``.
+    :return tuple[dict[str, Any], Path, Path, dict[str, str]]: Captured spawn,
+        project dir, marker dir, and the poisoned parent environment.
+    """
+    config = _config(tmp_path)
+    project = tmp_path / "project"
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    shadow = project / "phasesweep" / "mcp"
+    shadow.mkdir(parents=True)
+
+    def poison(path: Path, name: str) -> None:
+        path.write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(markers)!r}).joinpath({name!r}).write_text('executed')\n"
+        )
+
+    poison(project / "phasesweep" / "__init__.py", "shadow_package")
+    poison(shadow / "__init__.py", "shadow_mcp")
+    poison(shadow / "runner.py", "shadow_runner")
+    poison(project / "sitecustomize.py", "sitecustomize")
+    poison(project / "startup.py", "pythonstartup")
+
+    monkeypatch.setenv("PYTHONPATH", str(project))
+    monkeypatch.setenv("PYTHONSTARTUP", str(project / "startup.py"))
+    monkeypatch.setenv("PYTHONHOME", str(project))
+    monkeypatch.setenv("PYTHONEXECUTABLE", str(project / "python"))
+    app, _registry, _store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"srv": config},
+            allow=ALLOW_SIDE_EFFECTS,
+            cwd={"srv": project},
+        )
+    )
+    captured = _capture_spawn(monkeypatch)
+
+    app.launch("srv")
+
+    parent_env = dict(os.environ)
+    monkeypatch.undo()
+    return captured, project, markers, parent_env
+
+
+def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The child must not start inside the project it is about to run.
+
+    Interpreter startup from the experiment's directory executes project-local
+    code before the server can name the process it created (review v0.5.17 /
+    blocker 9), so ``Popen`` uses the server-owned state directory and the
+    project directory travels as an explicit argument the runner applies later.
+    """
     config = _config(tmp_path)
     runner_cwd = tmp_path / "runner-cwd"
     runner_cwd.mkdir()
-    app, _registry, _store = make_mcp_app(
+    app, registry, _store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
             {"srv": config},
@@ -852,7 +967,162 @@ def test_launch_spawns_runner_with_registered_cwd(
 
     app.launch("srv")
 
-    assert captured["cwd"] == str(runner_cwd.resolve())
+    assert captured["cwd"] == str(registry.state_dir)
+    assert captured["cwd"] != str(runner_cwd.resolve())
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--cwd") + 1] == str(runner_cwd.resolve())
+
+
+def test_launch_hardens_runner_interpreter_flags_and_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "attacker"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
+    monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker" / "startup.py"))
+    monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
+    monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    captured = _capture_spawn(monkeypatch)
+
+    app.launch("srv")
+
+    cmd = captured["cmd"]
+    assert cmd[0] == sys.executable
+    # The flags must precede -m, or the interpreter treats them as module args.
+    assert cmd[1:3] == ["-P", "-s"]
+    assert cmd[3:5] == ["-m", "phasesweep.mcp.runner"]
+    env = captured["env"]
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "PYTHONSTARTUP" not in env
+    assert "PYTHONEXECUTABLE" not in env
+    assert env["PYTHONNOUSERSITE"] == "1"
+    assert env["PHASESWEEP_KEEP_ME"] == "kept"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
+def test_spawned_runner_cannot_execute_project_local_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spawn a real child under the server's contract; no project code may run.
+
+    The runner module itself is not started (its import graph is irrelevant to
+    the question); the child instead reports which ``phasesweep`` the hardened
+    interpreter resolves and whether any poisoned hook left a marker.
+    """
+    captured, project, markers, _parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
+    resolved = tmp_path / "resolved.txt"
+    probe = (
+        "import pathlib, sys\n"
+        "import phasesweep\n"
+        "pathlib.Path(sys.argv[1]).write_text(phasesweep.__file__ + '\\n' + repr(sys.path))\n"
+    )
+    cmd = captured["cmd"]
+    flags = cmd[1 : cmd.index("-m")]
+
+    completed = subprocess.run(
+        [cmd[0], *flags, "-c", probe, str(resolved)],
+        cwd=captured["cwd"],
+        env=captured["env"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sorted(path.name for path in markers.iterdir()) == []
+    # Neither the resolved module nor any sys.path entry comes from the project.
+    assert str(project) not in resolved.read_text()
+
+
+def test_launch_records_the_current_boot_id_in_the_spawned_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+
+    run_id = app.launch("srv")["run_id"]
+
+    handle = store.get(run_id)
+    assert handle is not None
+    assert handle.boot_id == read_boot_id()
+
+
+def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reboot settles cleanup; the saved PGID now belongs to someone else.
+
+    Reached through a run left ``running`` by an unfinalized terminal snapshot,
+    which is the state a reboot mid-finalization leaves behind.
+    """
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    handle = replace(
+        make_run_handle(run_id="srv-boot", experiment_id="srv", pid=999999, starttime=111),
+        boot_id="0" * len(current_boot) if current_boot != "0" * len(current_boot) else "1",
+    )
+    store.create(handle)
+    write_run_status(store, "srv-boot", returncode=0, result_snapshot_state="pending")
+    signalled: list[tuple[object, ...]] = []
+
+    def record_kill(*args: object, **kwargs: object) -> bool:
+        signalled.append(args)
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", record_kill)
+    assert store.state(handle) == "running"
+
+    result = app.cancel("srv-boot")
+
+    assert signalled == []
+    assert result["cleanup_confirmed"] is True
+    # The orphaned pending snapshot is a separate operator concern from process
+    # cleanup, so it still asks for recovery.
+    assert result["recovery_required"] is True
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
+def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the test above: the poison is genuinely executable.
+
+    Reproducing the pre-fix contract - project cwd, no ``-P``/``-s``, inherited
+    environment - must import the shadow package, so a passing hardened case is
+    evidence about the fix rather than about an inert fixture.
+    """
+    _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
+    # PYTHONHOME alone would break the interpreter before it could import
+    # anything; drop it so the control isolates the cwd and PYTHONPATH hooks.
+    env = {name: value for name, value in parent_env.items() if name != "PYTHONHOME"}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import phasesweep.mcp.runner"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sorted(path.name for path in markers.iterdir()) == [
+        "shadow_mcp",
+        "shadow_package",
+        "shadow_runner",
+        "sitecustomize",
+    ]
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])

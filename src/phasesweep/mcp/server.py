@@ -53,11 +53,17 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
-from phasesweep.mcp.runs import RunHandle, RunState, RunStore, write_status_file
+from phasesweep.mcp.runs import (
+    RunHandle,
+    RunState,
+    RunStore,
+    identity_from_earlier_boot,
+    write_status_file,
+)
 from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
 from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
-from phasesweep.runtime.files import fsync_directory, open_private_text
-from phasesweep.runtime.process import kill_stale_group, read_proc_starttime
+from phasesweep.runtime.files import ensure_private_dir, fsync_directory, open_private_text
+from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc_starttime
 
 log = logging.getLogger("phasesweep.mcp.server")
 
@@ -237,6 +243,35 @@ AwaitTimeoutSeconds = Annotated[
         le=AWAIT_MAX_TIMEOUT_SECONDS,
     ),
 ]
+
+# Environment variables that make the interpreter execute code before the
+# detached runner's first statement. They are dropped from the child's
+# environment (review v0.5.17 / blocker 9); PYTHONNOUSERSITE backs up the
+# ``-s`` flag for the same reason.
+_PRE_IMPORT_CODE_ENV_VARS = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONEXECUTABLE",
+)
+
+
+def _runner_env() -> dict[str, str]:
+    """Build the detached runner's environment without pre-import code hooks.
+
+    Everything else the operator exported is preserved: the runner's trials
+    legitimately need ``PATH``, ``CUDA_*``, credentials, and the rest of the
+    ambient environment, so this strips exactly the variables that can run
+    code before ``phasesweep.mcp.runner`` gets control.
+
+    :return dict[str, str]: Copy of this server's environment with the
+        pre-import code hooks removed and ``PYTHONNOUSERSITE`` forced on.
+    """
+    env = {
+        name: value for name, value in os.environ.items() if name not in _PRE_IMPORT_CODE_ENV_VARS
+    }
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
 
 
 class _ToolPayload(BaseModel):
@@ -1303,17 +1338,24 @@ class PhaseSweepMCP:
                 # uncertainty, child trial PGIDs may still live, so keep the run
                 # counted as live and fail closed.
                 identity = self._runs.cleanup_identity(handle)
-                runner_group_gone = kill_stale_group(
+                # A recorded boot id from an earlier boot proves the runner and
+                # its trial descendants cannot exist, so signalling the saved
+                # PGID would only reach whatever inherited those numbers after
+                # the reboot. Skip the signal and treat cleanup as confirmed.
+                earlier_boot = identity_from_earlier_boot(identity.boot_id)
+                runner_group_gone = earlier_boot or kill_stale_group(
                     identity.pid,
                     identity.pid_starttime,
                     pgid=identity.pgid,
                     grace_seconds=30.0,
                 )
                 terminal_status = self._runs.recorded_terminal_status(handle)
-                confirmed = (
-                    runner_group_gone
-                    and terminal_status is not None
-                    and terminal_status.get("cleanup_confirmed") is True
+                confirmed = runner_group_gone and (
+                    earlier_boot
+                    or (
+                        terminal_status is not None
+                        and terminal_status.get("cleanup_confirmed") is True
+                    )
                 )
                 if confirmed:
                     self._runs.clear_cleanup_uncertain(handle)
@@ -1553,6 +1595,11 @@ class PhaseSweepMCP:
         status_path = self._runs.status_path(run_id)
         cmd = [
             sys.executable,
+            # -P: never prepend the cwd or script dir to sys.path. -s: no
+            # per-user site dir. Both close the pre-identity window described
+            # below; keep them together with the sanitized env.
+            "-P",
+            "-s",
             "-m",
             "phasesweep.mcp.runner",
             "--run-id",
@@ -1569,11 +1616,29 @@ class PhaseSweepMCP:
             reg.id,
             "--started-at",
             pending.started_at,
+            # The runner chdirs here itself once its identity is durable; see
+            # the trust-boundary note below for why Popen must not do it.
+            "--cwd",
+            str(reg.cwd),
         ]
         if reg.allow_cancel:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
+        # Pre-identity trust boundary (review v0.5.17 / blocker 9). Everything
+        # between exec and the runner's own durable handle write runs before
+        # this server can name the process it just created. Spawning with the
+        # experiment's project directory as cwd put that window inside the
+        # project's reach: interpreter startup would import a project-local
+        # `phasesweep/` shadow package or `sitecustomize.py`, and a
+        # PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected module would run
+        # earlier still. Any of it could fork+setsid out of the process group
+        # recorded below, after which "cleanup confirmed" would be a claim
+        # about an empty group. So the child starts in the server-owned state
+        # directory, with -P/-s and a sanitized environment, and receives the
+        # project directory as an explicit argument it applies only after its
+        # identity is on disk.
+        spawn_cwd = self._neutral_spawn_cwd()
         # Open the log here, hand the fd to the child, then close our copy. The
         # child keeps it. stdin is /dev/null so the runner never blocks on input.
         with open_private_text(log_path, "w") as log_file:
@@ -1583,7 +1648,8 @@ class PhaseSweepMCP:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # own session/pgid; survives restart; signal as a group
-                cwd=str(reg.cwd),
+                cwd=str(spawn_cwd),
+                env=_runner_env(),
             )
         handle = RunHandle(
             run_id=run_id,
@@ -1597,8 +1663,23 @@ class PhaseSweepMCP:
             started_at=pending.started_at,
             launch_state="spawned",
             allow_cancel=reg.allow_cancel,
+            boot_id=read_boot_id(),
         )
         return handle
+
+    def _neutral_spawn_cwd(self) -> Path:
+        """Return the server-owned directory the detached runner is spawned in.
+
+        The runner must not start in a directory the experiment's project can
+        write to, so use the operator-owned MCP state directory that already
+        holds run handles, logs, and config snapshots. It is re-validated here
+        because it must exist and stay owner-only at the moment of the spawn.
+
+        :return Path: Private state directory used as the child's initial cwd.
+        """
+        state_dir = self._registry.state_dir
+        ensure_private_dir(state_dir)
+        return state_dir
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Return whether the current catalog or launch handle permits cancellation.

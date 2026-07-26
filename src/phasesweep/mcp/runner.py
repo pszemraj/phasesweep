@@ -5,6 +5,12 @@ stdout/stderr redirected to a per-run log. Runs ``run_config`` and records the
 terminal cause in ``status.json`` so the server can report succeeded / failed /
 cancelled without scraping logs. The path it runs is supplied by the server
 from the frozen registry; it is never agent input.
+
+The server starts this process in its own state directory, not the
+experiment's, so that nothing in the project tree can execute during
+interpreter startup - before any identity exists to clean up (review v0.5.17 /
+blocker 9). The project directory arrives as ``--cwd`` and is entered here,
+after every import has run and this runner's identity is durable.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     defer_shutdown_signals,
     install_signal_handlers,
+    read_boot_id,
     read_proc_starttime,
 )
 
@@ -320,8 +327,22 @@ def _persist_spawned_handle(
             started_at=started_at,
             launch_state="spawned",
             allow_cancel=allow_cancel,
+            # Binds pid/pid_starttime to this boot: after a reboot the pair can
+            # name an unrelated process, and a reader that knows the boot
+            # differs can rule the runner dead without signalling anything.
+            boot_id=read_boot_id(),
         )
     )
+
+
+def _resolve_under(base: Path, path: Path) -> Path:
+    """Resolve a server-supplied path the way the project directory would have.
+
+    :param Path base: Experiment project directory passed as ``--cwd``.
+    :param Path path: Path argument received from the server.
+    :return Path: ``path`` unchanged when absolute, otherwise joined onto ``base``.
+    """
+    return path if path.is_absolute() else base / path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -338,9 +359,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--started-at", required=True)
+    # The catalog entry's frozen working directory. The process does not start
+    # there (see the module docstring), so it is an explicit argument.
+    parser.add_argument("--cwd", required=True, type=Path)
     parser.add_argument("--allow-cancel", action="store_true")
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
+
+    # This process starts in the server's state directory, so a relative path
+    # argument would no longer mean what it meant when the child inherited the
+    # project directory as its cwd. Bind every path to --cwd instead, before
+    # anything reads or writes.
+    project_cwd = args.cwd.expanduser()
+    config_path = _resolve_under(project_cwd, args.config)
+    status_path = _resolve_under(project_cwd, args.status_path)
+    state_dir = _resolve_under(project_cwd, args.state_dir)
 
     # This process's stdout/stderr are the server-redirected run log. Log to
     # stderr; never print to stdout here. (The engine's own run.log under the
@@ -375,16 +408,22 @@ def main(argv: list[str] | None = None) -> int:
         # self-write closes the restart-recovery window if the server dies
         # after Popen but before its own spawned-handle save reaches disk.
         _persist_spawned_handle(
-            state_dir=args.state_dir,
+            state_dir=state_dir,
             run_id=args.run_id,
             experiment_id=args.experiment_id,
             config_sha256=args.config_sha256,
             started_at=args.started_at,
             allow_cancel=args.allow_cancel,
         )
+        # Only now enter the experiment's project directory: every import has
+        # already resolved against the trusted interpreter path, and this
+        # runner's PID/PGID are durable, so anything the project directory
+        # influences from here on is attributable to a process the server can
+        # find and terminate.
+        os.chdir(project_cwd)
         try:
             config = load_experiment_snapshot(
-                args.config,
+                config_path,
                 args.config_sha256,
                 source=f"run snapshot {args.run_id}",
             )
@@ -501,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 status["generation_unavailable_reason"] = "engine_generation_not_claimed"
         _write_status(
-            args.status_path,
+            status_path,
             status,
             result_snapshot=result_snapshot,
             result_snapshot_error=result_snapshot_error,

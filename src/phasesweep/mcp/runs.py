@@ -31,7 +31,7 @@ from phasesweep.runtime.files import (
     unlock_file,
     validate_private_dir,
 )
-from phasesweep.runtime.process import is_same_live_process, reap_child
+from phasesweep.runtime.process import is_same_live_process, read_boot_id, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
@@ -42,6 +42,7 @@ __all__ = [
     "RunLaunchState",
     "RunState",
     "RunStore",
+    "identity_from_earlier_boot",
     "write_status_file",
 ]
 
@@ -65,6 +66,28 @@ def write_status_file(status_path: Path, payload: dict) -> None:
     private_atomic_write_text(status_path, json.dumps(payload, indent=2) + "\n")
 
 
+def identity_from_earlier_boot(boot_id: str | None) -> bool:
+    """Return whether a recorded boot identity proves its process cannot exist.
+
+    PID plus ``/proc`` start time is unique only within one boot: after a
+    reboot the kernel restarts both counters, so a saved pair can match an
+    unrelated process. A recorded boot id that differs from the current one
+    settles the question in the safe direction - nothing launched under the
+    earlier boot survived it, so the process and every descendant it ever had
+    are conclusively gone and cleanup needs no signal. An unknown boot id on
+    either side (a handle written before boot ids were recorded, or a host
+    without ``/proc/sys/kernel/random/boot_id``) yields ``False``, leaving the
+    caller's conservative same-boot behavior unchanged.
+
+    :param str | None boot_id: Boot identity recorded when the process launched.
+    :return bool: Whether both boot ids are known and differ.
+    """
+    if boot_id is None:
+        return False
+    current = read_boot_id()
+    return current is not None and current != boot_id
+
+
 @dataclass(frozen=True)
 class ProcessIdentity:
     """Persisted process identity used for PID-reuse-safe runner cleanup."""
@@ -72,6 +95,7 @@ class ProcessIdentity:
     pid: int | None
     pgid: int | None
     pid_starttime: int | None
+    boot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,9 @@ class RunHandle:
     started_at: str  # ISO-8601 UTC
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
+    # Boot that pid/pid_starttime belong to; None off-Linux and in handles
+    # written before boot ids were recorded.
+    boot_id: str | None = None
 
 
 class RunStore:
@@ -298,11 +325,14 @@ class RunStore:
             return None
         if parse_utc_iso(handle.started_at) is None:
             return None
+        if not _valid_optional_boot_id(handle.boot_id):
+            return None
         if handle.launch_state == "launching":
             if (
                 handle.pid is not None
                 or handle.pgid is not None
                 or handle.pid_starttime is not None
+                or handle.boot_id is not None
             ):
                 return None
         else:
@@ -332,10 +362,12 @@ class RunStore:
         (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
         cannot prove that its separately-sessioned trial descendants are gone,
         so it is marked cleanup-uncertain and remains ``running`` until
-        operator recovery records cleanup evidence. An unresolved pre-spawn
-        handle also remains ``running`` because a server restart cannot know
-        whether ``Popen`` completed before the crash; known launch failures
-        write terminal status explicitly.
+        operator recovery records cleanup evidence - unless its recorded boot
+        id differs from the current boot, which proves no process from that
+        boot survived and settles cleanup without signalling anything. An
+        unresolved pre-spawn handle also remains ``running`` because a server
+        restart cannot know whether ``Popen`` completed before the crash; known
+        launch failures write terminal status explicitly.
 
         Args:
             handle: The run handle to evaluate.
@@ -350,8 +382,11 @@ class RunStore:
         if handle.pid is not None:
             reap_child(handle.pid)
         status = self._read_status(handle)
+        # Read the boot verdict before the marker can be cleared below: the
+        # marker is part of the strongest identity this run has.
+        earlier_boot = self.from_earlier_boot(handle)
         if self.cleanup_uncertain(handle):
-            if status is not None and status.get("cleanup_confirmed") is True:
+            if (status is not None and status.get("cleanup_confirmed") is True) or earlier_boot:
                 with contextlib.suppress(OSError):
                     self.clear_cleanup_uncertain(handle)
             else:
@@ -373,6 +408,12 @@ class RunStore:
             # child has not self-persisted yet", so reserve concurrency until
             # a known launch error or operator recovery writes terminal status.
             return "running"
+        if earlier_boot:
+            # The host rebooted since this runner was spawned. Neither it nor
+            # any descendant it ever had can still hold a GPU or a lock, so
+            # cleanup is confirmed with no signal sent and the run derives
+            # terminal instead of parking in cleanup-uncertain recovery.
+            return "failed"
         if handle.pid_starttime is None:
             if self._cleanup_recovered(handle):
                 return "failed"
@@ -413,6 +454,7 @@ class RunStore:
             pid=handle.pid,
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
+            boot_id=handle.boot_id,
         )
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
         identity = existing if existing is not None and not candidate_has_identity else candidate
@@ -422,6 +464,7 @@ class RunStore:
             "pid": identity.pid,
             "pgid": identity.pgid,
             "pid_starttime": identity.pid_starttime,
+            "boot_id": identity.boot_id,
             "cleanup_confirmed": False,
         }
         private_atomic_write_text(
@@ -463,7 +506,20 @@ class RunStore:
             pid=handle.pid,
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
+            boot_id=handle.boot_id,
         )
+
+    def from_earlier_boot(self, handle: RunHandle) -> bool:
+        """Return whether this run's strongest identity predates the current boot.
+
+        Callers use this as a conclusive not-alive / cleanup-confirmed verdict:
+        it is safe to skip signalling a PID or process group entirely, because
+        the identity being verified cannot correspond to any live process.
+
+        :param RunHandle handle: Run handle whose recorded boot should be checked.
+        :return bool: Whether the recorded boot id is known and differs from this boot.
+        """
+        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id)
 
     def live_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the currently-running handle for an experiment, if any.
@@ -529,9 +585,10 @@ class RunStore:
 
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
         :return bool: True when a server marker or terminal runner status still
-            records cleanup uncertainty without matching recovery evidence.
+            records cleanup uncertainty without matching recovery evidence, and
+            the recorded identity does not already predate the current boot.
         """
-        if self.cleanup_uncertain(handle):
+        if self.cleanup_uncertain(handle) and not self.from_earlier_boot(handle):
             return True
         status = self._read_status(handle)
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
@@ -578,12 +635,14 @@ class RunStore:
         """Return whether a spawned handle still identifies a live runner.
 
         :param RunHandle handle: Persisted runner identity.
-        :return bool: True when PID and starttime still identify a non-zombie process.
+        :return bool: True when PID and starttime still identify a non-zombie
+            process of the boot the handle was written under.
         """
         return (
             handle.launch_state == "spawned"
             and handle.pid is not None
             and handle.pid_starttime is not None
+            and not identity_from_earlier_boot(handle.boot_id)
             and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 
@@ -647,7 +706,11 @@ class RunStore:
         :param Mapping[str, object] status: Terminal runner status payload.
         :return bool: Whether cleanup is uncertain and lacks recovery evidence.
         """
-        return status.get("cleanup_confirmed") is False and not self._cleanup_recovered(handle)
+        return (
+            status.get("cleanup_confirmed") is False
+            and not self._cleanup_recovered(handle)
+            and not self.from_earlier_boot(handle)
+        )
 
     def _cleanup_recovered(self, handle: RunHandle) -> bool:
         """Return whether operator recovery evidence confirms cleanup for this run.
@@ -712,17 +775,21 @@ class RunStore:
         pid = payload.get("pid")
         pgid = payload.get("pgid")
         pid_starttime = payload.get("pid_starttime")
+        boot_id = payload.get("boot_id")
         if not _valid_positive_optional_int(pid):
             return None
         if not _valid_positive_optional_int(pgid):
             return None
         if not _valid_positive_optional_int(pid_starttime):
             return None
+        if not _valid_optional_boot_id(boot_id):
+            return None
 
         return ProcessIdentity(
             pid=pid,
             pgid=pgid,
             pid_starttime=pid_starttime,
+            boot_id=boot_id,
         )
 
 
@@ -733,3 +800,12 @@ def _valid_positive_optional_int(value: object) -> bool:
     :return bool: Whether the value is ``None`` or a positive non-bool integer.
     """
     return value is None or (type(value) is int and value > 0)
+
+
+def _valid_optional_boot_id(value: object) -> bool:
+    """Return whether ``value`` is ``None`` or a non-empty ``str`` boot id.
+
+    :param object value: Value to validate.
+    :return bool: Whether the value is ``None`` or a non-empty string.
+    """
+    return value is None or (type(value) is str and bool(value))
