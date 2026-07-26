@@ -111,6 +111,8 @@ GPU locks key on canonical physical-device identity, not on how a token is spell
 
 Two caveats. If `nvidia-smi` cannot be read (missing binary, timeout, nonzero exit — normal on CPU-only hosts), indices stay their own identity: one spelling convention used consistently on a host still collides with itself, but a device set that *mixes* numeric indices with opaque tokens fails closed with a `RuntimeError`, because phasesweep cannot then tell whether the two forms name the same GPU. Use one convention per host, or fix `nvidia-smi`. And a `MIG-...` token locks on the MIG instance itself: phasesweep does not bind a MIG instance to its parent GPU, so a run holding a MIG instance and a run holding the whole parent device do not exclude each other.
 
+Upgrade note: builds before UUID canonicalization locked numeric devices under `gpu_<index>.lock`; this build locks the same card under its UUID-derived name, so the two lock namespaces do not exclude each other. Running an old and a new phasesweep concurrently on one host can therefore double-book a GPU — the exact failure canonicalization prevents within one version. Upgrade every phasesweep on a host together; leftover `gpu_<index>.lock` files from old builds are inert and safe to delete.
+
 When a GPU is assigned, the child environment defaults `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless the operator explicitly set another order.
 
 > [!WARNING]

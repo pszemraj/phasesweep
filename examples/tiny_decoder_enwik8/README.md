@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and top-ups matter.
+The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and top-ups matter. Because storage is in-memory, this smoke run never exercises the persistent-study resume paths — no-op replay, top-ups, or the durable phase-abort record; to check those on real hardware, point `storage:` at a scratch SQLite file (and add a `provenance:` entry) before re-invoking.
 
 Use the full three-phase example only when you intentionally want the longer experiment:
 
