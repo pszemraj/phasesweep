@@ -233,6 +233,8 @@ This is a workdir-artifact change, not a config-load failure. New publications w
 
 Results published by older builds (summaries without `schema_version`) remain readable through the previous identity-only check — nothing to migrate. But note the interpretation change: status and winner reads now report a published result under the metric name, goal, and phase comments *it* recorded, and add `published_config_matches_current` so an edited config is flagged instead of silently relabeling historical evidence. Editing run-control fields (`n_trials` top-ups, comments, throughput knobs) does not flag drift; editing the metric, extractor, search spaces, phase names/order, or inheritance does.
 
+Suite summaries got the same treatment one revision later (`schema_version: 3`): each study record now carries the path and SHA-256 of its component generation summary, and reads refuse a suite summary whose exposed winners are not anchored to those hash-verified components. Suite results published at schema 1/2 stay readable through the identity-only check; the next successful `run_suite` republishes at schema 3 with the anchors in place.
+
 ### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
 
 ```text

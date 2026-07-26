@@ -38,6 +38,7 @@ from phasesweep.engine.state import (
     _last_successful_suite_generation_id,
     _suite_generation_path,
     _suite_generation_record_path,
+    _suite_generation_summary_path,
     _suite_summary_path,
 )
 from phasesweep.runtime import process as runtime_process
@@ -934,6 +935,45 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
         "failed to refresh the current suite-generation pointer or compatibility cache" in r.message
         for r in caplog.records
     )
+
+
+def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
+    tmp_path: Path,
+) -> None:
+    """An edited suite summary or component summary fails read-side integrity
+    validation instead of presenting altered results as published (review
+    v0.5.17 gap hunt): the suite summary's winner facts are anchored to the
+    hash-covered component summaries it recorded at publication. The
+    experiment path has enforced this since the v0.5.16 manifest work; the
+    suite path previously trusted the summary text on identity alone."""
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    generation_id = _last_successful_suite_generation_id(suite)
+    assert generation_id is not None
+
+    summary_path = _suite_generation_summary_path(suite, generation_id)
+    original = summary_path.read_text()
+    summary = yaml.safe_load(original)
+    study = summary["studies"][0]
+    exposed = [item for item in study["phases"] if item.get("exposed")]
+    assert exposed, "test setup: suite must expose at least one winner"
+
+    # Spoof the published metric value in the suite summary itself.
+    exposed[0]["metric"] = exposed[0]["metric"] + 1.0
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    assert _last_successful_suite_generation_id(suite) is None
+
+    # Restore, then tamper the hash-anchored component summary instead.
+    summary_path.write_text(original)
+    assert _last_successful_suite_generation_id(suite) == generation_id
+    component_path = Path(study["component_summary_path"])
+    component_original = component_path.read_text()
+    component_path.write_text(component_original + "\n# tampered\n")
+    assert _last_successful_suite_generation_id(suite) is None
+
+    # Restoring both artifacts restores the published result.
+    component_path.write_text(component_original)
+    assert _last_successful_suite_generation_id(suite) == generation_id
 
 
 def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:

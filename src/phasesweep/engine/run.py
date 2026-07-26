@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
     Winner,
     _experiment_dir,
     _file_log_handler,
+    _file_sha256,
     _generation_artifact_manifest,
     _generation_dir,
     _generation_path,
@@ -71,6 +72,7 @@ from phasesweep.engine.state import (
     _suite_summary_path,
     _summary_path,
     _validate_generation_manifest,
+    _validate_suite_summary_integrity,
     _winner_path,
     _write_yaml_atomic,
     _write_yaml_exclusive,
@@ -1322,10 +1324,20 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 # (review v0.5.14 / blocker 2).
                 component = _run_experiment_outcome(experiment)
                 study_winners = dict(component.winners)
+                # The component summary's path and content hash anchor this
+                # study's exposed results for read-side integrity validation
+                # (review v0.5.17 gap hunt): the published generation
+                # namespace is immutable, so the hash taken here stays valid
+                # for the life of the artifact.
+                component_summary_path = _generation_summary_path(
+                    experiment, component.generation_id
+                )
                 component_records[study_spec.name] = {
                     "experiment": experiment.experiment,
                     "experiment_generation_id": component.generation_id,
                     "experiment_phase_fingerprints": dict(component.phase_fingerprints),
+                    "component_summary_path": str(component_summary_path),
+                    "component_summary_sha256": _file_sha256(component_summary_path),
                 }
                 exposed_winners, decision = _apply_study_promotion(
                     suite=suite,
@@ -1554,6 +1566,13 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
     missing = set(studies_by_name) - seen
     if missing:
         raise _fail(f"summary is missing study record(s) {sorted(missing)}")
+    try:
+        # Same integrity contract the read side enforces: the suite summary's
+        # own winner facts must be anchored to the hash-covered component
+        # summaries before the pointer may advance (review v0.5.17 gap hunt).
+        _validate_suite_summary_integrity(generation_id, summary)
+    except RuntimeError as exc:
+        raise _fail(str(exc)) from exc
 
 
 def _write_suite_generation_state(

@@ -308,7 +308,7 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 2
-SUITE_SUMMARY_SCHEMA_VERSION = 2
+SUITE_SUMMARY_SCHEMA_VERSION = 3
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
 
@@ -883,17 +883,146 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
     )
     if summary is None:
         return None
-    if summary.get("schema_version") not in (None, 1, SUITE_SUMMARY_SCHEMA_VERSION):
+    if summary.get("schema_version") not in (None, 1, 2, SUITE_SUMMARY_SCHEMA_VERSION):
         # A summary from a newer schema must not be silently misread.
         return None
-    # Component-generation manifests are validated at suite publication time
-    # (see engine.run._validate_suite_generation_publishable), where the
-    # config in hand is by definition the one that produced them. Read-side
-    # validation stops at the suite summary's identity: chasing component
-    # artifacts through the CURRENT compiled plan would fail legitimate
-    # historical reads after any suite edit, which the suite fingerprint
-    # already surfaces explicitly.
+    if summary.get("schema_version") == SUITE_SUMMARY_SCHEMA_VERSION:
+        # The summary's own winner facts must be anchored to the hash-covered
+        # component artifacts it recorded at publication, so an edited or
+        # partially written suite summary cannot present altered results as
+        # published (review v0.5.17 gap hunt). Historical reads survive suite
+        # config edits because the recorded paths and hashes are resolved
+        # directly, never through the CURRENT compiled plan; pre-v3 legacy
+        # summaries keep the identity-only gate above.
+        try:
+            _validate_suite_summary_integrity(generation_id, summary)
+        except RuntimeError:
+            log.warning(
+                "Suite last-success pointer target failed integrity validation",
+                exc_info=True,
+            )
+            return None
     return generation_id
+
+
+def _validate_suite_summary_integrity(
+    generation_id: str,
+    summary: Mapping[str, Any],
+) -> None:
+    """Validate a suite summary's winner facts against its recorded components.
+
+    Suite mirror of :func:`_validate_generation_manifest` (review v0.5.17 gap
+    hunt): the published suite summary is the authoritative read surface for
+    suite winners, so its per-study results must be anchored to hash-covered
+    component artifacts rather than trusted as bare text. Each study record
+    names its component generation summary by absolute path plus content
+    hash; the file must sit at ``generations/<component id>/summary.yaml``,
+    parse, and name the recorded experiment and generation — and every
+    exposed phase winner in the suite summary must appear verbatim (name,
+    trial number, metric value, generation id, attempt id) in one of those
+    verified component summaries. Promotion-adopted winners match the
+    promotion baseline's component summary. Runs pre-commit (before the suite
+    last-success pointer advances) and read-side (before a pointer target is
+    trusted).
+
+    :param str generation_id: Suite generation id, used for error text.
+    :param Mapping[str, Any] summary: Parsed suite summary payload.
+    :raises RuntimeError: A study record is malformed, a component summary is
+        missing, altered, or misidentified, or an exposed winner is not
+        anchored to any verified component summary.
+    """
+
+    def _fail(reason: str) -> RuntimeError:
+        """Build one uniformly labeled suite-integrity error.
+
+        :param str reason: Specific validation failure being reported.
+        :return RuntimeError: Error naming the suite generation and the reason.
+        """
+        return RuntimeError(
+            f"Suite generation {generation_id!r} summary integrity validation failed: {reason}"
+        )
+
+    records = summary.get("studies")
+    if not isinstance(records, list):
+        raise _fail("summary has no study records")
+
+    def _winner_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Return the identity tuple used to anchor one exposed winner.
+
+        :param Mapping[str, Any] item: One summary phase-winner entry.
+        :return tuple[Any, ...]: Name, trial number, metric value, and the
+            winner's generation/attempt identity.
+        """
+        return (
+            item.get("name"),
+            item.get("trial_number"),
+            item.get("metric"),
+            item.get("generation_id"),
+            item.get("attempt_id"),
+        )
+
+    component_winners: set[tuple[Any, ...]] = set()
+    for record in records:
+        if not isinstance(record, Mapping) or not isinstance(record.get("name"), str):
+            raise _fail("summary study record is malformed")
+        name = str(record["name"])
+        component_generation = record.get("experiment_generation_id")
+        recorded_path = record.get("component_summary_path")
+        recorded_sha = record.get("component_summary_sha256")
+        if (
+            not isinstance(component_generation, str)
+            or not component_generation
+            or not isinstance(recorded_path, str)
+            or not recorded_path
+            or not isinstance(recorded_sha, str)
+        ):
+            raise _fail(f"study {name!r} has no component summary reference")
+        target = Path(recorded_path)
+        expected_suffix = Path("generations") / component_generation / "summary.yaml"
+        if not target.is_absolute() or target.parts[-3:] != expected_suffix.parts:
+            raise _fail(
+                f"study {name!r} component summary path does not name its "
+                "recorded generation namespace"
+            )
+        try:
+            content = target.read_bytes()
+        except OSError as exc:
+            raise _fail(f"study {name!r} component summary is missing or unreadable") from exc
+        if hashlib.sha256(content).hexdigest() != recorded_sha:
+            raise _fail(f"study {name!r} component summary does not match its recorded hash")
+        try:
+            payload = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise _fail(f"study {name!r} component summary is not parseable") from exc
+        if not isinstance(payload, Mapping):
+            raise _fail(f"study {name!r} component summary is not a mapping")
+        if (
+            payload.get("experiment") != record.get("experiment")
+            or payload.get("generation_id") != component_generation
+        ):
+            raise _fail(f"study {name!r} component summary names a different identity")
+        phases = payload.get("phases")
+        if not isinstance(phases, list):
+            raise _fail(f"study {name!r} component summary has no phase list")
+        for item in phases:
+            if isinstance(item, Mapping):
+                component_winners.add(_winner_key(item))
+
+    for record in records:
+        name = str(record["name"])
+        phases = record.get("phases")
+        if not isinstance(phases, list):
+            raise _fail(f"study {name!r} has no phase list")
+        for item in phases:
+            if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+                raise _fail(f"study {name!r} has a malformed phase entry")
+            if item.get("exposed") is not True:
+                continue
+            if _winner_key(item) not in component_winners:
+                raise _fail(
+                    f"study {name!r} exposed winner for phase {item['name']!r} does "
+                    "not match any verified component summary"
+                )
 
 
 def _published_suite_summary_path(suite: Suite) -> Path | None:
