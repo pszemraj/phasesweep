@@ -362,6 +362,11 @@ def _validate_generation_manifest(
     """
 
     def _fail(reason: str) -> RuntimeError:
+        """Build one uniformly labeled manifest-validation error.
+
+        :param str reason: Specific validation failure being reported.
+        :return RuntimeError: Error naming the generation and the reason.
+        """
         return RuntimeError(f"Generation {generation_id!r} manifest validation failed: {reason}")
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:

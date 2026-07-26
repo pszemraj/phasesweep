@@ -1498,6 +1498,11 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
     )
 
     def _fail(reason: str) -> RuntimeError:
+        """Build one uniformly labeled suite publication-validation error.
+
+        :param str reason: Specific validation failure being reported.
+        :return RuntimeError: Error naming the suite generation and the reason.
+        """
         return RuntimeError(
             f"Suite generation {generation_id!r} failed publication validation: {reason}; "
             "refusing to advance the last-success pointer."
