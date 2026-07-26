@@ -281,6 +281,14 @@ def _run_phase(
         ``abort['flag']`` so queued objectives prune before launch, and asks
         Optuna to stop scheduling new trials. ``study.stop`` is best-effort:
         we do not want a storage hiccup to mask the safety-critical state.
+
+        The first writer also persists the abort durably: without that, an
+        identical re-run of a study whose terminal trial set was produced by
+        an unsafe-cleanup abort takes the no-op republish path and converts
+        the safety abort into a published success (review v0.5.17 gap hunt;
+        the blocker-1 fix covered only the consecutive-failures policy). The
+        durable write is best-effort — a storage failure must not mask the
+        in-memory abort, which still fails this invocation.
         """
         with _hard_abort_lock:
             first = hard_abort["message"] is None
@@ -288,6 +296,17 @@ def _run_phase(
                 hard_abort["message"] = message
         if first:
             log.error("phase=%s HARD ABORT: %s", phase.name, message)
+            try:
+                study.set_user_attr(
+                    PHASE_ABORT_ATTR,
+                    {"policy": "unsafe_process_cleanup", "cause": message},
+                )
+            except Exception:  # noqa: BLE001 - durability failure must not mask the abort
+                log.exception(
+                    "phase=%s could not persist the durable hard-abort record; "
+                    "an identical no-op re-run of this phase may not see the abort",
+                    phase.name,
+                )
         abort["flag"] = True
         with contextlib.suppress(Exception):
             study.stop()
@@ -690,8 +709,20 @@ def _run_phase(
             "terminal trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
+    if study.user_attrs.get(PHASE_ABORT_ATTR) is not None:
+        # This invocation ran new work (the no-op path raises on an abort
+        # record) and reached the winner-selection stage — past the hard-abort
+        # re-raise and the completeness checks above — so the durable abort
+        # no longer describes the study's terminal state (review v0.5.17 /
+        # blocker 1). Clear it BEFORE selection: selection is deterministic
+        # from durable trial data, so a crash during it re-derives the same
+        # outcome on replay, while a crash between selection and a later
+        # clear would leave a false abort that a stateful (tpe/cmaes) phase
+        # could never top up past (review v0.5.17 gap hunt). ``None`` reads
+        # back as "absent" through ``.get``.
+        study.set_user_attr(PHASE_ABORT_ATTR, None)
     try:
-        winner = _select_phase_winner(
+        return _select_phase_winner(
             experiment,
             phase,
             inherited_winners,
@@ -717,13 +748,6 @@ def _run_phase(
                 "before any feasible trial could complete; no winner can be selected."
             ) from exc
         raise
-    if study.user_attrs.get(PHASE_ABORT_ATTR) is not None:
-        # This invocation ran new work (the no-op path raises on an abort
-        # record) and reached a successful selection, so the durable abort
-        # no longer describes the study's terminal state (review v0.5.17 /
-        # blocker 1). ``None`` reads back as "absent" through ``.get``.
-        study.set_user_attr(PHASE_ABORT_ATTR, None)
-    return winner
 
 
 def _select_phase_winner(

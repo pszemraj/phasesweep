@@ -36,7 +36,11 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
-from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+from phasesweep.engine.trial import (
+    ExecutedTrial,
+    UnsafeProcessCleanupError,
+    extract_trial_result,
+)
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import (
@@ -865,6 +869,110 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+
+
+def test_unsafe_cleanup_abort_is_durable_across_identical_reruns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unsafe-cleanup hard abort survives restart like the failure-policy
+    abort: the identical no-op re-run must stay failed instead of publishing
+    the surviving COMPLETE trial (review v0.5.17 gap hunt; the blocker-1 fix
+    made only the max_consecutive_failures abort durable)."""
+    import phasesweep.engine.trial as trial_mod
+
+    db = tmp_path / "abort.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db}",
+        n_trials=2,
+        sampler={"type": "random", "seed": 7},
+    )
+
+    real_run_supervised = trial_mod.run_supervised
+    calls = {"n": 0}
+
+    def uncertain_on_second(*args: object, **kwargs: object) -> ProcessResult:
+        calls["n"] += 1
+        result = real_run_supervised(*args, **kwargs)
+        if calls["n"] == 2:
+            result.cleanup_confirmed = False
+        return result
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_supervised", uncertain_on_second)
+    with pytest.raises(UnsafeProcessCleanupError):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    record = study.user_attrs[PHASE_ABORT_ATTR]
+    assert record["policy"] == "unsafe_process_cleanup"
+    assert "cleanup could not be confirmed" in record["cause"]
+
+    # Identical retry with healthy cleanup: 2/2 terminal trials mean no new
+    # work; the durable record must keep the phase failed, not publish it.
+    monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
+
+
+def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable abort clear must precede winner selection.
+
+    A top-up that died mid-selection used to leave the durable abort record
+    behind; the next identical invocation then reported "previously aborted"
+    and — for stateful samplers — rejected the advised raise-n_trials remedy
+    too, wedging the phase (review v0.5.17 gap hunt). Selection is
+    deterministic from durable trial data, so clearing first is safe: the
+    replay re-derives the same winner.
+    """
+    flag = tmp_path / "resume_enabled"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import pathlib, sys
+        if not pathlib.Path({str(flag)!r}).exists():
+            sys.exit(1)
+        print("x=0.5")
+        """,
+    )
+    db = tmp_path / "abort.db"
+
+    def _exp(n_trials: int):
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=f"python {trainer} {{overrides}}",
+            n_trials=n_trials,
+            max_consecutive_failures=2,
+            sampler={"type": "random", "seed": 7},
+        )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(_exp(3))
+
+    flag.touch()
+    import phasesweep.engine.phase as phase_mod
+
+    real_select = phase_mod._select_phase_winner
+
+    def crash_in_selection(*args: object, **kwargs: object):
+        raise RuntimeError("simulated crash during winner selection")
+
+    monkeypatch.setattr("phasesweep.engine.phase._select_phase_winner", crash_in_selection)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_experiment(_exp(6))
+
+    # The durable abort was consumed before selection started...
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+
+    # ...so the identical replay republishes deterministically instead of
+    # wedging on "previously aborted".
+    monkeypatch.setattr("phasesweep.engine.phase._select_phase_winner", real_select)
+    winners = run_experiment(_exp(6))
+    assert winners["p"].metric == pytest.approx(0.5)
 
 
 def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> None:
