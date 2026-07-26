@@ -265,6 +265,40 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
         )
 
 
+def test_categorical_choices_reject_duplicates() -> None:
+    """A repeated choice inflates cardinality and skews sampling weight."""
+    with pytest.raises(ValidationError, match="choices must be unique"):
+        CategoricalParam(type="categorical", choices=[1, 1, 2])
+    with pytest.raises(ValidationError, match="index 0 and index 2"):
+        CategoricalParam(type="categorical", choices=["a", "b", "a"])
+
+
+def test_categorical_duplicate_identity_is_type_aware() -> None:
+    """1, 1.0, and true compare equal in Python but are distinct trainer overrides."""
+    param = CategoricalParam(type="categorical", choices=[1, 1.0, True])
+    assert [type(c).__name__ for c in param.choices] == ["int", "float", "bool"]
+
+
+def test_grid_cardinality_rejects_duplicate_choices(tmp_path: Path) -> None:
+    """[1, 1, 2] used to count as three grid points and report a complete grid."""
+    with pytest.raises(ValidationError, match="choices must be unique"):
+        load_experiment(
+            _grid_yaml(tmp_path, "x: { type: categorical, choices: [1, 1, 2] }", n_trials=3)
+        )
+
+
+def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
+    """Sub-1e-12 steps collapse onto the same rounded value, so cardinality would lie."""
+    with pytest.raises(ValidationError, match="collapses to 2 unique value"):
+        load_experiment(
+            _grid_yaml(
+                tmp_path,
+                "x: { type: float, low: 0.0, high: 1.0e-12, step: 1.0e-13 }",
+                n_trials=11,
+            )
+        )
+
+
 def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
     """A key cannot be both fixed_overrides and search_space in the same phase."""
     p = write_yaml(

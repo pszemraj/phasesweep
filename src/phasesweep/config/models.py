@@ -598,6 +598,12 @@ class Experiment(_Frozen):
             # safety unless explicitly acknowledged.
             _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
 
+            # JSON wire serializability (review v0.5.17 / finding B): the
+            # template preflight below renders with write_files=False, so it
+            # never calls write_json_file and never proves the composed values
+            # can actually be encoded. Check them explicitly here.
+            _validate_json_file_override_values(self, phase)
+
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
             # unknown placeholders, and unbalanced braces at config-load instead
@@ -690,6 +696,104 @@ def _validate_storage_policy(
             "journal:///path.journal for a single-host parallel sweep, or "
             "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
         )
+
+
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _first_json_unserializable(value: Any, _seen: set[int] | None = None) -> Any | None:
+    """Return the first object inside ``value`` that strict JSON cannot represent.
+
+    Used only to turn a bare ``TypeError`` from :func:`json.dumps` into a
+    message that names the offending *type* rather than repeating the encoder's
+    generic complaint. Containers are tracked by identity so a recursive YAML
+    anchor cannot spin this into a ``RecursionError``.
+
+    :param Any value: Composed override value to inspect.
+    :param set[int] | None _seen: Internal recursion guard of container ids.
+    :return Any | None: The offending object, or ``None`` when every leaf is a
+        JSON scalar.
+    """
+    if isinstance(value, _JSON_SCALARS):
+        return None
+    seen = set() if _seen is None else _seen
+    if id(value) in seen:
+        return None
+    seen.add(id(value))
+    if isinstance(value, dict):
+        for key, item in value.items():
+            # json.dumps stringifies scalar keys but rejects anything else.
+            if not isinstance(key, _JSON_SCALARS):
+                return key
+            found = _first_json_unserializable(item, seen)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_json_unserializable(item, seen)
+            if found is not None:
+                return found
+        return None
+    return value
+
+
+def _validate_json_file_override_values(experiment: Experiment, phase: Phase) -> None:
+    """Reject ``json_file`` override values the wire serializer cannot encode.
+
+    ``override_format: json_file`` writes the composed overrides through
+    :func:`phasesweep.runtime.commands.write_json_file`, which uses a strict
+    ``json.dumps`` with no ``default=`` fallback. Nothing else proved those
+    values encodable before the first real trial: the template preflight in
+    :func:`_validate_trial_command_template` renders with ``write_files=False``,
+    which skips ``write_json_file`` entirely. So a YAML like ``cutoff:
+    2024-01-01`` — PyYAML resolves that to :class:`datetime.date`, not to a
+    string — loaded clean, passed ``phasesweep validate``, and then killed the
+    first trial in ``json.dumps`` (review v0.5.17 / finding B).
+
+    Only the statically-known layers are checked, in composition order:
+    contract ``fixed_overrides`` then phase ``fixed_overrides``. Sampled values
+    need no check (``CategoricalParam`` already restricts choices to Optuna
+    scalars, which are exactly the JSON scalars, and float/int params yield
+    numbers), and inherited values are themselves composed from an earlier
+    phase's already-validated layers.
+
+    :param Experiment experiment: Experiment being validated; supplies
+        ``override_format`` and the contract definitions.
+    :param Phase phase: Phase whose composed fixed values are checked.
+    :raises ValueError: A composed value cannot be encoded by the canonical
+        strict serializer.
+    """
+    if experiment.override_format != "json_file":
+        return
+
+    # Lazy import to avoid a circular config <-> runtime cycle.
+    from phasesweep.runtime.commands import dump_overrides_json
+
+    composed: dict[str, tuple[str, Any]] = {}
+    for contract_name in phase.contracts:
+        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
+            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
+    for key, value in phase.fixed_overrides.items():
+        composed[key] = ("fixed_overrides", value)
+
+    for key, (origin, value) in composed.items():
+        try:
+            dump_overrides_json(value)
+        except (TypeError, ValueError) as exc:
+            offender = _first_json_unserializable(value) if isinstance(exc, TypeError) else None
+            detail = (
+                f"type {type(offender).__name__}"
+                if offender is not None
+                else f"{type(exc).__name__}: {exc}"
+            )
+            raise ValueError(
+                f"Phase {phase.name!r}: override_format='json_file' but {origin} key "
+                f"{key!r} holds a value the overrides.json serializer cannot encode "
+                f"({detail}): {value!r}. YAML resolves unquoted scalars such as "
+                "2024-01-01 or 12:30:00 into Python date/datetime objects; quote the "
+                'value in YAML (e.g. "2024-01-01") to keep it a JSON string.'
+            ) from exc
 
 
 def _format_field_names(template: str) -> set[str]:

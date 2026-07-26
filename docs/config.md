@@ -36,7 +36,7 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 `search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
-Use categorical parameters for explicit choices and integer or float parameters for ranges. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
+Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be unique under a type-aware identity: `1`, `1.0`, and `true` stay three distinct choices even though Python compares them equal, but the same value listed twice is rejected. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
 ## Override formats
 
@@ -49,7 +49,7 @@ Use categorical parameters for explicit choices and integer or float parameters 
 | `hydra` | Existing Hydra/OmegaConf applications. |
 | `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
-Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values; serialization is exercised only by a real trial launch because validation and dry-run do not write `overrides.json`.
+Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Validation and dry-run still do not write `overrides.json`, but config load now encodes every statically known composed value — contract then phase `fixed_overrides` — through the same strict serializer the real trial uses, so a value YAML resolved into a non-JSON Python object is named and rejected before any trial starts. The most common case is an unquoted date: `cutoff: 2024-01-01` is a `datetime.date`, not a string. Quote it.
 
 ## Trainer contract
 
@@ -63,7 +63,7 @@ The command in `trial_command` is the training or evaluation program for one tri
 
 The trial environment starts from the phasesweep process environment, then top-level `env` overrides it. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is also set to the attempt ID so W&B evidence lookup uses an immutable identity instead of a reusable label. GPU assignment can override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
 
-Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; metric values within an absolute `1e-12` of the best value resolve to the lowest trial number. When a swept key has no measurable effect, the selected value is therefore the lowest-numbered near-best trial's choice, not evidence of a preference.
+Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution — an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
 
 ### Result envelope
 
@@ -182,6 +182,38 @@ relational store. ... Set allow_external_rdb_single_host: true ...
 ```
 
 PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+
+### Categorical `choices` must be unique
+
+```text
+phases.0.search_space.x.CategoricalParam.choices
+  Value error, categorical choices must be unique; 1 appears at index 0 and index 1.
+```
+
+A repeated choice was previously kept verbatim. For a grid phase that inflated the cardinality, so `choices: [1, 1, 2]` with `n_trials: 3` ran three trials over two distinct assignments and still reported the matrix complete; under TPE or random sampling it doubled that value's weight. Delete the repeat and lower `n_trials` to the new cardinality. Uniqueness is type-aware, so `[1, 1.0, true]` is still three choices - they render as three different values at the trainer boundary.
+
+The same completeness rule now covers generated float grids: a `step` small enough that adjacent points collapse under the 12-decimal canonical rounding (`low: 0.0, high: 1.0e-12, step: 1.0e-13`) is rejected rather than silently enumerating repeats. Sweep an exponent or a multiplier rather than values that fine.
+
+### `json_file` override values are checked against the JSON serializer at load
+
+```text
+Value error, Phase 'p': override_format='json_file' but fixed_overrides key 'cutoff'
+holds a value the overrides.json serializer cannot encode (type date) ...
+```
+
+`override_format: json_file` writes overrides through a strict `json.dumps`. Config validation and dry-run do not write `overrides.json`, so a value YAML resolved into a non-JSON Python object used to load clean, pass `phasesweep validate`, and then kill the first real trial. Contract and phase `fixed_overrides` are now encoded through that same serializer at load, and the error names the phase, the origin layer, the key, and the offending type.
+
+The usual cause is an unquoted YAML scalar that PyYAML resolves to `date`, `datetime`, or `time`. Quote it:
+
+```yaml
+# before - datetime.date, not a string
+fixed_overrides:
+  cutoff: 2024-01-01
+
+# after
+fixed_overrides:
+  cutoff: "2024-01-01"
+```
 
 ### Generation summaries are now versioned result manifests
 

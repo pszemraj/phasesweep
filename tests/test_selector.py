@@ -12,7 +12,7 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
-from phasesweep.engine.selection import WINNER_TIE_EPS, NoFeasibleTrialError, select_winner
+from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -123,13 +123,14 @@ def test_tie_break_lower_trial_number():
 @pytest.mark.parametrize(
     ("goal", "first_delta", "expected_x"),
     [
-        pytest.param("minimize", WINNER_TIE_EPS / 2, 1, id="minimize-within-epsilon"),
-        pytest.param("minimize", WINNER_TIE_EPS * 2, 2, id="minimize-beyond-epsilon"),
-        pytest.param("maximize", -(WINNER_TIE_EPS / 2), 1, id="maximize-within-epsilon"),
-        pytest.param("maximize", -(WINNER_TIE_EPS * 2), 2, id="maximize-beyond-epsilon"),
+        pytest.param("minimize", 0.0, 1, id="minimize-exact-tie"),
+        pytest.param("minimize", 1e-15, 2, id="minimize-worse-by-one-ulp-scale"),
+        pytest.param("maximize", 0.0, 1, id="maximize-exact-tie"),
+        pytest.param("maximize", -1e-15, 2, id="maximize-worse-by-one-ulp-scale"),
     ],
 )
-def test_metric_tie_epsilon(goal: str, first_delta: float, expected_x: int) -> None:
+def test_metric_ordering_is_exact(goal: str, first_delta: float, expected_x: int) -> None:
+    """Only exact equality ties; any representable difference decides the winner."""
     exp = _make_exp(goal=goal)
     study = _make_study()
     _add_trial(study, 0.1 + first_delta, params={"x": 1})
@@ -140,11 +141,33 @@ def test_metric_tie_epsilon(goal: str, first_delta: float, expected_x: int) -> N
     assert winner.params == {"x": expected_x}
 
 
-def test_near_tie_band_is_anchored_to_optimum_not_iteration_order():
+@pytest.mark.parametrize(
+    ("goal", "expected_x"),
+    [pytest.param("minimize", 2, id="minimize"), pytest.param("maximize", 1, id="maximize")],
+)
+def test_tiny_scale_objectives_rank_by_value_not_trial_number(goal: str, expected_x: int) -> None:
+    """Objectives below the old 1e-12 epsilon must still rank by value.
+
+    Regression for review v0.5.17 / finding H: 1e-13 and 3e-13 are 2e-13 apart,
+    which the removed absolute tie epsilon swallowed — the lower trial number
+    won regardless of which result was actually better.
+    """
+    exp = _make_exp(goal=goal)
+    study = _make_study()
+    _add_trial(study, 3e-13, params={"x": 1})
+    _add_trial(study, 1e-13, params={"x": 2})
+
+    winner = select_winner(study, exp)
+
+    assert winner.params == {"x": expected_x}
+    assert winner.trial_number == expected_x - 1
+
+
+def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
     exp = _make_exp()
     study = _make_study()
-    _add_trial(study, WINNER_TIE_EPS * 1.5, params={"x": 0})
-    _add_trial(study, WINNER_TIE_EPS * 0.75, params={"x": 1})
+    _add_trial(study, 1.0, params={"x": 0})
+    _add_trial(study, 0.0, params={"x": 1})
     _add_trial(study, 0.0, params={"x": 2})
     trials = list(reversed(study.get_trials(deepcopy=False)))
 

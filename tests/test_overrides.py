@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import datetime
 import shlex
 
 import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.runtime.commands import format_argparse, format_hydra, render_command
+from phasesweep.runtime.commands import (
+    dump_overrides_json,
+    format_argparse,
+    format_hydra,
+    render_command,
+    write_json_file,
+)
 from tests.conftest import copy_fake_train, write_yaml
 
 
@@ -94,6 +101,89 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
 
     with pytest.raises(ValidationError, match="override_format='hydra'.*json_file"):
         load_experiment(p)
+
+
+def _json_file_yaml(tmp_path, body: str):
+    """Write a minimal json_file-format config with caller-supplied phase/contract body."""
+    return write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        trial_command: "python train.py --overrides {{overrides_path}}"
+        override_format: json_file
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+{body}
+        """,
+    )
+
+
+def test_write_json_file_uses_the_canonical_strict_serializer(tmp_path):
+    """The wire artifact and the load-time check must share one encoder."""
+    path = write_json_file({"a.b": 1, "c": "x"}, tmp_path)
+
+    assert path.read_text() == dump_overrides_json({"a": {"b": 1}, "c": "x"})
+    with pytest.raises(TypeError):
+        dump_overrides_json({"cutoff": datetime.date(2024, 1, 1)})
+    with pytest.raises(TypeError):
+        write_json_file({"cutoff": datetime.date(2024, 1, 1)}, tmp_path)
+
+
+def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
+    """An unquoted YAML date becomes datetime.date, which overrides.json cannot encode."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              cutoff: 2024-01-01
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="Phase 'p'.*'cutoff'.*cannot encode.*type date"):
+        load_experiment(p)
+
+
+def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
+    """Contract-supplied values are composed into the same artifact and checked too."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        contracts:
+          frozen:
+            fixed_overrides:
+              cutoff: 2024-01-01
+        phases:
+          - name: p
+            n_trials: 1
+            contracts: [frozen]
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
+        load_experiment(p)
+
+
+def test_json_file_accepts_quoted_date_like_override(tmp_path):
+    """Quoting keeps the value a string, which is exactly the documented fix."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              cutoff: "2024-01-01"
+        """,
+    )
+
+    exp = load_experiment(p)
+
+    assert exp.phases[0].fixed_overrides["cutoff"] == "2024-01-01"
 
 
 # ---- migrated from version-named files ----

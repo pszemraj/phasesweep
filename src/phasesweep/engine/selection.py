@@ -23,8 +23,6 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 
-WINNER_TIE_EPS = 1e-12
-
 
 @dataclass
 class SelectedTrial:
@@ -54,7 +52,14 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
       2. Trial's metric must be finite.
       3. All constraint values (read from user_attrs) must satisfy bounds.
       4. Among survivors, argmin/argmax on metric.
-      5. Ties (within absolute eps 1e-12) broken by lower trial_number.
+      5. Ties — exact float equality only — broken by lower trial_number.
+
+    Ordering is exact, never approximate. An earlier absolute epsilon (1e-12)
+    folded everything within that distance of the optimum into one "tie" band,
+    which silently reordered any objective whose natural scale sits at or below
+    1e-12: two genuinely different results at 1e-13 and 3e-13 ranked by trial
+    number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
+    way to know a config's meaningful resolution, so it does not guess one.
 
     Args:
         study: Optuna study for the phase whose winner we want.
@@ -119,8 +124,9 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         if minimize
         else max(_trial_value(t) for t in survivors)
     )
-    near_best = [t for t in survivors if abs(_trial_value(t) - best_value) <= WINNER_TIE_EPS]
-    best = min(near_best, key=lambda t: t.number)
+    # Exact equality, not a tolerance band (review v0.5.17 / finding H).
+    tied = [t for t in survivors if _trial_value(t) == best_value]
+    best = min(tied, key=lambda t: t.number)
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
