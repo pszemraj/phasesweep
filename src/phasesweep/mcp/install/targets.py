@@ -133,6 +133,15 @@ def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     Recognizes both launcher modes this installer can write: the default
     absolute-path launcher and the pinned ``uvx`` launcher.
 
+    Ownership is inferred from the exact entry shape alone; no receipt records
+    which entries this installer actually wrote. A hand-authored entry that
+    happens to match one of these shapes byte for byte is therefore
+    indistinguishable from an installed one and is treated as
+    installer-managed: ``install`` replaces it and ``uninstall`` removes it
+    (the Codex TOML path additionally requires the installer's marker lines).
+    Anything differing in keys, argv length, or argument spelling is foreign
+    and left untouched (review v0.5.16).
+
     :param EntryStyle style: Client entry dialect expected for the member.
     :param object value: JSON member value to inspect.
     :return bool: True when the member is an installer-managed phasesweep entry.

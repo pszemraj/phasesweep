@@ -9,7 +9,8 @@ command exit nonzero so scripts notice.
 
 :func:`check_install` is the read-only counterpart (review v0.5.15 / item G):
 it never edits a client file, only inspects whichever phasesweep MCP entry is
-already configured and reports whether its launcher executable resolves.
+already configured and reports whether its launcher executable and its
+configured catalog path still resolve.
 """
 
 from __future__ import annotations
@@ -112,6 +113,22 @@ def resolve_server_command() -> str:
     )
 
 
+def _is_unpublishable_version(version: str) -> bool:
+    """Return whether a version names a build no package index can serve.
+
+    Local segments (``1.0.0+local``) are never uploadable, ``.dev`` releases
+    describe an unreleased snapshot, and ``0.0.0`` is the placeholder version
+    build backends emit when they cannot derive one. Deliberately plain string
+    matching: this only has to recognize what an editable or source-tree
+    install of *this* package produces, which is not worth a ``packaging``
+    dependency (review v0.5.16).
+
+    :param str version: Version reported by ``importlib.metadata``.
+    :return bool: True when pinning this version could never resolve remotely.
+    """
+    return "+" in version or ".dev" in version or version == "0.0.0"
+
+
 def resolve_uvx_launcher() -> tuple[str, list[str]]:
     """Resolve the pinned ``uvx`` launcher for the installed phasesweep version.
 
@@ -121,12 +138,15 @@ def resolve_uvx_launcher() -> tuple[str, list[str]]:
     ``uvx`` resolves fresh at launch time, so it keeps working after this
     environment is moved or recreated. Requires ``uvx`` on ``PATH`` now (the
     client may run on a different ``PATH`` later, but this is still the
-    earliest useful check) and a resolvable installed version to pin.
+    earliest useful check) and a publishable installed version to pin. Whether
+    that version is actually on an index is never checked: this command does
+    not reach the network (review v0.5.16).
 
     :return tuple[str, list[str]]: ``"uvx"`` and its argv prefix before ``--catalog``.
     :raises FileNotFoundError: If ``uvx`` is not on ``PATH``.
     :raises LookupError: If the running phasesweep is not an installed
-        distribution with a resolvable version (e.g. an unbuilt source checkout).
+        distribution with a resolvable version (e.g. an unbuilt source
+        checkout), or reports a local/dev version no index could serve.
     """
     if shutil.which("uvx") is None:
         raise FileNotFoundError(
@@ -140,6 +160,12 @@ def resolve_uvx_launcher() -> tuple[str, list[str]]:
             "phasesweep is not an installed distribution, so there is no version to pin; "
             "install it normally or omit --launcher uvx"
         ) from exc
+    if _is_unpublishable_version(version):
+        raise LookupError(
+            f"the installed phasesweep version {version} is a local or development build, "
+            "which uvx cannot resolve from a package index; for a development checkout omit "
+            "--launcher uvx to pin this environment's absolute phasesweep-mcp path instead"
+        )
     return "uvx", ["--from", f"{PACKAGE_NAME}[mcp]=={version}", "phasesweep-mcp"]
 
 
@@ -903,27 +929,41 @@ def run(
 #   status           triggered when                                    attention?
 #   ---------------  -------------------------------------------------  ----------
 #   ok               launcher executable resolves (path is executable,  no
-#                     or `uvx` is on PATH in --launcher uvx mode)
+#                     or `uvx` is on PATH in --launcher uvx mode) and
+#                     the configured --catalog is a readable file
 #   missing          launcher path no longer exists, or `uvx` is not     yes
 #                     on PATH
 #   not-executable   launcher path exists but lacks the execute bit      yes
+#   catalog-missing  launcher resolves but its configured --catalog      yes
+#                     path is absent or is not a readable file
 #   unmanaged        an entry exists but was not written by this         no
 #                     installer (foreign shape); left unprobed
 #   not-configured   no phasesweep MCP entry exists for this target      no
 #   unreadable       config path/entry could not be safely resolved,     yes
 #                     read, or parsed
 #
+# An entry can be broken in several ways at once; the executable status wins,
+# because a launcher that cannot start never reads its catalog (review v0.5.16).
 # _CHECK_ATTENTION_STATUSES below is the authoritative needs-attention set.
 CheckStatus: TypeAlias = Literal[
     "ok",
     "missing",
     "not-executable",
+    "catalog-missing",
     "unmanaged",
     "not-configured",
     "unreadable",
 ]
 
-_CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset({"missing", "not-executable", "unreadable"})
+_CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset(
+    {"missing", "not-executable", "catalog-missing", "unreadable"}
+)
+
+# Attached to an otherwise ok uvx entry: `uvx` being on PATH says nothing about
+# whether the pinned requirement still resolves, and check-install is offline.
+_UVX_PIN_UNVERIFIED_NOTE = (
+    "pinned package resolvability is not verified offline; the client resolves it at launch"
+)
 
 
 @dataclass(frozen=True)
@@ -940,7 +980,8 @@ class LauncherCheck:
     def ok(self) -> bool:
         """Whether this check needs no further operator action.
 
-        :return bool: True unless the launcher is missing, not executable, or unreadable.
+        :return bool: True unless the launcher is missing, not executable, its
+            catalog is missing, or the config is unreadable.
         """
         return self.status not in _CHECK_ATTENTION_STATUSES
 
@@ -971,12 +1012,43 @@ def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
     return "ok", None
 
 
+def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | None]:
+    """Probe whether the catalog an entry passes to the server is still readable.
+
+    A launcher that starts fine still fails at handshake time when its catalog
+    was moved, renamed, or deleted, so ``check-install`` inspects the argument
+    as well as the executable (review v0.5.16). Every managed shape ends in
+    ``--catalog <absolute path>``; anything else is a shape this function does
+    not own and is reported rather than guessed at.
+
+    :param Sequence[str] args: Configured launcher argv after the executable.
+    :return tuple[CheckStatus, str | None]: ``("ok", None)``, or
+        ``("catalog-missing", ...)`` with actionable repair guidance.
+    """
+    if len(args) < 2 or args[-2] != "--catalog":
+        return "catalog-missing", (
+            "the configured entry passes no --catalog argument; rerun "
+            "`phasesweep mcp install --catalog PATH` with the catalog this client should use"
+        )
+    catalog = args[-1]
+    path = Path(catalog)
+    if not path.is_file() or not os.access(path, os.R_OK):
+        return "catalog-missing", (
+            f"the configured catalog {catalog} is not a readable file; rerun "
+            "`phasesweep mcp install --catalog PATH` with the catalog's current location "
+            "(--dry-run previews the repair)"
+        )
+    return "ok", None
+
+
 def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
-    """Read one target's configured phasesweep MCP entry and probe its launcher.
+    """Read one target's configured phasesweep MCP entry and probe it.
 
     Read-only counterpart to :func:`_apply_mcp`: recognizes entries written by
     either launcher mode, reports an entry this installer does not own as
-    ``unmanaged`` without probing it, and never edits the client file.
+    ``unmanaged`` without probing it, and never edits the client file. Probes
+    both the launcher executable and the configured ``--catalog`` path, the
+    executable first because it fails earlier at launch.
 
     :param AgentTarget target: Client to inspect.
     :return LauncherCheck: Verification outcome for this target.
@@ -1066,6 +1138,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         command, args = argv[0], argv[1:]
 
     status, detail = _probe_launcher_executable(command)
+    if status == "ok":
+        status, detail = _probe_configured_catalog(args)
+        if status == "ok" and command == "uvx":
+            detail = _UVX_PIN_UNVERIFIED_NOTE
     return LauncherCheck(spec.path, command, tuple(args), status, detail)
 
 
@@ -1075,9 +1151,11 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     Read-only counterpart to ``install``/``uninstall`` (review v0.5.15 / item
     G): for every selected target, inspects whatever phasesweep MCP entry is
     already on disk (written by either launcher mode, or by hand), reports
-    whether it is installer-managed and whether its launcher executable
-    resolves, and prints repair guidance for anything broken. Never edits a
-    client file.
+    whether it is installer-managed, whether its launcher executable resolves,
+    and whether the ``--catalog`` path it passes is still a readable file, then
+    prints repair guidance for anything broken. Never edits a client file and
+    never reaches the network, so a pinned uvx requirement is reported as
+    unverified rather than resolved (review v0.5.16).
 
     :param Path project: Project root anchoring project-scoped paths.
     :param Sequence[str] | None agent_ids: Explicit target ids, or ``None`` to

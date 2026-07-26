@@ -532,6 +532,37 @@ def test_resolve_uvx_launcher_requires_installed_distribution(monkeypatch):
         installer.resolve_uvx_launcher()
 
 
+def test_resolve_uvx_launcher_pins_a_published_looking_version(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: "1.2.3")
+
+    assert installer.resolve_uvx_launcher() == (
+        "uvx",
+        ["--from", "phasesweep[mcp]==1.2.3", "phasesweep-mcp"],
+    )
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.2.1.dev237+g8d1cb1e2b",  # editable checkout: dev release and local segment
+        "1.0.0+local",  # local segment alone
+        "0.0.0",  # placeholder emitted when version discovery fails
+    ],
+)
+def test_resolve_uvx_launcher_refuses_unpublishable_versions(version, monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: version)
+
+    with pytest.raises(LookupError) as exc_info:
+        installer.resolve_uvx_launcher()
+
+    message = str(exc_info.value)
+    assert version in message
+    assert "cannot resolve from a package index" in message
+    assert "omit --launcher uvx" in message
+
+
 def test_installer_uvx_launcher_round_trip_across_json_and_toml(
     fake_home, tmp_path, capsys, monkeypatch
 ):
@@ -624,12 +655,19 @@ def _executable(tmp_path, name="phasesweep-mcp"):
     return script
 
 
+def _configured_catalog(tmp_path):
+    """Stand in for the catalog an entry points at; check-install only reads it."""
+    catalog = tmp_path / "configured-catalog.yaml"
+    catalog.write_text("experiments: []\n")
+    return catalog
+
+
 def test_check_install_reports_healthy_path_launcher(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
     script = _executable(tmp_path)
     claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
+    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
 
     code = installer.check_install(project, ["claude"])
 
@@ -644,7 +682,7 @@ def test_check_install_reports_missing_executable_with_repair_guidance(fake_home
     project.mkdir()
     missing = tmp_path / "gone" / "phasesweep-mcp"
     claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(missing), Path("/proj/catalog.yaml")))
+    _write_json_entry(claude, mcp_entry("stdio", str(missing), _configured_catalog(tmp_path)))
 
     code = installer.check_install(project, ["claude"])
 
@@ -662,7 +700,7 @@ def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
     script = _executable(tmp_path)
     script.chmod(0o644)
     claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(script), Path("/proj/catalog.yaml")))
+    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
 
     code = installer.check_install(project, ["claude"])
 
@@ -679,7 +717,7 @@ def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, 
     entry = mcp_entry(
         "stdio",
         "uvx",
-        Path("/proj/catalog.yaml"),
+        _configured_catalog(tmp_path),
         launcher_args=["--from", "phasesweep[mcp]==1.0.0", "phasesweep-mcp"],
     )
     _write_json_entry(claude, entry)
@@ -695,6 +733,43 @@ def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, 
     healthy_output = capsys.readouterr().out
     assert healthy_code == 0
     assert "uvx" in healthy_output
+    # An on-PATH uvx says nothing about the pinned requirement; the report says so.
+    assert "not verified offline" in healthy_output
+
+
+def test_check_install_reports_missing_catalog(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    catalog = _configured_catalog(tmp_path)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, mcp_entry("stdio", str(script), catalog))
+    catalog.unlink()
+
+    code = installer.check_install(project, ["claude"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "catalog-missing" in captured.out
+    assert str(catalog) in captured.out
+    assert "phasesweep mcp install --catalog PATH" in captured.out
+    assert "need attention" in captured.err
+
+
+def test_check_install_reports_executable_before_catalog(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    missing_script = tmp_path / "gone" / "phasesweep-mcp"
+    missing_catalog = tmp_path / "gone-catalog.yaml"
+    claude = _target(project, "claude")
+    _write_json_entry(claude, mcp_entry("stdio", str(missing_script), missing_catalog))
+
+    code = installer.check_install(project, ["claude"])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "catalog-missing" not in output
+    assert "no longer exists" in output
 
 
 def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_path, capsys):

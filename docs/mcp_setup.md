@@ -68,7 +68,7 @@ An instructions-only install (`--type instructions`) needs neither a catalog nor
 
 Claude Desktop and Codex MCP entries are user-scoped, so those clients see the server from every project. The plan flags this. Interactive installs require confirmation; unattended `--yes` installs additionally require `--allow-user-scope`.
 
-By default the generated entry pins the absolute `phasesweep-mcp` executable from the Python environment that ran `install`; if that environment is later moved, recreated, or deleted, the entry breaks (see [Troubleshooting](#troubleshooting)). Pass `--launcher uvx` to instead pin a `uvx --from phasesweep[mcp]==<installed version> phasesweep-mcp` invocation, resolved fresh by [uvx](https://docs.astral.sh/uv/) on every launch instead of bound to this environment's path. Prefer the default for a normal local dev environment you intend to keep; prefer `--launcher uvx` when the environment running `install` is disposable or expected to be rebuilt (a container, a throwaway venv, a CI-provisioned tool). The uvx mode requires `uvx` on the path that will actually launch the client's subprocess, and a real installed phasesweep version to pin (not an unbuilt source checkout) - `install` refuses to write the entry, unchanged, when either is missing. Both modes write the same client files and `uninstall` reverses either one; switching modes is just re-running `install` for the same agent.
+By default the generated entry pins the absolute `phasesweep-mcp` executable from the Python environment that ran `install`; if that environment is later moved, recreated, or deleted, the entry breaks (see [Troubleshooting](#troubleshooting)). Pass `--launcher uvx` to instead pin a `uvx --from phasesweep[mcp]==<installed version> phasesweep-mcp` invocation, resolved fresh by [uvx](https://docs.astral.sh/uv/) on every launch instead of bound to this environment's path. Prefer the default for a normal local dev environment you intend to keep; prefer `--launcher uvx` when the environment running `install` is disposable or expected to be rebuilt (a container, a throwaway venv, a CI-provisioned tool). The uvx mode requires `uvx` on the path that will actually launch the client's subprocess, and a published phasesweep version to pin - `install` refuses to write the entry, unchanged, when `uvx` is absent, when phasesweep is not an installed distribution, or when the installed version is one no index can serve (a local `+` segment, a `.dev` release, or the `0.0.0` placeholder), which is what an editable development checkout reports. Use the default launcher in a development checkout. `install` does not check whether the pinned version actually exists on an index; it never reaches the network. Both modes write the same client files and `uninstall` reverses either one; switching modes is just re-running `install` for the same agent.
 
 Restart the client after any config change.
 
@@ -76,6 +76,8 @@ Restart the client after any config change.
 <summary>What automatic edits preserve</summary>
 
 Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed, and project-scoped symlinks are followed only when their resolved target remains inside the selected project. Each edit pins that physical target, serializes with other PhaseSweep installers, and is refused if the file changes before replacement. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+
+Ownership of a `phasesweep` entry is decided by its exact shape, not by a record of what the installer wrote. A hand-written JSON entry that matches the generated shape exactly is therefore treated as installer-managed: `install` will replace it and `uninstall` will remove it. (Codex additionally requires the `PHASESWEEP_START`/`PHASESWEEP_END` marker lines around the table.) If you maintain your own `phasesweep` entry and want it left alone, make it differ from the generated shape - add an `env` key, point `command` at a wrapper script, or pass an extra argument - and it will be reported as `unmanaged` and never edited.
 
 Marker-fenced edits preserve all bytes outside the managed block. Strict JSON edits re-serialize the document while retaining key order, detected indentation and newline style, final-newline state, and permissions; compact whitespace and numeric spellings may be normalized. Duplicate keys, non-finite or overflowing numbers, comments, and JSON5 are refused. `uninstall` leaves empty files and containers in place because whole-file creation ownership is not persisted. Shared instruction blocks remain until their last installed agent owner is removed.
 
@@ -112,16 +114,19 @@ phasesweep mcp check-install                    # every supported agent
 phasesweep mcp check-install --agent claude     # one agent; repeat --agent for more
 ```
 
-It never edits a client file. Each target is reported with one of six statuses:
+It never edits a client file and never reaches the network. Each target is reported with one of seven statuses:
 
-- `ok` - the launcher resolves: the absolute path exists and is executable (default mode), or `uvx` is on `PATH` (`--launcher uvx` mode).
+- `ok` - the launcher resolves and its configured `--catalog` file is readable. The launcher resolves when the absolute path exists and is executable (default mode), or `uvx` is on `PATH` (`--launcher uvx` mode). In uvx mode the report adds a note that the pinned package itself is not resolved offline; the client resolves it at launch.
 - `missing` - the launcher no longer resolves: the absolute path is gone, or `uvx` is not on `PATH`.
 - `not-executable` - the launcher path exists but lacks the execute bit.
+- `catalog-missing` - the launcher resolves, but the `--catalog` path in the entry is absent or is not a readable file, so the server would fail at startup. The report names the configured path.
 - `unmanaged` - an entry exists but was not written by this installer; left unexamined.
 - `not-configured` - no phasesweep MCP entry exists for this target.
 - `unreadable` - the config file or entry could not be safely resolved, read, or parsed.
 
-Exit code 0 means every configured launcher resolves; exit code 1 means at least one is `missing`, `not-executable`, or `unreadable` (see the repair guidance printed above it). `unmanaged` and `not-configured` are informational only and do not affect the exit code.
+A single entry can be broken in more than one way; the launcher executable is reported first, because a launcher that cannot start never reads its catalog.
+
+Exit code 0 means every configured launcher resolves; exit code 1 means at least one is `missing`, `not-executable`, `catalog-missing`, or `unreadable` (see the repair guidance printed above it). `unmanaged` and `not-configured` are informational only and do not affect the exit code.
 
 ## 5. Instruct the agent
 
