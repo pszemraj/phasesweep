@@ -320,9 +320,13 @@ class RunStore:
         """Derive the current state from status.json and a live PID check.
 
         A finalized status.json (written by the runner on every exit) is
-        authoritative: returncode 0 with no explicit snapshot failure ->
-        succeeded, a signalled code -> cancelled, and any other return code or
-        failed result snapshot -> failed. Pending result snapshot capture
+        authoritative: returncode 0 -> succeeded, a signalled code ->
+        cancelled, and any other return code -> failed. The engine's exit
+        status is the single authority on success; a failed *result snapshot*
+        capture degrades the run's frozen results, never its outcome — the
+        old ``returncode 0 + snapshot failed -> failed`` rule let an optional
+        diagnostic artifact contradict an engine-defined, already-published
+        success (review v0.5.16 / blocker 2). Pending result snapshot capture
         remains running so another launch cannot mutate shared result storage
         before the snapshot is frozen. With no status.json, a live
         (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
@@ -359,8 +363,6 @@ class RunStore:
                 return "running"
             rc = status.get("returncode")
             if rc == 0:
-                if status.get("result_snapshot_state") == "failed":
-                    return "failed"
                 return "succeeded"
             if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
                 return "cancelled"

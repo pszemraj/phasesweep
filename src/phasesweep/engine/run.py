@@ -88,7 +88,16 @@ from phasesweep.runtime.process import (
 
 @dataclass(frozen=True)
 class TerminalReport:
-    """One engine invocation's primary outcome and independent cleanup evidence."""
+    """One engine invocation's primary outcome and independent cleanup evidence.
+
+    ``winners`` is the engine's own authoritative winner mapping, populated on
+    the success path while the experiment lock is still held (review v0.5.16 /
+    blocker 2): a terminal-result consumer (the MCP runner's snapshot capture)
+    must be able to freeze the published outcome from the exact in-memory
+    state the engine just returned, instead of re-deriving it from mutable
+    storage or optional diagnostic files whose absence would then contradict
+    an engine-defined success. ``None`` on every failure path.
+    """
 
     generation_id: str
     primary_error: BaseException | None
@@ -97,6 +106,7 @@ class TerminalReport:
     uncertain_attempt_ids: frozenset[str]
     cleanup_error: BaseException | None = None
     failure_stage: str | None = None
+    winners: Mapping[str, Winner] | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +341,7 @@ def _run_experiment_outcome(
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
                 uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 failure_stage=None,
+                winners=MappingProxyType(dict(result)),
             )
             return ExperimentRunOutcome(
                 generation_id=generation_id,

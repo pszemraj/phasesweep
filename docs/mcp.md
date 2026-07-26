@@ -77,9 +77,9 @@ Cleanup and result-finalization recovery are operator-only. After inspecting the
 
 When a `run_id` is supplied, live status is read through that run's saved config snapshot, so catalog edits after launch cannot redirect monitoring. Terminal finalization is ordered:
 
-1. The engine captures a validated, path-free snapshot of phase counts and sampled winners before releasing the experiment lock, on both success and failure paths.
+1. The engine captures a validated, path-free snapshot of phase counts and sampled winners before releasing the experiment lock, on both success and failure paths. On success the frozen winners come from the engine's own terminal report — the exact in-memory outcome it returned — not from a second read of winner files; the optional per-generation lifecycle record and per-phase storage counts only enrich the snapshot (unreadable counts freeze as `trial_data_available: false`), they are never a second success gate.
 2. The runner persists the terminal cause, cleanup evidence, and raw captured snapshot with `result_snapshot_state: pending`.
-3. It serializes only that already-frozen object and records the snapshot state as `complete` or `failed`.
+3. It serializes only that already-frozen object and records the snapshot state as `complete` or `failed`. The engine's exit status stays the single authority on the run outcome: a run that exited 0 derives `succeeded` even when its snapshot could not be captured or finalized — result reads then fail closed with the explicit finalization state instead of contradicting an engine-defined, already-published success.
 
 While finalization is `pending`, the run remains `running` and counts toward the launch concurrency limit. The shared-state read itself already happened under the engine lock; the pending state covers durable serialization of that immutable object. Later resumes cannot rewrite reads backed by a completed snapshot.
 

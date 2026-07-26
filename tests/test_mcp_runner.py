@@ -31,6 +31,7 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
+    Winner,
     _generation_path,
     _generation_record_path,
     _generations_dir,
@@ -394,17 +395,25 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
     assert [winner["phase"] for winner in captured["winners"]] == ["a"]  # type: ignore[index]
 
 
-def test_terminal_snapshot_rejects_generation_without_lifecycle_record(tmp_path: Path) -> None:
+def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) -> None:
+    """A missing per-generation record must not fail the snapshot capture.
+
+    The engine writes that record as an optional post-commit diagnostic; a
+    capture that hard-required it contradicted engine-defined success
+    whenever the best-effort write had failed (review v0.5.16 / blocker 2).
+    """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     generation_path = _generation_path(experiment)
     generation_path.parent.mkdir(parents=True)
     generation_path.write_text("generation_id: prior-generation\n")
 
-    with pytest.raises(RuntimeError, match="no readable immutable lifecycle record"):
-        mcp_runner.capture_result_snapshot(
-            experiment,
-            generation_id="failed-new-generation",
-        )
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="pinned-generation",
+    )
+
+    assert snapshot["status"]["represented_generation_id"] == "pinned-generation"
+    assert snapshot["status"]["is_published"] is False
 
 
 def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
@@ -444,14 +453,140 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
-def test_successful_terminal_snapshot_rejects_unavailable_trial_data(tmp_path: Path) -> None:
+def test_successful_terminal_snapshot_freezes_unavailable_trial_data_flags(
+    tmp_path: Path,
+) -> None:
+    """Unreadable trial storage degrades the frozen counts, never the capture.
+
+    The old ``require_trial_data`` gate let a transient post-publication
+    storage read invert an engine-defined success into a failed snapshot
+    (review v0.5.16 / blocker 2); the snapshot now freezes the truthful
+    per-phase ``trial_data_available: false`` flags instead.
+    """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
 
-    with pytest.raises(RuntimeError, match="terminal trial data is unavailable.*p"):
-        mcp_runner.capture_result_snapshot(
-            experiment,
-            require_trial_data=True,
+    snapshot = mcp_runner.capture_result_snapshot(experiment)
+
+    phase = snapshot["status"]["phases"][0]
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] == []
+
+
+def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
+    """Engine-supplied winners are frozen verbatim, with no second file read."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = Winner(
+        trial_number=4,
+        params={"x": 3},
+        effective_overrides={"x": 3},
+        metric=0.25,
+        gates=[{"type": "g", "passed": True}],
+        completion={"incomplete": False},
+        generation_id="engine-generation",
+        attempt_id="engine-attempt",
+    )
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="engine-generation",
+        engine_winners={"p": winner},
+    )
+
+    # No winner file exists anywhere on disk; the frozen winner is exactly
+    # the engine's own in-memory outcome.
+    (frozen,) = snapshot["winners"]
+    assert frozen["phase"] == "p"
+    assert frozen["trial_number"] == 4
+    assert frozen["metric"] == 0.25
+    assert frozen["gates_passed"] is True
+    assert frozen["incomplete"] is False
+    assert frozen["generation_id"] == "engine-generation"
+    assert frozen["source"]["kind"] == "phase_trial"
+
+
+def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end (review v0.5.16 / blocker 2): the engine and MCP agree on success.
+
+    The per-generation lifecycle record write is injected to fail after the
+    pointer commit — a failure the engine's own transaction contract accepts.
+    The detached runner must still record returncode 0 with a complete frozen
+    snapshot, and the run store must derive ``succeeded``.
+    """
+    import phasesweep.engine.run as engine_run
+
+    trainer = write_constant_trainer(tmp_path)
+    config_path = tmp_path / "exp.yaml"
+    config_path.write_text(
+        f"""
+experiment: record_fail
+workdir: {tmp_path}/runs
+trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+metric:
+  name: x
+  goal: minimize
+  extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+phases:
+  - name: p
+    n_trials: 1
+    search_space: {{}}
+"""
+    )
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+
+    def fail_record_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated record write failure")
+
+    monkeypatch.setattr(engine_run, "_write_generation_record_once", fail_record_write)
+
+    store = RunStore(tmp_path / "state")
+    run_id = "record-fail-run"
+    started_at = utc_now_iso()
+    store.create(
+        RunHandle(
+            run_id=run_id,
+            experiment_id="record_fail",
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=started_at,
+            launch_state="launching",
         )
+    )
+    status_path = store.status_path(run_id)
+
+    assert (
+        mcp_runner.main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config_path),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(status_path),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "record_fail",
+                "--started-at",
+                started_at,
+            ]
+        )
+        == 0
+    )
+
+    terminal = json.loads(status_path.read_text())
+    assert terminal["returncode"] == 0
+    assert terminal["result_snapshot_state"] == "complete"
+    assert [w["phase"] for w in terminal["result_snapshot"]["winners"]] == ["p"]
+    handle = store.get(run_id)
+    assert handle is not None
+    assert store.state(handle) == "succeeded"
 
 
 def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
@@ -472,10 +607,7 @@ def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
         fail_redundant_read,
     )
 
-    snapshot = mcp_runner.capture_result_snapshot(
-        experiment,
-        require_trial_data=False,
-    )
+    snapshot = mcp_runner.capture_result_snapshot(experiment)
 
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is False

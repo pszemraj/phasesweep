@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                 result_snapshot = capture_result_snapshot(
                     config,
                     generation_id=report.generation_id,
-                    require_trial_data=report.primary_error is None,
+                    engine_winners=report.winners,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
                 result_snapshot_error = type(exc).__name__

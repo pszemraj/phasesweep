@@ -587,9 +587,8 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         experiment: Experiment,
         *,
         generation_id: str,
-        require_trial_data: bool,
+        engine_winners: object = None,
     ) -> dict[str, object]:
-        assert require_trial_data is True
         return capture_result_snapshot(
             experiment,
             generation_id=generation_id,
@@ -1881,7 +1880,10 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "failed"
     assert terminal["result_snapshot_error"] == "InterruptedFinalization"
-    assert store.state(handle) == "failed"
+    # The engine exit status stays authoritative: an unavailable frozen
+    # snapshot degrades result reads (below), never the run outcome itself
+    # (review v0.5.16 / blocker 2).
+    assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
     with pytest.raises(Exception, match="finalization state: failed"):

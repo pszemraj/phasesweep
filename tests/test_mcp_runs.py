@@ -264,7 +264,15 @@ def test_terminal_status_determines_state(
     assert store.state(handle) == expected_state
 
 
-def test_successful_process_with_failed_result_snapshot_is_failed(tmp_path: Path) -> None:
+def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_path: Path) -> None:
+    """The engine's exit status is the single authority on success.
+
+    A failed *result snapshot* capture degrades the run's frozen results
+    (result reads surface the finalization state explicitly), never the run
+    outcome itself — the old ``returncode 0 + snapshot failed -> failed``
+    rule let an optional diagnostic contradict an engine-defined,
+    already-published success (review v0.5.16 / blocker 2).
+    """
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1")
     write_run_status(
@@ -277,7 +285,7 @@ def test_successful_process_with_failed_result_snapshot_is_failed(tmp_path: Path
         result_snapshot_error="InterruptedFinalization",
     )
 
-    assert store.state(handle) == "failed"
+    assert store.state(handle) == "succeeded"
 
 
 def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) -> None:

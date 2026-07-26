@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Mapping
 from typing import Annotated, Any, Literal
 
@@ -14,10 +15,13 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    Winner,
     WinnerSource,
     _generation_record_path,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
+
+log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 
@@ -239,7 +243,7 @@ def capture_result_snapshot(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
-    require_trial_data: bool = False,
+    engine_winners: Mapping[str, Winner] | None = None,
 ) -> dict[str, Any]:
     """Capture one experiment's current path-free status and sampled winners.
 
@@ -250,32 +254,40 @@ def capture_result_snapshot(
     failed-publication generation's terminal snapshot still reports its own
     (unpublished) partial results, correctly flagged ``is_published: False``.
 
+    The engine and this capture must agree about what a valid terminal
+    result is (review v0.5.16 / blocker 2): the per-generation lifecycle
+    record is an optional post-commit diagnostic to the engine, so its
+    absence is logged, never fatal here; storage reads only *enrich* the
+    snapshot (a phase whose counts are unreadable is frozen with
+    ``trial_data_available: false`` rather than failing the capture); and
+    when the engine hands over its own authoritative ``engine_winners``, the
+    frozen winners come from that exact in-memory outcome instead of a
+    second read of the winner files.
+
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
-    :param bool require_trial_data: Refuse ambiguous storage reads when the engine succeeded.
+    :param Mapping[str, Winner] | None engine_winners: The engine's own
+        winner mapping from its terminal report, when the run succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
     """
     if generation_id is not None:
+        # Best-effort diagnostic cross-check only: the record is written
+        # post-commit and may legitimately be absent.
         try:
             lifecycle = yaml.safe_load(
                 _generation_record_path(experiment, generation_id).read_text()
             )
-        except (OSError, yaml.YAMLError) as exc:
-            raise RuntimeError(
-                "requested generation has no readable immutable lifecycle record"
-            ) from exc
-        if not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id:
-            raise RuntimeError("requested generation lifecycle record does not match its identity")
-    status = read_status(experiment, generation_id=generation_id)
-    if require_trial_data:
-        unavailable = [
-            phase["phase"] for phase in status["phases"] if not phase["trial_data_available"]
-        ]
-        if unavailable:
-            raise RuntimeError(
-                "terminal trial data is unavailable for phase(s) "
-                f"{', '.join(unavailable)}; refusing to freeze ambiguous counts"
+        except (OSError, yaml.YAMLError):
+            lifecycle = None
+        if lifecycle is not None and (
+            not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id
+        ):
+            log.warning(
+                "generation %s lifecycle record does not match its identity; "
+                "capturing the terminal snapshot from the authoritative artifacts anyway",
+                generation_id,
             )
+    status = read_status(experiment, generation_id=generation_id)
     phases_by_name = {phase.name: phase for phase in experiment.phases}
     for phase_status in status["phases"]:
         running_attempts: list[dict[str, Any]] = []
@@ -296,22 +308,20 @@ def capture_result_snapshot(
                         }
                     )
         phase_status["running_attempts"] = running_attempts
-    # Winners must be scoped to the generation this snapshot *represents*, not
-    # the (possibly different) true current pointer: a pinned capture wants
-    # exactly its own generation's winners even when a newer generation has
-    # since become current (review v0.5.15 / blocker 3).
-    winners = read_winners(experiment, generation_id=status["represented_generation_id"])
-    snapshot = RunResultSnapshot(
-        status=StatusSnapshot(
-            current_generation_id=status["current_generation_id"],
-            published_generation_id=status["published_generation_id"],
-            represented_generation_id=status["represented_generation_id"],
-            is_published=status["is_published"],
-            metric=status["metric"],
-            phases=status["phases"],
-            summary_present=status["summary_present"],
-        ),
-        winners=[
+    if engine_winners is not None:
+        # The engine's terminal report is the authority on a successful
+        # outcome (review v0.5.16 / blocker 2); freeze exactly what it
+        # returned instead of re-reading the winner files.
+        winner_snapshots = [
+            _winner_snapshot_from_engine(phase_name, winner)
+            for phase_name, winner in engine_winners.items()
+        ]
+    else:
+        # Winners must be scoped to the generation this snapshot *represents*,
+        # not the (possibly different) true current pointer: a pinned capture
+        # wants exactly its own generation's winners even when a newer
+        # generation has since become current (review v0.5.15 / blocker 3).
+        winner_snapshots = [
             WinnerSnapshot(
                 phase=winner.phase,
                 trial_number=winner.trial_number,
@@ -324,10 +334,60 @@ def capture_result_snapshot(
                 source=_winner_source_snapshot(winner),
                 promotion=winner.promotion,
             )
-            for winner in winners
-        ],
+            for winner in read_winners(
+                experiment, generation_id=status["represented_generation_id"]
+            )
+        ]
+    snapshot = RunResultSnapshot(
+        status=StatusSnapshot(
+            current_generation_id=status["current_generation_id"],
+            published_generation_id=status["published_generation_id"],
+            represented_generation_id=status["represented_generation_id"],
+            is_published=status["is_published"],
+            metric=status["metric"],
+            phases=status["phases"],
+            summary_present=status["summary_present"],
+        ),
+        winners=winner_snapshots,
     )
     return snapshot.model_dump(mode="json")
+
+
+def _winner_snapshot_from_engine(phase_name: str, winner: Winner) -> WinnerSnapshot:
+    """Freeze one engine-returned :class:`Winner` as a path-free snapshot.
+
+    :param str phase_name: Phase the engine exposed this winner under.
+    :param Winner winner: Engine winner object from the terminal report.
+    :return WinnerSnapshot: Validated snapshot of the engine's own outcome.
+    """
+    source = winner.source or WinnerSource(
+        kind="phase_trial",
+        phase=phase_name,
+        trial_number=winner.trial_number,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+    )
+    return WinnerSnapshot(
+        phase=phase_name,
+        trial_number=winner.trial_number,
+        metric=winner.metric,
+        params=dict(winner.params),
+        gates_passed=(
+            all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
+        ),
+        incomplete=bool(winner.completion.get("incomplete", False)),
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+        source=WinnerSourceSnapshot(
+            kind=source.kind,
+            phase=source.phase,
+            trial_number=source.trial_number,
+            generation_id=source.generation_id,
+            attempt_id=source.attempt_id,
+            study=source.study,
+        ),
+        promotion=winner.promotion,
+    )
 
 
 def finalize_result_snapshot(
