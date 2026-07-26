@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    GENERATION_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
@@ -1303,6 +1304,41 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
             "but the study-level cleanup recovery ledger could not be updated. "
             "Refusing to clear MCP cleanup uncertainty without consuming the trial evidence."
         ) from exc
+
+
+def _previously_recovered_uncertain_trial_count(study: optuna.Study, generation_id: str) -> int:
+    """Count this generation's cleanup-uncertain trials a prior recovery pass consumed.
+
+    Recovery durably records each confirmed trial in the study-level ledger
+    before the CLI can persist its run-level recovery record or clear the
+    cleanup-uncertainty marker. A crash in that window must not erase the
+    evidence: the retry skips these trials as already recovered, and without
+    this count the trial-level-evidence guard would refuse to clear cleanup
+    uncertainty forever (review v0.5.17 gap hunt).
+
+    The count is scoped to ``generation_id`` — detached MCP runs use their run
+    id as the generation id — so a *different* run's already-consumed evidence
+    cannot clear this run's uncertainty; that cross-run refusal stays
+    fail-closed.
+
+    :param optuna.Study study: Study whose ledger and trials are inspected.
+    :param str generation_id: Generation identity of the run being recovered.
+    :return int: This generation's terminal trials that record cleanup
+        uncertainty and appear in the durable recovery ledger.
+    """
+    recovered = _cleanup_recovered_trial_numbers(study)
+    if not recovered:
+        return 0
+    count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if (
+            trial.state.is_finished()
+            and trial.number in recovered
+            and trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False
+            and trial.user_attrs.get(GENERATION_ID_ATTR) == generation_id
+        ):
+            count += 1
+    return count
 
 
 def _trial_dir_for_cleanup_recovery(

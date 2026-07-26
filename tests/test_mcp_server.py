@@ -155,7 +155,9 @@ def _write_trial_process_identity(
     )
 
 
-def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
+def _write_cleanup_uncertain_failed_trial(
+    config: Path, *, generation_id: str = "stale-generation"
+) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
@@ -170,7 +172,7 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
         exp,
         phase.name,
         trial.number,
-        generation_id="stale-generation",
+        generation_id=generation_id,
         attempt_id=attempt_id,
     )
     trial_dir.mkdir(parents=True)
@@ -181,7 +183,7 @@ def _write_cleanup_uncertain_failed_trial(config: Path) -> int:
         starttime=111,
     )
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    trial.set_user_attr(GENERATION_ID_ATTR, "stale-generation")
+    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
@@ -2849,6 +2851,142 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     assert "could not confirm any trial-level cleanup evidence" in replay.output
     assert not store.cleanup_recovery_path(second_run).exists()
     assert store.state(second_handle) == "running"
+
+
+def _stage_terminal_uncertain_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str,
+    mark_uncertain: bool,
+) -> tuple[RunStore, RunHandle, int, Path, list[str]]:
+    """Stage a run whose only cleanup evidence is one of its own
+    cleanup-uncertain terminal trials (generation id == run id, matching the
+    detached-runner contract). Returns ``(store, handle, trial_number,
+    config, command)``."""
+    config = _config(tmp_path)
+    trial_number = _write_cleanup_uncertain_failed_trial(config, generation_id=run_id)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    if mark_uncertain:
+        store.mark_cleanup_uncertain(handle)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+
+    def fake_cleanup(*args: object, **kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
+    command = [
+        "mcp",
+        "recover-run",
+        "--state-dir",
+        str(registry.state_dir),
+        "--run-id",
+        run_id,
+        "--confirm",
+    ]
+    return store, handle, trial_number, config, command
+
+
+def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after the study-ledger write but before the run-level recovery
+    record must not wedge the run forever: the --confirm retry counts the
+    durable ledger evidence for this run's own generation instead of refusing
+    with "no trial-level cleanup evidence" (review v0.5.17 gap hunt)."""
+    from phasesweep.runtime.files import private_atomic_write_text as real_write
+
+    run_id = "srv-ledger-retry"
+    store, handle, trial_number, config, command = _stage_terminal_uncertain_run(
+        tmp_path, monkeypatch, run_id=run_id, mark_uncertain=False
+    )
+    recovery_record = store.cleanup_recovery_path(run_id)
+
+    def crash_on_recovery_record(path: Path, text: str) -> None:
+        if path == recovery_record:
+            raise RuntimeError("simulated crash before the recovery record")
+        real_write(path, text)
+
+    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", crash_on_recovery_record)
+    runner = CliRunner()
+
+    first = runner.invoke(cli_main, command)
+
+    assert first.exit_code != 0
+    # The durable study ledger consumed the trial before the crash; the
+    # run-level record never landed.
+    study = _load_first_phase_study(config)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
+    assert not recovery_record.exists()
+
+    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", real_write)
+
+    retry = runner.invoke(cli_main, command)
+
+    assert retry.exit_code == 0, retry.output
+    recovery = json.loads(recovery_record.read_text())
+    assert recovery["cleanup_confirmed"] is True
+    assert store.live_runs() == []
+
+
+def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupting ``clear_cleanup_uncertain`` after a recovery whose only
+    evidence was a cleanup-uncertain terminal trial used to wedge the run:
+    the retry found nothing fresh to recover and refused even though the
+    recovery record was already on disk. The study ledger now supplies the
+    evidence (review v0.5.17 gap hunt; the existing retry pin covered only
+    the reaped-RUNNING-trial variant, whose attempt ids persist in status)."""
+    run_id = "srv-terminal-marker-retry"
+    store, handle, _trial_number, _config_path, command = _stage_terminal_uncertain_run(
+        tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True
+    )
+
+    real_clear = RunStore.clear_cleanup_uncertain
+    clear_calls = 0
+
+    def interrupt_first_clear(candidate_store: RunStore, candidate: RunHandle) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise RuntimeError("interrupted before clearing cleanup marker")
+        real_clear(candidate_store, candidate)
+
+    monkeypatch.setattr(RunStore, "clear_cleanup_uncertain", interrupt_first_clear)
+    runner = CliRunner()
+
+    first = runner.invoke(cli_main, command)
+
+    assert first.exit_code != 0
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["cleanup_uncertain_terminal_trials"] == 1
+
+    retry = runner.invoke(cli_main, command)
+
+    assert retry.exit_code == 0, retry.output
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert store.live_runs() == []
 
 
 def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(

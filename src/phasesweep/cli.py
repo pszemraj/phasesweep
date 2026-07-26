@@ -22,6 +22,7 @@ from phasesweep.engine.guards import (
     _experiment_semantic_fingerprint,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
+    _previously_recovered_uncertain_trial_count,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
     _suite_fingerprint,
@@ -538,6 +539,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
             persisted_reaped_attempts = len(reaped_attempt_ids)
             cleanup_recovered = 0
+            previously_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
                 for phase in config.phases:
@@ -545,6 +547,15 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     if study is None:
                         continue
                     inspected_studies += 1
+                    # Durable proof left by an interrupted earlier pass: the
+                    # study ledger is written before the run-level recovery
+                    # record, so a crash between them must still count as
+                    # trial-level evidence on retry (review v0.5.17 gap hunt).
+                    # Read before the fresh pass below, which appends to the
+                    # same ledger.
+                    previously_recovered += _previously_recovered_uncertain_trial_count(
+                        study, run_id
+                    )
                     if confirm:
                         cleanup_recovered += _recover_cleanup_uncertain_trials(
                             study,
@@ -560,7 +571,9 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     else:
                         cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
                         reaped += _inspect_stale_running_trials(study, config, phase.name)
-            cleanup_evidence_count = persisted_reaped_attempts + reaped + cleanup_recovered
+            cleanup_evidence_count = (
+                persisted_reaped_attempts + reaped + cleanup_recovered + previously_recovered
+            )
             if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
                 if inspected_studies == 0:
                     detail = (
@@ -568,8 +581,9 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     )
                 else:
                     detail = (
-                        "no RUNNING trials were reaped and no terminal trials recorded cleanup "
-                        "uncertainty"
+                        "no RUNNING trials were reaped, no terminal trials recorded cleanup "
+                        "uncertainty, and no prior recovery pass left durable trial-level "
+                        "evidence"
                     )
                 raise click.ClickException(
                     "runner status recorded cleanup_confirmed=false, but recovery could not "
