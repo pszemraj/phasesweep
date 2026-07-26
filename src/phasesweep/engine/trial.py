@@ -348,7 +348,17 @@ def extract_trial_result(
     failure_reason = executed.process.failure_reason
 
     def _deadline_failure(stage: str) -> TrialResult | None:
-        """Fail the trial when the wallclock deadline expired before ``stage``."""
+        """Fail the trial when the wallclock deadline expired before ``stage``.
+
+        Args:
+            stage: Human-readable name of the stage about to run, used in the
+                failure reason.
+
+        Returns:
+            A deadline-failure :class:`TrialResult`, or ``None`` when no
+            deadline is set or budget remains.
+
+        """
         if deadline is None or time.monotonic() < deadline:
             return None
         return _failed_trial(
