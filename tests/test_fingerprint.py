@@ -960,3 +960,63 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
         return _phase_fingerprint(experiment, experiment.phases[0], {})
 
     assert fingerprint("First version") == fingerprint("Reworded later") == fingerprint(None)
+
+
+def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resource failure before any trial must not bind an empty study forever.
+
+    Reviewer repro (review v0.5.17 / finding A): the fingerprint is stamped
+    before GPU preflight; a config that failed before launching any trial used
+    to leave a zero-trial study bound to that fingerprint, so the *corrected*
+    config was rejected with StudyFingerprintMismatchError even though nothing
+    ever ran.
+    """
+    from tests.conftest import make_experiment, write_trainer
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    db = tmp_path / "fp.db"
+
+    def _exp(command: str) -> Experiment:
+        return make_experiment(
+            experiment="fp_poison",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=command,
+            n_trials=1,
+        )
+
+    def _gpu_preflight_fails(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("no GPUs detected")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr("phasesweep.engine.phase.GpuPool.create", _gpu_preflight_fails)
+        with pytest.raises(RuntimeError, match="no GPUs detected"):
+            run_experiment(_exp("false {overrides}"))
+
+    # Corrected trainer command = different semantic fingerprint. The empty
+    # study must rebind instead of rejecting the fix.
+    winners = run_experiment(_exp(f"python {trainer} {{overrides}}"))
+    assert winners["p"].metric == pytest.approx(1.0)
+
+
+def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -> None:
+    """The empty-study rebind must not weaken identity once results exist."""
+    from tests.conftest import make_experiment, write_trainer
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    db = tmp_path / "fp2.db"
+
+    def _exp(command: str) -> Experiment:
+        return make_experiment(
+            experiment="fp_guard",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=command,
+            n_trials=1,
+        )
+
+    run_experiment(_exp(f"python {trainer} {{overrides}}"))
+    with pytest.raises(RuntimeError, match="different phase config"):
+        run_experiment(_exp(f"python {trainer} --changed {{overrides}}"))

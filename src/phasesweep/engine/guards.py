@@ -462,6 +462,23 @@ def _verify_fingerprint(
     if existing is None:
         study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:
+        # A zero-trial study whose launch prerequisites failed (bad GPU
+        # policy, broken command) must not permanently bind its semantic
+        # identity: nothing was ever evaluated under the old fingerprint, so
+        # rebinding cannot mix results, and refusing here would make the
+        # corrected config a rejected regression (review v0.5.17 / finding A).
+        # An accepted trial target is treated as identity too — it means an
+        # earlier invocation got past every launch prerequisite.
+        if not study.get_trials(deepcopy=False) and study.user_attrs.get(TRIAL_TARGET_ATTR) is None:
+            log.warning(
+                "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
+                "ever ran under the previous config.",
+                study.study_name,
+                existing,
+                fp,
+            )
+            study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
+            return fp
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
