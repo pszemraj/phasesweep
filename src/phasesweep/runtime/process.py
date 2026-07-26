@@ -226,17 +226,13 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
         log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
         confirmed_by_pgid: dict[int, bool] = {}
-        for pgid in pgids:
-            try:
-                confirmed_by_pgid[pgid] = _terminate_process_group(
-                    pgid,
-                    grace_seconds=_KILL_GRACE_SECONDS,
-                )
-            except Exception:
-                log.exception(
-                    "Failed while cleaning child process group %d after signal %d", pgid, signum
-                )
-                confirmed_by_pgid[pgid] = False
+        try:
+            confirmed_by_pgid = _terminate_process_groups(
+                pgids,
+                grace_seconds=_KILL_GRACE_SECONDS,
+            )
+        except Exception:
+            log.exception("Failed while cleaning child process groups after signal %d", signum)
 
         cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
         report = ShutdownCleanupReport(
@@ -1814,42 +1810,93 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
         group is still alive 2s after SIGKILL.
 
     """
+    return _terminate_process_groups((pgid,), grace_seconds=grace_seconds)[pgid]
+
+
+def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+    """Escalate SIGTERM → SIGKILL across process groups with shared wait windows.
+
+    Per-group semantics match :func:`_terminate_process_group`; the SIGTERM
+    grace and the post-SIGKILL confirmation window are shared across all
+    groups, so total worst-case latency stays roughly ``grace_seconds + 2``
+    seconds instead of scaling with the number of live groups. The shutdown
+    handler kills every active trial group of an ``n_jobs > 1`` phase through
+    this path — trainers that ignore SIGTERM fail correlated, not
+    independently, so a serial escalation would multiply the documented
+    worst case by the trial parallelism.
+
+    Args:
+        pgids: Target process-group IDs.
+        grace_seconds: Seconds to wait after SIGTERM before escalating to
+            SIGKILL, shared across all groups.
+
+    Returns:
+        Confirmation verdict per requested pgid — ``True`` only when that
+        group is confirmed dead.
+
+    """
     import time
 
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError) as exc:
-        log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
-        return False
+    confirmed: dict[int, bool] = {}
+    members: dict[int, set[int]] = {}
+    pending: list[int] = []
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            confirmed[pgid] = True
+            continue
+        except (PermissionError, OSError) as exc:
+            log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
+            confirmed[pgid] = False
+            continue
+        members[pgid] = set(_group_member_pids(pgid))
+        pending.append(pgid)
 
-    member_pids = set(_group_member_pids(pgid))
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _process_group_alive_with_members(pgid, member_pids):
-            return True
-        time.sleep(0.1)
+    while pending and time.monotonic() < deadline:
+        still_alive = []
+        for pgid in pending:
+            if _process_group_alive_with_members(pgid, members[pgid]):
+                still_alive.append(pgid)
+            else:
+                confirmed[pgid] = True
+        pending = still_alive
+        if pending:
+            time.sleep(0.1)
 
-    log.warning("Stale process group %d survived SIGTERM — sending SIGKILL", pgid)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError) as exc:
-        log.error("Failed to send SIGKILL to process group %d: %s", pgid, exc)
-        return False
+    survivors: list[int] = []
+    for pgid in pending:
+        log.warning("Stale process group %d survived SIGTERM — sending SIGKILL", pgid)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            confirmed[pgid] = True
+            continue
+        except (PermissionError, OSError) as exc:
+            log.error("Failed to send SIGKILL to process group %d: %s", pgid, exc)
+            confirmed[pgid] = False
+            continue
+        survivors.append(pgid)
 
     # Wait briefly for the kernel to actually reap descendants so the reaper's
     # "marked FAIL" state means cleanup completed, not requested.
     kill_deadline = time.monotonic() + 2.0
-    while time.monotonic() < kill_deadline:
-        if not _process_group_alive_with_members(pgid, member_pids):
-            return True
-        time.sleep(0.05)
+    while survivors and time.monotonic() < kill_deadline:
+        still_alive = []
+        for pgid in survivors:
+            if _process_group_alive_with_members(pgid, members[pgid]):
+                still_alive.append(pgid)
+            else:
+                confirmed[pgid] = True
+        survivors = still_alive
+        if survivors:
+            time.sleep(0.05)
 
-    log.error("Process group %d still appears alive after SIGKILL", pgid)
-    return False
+    for pgid in survivors:
+        log.error("Process group %d still appears alive after SIGKILL", pgid)
+        confirmed[pgid] = False
+    return confirmed
 
 
 def _process_group_alive(pgid: int) -> bool:

@@ -31,6 +31,7 @@ from phasesweep.runtime.process import (
     _shutdown_handler,
     _spawn_blocked_supervisor,
     _terminate_process_group,
+    _terminate_process_groups,
     cleanup_stale_trial_process,
     defer_shutdown_signals,
     is_pid_alive,
@@ -905,6 +906,64 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     )
 
 
+def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:
+    """Two SIGTERM-ignoring groups burn ONE shared grace window, not one each.
+
+    The shutdown handler kills every active trial group of an ``n_jobs > 1``
+    phase through this path; serial escalation would multiply worst-case
+    shutdown latency by the trial parallelism (review v0.5.17 gap hunt).
+    """
+    grace = 1.5
+    procs: list[subprocess.Popen] = []
+    try:
+        for idx in range(2):
+            ready = tmp_path / f"ready_{idx}"
+            script = (
+                "import pathlib, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"pathlib.Path({str(ready)!r}).touch(); "
+                "time.sleep(60)"
+            )
+            procs.append(subprocess.Popen([sys.executable, "-c", script], start_new_session=True))
+        deadline = time.time() + 10.0
+        while not all((tmp_path / f"ready_{i}").exists() for i in range(2)):
+            if time.time() > deadline:
+                pytest.fail("children never installed their SIGTERM ignore handlers")
+            time.sleep(0.02)
+
+        start = time.monotonic()
+        verdicts = _terminate_process_groups(tuple(proc.pid for proc in procs), grace_seconds=grace)
+        elapsed = time.monotonic() - start
+    finally:
+        for proc in procs:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+
+    assert verdicts == {proc.pid: True for proc in procs}
+    # Serial escalation would burn at least one full grace per group.
+    assert elapsed < 2 * grace - 0.2, f"escalation took {elapsed:.2f}s; grace not shared"
+
+
+def test_terminate_process_groups_reports_per_group_verdicts(tmp_path: Path) -> None:
+    """An already-gone group confirms instantly; a live group still gets killed."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    dead.wait()
+    live = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    try:
+        verdicts = _terminate_process_groups((dead.pid, live.pid), grace_seconds=5.0)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(live.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            live.wait(timeout=5)
+
+    assert verdicts == {dead.pid: True, live.pid: True}
+
+
 def test_shutdown_handler_uses_initial_pgid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -919,12 +978,12 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
 
     monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
 
-    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
-        terminated.append(pgid)
+    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+        terminated.extend(pgids)
         active.clear()
-        return True
+        return dict.fromkeys(pgids, True)
 
-    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_groups", fake_terminate)
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
@@ -939,8 +998,8 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
 ) -> None:
     monkeypatch.setattr("phasesweep.runtime.process._active_children", {1234: object()})
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: False,
+        "phasesweep.runtime.process._terminate_process_groups",
+        lambda pgids, *, grace_seconds: dict.fromkeys(pgids, False),
     )
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
@@ -961,15 +1020,15 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
 
     monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
 
-    def fake_terminate(pgid: int, *, grace_seconds: float) -> bool:
+    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
         nonlocal reentered
-        terminated.append(pgid)
+        terminated.extend(pgids)
         if not reentered:
             reentered = True
             assert _shutdown_handler(signal.SIGINT, None) is None
-        return True
+        return dict.fromkeys(pgids, True)
 
-    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_group", fake_terminate)
+    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_groups", fake_terminate)
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
