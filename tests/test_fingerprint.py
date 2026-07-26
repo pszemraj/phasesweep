@@ -14,6 +14,7 @@ import yaml
 from phasesweep import __version__, load_experiment, run_experiment
 from phasesweep.config import (
     CategoricalParam,
+    ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
@@ -382,6 +383,53 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             assert fp_a == fp_b, case
         else:
             assert fp_a != fp_b, case
+
+
+def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
+    tmp_path: Path,
+) -> None:
+    """The trainer's cwd and env-inheritance contract are semantic inputs.
+
+    Both were unbound implicit inputs before review v0.5.17 / blocker 4: one
+    study could mix trials launched from different directories or with
+    different credentials visible. Both fingerprints must move when either
+    changes, and must not move when the operator merely spells out the
+    default block.
+    """
+    from phasesweep.engine.guards import _experiment_semantic_fingerprint, _phase_semantic_payload
+
+    variants = {
+        "unbound": make_experiment(),
+        "explicit_default": make_experiment(execution=ExecutionContext()),
+        "cwd": make_experiment(execution=ExecutionContext(cwd=str(tmp_path))),
+        "inherit_none": make_experiment(execution=ExecutionContext(inherit_env="none")),
+        "inherit_names": make_experiment(execution=ExecutionContext(inherit_env=["HF_TOKEN"])),
+    }
+    experiment_fps = {name: _experiment_semantic_fingerprint(exp) for name, exp in variants.items()}
+    phase_fps = {name: _phase_fingerprint(exp, exp.phases[0], {}) for name, exp in variants.items()}
+
+    # Writing the default block out longhand is not a semantic edit.
+    assert experiment_fps["unbound"] == experiment_fps["explicit_default"]
+    assert phase_fps["unbound"] == phase_fps["explicit_default"]
+
+    distinct = ["unbound", "cwd", "inherit_none", "inherit_names"]
+    assert len({experiment_fps[name] for name in distinct}) == len(distinct)
+    assert len({phase_fps[name] for name in distinct}) == len(distinct)
+
+    # The phase payload carries the same resolved contract as the experiment one.
+    cwd_exp = variants["cwd"]
+    payload = _phase_semantic_payload(cwd_exp, cwd_exp.phases[0], {})
+    assert payload["execution"] == {"cwd": str(tmp_path.resolve()), "inherit_env": "all"}
+
+    # Names are a set, not a sequence: reordering the list is not an edit.
+    reordered = make_experiment(
+        execution=ExecutionContext(inherit_env=["HF_TOKEN", "WANDB_API_KEY"])
+    )
+    ordered = make_experiment(execution=ExecutionContext(inherit_env=["WANDB_API_KEY", "HF_TOKEN"]))
+    assert _experiment_semantic_fingerprint(reordered) == _experiment_semantic_fingerprint(ordered)
+    assert _phase_fingerprint(reordered, reordered.phases[0], {}) == _phase_fingerprint(
+        ordered, ordered.phases[0], {}
+    )
 
 
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:

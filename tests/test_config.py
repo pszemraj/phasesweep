@@ -5,8 +5,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from phasesweep import load_experiment
-from phasesweep.config import Experiment, JsonExtractor, LogRegexExtractor, Metric, Phase
+from phasesweep import load_config, load_experiment
+from phasesweep.config import (
+    ExecutionContext,
+    Experiment,
+    JsonExtractor,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Suite,
+)
 from tests.conftest import write_yaml
 
 
@@ -116,6 +124,88 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
             ),
             phases=[Phase(name="p", n_trials=1)],
         )
+
+
+@pytest.mark.parametrize(
+    ("inherit_env", "message"),
+    [
+        ([""], "nonempty and unpadded"),
+        ([" PATH"], "nonempty and unpadded"),
+        (["PATH "], "nonempty and unpadded"),
+        (["WANDB_API_KEY", "WANDB_API_KEY"], "must be unique"),
+    ],
+    ids=["empty", "leading_space", "trailing_space", "duplicate"],
+)
+def test_execution_inherit_env_names_validated(inherit_env: list[str], message: str) -> None:
+    """A named-inheritance list must be a set of exact variable names.
+
+    Padded or empty names would silently inherit nothing (``os.environ`` has
+    no ``' PATH'``), and duplicates hide a typo in a second entry.
+    """
+    with pytest.raises(ValidationError, match=message):
+        ExecutionContext(inherit_env=inherit_env)
+
+
+def test_execution_accepts_named_inherit_list() -> None:
+    execution = ExecutionContext(inherit_env=["WANDB_API_KEY", "HF_TOKEN"])
+
+    assert execution.inherit_env == ["WANDB_API_KEY", "HF_TOKEN"]
+    assert execution.cwd is None
+    assert ExecutionContext().inherit_env == "all"
+
+
+def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> None:
+    """``defaults.execution`` reaches studies that omit it; a study that
+    declares its own block replaces the default *wholesale* rather than
+    merging per key, and an explicit null resets to the built-in default
+    (see ``Suite.experiment_for_study``).
+    """
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: execution_suite
+            defaults:
+              trial_command: "echo"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
+              execution:
+                inherit_env: none
+            studies:
+              - name: inherited
+                phases: [{name: p, n_trials: 1}]
+              - name: replaced_cwd
+                execution: {cwd: /srv/trainer}
+                phases: [{name: p, n_trials: 1}]
+              - name: replaced_names
+                execution: {inherit_env: [WANDB_API_KEY, HF_TOKEN]}
+                phases: [{name: p, n_trials: 1}]
+              - name: reset
+                execution: null
+                phases: [{name: p, n_trials: 1}]
+            """,
+        )
+    )
+
+    assert isinstance(config, Suite)
+    inherited, replaced_cwd, replaced_names, reset = (
+        config.experiment_for_study(study) for study in config.studies
+    )
+
+    assert inherited.execution == ExecutionContext(inherit_env="none")
+
+    # Wholesale replacement: the study's block does not keep the suite's
+    # inherit_env: none — the unset field falls back to the field default.
+    assert replaced_cwd.execution == ExecutionContext(cwd="/srv/trainer")
+    assert replaced_cwd.execution.inherit_env == "all"
+    assert replaced_names.execution == ExecutionContext(inherit_env=["WANDB_API_KEY", "HF_TOKEN"])
+    assert replaced_names.execution.cwd is None
+
+    # Explicit null is not "inherit the default block" — it is a reset.
+    assert reset.execution == ExecutionContext()
+    assert reset.execution.inherit_env == "all"
 
 
 # ---- migrated from version-named files ----

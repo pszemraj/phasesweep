@@ -279,9 +279,40 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
-FINGERPRINT_SCHEMA_VERSION = 2
-SUITE_FINGERPRINT_SCHEMA_VERSION = 1
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 1
+# v3 / v2 / v2: the execution contract (resolved trainer cwd + declared
+# env-inheritance) joined every semantic fingerprint (review v0.5.17 /
+# blocker 4). Existing populated studies from earlier schemas fail the
+# fingerprint check on resume; see docs/config.md's upgrade section.
+FINGERPRINT_SCHEMA_VERSION = 3
+SUITE_FINGERPRINT_SCHEMA_VERSION = 2
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 2
+
+
+def _execution_identity(experiment: Experiment) -> dict[str, Any]:
+    """Return the execution contract's contribution to semantic fingerprints.
+
+    The trainer's working directory and ambient-environment inheritance are
+    semantic inputs: two invocations differing in either can evaluate
+    different code or data under one study (review v0.5.17 / blocker 4). A
+    configured cwd contributes its RESOLVED path — a relative cwd invoked
+    from two directories is two different execution contexts and must not
+    share a study. An unconfigured cwd is recorded as ``None`` (explicitly
+    unbound, the documented historical behavior). Ambient variable *values*
+    are never hashed — they may hold secrets and are not declared semantic;
+    put semantic values in ``env``, which is fingerprinted.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :return dict[str, Any]: JSON-serialisable execution-identity payload.
+    """
+    contract = experiment.execution.inherit_env
+    return {
+        "cwd": (
+            None
+            if experiment.execution.cwd is None
+            else str(Path(experiment.execution.cwd).expanduser().resolve())
+        ),
+        "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
+    }
 
 
 def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
@@ -307,6 +338,7 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
         "trial_command": experiment.trial_command,
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
+        "execution": _execution_identity(experiment),
         "provenance": dict(sorted(experiment.provenance.items())),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
@@ -394,6 +426,7 @@ def _phase_semantic_payload(
         "provenance": dict(sorted(experiment.provenance.items())),
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
+        "execution": _execution_identity(experiment),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
         "contracts": {

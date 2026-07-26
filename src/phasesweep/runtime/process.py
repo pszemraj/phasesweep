@@ -1106,8 +1106,8 @@ def _sanitized_supervisor_env() -> dict[str, str]:
     return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
 
-def _encode_launch_payload(cmd: str, env: dict[str, str]) -> bytes:
-    """Frame the trainer command and environment for the supervisor's ack pipe.
+def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None) -> bytes:
+    """Frame the trainer command, environment, and cwd for the supervisor's ack pipe.
 
     Decoded on the other end by
     :func:`phasesweep.runtime.supervisor._read_launch_payload` (via
@@ -1115,10 +1115,15 @@ def _encode_launch_payload(cmd: str, env: dict[str, str]) -> bytes:
 
     :param str cmd: Shell command string the supervisor execs with ``/bin/sh``.
     :param dict[str, str] env: Full trainer process environment.
+    :param str | None cwd: Optional working directory the supervisor changes
+        into before exec'ing the trainer (review v0.5.17 / blocker 4).
     :return bytes: An ASCII decimal length header (byte length of the UTF-8
         JSON body) immediately followed by that many body bytes.
     """
-    body = json.dumps({"cmd": cmd, "env": env}).encode("utf-8")
+    payload: dict[str, Any] = {"cmd": cmd, "env": env}
+    if cwd is not None:
+        payload["cwd"] = cwd
+    body = json.dumps(payload).encode("utf-8")
     # supervisor.py's _HEADER_LEN is the single source of truth for the frame
     # header width; derive the format width from it rather than hardcoding
     # the digit count here.
@@ -1255,6 +1260,7 @@ def run_supervised(
     timeout: float | None,
     trial_dir: Path,
     attempt_id: str,
+    cwd: str | None = None,
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
@@ -1295,6 +1301,10 @@ def run_supervised(
             entry (launch overhead included), or ``None`` for no timeout.
         trial_dir: Per-trial directory where ``process_identity.json`` is written.
         attempt_id: Immutable attempt identity already persisted in Optuna.
+        cwd: Optional working directory the supervisor changes into before
+            exec'ing the trainer, delivered over the ack pipe with the rest
+            of the launch payload (review v0.5.17 / blocker 4). ``None``
+            keeps the invocation cwd.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
@@ -1353,7 +1363,7 @@ def run_supervised(
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
             # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
-            _write_all(ack_write, _encode_launch_payload(cmd, env))
+            _write_all(ack_write, _encode_launch_payload(cmd, env, cwd))
             os.close(ack_write)
             ack_write = None
     except _LaunchDeadlineExpired as exc:

@@ -50,6 +50,55 @@ class TrialResult:
     gate_results: list[GateResult] | None = None
 
 
+# Minimal environment base used when the execution contract narrows
+# inheritance below "all": enough for a shell + interpreter to start and
+# write temp files, nothing that can carry semantic configuration.
+_BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
+
+
+def _trainer_environment(experiment: Experiment) -> dict[str, str]:
+    """Compose the trainer environment per the execution contract.
+
+    ``inherit_env: all`` preserves the historical full-inheritance behavior.
+    ``none`` starts from the minimal base; a list adds exactly the named
+    ambient variables on top of that base. Configured ``experiment.env``
+    values always apply last (review v0.5.17 / blocker 4).
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :return dict[str, str]: The composed trainer environment.
+    """
+    contract = experiment.execution.inherit_env
+    if contract == "all":
+        env = os.environ.copy()
+    else:
+        names = list(_BASE_INHERITED_ENV)
+        if isinstance(contract, list):
+            names.extend(contract)
+        env = {name: os.environ[name] for name in names if name in os.environ}
+    env.update(experiment.env)
+    return env
+
+
+def _resolved_execution_cwd(experiment: Experiment) -> Path | None:
+    """Resolve the configured trainer working directory, if any.
+
+    :param Experiment experiment: Parsed experiment supplying ``execution.cwd``.
+    :raises TrialExecutionError: The configured directory does not exist.
+    :return Path | None: Resolved absolute directory, or ``None`` when the
+        contract leaves the cwd unbound (invocation cwd, historical behavior).
+    """
+    configured = experiment.execution.cwd
+    if configured is None:
+        return None
+    resolved = Path(configured).expanduser().resolve()
+    if not resolved.is_dir():
+        raise TrialExecutionError(
+            f"execution.cwd {configured!r} resolves to {resolved}, which is not a "
+            "directory on this host."
+        )
+    return resolved
+
+
 class TrialExecutionError(RuntimeError):
     """Raised when a trial subprocess crashes or extraction fails.
 
@@ -191,8 +240,11 @@ def launch_trial(
     # the trust-boundary comment above).
     (workdir / "command.txt").write_text(cmd + "\n")
 
-    env = os.environ.copy()
-    env.update(experiment.env)
+    # Environment and working directory follow the explicit execution
+    # contract instead of unbounded ambient inheritance (review v0.5.17 /
+    # blocker 4).
+    env = _trainer_environment(experiment)
+    trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name
@@ -220,6 +272,7 @@ def launch_trial(
             timeout=timeout_seconds,
             trial_dir=workdir,
             attempt_id=attempt_id,
+            cwd=None if trainer_cwd is None else str(trainer_cwd),
         )
 
     ctx = TrialContext(

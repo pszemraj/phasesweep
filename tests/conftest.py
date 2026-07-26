@@ -16,6 +16,7 @@ import pytest
 
 from phasesweep.config import (
     Constraint,
+    ExecutionContext,
     Experiment,
     IntParam,
     LogRegexExtractor,
@@ -82,6 +83,7 @@ def make_experiment(
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
+    execution: ExecutionContext | None = None,
     provenance: dict[str, str] | None = None,
     **phase_overrides: Any,
 ) -> Experiment:
@@ -124,6 +126,8 @@ def make_experiment(
         kwargs["constraints"] = constraints
     if env is not None:
         kwargs["env"] = env
+    if execution is not None:
+        kwargs["execution"] = execution
 
     return Experiment(**kwargs)
 

@@ -83,6 +83,7 @@ def _run_supervised(
     env: dict[str, str] | None = None,
     timeout: float | None = None,
     attempt_id: str,
+    cwd: str | None = None,
 ):
     """Open ``trial_dir``'s out/err logs and delegate to ``run_supervised``.
 
@@ -98,6 +99,7 @@ def _run_supervised(
             timeout=timeout,
             trial_dir=trial_dir,
             attempt_id=attempt_id,
+            cwd=cwd,
         )
 
 
@@ -439,6 +441,42 @@ def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None
 
     assert result.return_code == 0
     assert out_path.read_text() == "trial-env-value"
+
+
+def test_run_supervised_enters_payload_cwd_before_exec(tmp_path: Path) -> None:
+    """The supervisor chdirs into the payload's working directory before exec,
+    so relative-path trainer commands resolve against the execution contract's
+    cwd (review v0.5.17 / blocker 4)."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    trainer_home = tmp_path / "trainer_home"
+    trainer_home.mkdir()
+
+    result = _run_supervised(
+        trial_dir, "pwd", timeout=None, attempt_id="cwd-attempt", cwd=str(trainer_home)
+    )
+
+    assert result.return_code == 0
+    assert (trial_dir / "out.log").read_text().strip() == str(trainer_home)
+
+
+def test_run_supervised_fails_with_chdir_exit_code_when_cwd_vanishes(tmp_path: Path) -> None:
+    """A payload cwd that cannot be entered must fail loudly (exit 76) instead
+    of silently running the trainer from the wrong directory. launch_trial
+    validates existence up front; this covers the race where the directory
+    disappears between validation and exec."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    result = _run_supervised(
+        trial_dir,
+        "pwd",
+        timeout=None,
+        attempt_id="cwd-race-attempt",
+        cwd=str(tmp_path / "vanished"),
+    )
+
+    assert result.return_code == 76
 
 
 def test_spawn_blocked_supervisor_launch_argv_and_env(

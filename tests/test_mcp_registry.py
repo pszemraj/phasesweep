@@ -241,6 +241,30 @@ def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
+def test_relative_execution_cwd_rejected_for_mcp(tmp_path: Path) -> None:
+    """Same stability rule as ``workdir``: a relative trainer cwd would mean
+    one thing to a CLI operator and another to the detached MCP runner."""
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
+    )
+
+    with pytest.raises(CatalogError, match=r"absolute execution\.cwd"):
+        Registry.load(_catalog(tmp_path, config))
+
+
+def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
+    trainer_cwd = tmp_path / "trainer"
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path) + f"execution:\n  cwd: {trainer_cwd}\n",
+    )
+
+    registry = Registry.load(_catalog(tmp_path, config))
+
+    assert registry.get("reg_ok").experiment.execution.cwd == str(trainer_cwd)
+
+
 @pytest.mark.parametrize(
     "storage",
     [

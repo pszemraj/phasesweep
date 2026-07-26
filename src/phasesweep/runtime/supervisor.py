@@ -50,21 +50,23 @@ def _read_exact(fd: int, size: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str]] | None:
+def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] | None:
     """Read and parse the length-prefixed launch payload from the ack pipe.
 
     The wire format is ``_HEADER_LEN`` ASCII decimal bytes giving the byte
     length of a UTF-8 JSON body, immediately followed by that many body
-    bytes. The body must decode to ``{"cmd": <str>, "env": {<str>: <str>}}``.
+    bytes. The body must decode to ``{"cmd": <str>, "env": {<str>: <str>}}``
+    with an optional ``"cwd": <str>`` naming the trainer's working directory
+    (review v0.5.17 / blocker 4).
 
     Encoded on the other end by ``phasesweep.runtime.process._encode_launch_payload``
     (prose reference only — this module is stdlib-only and must never import
     phasesweep); keep both sides in sync if the wire format changes.
 
     :param int ack_fd: Read end of the acknowledgement pipe.
-    :return tuple[str, dict[str, str]] | None: ``(cmd, env)`` on a well-formed
-        payload; ``None`` on EOF, a malformed header, a truncated body, or a
-        body that is not a ``{"cmd": str, "env": {str: str}}`` JSON object.
+    :return tuple[str, dict[str, str], str | None] | None: ``(cmd, env, cwd)``
+        on a well-formed payload; ``None`` on EOF, a malformed header, a
+        truncated body, or a body of the wrong shape.
     """
     header = _read_exact(ack_fd, _HEADER_LEN)
     if header is None:
@@ -86,12 +88,15 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str]] | None:
         return None
     cmd = payload.get("cmd")
     env = payload.get("env")
+    cwd = payload.get("cwd")
     if not isinstance(cmd, str) or not isinstance(env, dict):
+        return None
+    if cwd is not None and (not isinstance(cwd, str) or not cwd):
         return None
     for key, value in env.items():
         if not isinstance(key, str) or not isinstance(value, str):
             return None
-    return cmd, env
+    return cmd, env, cwd
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
     :return int: ``64`` if ``argv`` does not have exactly two elements; ``75``
         if the acknowledgement pipe does not deliver a well-formed
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
-        violation; on success, ``os.execve`` replaces this process image with
+        violation; ``76`` if the payload's optional working directory cannot
+        be entered; on success, ``os.execve`` replaces this process image with
         ``/bin/sh -c cmd`` under the delivered environment and never returns
         here — the trailing ``127`` only guards against ``execve`` returning
         unexpectedly.
@@ -137,7 +143,17 @@ def main(argv: list[str] | None = None) -> int:
         os.close(ack_fd)
     if payload is None:
         return 75
-    cmd, env = payload
+    cmd, env, cwd = payload
+
+    if cwd is not None:
+        # The execution contract's trainer working directory (review v0.5.17 /
+        # blocker 4). A failed chdir must fail loudly BEFORE exec — running
+        # the trainer from the wrong directory would silently change what a
+        # relative-path command means.
+        try:
+            os.chdir(cwd)
+        except OSError:
+            return 76
 
     os.execve("/bin/sh", ["sh", "-c", cmd], env)
     return 127

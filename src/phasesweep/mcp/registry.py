@@ -291,6 +291,22 @@ def _require_mcp_stable_paths(
             suggestion=f"set workdir to an absolute path, e.g. {(config_dir / workdir).resolve()}",
         )
 
+    execution_cwd = experiment.execution.cwd
+    if execution_cwd is not None and not Path(execution_cwd).expanduser().is_absolute():
+        # Same stability rule as workdir (review v0.5.17 / blocker 4): a
+        # relative trainer cwd would resolve differently for a CLI operator
+        # and the detached MCP runner, splitting one config into two
+        # execution contexts.
+        raise CatalogError(
+            f"{experiment_id!r}: MCP experiments must use an absolute execution.cwd; "
+            "relative values depend on the invoking process's directory and would "
+            "give CLI and MCP invocations different trainer working directories",
+            suggestion=(
+                "set execution.cwd to an absolute path, e.g. "
+                f"{(config_dir / Path(execution_cwd).expanduser()).resolve()}"
+            ),
+        )
+
     backend = storage_backend(storage)
     if backend not in {"sqlite", "journal"}:
         raise CatalogError(

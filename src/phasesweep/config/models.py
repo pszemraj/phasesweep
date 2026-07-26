@@ -364,6 +364,61 @@ class Phase(_Frozen):
         return self
 
 
+class ExecutionContext(_Frozen):
+    """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
+
+    Without this block, the trainer inherits the orchestrator's *entire*
+    ambient environment and current working directory — two unbounded
+    implicit semantic inputs that never contribute to study identity, so one
+    persistent study can silently mix evaluations from different trainers,
+    datasets, or credentials. Declaring the contract makes both explicit,
+    passes them to the trainer deterministically, and binds them into the
+    semantic fingerprint.
+    """
+
+    cwd: str | None = Field(
+        default=None,
+        description=(
+            "Working directory for every trainer subprocess. Relative paths "
+            "resolve against the invocation cwd at launch (same rule as "
+            "workdir); prefer an absolute path so CLI and MCP invocations "
+            "agree. When set, the RESOLVED path joins the semantic "
+            "fingerprint, so the same study can never mix trainers reached "
+            "through different working directories. When unset, trainers run "
+            "in the invocation cwd and the fingerprint records the context as "
+            "unbound (null)."
+        ),
+    )
+    inherit_env: Literal["all", "none"] | list[str] = Field(
+        default="all",
+        description=(
+            "Which ambient environment variables the trainer inherits. 'all' "
+            "(default) preserves the historical full-inheritance behavior. "
+            "'none' starts from a minimal documented base (PATH, HOME, LANG, "
+            "LC_ALL, TMPDIR, USER, LOGNAME, TZ). A list inherits the base "
+            "plus exactly the named variables. Configured `env` values are "
+            "always applied on top and are always fingerprinted; the "
+            "inherit contract (mode/names, not ambient values) is "
+            "fingerprinted too."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_inherit_names(self) -> ExecutionContext:
+        """Reject empty or whitespace-only inherited-variable names.
+
+        :raises ValueError: A listed variable name is empty or padded.
+        :return ExecutionContext: Self, unchanged.
+        """
+        if isinstance(self.inherit_env, list):
+            bad = [name for name in self.inherit_env if not name or name != name.strip()]
+            if bad:
+                raise ValueError(f"inherit_env names must be nonempty and unpadded: {bad!r}")
+            if len(set(self.inherit_env)) != len(self.inherit_env):
+                raise ValueError("inherit_env names must be unique.")
+        return self
+
+
 class Experiment(_Frozen):
     """Top-level experiment: trial command, metric, constraints, and ordered phases."""
 
@@ -414,6 +469,13 @@ class Experiment(_Frozen):
     contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
+    execution: ExecutionContext = Field(
+        default_factory=ExecutionContext,
+        description=(
+            "Explicit trainer execution context: working directory and "
+            "environment-inheritance contract (review v0.5.17 / blocker 4)."
+        ),
+    )
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -956,6 +1018,7 @@ class SuiteDefaults(_Frozen):
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
+    execution: ExecutionContext = Field(default_factory=ExecutionContext)
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
 
 
@@ -975,6 +1038,7 @@ class StudySpec(_Frozen):
     contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] | None = None
+    execution: ExecutionContext | None = None
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
     promotion: Promotion | None = None
 
@@ -1091,6 +1155,7 @@ class Suite(_Frozen):
             contracts=contracts,
             phases=copy.deepcopy(study.phases),
             env=env,
+            execution=value("execution") or ExecutionContext(),
             timeout_seconds_per_run=value("timeout_seconds_per_run"),
         )
 

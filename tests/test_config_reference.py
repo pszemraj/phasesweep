@@ -14,6 +14,7 @@ from phasesweep.config import (
     CategoricalParam,
     Constraint,
     Contract,
+    ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
@@ -38,7 +39,7 @@ from phasesweep.config import (
 _REFERENCE = Path(__file__).parents[1] / "docs" / "config_reference.yaml"
 _FIELD_DECLARATION = re.compile(r"^# +([a-z][a-z0-9_]*):", re.MULTILINE)
 _SECTION_MODELS = {
-    "EXPERIMENT ROOT": (Experiment, Metric, Constraint, Contract, Phase, Sampler),
+    "EXPERIMENT ROOT": (Experiment, Metric, Constraint, Contract, Phase, Sampler, ExecutionContext),
     "SEARCH PARAMETER OBJECTS": (FloatParam, IntParam, CategoricalParam),
     "EXTRACTOR OBJECTS": (
         JsonExtractor,

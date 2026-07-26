@@ -24,6 +24,8 @@ Agent-visible metric descriptors label the configured extractor's evidence assur
 
 The remaining top-level keys: `workdir` (default `./runs`) is the output root laid out in [runtime behavior](runtime.md#output-layout); `override_format` selects the trainer boundary covered in [override formats](#override-formats); `env` adds environment variables to every trial subprocess (included in semantic fingerprints); `timeout_seconds_per_run` is the whole-experiment wallclock guard described with the other timeouts in [runtime behavior](runtime.md#process-management).
 
+`execution` declares the trainer's execution context explicitly instead of inheriting it silently. `execution.cwd` sets the working directory every trainer subprocess runs in; when set, the resolved path joins the semantic fingerprint, so one persistent study can never mix trainers reached through different working directories (a relative `trial_command` like `python trainer.py` means different code from different directories). Prefer an absolute path — a relative value resolves from the invocation directory, and two invocation directories then count as two incompatible execution contexts by design. When unset, trainers run in the invocation cwd and the fingerprint records the context as unbound, preserving historical behavior. `execution.inherit_env` controls which ambient environment variables trainers inherit: `all` (default, historical behavior), `none` (a minimal documented base: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `USER`, `LOGNAME`, `TZ`), or a list of names inherited on top of that base — use a narrowed contract to keep unrelated host variables and secrets out of trainer subprocesses. The inherit contract (mode or sorted names) joins the fingerprint; ambient *values* are never hashed, so put values that change trial meaning in `env`, which is always fingerprinted. Configured `env` entries apply on top of whatever is inherited.
+
 For normal CLI runs, relative `workdir` values, relative paths inside `trial_command`, and file-backed storage paths resolve from the directory where `phasesweep` was invoked, not from the config file's directory. Invoke a relative-path config from one stable intended directory; changing cwd can silently select a different artifact tree and study. `phasesweep validate` checks the command template but does not require referenced executables or paths to exist. File storage URLs use three slashes for relative paths (`sqlite:///runs.db`, `journal:///runs.journal`) and four for absolute POSIX paths (`sqlite:////tmp/runs.db`). MCP-launched runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
 
 ## Phase keys
@@ -182,6 +184,16 @@ relational store. ... Set allow_external_rdb_single_host: true ...
 ```
 
 PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+
+### Fingerprints now include the execution contract
+
+Every semantic fingerprint (phase schema v3, experiment schema v2, suite schema v2) now includes the trainer execution context: the resolved `execution.cwd` (or `null` when unbound) and the `execution.inherit_env` contract. Populated studies created under earlier schemas fail the fingerprint check on their next resume or top-up:
+
+```text
+StudyFingerprintMismatchError: Study 'exp::phase' was created with a different phase config ...
+```
+
+Nothing about your trainer semantics changed if you never set `execution`; the identity schema did. Finish or archive in-flight studies under the old release, or use a new experiment name for work started under this one. Published generation summaries from earlier releases are likewise reported as historical (`published_config_matches_current: false`) rather than reinterpreted.
 
 ### Categorical `choices` must be unique
 
