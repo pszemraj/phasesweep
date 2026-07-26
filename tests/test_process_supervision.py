@@ -35,6 +35,7 @@ from phasesweep.runtime.process import (
     defer_shutdown_signals,
     is_pid_alive,
     is_pid_zombie,
+    read_attempt_lifecycle,
     read_stale_process_identity,
     reap_child,
     run_supervised,
@@ -119,8 +120,14 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
     assert identity.boot_id is not None
 
 
-def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None:
-    """Clean exit removes the durable process identity."""
+def test_run_supervised_retains_identity_and_records_exit_on_success(tmp_path: Path) -> None:
+    """Clean exit retains the identity and durably records the 'exited' state.
+
+    The identity used to be unlinked on clean exit, which made an orchestrator
+    death between process exit and the Optuna terminal commit (evidence
+    extraction, gates) indistinguishable from a missing identity — recovery
+    then failed closed forever (review v0.5.17 / blocker 2 gap B).
+    """
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
 
@@ -129,7 +136,12 @@ def test_run_supervised_cleans_identity_files_on_success(tmp_path: Path) -> None
     result = _run_supervised(trial_dir, "true", timeout=None, attempt_id="success-attempt")
     assert result.return_code == 0
     assert result.duration_seconds >= 0.0
-    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id="success-attempt")
+    assert lifecycle is not None
+    assert lifecycle.state == "exited"
+    assert lifecycle.return_code == 0
+    assert lifecycle.cleanup_confirmed is True
 
 
 def test_run_supervised_terminates_child_when_identity_write_fails(

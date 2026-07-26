@@ -929,6 +929,165 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     )
 
 
+ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 1
+_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "exited"})
+
+
+@dataclass(frozen=True)
+class AttemptLifecycle:
+    """Durable coarse lifecycle state for one trial attempt.
+
+    Closes the two recovery windows the transient identity file could not
+    represent (review v0.5.17 / blocker 2): ``allocated`` says a durable
+    Optuna ``RUNNING`` trial exists but no process was ever created (the
+    worker may still be queued for a GPU), and ``exited`` says the supervised
+    process group is confirmed gone even though evidence extraction and the
+    Optuna terminal commit may not have happened yet. Recovery can then fail
+    such trials safely instead of treating both states as unverifiable
+    cleanup uncertainty.
+    """
+
+    schema_version: int
+    attempt_id: str
+    state: str
+    return_code: int | None
+    cleanup_confirmed: bool | None
+
+
+def write_attempt_lifecycle(
+    trial_dir: Path,
+    *,
+    attempt_id: str,
+    state: str,
+    return_code: int | None = None,
+    cleanup_confirmed: bool | None = None,
+) -> None:
+    """Atomically persist the attempt's coarse lifecycle state.
+
+    Args:
+        trial_dir: Per-trial directory (attempt-scoped, so states from
+            different attempts can never collide).
+        attempt_id: Immutable attempt identity binding the record.
+        state: One of ``"allocated"`` or ``"exited"``.
+        return_code: Root return code; only meaningful for ``"exited"``.
+        cleanup_confirmed: Whether the whole process group was confirmed
+            gone; only meaningful for ``"exited"``.
+
+    Raises:
+        ValueError: ``state`` is not a known lifecycle state.
+        OSError: The record could not be written.
+
+    """
+    if state not in _ATTEMPT_LIFECYCLE_STATES:
+        raise ValueError(f"Unknown attempt lifecycle state {state!r}.")
+    atomic_write_text(
+        trial_dir / ATTEMPT_LIFECYCLE_FILE,
+        json.dumps(
+            {
+                "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
+                "attempt_id": attempt_id,
+                "state": state,
+                "return_code": return_code,
+                "cleanup_confirmed": cleanup_confirmed,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def read_attempt_lifecycle(
+    trial_dir: Path,
+    *,
+    expected_attempt_id: str,
+) -> AttemptLifecycle | None:
+    """Load and validate the attempt lifecycle record, if one exists.
+
+    Args:
+        trial_dir: Trial directory that may contain ``attempt_lifecycle.json``.
+        expected_attempt_id: Attempt identity stored on the Optuna trial.
+
+    Returns:
+        The validated record, or ``None`` when no record exists (legacy
+        attempts written before this schema).
+
+    Raises:
+        ValueError: The record is malformed, uses an unknown schema or state,
+            or belongs to another attempt. Callers must treat this as
+            cleanup uncertainty, not as absence.
+
+    """
+    path = trial_dir / ATTEMPT_LIFECYCLE_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"Attempt lifecycle record at {path} is unreadable.") from exc
+    try:
+        payload = strict_json_loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"Malformed attempt lifecycle record at {path}.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Attempt lifecycle record at {path} must be a JSON object.")
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != ATTEMPT_LIFECYCLE_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported attempt lifecycle schema at {path}.")
+    if payload.get("attempt_id") != expected_attempt_id:
+        raise ValueError(f"Attempt lifecycle record at {path} belongs to another attempt.")
+    state = payload.get("state")
+    if state not in _ATTEMPT_LIFECYCLE_STATES:
+        raise ValueError(f"Unknown attempt lifecycle state at {path}: {state!r}.")
+    return_code = payload.get("return_code")
+    if return_code is not None and (isinstance(return_code, bool) or type(return_code) is not int):
+        raise ValueError(f"Attempt lifecycle field 'return_code' is invalid at {path}.")
+    cleanup_confirmed = payload.get("cleanup_confirmed")
+    if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
+        raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
+    return AttemptLifecycle(
+        schema_version=schema_version,
+        attempt_id=expected_attempt_id,
+        state=state,
+        return_code=return_code,
+        cleanup_confirmed=cleanup_confirmed,
+    )
+
+
+def _record_attempt_exited(
+    trial_dir: Path,
+    *,
+    attempt_id: str,
+    return_code: int,
+) -> None:
+    """Best-effort durable transition to the ``exited`` lifecycle state.
+
+    Called only after the supervised group is confirmed gone. A write failure
+    must not fail the trial: the retained identity file still lets recovery
+    verify the (now dead) process the slow way.
+
+    Args:
+        trial_dir: Per-trial directory holding the lifecycle record.
+        attempt_id: Immutable attempt identity binding the record.
+        return_code: Root process return code observed by the supervisor wait.
+
+    """
+    try:
+        write_attempt_lifecycle(
+            trial_dir,
+            attempt_id=attempt_id,
+            state="exited",
+            return_code=return_code,
+            cleanup_confirmed=True,
+        )
+    except OSError:
+        log.warning(
+            "Could not persist the 'exited' lifecycle transition for attempt %s; "
+            "recovery will fall back to verifying the retained process identity.",
+            attempt_id,
+        )
+
+
 def _sanitized_supervisor_env() -> dict[str, str]:
     """Build the minimal environment for the pre-ACK supervisor interpreter.
 
@@ -1210,6 +1369,8 @@ def run_supervised(
             pid = proc.pid
             if proc.returncode is not None:
                 return_code = proc.returncode
+        if cleanup_confirmed:
+            _record_attempt_exited(trial_dir, attempt_id=attempt_id, return_code=return_code)
         log.warning(
             "Trial launch deadline expired before the trainer started (pid %d): %s",
             pid,
@@ -1242,6 +1403,12 @@ def run_supervised(
             target_pgid,
         )
         cleanup_confirmed = _abort_launch(proc, pgid)
+        if cleanup_confirmed:
+            _record_attempt_exited(
+                trial_dir,
+                attempt_id=attempt_id,
+                return_code=proc.returncode if proc.returncode is not None else -9,
+            )
         duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
@@ -1292,10 +1459,19 @@ def run_supervised(
     finally:
         _unregister(pgid)
 
-        # Only clean the identity record when the trial exited cleanly AND no
-        # descendant cleanup was required.
-        if failure_reason is None and proc.returncode == 0:
-            identity_path.unlink(missing_ok=True)
+    # The identity record is deliberately RETAINED on clean exit (review
+    # v0.5.17 / blocker 2 gap B): the orchestrator can still die between
+    # here and the Optuna terminal commit (evidence extraction, gates), and
+    # recovery must be able to distinguish "safely exited" from "identity
+    # missing". The durable 'exited' transition records that the whole group
+    # is confirmed gone; it is only written outside the exception paths
+    # above, so an interrupted wait can never claim a confirmed exit.
+    if cleanup_confirmed:
+        _record_attempt_exited(
+            trial_dir,
+            attempt_id=attempt_id,
+            return_code=proc.returncode if proc.returncode is not None else -9,
+        )
 
     duration = time.monotonic() - started
     return ProcessResult(

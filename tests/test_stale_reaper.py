@@ -54,6 +54,7 @@ from phasesweep.runtime.process import (
     read_boot_id,
     read_proc_starttime,
     read_stale_process_identity,
+    write_attempt_lifecycle,
 )
 from tests.conftest import make_experiment, write_trainer
 
@@ -1035,3 +1036,125 @@ def test_reaper_raises_when_tell_fails_after_cleanup(
 
     # The trial must NOT have been marked FAIL (because tell raised).
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
+
+
+def _fabricate_stale_running_trial(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    attempt_id: str,
+    generation_id: str = "old-generation",
+) -> tuple[optuna.Study, Path, int]:
+    """Create the phase study with one attribute-complete RUNNING trial."""
+    study = optuna.create_study(
+        study_name=f"{experiment.experiment}::{phase_name}",
+        storage=experiment.storage,
+        direction="minimize",
+    )
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    trial = study.ask()
+    trial_dir = _trial_dir_for(
+        experiment,
+        phase_name,
+        trial.number,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    return study, trial_dir, trial.number
+
+
+def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
+    """A worker killed while queued for a GPU leaves 'allocated' and no identity.
+
+    Recovery used to treat the missing process identity as unverifiable
+    cleanup and fail closed forever (review v0.5.17 / blocker 2 gap A). The
+    durable 'allocated' marker proves no process was ever created, so the
+    stale trial is failed safely and the study unwedges.
+    """
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        experiment="prelaunch",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'p.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        n_trials=2,
+        sampler=Sampler(type="random", seed=1),
+    )
+    study, trial_dir, stale_number = _fabricate_stale_running_trial(
+        exp, "p", attempt_id="queued-attempt"
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="queued-attempt", state="allocated")
+
+    winners = run_experiment(exp)
+
+    assert "p" in winners
+    states = {t.number: t.state for t in study.get_trials(deepcopy=False)}
+    assert states[stale_number] == optuna.trial.TrialState.FAIL
+    assert optuna.trial.TrialState.COMPLETE in states.values()
+
+
+def test_exited_attempt_recovers_without_signalling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between process exit and the Optuna commit recovers via 'exited'.
+
+    The retained identity plus the durable 'exited' transition prove the group
+    is gone; recovery must fail the trial without sending any signal (review
+    v0.5.17 / blocker 2 gap B).
+    """
+    exp = make_experiment(
+        experiment="exited",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'e.db'}",
+    )
+    study, trial_dir, stale_number = _fabricate_stale_running_trial(
+        exp, "p", attempt_id="exited-attempt"
+    )
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        starttime = read_proc_starttime(child.pid)
+        pgid = os.getpgid(child.pid)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    _write_test_process_identity(
+        trial_dir,
+        attempt_id="exited-attempt",
+        pid=child.pid,
+        pgid=pgid,
+        starttime=starttime,
+    )
+    write_attempt_lifecycle(
+        trial_dir,
+        attempt_id="exited-attempt",
+        state="exited",
+        return_code=0,
+        cleanup_confirmed=True,
+    )
+
+    def _no_signal(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("an 'exited' attempt must never be signalled")
+
+    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", _no_signal)
+
+    assert _reap_stale_trials(study, exp, "p") == 1
+    assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+
+
+def test_missing_lifecycle_and_identity_still_fails_closed(tmp_path: Path) -> None:
+    """A legacy attempt with neither lifecycle nor identity keeps failing closed."""
+    exp = make_experiment(
+        experiment="legacy",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'l.db'}",
+    )
+    study, _trial_dir, _number = _fabricate_stale_running_trial(
+        exp, "p", attempt_id="legacy-attempt"
+    )
+
+    with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
+        _reap_stale_trials(study, exp, "p")

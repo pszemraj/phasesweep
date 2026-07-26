@@ -52,6 +52,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.process import write_attempt_lifecycle
 
 log = logging.getLogger("phasesweep.engine.phase")
 
@@ -400,6 +401,23 @@ def _run_phase(
             generation_id=generation_id,
             attempt_id=attempt_id,
         )
+        # Durable 'allocated' marker BEFORE the trial's attrs make it
+        # discoverable and BEFORE the (arbitrarily long) GPU wait. A worker
+        # killed while queued leaves a RUNNING trial with this marker and no
+        # process identity; recovery can then prove no process was ever
+        # created instead of failing closed forever (review v0.5.17 /
+        # blocker 2 gap A). Best-effort: a write failure only degrades that
+        # trial back to the old fail-closed recovery semantics.
+        try:
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+        except OSError:
+            log.warning(
+                "Could not persist the 'allocated' lifecycle marker for trial %d "
+                "(attempt %s); recovery of a pre-launch crash will fail closed.",
+                trial.number,
+                attempt_id,
+            )
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))

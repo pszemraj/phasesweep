@@ -48,8 +48,11 @@ from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
 from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    AttemptLifecycle,
     StaleProcessIdentity,
     cleanup_stale_trial_process,
+    read_attempt_lifecycle,
     read_stale_process_identity,
 )
 
@@ -555,6 +558,111 @@ def _read_trial_process_identity(
         ) from exc
 
 
+def _attempt_lifecycle_for_reaping(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+) -> AttemptLifecycle | None:
+    """Read the durable attempt lifecycle record bound to a stale trial.
+
+    :param optuna.trial.FrozenTrial trial: Trial being inspected for recovery.
+    :param Path trial_dir: Persisted trial directory.
+    :param str study_name: Study name, used only for diagnostics.
+    :return AttemptLifecycle | None: Validated record, or ``None`` for legacy
+        attempts that never wrote one.
+    :raises ProcessCleanupUncertainError: The trial has no valid persisted
+        attempt id, or the record is malformed or belongs to another attempt.
+    """
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+        )
+    try:
+        return read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: its attempt "
+            f"lifecycle record is malformed or belongs to another attempt. "
+            f"trial_dir={trial_dir}."
+        ) from exc
+
+
+def _resolve_attempt_for_reaping(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+    *,
+    inspect_only: bool = False,
+) -> None:
+    """Prove that failing one stale RUNNING trial cannot leak a live process.
+
+    Resolution order (review v0.5.17 / blocker 2):
+
+    1. A durable ``exited`` lifecycle with confirmed cleanup means the
+       supervised group was already proven gone by the launching orchestrator
+       — the crash landed between process exit and the Optuna terminal
+       commit. Safe to fail without signalling anything.
+    2. A retained process identity means a process was launched — verify and
+       clean it the fail-closed way.
+    3. A durable ``allocated`` lifecycle with no identity means no process
+       was ever created (the worker died queued for a GPU). Safe to fail.
+    4. Anything else keeps today's fail-closed behavior.
+
+    :param optuna.trial.FrozenTrial trial: Stale RUNNING trial being resolved.
+    :param Path trial_dir: Persisted trial directory.
+    :param str study_name: Study name, used only for diagnostics.
+    :param bool inspect_only: When ``True``, never signal a process — only
+        prove the same resolution the confirming call would take (used by
+        ``mcp recover-run`` preflight).
+    :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
+    """
+    lifecycle = _attempt_lifecycle_for_reaping(trial, trial_dir, study_name)
+    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+        log.warning(
+            "Trial %d in study %s exited (rc=%s) before its terminal state was "
+            "committed; failing it without signalling.",
+            trial.number,
+            study_name,
+            lifecycle.return_code,
+        )
+        return
+    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+        # A missing identity is exactly what 'allocated' predicts: the worker
+        # died queued (e.g. waiting for a GPU) before any process existed. A
+        # present-but-unreadable identity instead falls through to the strict
+        # reader below and fails closed — a launch had begun.
+        log.warning(
+            "Trial %d in study %s was allocated but no process was ever launched "
+            "(orchestrator died while queued); failing it without signalling.",
+            trial.number,
+            study_name,
+        )
+        return
+    identity = _read_trial_process_identity(trial, trial_dir, study_name)
+    if inspect_only:
+        return
+    safe_to_fail = cleanup_stale_trial_process(identity)
+    if not safe_to_fail:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
+            f"could not prove the process group is gone. trial_dir={trial_dir} "
+            f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
+            "process may still be holding GPU memory. Investigate "
+            f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
+            f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
+            "phasesweep."
+        )
+    log.warning(
+        "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
+        trial.number,
+        identity.pid,
+        identity.pgid,
+    )
+
+
 def _reap_stale_trials(
     study: optuna.Study,
     experiment: Experiment,
@@ -588,26 +696,8 @@ def _reap_stale_trials(
         try:
             trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
 
-            identity: StaleProcessIdentity | None = None
             if TRIAL_DIR_ATTR in trial.user_attrs:
-                identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
-                safe_to_fail = cleanup_stale_trial_process(identity)
-                if not safe_to_fail:
-                    raise ProcessCleanupUncertainError(
-                        f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
-                        f"could not prove the process group is gone. trial_dir={trial_dir} "
-                        f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
-                        "process may still be holding GPU memory. Investigate "
-                        f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
-                        f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
-                        "phasesweep."
-                    )
-                log.warning(
-                    "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
-                    trial.number,
-                    identity.pid,
-                    identity.pgid,
-                )
+                _resolve_attempt_for_reaping(trial, trial_dir, study.study_name)
         except ProcessCleanupUncertainError:
             if uncertain_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
                 uncertain_attempt_ids.add(attempt_id)
@@ -851,7 +941,7 @@ def _inspect_stale_running_trials(
             continue
         trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
         if TRIAL_DIR_ATTR in trial.user_attrs:
-            _read_trial_process_identity(trial, trial_dir, study.study_name)
+            _resolve_attempt_for_reaping(trial, trial_dir, study.study_name, inspect_only=True)
         count += 1
     return count
 
