@@ -14,14 +14,15 @@ site initialization (no ``sitecustomize``/``usercustomize``); ``-I``
 (isolated mode) implies ``-P`` on Python >= 3.11, so this script's own
 directory — which contains the sibling module ``phasesweep/runtime/json.py``
 — is never prepended to ``sys.path``, keeping ``import json`` resolved to the
-stdlib module every time. Keep imports here limited to ``os``, ``sys``, and
-``json``.
+stdlib module every time. Keep imports here limited to the stdlib modules
+``os``, ``sys``, ``json``, and ``signal``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 
 # Single source of truth for the wire frame's header width:
@@ -111,6 +112,17 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     ready_fd = int(args[0])
     ack_fd = int(args[1])
+
+    # The parent spawns this process from inside its shutdown-signal deferral
+    # window, and the blocked signal mask survives fork AND exec — without
+    # this reset, the supervisor and every trainer exec'd from it would run
+    # with SIGTERM/SIGINT/SIGHUP permanently blocked, making the documented
+    # SIGTERM -> grace -> SIGKILL escalation a dead letter (trainers could
+    # never shut down gracefully and every kill burned the full grace before
+    # SIGKILL). This is the first code phasesweep controls after exec, so the
+    # mask is cleaned here.
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
     try:
         # Checked by phasesweep.runtime.process._spawn_blocked_supervisor's
