@@ -297,14 +297,22 @@ def install_signal_handlers() -> None:
     ``_shutdown_handler``) rather than a separate flag, so an external reset
     of a handler is never masked by stale bookkeeping. The main thread's
     shutdown signals are unblocked on each call so an inherited signal mask
-    cannot prevent the handlers from running. Must be called from the main
-    thread.
+    cannot prevent the handlers from running.
+
+    Main-thread only, enforced BEFORE any ownership state is inspected or
+    mutated (review v0.5.16 / blocker 5). The old off-main-thread behavior
+    silently fell through to the idempotent check; during an open main-thread
+    :func:`signal_handler_scope` every handler already points at
+    ``_shutdown_handler``, so a worker thread could take the fast path and
+    convert the scope's *temporary* installation into *process-lifetime*
+    ownership — the scope's exit then skipped restoring the host's handlers,
+    permanently stealing them from a worker thread that could never legally
+    call ``signal.signal`` itself.
 
     On success — including the idempotent already-installed path — this
     takes process-lifetime ownership of the shutdown signals: every later
     :func:`signal_handler_scope` call, on any thread, becomes a no-op for the
-    rest of the process (review v0.5.15 / blocker 2B). Ownership is NOT taken
-    when installation fails because this was called off the main thread.
+    rest of the process (review v0.5.15 / blocker 2B).
 
     Calling this while a :func:`signal_handler_scope` is open is a valid
     handover, not a conflict: the scope's exit sees the ownership claim and
@@ -314,21 +322,56 @@ def install_signal_handlers() -> None:
     that installation down on exit, and every later scope would no-op with
     no handler installed at all — silently disabling child-group cleanup for
     the rest of the process.
+
+    Raises:
+        SignalOwnershipUnavailableError: Called from a thread other than the
+            main thread. ``signal.signal`` is main-thread-only, and so is the
+            ownership handover above; entry points must install from the main
+            thread at process start.
+
     """
     global _process_lifetime_owner  # noqa: PLW0603
+    if threading.current_thread() is not threading.main_thread():
+        raise SignalOwnershipUnavailableError(
+            "install_signal_handlers() must be called from the main thread: "
+            "signal.signal and process-lifetime shutdown-signal ownership are "
+            "main-thread-only."
+        )
     _unblock_shutdown_signals()
     if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
         _process_lifetime_owner = True
         return
-    try:
-        signal.signal(signal.SIGTERM, _shutdown_handler)
-        signal.signal(signal.SIGINT, _shutdown_handler)
-        if hasattr(signal, "SIGHUP"):
-            signal.signal(signal.SIGHUP, _shutdown_handler)
-    except ValueError:
-        log.debug("Cannot install signal handlers (not on main thread)")
-        return
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _shutdown_handler)
     _process_lifetime_owner = True
+
+
+def _reassert_process_lifetime_handlers() -> None:
+    """Reinstall any process-lifetime shutdown handler an outside party replaced.
+
+    Runs only when :data:`_process_lifetime_owner` is already ``True``: the
+    entry point committed this whole process to phasesweep's shutdown
+    cleanup, so a handler some other library re-bound afterward would leave
+    child process groups (and their GPUs) leaking on SIGTERM while the
+    boolean claim still says otherwise. Off the main thread this can only
+    observe, not repair (``signal.signal`` is main-thread-only), so it
+    returns silently and the next main-thread scope entry repairs it.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    stale = [sig for sig in _SHUTDOWN_SIGNALS if signal.getsignal(sig) is not _shutdown_handler]
+    if not stale:
+        return
+    log.warning(
+        "Shutdown handler(s) for signal(s) %s were replaced after phasesweep "
+        "took process-lifetime ownership; reinstalling them for child cleanup.",
+        stale,
+    )
+    for sig in stale:
+        signal.signal(sig, _shutdown_handler)
+    _unblock_shutdown_signals()
 
 
 def _restore_host_signal_state(
@@ -425,7 +468,13 @@ def signal_handler_scope() -> Iterator[None]:
 
     if _process_lifetime_owner:
         # An entry point (CLI/MCP) already owns shutdown signals for the
-        # whole process. Nothing to install or restore, on any thread.
+        # whole process. Nothing to install or restore, on any thread — but
+        # the ownership claim is a Python-side boolean, and another library
+        # may have replaced an OS handler since the install. Re-assert the
+        # OS ground truth (main thread only) so a stale claim cannot make
+        # this run silently execute without child-group cleanup (review
+        # v0.5.16 / blocker 5 follow-up).
+        _reassert_process_lifetime_handlers()
         yield
         return
 

@@ -1403,3 +1403,70 @@ def test_install_signal_handlers_inside_open_scope_survives_that_scope_exit() ->
         signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
+
+
+def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
+    """A worker-thread ``install_signal_handlers()`` raises and takes nothing.
+
+    During an open main-thread ``signal_handler_scope()`` every shutdown
+    handler already points at ``_shutdown_handler``, so a worker thread used
+    to take the idempotent fast path, flip ``_process_lifetime_owner``, and
+    silently convert the scope's temporary installation into permanent
+    process ownership — the scope exit then skipped restoring the host's
+    handlers (review v0.5.16 / blocker 5). The install must now reject
+    off-main-thread callers before touching any ownership state.
+    """
+
+    def host_handler(_signum: int, _frame: object) -> None:
+        raise AssertionError("host handler should never fire during this test")
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                install_signal_handlers()
+            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+                errors.append(exc)
+
+        with signal_handler_scope():
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            assert not runtime_process._process_lifetime_owner
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], SignalOwnershipUnavailableError)
+        assert not runtime_process._process_lifetime_owner
+        # The scope's exit restored the host's handlers because no legitimate
+        # process-lifetime handover happened.
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is host_handler
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
+def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
+    """A scope entered under a stale ownership claim reinstalls the OS handlers.
+
+    ``_process_lifetime_owner`` is a Python-side boolean; another library can
+    re-bind a shutdown signal after the entry point installed. A later
+    main-thread scope must notice the divergence and reinstall phasesweep's
+    handler so the run does not silently execute without child-group cleanup.
+    """
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    try:
+        install_signal_handlers()
+        interloper_sig = runtime_process._SHUTDOWN_SIGNALS[0]
+        signal.signal(interloper_sig, signal.SIG_IGN)
+
+        with signal_handler_scope():
+            assert signal.getsignal(interloper_sig) is runtime_process._shutdown_handler
+    finally:
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
