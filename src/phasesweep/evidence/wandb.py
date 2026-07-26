@@ -26,6 +26,20 @@ class WandbRunTerminalError(RuntimeError):
     state: str
 
 
+@dataclass(frozen=True)
+class WandbSetupError(RuntimeError):
+    """Raised when the W&B API client cannot be constructed.
+
+    Client construction reads local credentials and settings — its failures
+    are deterministic setup problems (bad api key file, broken settings), not
+    transient request errors, so retrying the poll loop would only burn the
+    budget repeating them (review v0.5.17 / finding D).
+    """
+
+    run_id: str
+    cause: str
+
+
 def poll_wandb_summary(
     *,
     entity: str,
@@ -47,6 +61,8 @@ def poll_wandb_summary(
         one second after this budget expires.
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
+    :raises WandbSetupError: If the API client cannot be constructed (bad
+        credentials/settings) — a deterministic setup failure, not retried.
     :raises WandbRunTerminalError: If the run crashes, fails, or is killed.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
     :return dict[str, Any]: Terminal run summary values.
@@ -63,8 +79,14 @@ def poll_wandb_summary(
             break
         # W&B accepts an integer request timeout. Bound each request by the
         # remaining monotonic budget so a late poll cannot extend the overall
-        # wait by another full timeout interval.
-        api = Api(timeout=max(1, ceil(remaining)))
+        # wait by another full timeout interval. Construction happens inside
+        # the typed error boundary: a credential/settings failure here must
+        # surface as a classified setup error, not escape the extractor's
+        # error model (review v0.5.17 / finding D).
+        try:
+            api = Api(timeout=max(1, ceil(remaining)))
+        except Exception as exc:  # noqa: BLE001 - classified into the typed error model
+            raise WandbSetupError(run_id, str(exc)) from exc
         try:
             run = api.run(path)
             if run.state in {"crashed", "failed", "killed"}:

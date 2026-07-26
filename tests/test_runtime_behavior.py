@@ -1656,3 +1656,82 @@ def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
     finally:
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
+
+
+def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
+    """A successful trainer whose evidence lands past the deadline cannot count.
+
+    ``timeout_seconds_per_phase``/``timeout_seconds_per_run`` bound the whole
+    trial; before review v0.5.17 / blocker 8 extraction ran with no deadline
+    at all, so a run could exceed both configured limits and still publish a
+    complete winner.
+    """
+    experiment = make_experiment(workdir=tmp_path)
+    (tmp_path / "r.json").write_text('{"x": 1.0}')
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=0,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(
+            return_code=0,
+            timed_out=False,
+            pid=123,
+            duration_seconds=0.1,
+        ),
+    )
+
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=executed,
+        deadline=time.monotonic() - 1.0,
+    )
+
+    assert result.metric is None
+    assert result.feasible is False
+    assert result.failure_reason is not None
+    assert "wallclock deadline exceeded" in result.failure_reason
+
+
+def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer repro (review v0.5.17 / blocker 8): quick trainer, slow extraction.
+
+    The trainer finishes inside the 0.5s budget but extraction takes 3s. The
+    run used to publish ``incomplete: false`` more than 2x past both limits;
+    it must now report a timeout and publish nothing.
+    """
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=1,
+        timeout_seconds_per_phase=0.5,
+    )
+
+    import phasesweep.engine.trial as trial_mod
+
+    real_extractor = trial_mod.run_extractor
+
+    def slow_extractor(*args, **kwargs):
+        time.sleep(3.0)
+        return real_extractor(*args, **kwargs)
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", slow_extractor)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        run_experiment(exp)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20.0
+    assert not _last_successful_generation_path(exp).exists()

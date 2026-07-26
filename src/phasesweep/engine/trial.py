@@ -165,7 +165,10 @@ def launch_trial(
     # no-follow helpers instead — see docs/runtime.md's trust-boundary note
     # (review v0.5.15 / item F).
     resolved_overrides_path = workdir / "overrides_resolved.json"
-    resolved_overrides_path.write_text(_json_dump_overrides(overrides), encoding="utf-8")
+    resolved_overrides_path.write_text(
+        _json_dump_overrides(overrides, strict=experiment.override_format == "json_file"),
+        encoding="utf-8",
+    )
 
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     cmd = render_command(
@@ -241,6 +244,7 @@ def extract_trial_result(
     executed: ExecutedTrial,
     gates: list[Gate] | None = None,
     enforce_gates: bool = True,
+    deadline: float | None = None,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -251,6 +255,8 @@ def extract_trial_result(
       * metric extractor returned a non-finite value
       * any constraint extractor raised ExtractorError (review v0.5.2 / item 2)
       * any constraint extractor returned a non-finite value (review v0.5.2 / item 3)
+      * the phase/run wallclock deadline expired before extraction completed
+        (review v0.5.17 / blocker 8)
 
     A trial that produced a finite metric and finite constraint values but violated
     a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation
@@ -264,15 +270,38 @@ def extract_trial_result(
         enforce_gates: If ``True``, failed gates fail the trial. If ``False``,
             gates are advisory and are recorded without changing the metric
             result.
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
+            ``timeout_seconds_per_phase`` / ``timeout_seconds_per_run`` bound
+            the *whole* trial — extraction and gates included, not just the
+            trainer. Enforcement is cooperative at stage boundaries (before
+            the metric, each constraint, the gates, and the final result), so
+            a single blocking local stage can overrun by at most its own
+            duration; W&B polling additionally caps its request budget to the
+            remainder.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
         or ``metric=None`` plus a ``failure_reason``.
 
     """
+    import time
+
     rc = executed.process.return_code
     duration = executed.process.duration_seconds
     failure_reason = executed.process.failure_reason
+
+    def _deadline_failure(stage: str) -> TrialResult | None:
+        """Fail the trial when the wallclock deadline expired before ``stage``."""
+        if deadline is None or time.monotonic() < deadline:
+            return None
+        return _failed_trial(
+            rc=rc,
+            duration=duration,
+            failure_reason=(
+                f"phase/run wallclock deadline exceeded before {stage}; the trainer "
+                "finished but its evidence could not be evaluated within the budget"
+            ),
+        )
 
     if rc != 0 and failure_reason is None:
         failure_reason = f"non-zero exit code {rc}"
@@ -280,8 +309,12 @@ def extract_trial_result(
     if failure_reason is not None:
         return _failed_trial(rc=rc, duration=duration, failure_reason=failure_reason)
 
+    expired = _deadline_failure("metric extraction")
+    if expired is not None:
+        return expired
+
     try:
-        metric_value = run_extractor(executed.ctx, experiment.metric.extractor)
+        metric_value = run_extractor(executed.ctx, experiment.metric.extractor, deadline=deadline)
     except ExtractorError as exc:
         log.warning(
             "[%s/trial_%d] metric extraction failed: %s",
@@ -307,8 +340,12 @@ def extract_trial_result(
     constraint_values: dict[str, float] = {}
     feasible = True
     for c in experiment.constraints:
+        expired = _deadline_failure(f"constraint extractor {c.name!r}")
+        if expired is not None:
+            expired.constraints.update(constraint_values)
+            return expired
         try:
-            v = run_extractor(executed.ctx, c.extractor)
+            v = run_extractor(executed.ctx, c.extractor, deadline=deadline)
         except ExtractorError as exc:
             log.warning(
                 "[%s/trial_%d] constraint %s extraction failed: %s",
@@ -343,7 +380,7 @@ def extract_trial_result(
         if not check_bounds(v, min_value=c.min, max_value=c.max):
             feasible = False
 
-    gate_results = evaluate_gates(executed.ctx, gates or [])
+    gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
     failed_gates = [gate for gate in gate_results if not gate.passed]
     if failed_gates and enforce_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
@@ -361,6 +398,15 @@ def extract_trial_result(
             gate_results=gate_results,
         )
 
+    # Final boundary check: a slow last stage must not let a trial publish a
+    # "complete" evaluation past the configured wallclock bound (review
+    # v0.5.17 / blocker 8 — the field names promise an end-to-end limit).
+    expired = _deadline_failure("the trial result could be accepted")
+    if expired is not None:
+        expired.constraints.update(constraint_values)
+        expired.gate_results = gate_results
+        return expired
+
     return TrialResult(
         metric=metric_value,
         constraints=constraint_values,
@@ -372,17 +418,27 @@ def extract_trial_result(
     )
 
 
-def _json_dump_overrides(overrides: dict[str, Any]) -> str:
+def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
     """Serialize resolved overrides to indented JSON for ``overrides_resolved.json``.
 
     Args:
         overrides: The composed (inherited + fixed + sampled) overrides dict.
+        strict: When ``True`` (``json_file`` format), use the canonical wire
+            serializer so the audit artifact can never claim a value the
+            actual ``overrides.json`` wire artifact would reject (review
+            v0.5.17 / finding B); load-time validation guarantees this
+            succeeds. When ``False`` (``argparse``/``hydra``), non-JSON
+            scalars fall back through ``default=str`` (Path, etc.) — there is
+            no JSON wire artifact for those formats to diverge from.
 
     Returns:
-        Trailing-newline-terminated, sorted, two-space-indented JSON. Non-JSON
-        scalars fall back through ``default=str`` (Path, etc.).
+        Trailing-newline-terminated, sorted, two-space-indented JSON.
 
     """
     import json
 
+    from phasesweep.runtime.commands import dump_overrides_json
+
+    if strict:
+        return dump_overrides_json(overrides) + "\n"
     return json.dumps(overrides, indent=2, sort_keys=True, default=str) + "\n"

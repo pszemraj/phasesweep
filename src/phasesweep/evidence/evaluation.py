@@ -27,6 +27,7 @@ from phasesweep.evidence.models import (
 from phasesweep.evidence.wandb import (
     WandbPollTimeout,
     WandbRunTerminalError,
+    WandbSetupError,
     poll_wandb_summary,
 )
 from phasesweep.runtime.json import strict_json_loads
@@ -303,6 +304,11 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
             'python -m pip install "phasesweep[wandb] @ '
             'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
+    except WandbSetupError as exc:
+        raise ExtractorError(
+            f"W&B client setup failed for run {ctx.attempt_id!r}: {exc.cause}. "
+            "Fix the W&B credentials/settings on this host; retrying will not help."
+        ) from exc
     except WandbRunTerminalError as exc:
         raise ExtractorError(
             f"W&B run {ctx.attempt_id!r} ended in state {exc.state!r}; "
@@ -333,7 +339,20 @@ _DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {
 }
 
 
-def run_extractor(ctx: TrialContext, cfg: Extractor) -> float:
+def _remaining_budget_seconds(deadline: float | None) -> float | None:
+    """Return seconds until ``deadline``, or ``None`` when unbounded.
+
+    :param float | None deadline: Absolute ``time.monotonic()`` deadline.
+    :return float | None: Non-negative remaining budget, or ``None``.
+    """
+    if deadline is None:
+        return None
+    import time
+
+    return max(0.0, deadline - time.monotonic())
+
+
+def run_extractor(ctx: TrialContext, cfg: Extractor, *, deadline: float | None = None) -> float:
     """Dispatch to the appropriate extractor for ``cfg``.
 
     Args:
@@ -341,6 +360,12 @@ def run_extractor(ctx: TrialContext, cfg: Extractor) -> float:
         cfg: A concrete extractor config (one of :class:`JsonExtractor`,
             :class:`JsonEnvelopeExtractor`, :class:`LogRegexExtractor`,
             :class:`WandbExtractor`).
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
+            Remote extractors (W&B) cap their own polling timeout to the
+            remaining budget so evidence extraction cannot extend a run
+            arbitrarily past its configured wallclock bound (review v0.5.17 /
+            blocker 8). Local extractors are bounded by the caller's
+            stage-boundary deadline checks instead.
 
     Returns:
         The numeric value the extractor pulled from this trial's outputs.
@@ -353,6 +378,9 @@ def run_extractor(ctx: TrialContext, cfg: Extractor) -> float:
     fn = _DISPATCH.get(type(cfg))
     if fn is None:
         raise ExtractorError(f"No extractor registered for {type(cfg).__name__}.")
+    remaining = _remaining_budget_seconds(deadline)
+    if remaining is not None and isinstance(cfg, WandbExtractor):
+        cfg = cfg.model_copy(update={"timeout_seconds": min(cfg.timeout_seconds, remaining)})
     return fn(ctx, cfg)
 
 
@@ -504,6 +532,8 @@ def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -
         )
     except ImportError:
         return GateResult(gate.type, False, "wandb package is not installed")
+    except WandbSetupError as exc:
+        return GateResult(gate.type, False, f"W&B client setup failed: {exc.cause}")
     except WandbRunTerminalError as exc:
         return GateResult(
             gate.type,
@@ -532,11 +562,20 @@ _GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
 }
 
 
-def evaluate_gates(ctx: TrialContext, gates: list[Gate]) -> list[GateResult]:
+def evaluate_gates(
+    ctx: TrialContext,
+    gates: list[Gate],
+    *,
+    deadline: float | None = None,
+) -> list[GateResult]:
     """Evaluate all gates against a completed trial context.
 
     :param TrialContext ctx: Trial context containing outputs and run metadata.
     :param list[Gate] gates: Gate configs to evaluate in order.
+    :param float | None deadline: Optional absolute ``time.monotonic()``
+        phase/run deadline. An expired deadline fails remaining gates
+        immediately, and W&B gates cap their polling to the remaining budget
+        (review v0.5.17 / blocker 8).
     :return list[GateResult]: One result for each gate in ``gates``.
     """
     results: list[GateResult] = []
@@ -545,5 +584,20 @@ def evaluate_gates(ctx: TrialContext, gates: list[Gate]) -> list[GateResult]:
         if fn is None:  # pragma: no cover - closed union
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
+        remaining = _remaining_budget_seconds(deadline)
+        if remaining is not None:
+            if remaining <= 0.0:
+                results.append(
+                    GateResult(
+                        gate.type,
+                        False,
+                        "phase/run wallclock deadline exceeded before this gate ran",
+                    )
+                )
+                continue
+            if isinstance(gate, WandbSummaryRequiredGate):
+                gate = gate.model_copy(
+                    update={"timeout_seconds": min(gate.timeout_seconds, remaining)}
+                )
         results.append(fn(ctx, gate))
     return results

@@ -438,3 +438,72 @@ def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wand
 
     assert run_extractor(ctx, cfg) == pytest.approx(0.1)
     assert seen == ["new-attempt"]
+
+
+def test_wandb_api_constructor_failure_is_typed_extractor_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """A credential/settings failure in ``Api(...)`` must not escape the error model.
+
+    Construction used to happen outside the polling ``try`` block, so an
+    exception there surfaced as an arbitrary exception instead of a typed
+    extractor failure (review v0.5.17 / finding D).
+    """
+    wandb_mod = types.ModuleType("wandb")
+    apis_mod = types.ModuleType("wandb.apis")
+    public_mod = types.ModuleType("wandb.apis.public")
+
+    class Api:
+        def __init__(self, timeout=None):
+            raise RuntimeError("credential loader exploded during Api construction")
+
+    public_mod.Api = Api
+    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
+    apis_mod.public = public_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
+    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    with pytest.raises(ExtractorError, match="W&B client setup failed"):
+        run_extractor(make_trial_context(tmp_path), cfg)
+
+
+def test_wandb_extractor_poll_budget_is_capped_by_phase_deadline(fake_wandb, tmp_path):
+    """A 60s W&B poll budget must shrink to the remaining phase/run budget.
+
+    Without the cap, evidence extraction could extend a 1-second phase budget
+    by a full extractor timeout (review v0.5.17 / blocker 8).
+    """
+    import time as _time
+
+    fake_wandb(lambda _path: (_ for _ in ()).throw(ConnectionError("unreachable")))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.05,
+        timeout_seconds=60,
+    )
+
+    started = _time.monotonic()
+    with pytest.raises(ExtractorError):
+        run_extractor(
+            make_trial_context(tmp_path),
+            cfg,
+            deadline=_time.monotonic() + 1.0,
+        )
+    elapsed = _time.monotonic() - started
+
+    # Enormous two-sided margin: capped polling ends in ~1s; an uncapped
+    # budget would need the full 60s.
+    assert elapsed < 20.0

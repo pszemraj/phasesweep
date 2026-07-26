@@ -514,13 +514,24 @@ def _run_phase(
             deadline_exhausted["flag"] = True
             raise TrialExecutionError(str(exc)) from exc
 
-        # Extraction happens outside GPU lease.
+        # Extraction happens outside GPU lease but INSIDE the phase/run
+        # wallclock budget: the configured timeouts bound the whole trial,
+        # not just the trainer (review v0.5.17 / blocker 8).
         result = extract_trial_result(
             experiment=experiment,
             executed=executed,
             gates=_phase_gates(experiment, phase),
             enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
+            deadline=optimize_deadline,
         )
+        if (
+            result.failure_reason
+            and optimize_deadline is not None
+            and time.monotonic() >= optimize_deadline
+        ):
+            # The deadline was a factor in this failure; make sure phase-level
+            # accounting reports a timeout rather than "no feasible trial".
+            deadline_exhausted["flag"] = True
 
         trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
         trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
