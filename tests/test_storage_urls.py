@@ -253,10 +253,10 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     (relative paths, ``..`` segments) produce one stable lock identity. None
     in returns None out (in-memory has no shared backend to collide on).
 
-    SQLite-dialect collapse and RDB pass-through are pinned by sibling tests
-    in this file (``test_storage_backend_collapses_sqlalchemy_dialects``,
-    ``test_canonical_storage_identity_rdb_passes_through``); this test only
-    pins the path-resolution and None-handling contract.
+    SQLite-dialect collapse and RDB canonicalization are pinned by sibling
+    tests in this file (``test_storage_backend_collapses_sqlalchemy_dialects``,
+    ``test_equivalent_rdb_urls_share_one_identity``); this test only pins the
+    path-resolution and None-handling contract.
     """
     # SQLite path with `..` must be resolved away.
     sqlite_id = canonical_storage_identity(f"sqlite:///{tmp_path}/sub/../db.sqlite3")
@@ -313,11 +313,119 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
         make_experiment(workdir=tmp_path / "runs", storage=storage, n_jobs=2)
 
 
-def test_canonical_storage_identity_rdb_passes_through() -> None:
-    """RDB URLs are not rewritten — same-host advisory lock has no business
-    second-guessing a remote DB URL."""
-    url = "postgresql://u:p@host/db"
-    assert canonical_storage_identity(url) == url
+@pytest.mark.parametrize(
+    ("label", "left", "right"),
+    [
+        (
+            "password rotation",
+            "postgresql://sweep:old-secret@db.internal:5432/studies",
+            "postgresql://sweep:new-secret@db.internal:5432/studies",
+        ),
+        (
+            "query order",
+            "postgresql://sweep@db.internal/studies?a=1&b=2",
+            "postgresql://sweep@db.internal/studies?b=2&a=1",
+        ),
+        (
+            "connection-only options ignored",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal/studies"
+            "?application_name=phasesweep&connect_timeout=10&sslmode=require"
+            "&keepalives_idle=30&target_session_attrs=read-write",
+        ),
+        (
+            "default vs explicit postgres port",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal:5432/studies",
+        ),
+        (
+            "default vs explicit mysql port",
+            "mysql://sweep@db.internal/studies",
+            "mysql://sweep@db.internal:3306/studies",
+        ),
+        (
+            "host case",
+            "postgresql://sweep@DB.Internal/studies",
+            "postgresql://sweep@db.internal/studies",
+        ),
+        (
+            "psycopg driver spelling",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql+psycopg://sweep@db.internal/studies",
+        ),
+        (
+            "psycopg2 driver spelling",
+            "postgresql+psycopg://sweep@db.internal/studies",
+            "postgresql+psycopg2://sweep@db.internal/studies",
+        ),
+    ],
+)
+def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: str) -> None:
+    """Equivalent spellings of one external database must share one lock identity.
+
+    Before v0.5.18 the raw URL string was hashed into the same-host lock path,
+    so a rotated password or a reordered query silently split the lock and let
+    two orchestrators write the same study (review v0.5.17 / blocker 5).
+    """
+    identity = canonical_storage_identity(left)
+    assert identity is not None
+    assert identity == canonical_storage_identity(right), label
+
+
+@pytest.mark.parametrize(
+    ("label", "left", "right"),
+    [
+        ("database", "postgresql://u@h/db_a", "postgresql://u@h/db_b"),
+        ("host", "postgresql://u@host_a/db", "postgresql://u@host_b/db"),
+        ("user", "postgresql://user_a@h/db", "postgresql://user_b@h/db"),
+        ("non-default port", "postgresql://u@h:5432/db", "postgresql://u@h:6432/db"),
+        ("dialect family", "postgresql://u@h/db", "mysql://u@h/db"),
+        (
+            "unix socket vs tcp",
+            "postgresql://u@/db?host=/var/run/postgresql",
+            "postgresql://u@/db",
+        ),
+        (
+            "different unix socket dir",
+            "postgresql://u@/db?host=/var/run/postgresql",
+            "postgresql://u@/db?host=/tmp",
+        ),
+    ],
+)
+def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right: str) -> None:
+    """Canonicalization must not over-collide onto genuinely different targets."""
+    assert canonical_storage_identity(left) != canonical_storage_identity(right), label
+
+
+def test_rdb_identity_excludes_credentials_and_keeps_socket_path() -> None:
+    """The password never reaches the lock identity; ``host=`` (unix socket) does."""
+    identity = canonical_storage_identity(
+        "postgresql://sweep:hunter2@/studies?host=/var/run/postgresql&connect_timeout=10"
+    )
+
+    assert identity is not None
+    assert "hunter2" not in identity
+    assert "connect_timeout" not in identity
+    assert "sweep" in identity
+    assert "studies" in identity
+    # The socket directory is identity-bearing, percent-encoded in the identity.
+    assert "%2Fvar%2Frun%2Fpostgresql" in identity
+
+
+def test_rdb_identity_is_deterministic_and_prefixed() -> None:
+    """The emitted form is stable across calls and self-describing."""
+    url = "postgresql+psycopg2://sweep:pw@DB.Internal/studies?application_name=x&b=2&a=1"
+
+    identity = canonical_storage_identity(url)
+
+    assert identity == "rdb://postgresql://sweep@db.internal:5432/studies?a=1&b=2"
+    assert identity == canonical_storage_identity(url)
+
+
+def test_unparseable_storage_identity_falls_back_to_raw_string() -> None:
+    """Lock-path derivation must never crash on a URL SQLAlchemy cannot parse."""
+    for storage in ("not a url", "://", "postgres_but_not_a_url"):
+        assert canonical_storage_identity(storage) == storage
 
 
 def test_file_url_path_preserves_absolute_paths() -> None:

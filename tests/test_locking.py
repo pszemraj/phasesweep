@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import FloatParam, IntParam, Phase
+from phasesweep.config import Experiment, FloatParam, IntParam, Phase
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.guards import (
@@ -493,6 +493,50 @@ def test_run_lock_does_not_collide_for_different_experiment_names(
     exp_b = exp_b.model_copy(update={"experiment": "other"})
 
     # Both output and storage lock identities differ — sets share no element.
+    assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
+
+
+def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
+    """Experiment with an external-RDB storage URL, bypassing the config ack.
+
+    ``model_copy`` skips validation, which is what we want here: the RDB policy
+    check (``allow_external_rdb_single_host``) is exercised in
+    ``tests/test_storage_urls.py``; this file only cares about the lock path
+    derived from the URL.
+    """
+    return make_experiment(workdir=str(workdir), storage="sqlite:///unused.db").model_copy(
+        update={"storage": storage}
+    )
+
+
+def test_run_lock_collides_for_equivalent_rdb_storage_urls(tmp_path: Path) -> None:
+    """Equivalent external-RDB URLs must land on one storage lock.
+
+    ``allow_external_rdb_single_host: true`` promises that host-local locking
+    supplies all coordination for a shared RDB. Hashing the raw URL broke that
+    promise: a rotated password or a reordered query split the lock namespace
+    and let two orchestrators run the same study (review v0.5.17 / blocker 5).
+    Distinct workdirs keep the output locks apart, so any shared path is the
+    storage lock.
+    """
+    exp_a = _rdb_experiment(
+        tmp_path / "runs_a",
+        "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
+    )
+    exp_b = _rdb_experiment(
+        tmp_path / "runs_b",
+        "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
+    )
+
+    assert set(_run_lock_paths(exp_a)) & set(_run_lock_paths(exp_b))
+
+
+def test_run_lock_does_not_collide_for_different_rdb_databases(tmp_path: Path) -> None:
+    """Canonicalization must not over-collide: distinct databases stay independent."""
+    exp_a = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_a")
+    exp_b = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_b")
+    exp_b = exp_b.model_copy(update={"experiment": "other"})
+
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 

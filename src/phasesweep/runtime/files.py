@@ -9,7 +9,7 @@ import os
 import secrets
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, cast
@@ -1033,6 +1033,113 @@ def sqlite_readonly_uri(storage: str) -> str | None:
     return f"file:{quote(str(path), safe='/')}?mode=ro"
 
 
+# Default TCP ports per RDB dialect family, so `host/db` and `host:5432/db`
+# share one lock identity. Families absent here keep no port segment when the
+# URL omits the port.
+_RDB_DEFAULT_PORTS = {
+    "postgresql": 5432,
+    "mysql": 3306,
+    "mariadb": 3306,
+    "mssql": 1433,
+    "oracle": 1521,
+}
+
+# Query options that configure *how* we connect, not *what* we connect to.
+# Excluding them fails safe: an excluded identity-bearing option can only
+# over-collide (a spurious "already running" error), whereas keeping a
+# connection-only option would split the lock for one shared database.
+_RDB_CONNECTION_ONLY_OPTIONS = frozenset(
+    {
+        "application_name",
+        "charset",
+        "connect_timeout",
+        "options",
+        "read_timeout",
+        "sslcert",
+        "sslkey",
+        "sslmode",
+        "sslrootcert",
+        "target_session_attrs",
+        "write_timeout",
+    }
+)
+_RDB_CONNECTION_ONLY_OPTION_PREFIXES = ("keepalives",)
+
+
+def _is_connection_only_rdb_option(key: str) -> bool:
+    """Return whether an RDB URL query key configures the connection, not the target.
+
+    :param str key: Query parameter name from an RDB storage URL.
+    :return bool: True when the option must be excluded from lock identity.
+    """
+    lowered = key.lower()
+    return lowered in _RDB_CONNECTION_ONLY_OPTIONS or lowered.startswith(
+        _RDB_CONNECTION_ONLY_OPTION_PREFIXES
+    )
+
+
+def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Return the identity-bearing query pairs of an RDB URL, in stable order.
+
+    Connection-only options are dropped; everything else is kept, because a
+    parameter such as libpq's ``host=/var/run/postgresql`` (unix socket) or a
+    schema selector really does name a different target.
+
+    :param Mapping[str, Any] query: SQLAlchemy ``URL.query`` mapping; a value may
+        be a tuple when the URL repeats a key.
+    :return list[tuple[str, str]]: Key/value pairs sorted deterministically.
+    """
+    pairs: list[tuple[str, str]] = []
+    for key, value in query.items():
+        if _is_connection_only_rdb_option(key):
+            continue
+        values = value if isinstance(value, tuple | list) else (value,)
+        pairs.extend((key, str(item)) for item in values)
+    return sorted(pairs, key=lambda pair: (pair[0].lower(), pair[0], pair[1]))
+
+
+def _canonical_rdb_identity(storage: str) -> str:
+    """Canonicalize a non-file RDB URL into a same-host lock identity.
+
+    Equivalent spellings of one database must produce one identity, or the
+    same-host experiment lock silently splits and two orchestrators write the
+    same study (review v0.5.17 / blocker 5). Normalized away: the password
+    (rotating a credential must not orphan a live lock), the driver
+    (``postgresql``/``postgresql+psycopg``/``postgresql+psycopg2`` collide on
+    the base dialect), host case, a port left implicit when it equals the
+    family default, query-parameter order, and connection-only query options.
+
+    Emitted form (each component percent-encoded so no separator is
+    ambiguous)::
+
+        rdb://<family>://<user>@<host>[:<port>]/<database>[?<sorted-query>]
+
+    :param str storage: A non-file Optuna storage URL (``postgresql://...``, ...).
+    :return str: The canonical identity, or ``storage`` unchanged when
+        SQLAlchemy cannot parse it — lock-path derivation must never crash.
+    """
+    # Local import: SQLAlchemy ships with Optuna, but this module is on the
+    # `phasesweep --help` path and importing it costs ~80ms we only owe for
+    # the rare RDB storage URL.
+    from sqlalchemy.engine.url import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        url = make_url(storage)
+    except (ArgumentError, ValueError):
+        return storage
+
+    family = url.drivername.split("+", 1)[0].lower()
+    port = url.port if url.port is not None else _RDB_DEFAULT_PORTS.get(family)
+    port_segment = "" if port is None else f":{port}"
+    user = quote(url.username or "", safe="")
+    host = quote((url.host or "").lower(), safe="")
+    database = quote(url.database or "", safe="")
+    query = urlencode(_rdb_identity_query_pairs(url.query))
+    query_segment = f"?{query}" if query else ""
+    return f"rdb://{family}://{user}@{host}{port_segment}/{database}{query_segment}"
+
+
 def canonical_storage_identity(storage: str | None) -> str | None:
     """Stable same-host identity string for a storage URL.
 
@@ -1042,13 +1149,25 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     SQLAlchemy dialect (``sqlite+pysqlite:///`` etc.) onto the canonical
     ``sqlite:///`` prefix so dialect choice never splits the lock.
 
+    Non-file RDB URLs (``postgresql://``, ``mysql://``, ...) are canonicalized
+    by :func:`_canonical_rdb_identity`: password, driver suffix, host case,
+    implicit vs. explicit default port, query order, and connection-only query
+    options are all normalized away. What is *not* resolved: DNS aliases and
+    ``CNAME``s, load-balancer or pgbouncer endpoints, ``PGSERVICE`` service
+    files, ``~/.pg_service.conf`` or environment-supplied defaults, and
+    ``localhost`` vs. ``127.0.0.1`` vs. a unix socket. Those all reach the same
+    database under different identities, so operators relying on
+    ``allow_external_rdb_single_host: true`` must still spell the storage URL
+    the same way in every config that shares one database.
+
     Args:
         storage: An Optuna storage URL, or ``None`` for in-memory storage.
 
     Returns:
         The canonical identity string used to derive the same-host storage
         lock path, or ``None`` for in-memory storage (no shared backend to
-        collide on). Non-file RDB URLs are returned unchanged.
+        collide on). Storage strings SQLAlchemy cannot parse are returned
+        unchanged.
 
     """
     if storage is None:
@@ -1079,5 +1198,6 @@ def canonical_storage_identity(storage: str | None) -> str | None:
         path = file_url_path(storage)
         return "journal:///" + str(Path(path).expanduser().resolve())
 
-    # RDB URLs (postgres, mysql, ...) are passed through.
-    return storage
+    # RDB URLs (postgresql, mysql, ...): canonicalize so equivalent spellings of
+    # one database share a lock instead of splitting it (review v0.5.17 / blocker 5).
+    return _canonical_rdb_identity(storage)
