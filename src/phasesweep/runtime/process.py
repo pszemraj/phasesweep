@@ -822,6 +822,35 @@ class ProcessResult:
     cleanup_confirmed: bool = True
 
 
+class _LaunchDeadlineExpired(Exception):
+    """The launch deadline expired before the trainer payload was delivered.
+
+    Raised inside the supervised-launch critical section (review v0.5.16 /
+    blocker 6) so :func:`run_supervised` can classify the outcome as a
+    timeout — the trainer never started — instead of a generic launch
+    failure. Carries the cleanup confirmation and pid when the raising site
+    already aborted the blocked supervisor itself.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cleanup_confirmed: bool = True,
+        pid: int = -1,
+    ) -> None:
+        """Record the expiry context for :func:`run_supervised`'s timeout result.
+
+        :param str message: Human-readable description of which launch stage expired.
+        :param bool cleanup_confirmed: Whether the aborted supervisor's group
+            is confirmed gone (set by the abort site when it already ran).
+        :param int pid: PID of the aborted supervisor, or ``-1`` when unknown.
+        """
+        super().__init__(message)
+        self.cleanup_confirmed = cleanup_confirmed
+        self.pid = pid
+
+
 @dataclass(frozen=True)
 class StaleProcessIdentity:
     """Durable identity of one launched trial process group."""
@@ -954,6 +983,7 @@ def _spawn_blocked_supervisor(
     *,
     stdout: IO[str],
     stderr: IO[str],
+    deadline: float | None = None,
 ) -> tuple[subprocess.Popen, int, int]:
     """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
@@ -962,14 +992,21 @@ def _spawn_blocked_supervisor(
     ``python -I -S`` with a minimal sanitized environment — see
     :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
     acknowledgement pipe. Blocks (via ``select``) until the supervisor
-    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses, then
-    registers the new process group. On any failure — timeout, an unexpected
-    readiness byte, or an exception from ``Popen`` itself — any spawned
-    process group is killed and unregistered before the exception propagates.
+    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
+    capped by the remaining launch ``deadline`` when one is given (review
+    v0.5.16 / blocker 6), so a slow supervisor startup can never outlive the
+    trial's own wallclock budget. Then registers the new process group. On
+    any failure — timeout, an unexpected readiness byte, or an exception
+    from ``Popen`` itself — any spawned process group is killed and
+    unregistered before the exception propagates.
 
     Args:
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
+        deadline: Optional ``time.monotonic()`` launch deadline. When it
+            expires during the readiness wait, the spawn is aborted and
+            :class:`_LaunchDeadlineExpired` is raised so the caller reports a
+            timeout instead of a generic launch failure.
 
     Returns:
         A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
@@ -979,11 +1016,16 @@ def _spawn_blocked_supervisor(
         it once the trial's process identity is durably persisted.
 
     Raises:
+        _LaunchDeadlineExpired: The launch deadline expired before the
+            supervisor became ready; the spawned group is already aborted and
+            the exception carries the cleanup confirmation.
         RuntimeError: If the supervisor does not signal readiness within
             ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
             than ``b"R"``.
 
     """
+    import time
+
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
     proc: subprocess.Popen | None = None
@@ -1010,24 +1052,34 @@ def _spawn_blocked_supervisor(
         ack_read = -1
 
         pgid = _register(proc)
+        ready_timeout = _SUPERVISOR_READY_TIMEOUT_SECONDS
+        if deadline is not None:
+            ready_timeout = min(ready_timeout, max(0.0, deadline - time.monotonic()))
         readable, _, _ = select.select(
             [ready_read],
             [],
             [],
-            _SUPERVISOR_READY_TIMEOUT_SECONDS,
+            ready_timeout,
         )
+        if not readable and deadline is not None and time.monotonic() >= deadline:
+            raise _LaunchDeadlineExpired(
+                "trial launch deadline expired while waiting for the supervisor",
+                pid=proc.pid,
+            )
         # Written by phasesweep.runtime.supervisor.main's os.write(ready_fd, b"R").
         if not readable or os.read(ready_read, 1) != b"R":
             raise RuntimeError("trial supervisor did not become ready before launch")
         os.close(ready_read)
         ready_read = -1
         return proc, pgid, ack_write
-    except Exception:
+    except Exception as exc:
         if ack_write >= 0:
             os.close(ack_write)
             ack_write = -1
         if proc is not None:
-            _abort_launch(proc, pgid)
+            confirmed = _abort_launch(proc, pgid)
+            if isinstance(exc, _LaunchDeadlineExpired):
+                exc.cleanup_confirmed = confirmed
         raise
     finally:
         for fd in (ready_read, ready_write, ack_read):
@@ -1065,12 +1117,23 @@ def run_supervised(
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
+    ``timeout`` is the total launch-plus-execution budget, converted to an
+    absolute ``time.monotonic()`` deadline at entry (review v0.5.16 /
+    blocker 6). Every stage consumes it: the supervisor readiness wait is
+    capped to the remaining budget, the deadline is re-checked after
+    identity persistence and *before* the trainer payload crosses the ack
+    pipe — an expired deadline aborts the blocked supervisor and returns a
+    timeout without ever starting the trainer — and the final ``proc.wait``
+    uses the recomputed remainder, never the original duration. Cleanup
+    grace after a timeout is explicitly post-deadline time.
+
     Args:
         cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
         env: Full process environment for the subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
-        timeout: Wall-clock timeout in seconds, or ``None`` for no timeout.
+        timeout: Total wall-clock budget in seconds measured from this call's
+            entry (launch overhead included), or ``None`` for no timeout.
         trial_dir: Per-trial directory where ``process_identity.json`` is written.
         attempt_id: Immutable attempt identity already persisted in Optuna.
 
@@ -1084,6 +1147,7 @@ def run_supervised(
     import time
 
     started = time.monotonic()
+    deadline = None if timeout is None else started + timeout
 
     # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
@@ -1110,6 +1174,7 @@ def run_supervised(
             proc, pgid, ack_write = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,
+                deadline=deadline,
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,
@@ -1117,12 +1182,47 @@ def run_supervised(
                 pgid=pgid,
             )
             _write_process_identity(identity_path, identity)
+            if deadline is not None and time.monotonic() >= deadline:
+                # The budget expired during launch bookkeeping. The payload
+                # has NOT been delivered, so the blocked supervisor can be
+                # aborted without any trainer work ever starting (review
+                # v0.5.16 / blocker 6).
+                raise _LaunchDeadlineExpired(
+                    "trial launch deadline expired before the trainer payload was delivered",
+                    pid=proc.pid,
+                )
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
             # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
             _write_all(ack_write, _encode_launch_payload(cmd, env))
             os.close(ack_write)
             ack_write = None
+    except _LaunchDeadlineExpired as exc:
+        if ack_write is not None:
+            os.close(ack_write)
+        cleanup_confirmed = exc.cleanup_confirmed
+        pid = exc.pid
+        return_code = -9
+        if proc is not None:
+            # Raised at the pre-payload recheck: the supervisor is still
+            # blocked on its ack pipe; kill and reap it here.
+            cleanup_confirmed = _abort_launch(proc, pgid)
+            pid = proc.pid
+            if proc.returncode is not None:
+                return_code = proc.returncode
+        log.warning(
+            "Trial launch deadline expired before the trainer started (pid %d): %s",
+            pid,
+            exc,
+        )
+        return ProcessResult(
+            return_code=return_code,
+            timed_out=True,
+            pid=pid,
+            duration_seconds=time.monotonic() - started,
+            failure_reason=f"timeout after {timeout}s before trainer launch",
+            cleanup_confirmed=cleanup_confirmed,
+        )
     except Exception as exc:
         if ack_write is not None:
             os.close(ack_write)
@@ -1161,7 +1261,10 @@ def run_supervised(
 
     try:
         try:
-            proc.wait(timeout=timeout)
+            # Recompute the remainder: the original duration would silently
+            # extend the budget by however long launch bookkeeping took
+            # (review v0.5.16 / blocker 6).
+            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
             failure_reason = f"timeout after {timeout}s"

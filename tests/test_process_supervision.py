@@ -634,6 +634,188 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     )
 
 
+def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
+    """The exec'd trainer must not inherit the launcher's blocked signal mask.
+
+    ``run_supervised`` spawns the supervisor from inside its shutdown-signal
+    deferral window, and a blocked mask survives both fork and exec. Without
+    the supervisor's explicit mask reset, every trainer ran with
+    SIGTERM/SIGINT/SIGHUP blocked: graceful trainer shutdown was impossible
+    and the SIGTERM -> grace -> SIGKILL escalation always burned the full
+    grace period.
+    """
+    if not Path("/proc/self/status").exists():
+        pytest.skip("Linux-only test")
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    status_out = tmp_path / "status.txt"
+    cmd = f"cp /proc/self/status {status_out}"
+
+    result = _run_supervised(trial_dir, cmd, timeout=30.0, attempt_id="mask-attempt")
+
+    assert result.return_code == 0
+    blocked = int(status_out.read_text().split("SigBlk:")[1].split()[0], 16)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        assert not blocked & (1 << (sig - 1)), f"signal {sig} is blocked in the trainer"
+
+
+def test_deadline_expired_before_payload_never_starts_trainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A budget that expires during launch bookkeeping must not start the trainer.
+
+    Pre-fix (review v0.5.16 / blocker 6), the timeout was applied only at
+    ``proc.wait``: supervisor spawn, readiness, identity persistence, and
+    payload delivery all ran on an already-expired budget and the trainer
+    still started. The deadline is now re-checked before the payload crosses
+    the ack pipe.
+    """
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    marker = tmp_path / "trainer_ran.txt"
+
+    import phasesweep.runtime.process as _process
+
+    real_write_identity = _process._write_process_identity
+
+    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
+        real_write_identity(path, identity)
+        time.sleep(0.5)
+
+    monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
+
+    result = _run_supervised(
+        trial_dir,
+        f"touch {marker}",
+        timeout=0.2,
+        attempt_id="pre-payload-deadline-attempt",
+    )
+
+    assert result.timed_out
+    assert result.failure_reason is not None
+    assert "before trainer launch" in result.failure_reason
+    assert result.cleanup_confirmed
+    # The trainer command itself never ran: the payload was never delivered.
+    time.sleep(0.2)
+    assert not marker.exists()
+
+
+def test_supervisor_ready_wait_is_capped_by_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow supervisor startup cannot outlive the trial's own budget.
+
+    The readiness wait used to be a fixed ``_SUPERVISOR_READY_TIMEOUT_SECONDS``
+    regardless of the remaining budget; with a 10s allowance a 0.15s trial
+    budget could stall far past its deadline and then still launch (review
+    v0.5.16 / blocker 6).
+    """
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    marker = tmp_path / "trainer_ran.txt"
+
+    slow_supervisor = tmp_path / "slow_supervisor.py"
+    slow_supervisor.write_text(
+        "import os, signal, sys, time\n"
+        # Mirror the real supervisor's mask reset: the parent's launch window
+        # blocks shutdown signals and the mask survives exec.
+        "signal.pthread_sigmask(signal.SIG_SETMASK, set())\n"
+        "time.sleep(1.0)\n"
+        "os.write(int(sys.argv[1]), b'R')\n"
+        "time.sleep(30)\n"
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._SUPERVISOR_SCRIPT_PATH", str(slow_supervisor))
+
+    started = time.monotonic()
+    result = _run_supervised(
+        trial_dir,
+        f"touch {marker}",
+        timeout=0.15,
+        attempt_id="ready-wait-deadline-attempt",
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.timed_out
+    assert result.failure_reason is not None
+    assert "before trainer launch" in result.failure_reason
+    # Bounded by the budget plus kill/reap grace — nowhere near the slow
+    # supervisor's 1s startup + fixed 10s readiness allowance.
+    assert elapsed < 5.0
+    assert not marker.exists()
+
+
+def test_proc_wait_uses_remaining_budget_not_original_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch overhead must consume the budget, not silently extend it.
+
+    Pre-fix, ``proc.wait(timeout=<original duration>)`` restarted the clock
+    after launch bookkeeping, so a trainer could run for (overhead + budget)
+    wallclock (review v0.5.16 / blocker 6).
+    """
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    marker = tmp_path / "trainer_finished.txt"
+
+    import phasesweep.runtime.process as _process
+
+    real_write_identity = _process._write_process_identity
+
+    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
+        real_write_identity(path, identity)
+        time.sleep(0.6)
+
+    monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
+
+    # The trainer needs 0.6s; the original 1.0s duration would fit it, but
+    # after 0.6s of injected launch overhead only ~0.4s of budget remains.
+    result = _run_supervised(
+        trial_dir,
+        f"sleep 0.6 && touch {marker}",
+        timeout=1.0,
+        attempt_id="remaining-budget-attempt",
+    )
+
+    assert result.timed_out
+    assert not marker.exists()
+
+
+def test_phase_deadline_expiring_during_launch_fails_as_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A one-trial phase whose budget dies mid-launch must not publish success.
+
+    Review v0.5.16 / blocker 6 reproduction: with startup delay injected into
+    the launch path and a tiny phase budget, the trainer used to start after
+    the deadline had expired and the phase published success with
+    ``incomplete: false``. Now the launch aborts pre-payload, the trial
+    fails, and the phase surfaces a TimeoutError — no winner, no publication.
+    """
+    trial_dir_marker = tmp_path / "trainer_ran.txt"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
+        n_trials=1,
+        timeout_seconds_per_phase=0.2,
+    )
+
+    import phasesweep.runtime.process as _process
+
+    real_write_identity = _process._write_process_identity
+
+    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
+        real_write_identity(path, identity)
+        time.sleep(0.5)
+
+    monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        run_experiment(experiment)
+
+    assert not trial_dir_marker.exists(), "trainer started after the phase deadline expired"
+
+
 def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     """Root exits 0 while a child ignores SIGTERM.
 

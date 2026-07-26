@@ -566,21 +566,33 @@ def _run_phase(
             "terminal trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
-    return _select_phase_winner(
-        experiment,
-        phase,
-        inherited_winners,
-        study,
-        phase_fingerprint=phase_fingerprint,
-        completion={
-            "requested_trials": phase.n_trials,
-            "finished_trials": finished_after,
-            "completed_trials": completed_after,
-            "incomplete": accepted_partial_timeout,
-            "reason": "timeout" if accepted_partial_timeout else None,
-            "timeout_scope": timeout_source if accepted_partial_timeout else None,
-        },
-    )
+    try:
+        return _select_phase_winner(
+            experiment,
+            phase,
+            inherited_winners,
+            study,
+            phase_fingerprint=phase_fingerprint,
+            completion={
+                "requested_trials": phase.n_trials,
+                "finished_trials": finished_after,
+                "completed_trials": completed_after,
+                "incomplete": accepted_partial_timeout,
+                "reason": "timeout" if accepted_partial_timeout else None,
+                "timeout_scope": timeout_source if accepted_partial_timeout else None,
+            },
+        )
+    except NoFeasibleTrialError as exc:
+        if deadline_exhausted["flag"]:
+            # The deadline (not the trainer) is what prevented feasible work
+            # — e.g. every launch was refused or cut short after the budget
+            # expired (review v0.5.16 / blocker 6). Reporting this as
+            # "no feasible trial" would misdirect operators at trainer logs.
+            raise TimeoutError(
+                f"Phase {phase.name!r} hit its {timeout_source or 'wallclock'} deadline "
+                "before any feasible trial could complete; no winner can be selected."
+            ) from exc
+        raise
 
 
 def _select_phase_winner(

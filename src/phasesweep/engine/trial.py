@@ -138,8 +138,12 @@ def launch_trial(
         attempt_id: Immutable identity of this subprocess attempt.
         trial_dir: Resolved per-trial directory; created if missing.
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
-        timeout_seconds: Wall-clock timeout passed to :func:`run_supervised`,
-            or ``None`` for no timeout.
+        timeout_seconds: Total wall-clock budget passed to
+            :func:`run_supervised`, or ``None`` for no timeout. The budget
+            covers the whole supervised launch (supervisor startup, identity
+            persistence, payload delivery) as well as trainer execution, so
+            an already-expired phase/run deadline can never start new
+            trainer work (review v0.5.16 / blocker 6).
         gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
 
