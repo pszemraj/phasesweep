@@ -9,6 +9,7 @@ Verifies:
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -66,6 +67,22 @@ def test_full_sweep_and_replay(tmp_path):
     summary = yaml.safe_load((exp_dir / "summary.yaml").read_text())
     assert {p["name"] for p in summary["phases"]} == {"depth", "lr", "regularization"}
 
+    # Frozen objective evidence provenance (review v0.5.17 / finding F): the
+    # winner records the digest of the exact evidence file its scalar came from.
+    provenance = depth_winner.objective_provenance
+    assert provenance is not None
+    assert provenance["extractor"]["kind"] == "json_envelope"
+    winner_trial_dirs = [
+        d
+        for d in (exp_dir / "depth").glob("trial_*")
+        if d.name.endswith(f"attempt_{depth_winner.attempt_id}")
+    ]
+    assert len(winner_trial_dirs) == 1
+    evidence = winner_trial_dirs[0] / provenance["source"]["path"]
+    assert provenance["source"]["sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
+    stored = yaml.safe_load((exp_dir / "depth" / "winner.yaml").read_text())
+    assert stored["objective_provenance"] == provenance
+
     # Replay: drop the regularization study and its winner, then re-run from that phase.
     # The depth and lr winners should be re-loaded from yaml without re-running trials.
     import optuna
@@ -82,3 +99,5 @@ def test_full_sweep_and_replay(tmp_path):
     assert winners2["depth"].params == winners["depth"].params  # loaded from disk
     assert winners2["lr"].params == winners["lr"].params  # loaded from disk
     assert "regularization" in winners2  # re-run
+    # Reloaded winners preserve the frozen provenance record verbatim.
+    assert winners2["depth"].objective_provenance == provenance

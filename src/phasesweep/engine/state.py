@@ -105,6 +105,11 @@ class Winner:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
+    # Frozen evidence provenance captured when the winning objective was
+    # extracted: extractor config fingerprint plus source digest / frozen
+    # remote summary subset (review v0.5.17 / finding F). None for dry-run
+    # placeholders and winners persisted before the record existed.
+    objective_provenance: dict[str, Any] | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -121,6 +126,9 @@ TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 PHASE_ABORT_ATTR = "phasesweep_phase_abort"
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
+# JSON-encoded frozen objective evidence provenance (review v0.5.17 /
+# finding F); written when metric extraction succeeds.
+OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
 RETURN_CODE_ATTR = "phasesweep_return_code"
 DURATION_ATTR = "phasesweep_duration_s"
 OVERRIDES_ATTR = "phasesweep_overrides"
@@ -1072,6 +1080,7 @@ def _save_winner(
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
         "winner_source": _winner_source_payload(winner, phase_name),
+        "objective_provenance": winner.objective_provenance,
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
@@ -1246,6 +1255,11 @@ def _load_winner(
             generation_id=generation_id,
             attempt_id=attempt_id,
             source=source,
+            objective_provenance=(
+                dict(data["objective_provenance"])
+                if isinstance(data.get("objective_provenance"), dict)
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(

@@ -48,6 +48,10 @@ class TrialResult:
     feasible: bool
     failure_reason: str | None = None
     gate_results: list[GateResult] | None = None
+    # Frozen evidence provenance captured when the objective was extracted:
+    # extractor config fingerprint plus source digest / remote summary subset
+    # (review v0.5.17 / finding F). None when metric extraction failed.
+    objective_provenance: dict[str, Any] | None = None
 
 
 # Minimal environment base used when the execution contract narrows
@@ -366,8 +370,14 @@ def extract_trial_result(
     if expired is not None:
         return expired
 
+    objective_provenance: dict[str, Any] = {}
     try:
-        metric_value = run_extractor(executed.ctx, experiment.metric.extractor, deadline=deadline)
+        metric_value = run_extractor(
+            executed.ctx,
+            experiment.metric.extractor,
+            deadline=deadline,
+            provenance=objective_provenance,
+        )
     except ExtractorError as exc:
         log.warning(
             "[%s/trial_%d] metric extraction failed: %s",
@@ -468,6 +478,7 @@ def extract_trial_result(
         feasible=feasible,
         failure_reason=None,
         gate_results=gate_results,
+        objective_provenance=objective_provenance or None,
     )
 
 

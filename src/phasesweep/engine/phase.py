@@ -35,6 +35,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     OVERRIDES_ATTR,
     PHASE_ABORT_ATTR,
     RETURN_CODE_ATTR,
@@ -537,6 +538,11 @@ def _run_phase(
         trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
         trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
         trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
+        if result.objective_provenance is not None:
+            trial.set_user_attr(
+                OBJECTIVE_PROVENANCE_ATTR,
+                json.dumps(result.objective_provenance, sort_keys=True),
+            )
         if result.gate_results is not None:
             trial.set_user_attr(
                 GATES_ATTR,
@@ -760,6 +766,7 @@ def _select_phase_winner(
             generation_id=selected.generation_id,
             attempt_id=selected.attempt_id,
         ),
+        objective_provenance=selected.objective_provenance,
     )
 
 

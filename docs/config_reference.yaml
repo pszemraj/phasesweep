@@ -214,7 +214,7 @@
 # pattern: str (required)
 # Python regex with a named `(?P<value>...)` group. Invalid regex, a missing group, or no numeric match fails the trial.
 # select: Literal["last", "first", "min", "max"] = "last"
-# `first` returns on the first numeric match; the other modes scan the file line by line.
+# `first` stops matching at the first numeric match; every mode still reads the whole file so the frozen evidence digest covers all of it.
 
 # type: Literal["wandb"] (required)
 # entity: str (required)

@@ -16,6 +16,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -38,6 +39,10 @@ class SelectedTrial:
     gates: list[dict[str, Any]] = field(default_factory=list)
     generation_id: str = ""
     attempt_id: str = ""
+    # Frozen evidence provenance recorded when the trial's objective was
+    # extracted (review v0.5.17 / finding F); None for trials persisted
+    # before the record existed.
+    objective_provenance: dict[str, Any] | None = None
 
 
 class NoFeasibleTrialError(RuntimeError):
@@ -144,6 +149,17 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             if isinstance(parsed_gates, list):
                 gates = [item for item in parsed_gates if isinstance(item, dict)]
 
+    provenance: dict[str, Any] | None = None
+    raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
+    if isinstance(raw_provenance, str) and raw_provenance:
+        try:
+            parsed_provenance = json.loads(raw_provenance)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed_provenance, dict):
+                provenance = parsed_provenance
+
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
@@ -152,6 +168,7 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
+        objective_provenance=provenance,
     )
 
 
@@ -221,6 +238,11 @@ def _clone_winner_from_baseline(
         phase_fingerprint=phase_fingerprint,
         generation_id=baseline.generation_id,
         attempt_id=baseline.attempt_id,
+        objective_provenance=(
+            dict(baseline.objective_provenance)
+            if baseline.objective_provenance is not None
+            else None
+        ),
         source=WinnerSource(
             kind=source_kind,
             phase=baseline_source.phase,

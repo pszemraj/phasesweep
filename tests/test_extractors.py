@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import types
@@ -17,6 +18,7 @@ from phasesweep.config import (
     WandbSummaryRequiredGate,
 )
 from phasesweep.evidence import ExtractorError, run_extractor
+from phasesweep.evidence.evaluation import extractor_config_fingerprint
 from tests.conftest import make_trial_context
 
 
@@ -290,6 +292,134 @@ def test_log_regex_reports_invalid_patterns_or_no_matches(tmp_path):
         )
         with pytest.raises(ExtractorError, match=match):
             run_extractor(make_trial_context(case_dir), cfg)
+
+
+def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
+    """The provenance sink freezes the exact evidence bytes and the extractor's
+    config identity at extraction time (review v0.5.17 / finding F)."""
+    raw = json.dumps({"eval": {"loss": 0.42}}).encode("utf-8")
+    (tmp_path / "result.json").write_bytes(raw)
+    cfg = JsonExtractor(type="json", path="result.json", key="eval.loss")
+
+    provenance: dict = {}
+    value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+
+    assert value == pytest.approx(0.42)
+    assert provenance["schema_version"] == 1
+    assert provenance["extractor"]["kind"] == "json"
+    assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
+    assert provenance["source"] == {
+        "kind": "file",
+        "path": "result.json",
+        "key": "eval.loss",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": len(raw),
+    }
+    assert provenance["recorded_at"]
+    json.dumps(provenance)  # must survive the JSON study-attr round trip
+
+    other = JsonExtractor(type="json", path="result.json", key="eval.acc")
+    assert extractor_config_fingerprint(other) != extractor_config_fingerprint(cfg)
+
+
+def test_provenance_absent_when_extraction_fails(tmp_path):
+    cfg = JsonExtractor(type="json", path="missing.json", key="x")
+    provenance: dict = {}
+    with pytest.raises(ExtractorError):
+        run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+    assert "source" not in provenance
+
+
+def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "generation_id": "generation-test",
+        "attempt_id": "attempt-test",
+        "overrides_sha256": "a" * 64,
+        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
+        "evaluation": {
+            "policy": "final_checkpoint",
+            "checkpoint": "step_1000.pt",
+            "step": 1000,
+        },
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    (tmp_path / "result.json").write_bytes(raw)
+    cfg = JsonEnvelopeExtractor(
+        type="json_envelope",
+        path="result.json",
+        objective_name="val_loss",
+        split="validation",
+        policy="final_checkpoint",
+    )
+
+    provenance: dict = {}
+    run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+
+    source = provenance["source"]
+    assert source["sha256"] == hashlib.sha256(raw).hexdigest()
+    # The checkpoint and step are the envelope's own validated values even
+    # when the config did not pin them.
+    assert source["evaluation"] == {
+        "objective_name": "val_loss",
+        "split": "validation",
+        "policy": "final_checkpoint",
+        "checkpoint": "step_1000.pt",
+        "step": 1000,
+    }
+
+
+def test_provenance_log_regex_records_selected_line_and_whole_file_digest(tmp_path):
+    text = "eval_loss=1.0\neval_loss=0.5\neval_loss=0.7\n"
+    raw = text.encode("utf-8")
+    (tmp_path / "stdout.log").write_bytes(raw)
+
+    for select, expected_value, expected_line, expected_count in [
+        ("min", 0.5, 2, 3),
+        ("last", 0.7, 3, 3),
+        # "first" stops matching at line 1 but must still digest the whole file.
+        ("first", 1.0, 1, 1),
+    ]:
+        cfg = LogRegexExtractor(
+            type="log_regex",
+            file="stdout.log",
+            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
+            select=select,
+        )
+        provenance: dict = {}
+        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+        assert value == expected_value, select
+        source = provenance["source"]
+        assert source["sha256"] == hashlib.sha256(raw).hexdigest(), select
+        assert source["size_bytes"] == len(raw), select
+        assert source["matched_line"] == expected_line, select
+        assert source["match_count"] == expected_count, select
+
+
+def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):
+    fake_wandb(lambda path: _FakeRun(state="finished", summary={"eval/loss": 0.123, "extra": 9}))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    provenance: dict = {}
+    run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+
+    source = provenance["source"]
+    assert source["kind"] == "wandb"
+    assert source["entity"] == "me"
+    assert source["project"] == "proj"
+    assert source["run_id"] == "attempt-test"
+    assert source["run_state"] == "finished"
+    # Only the subset that justified the metric is frozen.
+    assert source["summary"] == {"eval/loss": 0.123}
+    assert source["retrieved_at"]
 
 
 def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):

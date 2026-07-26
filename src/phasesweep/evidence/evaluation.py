@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
@@ -32,19 +34,58 @@ from phasesweep.evidence.wandb import (
 )
 from phasesweep.runtime.json import strict_json_loads
 
+# Version of the objective evidence provenance payload frozen alongside a
+# metric at extraction time (review v0.5.17 / finding F).
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
 
-def load_json_value(trial_dir: Path, relative_path: str, key: str) -> tuple[Path, Any]:
+
+def extractor_config_fingerprint(cfg: Extractor) -> str:
+    """Return the SHA-256 identity of an extractor's exact configuration.
+
+    Frozen into evidence provenance so a forensic review can prove which
+    extractor contract produced a published scalar even after the experiment
+    config changes (review v0.5.17 / finding F).
+
+    :param Extractor cfg: Concrete extractor config to fingerprint.
+    :return str: Hex SHA-256 of the extractor's canonical JSON dump.
+    """
+    dumped = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
+def _file_digest(raw: bytes) -> dict[str, Any]:
+    """Return the digest fields shared by every file-based evidence source.
+
+    :param bytes raw: Exact evidence bytes as read for extraction.
+    :return dict[str, Any]: ``sha256`` and ``size_bytes`` of those bytes.
+    """
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+
+
+def load_json_value(
+    trial_dir: Path,
+    relative_path: str,
+    key: str,
+    *,
+    digest: dict[str, Any] | None = None,
+) -> tuple[Path, Any]:
     """Load a dotted JSON value from a trial-relative file.
 
     :param Path trial_dir: Directory containing the trial outputs.
     :param str relative_path: JSON file path relative to ``trial_dir``.
     :param str key: Dot-separated key path to read from the JSON object.
+    :param dict[str, Any] | None digest: Optional sink that receives the
+        ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
+        provenance (review v0.5.17 / finding F).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
     target = trial_dir / relative_path
     if not target.is_file():
         raise FileNotFoundError(target)
-    cur = strict_json_loads(target.read_text(encoding="utf-8"))
+    raw = target.read_bytes()
+    if digest is not None:
+        digest.update(_file_digest(raw))
+    cur = strict_json_loads(raw.decode("utf-8"))
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -89,13 +130,17 @@ class TrialContext:
     duration_seconds: float
 
 
-def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
+def _extract_json(
+    ctx: TrialContext, cfg: JsonExtractor, provenance: dict[str, Any] | None = None
+) -> float:
     """Read a JSON file in the trial directory and extract a numeric value.
 
     Args:
         ctx: Trial context (used for ``trial_dir``).
         cfg: ``JsonExtractor`` config naming the relative file path and the
             dotted lookup key inside it.
+        provenance: Optional sink that receives the frozen evidence ``source``
+            payload on success (review v0.5.17 / finding F).
 
     Returns:
         The numeric value at the configured key.
@@ -105,8 +150,9 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
             not coercible to ``float``.
 
     """
+    digest: dict[str, Any] = {}
     try:
-        target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key)
+        target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON file not found: {exc.args[0]}") from exc
     except UnicodeError as exc:
@@ -125,23 +171,32 @@ def _extract_json(ctx: TrialContext, cfg: JsonExtractor) -> float:
         ) from exc
 
     try:
-        return json_float(cur, label=cfg.key)
+        value = json_float(cur, label=cfg.key)
     except ValueError as exc:
         raise ExtractorError(str(exc)) from exc
+    if provenance is not None:
+        provenance["source"] = {"kind": "file", "path": cfg.path, "key": cfg.key, **digest}
+    return value
 
 
-def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> float:
+def _extract_json_envelope(
+    ctx: TrialContext, cfg: JsonEnvelopeExtractor, provenance: dict[str, Any] | None = None
+) -> float:
     """Validate and extract an attempt-bound JSON result envelope.
 
     :param TrialContext ctx: Current trial identity and resolved-overrides digest.
     :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
+    :param dict[str, Any] | None provenance: Optional sink that receives the
+        frozen evidence ``source`` payload — envelope digest plus the
+        validated evaluation metadata — on success (review v0.5.17 / finding F).
     :raises ExtractorError: If the envelope is missing, malformed, or belongs to
         another execution attempt.
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
     try:
-        data = strict_json_loads(target.read_text(encoding="utf-8"))
+        raw = target.read_bytes()
+        data = strict_json_loads(raw.decode("utf-8"))
     except FileNotFoundError as exc:
         raise ExtractorError(f"JSON envelope not found: {target}") from exc
     except UnicodeError as exc:
@@ -204,10 +259,27 @@ def _extract_json_envelope(ctx: TrialContext, cfg: JsonEnvelopeExtractor) -> flo
         raise ExtractorError(str(exc)) from exc
     if not math.isfinite(value):
         raise ExtractorError(f"JSON envelope at {target} has a non-finite objective value.")
+    if provenance is not None:
+        provenance["source"] = {
+            "kind": "file",
+            "path": cfg.path,
+            **_file_digest(raw),
+            # Evaluation metadata as validated from the envelope body — the
+            # checkpoint and step are the envelope's own reported values.
+            "evaluation": {
+                "objective_name": cfg.objective_name,
+                "split": cfg.split,
+                "policy": cfg.policy,
+                "checkpoint": checkpoint,
+                "step": step,
+            },
+        }
     return value
 
 
-def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
+def _extract_log_regex(
+    ctx: TrialContext, cfg: LogRegexExtractor, provenance: dict[str, Any] | None = None
+) -> float:
     """Scan a log file line-by-line and return the value of a named regex group.
 
     Args:
@@ -215,6 +287,12 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
         cfg: ``LogRegexExtractor`` config; ``pattern`` must contain a named
             group ``(?P<value>...)``, and ``select`` is one of
             ``"first"``/``"last"``/``"min"``/``"max"``.
+        provenance: Optional sink that receives the frozen evidence ``source``
+            payload on success: whole-file digest, the 1-based line number
+            that supplied the selected value, and how many numeric matches
+            were examined (review v0.5.17 / finding F). ``select: "first"``
+            stops *matching* at the first hit but still reads the remaining
+            bytes so the digest always covers the full file.
 
     Returns:
         The selected numeric value across all matches.
@@ -238,12 +316,29 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
     if "value" not in pattern.groupindex:
         raise ExtractorError(f"Regex {cfg.pattern!r} must contain a named group 'value'.")
 
-    # Stream line-by-line to avoid 500 MB RSS on large training logs.
+    # Stream line-by-line to avoid 500 MB RSS on large training logs. Binary
+    # iteration feeds the evidence digest with the exact on-disk bytes; each
+    # line is decoded (with the text-mode CRLF translation matching applied to
+    # historical behavior) before regex matching.
+    hasher = hashlib.sha256()
+    size_bytes = 0
     result: float | None = None
+    result_line: int | None = None
     count = 0
+    line_no = 0
     try:
-        with target.open(encoding="utf-8") as fh:
-            for line in fh:
+        with target.open("rb") as fh:
+            for raw_line in fh:
+                hasher.update(raw_line)
+                size_bytes += len(raw_line)
+                line_no += 1
+                if cfg.select == "first" and result is not None:
+                    # Value already selected; keep reading only to finish the
+                    # whole-file digest.
+                    continue
+                line = raw_line.decode("utf-8")
+                if line.endswith("\r\n"):
+                    line = line[:-2] + "\n"
                 m = pattern.search(line)
                 if m is None:
                     continue
@@ -252,14 +347,15 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
                 except (TypeError, ValueError):
                     continue
                 count += 1
-                if cfg.select == "first":
-                    return v
-                if cfg.select == "last":
+                if cfg.select in ("first", "last"):
                     result = v
+                    result_line = line_no
                 elif cfg.select == "min":
-                    result = v if result is None else min(result, v)
+                    if result is None or v < result:
+                        result, result_line = v, line_no
                 elif cfg.select == "max":
-                    result = v if result is None else max(result, v)
+                    if result is None or v > result:
+                        result, result_line = v, line_no
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
     except OSError as exc:
@@ -267,11 +363,22 @@ def _extract_log_regex(ctx: TrialContext, cfg: LogRegexExtractor) -> float:
 
     if count == 0:
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
-    assert result is not None  # count > 0 guarantees this for last/min/max
+    assert result is not None  # count > 0 guarantees this
+    if provenance is not None:
+        provenance["source"] = {
+            "kind": "file",
+            "path": cfg.file,
+            "sha256": hasher.hexdigest(),
+            "size_bytes": size_bytes,
+            "matched_line": result_line,
+            "match_count": count,
+        }
     return result
 
 
-def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
+def _extract_wandb(
+    ctx: TrialContext, cfg: WandbExtractor, provenance: dict[str, Any] | None = None
+) -> float:
     """Poll the W&B public API for this attempt's run and return a summary metric.
 
     Args:
@@ -279,6 +386,11 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
             ``WANDB_RUN_ID`` before subprocess launch.
         cfg: ``WandbExtractor`` config: entity, project, metric key, poll
             cadence, and timeout.
+        provenance: Optional sink that receives the frozen evidence ``source``
+            payload on success: run address, terminal run state, the summary
+            subset that justified the metric, and the retrieval timestamp —
+            remote summaries are mutable, so the frozen copy is the only
+            durable record of what was read (review v0.5.17 / finding F).
 
     Returns:
         The numeric value of ``cfg.metric_key`` on the finished run.
@@ -324,14 +436,35 @@ def _extract_wandb(ctx: TrialContext, cfg: WandbExtractor) -> float:
         raise ExtractorError(msg) from exc
 
     try:
-        return json_float(summary[cfg.metric_key], label=cfg.metric_key)
+        value = json_float(summary[cfg.metric_key], label=cfg.metric_key)
     except ValueError as exc:
         raise ExtractorError(
             f"Value at W&B metric {cfg.metric_key!r} is not numeric: {summary[cfg.metric_key]!r}"
         ) from exc
+    if provenance is not None:
+        provenance["source"] = {
+            "kind": "wandb",
+            "entity": cfg.entity,
+            "project": cfg.project,
+            "run_id": ctx.attempt_id,
+            # poll_wandb_summary returns only for finished runs; every other
+            # terminal state raises WandbRunTerminalError above.
+            "run_state": "finished",
+            "summary": {cfg.metric_key: summary[cfg.metric_key]},
+            "retrieved_at": _utc_now_iso(),
+        }
+    return value
 
 
-_DISPATCH: dict[type, Callable[[TrialContext, Any], float]] = {
+def _utc_now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string.
+
+    :return str: Second-resolution UTC timestamp for provenance records.
+    """
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+_DISPATCH: dict[type, Callable[[TrialContext, Any, dict[str, Any] | None], float]] = {
     JsonExtractor: _extract_json,
     JsonEnvelopeExtractor: _extract_json_envelope,
     LogRegexExtractor: _extract_log_regex,
@@ -352,7 +485,13 @@ def _remaining_budget_seconds(deadline: float | None) -> float | None:
     return max(0.0, deadline - time.monotonic())
 
 
-def run_extractor(ctx: TrialContext, cfg: Extractor, *, deadline: float | None = None) -> float:
+def run_extractor(
+    ctx: TrialContext,
+    cfg: Extractor,
+    *,
+    deadline: float | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> float:
     """Dispatch to the appropriate extractor for ``cfg``.
 
     Args:
@@ -366,6 +505,12 @@ def run_extractor(ctx: TrialContext, cfg: Extractor, *, deadline: float | None =
             arbitrarily past its configured wallclock bound (review v0.5.17 /
             blocker 8). Local extractors are bounded by the caller's
             stage-boundary deadline checks instead.
+        provenance: Optional sink that, on success, is filled with the frozen
+            evidence provenance record: schema version, the extractor's kind
+            and exact config fingerprint, the per-source evidence identity
+            (file digest or frozen remote summary), and the capture timestamp
+            (review v0.5.17 / finding F). The extractor fingerprint always
+            reflects the *configured* extractor, not any deadline-capped copy.
 
     Returns:
         The numeric value the extractor pulled from this trial's outputs.
@@ -378,10 +523,24 @@ def run_extractor(ctx: TrialContext, cfg: Extractor, *, deadline: float | None =
     fn = _DISPATCH.get(type(cfg))
     if fn is None:
         raise ExtractorError(f"No extractor registered for {type(cfg).__name__}.")
+    if provenance is not None:
+        provenance.clear()
+        provenance.update(
+            {
+                "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+                "extractor": {
+                    "kind": cfg.type,
+                    "config_sha256": extractor_config_fingerprint(cfg),
+                },
+            }
+        )
     remaining = _remaining_budget_seconds(deadline)
     if remaining is not None and isinstance(cfg, WandbExtractor):
         cfg = cfg.model_copy(update={"timeout_seconds": min(cfg.timeout_seconds, remaining)})
-    return fn(ctx, cfg)
+    value = fn(ctx, cfg, provenance)
+    if provenance is not None:
+        provenance["recorded_at"] = _utc_now_iso()
+    return value
 
 
 @dataclass(frozen=True)
