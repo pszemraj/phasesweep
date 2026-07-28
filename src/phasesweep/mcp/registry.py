@@ -403,6 +403,43 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     )
 
 
+def _claim_catalog_entry_identity(
+    loaded: RegisteredExperiment,
+    namespace_owners: dict[str, str],
+    storage_owners: dict[str, str],
+) -> None:
+    """Claim one entry's engine namespaces, rejecting aliases across catalog ids.
+
+    :param RegisteredExperiment loaded: Validated catalog entry to claim.
+    :param dict[str, str] namespace_owners: Catalog ids keyed by output namespace.
+    :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
+    :raises CatalogError: If another catalog id already governs either namespace.
+    """
+    namespace = str(_experiment_dir(loaded.experiment))
+    other = namespace_owners.get(namespace)
+    if other is not None:
+        raise CatalogError(
+            f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
+            f"experiment output namespace ({namespace}); one engine "
+            "experiment must be governed by exactly one catalog entry."
+        )
+    namespace_owners[namespace] = loaded.id
+
+    storage_identity = canonical_storage_identity(loaded.experiment.storage)
+    if storage_identity is None:
+        return
+    storage_key = f"{storage_identity}::{loaded.experiment.experiment}"
+    other = storage_owners.get(storage_key)
+    if other is not None:
+        raise CatalogError(
+            f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
+            f"Optuna study namespace ({loaded.experiment.experiment!r} on "
+            f"{storage_identity}); one engine experiment must be governed "
+            "by exactly one catalog entry."
+        )
+    storage_owners[storage_key] = loaded.id
+
+
 @dataclass(frozen=True)
 class CatalogCheckEntry:
     """Operator-facing validation verdict for one catalog entry."""
@@ -452,6 +489,8 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     _require_linux_mcp_host()
     catalog, base = _parse_catalog(catalog_path)
     seen: set[str] = set()
+    namespace_owners: dict[str, str] = {}
+    storage_owners: dict[str, str] = {}
     entries: list[CatalogCheckEntry] = []
     for entry in catalog.experiments:
         if entry.id in seen:
@@ -460,6 +499,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
         seen.add(entry.id)
         try:
             registered = _load_entry(base, entry)
+            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
         except CatalogError as exc:
             entries.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
             continue
@@ -529,27 +569,7 @@ class Registry:
             if entry.id in items:
                 raise CatalogError(f"duplicate catalog id {entry.id!r}")
             loaded = _load_entry(base, entry)
-            namespace = str(_experiment_dir(loaded.experiment))
-            other = namespace_owners.get(namespace)
-            if other is not None:
-                raise CatalogError(
-                    f"catalog ids {other!r} and {entry.id!r} resolve to the same "
-                    f"experiment output namespace ({namespace}); one engine "
-                    "experiment must be governed by exactly one catalog entry."
-                )
-            namespace_owners[namespace] = entry.id
-            storage_identity = canonical_storage_identity(loaded.experiment.storage)
-            if storage_identity is not None:
-                storage_key = f"{storage_identity}::{loaded.experiment.experiment}"
-                other = storage_owners.get(storage_key)
-                if other is not None:
-                    raise CatalogError(
-                        f"catalog ids {other!r} and {entry.id!r} resolve to the same "
-                        f"Optuna study namespace ({loaded.experiment.experiment!r} on "
-                        f"{storage_identity}); one engine experiment must be governed "
-                        "by exactly one catalog entry."
-                    )
-                storage_owners[storage_key] = entry.id
+            _claim_catalog_entry_identity(loaded, namespace_owners, storage_owners)
             items[entry.id] = loaded
         return cls(
             state_dir=_prepare_state_dir(base, catalog.state_dir),

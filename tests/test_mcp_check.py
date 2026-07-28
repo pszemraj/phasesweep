@@ -121,6 +121,37 @@ experiments:
     assert "config not found" in (ghost.error or "")
 
 
+@pytest.mark.parametrize(
+    ("alias_kind", "expected_error"),
+    [
+        ("output", "same experiment output namespace"),
+        ("storage", "same Optuna study namespace"),
+    ],
+)
+def test_check_catalog_matches_server_cross_entry_identity_rejections(
+    tmp_path: Path,
+    alias_kind: str,
+    expected_error: str,
+) -> None:
+    shared = mcp_experiment_config_text(tmp_path, name="shared")
+    second = shared
+    if alias_kind == "storage":
+        second = second.replace(
+            f"workdir: {tmp_path}/runs/shared",
+            f"workdir: {tmp_path}/runs/other",
+        )
+    catalog = write_mcp_config_catalog(tmp_path, {"first": shared, "second": second})
+
+    report = check_catalog(catalog)
+
+    assert not report.ok
+    assert report.entries[0].ok
+    assert expected_error in (report.entries[1].error or "")
+    assert not (tmp_path / "state").exists()
+    with pytest.raises(CatalogError, match=expected_error):
+        Registry.load(catalog)
+
+
 def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
     catalog = tmp_path / "catalog.yaml"
     catalog.write_text("experiments: []\n")
