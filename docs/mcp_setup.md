@@ -126,11 +126,13 @@ It never edits a client file and never reaches the network. Each target is repor
 
 A single entry can be broken in more than one way; the launcher executable is reported first, because a launcher that cannot start never reads its catalog.
 
-Exit code 0 means every configured launcher resolves; exit code 1 means at least one is `missing`, `not-executable`, `catalog-missing`, or `unreadable` (see the repair guidance printed above it). `unmanaged` and `not-configured` are informational only and do not affect the exit code.
+Exit code 0 means no configured entry has a failure status; exit code 1 means at least one is `missing`, `not-executable`, `catalog-missing`, or `unreadable` (see the repair guidance printed above it). `unmanaged` and `not-configured` are informational only and do not affect the exit code.
 
 ## 5. Instruct the agent
 
 If step 3 ran with instructions enabled, the client already received the [agent instructions](../src/phasesweep/mcp/agent_prompt.md) in its project instructions file. The server also sends the same workflow in its MCP initialization instructions, and clients with MCP prompt support can load `phasesweep_run_and_monitor`. If the client honors none of those channels, copy the linked instructions into the agent's project instructions or the chat before asking it to run a sweep.
+
+After upgrading or reinstalling phasesweep, rerun the same `phasesweep mcp install` command for each selected client and restart it. Reinstallation refreshes the generated launcher entry and copied instructions; `--launcher uvx` entries also move their exact package pin to the installed version.
 
 ## Requests that work well
 
@@ -148,4 +150,4 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 - `launch outcome is unresolved`: wait briefly and retry `recover-run`. If it persists after a server crash, automated recovery cannot distinguish a pre-spawn crash from a not-yet-registered runner; inspect the host and keep the run reserved until a matching runner is ruled out.
 - Path or storage rejected at startup: follow the MCP [path and working-directory rules](mcp.md#paths-and-the-working-directory); catalogs support local-node SQLite and Journal storage, not in-memory or external RDB storage.
 - A cancelled or failed run stays `running` with `cleanup_confirmed: false`: follow the operator procedure under [run state and recovery](mcp.md#run-state-and-recovery).
-- Old MCP runs clutter status or logs: inspect `state_dir/runs` and `state_dir/logs`, then archive or prune terminal run handles between campaigns.
+- Old MCP runs clutter status or logs: follow [pruning terminal run history](mcp.md#pruning-terminal-run-history) so handles and sidecars stay consistent.
