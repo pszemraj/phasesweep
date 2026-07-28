@@ -2073,11 +2073,7 @@ def serve(catalog: Path) -> int:
         print(f"phasesweep mcp: {exc}", file=sys.stderr)
         return 2
 
-    app = PhaseSweepMCP(
-        registry,
-        RunStore(registry.state_dir),
-        audit=AuditLogger(registry.state_dir / "audit.jsonl"),
-    )
+    app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
     build_server(app).run(transport="stdio")
     return 0
 
