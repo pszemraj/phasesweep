@@ -393,12 +393,10 @@ def mcp() -> None:
 @click.option(
     "--state-dir",
     required=True,
-    # resolve_path matches how the catalog loader normalizes state_dir
-    # (expanduser + resolve): without it a relative or symlinked spelling
-    # names a different directory than the server used, and recovery reports
-    # "not an existing MCP state directory" for a perfectly healthy root
-    # (review v0.5.17 gap hunt).
-    type=click.Path(exists=True, file_okay=False, resolve_path=True, path_type=Path),
+    # RunStore.open_existing validates the normalized path without creating it.
+    # Normalization happens inside the command because Click's resolve_path
+    # does not expand "~", unlike the catalog loader (review v0.5.17 gap hunt).
+    type=click.Path(file_okay=False, path_type=Path),
     help="MCP state_dir containing runs/ and logs/.",
 )
 @click.option("--run-id", required=True, help="MCP run id to recover.")
@@ -414,6 +412,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
     """
+    state_dir = state_dir.expanduser().resolve()
     if not sys.platform.startswith("linux"):
         raise click.ClickException(
             "MCP recovery is supported only on Linux because safe process cleanup "

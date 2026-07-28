@@ -20,6 +20,7 @@ from phasesweep.engine.state import (
     _last_successful_generation_path,
     _winner_path,
 )
+from phasesweep.mcp.runs import RunStore
 from tests.conftest import write_trainer, write_yaml
 
 
@@ -73,6 +74,23 @@ def test_help_registers_commands_and_options() -> None:
     init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "--from PATH" in init_help.output
+
+
+def test_recover_run_expands_user_state_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    RunStore(tmp_path / "state")
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", "~/state", "--run-id", "missing"],
+    )
+
+    assert result.exit_code != 0
+    assert "unknown run id: missing" in result.output
+    assert "not an existing MCP state directory" not in result.output
 
 
 @pytest.mark.parametrize(
