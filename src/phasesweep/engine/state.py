@@ -312,16 +312,6 @@ SUITE_SUMMARY_SCHEMA_VERSION = 3
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
 
-# Successful whole-manifest validations, keyed by (generation dir, generation
-# id). A published generation's namespace is immutable by design (exclusively
-# claimed at birth, write-once record, validated before the pointer ever names
-# it), so one successful validation holds for the life of the process; the
-# cache keeps hot status paths from re-hashing every artifact on every pointer
-# read (review v0.5.16 / blocker 3). Failures are never cached: readers can
-# race a publication only *before* the pointer commits, and a failed read must
-# re-check rather than pin a transient state.
-_VALIDATED_MANIFESTS: set[tuple[str, str]] = set()
-
 
 def _file_sha256(path: Path) -> str:
     """Return the SHA-256 hex digest of one file's bytes.
@@ -513,22 +503,18 @@ def _generation_manifest_is_valid(
     generation_id: str,
     summary: Mapping[str, Any],
 ) -> bool:
-    """Validate a generation manifest read-side, caching per immutable generation.
+    """Validate a generation manifest before trusting its publication pointer.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary claims.
     :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :return bool: Whether the manifest validated (possibly from cache).
+    :return bool: Whether the manifest currently validates.
     """
-    cache_key = (str(generation_dir), generation_id)
-    if cache_key in _VALIDATED_MANIFESTS:
-        return True
     try:
         _validate_generation_manifest(generation_dir, generation_id, summary)
     except RuntimeError as exc:
         log.warning("%s", exc)
         return False
-    _VALIDATED_MANIFESTS.add(cache_key)
     return True
 
 
@@ -619,10 +605,11 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     For schema-versioned summaries the target's complete artifact manifest is
     additionally validated -- every listed winner/promotion artifact must
     exist, hash to its recorded content, and cross-check against the summary
-    (review v0.5.16 / blocker 3). One successful validation is cached for the
-    life of the process per immutable generation, so hot status paths pay the
-    full artifact walk once, not per read. Pre-manifest legacy summaries keep
-    the identity-only gate.
+    (review v0.5.16 / blocker 3). Validation runs on every authoritative read:
+    generation directories are write-once by PhaseSweep convention, but the
+    filesystem does not enforce immutability and a long-lived reader must
+    notice later corruption or operator edits. Pre-manifest legacy summaries
+    keep the identity-only gate.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return str | None: The last-successful generation id, or ``None`` if the
