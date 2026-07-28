@@ -14,7 +14,6 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import main as cli_main
 from phasesweep.engine.state import (
     _generation_path,
-    _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
@@ -255,9 +254,6 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
     summary = _generation_summary_path(experiment, "successful")
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text("experiment: t\ngeneration_id: successful\n")
-    record = _generation_record_path(experiment, "successful")
-    record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text("experiment: t\ngeneration_id: successful\nstate: published\n")
     _last_successful_generation_path(experiment).write_text(
         "experiment: t\ngeneration_id: successful\n"
     )
