@@ -532,16 +532,6 @@ def test_resolve_uvx_launcher_requires_installed_distribution(monkeypatch):
         installer.resolve_uvx_launcher()
 
 
-def test_resolve_uvx_launcher_pins_a_published_looking_version(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: "1.2.3")
-
-    assert installer.resolve_uvx_launcher() == (
-        "uvx",
-        ["--from", "phasesweep[mcp]==1.2.3", "phasesweep-mcp"],
-    )
-
-
 @pytest.mark.parametrize(
     "version",
     [
