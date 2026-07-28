@@ -369,7 +369,7 @@ def status(config_path: Path) -> None:
     payload = config_status(config)
     if isinstance(config, Experiment):
         payload = _with_generation_identity(payload, config)
-    click.echo(_format_status(payload))
+    click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
 
 
 @main.group(
@@ -1157,15 +1157,6 @@ def check_install_cmd(ctx: click.Context, agents: tuple[str, ...], project_dir: 
     :param Path project_dir: Project root for project-scoped client files.
     """
     ctx.exit(mcp_installer.check_install(project_dir.resolve(), list(agents) or None))
-
-
-def _format_status(status_obj: dict) -> str:
-    """Render status data as stable YAML.
-
-    :param dict status_obj: Status payload returned by :func:`config_status`.
-    :return str: YAML-formatted status text without a trailing newline.
-    """
-    return yaml.safe_dump(status_obj, sort_keys=False).rstrip()
 
 
 if __name__ == "__main__":
