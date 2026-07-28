@@ -669,3 +669,20 @@ def test_wandb_extractor_poll_budget_is_capped_by_phase_deadline(fake_wandb, tmp
     # Enormous two-sided margin: capped polling ends in ~1s; an uncapped
     # budget would need the full 60s.
     assert elapsed < 20.0
+
+
+def test_wandb_extractor_rejects_expired_deadline_before_polling(fake_wandb, tmp_path):
+    """An exhausted phase budget reports the deadline, not a zero-second W&B miss."""
+    timeouts = fake_wandb(lambda _path: _FakeRun("finished", {"eval/loss": 0.1}))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="proj",
+        metric_key="eval/loss",
+        timeout_seconds=60,
+    )
+
+    with pytest.raises(ExtractorError, match="wallclock deadline exceeded"):
+        run_extractor(make_trial_context(tmp_path), cfg, deadline=0.0)
+
+    assert timeouts == []

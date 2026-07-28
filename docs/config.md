@@ -106,7 +106,7 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, checkpoint, evaluation policy, and step. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
@@ -114,7 +114,7 @@ The [config reference](config_reference.yaml) defines each extractor shape, incl
 
 ## Evidence gates
 
-Evidence gates validate local artifacts or W&B summary values after extraction. Gate failures mark the trial `FAIL` unless promotion has `requires_gates: false`, where they are advisory evidence. The [config reference](config_reference.yaml) defines the available gate shapes.
+Evidence gates validate local artifacts or W&B summary values after extraction. Local file gates share the trial directory's attempt-location scoping but do not parse an identity envelope; a stale or copied artifact can therefore satisfy a gate if the trainer places it in the current trial directory. Gate failures mark the trial `FAIL` unless promotion has `requires_gates: false`, where they are advisory evidence. The [config reference](config_reference.yaml) defines the available gate shapes.
 
 `json_equals` is type-strict, so `true`, `1`, and `1.0` are distinct. Use `json_scalar_bound` for numeric comparisons where integer and float representations should both pass.
 

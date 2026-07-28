@@ -542,6 +542,8 @@ def run_extractor(
             }
         )
     remaining = _remaining_budget_seconds(deadline)
+    if remaining is not None and remaining <= 0.0:
+        raise ExtractorError("Phase/run wallclock deadline exceeded before evidence extraction.")
     if remaining is not None and isinstance(cfg, WandbExtractor):
         cfg = cfg.model_copy(update={"timeout_seconds": min(cfg.timeout_seconds, remaining)})
     value = fn(ctx, cfg, provenance)
