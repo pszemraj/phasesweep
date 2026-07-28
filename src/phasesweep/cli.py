@@ -695,13 +695,10 @@ def _finalize_stored_terminal_result_snapshot(
     terminal_status["result_snapshot_state"] = "pending"
     try:
         write_status_file(store.status_path(run_id), terminal_status)
-        if confirmed_attempt_ids:
-            terminal_status["result_snapshot"] = finalize_result_snapshot(
-                raw_snapshot,
-                confirmed_attempt_ids=confirmed_attempt_ids,
-            )
-        else:
-            terminal_status["result_snapshot"] = finalize_result_snapshot(raw_snapshot)
+        terminal_status["result_snapshot"] = finalize_result_snapshot(
+            raw_snapshot,
+            confirmed_attempt_ids=confirmed_attempt_ids,
+        )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
     except Exception as exc:  # noqa: BLE001 - convert operator repair failures to CLI errors
