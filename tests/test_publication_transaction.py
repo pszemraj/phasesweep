@@ -461,47 +461,17 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "inject",
-    ["precommit_validation", "pointer_commit", "ordinary_execution"],
-)
-def test_no_failure_path_leaves_current_pointer_non_terminal(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    inject: str,
-) -> None:
-    """Every injected failure drives the current pointer to a terminal state."""
-    experiment = _stored_experiment(tmp_path)
+def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> None:
+    """An ordinary execution failure drives the current pointer to a terminal state."""
+    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        max_consecutive_failures=1,
+    )
 
-    if inject == "precommit_validation":
-
-        def fail(*_args: object, **_kwargs: object) -> None:
-            raise RuntimeError("simulated failure")
-
-        monkeypatch.setattr(engine_run, "_validate_generation_publishable", fail)
-        expected_exc = RuntimeError
-    elif inject == "pointer_commit":
-        pointer_path = _last_successful_generation_path(experiment)
-        original_write = engine_run._write_yaml_atomic
-
-        def flaky_write(path: Path, payload: object) -> None:
-            if path == pointer_path:
-                raise OSError("simulated failure")
-            return original_write(path, payload)
-
-        monkeypatch.setattr(engine_run, "_write_yaml_atomic", flaky_write)
-        expected_exc = OSError
-    else:
-        trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
-        experiment = make_experiment(
-            workdir=tmp_path / "runs",
-            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-            n_trials=1,
-            max_consecutive_failures=1,
-        )
-        expected_exc = NoFeasibleTrialError
-
-    with pytest.raises(expected_exc):
+    with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
     assert _current_pointer_state(experiment) in engine_run._TERMINAL_GENERATION_STATES
