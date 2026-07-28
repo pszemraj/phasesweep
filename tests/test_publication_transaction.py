@@ -963,6 +963,14 @@ def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     assert _last_successful_suite_generation_id(suite) is None
 
+    # Parameters and effective overrides are published winner facts too.
+    summary = yaml.safe_load(original)
+    study = summary["studies"][0]
+    exposed = [item for item in study["phases"] if item.get("exposed")]
+    exposed[0]["params"]["x"] = exposed[0]["params"]["x"] + 1
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    assert _last_successful_suite_generation_id(suite) is None
+
     # Restore, then tamper the hash-anchored component summary instead.
     summary_path.write_text(original)
     assert _last_successful_suite_generation_id(suite) == generation_id

@@ -271,7 +271,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         studies:
           - name: baseline
             phases:
-              - name: eval
+              - name: baseline_eval
                 n_trials: 1
                 fixed_overrides: {{ score: 1.0 }}
                 search_space: {{}}
@@ -282,7 +282,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
               min_delta: 0.1
               on_fail: continue_baseline
             phases:
-              - name: eval
+              - name: candidate_eval
                 n_trials: 1
                 fixed_overrides: {{ score: 0.95 }}
                 search_space: {{}}
@@ -292,18 +292,20 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     config = load_config(p)
     winners = run_config(config)
 
-    assert winners["candidate"]["eval"].metric == winners["baseline"]["eval"].metric
+    assert (
+        winners["candidate"]["candidate_eval"].metric == winners["baseline"]["baseline_eval"].metric
+    )
     assert isinstance(config, Suite)
     summary_path = tmp_path / "runs" / "promote_suite" / "suite_summary.yaml"
     first_summary = yaml.safe_load(summary_path.read_text())
     first_decision = first_summary["promotion_decisions"][0]
     assert first_summary["studies"][1]["promotion"] == first_decision
-    first_baseline = winners["baseline"]["eval"]
-    first_exposed = winners["candidate"]["eval"]
+    first_baseline = winners["baseline"]["baseline_eval"]
+    first_exposed = winners["candidate"]["candidate_eval"]
     assert first_exposed.source is not None
     assert first_exposed.source.kind == "suite_baseline"
     assert first_exposed.source.study == "baseline"
-    assert first_exposed.source.phase == "eval"
+    assert first_exposed.source.phase == "baseline_eval"
     assert first_summary["studies"][1]["phases"][0]["winner_source"]["kind"] == "suite_baseline"
     assert first_decision["action"] == "continue_baseline"
     assert first_decision["exposed_source"] == "baseline"
@@ -315,7 +317,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     candidate_experiment = config.experiment_for_study(config.studies[1])
     first_candidate_dir = _trial_dir_for(
         candidate_experiment,
-        "eval",
+        "candidate_eval",
         first_decision["candidate_trial_number"],
         generation_id=first_decision["candidate_generation_id"],
         attempt_id=first_decision["candidate_attempt_id"],
@@ -336,7 +338,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     second_summary = yaml.safe_load(summary_path.read_text())
     second_decision = second_summary["promotion_decisions"][0]
     assert second_summary["studies"][1]["promotion"] == second_decision
-    second_baseline = second_winners["baseline"]["eval"]
+    second_baseline = second_winners["baseline"]["baseline_eval"]
     assert second_decision["candidate_generation_id"] != first_decision["candidate_generation_id"]
     assert second_decision["candidate_attempt_id"] != first_decision["candidate_attempt_id"]
     assert second_decision["baseline_generation_id"] == second_baseline.generation_id
@@ -344,7 +346,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     assert first_candidate_dir.is_dir()
     assert _trial_dir_for(
         candidate_experiment,
-        "eval",
+        "candidate_eval",
         second_decision["candidate_trial_number"],
         generation_id=second_decision["candidate_generation_id"],
         attempt_id=second_decision["candidate_attempt_id"],

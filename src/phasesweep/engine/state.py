@@ -918,10 +918,13 @@ def _validate_suite_summary_integrity(
     names its component generation summary by absolute path plus content
     hash; the file must sit at ``generations/<component id>/summary.yaml``,
     parse, and name the recorded experiment and generation — and every
-    exposed phase winner in the suite summary must appear verbatim (name,
-    trial number, metric value, generation id, attempt id) in one of those
-    verified component summaries. Promotion-adopted winners match the
-    promotion baseline's component summary. Runs pre-commit (before the suite
+    exposed phase winner in the suite summary must match one of those verified
+    component summaries. A study's own winner matches its complete compact
+    payload. A promotion-adopted suite baseline matches the recorded source
+    phase and trial-derived payload (trial, metric, parameters, effective
+    overrides, constraints, gates, generation, and attempt), while its
+    completion/source/promotion metadata may legitimately describe the
+    candidate slot that exposes the clone. Runs pre-commit (before the suite
     last-success pointer advances) and read-side (before a pointer target is
     trusted).
 
@@ -946,22 +949,43 @@ def _validate_suite_summary_integrity(
     if not isinstance(records, list):
         raise _fail("summary has no study records")
 
-    def _winner_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
-        """Return the identity tuple used to anchor one exposed winner.
+    evidence_fields = (
+        "trial_number",
+        "metric",
+        "params",
+        "effective_overrides",
+        "constraints",
+        "gates",
+        "generation_id",
+        "attempt_id",
+    )
+    full_fields = (*evidence_fields, "completion", "winner_source", "promotion")
+
+    def _winner_key(
+        item: Mapping[str, Any],
+        *,
+        phase_name: str,
+        include_exposure_metadata: bool,
+    ) -> tuple[str, str]:
+        """Return a type-aware canonical key for one component winner.
 
         :param Mapping[str, Any] item: One summary phase-winner entry.
-        :return tuple[Any, ...]: Name, trial number, metric value, and the
-            winner's generation/attempt identity.
+        :param str phase_name: Source component phase that produced the winner.
+        :param bool include_exposure_metadata: Include completion, source, and
+            promotion fields when the suite exposes its own component winner.
+        :raises RuntimeError: If the winner payload cannot be represented as safe YAML.
+        :return tuple[str, str]: Source phase plus canonical winner payload.
         """
-        return (
-            item.get("name"),
-            item.get("trial_number"),
-            item.get("metric"),
-            item.get("generation_id"),
-            item.get("attempt_id"),
-        )
+        fields = full_fields if include_exposure_metadata else evidence_fields
+        payload = {field: item[field] for field in fields if field in item}
+        try:
+            encoded = yaml.safe_dump(payload, sort_keys=True)
+        except yaml.YAMLError as exc:
+            raise _fail("summary contains an invalid winner payload") from exc
+        return phase_name, encoded
 
-    component_winners: set[tuple[Any, ...]] = set()
+    component_full_winners: set[tuple[str, str]] = set()
+    component_evidence_winners: set[tuple[str, str]] = set()
     legacy_component_studies: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping) or not isinstance(record.get("name"), str):
@@ -1013,8 +1037,15 @@ def _validate_suite_summary_integrity(
         if not isinstance(phases, list):
             raise _fail(f"study {name!r} component summary has no phase list")
         for item in phases:
-            if isinstance(item, Mapping):
-                component_winners.add(_winner_key(item))
+            if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+                raise _fail(f"study {name!r} component summary has a malformed phase entry")
+            phase_name = str(item["name"])
+            component_full_winners.add(
+                _winner_key(item, phase_name=phase_name, include_exposure_metadata=True)
+            )
+            component_evidence_winners.add(
+                _winner_key(item, phase_name=phase_name, include_exposure_metadata=False)
+            )
 
     for record in records:
         name = str(record["name"])
@@ -1028,7 +1059,40 @@ def _validate_suite_summary_integrity(
                 raise _fail(f"study {name!r} has a malformed phase entry")
             if item.get("exposed") is not True:
                 continue
-            if _winner_key(item) not in component_winners:
+            source = item.get("winner_source")
+            if isinstance(source, Mapping) and source.get("kind") == "suite_baseline":
+                source_phase = source.get("phase")
+                if not isinstance(source_phase, str) or not source_phase:
+                    raise _fail(
+                        f"study {name!r} exposed winner for phase {item['name']!r} "
+                        "has no baseline source phase"
+                    )
+                for identity_field in (
+                    "trial_number",
+                    "generation_id",
+                    "attempt_id",
+                ):
+                    if type(source.get(identity_field)) is not type(
+                        item.get(identity_field)
+                    ) or source.get(identity_field) != item.get(identity_field):
+                        raise _fail(
+                            f"study {name!r} exposed winner for phase {item['name']!r} "
+                            "does not match its baseline source identity"
+                        )
+                key = _winner_key(
+                    item,
+                    phase_name=source_phase,
+                    include_exposure_metadata=False,
+                )
+                anchored = key in component_evidence_winners
+            else:
+                key = _winner_key(
+                    item,
+                    phase_name=str(item["name"]),
+                    include_exposure_metadata=True,
+                )
+                anchored = key in component_full_winners
+            if not anchored:
                 raise _fail(
                     f"study {name!r} exposed winner for phase {item['name']!r} does "
                     "not match any verified component summary"
