@@ -127,3 +127,43 @@ def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
         wrapper._evaluate_final_checkpoint(tmp_path, tmp_path)
 
     assert observed == [0]
+
+
+def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) -> None:
+    """A zero-batch evaluation cannot publish a data-free validation objective."""
+    wrapper = _load_wrapper()
+
+    class FakeModel:
+        def to(self, _device):
+            return self
+
+        def load_state_dict(self, _state):
+            return None
+
+        def eval(self):
+            return None
+
+    fake_torch = SimpleNamespace(
+        load=lambda *_args, **_kwargs: {
+            "config": {
+                "batch_size": 1,
+                "data_path": "data.bin",
+                "seq_len": 8,
+                "val_batches": 0,
+            },
+            "model": {},
+        },
+    )
+    fake_trainer = SimpleNamespace(
+        torch=fake_torch,
+        get_optimal_device=lambda: ("cpu", "cpu", None),
+        Llama=lambda **_kwargs: FakeModel(),
+        load_data=lambda _path: (b"train", b"validation"),
+        SequenceDataset=lambda *_args: object(),
+        DataLoader=lambda *_args, **_kwargs: object(),
+        cycle=lambda _loader: iter(()),
+    )
+    monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
+
+    with pytest.raises(ValueError, match="evaluated no validation tokens"):
+        wrapper._evaluate_final_checkpoint(tmp_path, tmp_path)
