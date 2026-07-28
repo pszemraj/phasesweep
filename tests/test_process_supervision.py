@@ -521,6 +521,41 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
         process._unregister(pgid)
 
 
+def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close interruption must propagate without a second close masking it."""
+    import phasesweep.runtime.process as process
+
+    class InjectedClose(RuntimeError):
+        """Interrupt the first parent-side pipe close after the descriptor closes."""
+
+    fake_proc = object()
+    real_close = os.close
+    fired = False
+
+    def close_then_fail(fd: int) -> None:
+        nonlocal fired
+        real_close(fd)
+        if not fired:
+            fired = True
+            raise InjectedClose
+
+    monkeypatch.setattr(process.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
+    monkeypatch.setattr(process, "_abort_launch", lambda proc, pgid: True)
+    monkeypatch.setattr(process.os, "close", close_then_fail)
+
+    with (
+        (tmp_path / "out.log").open("w") as fout,
+        (tmp_path / "err.log").open("w") as ferr,
+        pytest.raises(InjectedClose),
+    ):
+        process._spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+
+    assert fired
+
+
 def test_supervisor_main_exits_without_exec_on_ack_pipe_eof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

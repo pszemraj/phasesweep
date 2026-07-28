@@ -95,7 +95,8 @@ _active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
 # _spawn_blocked_supervisor's except-block runs _kill_group while this lock is
 # still held (run_supervised's caller holds it across the whole spawn), that
 # one failing launch can delay the shutdown handler's snapshot — and thus
-# global shutdown response — by up to ~17s worst case (see _kill_group).
+# global shutdown response — by up to ~27s worst case: 10s awaiting supervisor
+# readiness plus ~17s in _kill_group.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
@@ -737,11 +738,13 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     Worst case this blocks for roughly ``_KILL_GRACE_SECONDS`` (10s) SIGTERM
     grace + ~2s SIGKILL confirm inside :func:`_terminate_process_group`, plus
     ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS`` (5s) for the direct-child reap
-    above — up to ~17s total. One caller, ``_spawn_blocked_supervisor``'s
-    except-block, invokes this while ``run_supervised`` still holds
-    ``_launch_lock`` with shutdown signals deferred, so that path can delay
-    the global shutdown handler by the same amount (see the ``_launch_lock``
-    comment block).
+    above — up to ~17s total. Before one caller,
+    ``_spawn_blocked_supervisor``'s except-block, reaches this cleanup it can
+    spend up to ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` (10s) awaiting
+    readiness. Because ``run_supervised`` still holds ``_launch_lock`` with
+    shutdown signals deferred throughout, that combined path can delay the
+    global shutdown handler by up to ~27s (see the ``_launch_lock`` comment
+    block).
 
     Args:
         pgid: Process-group ID of the trial subprocess.
@@ -1206,10 +1209,12 @@ def _spawn_blocked_supervisor(
             start_new_session=True,
             pass_fds=(ready_write, ack_read),
         )
-        os.close(ready_write)
+        closed_fd = ready_write
         ready_write = -1
-        os.close(ack_read)
+        os.close(closed_fd)
+        closed_fd = ack_read
         ack_read = -1
+        os.close(closed_fd)
 
         pgid = _register(proc)
         ready_timeout = _SUPERVISOR_READY_TIMEOUT_SECONDS
@@ -1229,13 +1234,15 @@ def _spawn_blocked_supervisor(
         # Written by phasesweep.runtime.supervisor.main's os.write(ready_fd, b"R").
         if not readable or os.read(ready_read, 1) != b"R":
             raise RuntimeError("trial supervisor did not become ready before launch")
-        os.close(ready_read)
+        closed_fd = ready_read
         ready_read = -1
+        os.close(closed_fd)
         return proc, pgid, ack_write
     except Exception as exc:
         if ack_write >= 0:
-            os.close(ack_write)
+            closed_fd = ack_write
             ack_write = -1
+            os.close(closed_fd)
         if proc is not None:
             confirmed = _abort_launch(proc, pgid)
             if isinstance(exc, _LaunchDeadlineExpired):
@@ -1270,11 +1277,11 @@ def run_supervised(
     before delivering that payload, pipe EOF makes the supervisor exit
     without starting training.
 
-    The identity record is removed only on a fully clean exit: root returned 0
-    **and** no descendant processes were left alive. If the root exits cleanly
+    The identity record is always retained. On a fully clean exit — root
+    returned 0 and no descendant processes were left alive — the attempt
+    lifecycle is durably advanced to ``exited``. If the root exits cleanly
     but leaves GPU-holding descendants running, we treat that as a lifecycle
-    failure, kill the group, and preserve the identity record for forensics (review
-    v0.5.5 / blocker 1).
+    failure and kill the group (review v0.5.5 / blocker 1).
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 

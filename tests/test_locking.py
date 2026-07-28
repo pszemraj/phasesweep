@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import threading
 from pathlib import Path
@@ -351,6 +352,136 @@ def test_private_atomic_write_keeps_opened_parent_during_path_swap(
 
     assert (moved / "status.json").read_text() == "inside"
     assert outside_status.read_text() == "outside"
+
+
+def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown after the stream is created must leave one descriptor owner."""
+
+    class InjectedShutdown(BaseException):
+        """Stand in for ``PhaseSweepShutdown`` at the fd-to-stream boundary."""
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    real_new_temp = runtime_files._new_private_temp_fd
+    real_fdopen = os.fdopen
+    real_close = os.close
+    temporary_fd: int | None = None
+    temporary_close_count = 0
+
+    def capture_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
+        nonlocal temporary_fd
+        temporary_fd, temporary = real_new_temp(parent_fd, leaf)
+        return temporary_fd, temporary
+
+    def shutdown_after_wrap(fd: int, *args: object, **kwargs: object) -> None:
+        stream = real_fdopen(fd, *args, **kwargs)
+        assert not stream.closed
+        raise InjectedShutdown
+
+    def count_temp_close(fd: int) -> None:
+        nonlocal temporary_close_count
+        if fd == temporary_fd:
+            temporary_close_count += 1
+        real_close(fd)
+
+    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", capture_temp_fd)
+    monkeypatch.setattr(os, "fdopen", shutdown_after_wrap)
+    monkeypatch.setattr(os, "close", count_temp_close)
+
+    with pytest.raises(InjectedShutdown):
+        runtime_files.private_atomic_write_text(state / "status.json", "replacement")
+
+    assert temporary_close_count == 1
+    assert list(state.iterdir()) == []
+
+
+def test_open_lock_file_closes_descriptor_on_shutdown_during_fdopen_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred shutdown aborting fd handoff must close the returned stream."""
+    from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
+
+    lock_root = tmp_path / "locks"
+    lock_root.mkdir(mode=0o700)
+    lock_root.chmod(0o700)
+    opened_fd: int | None = None
+    real_fdopen = os.fdopen
+
+    def shutdown_during_wrap(fd: int, *args: object, **kwargs: object) -> object:
+        nonlocal opened_fd
+        opened_fd = fd
+        _shutdown_handler(signal.SIGTERM, None)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", shutdown_during_wrap)
+
+    with pytest.raises(PhaseSweepShutdown):
+        runtime_files.open_lock_file(lock_root / "run.lock")
+
+    assert opened_fd is not None
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened_fd)
+
+
+def test_open_private_text_closes_descriptor_on_shutdown_during_fdopen_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred shutdown aborting fd handoff must close the returned stream."""
+    from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    path = state / "status.json"
+    opened_fd: int | None = None
+    real_fdopen = os.fdopen
+
+    def shutdown_during_wrap(fd: int, *args: object, **kwargs: object) -> object:
+        nonlocal opened_fd
+        opened_fd = fd
+        _shutdown_handler(signal.SIGTERM, None)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", shutdown_during_wrap)
+
+    with pytest.raises(PhaseSweepShutdown):
+        runtime_files.open_private_text(path)
+
+    assert opened_fd is not None
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened_fd)
+
+
+def test_private_atomic_write_logs_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A committed private write reports lost crash durability without failing."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    path = state / "status.json"
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    caplog.set_level("WARNING", logger="phasesweep.runtime.files")
+
+    runtime_files.private_atomic_write_text(path, "committed")
+
+    assert path.read_text() == "committed"
+    assert "Directory fsync failed after a private atomic write" in caplog.text
 
 
 def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(

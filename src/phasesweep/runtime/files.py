@@ -202,6 +202,14 @@ def open_lock_file(path: Path) -> IO[str]:
         parent directory is missing or unsafe, the leaf name is unsafe, or
         the file fails the regular-file/ownership/mode checks.
     """
+    from phasesweep.runtime.process import defer_shutdown_signals
+
+    with defer_shutdown_signals():
+        return _open_lock_file(path)
+
+
+def _open_lock_file(path: Path) -> IO[str]:
+    """Open and validate a lock file while shutdown is deferred."""
     require_posix_runtime()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -603,8 +611,16 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     :raises ValueError: If ``mode`` is unsupported.
     :raises UnsafePrivatePathError: If the file or its parent path is unsafe.
     """
+    from phasesweep.runtime.process import defer_shutdown_signals
+
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
+    with defer_shutdown_signals():
+        return _open_private_text(path, mode)
+
+
+def _open_private_text(path: Path, mode: str) -> IO[str]:
+    """Open and validate a private text file while shutdown is deferred."""
     parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
     leaf = leaf_name(path)
     flags = os.O_WRONLY | os.O_CLOEXEC | nofollow_flag()
@@ -719,8 +735,10 @@ def _private_atomic_writer(
     replaced = False
     try:
         fd, temporary = _new_private_temp_fd(parent_fd, leaf)
-        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
-        fd = -1
+        # Keep the raw descriptor as the sole owner until the outer ``finally``.
+        # A shutdown between wrapping it and invalidating ``fd`` would otherwise
+        # leave both the stream and cleanup path closing the same descriptor.
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline, closefd=False)
         with stream as handle:
             yield handle
             handle.flush()
@@ -728,8 +746,15 @@ def _private_atomic_writer(
         _validate_private_destination(parent_fd, leaf, path)
         os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         replaced = True
-        with contextlib.suppress(OSError):
+        try:
             os.fsync(parent_fd)
+        except OSError:
+            log.warning(
+                "Directory fsync failed after a private atomic write in %s; the write is "
+                "committed but its durability across a crash is uncertain.",
+                path.parent,
+                exc_info=True,
+            )
     finally:
         if fd >= 0:
             os.close(fd)
