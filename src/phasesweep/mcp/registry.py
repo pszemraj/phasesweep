@@ -415,7 +415,7 @@ def _claim_catalog_entry_identity(
     :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
     :raises CatalogError: If another catalog id already governs either namespace.
     """
-    namespace = str(_experiment_dir(loaded.experiment))
+    namespace = str(_experiment_dir(loaded.experiment).resolve())
     other = namespace_owners.get(namespace)
     if other is not None:
         raise CatalogError(

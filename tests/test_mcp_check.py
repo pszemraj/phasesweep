@@ -152,6 +152,31 @@ def test_check_catalog_matches_server_cross_entry_identity_rejections(
         Registry.load(catalog)
 
 
+def test_check_catalog_resolves_symlinked_output_namespaces(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "real").mkdir()
+    (runs / "alias").symlink_to(runs / "real")
+    real = mcp_experiment_config_text(tmp_path, name="real").replace(
+        f"workdir: {tmp_path}/runs/real",
+        f"workdir: {runs}",
+    )
+    alias = mcp_experiment_config_text(tmp_path, name="alias").replace(
+        f"workdir: {tmp_path}/runs/alias",
+        f"workdir: {runs}",
+    )
+    catalog = write_mcp_config_catalog(tmp_path, {"first": real, "second": alias})
+
+    report = check_catalog(catalog)
+
+    assert not report.ok
+    assert report.entries[0].ok
+    assert "same experiment output namespace" in (report.entries[1].error or "")
+    assert not (tmp_path / "state").exists()
+    with pytest.raises(CatalogError, match="same experiment output namespace"):
+        Registry.load(catalog)
+
+
 def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
     catalog = tmp_path / "catalog.yaml"
     catalog.write_text("experiments: []\n")
