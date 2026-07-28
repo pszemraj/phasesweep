@@ -23,7 +23,7 @@ Or from a local checkout:
 python -m pip install -e ".[mcp]"
 ```
 
-Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable). The generated entry remains bound to this Python environment; see [Troubleshooting](#troubleshooting) if it moves.
+Client configs want the executable path absolute, because clients launch servers outside your shell environment. `phasesweep mcp install` (step 3) resolves it for you, so you only need the path for manual setup - in that case, find it now (`phasesweep-mcp` and `phasesweep mcp serve` start the same server; client configs use the dedicated executable).
 
 ```bash
 which phasesweep-mcp
@@ -141,7 +141,7 @@ If step 3 ran with instructions enabled, the client already received the [agent 
 
 ## Troubleshooting
 
-- The client cannot find `phasesweep-mcp`: run `phasesweep mcp check-install` to confirm which configured executable is missing without guessing. A default-mode entry points to the Python environment that ran the installer; if that environment moved, was deleted, or was recreated, install the MCP extra in its replacement, rerun the same `phasesweep mcp install` command (`--dry-run` previews the repair), and restart the client, or switch that agent to `phasesweep mcp install --launcher uvx` so future environment churn doesn't break it again. For a manual config, update `command` to the new absolute path from `which phasesweep-mcp`. A uvx-mode entry instead needs `uvx` on the launching `PATH`; install [uv](https://docs.astral.sh/uv/) and restart the client.
+- The client cannot find `phasesweep-mcp`: run `phasesweep mcp check-install`, repair the reported launcher, rerun `phasesweep mcp install` (`--dry-run` previews the edit), and restart the client. For a manual config, update `command` to the new absolute path from `which phasesweep-mcp`. The default and uvx launcher requirements are covered under [Connect your client](#3-connect-your-client).
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: set the corresponding `allow` flag to `true` on that catalog entry and restart the MCP client.
 - `concurrency limit reached`: the refusal names up to five blocking run IDs. Await one directly and retry the refused launch after it becomes terminal, ask the user before cancelling it, or raise `max_concurrent_runs` on hosts that can safely run multiple sweeps.
 - `terminal result snapshot ... unavailable`: follow [run state and recovery](mcp.md#run-state-and-recovery); historical results are never rebuilt from mutable experiment state.
