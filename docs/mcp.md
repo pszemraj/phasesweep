@@ -53,7 +53,7 @@ MCP annotations mirror the effects in the table. Permissions, closed input schem
 
 ### Run state and recovery
 
-A launched sweep runs as a detached background process in its own session, so it survives the agent's tool call and a server restart and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `phasesweep_await_run` waits without preventing cancellation or other MCP calls. The packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md#workflow) define the call sequence. `from_phase` resumes from a phase whose earlier winners already exist on disk; the server checks resume-readiness before launching.
+A launched sweep runs as a detached background process in its own session, so it survives the agent's tool call and a server restart and can be cancelled as a group. `phasesweep_get_status` reports `running` / `succeeded` / `failed` / `cancelled`. `phasesweep_await_run` waits without preventing cancellation or other MCP calls. The packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md#workflow) define the call sequence. `from_phase` requires every preceding winner to be complete and fingerprint-compatible with the current phase chain; `phasesweep_launch_sweep` performs that authoritative readiness check before spawning.
 
 `cleanup_confirmed` on `phasesweep_cancel_sweep` is tri-state:
 
