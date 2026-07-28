@@ -132,7 +132,7 @@
 # Set true only to permit timeout_seconds_per_trial: null. It has no effect while a finite trial timeout is configured.
 
 # timeout_seconds_per_phase: float | None = null (>= 0 and finite when set)
-# Per-invocation wallclock budget for this phase's GPU waits and trainer work. It is not a hard deadline for post-process extraction/gates; W&B polling can finish after it under its own timeout.
+# Per-invocation wallclock budget for this phase's GPU waits, supervisor/trainer work, metric and constraint extraction, and evidence gates. Enforcement is cooperative at stage boundaries, so one blocking local stage or process-cleanup grace may finish after the deadline, but evidence completed late is rejected; W&B polling is capped to the remaining budget.
 # This run-control field is excluded from the semantic fingerprint.
 
 # allow_incomplete_on_timeout: bool = false
@@ -153,7 +153,7 @@
 # Compares this phase's candidate winner with a prior exposed phase winner before exposing it downstream. Promotion keys and outcomes are defined below.
 
 # timeout_seconds_per_run: float | None = null (>= 0 and finite when set)
-# Per-invocation experiment budget shared across phases. It caps remaining GPU waits/trainer work, but post-process extraction and W&B polling can carry the invocation past the deadline.
+# Per-invocation experiment budget shared across phases. Like the phase budget, it covers GPU waits, supervisor/trainer work, extraction, and gates; enforcement is cooperative at stage boundaries, and W&B polling is capped to the remaining budget.
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
