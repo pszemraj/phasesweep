@@ -1253,6 +1253,44 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
     assert not (outside / "mcp.json").exists()
 
 
+def test_installer_reuses_containment_resolution_across_symlink_swap(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    config_parent = project / ".cursor"
+    config_parent.mkdir()
+    (config_parent / "mcp.json").write_text("{}\n")
+    original_parent = project / ".cursor-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_config = outside / "mcp.json"
+    original = '{"outside": true}\n'
+    outside_config.write_text(original)
+    target_path = config_parent / "mcp.json"
+    real_resolve = Path.resolve
+    swapped = False
+
+    def swap_after_resolve(path, *args, **kwargs):
+        nonlocal swapped
+        resolved = real_resolve(path, *args, **kwargs)
+        if path == target_path and not swapped:
+            swapped = True
+            config_parent.rename(original_parent)
+            config_parent.symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", swap_after_resolve)
+
+    code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
+
+    assert code == 1
+    assert swapped
+    assert "error" in capsys.readouterr().out
+    assert outside_config.read_text() == original
+
+
 def test_installer_refuses_project_parent_symlink_swap(fake_home, tmp_path, capsys, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()

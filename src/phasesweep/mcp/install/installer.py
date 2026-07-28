@@ -169,18 +169,19 @@ def resolve_uvx_launcher() -> tuple[str, list[str]]:
     return "uvx", ["--from", f"{PACKAGE_NAME}[mcp]=={version}", "phasesweep-mcp"]
 
 
-def _project_path_is_contained(path: Path, project: Path) -> bool:
-    """Return whether resolving ``path`` stays beneath the project root.
+def _resolved_project_path(path: Path, project: Path) -> Path | None:
+    """Resolve ``path`` once when it stays beneath the project root.
 
     :param Path path: Candidate path to resolve.
     :param Path project: Existing project root that must contain the candidate.
-    :return bool: True when the resolved candidate is the project root or one of its descendants.
+    :return Path | None: Resolved candidate, or ``None`` when resolution or containment fails.
     """
     try:
-        path.resolve(strict=False).relative_to(project.resolve(strict=True))
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(project.resolve(strict=True))
     except (OSError, RuntimeError, ValueError):
-        return False
-    return True
+        return None
+    return resolved
 
 
 def _toml_mcp_entry(parsed: dict[str, object]) -> object | None:
@@ -388,24 +389,26 @@ def _apply_mcp(
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
-    if spec.scope == "project" and not _project_path_is_contained(spec.path, project):
-        return StepResult(
-            "mcp",
-            spec.path,
-            "error",
-            note="refusing project config path that resolves outside the project",
-        )
-    # Pin the physical target once. Project paths have already passed the
-    # containment check; user config symlinks are operator-owned dotfile state.
-    try:
-        edit_path = spec.path.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return StepResult(
-            "mcp",
-            spec.path,
-            "error",
-            note="config path could not be resolved",
-        )
+    if spec.scope == "project":
+        edit_path = _resolved_project_path(spec.path, project)
+        if edit_path is None:
+            return StepResult(
+                "mcp",
+                spec.path,
+                "error",
+                note="refusing project config path that resolves outside the project",
+            )
+    else:
+        # User config symlinks are operator-owned dotfile state.
+        try:
+            edit_path = spec.path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return StepResult(
+                "mcp",
+                spec.path,
+                "error",
+                note="config path could not be resolved",
+            )
     if spec.format == "toml":
         if edit_path.exists() and not edit_path.is_file():
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
@@ -553,21 +556,13 @@ def _apply_instructions(
     path = target.instructions_path
     if path is None:
         return StepResult("instructions", None, None)
-    if not _project_path_is_contained(path, project):
+    edit_path = _resolved_project_path(path, project)
+    if edit_path is None:
         return StepResult(
             "instructions",
             path,
             "error",
             note="refusing instructions path that resolves outside the project",
-        )
-    try:
-        edit_path = path.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return StepResult(
-            "instructions",
-            path,
-            "error",
-            note="instructions path could not be resolved",
         )
     valid_owner_ids: set[str] = set()
     for candidate_target in agent_targets(project):
