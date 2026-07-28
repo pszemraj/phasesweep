@@ -883,7 +883,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
 
 
 def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
-    """Skipped winners need matching fingerprints and scoped provenance."""
+    """Legacy skipped winners still need matching fingerprints and provenance."""
 
     def strip_fingerprint(data: dict) -> str:
         del data["phase_fingerprint"]
@@ -919,7 +919,16 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
         exp = _two_phase_experiment(workdir=case_dir / "runs", trainer=trainer)
         run_experiment(exp)
 
+        generation_id = _last_successful_generation_id(exp)
+        assert generation_id is not None
+        summary_path = _generation_summary_path(exp, generation_id)
+        summary = yaml.safe_load(summary_path.read_text())
+        for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
+            summary.pop(key, None)
+        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
         arch_winner_path = _published_winner_path(exp, "arch")
+        assert arch_winner_path is not None
         data = yaml.safe_load(arch_winner_path.read_text())
         match = mutate(data)
         arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
@@ -928,6 +937,27 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
 
         with pytest.raises(RuntimeError, match=match):
             run_experiment(exp, from_phase="lr")
+
+
+def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) -> None:
+    """Resume names the corrupt artifact instead of claiming no run completed."""
+    trainer = write_constant_trainer(tmp_path)
+    exp = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
+    run_experiment(exp)
+
+    arch_winner_path = _published_winner_path(exp, "arch")
+    assert arch_winner_path is not None
+    data = yaml.safe_load(arch_winner_path.read_text())
+    data["phase_fingerprint"] = "0" * 64
+    arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    shutil.rmtree(_phase_dir(exp, "lr"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="manifest validation failed: winner artifact for phase 'arch' "
+        "does not match its recorded hash",
+    ):
+        run_experiment(exp, from_phase="lr")
 
 
 def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:

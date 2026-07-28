@@ -374,9 +374,7 @@ def _validate_generation_manifest(
     hashes to the recorded content, parses, and cross-checks against the
     summary's own winner facts — and the namespace holds nothing the
     manifest does not list. Runs both pre-commit (before the last-success
-    pointer may advance) and read-side (before a pointer target is trusted),
-    with results cached per immutable generation via
-    :func:`_generation_manifest_is_valid`.
+    pointer may advance) and on every read before a pointer target is trusted.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
@@ -597,7 +595,11 @@ def _read_pointer_target_summary(
     return None
 
 
-def _last_successful_generation_id(experiment: Experiment) -> str | None:
+def _last_successful_generation_id(
+    experiment: Experiment,
+    *,
+    raise_on_manifest_error: bool = False,
+) -> str | None:
     """Read and validate the last-success pointer, failing closed on mismatch.
 
     The pointer is authoritative only when its target's own immutable summary
@@ -619,6 +621,9 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     keep the identity-only gate.
 
     :param Experiment experiment: Experiment config with artifact root details.
+    :param bool raise_on_manifest_error: Re-raise a versioned publication's
+        manifest error for an actionable resume failure instead of returning
+        ``None`` as read-only status APIs require.
     :return str | None: The last-successful generation id, or ``None`` if the
         pointer or its target summary is missing, unreadable, malformed,
         unsafely named, owned by another experiment, or fails manifest
@@ -641,15 +646,15 @@ def _last_successful_generation_id(experiment: Experiment) -> str | None:
     )
     if summary is None:
         return None
-    if "schema_version" in summary and not _generation_manifest_is_valid(
-        _generation_dir(experiment, generation_id),
-        generation_id,
-        summary,
-    ):
-        # A versioned summary must validate its complete artifact manifest
-        # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
-        # the identity-only gate above; see docs/config.md's upgrade notes.
-        return None
+    if "schema_version" in summary:
+        generation_dir = _generation_dir(experiment, generation_id)
+        if raise_on_manifest_error:
+            _validate_generation_manifest(generation_dir, generation_id, summary)
+        elif not _generation_manifest_is_valid(generation_dir, generation_id, summary):
+            # A versioned summary must validate its complete artifact manifest
+            # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
+            # the identity-only gate above; see docs/config.md's upgrade notes.
+            return None
     return generation_id
 
 
@@ -1364,7 +1369,11 @@ def _load_winner(
             fingerprint disagrees with the freshly computed one.
 
     """
-    path = _published_winner_path(experiment, phase.name)
+    published_generation_id = _last_successful_generation_id(
+        experiment,
+        raise_on_manifest_error=True,
+    )
+    path = _published_winner_path_for(experiment, published_generation_id, phase.name)
     if path is None:
         raise FileNotFoundError(
             f"Winner file missing for phase {phase.name!r}: no generation has completed."
