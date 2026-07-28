@@ -482,17 +482,23 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
-def test_successful_terminal_snapshot_freezes_unavailable_trial_data_flags(
+@pytest.mark.parametrize("storage_kind", ["none", "missing-sqlite"])
+def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_kind: str,
 ) -> None:
-    """Unreadable trial storage degrades the frozen counts, never the capture.
+    """Unavailable trial storage freezes explicit flags without a redundant study read."""
+    storage = None if storage_kind == "none" else f"sqlite:///{tmp_path / 'missing' / 'studies.db'}"
+    experiment = make_experiment(workdir=tmp_path / "runs", storage=storage, n_trials=1)
 
-    The old ``require_trial_data`` gate let a transient post-publication
-    storage read invert an engine-defined success into a failed snapshot
-    (review v0.5.16 / blocker 2); the snapshot now freezes the truthful
-    per-phase ``trial_data_available: false`` flags instead.
-    """
-    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    def fail_redundant_read(*args: object, **kwargs: object) -> None:
+        raise OSError("storage remains unavailable")
+
+    monkeypatch.setattr(
+        "phasesweep.mcp.snapshots._load_existing_phase_study",
+        fail_redundant_read,
+    )
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
@@ -624,31 +630,6 @@ phases:
     handle = store.get(run_id)
     assert handle is not None
     assert store.state(handle) == "succeeded"
-
-
-def test_failure_snapshot_does_not_reread_unavailable_trial_storage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'missing' / 'studies.db'}",
-        n_trials=1,
-    )
-
-    def fail_redundant_read(*args: object, **kwargs: object) -> None:
-        raise OSError("storage remains unavailable")
-
-    monkeypatch.setattr(
-        "phasesweep.mcp.snapshots._load_existing_phase_study",
-        fail_redundant_read,
-    )
-
-    snapshot = mcp_runner.capture_result_snapshot(experiment)
-
-    phase = snapshot["status"]["phases"][0]
-    assert phase["trial_data_available"] is False
-    assert phase["running_attempts"] == []
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
