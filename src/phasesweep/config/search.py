@@ -176,18 +176,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                 f"categorical parameters: {cats}. Use sampler.type='tpe' or "
                 f"remove the categorical params from this phase."
             )
-        # Optional dependency check at config-load (review v0.5.6 / non-blocking
-        # hardening item). Without this, the import error fires from
-        # ``_build_sampler`` mid-run, *after* ``phasesweep validate`` already
-        # said the config is fine.
-        try:
-            import cmaes  # type: ignore[import-untyped]  # noqa: F401
-        except ImportError as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: sampler.type='cmaes' requires the "
-                "'cmaes' package, which is not installed. Reinstall phasesweep "
-                "or install it directly with `pip install cmaes`."
-            ) from exc
 
     if sampler_type == "grid":
         cardinality = math.prod(
