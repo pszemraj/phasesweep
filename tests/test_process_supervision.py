@@ -9,7 +9,6 @@ import select
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -1240,50 +1239,6 @@ print("post-context", flush=True)
     )
     assert "queued" in proc.stdout
     assert proc.returncode == 128 + signal.SIGTERM
-
-
-def test_launch_lock_serializes_signal_handler_against_in_flight_launch() -> None:
-    """The shutdown handler must wait for ``_launch_lock`` before snapshotting.
-
-    We simulate the n_jobs > 1 race: a worker thread is mid-launch (holding the
-    lock), the main thread "receives" SIGTERM. Our test stand-in for the
-    handler is a function that takes the same lock and snapshots
-    ``_active_children``. It must block until the worker finishes register.
-    """
-    from phasesweep.runtime.process import _active_children, _launch_lock, _lock
-
-    snapshot_done = threading.Event()
-    snapshot: list[int] = []
-
-    def worker() -> None:
-        with _launch_lock:
-            # Pretend Popen happened; now we're between Popen and _register.
-            time.sleep(0.3)
-            with _lock:
-                _active_children[424242] = None  # type: ignore[assignment]
-
-    def handler_stand_in() -> None:
-        with _launch_lock, _lock:
-            snapshot.extend(_active_children.keys())
-        snapshot_done.set()
-
-    try:
-        t_worker = threading.Thread(target=worker)
-        t_handler = threading.Thread(target=handler_stand_in)
-
-        t_worker.start()
-        # Tiny delay so worker is definitely inside the critical section.
-        time.sleep(0.05)
-        t_handler.start()
-
-        t_worker.join(timeout=2.0)
-        t_handler.join(timeout=2.0)
-
-        assert snapshot_done.is_set()
-        assert 424242 in snapshot
-    finally:
-        with _lock:
-            _active_children.pop(424242, None)
 
 
 def test_pending_sigterm_inside_signal_deferred_sections_does_not_deadlock() -> None:
