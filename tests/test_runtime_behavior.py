@@ -1106,6 +1106,60 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     assert states == ["COMPLETE", "FAIL", "FAIL"]
 
 
+def test_parallel_unexpected_objective_error_is_phase_fatal_and_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker bug cannot be swallowed by Optuna or published on retry."""
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")')
+    journal = tmp_path / "fatal.journal"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{journal}",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=2,
+        n_jobs=2,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        sampler={"type": "random", "seed": 7},
+    )
+    real_extract = extract_trial_result
+
+    def fail_second_extraction(**kwargs: object):
+        executed = kwargs["executed"]
+        if isinstance(executed, ExecutedTrial) and executed.ctx.trial_id == 1:
+            raise RuntimeError("injected objective implementation bug")
+        return real_extract(**kwargs)
+
+    monkeypatch.setattr(
+        "phasesweep.engine.phase.extract_trial_result",
+        fail_second_extraction,
+    )
+    with pytest.raises(RuntimeError, match="injected objective implementation bug"):
+        run_experiment(exp)
+
+    study = optuna.load_study(
+        study_name="t::p",
+        storage=_resolve_storage(f"journal:///{journal}"),
+    )
+    assert sorted(trial.state.name for trial in study.trials) == ["COMPLETE", "FAIL"]
+    fatal = next(
+        trial.user_attrs[TRIAL_OUTCOME_ATTR]
+        for trial in study.trials
+        if trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
+    )
+    assert fatal["cause"] == "RuntimeError: injected objective implementation bug"
+    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
+    assert not _last_successful_generation_path(exp).exists()
+
+    monkeypatch.setattr(
+        "phasesweep.engine.phase.extract_trial_result",
+        real_extract,
+    )
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
+
+
 def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     """A phase wallclock timeout must not bless the best partial trial by default."""
     exp = _sleeping_score_experiment(

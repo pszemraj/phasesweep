@@ -238,9 +238,8 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
-    Defines nested
-    closures ``objective``, ``abort_callback``, ``_record_hard_abort``, and
-    ``_raise_if_hard_aborted`` to encapsulate per-phase mutable state.
+    Defines nested objective, callback, and fatal-abort closures to encapsulate
+    per-phase mutable state.
 
     Args:
         experiment: Parsed experiment config.
@@ -364,56 +363,49 @@ def _run_phase(
     _consecutive_failures = policy_state.consecutive_failures
     _completion_sequence = policy_state.max_sequence
     recorded_outcomes: dict[int, str] = {}
-    # ``abort["flag"]`` is the soft-abort flag, set by max_consecutive_failures
-    # and (for defense in depth) by ``_record_hard_abort`` below. Queued
-    # objectives check it inside the GPU lease and prune before launching.
+    # ``abort["flag"]`` is shared by the consecutive-failure and fatal-error
+    # paths. Queued objectives check it inside the GPU lease and prune before
+    # launching.
     abort = {"flag": False}
     abort_recorded = {"flag": False}
 
-    # Hard-abort state for unsafe process cleanup. Optuna's threaded
-    # ``n_jobs>1`` optimize path does NOT propagate uncaught objective
-    # exceptions: it logs them and marks the trial FAIL (verified against
-    # optuna._optimize._run_trial in v0.5.11 review). Propagation only works
-    # for ``n_jobs=1``. We therefore record the unsafe-cleanup condition in
-    # orchestrator-owned state and re-raise after ``study.optimize()``
-    # returns. See review v0.5.11.
-    _hard_abort_lock = threading.Lock()
-    hard_abort: dict[str, str | None] = {"message": None}
+    # Optuna's threaded optimize path can log an uncaught objective exception,
+    # mark that one trial FAIL, and still return normally. Keep the first fatal
+    # exception in orchestrator-owned state so every n_jobs setting presents
+    # the same failure to the caller after workers drain.
+    _fatal_abort_lock = threading.Lock()
+    fatal_abort: dict[str, BaseException | None] = {"exception": None}
     deadline_exhausted = {"flag": False}
     csv_throttle = CsvSnapshotThrottle()
 
-    def _record_hard_abort(message: str) -> None:
-        """Record a safety-critical phase abort.
+    def _record_fatal_abort(error: BaseException) -> None:
+        """Record the first fatal objective exception and stop peer launches.
 
-        First-writer wins on ``hard_abort['message']``. Flips the soft
-        ``abort['flag']`` so queued objectives prune before launch, and asks
-        Optuna to stop scheduling new trials. ``study.stop`` is best-effort:
-        we do not want a storage hiccup to mask the safety-critical state.
-
-        The objective wrapper persists the fatal trial outcome and matching
-        abort record before Optuna commits the terminal state.
+        First-writer wins so the root failure is not replaced by secondary
+        peer-prune or persistence fallout. The original exception object keeps
+        its worker traceback for the post-optimize re-raise.
         """
-        with _hard_abort_lock:
-            first = hard_abort["message"] is None
+        with _fatal_abort_lock:
+            first = fatal_abort["exception"] is None
             if first:
-                hard_abort["message"] = message
+                fatal_abort["exception"] = error
         if first:
-            log.error("phase=%s HARD ABORT: %s", phase.name, message)
+            log.error(
+                "phase=%s FATAL OBJECTIVE ERROR (%s): %s",
+                phase.name,
+                type(error).__name__,
+                error,
+            )
         abort["flag"] = True
         with contextlib.suppress(Exception):
             study.stop()
 
-    def _raise_if_hard_aborted() -> None:
-        """Raise ``UnsafeProcessCleanupError`` if any peer recorded a hard abort.
-
-        Raises:
-            UnsafeProcessCleanupError: ``hard_abort['message']`` is set.
-
-        """
-        with _hard_abort_lock:
-            message = hard_abort["message"]
-        if message is not None:
-            raise UnsafeProcessCleanupError(message)
+    def _raise_if_fatal_aborted() -> None:
+        """Re-raise the first fatal worker exception with its original traceback."""
+        with _fatal_abort_lock:
+            error = fatal_abort["exception"]
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
 
     def _record_outcome(
         trial: optuna.Trial,
@@ -448,15 +440,14 @@ def _run_phase(
             try:
                 trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
             except Exception as exc:
-                abort["flag"] = True
-                with contextlib.suppress(Exception):
-                    study.stop()
-                raise _PolicyStateWriteError(
+                error = _PolicyStateWriteError(
                     f"Could not persist the terminal outcome for trial {trial.number} "
                     f"in study {study.study_name!r}. Refusing to continue because a "
                     "restart could otherwise omit this trial from "
                     "max_consecutive_failures."
-                ) from exc
+                )
+                _record_fatal_abort(error)
+                raise error from exc
 
             _completion_sequence = next_sequence
             recorded_outcomes[trial.number] = outcome
@@ -491,14 +482,14 @@ def _run_phase(
             try:
                 study.set_user_attr(PHASE_ABORT_ATTR, record)
             except Exception as exc:
-                with contextlib.suppress(Exception):
-                    study.stop()
-                raise _PolicyStateWriteError(
+                error = _PolicyStateWriteError(
                     f"Trial {trial.number} durably recorded completion sequence "
                     f"{_completion_sequence}, but the phase abort marker could not be "
                     "persisted. Refusing to continue; the durable outcome ledger will "
                     "reconstruct the abort on the next run."
-                ) from exc
+                )
+                _record_fatal_abort(error)
+                raise error from exc
             abort_recorded["flag"] = True
         log.error("phase=%s ABORTED: %s", phase.name, record["cause"])
         with contextlib.suppress(Exception):
@@ -525,11 +516,6 @@ def _run_phase(
         """
         assert generation_id is not None
 
-        # Hard abort takes priority. For n_jobs=1 this matches the old
-        # behavior of relying on exception propagation; for n_jobs>1 this
-        # is the only mechanism that surfaces unsafe cleanup, since Optuna
-        # swallows non-caught objective exceptions in threaded mode.
-        _raise_if_hard_aborted()
         if abort["flag"]:
             raise optuna.TrialPruned("phase aborted")
 
@@ -588,14 +574,13 @@ def _run_phase(
         try:
             with gpu_pool.acquire(deadline=optimize_deadline) as gpu_id:
                 # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
-                # extended in v0.5.11 for hard_abort). Without this, queued
+                # extended to fatal objective errors). Without this, queued
                 # objective threads that passed the outer check before a peer
                 # flipped the flag would still launch trials after the abort
                 # fires — defeating max_consecutive_failures whenever n_jobs
                 # exceeds the GPU-pool size, and defeating unsafe-cleanup abort
                 # whenever any sibling thread is between launch_trial() return
                 # and the cleanup_confirmed check.
-                _raise_if_hard_aborted()
                 if abort["flag"]:
                     raise optuna.TrialPruned("phase aborted")
 
@@ -630,7 +615,7 @@ def _run_phase(
                 # v0.5.11 / blocker 3). Releasing the lease before observing
                 # ``cleanup_confirmed=False`` lets a queued worker acquire the
                 # GPU and launch a new trial onto the still-leaked process
-                # group. ``_record_hard_abort`` flips the soft abort flag while
+                # group. ``_record_fatal_abort`` flips the shared abort flag while
                 # we still hold the lease, so the next thread to enter sees the
                 # flag and prunes before launch.
                 if not executed.process.cleanup_confirmed:
@@ -641,11 +626,12 @@ def _run_phase(
                         "Refusing to launch additional trials because a leaked "
                         "process group may still hold GPU/CPU resources."
                     )
-                    _record_hard_abort(message)
+                    cleanup_error = UnsafeProcessCleanupError(message)
+                    _record_fatal_abort(cleanup_error)
 
                     # Best-effort forensic attrs. A storage write failure here
-                    # must not mask the safety-critical state: ``hard_abort``
-                    # is already recorded and ``_raise_if_hard_aborted`` will
+                    # must not mask the safety-critical state: the fatal error
+                    # is already recorded and ``_raise_if_fatal_aborted`` will
                     # fire after ``study.optimize`` returns regardless.
                     with contextlib.suppress(Exception):
                         trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
@@ -655,7 +641,7 @@ def _run_phase(
                             or "process cleanup could not be confirmed",
                         )
 
-                    raise UnsafeProcessCleanupError(message)
+                    raise cleanup_error
         except TimeoutError as exc:
             deadline_exhausted["flag"] = True
             raise TrialExecutionError(str(exc)) from exc
@@ -726,7 +712,8 @@ def _run_phase(
         """Classify and durably order every terminal objective outcome."""
         try:
             return _execute_objective(trial)
-        except _PolicyStateWriteError:
+        except _PolicyStateWriteError as exc:
+            _record_fatal_abort(exc)
             raise
         except optuna.TrialPruned as exc:
             _record_outcome(trial, "pruned", cause=str(exc))
@@ -735,6 +722,7 @@ def _run_phase(
             _record_outcome(trial, "failure", cause=str(exc))
             raise
         except UnsafeProcessCleanupError as exc:
+            _record_fatal_abort(exc)
             _record_outcome(
                 trial,
                 "fatal",
@@ -743,6 +731,7 @@ def _run_phase(
             )
             raise
         except BaseException as exc:
+            _record_fatal_abort(exc)
             _record_outcome(
                 trial,
                 "fatal",
@@ -839,23 +828,17 @@ def _run_phase(
         )
     finally:
         # Always snapshot trials.csv, even if ``study.optimize`` raises
-        # (n_jobs=1 hard-abort path) or some other transient backend
+        # (n_jobs=1 fatal-objective path) or some other transient backend
         # error escapes. Forensic data must survive every exit path.
         # Best-effort: a write failure here must not mask the actual
         # exception from ``study.optimize``.
         with contextlib.suppress(Exception):
             _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
-    # Re-raise unsafe cleanup BEFORE the soft abort check. Optuna's threaded
-    # n_jobs>1 optimize path can swallow non-caught objective exceptions when
-    # ``n_trials == n_jobs`` and every trial fails (it logs them and marks
-    # the trial FAIL — verified against optuna 4.8.0 in v0.5.11 review). We
-    # cannot rely on exception propagation alone to surface this safety-
-    # critical condition; the orchestrator owns the abort state and re-raises
-    # here. For n_jobs=1 the original UnsafeProcessCleanupError already
-    # propagated out of study.optimize above; this re-raise is a no-op then.
-    # Review v0.5.11 / v0.5.12.
-    _raise_if_hard_aborted()
+    # Optuna's threaded path can absorb any uncaught objective exception after
+    # marking that trial FAIL. Re-raise the first one before timeout, soft
+    # abort, completeness, or winner-selection logic can relabel it.
+    _raise_if_fatal_aborted()
 
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
