@@ -33,7 +33,6 @@ from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
-    _generation_record_path,
     _generations_dir,
     _last_successful_generation_id,
     _summary_path,
@@ -457,9 +456,6 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
-    generation_path = _generation_record_path(experiment, "current-generation")
-    generation_path.parent.mkdir(parents=True)
-    generation_path.write_text("generation_id: current-generation\n")
 
     captured = mcp_runner.capture_result_snapshot(
         experiment,
