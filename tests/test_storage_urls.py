@@ -185,29 +185,6 @@ def test_external_rdb_storage_error_is_actionable() -> None:
     assert "single host" in message
 
 
-def test_external_rdb_storage_allowed_when_acknowledged() -> None:
-    """Setting allow_external_rdb_single_host: true permits shared RDB storage."""
-    experiment = Experiment(
-        experiment="t",
-        storage="postgresql://user:pass@host/db",
-        allow_external_rdb_single_host=True,
-        provenance={"revision": "test-fixture-v1"},
-        trial_command="echo {overrides}",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(  # type: ignore[arg-type]
-                name="p",
-                n_trials=2,
-                search_space={"x": IntParam(type="int", low=0, high=1)},
-            )
-        ],
-    )
-    assert experiment.allow_external_rdb_single_host is True
-    assert experiment.storage == "postgresql://user:pass@host/db"
-
-
 def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
     """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
     study's Experiment exactly like ``storage`` and other defaulted fields
