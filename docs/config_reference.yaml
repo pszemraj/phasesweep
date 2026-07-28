@@ -89,6 +89,7 @@
 
 # n_trials: int (required; >= 1)
 # Monotonic target number of terminal attempts in this phase's study; COMPLETE, FAIL, and PRUNED trials all count. Persistent random/grid reruns launch only the remaining top-up. Lowering an accepted target is rejected; use a new experiment name for a smaller study.
+# Once any direct or transitive descendant phase study that inherits this phase has run, increasing this phase's target is rejected before launch because the descendant is already bound to its published winner. This applies even if the added trials might leave the winner unchanged; use a new experiment name for a larger upstream budget.
 # For a full grid, set this to the grid cardinality; a smaller value requires allow_partial_grid: true.
 
 # n_jobs: int = 1 (>= 1)
