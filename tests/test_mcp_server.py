@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -10,6 +11,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -709,6 +711,20 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert terminal["error_class"] == "OSError"
     assert terminal["cleanup_confirmed"] is True
     assert terminal["result_snapshot_state"] == "failed"
+    assert terminal["failure"] == {
+        "code": "internal_error",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "Ask the operator to inspect the PhaseSweep server diagnostics before retrying."
+        ),
+    }
+    latest = app.latest_run("srv")
+    failure = latest["run"]["failure"]
+    assert failure["code"] == "result_snapshot_unavailable"
+    assert failure["cause"] == terminal["failure"]
+    assert app.status(run_id=handle.run_id)["run"]["failure"] == failure
 
 
 def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -> None:
@@ -1977,6 +1993,58 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
+def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-concurrent-cancel"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.create(handle)
+    barrier = threading.Barrier(2)
+    status_lock = threading.Lock()
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        barrier.wait(timeout=2.0)
+        with status_lock:
+            if not store.status_path(run_id).exists():
+                write_run_status(
+                    store,
+                    run_id,
+                    returncode=143,
+                    error_class="cancelled",
+                    cleanup_confirmed=True,
+                )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: app.cancel(run_id), range(2)))
+
+    assert results == [
+        {
+            "run_id": run_id,
+            "state": "cancelled",
+            "cleanup_confirmed": True,
+            "recovery_required": False,
+        },
+        {
+            "run_id": run_id,
+            "state": "cancelled",
+            "cleanup_confirmed": True,
+            "recovery_required": False,
+        },
+    ]
+    assert not store.cleanup_uncertain_path(run_id).exists()
+
+
 def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2036,8 +2104,10 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert terminal_status["cleanup_confirmed"] is True
     assert terminal_status["result_snapshot_state"] == "failed"
     assert terminal_status["result_snapshot_error"] == "HistoricalSnapshotUnavailable"
-    with pytest.raises(Exception, match="finalization state: failed"):
-        app.status(run_id=run_id)
+    unavailable = app.status(run_id=run_id)
+    assert unavailable["result_source"] == "terminal_snapshot_unavailable"
+    assert unavailable["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert unavailable["phases"][0]["trial_data_available"] is False
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
@@ -2220,8 +2290,10 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
-    with pytest.raises(Exception, match="finalization state: failed"):
-        app.status(run_id=run_id)
+    unavailable = app.status(run_id=run_id)
+    assert unavailable["result_source"] == "terminal_snapshot_unavailable"
+    assert unavailable["run"]["state"] == "succeeded"
+    assert unavailable["run"]["failure"]["code"] == "result_snapshot_unavailable"
 
 
 def test_read_tools_use_live_view_while_result_snapshot_is_pending(
@@ -2332,8 +2404,10 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
         result_snapshot_error="RuntimeError",
     )
 
-    with pytest.raises(Exception, match="finalization state: failed"):
-        app.status(run_id=run_id)
+    unavailable = app.status(run_id=run_id)
+    assert unavailable["result_source"] == "terminal_snapshot_unavailable"
+    assert unavailable["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert app.winners(run_id=run_id)["failure"]["code"] == "result_snapshot_unavailable"
 
     runner = CliRunner()
     preflight = runner.invoke(

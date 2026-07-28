@@ -402,14 +402,28 @@ def test_await_run_returns_when_run_fails_mid_wait(
     assert clock["now"] == pytest.approx(AWAIT_RECHECK_SECONDS)
 
 
-def test_terminal_run_read_refuses_mutable_fallback_without_snapshot(tmp_path: Path) -> None:
+def test_terminal_run_snapshot_failure_returns_structured_unavailable_results(
+    tmp_path: Path,
+) -> None:
     app, _registry, store = _app_with_run(tmp_path)
     write_run_status(store, "r1", returncode=0, error_class=None, cleanup_confirmed=True)
 
-    with pytest.raises(Exception, match="do not substitute experiment-level results"):
-        app.status(run_id="r1")
-    with pytest.raises(Exception, match="do not substitute experiment-level results"):
-        app.winners(run_id="r1")
+    status = app.status(run_id="r1")
+    winners = app.winners(run_id="r1")
+    awaited = asyncio.run(app.await_run("r1"))
+
+    assert status["result_source"] == "terminal_snapshot_unavailable"
+    assert status["run"]["state"] == "succeeded"
+    assert status["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert status["run"]["failure"]["actor"] == "operator"
+    assert status["phases"][0]["trial_data_available"] is False
+    assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["winner_count"] == 0
+    assert winners["failure"]["code"] == "result_snapshot_unavailable"
+    assert awaited["reason"] == "terminal"
+    assert awaited["changed"] is False
+    assert awaited["result_source"] == "terminal_snapshot_unavailable"
+    assert awaited["run"]["failure"]["code"] == "result_snapshot_unavailable"
 
 
 def test_await_run_unknown_run_id(tmp_path: Path) -> None:

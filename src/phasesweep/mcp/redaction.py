@@ -13,7 +13,11 @@ from typing import Any, Literal, TypeAlias
 from phasesweep.engine import PhaseWinnerView
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
-ResultSource: TypeAlias = Literal["current_shared_study", "frozen_run_snapshot"]
+ResultSource: TypeAlias = Literal[
+    "current_shared_study",
+    "frozen_run_snapshot",
+    "terminal_snapshot_unavailable",
+]
 
 _TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
 

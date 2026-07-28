@@ -4,6 +4,7 @@ storage URL, the workdir, or any env value.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,13 @@ from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
-from tests.mcp_helpers import assert_no_sensitive, write_mcp_catalog
+from phasesweep.mcp.snapshots import capture_result_snapshot
+from tests.mcp_helpers import (
+    assert_no_sensitive,
+    patch_popen_capture,
+    write_mcp_catalog,
+    write_run_status,
+)
 
 
 def _winners_payload(
@@ -33,7 +40,11 @@ def _winners_payload(
     )
 
 
-def _write_catalog(tmp_path: Path) -> Path:
+def _write_catalog(
+    tmp_path: Path,
+    *,
+    allow: dict[str, bool] | None = None,
+) -> Path:
     # A config whose dangerous fields contain unmistakable sentinels.
     config = tmp_path / "exp.yaml"
     config.write_text(
@@ -57,7 +68,7 @@ phases:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
     )
-    return write_mcp_catalog(tmp_path, {"redact_me": config})
+    return write_mcp_catalog(tmp_path, {"redact_me": config}, allow=allow)
 
 
 def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
@@ -101,6 +112,72 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         app.winners(experiment_id=reg.id),
     ]
     assert_no_sensitive(tool_results, sensitive)
+
+
+def test_run_workflow_payloads_never_leak_sensitive_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = Registry.load(
+        _write_catalog(
+            tmp_path,
+            allow={"launch": True, "cancel": True, "from_phase": True},
+        )
+    )
+    reg = registry.get("redact_me")
+    store = RunStore(registry.state_dir)
+    app = PhaseSweepMCP(registry, store)
+    patch_popen_capture(monkeypatch)
+    sensitive = [
+        reg.experiment.trial_command,
+        reg.experiment.storage,
+        *reg.experiment.env.values(),
+        str(reg.config_path),
+        "SECRET_WORKDIR",
+        "DANGER_TOKEN",
+        "SECRET_ENV_VALUE",
+    ]
+
+    launched = app.launch(reg.id)
+    run_id = launched["run_id"]
+    live_status = app.status(run_id=run_id)
+    live_winners = app.winners(run_id=run_id)
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        write_run_status(
+            store,
+            run_id,
+            returncode=143,
+            error_class="cancelled",
+            cleanup_confirmed=True,
+            result_snapshot_state="complete",
+            result_snapshot=capture_result_snapshot(
+                reg.experiment,
+                generation_id=run_id,
+            ),
+        )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    cancelled = app.cancel(run_id)
+    terminal_status = app.status(run_id=run_id)
+    awaited = asyncio.run(app.await_run(run_id))
+    terminal_winners = app.winners(run_id=run_id)
+    latest = app.latest_run(reg.id)
+
+    assert_no_sensitive(
+        [
+            launched,
+            live_status,
+            live_winners,
+            cancelled,
+            terminal_status,
+            awaited,
+            terminal_winners,
+            latest,
+        ],
+        sensitive,
+    )
 
 
 def test_assert_no_sensitive_actually_catches_a_leak() -> None:

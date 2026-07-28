@@ -60,7 +60,11 @@ from phasesweep.mcp.runs import (
     identity_from_earlier_boot,
     write_status_file,
 )
-from phasesweep.mcp.snapshots import RunResultSnapshot, parse_result_snapshot
+from phasesweep.mcp.snapshots import (
+    RunResultSnapshot,
+    capture_pre_generation_result_snapshot,
+    parse_result_snapshot,
+)
 from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
 from phasesweep.runtime.files import ensure_private_dir, fsync_directory, open_private_text
 from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc_starttime
@@ -137,8 +141,10 @@ DESCRIPTION_GET_STATUS = (
     "actual published one; a run_id whose own publication failed still reports its own "
     "this-run counts and winners with is_published=false. "
     "trial_data_available=false means zero counts are not trustworthy. result_source names "
-    "the provenance. A terminal run_id requires the phase counts frozen when that run ended; "
-    "it never falls back to mutable experiment results. An experiment_id returns the current shared-study view. "
+    "the provenance; terminal_snapshot_unavailable is a config-only placeholder accompanied "
+    "by an actionable run failure, never mutable study data. A terminal run_id otherwise "
+    "requires the phase counts frozen when that run ended. An experiment_id returns the "
+    "current shared-study view. "
     f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
     "instead, wait at least 30 seconds between calls. When terminal, call "
     f"{TOOL_GET_WINNERS} with the same run_id."
@@ -151,9 +157,11 @@ DESCRIPTION_GET_WINNERS = (
     "Phases that completed still report winners when the run later failed or was "
     "cancelled. Values shown as <redacted> are intentional catalog policy, not "
     "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
-    "run_id); result_source identifies current versus frozen results, and missing_phases plus "
-    "all_phases_have_winners already compute completeness. Terminal run-id winners stay frozen "
-    "if the experiment is later resumed and never fall back to mutable results. This returns "
+    "run_id); result_source identifies current, frozen, or unavailable results, and "
+    "missing_phases plus all_phases_have_winners already compute completeness. A "
+    "terminal_snapshot_unavailable result carries an actionable failure and no mutable "
+    "fallback. Terminal run-id winners otherwise stay frozen if the experiment is later "
+    "resumed. This returns "
     "winners, not search ranges or non-winning trial history: do not infer convergence, trends, "
     "robustness, or boundary effects from it. Read-only."
 )
@@ -362,6 +370,7 @@ FailureCode = Literal[
     "timeout",
     "cleanup_uncertain",
     "cancelled",
+    "result_snapshot_unavailable",
     "internal_error",
 ]
 
@@ -449,7 +458,11 @@ class GetStatusResult(_ToolPayload):
     """Structured output for get_status."""
 
     experiment_id: ExperimentId
-    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    result_source: Literal[
+        "current_shared_study",
+        "frozen_run_snapshot",
+        "terminal_snapshot_unavailable",
+    ]
     current_generation_id: str | None = Field(
         description=(
             "Most recent generation id known to this experiment; may be failed or "
@@ -562,7 +575,11 @@ class GetWinnersResult(_ToolPayload):
 
     experiment_id: ExperimentId
     run_id: RunId | None
-    result_source: Literal["current_shared_study", "frozen_run_snapshot"]
+    result_source: Literal[
+        "current_shared_study",
+        "frozen_run_snapshot",
+        "terminal_snapshot_unavailable",
+    ]
     metric: MetricPayload
     declared_phase_count: int = Field(ge=0)
     winner_count: int = Field(ge=0)
@@ -841,28 +858,55 @@ class PhaseSweepMCP:
             "state": state,
             "started_at": handle.started_at,
             "recovery_required": self._runs.recovery_required(handle),
-            "failure": self._run_failure_payload(handle),
+            "failure": self._run_failure_payload(handle, state=state),
         }
 
-    def _run_failure_payload(self, handle: RunHandle) -> dict[str, Any] | None:
+    def _run_failure_payload(
+        self,
+        handle: RunHandle,
+        *,
+        state: RunState | None = None,
+    ) -> dict[str, Any] | None:
         """Return a validated safe terminal failure, never the raw exception text.
 
         :param RunHandle handle: Run handle whose recorded terminal status
             should be inspected.
+        :param RunState | None state: Already-derived run state, when available.
         :return dict[str, Any] | None: The run's ``failure`` payload validated
-            against :class:`FailurePayload` and dumped to JSON-safe types, or
-            ``None`` when there is no recorded terminal status, no failure was
-            recorded, or the stored failure fails schema validation.
+            against :class:`FailurePayload` and dumped to JSON-safe types. A
+            terminal run with no usable result snapshot receives a generated
+            snapshot-unavailable failure; otherwise returns ``None`` when no
+            valid failure was recorded.
         """
         terminal = self._runs.recorded_terminal_status(handle)
-        if terminal is None or terminal.get("failure") is None:
+        if terminal is None:
             return None
+        persisted: dict[str, Any] | None = None
         try:
-            return FailurePayload.model_validate(terminal["failure"]).model_dump(
-                mode="json", exclude_none=True
-            )
+            if terminal.get("failure") is not None:
+                persisted = FailurePayload.model_validate(terminal["failure"]).model_dump(
+                    mode="json", exclude_none=True
+                )
         except ValidationError:
-            return None
+            pass
+        if (
+            state if state is not None else self._runs.state(handle)
+        ) != "running" and parse_result_snapshot(terminal) is None:
+            failure: dict[str, Any] = {
+                "code": "result_snapshot_unavailable",
+                "stage": "cleanup",
+                "retryable": False,
+                "actor": "operator",
+                "remediation": (
+                    "Report that this run's historical results are unavailable and ask "
+                    "the operator to inspect the PhaseSweep run or server diagnostics; "
+                    "do not substitute mutable experiment-level results."
+                ),
+            }
+            if persisted is not None:
+                failure["cause"] = persisted
+            return failure
+        return persisted
 
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
         """Per-phase trial counts and winner presence plus the run process state.
@@ -965,7 +1009,7 @@ class PhaseSweepMCP:
             run_id=run_id,
             include_run=True,
         )
-        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
+        snapshot, result_source = self._result_snapshot_view(experiment, handle)
         status = (
             snapshot.status_payload()
             if snapshot is not None
@@ -973,9 +1017,6 @@ class PhaseSweepMCP:
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
             )
-        )
-        result_source: ResultSource = (
-            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
         )
         return target_id, status, run, handle, result_source
 
@@ -1095,7 +1136,7 @@ class PhaseSweepMCP:
             # its catalog entry. Without a current visibility policy,
             # default to the strict redacted posture.
             visible_params = "none"
-        snapshot = self._terminal_result_snapshot(handle) if handle is not None else None
+        snapshot, result_source = self._result_snapshot_view(experiment, handle)
         if snapshot is not None:
             winner_views = snapshot.winner_views()
             represented_generation_id = snapshot.status.represented_generation_id
@@ -1113,9 +1154,6 @@ class PhaseSweepMCP:
             )
             represented_generation_id = status["represented_generation_id"]
             winner_views = read_winners(experiment, generation_id=represented_generation_id)
-        result_source: ResultSource = (
-            "frozen_run_snapshot" if snapshot is not None else "current_shared_study"
-        )
         result = winners_payload(
             target_id,
             winner_views,
@@ -1132,6 +1170,37 @@ class PhaseSweepMCP:
         )
         result["failure"] = self._run_failure_payload(handle) if handle is not None else None
         return result
+
+    def _result_snapshot_view(
+        self,
+        experiment: Experiment,
+        handle: RunHandle | None,
+    ) -> tuple[RunResultSnapshot | None, ResultSource]:
+        """Resolve one run result without falling back to mutable terminal state.
+
+        A failed terminal snapshot is represented by the same config-only
+        unavailable-data shape used for pre-generation failures. This lets
+        monitoring return the terminal run and an actionable failure while
+        every phase count remains explicitly untrusted.
+
+        :param Experiment experiment: Exact catalog or saved run configuration.
+        :param RunHandle | None handle: Optional detached run being read.
+        :return tuple: Optional result view and its agent-visible provenance.
+        """
+        if handle is None:
+            return None, "current_shared_study"
+        try:
+            snapshot = self._terminal_result_snapshot(handle)
+        except RunResultSnapshotUnavailableError:
+            placeholder = capture_pre_generation_result_snapshot(experiment)
+            return (
+                RunResultSnapshot.model_validate(placeholder),
+                "terminal_snapshot_unavailable",
+            )
+        return (
+            snapshot,
+            "frozen_run_snapshot" if snapshot is not None else "current_shared_study",
+        )
 
     def _terminal_result_snapshot(self, handle: RunHandle) -> RunResultSnapshot | None:
         """Return a live run's current view or require its frozen terminal snapshot.
@@ -1327,6 +1396,11 @@ class PhaseSweepMCP:
                 after = before
                 confirmed: bool | None = None
             else:
+                # Concurrent callers deliberately converge without a cancel
+                # lock: marker writes are idempotent, kill_stale_group verifies
+                # the persisted process identity and treats an already-gone
+                # group as confirmed, terminal status is runner-authoritative,
+                # and marker removal uses missing_ok.
                 # Keep the run live before signalling. In the force-kill/no-status
                 # case state() could otherwise briefly derive "failed" while trial
                 # descendants still hold resources.
@@ -1517,6 +1591,16 @@ class PhaseSweepMCP:
                     "ended_at": utc_now_iso(),
                     "result_snapshot_state": "failed",
                     "result_snapshot_error": "LaunchDidNotProduceSnapshot",
+                    "failure": {
+                        "code": "internal_error",
+                        "stage": "preflight",
+                        "retryable": False,
+                        "actor": "operator",
+                        "remediation": (
+                            "Ask the operator to inspect the PhaseSweep server diagnostics "
+                            "before retrying."
+                        ),
+                    },
                 },
             )
         except Exception:
