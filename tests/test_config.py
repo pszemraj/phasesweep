@@ -208,6 +208,48 @@ def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> N
     assert reset.execution.inherit_env == "all"
 
 
+@pytest.mark.parametrize(
+    "candidate_metric",
+    [
+        "{name: accuracy, goal: minimize, "
+        "extractor: {type: log_regex, pattern: 'accuracy=(?P<value>[0-9.]+)'}}",
+        "{name: loss, goal: maximize, "
+        "extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}",
+        "{name: loss, goal: minimize, "
+        "extractor: {type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.]+)'}}",
+    ],
+    ids=["name", "goal", "extractor"],
+)
+def test_suite_promotion_requires_identical_metric_contracts(
+    tmp_path: Path, candidate_metric: str
+) -> None:
+    """Reject cross-study promotion when the compared scalars mean different things."""
+    config = f"""
+    suite: incompatible_metrics
+    defaults:
+      trial_command: "echo"
+      metric:
+        name: loss
+        goal: minimize
+        extractor: {{type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
+    studies:
+      - name: baseline
+        phases: [{{name: baseline_eval, n_trials: 1}}]
+      - name: candidate
+        metric: {candidate_metric}
+        promotion:
+          min_delta_vs: baseline
+        phases: [{{name: candidate_eval, n_trials: 1}}]
+    """
+
+    with pytest.raises(
+        ValidationError,
+        match=r"promotion against 'baseline' requires the same resolved metric contract.*"
+        r"Put the shared metric in suite.defaults",
+    ):
+        load_config(write_yaml(tmp_path, config))
+
+
 # ---- migrated from version-named files ----
 
 

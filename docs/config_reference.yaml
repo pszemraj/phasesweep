@@ -273,7 +273,7 @@
 
 # min_delta_vs: str (required)
 # In a phase, names a prior phase. In a suite study, names a prior study or `study.phase`; a bare study selects its final exposed phase.
-# Suite comparisons are not checked for matching metric names/scales and use the candidate study's metric.goal, so compare only genuinely compatible metrics.
+# Suite comparisons require the candidate and baseline studies to resolve to identical Metric contracts (name, goal, and extractor configuration); incompatible comparisons fail config validation before any study runs.
 
 # min_delta: float = 0.0 (finite)
 # Required signed improvement: baseline - candidate for minimize, candidate - baseline for maximize. Promotion occurs when improvement >= min_delta.

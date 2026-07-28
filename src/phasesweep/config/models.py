@@ -1096,16 +1096,21 @@ class Suite(_Frozen):
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:
-        """Require unique, prior-only study dependencies.
+        """Require prior-only dependencies and comparable promotion metrics.
 
-        :raises ValueError: If study names duplicate or dependencies point forward.
+        :raises ValueError: If study names duplicate, dependencies point forward,
+            or a promotion compares different resolved metric contracts.
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
         phases_by_study: dict[str, set[str]] = {}
+        metrics_by_study: dict[str, Metric | None] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
+            resolved_metric = (
+                study.metric if "metric" in study.model_fields_set else self.defaults.metric
+            )
             for dep in study.depends_on:
                 if dep not in seen:
                     raise ValueError(
@@ -1124,8 +1129,22 @@ class Suite(_Frozen):
                         f"Study {study.name!r} promotion references missing baseline phase "
                         f"{selector!r}."
                     )
+                baseline_metric = metrics_by_study[baseline_study]
+                if (
+                    resolved_metric is not None
+                    and baseline_metric is not None
+                    and resolved_metric != baseline_metric
+                ):
+                    raise ValueError(
+                        f"Study {study.name!r} promotion against {selector!r} requires the "
+                        "same resolved metric contract, but the candidate resolves to "
+                        f"{resolved_metric.model_dump(mode='json')!r} and the baseline "
+                        f"resolves to {baseline_metric.model_dump(mode='json')!r}. Put the "
+                        "shared metric in suite.defaults or make both study metrics identical."
+                    )
             seen.add(study.name)
             phases_by_study[study.name] = {phase.name for phase in study.phases}
+            metrics_by_study[study.name] = resolved_metric
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:
