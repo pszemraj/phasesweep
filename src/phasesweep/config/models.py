@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import math
 import string
 from pathlib import Path
 from typing import Any, Literal
@@ -349,17 +348,15 @@ class Phase(_Frozen):
                     f"Phase {self.name!r}: timeout_seconds_per_trial is required unless "
                     "allow_unbounded_trials: true is set."
                 )
-        elif not math.isfinite(self.timeout_seconds_per_trial):
-            raise ValueError(
-                f"Phase {self.name!r}: timeout_seconds_per_trial must be finite, "
-                f"got {self.timeout_seconds_per_trial!r}."
+        else:
+            _require_finite(
+                f"Phase {self.name!r}: timeout_seconds_per_trial",
+                self.timeout_seconds_per_trial,
             )
-        if self.timeout_seconds_per_phase is not None and not math.isfinite(
-            self.timeout_seconds_per_phase
-        ):
-            raise ValueError(
-                f"Phase {self.name!r}: timeout_seconds_per_phase must be finite, "
-                f"got {self.timeout_seconds_per_phase!r}."
+        if self.timeout_seconds_per_phase is not None:
+            _require_finite(
+                f"Phase {self.name!r}: timeout_seconds_per_phase",
+                self.timeout_seconds_per_phase,
             )
         if not self.allow_seed_search:
             seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
@@ -508,12 +505,8 @@ class Experiment(_Frozen):
         :raises ValueError: If ``timeout_seconds_per_run`` is non-finite.
         :return Experiment: Self, unchanged.
         """
-        if self.timeout_seconds_per_run is not None and not math.isfinite(
-            self.timeout_seconds_per_run
-        ):
-            raise ValueError(
-                f"timeout_seconds_per_run must be finite, got {self.timeout_seconds_per_run!r}."
-            )
+        if self.timeout_seconds_per_run is not None:
+            _require_finite("timeout_seconds_per_run", self.timeout_seconds_per_run)
         return self
 
     @field_validator("experiment")
