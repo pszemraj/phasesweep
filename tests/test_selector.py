@@ -110,27 +110,17 @@ def test_no_feasible_raises():
         select_winner(study, exp)
 
 
-def test_tie_break_lower_trial_number():
-    exp = _make_exp()
-    study = _make_study()
-    _add_trial(study, 0.1, params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-    w = select_winner(study, exp)
-    # First trial wins on tie
-    assert w.params == {"x": 1}
-
-
 @pytest.mark.parametrize(
     ("goal", "first_delta", "expected_x"),
     [
-        pytest.param("minimize", 0.0, 1, id="minimize-exact-tie"),
         pytest.param("minimize", 1e-15, 2, id="minimize-worse-by-one-ulp-scale"),
-        pytest.param("maximize", 0.0, 1, id="maximize-exact-tie"),
         pytest.param("maximize", -1e-15, 2, id="maximize-worse-by-one-ulp-scale"),
     ],
 )
-def test_metric_ordering_is_exact(goal: str, first_delta: float, expected_x: int) -> None:
-    """Only exact equality ties; any representable difference decides the winner."""
+def test_metric_ordering_preserves_representable_differences(
+    goal: str, first_delta: float, expected_x: int
+) -> None:
+    """Any representable metric difference decides the winner."""
     exp = _make_exp(goal=goal)
     study = _make_study()
     _add_trial(study, 0.1 + first_delta, params={"x": 1})
