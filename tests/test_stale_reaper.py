@@ -377,38 +377,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
         run_experiment(experiment)
 
 
-def test_storage_preflight_does_not_convert_shutdown_to_storage_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experiment = make_experiment(workdir=tmp_path / "runs")
-    shutdown = PhaseSweepShutdown(
-        signal.SIGTERM,
-        ShutdownCleanupReport(
-            signum=signal.SIGTERM,
-            cleanup_confirmed=True,
-            child_pgids=(),
-        ),
-    )
-
-    def interrupt_load(*args: object, **kwargs: object) -> None:
-        raise shutdown
-
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._load_existing_phase_study",
-        interrupt_load,
-    )
-    cleanup = _PreflightCleanupReport()
-
-    with pytest.raises(PhaseSweepShutdown) as exc_info:
-        _preflight_existing_studies(experiment, cleanup_report=cleanup)
-
-    assert exc_info.value is shutdown
-    assert cleanup.cleanup_confirmed is True
-    assert cleanup.error is None
-
-
-@pytest.mark.parametrize("stage", ["get_trials", "stale_reaper", "schema_validation"])
+@pytest.mark.parametrize("stage", ["load", "get_trials", "stale_reaper", "schema_validation"])
 def test_recovery_preflight_preserves_shutdown_control_flow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,7 +393,12 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
         ),
     )
 
-    if stage == "get_trials":
+    if stage == "load":
+        monkeypatch.setattr(
+            "phasesweep.engine.guards._load_existing_phase_study",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
+        )
+    elif stage == "get_trials":
         study = SimpleNamespace(
             study_name="shutdown::p",
             get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
@@ -454,10 +428,13 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
             )
 
+    cleanup = _PreflightCleanupReport()
     with pytest.raises(PhaseSweepShutdown) as exc_info:
-        _preflight_existing_studies(experiment)
+        _preflight_existing_studies(experiment, cleanup_report=cleanup)
 
     assert exc_info.value is shutdown
+    assert cleanup.cleanup_confirmed is True
+    assert cleanup.error is None
 
 
 def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
