@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 log = logging.getLogger("phasesweep.runtime.files")
@@ -690,9 +690,8 @@ def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
 def _private_atomic_writer(
     path: Path,
     *,
-    binary: bool,
     newline: str | None = None,
-) -> Iterator[IO[Any]]:
+) -> Iterator[IO[str]]:
     """Write to a private temporary file, then atomically replace a validated destination.
 
     Opens (creating if needed) the private destination directory, creates a
@@ -708,13 +707,10 @@ def _private_atomic_writer(
     file is unlinked and ``path`` is left untouched.
 
     :param Path path: Destination path to replace.
-    :param bool binary: Whether to open the temporary file in binary
-        (``"wb"``) mode instead of UTF-8 text (``"w"``).
     :param str | None newline: Newline handling passed to the text-mode
-        ``open`` call; ignored when ``binary`` is true.
-    :return Iterator[IO[Any]]: Writable handle (binary or text per
-        ``binary``) on the temporary file, open for the caller to populate
-        before the atomic replace.
+        ``open`` call.
+    :return Iterator[IO[str]]: Writable text handle on the temporary file,
+        open for the caller to populate before the atomic replace.
     """
     parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
     leaf = leaf_name(path)
@@ -723,11 +719,7 @@ def _private_atomic_writer(
     replaced = False
     try:
         fd, temporary = _new_private_temp_fd(parent_fd, leaf)
-        stream: IO[Any]
-        if binary:
-            stream = os.fdopen(fd, "wb")
-        else:
-            stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
         fd = -1
         with stream as handle:
             yield handle
@@ -755,8 +747,8 @@ def private_atomic_text_writer(path: Path, *, newline: str | None = None) -> Ite
     :param str | None newline: Newline handling passed to ``open``.
     :return Iterator[IO[str]]: Writable text handle.
     """
-    with _private_atomic_writer(path, binary=False, newline=newline) as handle:
-        yield cast(IO[str], handle)
+    with _private_atomic_writer(path, newline=newline) as handle:
+        yield handle
 
 
 def private_atomic_write_text(path: Path, text: str) -> None:
@@ -767,27 +759,6 @@ def private_atomic_write_text(path: Path, text: str) -> None:
     """
     with private_atomic_text_writer(path) as handle:
         handle.write(text)
-
-
-@contextlib.contextmanager
-def private_atomic_bytes_writer(path: Path) -> Iterator[IO[bytes]]:
-    """Atomically replace a private bytes file.
-
-    :param Path path: Destination path to replace.
-    :return Iterator[IO[bytes]]: Writable binary handle.
-    """
-    with _private_atomic_writer(path, binary=True) as handle:
-        yield cast(IO[bytes], handle)
-
-
-def private_atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically replace a private bytes file.
-
-    :param Path path: Destination path to replace.
-    :param bytes data: Bytes to write.
-    """
-    with private_atomic_bytes_writer(path) as handle:
-        handle.write(data)
 
 
 @contextlib.contextmanager
