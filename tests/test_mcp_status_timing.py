@@ -325,23 +325,26 @@ def test_await_run_returns_immediately_when_recovery_is_required(
     assert clock["sleeps"] == 0.0
 
 
-def test_await_run_clamps_timeout_to_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("requested_timeout", "effective_timeout"),
+    [
+        pytest.param(1, AWAIT_MIN_TIMEOUT_SECONDS, id="floor"),
+        pytest.param(10_000, AWAIT_MAX_TIMEOUT_SECONDS, id="cap"),
+    ],
+)
+def test_await_run_clamps_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_timeout: float,
+    effective_timeout: float,
+) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
     clock = _fake_clock(monkeypatch)
 
-    result = asyncio.run(app.await_run("r1", timeout_seconds=1))
+    result = asyncio.run(app.await_run("r1", timeout_seconds=requested_timeout))
 
     assert result["reason"] == "timeout"
-    assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
-
-
-def test_await_run_clamps_timeout_to_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch)
-
-    result = asyncio.run(app.await_run("r1", timeout_seconds=10_000))
-    assert result["reason"] == "timeout"
-    assert clock["sleeps"] == pytest.approx(AWAIT_MAX_TIMEOUT_SECONDS)
+    assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
 def test_await_run_returns_when_phase_gains_winner(
