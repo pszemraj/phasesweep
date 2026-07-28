@@ -41,9 +41,10 @@ Tests are organized by behavior:
 - `tests/test_fingerprint.py`: semantic fingerprints, resume verification, run-control exclusions.
 - `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
-- `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`: timeout policy, contracts, evidence gates, promotion, suites, and read-only engine views.
+- `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`, `tests/test_publication_transaction.py`: timeout policy, contracts, evidence gates, promotion, suites, publication transactions, and read-only engine views.
 - `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
-- `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`: focused unit surfaces.
+- `tests/test_tiny_decoder_example.py`: adapter composition, final-checkpoint result envelopes, and example config invariants.
+- `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.
 
 ## Tracked TODOs
 

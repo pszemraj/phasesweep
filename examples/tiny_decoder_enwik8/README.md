@@ -1,6 +1,6 @@
 # Tiny Decoder Enwik8 example
 
-This example runs a tiny Enwik8 decoder training sweep with phasesweep. The trainer implementation comes from [`decoder-pytorch-template`](https://github.com/pszemraj/decoder-pytorch-template), checked out as the `upstream/` git submodule. The trainer accepts YAML config files but not per-key CLI overrides, so `run_trial.py` adapts phasesweep's `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three GPU-backed phases tune optimizer scale, regularization, and training stability.
+This example runs a tiny Enwik8 decoder training sweep with phasesweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The trainer accepts YAML config files but not per-key CLI overrides, so `run_trial.py` adapts phasesweep's `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three phases tune optimizer scale, regularization, and training stability.
 
 ## Setup
 
@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and top-ups matter. Because storage is in-memory, this smoke run never exercises the persistent-study resume paths — no-op replay, top-ups, or the durable phase-abort record; to check those on real hardware, point `storage:` at a scratch SQLite file (and add a `provenance:` entry) before re-invoking.
+The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and reuse matter. Pointing the smoke config at a scratch SQLite file (and adding `provenance`) gives it persistent bookkeeping and satisfied-target no-op replay; testing top-ups or abort recovery also requires changing the trial target or producing the corresponding failure state.
 
 Use the full three-phase example only when you intentionally want the longer experiment:
 
@@ -40,7 +40,7 @@ phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-The real run launches 9 trials (3 phases x 3 trials, 1000 batches each). Runtime depends on the local CUDA hardware and software stack. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
+The real run launches 9 trials (3 phases x 3 trials, 1000 batches each). Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
 
 The phase order is deliberate: pick `learning_rate` first because it is the highest-leverage optimizer scale decision, tune `weight_decay` after the update scale is fixed, then tune `grad_clip_norm` last as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
 

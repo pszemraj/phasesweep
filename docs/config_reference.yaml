@@ -25,7 +25,7 @@
 
 # trial_command: str (required)
 # Shell command for one trial. Supported format fields are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`; path-like substitutions and rendered override tokens are shell-quoted.
-# Config loading checks format syntax and supported fields, but not executable/path existence, trainer parser compatibility, evidence production, or JSON serializability.
+# Config loading checks format syntax and supported fields, plus statically known values for a json_file contract, but not executable/path existence, trainer parser compatibility, or evidence production.
 # An override-free phase may use a constant command. Any inherited, contract, fixed, or sampled override requires the placeholder selected by override_format.
 
 # provenance: dict[str, str] = {}
@@ -35,7 +35,7 @@
 # override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
 # `argparse` requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed. Other values are stringified.
 # `hydra` requires `{overrides}` and emits `key=value`; it accepts scalars/lists and rejects mappings during config preflight.
-# `json_file` requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`. Validation and dry-run do not write that file, so non-JSON fixed values can still fail at real launch.
+# `json_file` requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
 
 # metric: Metric (required)
 # Metric object keys:
@@ -159,7 +159,7 @@
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
-# Applied over the parent process environment. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial.
+# Applied over the ambient variables selected by execution.inherit_env. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
 
