@@ -204,15 +204,6 @@ def _phase_study_name(experiment: Experiment, phase: Phase) -> str:
     return f"{experiment.experiment}::{phase.name}"
 
 
-def _study_direction(experiment: Experiment) -> str:
-    """Return the Optuna direction for the experiment metric goal.
-
-    :param Experiment experiment: Parsed experiment config containing the metric goal.
-    :return str: ``"minimize"`` or ``"maximize"`` for Optuna.
-    """
-    return "minimize" if experiment.metric.goal == "minimize" else "maximize"
-
-
 def _create_phase_study(
     experiment: Experiment,
     phase: Phase,
@@ -231,7 +222,7 @@ def _create_phase_study(
         storage=None if dry_run else _resolve_storage(experiment.storage),
         sampler=_build_sampler(phase.sampler, phase.search_space, n_jobs=phase.n_jobs),
         pruner=optuna.pruners.NopPruner(),
-        direction=_study_direction(experiment),
+        direction=experiment.metric.goal,
         load_if_exists=True,
     )
 

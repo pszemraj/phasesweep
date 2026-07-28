@@ -326,7 +326,13 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 existing_studies=existing_studies,
             )
-            _prepare_generation(experiment, from_phase=from_phase, generation_id=generation_id)
+            _write_generation_state(
+                experiment,
+                generation_id=generation_id,
+                state="running",
+                from_phase=from_phase,
+                publish_current=True,
+            )
             generation_prepared = True
             result = _run_experiment_inner(
                 experiment,
@@ -772,27 +778,6 @@ def _preflight_reached_fingerprint(
         return
     inherited = {name: preloaded_winners[name] for name in phase.inherits}
     _verify_fingerprint(study, experiment, phase, inherited)
-
-
-def _prepare_generation(
-    experiment: Experiment,
-    *,
-    from_phase: str | None,
-    generation_id: str,
-) -> None:
-    """Publish a generation as current after recovery and initial preflight.
-
-    :param Experiment experiment: Experiment whose current generation pointer is advanced.
-    :param str | None from_phase: Optional resume point; prior winners remain available.
-    :param str generation_id: Fresh identity for this engine invocation.
-    """
-    _write_generation_state(
-        experiment,
-        generation_id=generation_id,
-        state="running",
-        from_phase=from_phase,
-        publish_current=True,
-    )
 
 
 def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
