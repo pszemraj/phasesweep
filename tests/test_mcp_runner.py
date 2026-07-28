@@ -412,7 +412,16 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
     phases = captured["status"]["phases"]  # type: ignore[index]
     assert phases[0]["winner_present"] is True
     assert phases[1]["winner_present"] is False
-    assert [winner["phase"] for winner in captured["winners"]] == ["a"]  # type: ignore[index]
+    (winner,) = captured["winners"]  # type: ignore[index]
+    assert winner["phase"] == "a"
+    assert winner["source"] == {
+        "kind": "phase_trial",
+        "phase": "a",
+        "trial_number": winner["trial_number"],
+        "generation_id": winner["generation_id"],
+        "attempt_id": winner["attempt_id"],
+        "study": None,
+    }
 
 
 def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) -> None:
@@ -521,7 +530,14 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     assert frozen["gates_passed"] is True
     assert frozen["incomplete"] is False
     assert frozen["generation_id"] == "engine-generation"
-    assert frozen["source"]["kind"] == "phase_trial"
+    assert frozen["source"] == {
+        "kind": "phase_trial",
+        "phase": "p",
+        "trial_number": 4,
+        "generation_id": "engine-generation",
+        "attempt_id": "engine-attempt",
+        "study": None,
+    }
 
 
 def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(

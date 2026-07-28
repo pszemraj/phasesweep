@@ -119,19 +119,24 @@ class WinnerSnapshot(_SnapshotModel):
     promotion: dict[str, Any] | None = None
 
 
-def _winner_source_snapshot(winner: PhaseWinnerView) -> WinnerSourceSnapshot:
-    """Return the concrete source model for a winner view.
+def _winner_source_snapshot(
+    winner: PhaseWinnerView | Winner,
+    *,
+    phase: str,
+) -> WinnerSourceSnapshot:
+    """Return the concrete source model for a stored or engine-returned winner.
 
     Falls back to a ``"phase_trial"`` source built from the winner's own
     phase/trial/generation/attempt identity when ``winner.source`` is unset
     (winners persisted before source tracking was added have no ``source``).
 
-    :param PhaseWinnerView winner: Winner view whose source should be captured.
+    :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
+    :param str phase: Phase under which the winner is exposed.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
     source = winner.source or WinnerSource(
         kind="phase_trial",
-        phase=winner.phase,
+        phase=phase,
         trial_number=winner.trial_number,
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
@@ -331,7 +336,7 @@ def capture_result_snapshot(
                 incomplete=winner.incomplete,
                 generation_id=winner.generation_id,
                 attempt_id=winner.attempt_id,
-                source=_winner_source_snapshot(winner),
+                source=_winner_source_snapshot(winner, phase=winner.phase),
                 promotion=winner.promotion,
             )
             for winner in read_winners(
@@ -360,13 +365,6 @@ def _winner_snapshot_from_engine(phase_name: str, winner: Winner) -> WinnerSnaps
     :param Winner winner: Engine winner object from the terminal report.
     :return WinnerSnapshot: Validated snapshot of the engine's own outcome.
     """
-    source = winner.source or WinnerSource(
-        kind="phase_trial",
-        phase=phase_name,
-        trial_number=winner.trial_number,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-    )
     return WinnerSnapshot(
         phase=phase_name,
         trial_number=winner.trial_number,
@@ -378,14 +376,7 @@ def _winner_snapshot_from_engine(phase_name: str, winner: Winner) -> WinnerSnaps
         incomplete=bool(winner.completion.get("incomplete", False)),
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
-        source=WinnerSourceSnapshot(
-            kind=source.kind,
-            phase=source.phase,
-            trial_number=source.trial_number,
-            generation_id=source.generation_id,
-            attempt_id=source.attempt_id,
-            study=source.study,
-        ),
+        source=_winner_source_snapshot(winner, phase=phase_name),
         promotion=winner.promotion,
     )
 
