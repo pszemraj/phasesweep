@@ -401,7 +401,8 @@ def test_terminal_callback_reports_success_evidence(
     experiment = make_experiment(workdir=tmp_path / "runs")
     captured: list[TerminalReport] = []
 
-    def preflight(_experiment, *, cleanup_report):
+    def preflight(_experiment, *, cleanup_report, from_phase):
+        del from_phase
         cleanup_report.uncertain_attempt_ids.add("attempt-uncertain")
         return {}
 

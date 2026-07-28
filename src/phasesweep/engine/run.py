@@ -304,6 +304,7 @@ def _run_experiment_outcome(
             existing_studies = _preflight_existing_studies(
                 experiment,
                 cleanup_report=cleanup,
+                from_phase=from_phase,
             )
             _reject_bound_descendant_topups(
                 experiment,
@@ -367,6 +368,7 @@ def _run_experiment_outcome(
                     _preflight_existing_studies(
                         experiment,
                         cleanup_report=reconciliation,
+                        from_phase=from_phase,
                     )
                 except (KeyboardInterrupt, SystemExit, GeneratorExit) as cleanup_exc:
                     control_error = cleanup_exc

@@ -14,6 +14,7 @@ failures must never replace the primary exception.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import signal
@@ -606,6 +607,34 @@ def test_read_side_rejects_generation_with_altered_winner_artifact(tmp_path: Pat
     winner = yaml.safe_load(winner_path.read_text())
     winner["metric"]["x"] = -999.0
     winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
+
+
+@pytest.mark.parametrize("identity_field", ["generation_id", "attempt_id"])
+def test_manifest_rejects_winner_source_identity_disagreement(
+    tmp_path: Path,
+    identity_field: str,
+) -> None:
+    """The hash-covered winner's two provenance copies must identify one attempt."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    winner["winner_source"][identity_field] = f"different-{identity_field}"
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    artifact = next(
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
 
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None

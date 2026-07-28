@@ -482,6 +482,15 @@ def _validate_generation_manifest(
                 recorded = payload.get(id_field)
                 if not isinstance(recorded, str) or not recorded:
                     raise _fail(f"winner for phase {name!r} has no valid {id_field}")
+            source = payload.get("winner_source")
+            if not isinstance(source, Mapping):
+                raise _fail(f"winner for phase {name!r} has no valid winner_source")
+            for id_field in ("generation_id", "attempt_id"):
+                if source.get(id_field) != payload.get(id_field):
+                    raise _fail(
+                        f"winner for phase {name!r} has a winner_source "
+                        f"that disagrees with its {id_field}"
+                    )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
         elif name in decision_items:

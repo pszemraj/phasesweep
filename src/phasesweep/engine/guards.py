@@ -554,14 +554,11 @@ def _verify_fingerprint(
     if existing is None:
         study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:
-        # A zero-trial study whose launch prerequisites failed (bad GPU
-        # policy, broken command) must not permanently bind its semantic
-        # identity: nothing was ever evaluated under the old fingerprint, so
-        # rebinding cannot mix results, and refusing here would make the
-        # corrected config a rejected regression (review v0.5.17 / finding A).
-        # An accepted trial target is treated as identity too — it means an
-        # earlier invocation got past every launch prerequisite.
-        if not study.get_trials(deepcopy=False) and study.user_attrs.get(TRIAL_TARGET_ATTR) is None:
+        # A zero-trial study must not permanently bind its semantic identity:
+        # nothing was ever evaluated under the old fingerprint, so rebinding
+        # cannot mix results. This includes a process that died after recording
+        # its trial target but before Optuna created the first trial.
+        if not study.get_trials(deepcopy=False):
             log.warning(
                 "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
                 "ever ran under the previous config.",
@@ -1390,12 +1387,15 @@ def _preflight_existing_studies(
     experiment: Experiment,
     *,
     cleanup_report: _PreflightCleanupReport | None = None,
+    from_phase: str | None = None,
 ) -> dict[str, optuna.Study]:
     """Validate and reap every existing declared phase study before launch.
 
     :param Experiment experiment: Parsed experiment whose declared phases are inspected.
     :param _PreflightCleanupReport | None cleanup_report: Optional shared report to
         accumulate cleanup evidence into; a fresh one is created if omitted.
+    :param str | None from_phase: Optional resume point. Recovery and schema checks
+        still cover every phase; trial-target validation starts at this reached phase.
     :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
         with no durable study yet are omitted).
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
@@ -1420,7 +1420,10 @@ def _preflight_existing_studies(
         _preflight_active_attempts(experiment, report)
     except Exception as exc:
         errors.append(exc)
+    reached = from_phase is None
     for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
         try:
             study = _load_existing_phase_study(experiment, phase)
         except Exception as exc:
@@ -1449,7 +1452,8 @@ def _preflight_existing_studies(
             continue
         try:
             _validate_study_schema(study)
-            _validate_trial_target(study, phase)
+            if reached:
+                _validate_trial_target(study, phase)
         except Exception as exc:
             errors.append(exc)
     if errors:

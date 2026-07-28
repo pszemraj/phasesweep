@@ -818,6 +818,34 @@ def test_from_phase_accepts_skipped_winner_when_only_n_trials_changed(
     assert "lr" in winners2
 
 
+def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) -> None:
+    """A skipped phase's run-control budget cannot block an unrelated resume."""
+    trainer = write_constant_trainer(tmp_path)
+    workdir = tmp_path / "runs"
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    exp_v1 = _two_phase_experiment(
+        workdir=workdir,
+        trainer=trainer,
+        arch_n_trials=3,
+        storage=storage,
+    )
+    winners1 = run_experiment(exp_v1)
+
+    exp_v2 = _two_phase_experiment(
+        workdir=workdir,
+        trainer=trainer,
+        arch_n_trials=1,
+        storage=storage,
+    )
+    winners2 = run_experiment(exp_v2, from_phase="lr")
+
+    assert winners2["arch"].trial_number == winners1["arch"].trial_number
+    assert winners2["arch"].metric == winners1["arch"].metric
+    study = optuna.load_study(study_name="t::arch", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
+    assert len(study.trials) == 3
+
+
 def test_from_phase_preflight_consumes_run_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -866,8 +894,9 @@ def test_fresh_run_preflight_consumes_run_deadline(
         _experiment: Experiment,
         *,
         cleanup_report: object,
+        from_phase: str | None,
     ) -> dict[str, optuna.Study]:
-        del cleanup_report
+        del cleanup_report, from_phase
         clock["now"] += 2.0
         return {}
 
@@ -1103,6 +1132,47 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
 
     # Corrected trainer command = different semantic fingerprint. The empty
     # study must rebind instead of rejecting the fix.
+    winners = run_experiment(_exp(f"python {trainer} {{overrides}}"))
+    assert winners["p"].metric == pytest.approx(1.0)
+
+
+def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target attr without any trial is not evidence that the old config ran."""
+    import phasesweep.engine.phase as phase_module
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    db = tmp_path / "fp-target.db"
+
+    def _exp(command: str) -> Experiment:
+        return make_experiment(
+            experiment="fp_target_poison",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=command,
+            n_trials=1,
+            gpu_policy="none",
+        )
+
+    real_record = phase_module._record_trial_target
+
+    def record_then_crash(study: optuna.Study, phase: Phase) -> None:
+        real_record(study, phase)
+        raise RuntimeError("simulated crash after target record")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(phase_module, "_record_trial_target", record_then_crash)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            run_experiment(_exp("false {overrides}"))
+
+    study = optuna.load_study(
+        study_name="fp_target_poison::p",
+        storage=f"sqlite:///{db}",
+    )
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+    assert study.trials == []
+
     winners = run_experiment(_exp(f"python {trainer} {{overrides}}"))
     assert winners["p"].metric == pytest.approx(1.0)
 
