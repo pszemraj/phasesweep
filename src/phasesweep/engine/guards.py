@@ -74,7 +74,6 @@ class _PhasePolicyState:
 
     max_sequence: int
     consecutive_failures: int
-    recovery_boundary: int
     recovered_abort_sequence: int | None
     fatal_trial_number: int | None
     fatal_sequence: int | None
@@ -1263,7 +1262,6 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     return _PhasePolicyState(
         max_sequence=max_sequence,
         consecutive_failures=consecutive_failures,
-        recovery_boundary=recovery_boundary,
         recovered_abort_sequence=recovered_abort_sequence,
         fatal_trial_number=fatal_trial_number,
         fatal_sequence=fatal_sequence,

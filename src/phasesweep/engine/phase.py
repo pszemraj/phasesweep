@@ -693,7 +693,6 @@ def _run_phase(
         # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf (#4).
         if result.failure_reason:
             trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
-            _record_outcome(trial, "failure", cause=result.failure_reason)
             raise TrialExecutionError(result.failure_reason)
 
         for cname, cval in result.constraints.items():
