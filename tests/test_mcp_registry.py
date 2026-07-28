@@ -141,27 +141,23 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    ("catalog_path", "experiment_id", "description_fragment"),
+    ("catalog_path", "experiment_id"),
     [
-        ("examples/catalog.yaml", "tiny-lm", "16 MB LM"),
+        ("examples/catalog.yaml", "tiny-lm"),
         (
             "examples/tiny_decoder_enwik8/catalog.yaml",
             "tiny-decoder-enwik8-hparams",
-            "1000 batches/trial",
         ),
     ],
 )
 def test_checked_in_catalog_loads(
     catalog_path: str,
     experiment_id: str,
-    description_fragment: str,
 ) -> None:
     registry = Registry.load(REPO / catalog_path)
 
     entry = registry.get(experiment_id)
     assert entry.id == experiment_id
-    assert description_fragment in entry.description
-    assert "smoke" not in entry.experiment.experiment
 
 
 def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:

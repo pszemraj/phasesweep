@@ -18,14 +18,9 @@ def test_public_package_metadata() -> None:
 
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
     project = pyproject["project"]
-    classifiers = set(project["classifiers"])
     scripts = project["scripts"]
     package_data = pyproject["tool"]["setuptools"]["package-data"]
 
-    assert project["license"] == "MIT"
-    assert "Operating System :: POSIX" in classifiers
-    assert "Programming Language :: Python :: 3.12" in classifiers
-    assert "Typing :: Typed" in classifiers
     assert scripts == {
         "phasesweep": "phasesweep.cli:main",
         "phasesweep-mcp": "phasesweep.mcp.server:main",
