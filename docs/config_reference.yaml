@@ -112,7 +112,8 @@
 # Set true only for intentional CPU-only parallel trials or an external scheduler that already isolates devices. Required when n_jobs > 1 has no detectable GPU tokens, and when gpu_policy is "none" with n_jobs > 1.
 
 # max_consecutive_failures: int = 5 (>= 1)
-# Stops scheduling after this many consecutive failed or infeasible results; a feasible result resets the count. Already-running parallel peers may still finish after the threshold is reached.
+# Stops scheduling after this many consecutive failed or infeasible results; a feasible result resets the count. Completion order and the current streak are durable across supported random/grid top-ups and process restarts, and a stale RUNNING trial reaped as FAIL counts as a failure. Already-running parallel peers may still finish after the threshold is reached.
+# An identical rerun after an abort remains failed. For random/grid phases, raise n_trials above the aborting invocation's accepted target to explicitly start a new recovery streak; use a new experiment name for stateful samplers or when you do not want to reuse the prior study.
 # Raise only when failures are expected and informative; the default catches broken trainer/evidence contracts early.
 
 # sampler: Sampler = {}

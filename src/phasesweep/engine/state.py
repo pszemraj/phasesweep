@@ -117,13 +117,20 @@ GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 1
+STUDY_SCHEMA_VERSION = 2
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
-# Durable phase-abort record (review v0.5.17 / blockers 1+7). Set atomically
-# with the abort decision so a restarted orchestrator cannot reinterpret the
-# same terminal trials as a completed phase; cleared only when new work
-# reaches winner selection.
+# Ordered terminal outcome used to reconstruct the failure circuit breaker
+# after a restart. Every terminal trial in a current-schema study has one.
+TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
+TRIAL_OUTCOME_SCHEMA_VERSION = 1
+# Durable phase-abort record. A restarted orchestrator cannot reinterpret the
+# same terminal trials as a completed phase.
 PHASE_ABORT_ATTR = "phasesweep_phase_abort"
+# Durable boundary established when the operator explicitly raises n_trials
+# after an abort. Outcomes through this sequence belong to the aborted attempt;
+# later failures form the new recovery streak.
+PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
+PHASE_RECOVERY_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance (review v0.5.17 /

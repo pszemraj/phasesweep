@@ -29,9 +29,13 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
+    PHASE_RECOVERY_ATTR,
+    PHASE_RECOVERY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
     Winner,
     _attempts_dir,
@@ -60,6 +64,21 @@ from phasesweep.runtime.process import (
     read_attempt_lifecycle,
     read_stale_process_identity,
 )
+
+_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "fatal"})
+
+
+@dataclass(frozen=True)
+class _PhasePolicyState:
+    """Failure-policy state reconstructed from durable per-trial outcomes."""
+
+    max_sequence: int
+    consecutive_failures: int
+    recovery_boundary: int
+    recovered_abort_sequence: int | None
+    fatal_trial_number: int | None
+    fatal_sequence: int | None
+    fatal_cause: str | None
 
 
 @dataclass
@@ -823,6 +842,73 @@ def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Pat
     )
 
 
+def _parsed_trial_outcome(value: Any) -> tuple[int, str, str | None] | None:
+    """Return the ordered outcome fields when a trial attr is well formed."""
+    if not isinstance(value, dict):
+        return None
+    schema_version = value.get("schema_version")
+    sequence = value.get("sequence")
+    outcome = value.get("outcome")
+    cause = value.get("cause")
+    if (
+        schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
+        or type(sequence) is not int
+        or sequence < 1
+        or outcome not in _TRIAL_OUTCOMES
+        or (cause is not None and not isinstance(cause, str))
+    ):
+        return None
+    return sequence, outcome, cause
+
+
+def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Persist a failure-policy outcome before marking a stale trial ``FAIL``.
+
+    An objective may have written its outcome immediately before the
+    orchestrator died. Preserve a recorded fatal exception; convert a
+    not-yet-committed success/prune to failure because recovery is about to
+    commit the trial as ``FAIL``. Malformed or duplicate records are replaced
+    with a fresh sequence so current-schema validation can still diagnose any
+    other corrupt row without stranding this stale process.
+    """
+    trials = study.get_trials(deepcopy=False)
+    parsed_by_trial = {
+        candidate.number: parsed
+        for candidate in trials
+        if (parsed := _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR)))
+        is not None
+    }
+    used_sequences = [parsed[0] for parsed in parsed_by_trial.values()]
+    existing = parsed_by_trial.get(trial.number)
+    if existing is not None and used_sequences.count(existing[0]) == 1:
+        sequence, outcome, cause = existing
+        if outcome not in {"failure", "fatal"}:
+            outcome = "failure"
+            cause = "orchestrator stopped before Optuna committed the terminal trial state"
+    else:
+        sequence = max(used_sequences, default=0) + 1
+        outcome = "failure"
+        cause = "stale RUNNING trial recovered after its orchestrator stopped"
+
+    payload: dict[str, Any] = {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+    }
+    if cause is not None:
+        payload["cause"] = cause
+    try:
+        active_trial = optuna.Trial(study, trial._trial_id)
+        active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Process cleanup completed for stale RUNNING trial {trial.number} in study "
+            f"{study.study_name!r}, but its durable failure outcome could not be recorded. "
+            "The trial remains RUNNING so a later retry cannot silently omit this failure "
+            "from max_consecutive_failures."
+        ) from exc
+
+
 def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) -> str:
     """Mark the entry's Optuna trial FAIL through its *recorded* storage.
 
@@ -867,6 +953,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         # The RUNNING trial belongs to a different attempt than this entry;
         # leave it for that attempt's own recovery evidence.
         return "terminal"
+    _record_stale_trial_failure(study, trial)
     try:
         study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     except Exception as exc:
@@ -1068,6 +1155,7 @@ def _reap_stale_trials(
 
         if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
             _record_cleanup_recovery(study, trial)
+        _record_stale_trial_failure(study, trial)
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
         except Exception as exc:
@@ -1085,6 +1173,104 @@ def _reap_stale_trials(
     return count
 
 
+def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaMismatchError:
+    """Build the actionable error used for malformed durable policy state."""
+    return StudySchemaMismatchError(
+        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}. "
+        "Use a new experiment name, or archive/delete the inconsistent study before "
+        "running again."
+    )
+
+
+def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
+    """Validate and reconstruct the durable consecutive-failure state."""
+    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
+    recovery_boundary = 0
+    recovered_abort_sequence: int | None = None
+    if recovery is not None:
+        if not isinstance(recovery, dict):
+            raise _phase_policy_schema_error(
+                study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
+            )
+        schema_version = recovery.get("schema_version")
+        raw_recovery_boundary = recovery.get("start_after_sequence")
+        raw_recovered_abort_sequence = recovery.get("recovered_abort_sequence")
+        recovery_target = recovery.get("trial_target")
+        if (
+            schema_version != PHASE_RECOVERY_SCHEMA_VERSION
+            or type(raw_recovery_boundary) is not int
+            or raw_recovery_boundary < 1
+            or type(raw_recovered_abort_sequence) is not int
+            or raw_recovered_abort_sequence < 1
+            or raw_recovered_abort_sequence > raw_recovery_boundary
+            or type(recovery_target) is not int
+            or recovery_target < 1
+        ):
+            raise _phase_policy_schema_error(
+                study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
+            )
+        recovery_boundary = raw_recovery_boundary
+        recovered_abort_sequence = raw_recovered_abort_sequence
+
+    events: list[tuple[int, int, str, str | None]] = []
+    seen_sequences: dict[int, int] = {}
+    for trial in study.get_trials(deepcopy=False):
+        raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
+        parsed = _parsed_trial_outcome(raw)
+        if trial.state.is_finished() and parsed is None:
+            raise _phase_policy_schema_error(
+                study,
+                f"terminal trial {trial.number} has missing or malformed "
+                f"{TRIAL_OUTCOME_ATTR!r}: {raw!r}",
+            )
+        if parsed is None:
+            continue
+        sequence, outcome, cause = parsed
+        other_trial = seen_sequences.get(sequence)
+        if other_trial is not None:
+            raise _phase_policy_schema_error(
+                study,
+                f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
+            )
+        seen_sequences[sequence] = trial.number
+        events.append((sequence, trial.number, outcome, cause))
+
+    events.sort()
+    max_sequence = events[-1][0] if events else 0
+    if recovery_boundary > max_sequence:
+        raise _phase_policy_schema_error(
+            study,
+            f"{PHASE_RECOVERY_ATTR!r} starts after sequence {recovery_boundary}, "
+            f"but the largest recorded sequence is {max_sequence}",
+        )
+
+    consecutive_failures = 0
+    fatal_trial_number: int | None = None
+    fatal_sequence: int | None = None
+    fatal_cause: str | None = None
+    for sequence, trial_number, outcome, cause in events:
+        if sequence <= recovery_boundary:
+            continue
+        if outcome == "success":
+            consecutive_failures = 0
+        elif outcome in {"failure", "fatal"}:
+            consecutive_failures += 1
+        if outcome == "fatal" and fatal_trial_number is None:
+            fatal_trial_number = trial_number
+            fatal_sequence = sequence
+            fatal_cause = cause
+
+    return _PhasePolicyState(
+        max_sequence=max_sequence,
+        consecutive_failures=consecutive_failures,
+        recovery_boundary=recovery_boundary,
+        recovered_abort_sequence=recovered_abort_sequence,
+        fatal_trial_number=fatal_trial_number,
+        fatal_sequence=fatal_sequence,
+        fatal_cause=fatal_cause,
+    )
+
+
 def _validate_study_schema(study: optuna.Study) -> None:
     """Initialize an empty study or reject populated incompatible storage."""
     trials = study.get_trials(deepcopy=False)
@@ -1093,6 +1279,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         return
     if version == STUDY_SCHEMA_VERSION:
+        _load_phase_policy_state(study)
         return
 
     trial_numbers = [trial.number for trial in trials]

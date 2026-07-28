@@ -28,6 +28,7 @@ from phasesweep.engine.guards import (
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _reap_stale_trials,
+    _record_stale_trial_failure,
     _register_active_attempt,
 )
 from phasesweep.engine.phase import _run_phase
@@ -37,6 +38,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
     _generation_path,
     _trial_dir_for,
 )
@@ -191,6 +193,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         # Don't actually call the real reaper; just mark FAIL.
         for t_ in args[0].get_trials(deepcopy=False):
             if t_.state == optuna.trial.TrialState.RUNNING:
+                _record_stale_trial_failure(args[0], t_)
                 args[0].tell(t_.number, state=optuna.trial.TrialState.FAIL)
         return 1
 
@@ -346,6 +349,32 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
     # state that could make the phase's budget look satisfied.
     current = yaml.safe_load(_generation_path(experiment).read_text())
     assert current["state"] == "failed"
+
+
+def test_current_schema_rejects_terminal_trial_without_policy_outcome(
+    tmp_path: Path,
+) -> None:
+    """Current-schema terminal rows must carry reconstructable policy state."""
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        experiment="missing_outcome",
+        storage=storage,
+        workdir=tmp_path / "runs",
+        n_trials=1,
+    )
+    study = optuna.create_study(
+        study_name="missing_outcome::p",
+        storage=storage,
+        direction="minimize",
+    )
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"terminal trial 0 has missing or malformed '{TRIAL_OUTCOME_ATTR}'",
+    ):
+        run_experiment(experiment)
 
 
 def test_storage_preflight_does_not_convert_shutdown_to_storage_failure(
@@ -976,6 +1005,12 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
     assert reaped == 1
     assert expected_trial_dir.parent == tmp_path / "runs" / "t" / "p"
     assert study.trials[trial.number].state == optuna.trial.TrialState.FAIL
+    assert study.trials[trial.number].user_attrs[TRIAL_OUTCOME_ATTR] == {
+        "schema_version": 1,
+        "sequence": 1,
+        "outcome": "failure",
+        "cause": "stale RUNNING trial recovered after its orchestrator stopped",
+    }
 
 
 @pytest.mark.parametrize("bad_value", ["", 123])

@@ -30,6 +30,7 @@ from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_ABORT_ATTR,
+    TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _last_successful_generation_path,
     _load_winner,
@@ -869,6 +870,90 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+
+
+def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) -> None:
+    """A random-sampler top-up continues the durable failure streak."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os, sys
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            print("x=0.5")
+        else:
+            sys.exit(1)
+        """,
+    )
+    db = tmp_path / "topup.db"
+
+    def _exp(n_trials: int) -> Experiment:
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=f"python {trainer} {{overrides}}",
+            n_trials=n_trials,
+            max_consecutive_failures=3,
+            sampler={"type": "random", "seed": 7},
+        )
+
+    first = run_experiment(_exp(3))
+    assert first["p"].metric == pytest.approx(0.5)
+    published_before = _last_successful_generation_path(_exp(3)).read_text()
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(_exp(4))
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert [trial.state.name for trial in study.trials] == ["COMPLETE", "FAIL", "FAIL", "FAIL"]
+    assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert study.user_attrs[PHASE_ABORT_ATTR]["consecutive_failures"] == 3
+    assert _last_successful_generation_path(_exp(4)).read_text() == published_before
+
+
+def test_outcome_ledger_recovers_when_abort_marker_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed marker write cannot make an identical retry publish."""
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    db = tmp_path / "abort.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db}",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=2,
+        max_consecutive_failures=2,
+        sampler={"type": "random", "seed": 7},
+    )
+
+    real_set_user_attr = optuna.Study.set_user_attr
+    failed = {"once": False}
+
+    def fail_first_abort_marker(study: optuna.Study, key: str, value: object) -> None:
+        if key == PHASE_ABORT_ATTR and isinstance(value, dict) and not failed["once"]:
+            failed["once"] = True
+            raise RuntimeError("injected abort-marker write failure")
+        real_set_user_attr(study, key, value)
+
+    monkeypatch.setattr(optuna.Study, "set_user_attr", fail_first_abort_marker)
+    with pytest.raises(RuntimeError, match="abort marker could not be persisted"):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for trial in study.trials] == [
+        "failure",
+        "failure",
+    ]
+
+    monkeypatch.setattr(optuna.Study, "set_user_attr", real_set_user_attr)
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
 
 
 def test_unsafe_cleanup_abort_is_durable_across_identical_reruns(
