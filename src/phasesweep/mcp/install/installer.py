@@ -682,6 +682,28 @@ def _apply_instructions(
         return StepResult("instructions", path, action, note=install_note)
 
 
+def _select_explicit_targets(
+    targets: Sequence[AgentTarget],
+    agent_ids: Sequence[str],
+) -> list[AgentTarget] | None:
+    """Resolve explicit agent ids once, preserving request order and reporting unknown ids.
+
+    :param Sequence[AgentTarget] targets: Supported integration targets.
+    :param Sequence[str] agent_ids: Explicit ids requested by the operator.
+    :return list[AgentTarget] | None: Deduplicated targets, or ``None`` for unknown ids.
+    """
+    by_id = {target.id: target for target in targets}
+    selected_ids = list(dict.fromkeys(agent_ids))
+    unknown = [agent_id for agent_id in selected_ids if agent_id not in by_id]
+    if unknown:
+        click.echo(
+            f"unknown coding agent id(s): {', '.join(unknown)} (choices: {', '.join(by_id)})",
+            err=True,
+        )
+        return None
+    return [by_id[agent_id] for agent_id in selected_ids]
+
+
 def _select_targets(
     project: Path, agent_ids: Sequence[str] | None, mode: Mode, yes: bool
 ) -> list[AgentTarget] | None:
@@ -697,16 +719,7 @@ def _select_targets(
     """
     targets = agent_targets(project)
     if agent_ids is not None:
-        by_id = {target.id: target for target in targets}
-        selected_ids = list(dict.fromkeys(agent_ids))
-        unknown = [agent_id for agent_id in selected_ids if agent_id not in by_id]
-        if unknown:
-            click.echo(
-                f"unknown coding agent id(s): {', '.join(unknown)} (choices: {', '.join(by_id)})",
-                err=True,
-            )
-            return None
-        return [by_id[agent_id] for agent_id in selected_ids]
+        return _select_explicit_targets(targets, agent_ids)
     detected_by_id = {target.id: target.is_detected() for target in targets}
     detected = [target for target in targets if detected_by_id[target.id]]
     if yes:
@@ -1165,16 +1178,10 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     """
     targets = agent_targets(project)
     if agent_ids is not None:
-        by_id = {target.id: target for target in targets}
-        selected_ids = list(dict.fromkeys(agent_ids))
-        unknown = [agent_id for agent_id in selected_ids if agent_id not in by_id]
-        if unknown:
-            click.echo(
-                f"unknown coding agent id(s): {', '.join(unknown)} (choices: {', '.join(by_id)})",
-                err=True,
-            )
+        selected = _select_explicit_targets(targets, agent_ids)
+        if selected is None:
             return 2
-        targets = [by_id[agent_id] for agent_id in selected_ids]
+        targets = selected
 
     click.echo("\ncheck-install report:")
     attention = 0
