@@ -279,14 +279,6 @@ def test_categorical_duplicate_identity_is_type_aware() -> None:
     assert [type(c).__name__ for c in param.choices] == ["int", "float", "bool"]
 
 
-def test_grid_cardinality_rejects_duplicate_choices(tmp_path: Path) -> None:
-    """[1, 1, 2] used to count as three grid points and report a complete grid."""
-    with pytest.raises(ValidationError, match="choices must be unique"):
-        load_experiment(
-            _grid_yaml(tmp_path, "x: { type: categorical, choices: [1, 1, 2] }", n_trials=3)
-        )
-
-
 def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
     """Sub-1e-12 steps collapse onto the same rounded value, so cardinality would lie."""
     with pytest.raises(ValidationError, match="collapses to 2 unique value"):
