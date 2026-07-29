@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.state import _winner_source_or_default
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 ResultSource: TypeAlias = Literal[
@@ -76,14 +77,14 @@ def winners_payload(
     phases: list[dict[str, Any]] = []
     for view in views:
         params, redacted = _visible_winner_params(view.params, visible_params)
-        source = view.source
+        source = _winner_source_or_default(view, view.phase)
         winner_source = {
-            "kind": source.kind if source is not None else "phase_trial",
-            "phase": source.phase if source is not None else view.phase,
-            "trial_number": (source.trial_number if source is not None else view.trial_number),
-            "study": source.study if source is not None else None,
+            "kind": source.kind,
+            "phase": source.phase,
+            "trial_number": source.trial_number,
+            "study": source.study,
         }
-        source_generation_id = source.generation_id if source is not None else view.generation_id
+        source_generation_id = source.generation_id
         winner_generation = (
             "unknown"
             if source_generation_id is None or represented_generation_id is None

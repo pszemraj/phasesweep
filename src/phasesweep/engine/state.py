@@ -10,7 +10,7 @@ import os
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import optuna
 import yaml
@@ -19,6 +19,9 @@ from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+
+if TYPE_CHECKING:
+    from phasesweep.engine.read import PhaseWinnerView
 
 log = logging.getLogger("phasesweep.engine.state")
 
@@ -110,6 +113,29 @@ class Winner:
     # remote summary subset (review v0.5.17 / finding F). None for dry-run
     # placeholders and winners persisted before the record existed.
     objective_provenance: dict[str, Any] | None = None
+
+
+def _winner_source_or_default(
+    winner: Winner | PhaseWinnerView,
+    phase: str,
+    *,
+    study: str | None = None,
+) -> WinnerSource:
+    """Return a recorded winner source or synthesize its phase-trial identity.
+
+    :param Winner | PhaseWinnerView winner: Winner carrying optional source provenance.
+    :param str phase: Exposed phase used by the fallback source.
+    :param str | None study: Optional suite study used by the fallback source.
+    :return WinnerSource: Explicit provenance or a complete ``phase_trial`` fallback.
+    """
+    return winner.source or WinnerSource(
+        kind="phase_trial",
+        phase=phase,
+        trial_number=winner.trial_number,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+        study=study,
+    )
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -1280,22 +1306,35 @@ def _save_winner(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "phase": phase_name,
-        "trial_number": winner.trial_number,
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
+        **_winner_common_payload(winner, phase_name),
+        "phase_fingerprint": winner.phase_fingerprint,
+        "objective_provenance": winner.objective_provenance,
+    }
+    _write_yaml_atomic(path, payload)
+
+
+def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+    """Serialize winner fields shared by persisted and summary representations.
+
+    :param Winner winner: Winner whose common fields should be serialized.
+    :param str phase_name: Phase exposed by this winner.
+    :return dict[str, Any]: Shared trial, parameter, evidence, identity, and source fields.
+    """
+    payload = {
+        "trial_number": winner.trial_number,
         "params": winner.params,
         "effective_overrides": winner.effective_overrides,
         "constraints": winner.constraints,
         "gates": winner.gates,
         "completion": winner.completion,
-        "phase_fingerprint": winner.phase_fingerprint,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
         "winner_source": _winner_source_payload(winner, phase_name),
-        "objective_provenance": winner.objective_provenance,
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
-    _write_yaml_atomic(path, payload)
+    return payload
 
 
 def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
@@ -1309,13 +1348,7 @@ def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
         and ``study`` keys.
     """
-    source = winner.source or WinnerSource(
-        kind="phase_trial",
-        phase=phase_name,
-        trial_number=winner.trial_number,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-    )
+    source = _winner_source_or_default(winner, phase_name)
     return {
         "kind": source.kind,
         "phase": source.phase,

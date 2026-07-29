@@ -20,7 +20,8 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _winner_source_payload,
+    _winner_common_payload,
+    _winner_source_or_default,
     constraint_attr,
 )
 
@@ -218,14 +219,7 @@ def _clone_winner_from_baseline(
     :param dict[str, Any] | None promotion: Optional promotion audit payload.
     :return Winner: Cloned winner with copied mutable payloads.
     """
-    baseline_source = baseline.source or WinnerSource(
-        kind="phase_trial",
-        phase=source_phase,
-        trial_number=baseline.trial_number,
-        generation_id=baseline.generation_id,
-        attempt_id=baseline.attempt_id,
-        study=source_study,
-    )
+    baseline_source = _winner_source_or_default(baseline, source_phase, study=source_study)
     return Winner(
         trial_number=baseline.trial_number,
         params=dict(baseline.params),
@@ -302,19 +296,9 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     """
     payload = {
         "name": name,
-        "trial_number": winner.trial_number,
         "metric": winner.metric,
-        "params": winner.params,
-        "effective_overrides": winner.effective_overrides,
-        "constraints": winner.constraints,
-        "gates": winner.gates,
-        "completion": winner.completion,
-        "generation_id": winner.generation_id,
-        "attempt_id": winner.attempt_id,
-        "winner_source": _winner_source_payload(winner, name),
+        **_winner_common_payload(winner, name),
     }
-    if winner.promotion is not None:
-        payload["promotion"] = winner.promotion
     return payload
 
 

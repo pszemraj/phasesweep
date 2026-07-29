@@ -18,6 +18,7 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
     _generation_record_path,
+    _winner_source_or_default,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 
@@ -134,13 +135,7 @@ def _winner_source_snapshot(
     :param str phase: Phase under which the winner is exposed.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
-    source = winner.source or WinnerSource(
-        kind="phase_trial",
-        phase=phase,
-        trial_number=winner.trial_number,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-    )
+    source = _winner_source_or_default(winner, phase)
     return WinnerSourceSnapshot(
         kind=source.kind,
         phase=source.phase,
