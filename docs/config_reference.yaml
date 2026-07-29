@@ -148,7 +148,7 @@
 # False rejects search_space keys named `seed` or ending in `.seed`; set true only for an explicit variance audit. Excluded from the semantic fingerprint.
 
 # gates: list[Gate] = []
-# Contract gates run first, then this list. A failed gate fails the trial unless promotion exists with requires_gates: false, in which case the result is recorded as advisory.
+# Contract gates run first, then this list. A failed gate fails the trial unless this phase has promotion.requires_gates: false, in which case the result is recorded as advisory. Suite-study promotion is applied later and cannot make component gates advisory.
 # Gate shapes are defined below.
 
 # promotion: Promotion | None = null
@@ -168,7 +168,7 @@
 #   cwd: str | None = null
 #   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null leaves the trainer in the orchestrator's invocation directory. MCP catalog entries require an absolute path here, mirroring the workdir rule.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
-#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds exactly those variables to that base set. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted — ambient values are never hashed.
+#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds exactly those variables to that base set. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.
@@ -281,7 +281,7 @@
 # Required signed improvement: baseline - candidate for minimize, candidate - baseline for maximize. Promotion occurs when improvement >= min_delta.
 
 # requires_gates: bool = true
-# True makes failed candidate gates fail trials and block promotion. False makes gates advisory and bases promotion only on metric delta.
+# For phase promotion, true makes failed candidate gates fail trials and false makes them advisory. Suite-study promotion runs after its component experiment, so false cannot rescue a trial that a component gate already failed.
 
 # on_fail: Literal["stop", "skip", "continue_baseline"] = "stop"
 # For a phase: stop raises, skip ends remaining phases with a partial result, and continue_baseline exposes a clone of the baseline winner.

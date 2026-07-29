@@ -207,16 +207,12 @@ def launch_trial(
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
-    # This file and the other three orchestrator-created per-trial artifacts
-    # below (command.txt, stdout.log, stderr.log) use plain Path.write_text /
-    # .open("w") rather than runtime.files' O_NOFOLLOW private helpers.
-    # ``workdir`` is an operator-trusted location (the configured experiment
-    # workdir), not the owner-only 0700 directory those helpers require and
-    # validate; forcing trial dirs private would break normal operator/tool
-    # visibility into logs and resolved overrides. Private control/state
-    # paths (process_identity.json, lock files) go through the hardened
-    # no-follow helpers instead — see docs/runtime.md's trust-boundary note
-    # (review v0.5.15 / item F).
+    # Every engine artifact under ``workdir``, including process-control
+    # records written later, shares this operator-trusted boundary. These
+    # files use ordinary paths rather than the validated O_NOFOLLOW helpers
+    # reserved for the lock namespace and MCP state; forcing trial dirs
+    # private would break normal operator/tool visibility into logs and
+    # resolved overrides. See docs/runtime.md's trust-boundary note.
     resolved_overrides_path = workdir / "overrides_resolved.json"
     resolved_overrides_path.write_text(
         _json_dump_overrides(overrides, strict=experiment.override_format == "json_file"),
