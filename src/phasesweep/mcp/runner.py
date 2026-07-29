@@ -20,6 +20,9 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Literal, TypeAlias
+
+from pydantic import BaseModel, ConfigDict
 
 from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
@@ -48,6 +51,41 @@ from phasesweep.runtime.process import (
     read_boot_id,
     read_proc_starttime,
 )
+
+FailureCode: TypeAlias = Literal[
+    "fingerprint_mismatch",
+    "study_schema_mismatch",
+    "storage_unavailable",
+    "sampler_continuation_unsupported",
+    "trial_target_regression",
+    "experiment_busy",
+    "trainer_failed",
+    "timeout",
+    "cleanup_uncertain",
+    "cancelled",
+    "result_snapshot_unavailable",
+    "internal_error",
+]
+FailureStage: TypeAlias = Literal["preflight", "execution", "cleanup"]
+FailureActor: TypeAlias = Literal["agent", "operator"]
+
+
+class FailureCausePayload(BaseModel):
+    """Safe secondary cause retained beneath an actionable terminal failure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: FailureCode
+    stage: FailureStage
+    retryable: bool
+    actor: FailureActor
+    remediation: str
+
+
+class FailurePayload(FailureCausePayload):
+    """Path-free terminal failure category and recovery policy."""
+
+    cause: FailureCausePayload | None = None
 
 
 def _base_failure_payload(
@@ -200,7 +238,7 @@ def _safe_failure_payload(
     payload = _base_failure_payload(error, stage=stage)
     if cause is not None and cause is not error:
         payload["cause"] = _base_failure_payload(cause, stage=stage)
-    return payload
+    return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
 def _cleanup_failure_payload(
@@ -222,7 +260,40 @@ def _cleanup_failure_payload(
     payload = _base_failure_payload(cleanup, stage="cleanup")
     if not isinstance(primary, ProcessCleanupUncertainError):
         payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
-    return payload
+    return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
+
+
+def _terminal_error(
+    report: TerminalReport | None,
+    fallback: BaseException,
+) -> tuple[BaseException, str | None]:
+    """Return the engine's primary error and stage, or the caller's fallback.
+
+    :param TerminalReport | None report: Engine terminal report, when one was delivered.
+    :param BaseException fallback: Exception caught by the runner.
+    :return tuple[BaseException, str | None]: Authoritative error and failure stage.
+    """
+    if report is None:
+        return fallback, "execution"
+    return report.primary_error or fallback, report.failure_stage
+
+
+def _terminal_failure_payload(
+    error: BaseException,
+    *,
+    stage: str | None,
+    cleanup_confirmed: bool,
+) -> dict[str, object]:
+    """Classify one terminal error, making cleanup uncertainty authoritative.
+
+    :param BaseException error: Primary terminal error.
+    :param str | None stage: Stage at which the primary error occurred.
+    :param bool cleanup_confirmed: Whether child-process cleanup was confirmed.
+    :return dict[str, object]: Validated, path-free terminal failure payload.
+    """
+    if not cleanup_confirmed:
+        return _cleanup_failure_payload(error, cause_stage=stage)
+    return _safe_failure_payload(error, stage=stage)
 
 
 def _write_status(
@@ -440,16 +511,10 @@ def main(argv: list[str] | None = None) -> int:
             status["cleanup_confirmed"] = report.cleanup_confirmed
             status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
             if report.primary_error is not None:
-                status["failure"] = (
-                    _cleanup_failure_payload(
-                        report.primary_error,
-                        cause_stage=report.failure_stage,
-                    )
-                    if not report.cleanup_confirmed
-                    else _safe_failure_payload(
-                        report.primary_error,
-                        stage=report.failure_stage,
-                    )
+                status["failure"] = _terminal_failure_payload(
+                    report.primary_error,
+                    stage=report.failure_stage,
+                    cleanup_confirmed=report.cleanup_confirmed,
                 )
             try:
                 result_snapshot = capture_result_snapshot(
@@ -479,56 +544,37 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
-        primary = (
-            terminal_report.primary_error
-            if terminal_report is not None and terminal_report.primary_error is not None
-            else exc
-        )
-        failure_stage = (
-            terminal_report.failure_stage if terminal_report is not None else "execution"
-        )
-        status["failure"] = (
-            _cleanup_failure_payload(primary, cause_stage=failure_stage)
-            if status["cleanup_confirmed"] is False
-            else _safe_failure_payload(primary, stage=failure_stage)
+        primary, failure_stage = _terminal_error(terminal_report, exc)
+        status["failure"] = _terminal_failure_payload(
+            primary,
+            stage=failure_stage,
+            cleanup_confirmed=status["cleanup_confirmed"],
         )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1
-        primary = (
-            terminal_report.primary_error
-            if terminal_report is not None and terminal_report.primary_error is not None
-            else exc
-        )
+        primary, failure_stage = _terminal_error(terminal_report, exc)
         status["error_class"] = type(exc).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else False
         )
-        status["failure"] = _cleanup_failure_payload(
+        status["failure"] = _terminal_failure_payload(
             primary,
-            cause_stage=terminal_report.failure_stage
-            if terminal_report is not None
-            else "execution",
+            stage=failure_stage,
+            cleanup_confirmed=False,
         )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
-        primary = (
-            terminal_report.primary_error
-            if terminal_report is not None and terminal_report.primary_error is not None
-            else exc
-        )
+        primary, failure_stage = _terminal_error(terminal_report, exc)
         status["error_class"] = type(primary).__name__
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed if terminal_report is not None else True
         )
-        failure_stage = (
-            terminal_report.failure_stage if terminal_report is not None else "execution"
-        )
-        status["failure"] = (
-            _cleanup_failure_payload(primary, cause_stage=failure_stage)
-            if status["cleanup_confirmed"] is False
-            else _safe_failure_payload(primary, stage=failure_stage)
+        status["failure"] = _terminal_failure_payload(
+            primary,
+            stage=failure_stage,
+            cleanup_confirmed=status["cleanup_confirmed"],
         )
         raise
     finally:

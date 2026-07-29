@@ -53,6 +53,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
+from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     RunHandle,
     RunState,
@@ -357,38 +358,6 @@ class ValidateConfigResult(_ToolPayload):
     metric: MetricPayload
     capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
-
-
-FailureCode = Literal[
-    "fingerprint_mismatch",
-    "study_schema_mismatch",
-    "storage_unavailable",
-    "sampler_continuation_unsupported",
-    "trial_target_regression",
-    "experiment_busy",
-    "trainer_failed",
-    "timeout",
-    "cleanup_uncertain",
-    "cancelled",
-    "result_snapshot_unavailable",
-    "internal_error",
-]
-
-
-class FailureCausePayload(_ToolPayload):
-    """Safe secondary cause retained beneath an actionable terminal failure."""
-
-    code: FailureCode
-    stage: Literal["preflight", "execution", "cleanup"]
-    retryable: bool
-    actor: Literal["agent", "operator"]
-    remediation: str
-
-
-class FailurePayload(FailureCausePayload):
-    """Path-free terminal failure category and recovery policy."""
-
-    cause: FailureCausePayload | None = None
 
 
 class RunPayload(_ToolPayload):
