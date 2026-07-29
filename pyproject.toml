@@ -7,7 +7,7 @@ name = "phasesweep"
 dynamic = ["version"]
 description = "YAML-driven phase-chained hyperparameter sweeps with Optuna: each phase's winner is set for all following sweeps."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Peter Szemraj" }]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -25,14 +25,13 @@ classifiers = [
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
 ]
 dependencies = [
-    "optuna>=4.0",
+    "optuna>=4.0,<4.10",
     "cmaes>=0.10",
     "pydantic>=2.0",
     "pyyaml>=6.0",
@@ -46,7 +45,6 @@ dev = [
     "pytest>=7",
     "ruff>=0.5",
     "mypy>=1.10",
-    "tomli>=2; python_version < '3.11'",
     "types-PyYAML>=6.0",
     "mcp>=1.27,<1.28",
 ]
@@ -57,6 +55,7 @@ phasesweep-mcp = "phasesweep.mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/phasesweep"
+Documentation = "https://github.com/pszemraj/phasesweep/tree/main/docs"
 Repository = "https://github.com/pszemraj/phasesweep.git"
 Issues = "https://github.com/pszemraj/phasesweep/issues"
 
@@ -65,10 +64,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"phasesweep.mcp" = ["agent_prompt.md"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 extend-exclude = ["examples/tiny_decoder_enwik8/upstream"]
 
 [tool.ruff.lint]

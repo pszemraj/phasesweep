@@ -19,6 +19,7 @@ from phasesweep.config import (
     FloatParam,
     IntParam,
     JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
@@ -39,7 +40,7 @@ def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: p
             n_trials: {n_trials}
@@ -126,7 +127,7 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -166,6 +167,12 @@ def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
             "x: { type: categorical, choices: [1, 2, 3] }",
             2,
             "grid sampler has 3 combinations",
+        ),
+        (
+            "over_budget",
+            "x: { type: categorical, choices: [1, 2] }",
+            3,
+            "n_trials=3 exceeds the grid cardinality 2",
         ),
     ]
 
@@ -220,7 +227,7 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 2
@@ -233,6 +240,57 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
     load_experiment(p)
 
 
+def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None:
+    """Partial-grid mode permits a subset, not an impossible oversized budget."""
+    with pytest.raises(ValidationError, match="n_trials=4 exceeds the grid cardinality 3"):
+        load_experiment(
+            write_yaml(
+                tmp_path,
+                """
+                experiment: t
+                trial_command: "echo {overrides}"
+                metric:
+                  name: x
+                  goal: minimize
+                  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+                phases:
+                  - name: p
+                    n_trials: 4
+                    sampler: { type: grid }
+                    allow_partial_grid: true
+                    search_space:
+                      x: { type: categorical, choices: [1, 2, 3] }
+                """,
+            )
+        )
+
+
+def test_categorical_choices_reject_duplicates() -> None:
+    """A repeated choice inflates cardinality and skews sampling weight."""
+    with pytest.raises(ValidationError, match="choices must be unique"):
+        CategoricalParam(type="categorical", choices=[1, 1, 2])
+    with pytest.raises(ValidationError, match="index 0 and index 2"):
+        CategoricalParam(type="categorical", choices=["a", "b", "a"])
+
+
+def test_categorical_duplicate_identity_is_type_aware() -> None:
+    """1, 1.0, and true compare equal in Python but are distinct trainer overrides."""
+    param = CategoricalParam(type="categorical", choices=[1, 1.0, True])
+    assert [type(c).__name__ for c in param.choices] == ["int", "float", "bool"]
+
+
+def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
+    """Sub-1e-12 steps collapse onto the same rounded value, so cardinality would lie."""
+    with pytest.raises(ValidationError, match="collapses to 2 unique value"):
+        load_experiment(
+            _grid_yaml(
+                tmp_path,
+                "x: { type: float, low: 0.0, high: 1.0e-12, step: 1.0e-13 }",
+                n_trials=11,
+            )
+        )
+
+
 def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
     """A key cannot be both fixed_overrides and search_space in the same phase."""
     p = write_yaml(
@@ -243,7 +301,7 @@ def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> N
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -328,37 +386,13 @@ def test_rejects_dotted_prefix_collisions() -> None:
             Experiment(
                 experiment=f"t_{case}",
                 trial_command="echo {overrides}",
-                metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
+                    )
+                ),
                 phases=phases,
             )
-
-
-def test_yaml_load_rejects_prefix_collision(tmp_path: Path) -> None:
-    """End-to-end: load_experiment surfaces the prefix-collision error."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          extractor:
-            type: json
-            path: r.json
-            key: x
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              model: llama
-            search_space:
-              model.depth:
-                type: int
-                low: 8
-                high: 32
-        """)
-    )
-    with pytest.raises(ValueError, match="namespace collision"):
-        load_experiment(p)
 
 
 @pytest.mark.parametrize(
@@ -492,31 +526,6 @@ def test_trial_command_accepts_supported_templates() -> None:
         build()
 
 
-def test_yaml_load_surfaces_template_error(tmp_path: Path) -> None:
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {trail_dir} {overrides}"
-        metric:
-          extractor:
-            type: json
-            path: r.json
-            key: x
-        phases:
-          - name: p
-            n_trials: 1
-            search_space:
-              x:
-                type: int
-                low: 0
-                high: 1
-        """)
-    )
-    with pytest.raises(ValueError, match="unknown placeholder"):
-        load_experiment(p)
-
-
 def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> None:
     """Sanity: the strict loader rejects duplicates *within* a mapping, not
     across siblings. Two phases each with their own ``n_trials`` is fine.
@@ -524,11 +533,12 @@ def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> N
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1
@@ -617,13 +627,7 @@ def test_search_space_accepts_well_formed_keys() -> None:
 def test_cmaes_phase_rejected_at_config_load_when_package_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``phasesweep validate`` must catch a cmaes-without-cmaes-installed
-    config; pre-v0.5.7 this fired only at first trial launch.
-
-    We simulate the missing package by intercepting the import. The
-    validator then surfaces a ``ValueError`` (raised through pydantic
-    ``ValidationError``) at ``Experiment(...)`` construction time.
-    """
+    """CMA-ES availability is part of config validation, not first-trial launch."""
     import builtins
 
     real_import = builtins.__import__
@@ -643,8 +647,7 @@ def test_cmaes_phase_rejected_at_config_load_when_package_missing(
 
 
 def test_cmaes_phase_loads_when_package_present() -> None:
-    """Sanity: a cmaes phase loads cleanly with the packaged dependency."""
-
+    """A CMA-ES phase loads when the base dependency is importable."""
     import cmaes  # noqa: F401
 
     exp = make_experiment(
@@ -658,11 +661,12 @@ def test_inherit_search_space_collision_errors(tmp_path):
     body = """
 experiment: t
 storage: ":memory:"
+provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 metric:
   name: loss
   goal: minimize
-  extractor: { type: json, path: r.json, key: loss }
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
 phases:
   - name: a
     n_trials: 1

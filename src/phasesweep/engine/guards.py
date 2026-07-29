@@ -7,34 +7,93 @@ import hashlib
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import optuna
 
-from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
-from phasesweep.engine.optuna import _create_phase_study
+from phasesweep.engine.errors import (
+    ExperimentLockBusyError,
+    SamplerContinuationUnsupportedError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrialTargetRegressionError,
+)
+from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    GENERATION_ID_ATTR,
+    PHASE_FINGERPRINT_ATTR,
+    PHASE_RECOVERY_ATTR,
+    PHASE_RECOVERY_SCHEMA_VERSION,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+    TRIAL_TARGET_ATTR,
     Winner,
+    _attempts_dir,
     _experiment_dir,
     _suite_dir,
     _trial_dir_for,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
+    atomic_write_text,
     canonical_storage_identity,
     exclusive_lock,
+    storage_is_in_memory,
     try_lock_file,
     unlock_file,
 )
 from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
-from phasesweep.runtime.process import kill_stale_group, read_stale_process_identity
+from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    AttemptLifecycle,
+    StaleProcessIdentity,
+    cleanup_stale_trial_process,
+    read_attempt_lifecycle,
+    read_stale_process_identity,
+)
+
+_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "fatal"})
+
+
+@dataclass(frozen=True)
+class _PhasePolicyState:
+    """Failure-policy state reconstructed from durable per-trial outcomes."""
+
+    max_sequence: int
+    consecutive_failures: int
+    recovered_abort_sequence: int | None
+    fatal_trial_number: int | None
+    fatal_sequence: int | None
+    fatal_cause: str | None
+
+
+@dataclass
+class _PreflightCleanupReport:
+    """Cleanup evidence accumulated while inspecting all existing phase studies."""
+
+    cleanup_confirmed: bool = True
+    recovered_attempt_ids: set[str] = field(default_factory=set)
+    uncertain_attempt_ids: set[str] = field(default_factory=set)
+    error: BaseException | None = None
+
+    def mark_uncertain(self, error: BaseException) -> None:
+        """Record the first cleanup uncertainty and fail the aggregate closed."""
+        self.cleanup_confirmed = False
+        if self.error is None:
+            self.error = error
 
 
 def _lock_digest(material: dict[str, Any]) -> str:
@@ -54,12 +113,18 @@ def _lock_digest(material: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def _lock_path_from_material(experiment: Experiment, material: dict[str, str], label: str) -> Path:
+def _lock_path_from_material(name: str, material: dict[str, str], label: str) -> Path:
     """Lock path under the configured host lock directory.
 
+    ``name`` is part of the lock *filename*, so two configs whose material
+    hashes identically still miss each other unless their name components
+    match too. Callers must therefore derive it from the same identity the
+    material keys on — the resolved output namespace for the output lock —
+    not from an arbitrary spelling of it (review v0.5.17 gap hunt).
+
     Args:
-        experiment: Parsed experiment config; the experiment name is part of
-            the filename for human readability.
+        name: Human-readable identity prefix, derived from the lock material's
+            own identity.
         material: Lock-material dict produced by :func:`_lock_material` or
             similar; hashed into the digest segment.
         label: A short human-readable label (``"output"``, ``"storage"``,
@@ -70,7 +135,7 @@ def _lock_path_from_material(experiment: Experiment, material: dict[str, str], l
         created here; ``open(...).flock()`` does that lazily).
 
     """
-    return _lock_dir() / f"{experiment.experiment}__{label}__{_lock_digest(material)}.lock"
+    return _lock_dir() / f"{name}__{label}__{_lock_digest(material)}.lock"
 
 
 def _output_lock_material(experiment: Experiment) -> dict[str, str]:
@@ -89,7 +154,13 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
         Lock-material dict keyed on the resolved experiment directory.
 
     """
-    return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment))}
+    # Resolve the FULL directory, leaf included: _experiment_dir resolves only
+    # the workdir prefix before appending the experiment name, so a symlinked
+    # experiment leaf (runs/expA -> runs/expB) would otherwise mint a second
+    # lock identity for one physical namespace — and the second orchestrator's
+    # preflight would reap the first one's live trials (review v0.5.17 gap
+    # hunt). A leaf that does not exist yet resolves to itself.
+    return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment).resolve())}
 
 
 def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
@@ -107,6 +178,13 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
         when storage is in-memory.
 
     """
+    if storage_is_in_memory(experiment.storage):
+        # In-memory URLs (``sqlite:///:memory:`` and spellings thereof) have
+        # no shared backend to guard; locking their canonical identity would
+        # make two unrelated in-memory runs that share an experiment name
+        # contend on a lock naming a backend that does not exist (review
+        # v0.5.17 gap hunt).
+        return None
     storage_identity = canonical_storage_identity(experiment.storage)
     if storage_identity is None:
         return None
@@ -134,16 +212,22 @@ def _run_lock_paths(experiment: Experiment) -> list[Path]:
         in-memory storage, 2 (output + storage) otherwise.
 
     """
-    materials: list[tuple[str, dict[str, str]]] = [
-        ("output", _output_lock_material(experiment)),
+    # The output lock's filename prefix comes from the RESOLVED namespace
+    # leaf, not the configured experiment name: a symlinked experiment leaf
+    # spells the same physical directory differently, and a prefix mismatch
+    # alone would split the lock even with identical material (review
+    # v0.5.17 gap hunt).
+    paths = [
+        _lock_path_from_material(
+            _experiment_dir(experiment).resolve().name,
+            _output_lock_material(experiment),
+            "output",
+        )
     ]
     storage_material = _storage_run_lock_material(experiment)
     if storage_material is not None:
-        materials.append(("storage", storage_material))
-    return sorted(
-        (_lock_path_from_material(experiment, m, label) for label, m in materials),
-        key=str,
-    )
+        paths.append(_lock_path_from_material(experiment.experiment, storage_material, "storage"))
+    return sorted(paths, key=str)
 
 
 @contextlib.contextmanager
@@ -172,7 +256,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         ``None``. Use as ``with _experiment_lock(exp): ...``.
 
     Raises:
-        RuntimeError: Another phasesweep process holds one of the required
+        ExperimentLockBusyError: Another phasesweep process holds one of the required
             locks (output namespace or storage identity).
 
     """
@@ -182,7 +266,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         for path in paths:
             handle = try_lock_file(path)
             if handle is None:
-                raise RuntimeError(
+                raise ExperimentLockBusyError(
                     f"Another phasesweep process appears to be using the same "
                     f"experiment backend or output namespace for "
                     f"{experiment.experiment!r} (lock file: {path}). phasesweep "
@@ -240,6 +324,134 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
+# v3 / v2 / v2: the execution contract (resolved trainer cwd + declared
+# env-inheritance) joined every semantic fingerprint (review v0.5.17 /
+# blocker 4), and whole_node phases additionally fingerprint their configured
+# device-set size — the trainer's world size (review v0.5.17 gap hunt).
+# Existing populated studies from earlier schemas fail the fingerprint check
+# on resume; see docs/config.md's upgrade section.
+FINGERPRINT_SCHEMA_VERSION = 3
+SUITE_FINGERPRINT_SCHEMA_VERSION = 2
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 2
+
+
+def _execution_identity(experiment: Experiment) -> dict[str, Any]:
+    """Return the execution contract's contribution to semantic fingerprints.
+
+    The trainer's working directory and ambient-environment inheritance are
+    semantic inputs: two invocations differing in either can evaluate
+    different code or data under one study (review v0.5.17 / blocker 4). A
+    configured cwd contributes its RESOLVED path — a relative cwd invoked
+    from two directories is two different execution contexts and must not
+    share a study. An unconfigured cwd is recorded as ``None`` (explicitly
+    unbound, the documented historical behavior). Ambient variable *values*
+    are never hashed — they may hold secrets and are not declared semantic;
+    put semantic values in ``env``, which is fingerprinted.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :return dict[str, Any]: JSON-serialisable execution-identity payload.
+    """
+    contract = experiment.execution.inherit_env
+    return {
+        "cwd": (
+            None
+            if experiment.execution.cwd is None
+            else str(Path(experiment.execution.cwd).expanduser().resolve())
+        ),
+        "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
+    }
+
+
+def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
+    """Hash the experiment semantics that give a published result its meaning.
+
+    Stamped into each generation's summary manifest so reads can tell
+    whether the config supplied *today* still matches the config that
+    produced a published result (review v0.5.16 / blocker 4) — metric
+    name/goal/extractor, constraints, trial command, env, provenance, and
+    every phase's ordered semantic identity all contribute. Run-control
+    fields (``n_trials`` top-ups, throughput knobs, comments) are excluded
+    for the same reason :data:`_RUN_CONTROL_KEYS` excludes them from phase
+    fingerprints: they never change what the published numbers mean, so they
+    must not flag a published result as reinterpreted.
+
+    :param Experiment experiment: Parsed experiment config to fingerprint.
+    :return str: SHA-256 hex digest (64 characters) of the canonicalised
+        semantic payload.
+    """
+    payload = {
+        "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        "experiment": experiment.experiment,
+        "trial_command": experiment.trial_command,
+        "override_format": experiment.override_format,
+        "env": dict(sorted(experiment.env.items())),
+        "execution": _execution_identity(experiment),
+        "provenance": dict(sorted(experiment.provenance.items())),
+        "metric": experiment.metric.model_dump(mode="json"),
+        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        "contracts": {
+            name: contract.model_dump(mode="json")
+            for name, contract in sorted(experiment.contracts.items())
+        },
+        "phases": [
+            {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
+    """Return one phase's model dump reduced to its semantic fields.
+
+    ``gpu_ids``/``gpu_devices`` are run-control (which card runs a trial does
+    not change its meaning) — except under ``whole_node``, where the configured
+    device-set SIZE is the trainer's world size and therefore semantic: a
+    4-GPU DDP evaluation and a 1-GPU evaluation of the same phase must not
+    share a study (review v0.5.17 gap hunt). Only the count joins the
+    fingerprint, so respelling the same set (indices vs UUIDs) or moving
+    hosts does not invalidate a study.
+
+    :param Phase phase: Phase whose semantic payload is being built.
+    :return dict[str, Any]: JSON-serializable semantic phase payload.
+    """
+    dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
+    if phase.gpu_policy == "whole_node":
+        tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
+        dump["whole_node_device_count"] = len(tokens or [])
+    return dump
+
+
+def _suite_fingerprint(suite: Suite) -> str:
+    """Hash the fully compiled suite plan, including historical annotations.
+
+    Args:
+        suite: Parsed suite config; each study's name, dependency edges,
+            promotion rule, and fully resolved experiment contribute to the
+            digest.
+
+    Returns:
+        SHA-256 hex digest (64 characters) of the canonicalised suite payload.
+        Stamped onto suite-generation records to detect incompatible suite edits.
+
+    """
+    payload = {
+        "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
+        "suite": suite.suite,
+        "studies": [
+            {
+                "name": study.name,
+                "depends_on": study.depends_on,
+                "promotion": (
+                    None if study.promotion is None else study.promotion.model_dump(mode="json")
+                ),
+                "experiment": suite.experiment_for_study(study).model_dump(mode="json"),
+            }
+            for study in suite.studies
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _phase_semantic_payload(
@@ -262,18 +474,18 @@ def _phase_semantic_payload(
             ``effective_overrides`` are part of this phase's identity.
 
     Returns:
-        A JSON-serialisable dict whose contents fully determine trial meaning
-        for the phase. Stable across irrelevant config edits, varies on
-        anything that would change a trial's outcome.
+        A JSON-serialisable dict containing the configured trial semantics and
+        operator-declared external provenance.
 
     """
-    phase_dump = phase.model_dump(mode="json")
-    semantic_phase = {k: v for k, v in phase_dump.items() if k not in _RUN_CONTROL_KEYS}
+    semantic_phase = _semantic_phase_dump(phase)
     return {
-        "phasesweep_version": __version__,
+        "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         "trial_command": experiment.trial_command,
+        "provenance": dict(sorted(experiment.provenance.items())),
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
+        "execution": _execution_identity(experiment),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
         "contracts": {
@@ -320,7 +532,7 @@ def _verify_fingerprint(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-) -> None:
+) -> str:
     """Stamp a fresh study with its fingerprint or fail on mismatch.
 
     Args:
@@ -333,17 +545,35 @@ def _verify_fingerprint(
         RuntimeError: The study already has a fingerprint and it does not
             match the current computed value (incompatible config edit).
 
+    Returns:
+        The verified fingerprint.
+
     """
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
-    existing = study.user_attrs.get("phasesweep_fingerprint")
+    existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
     if existing is None:
-        study.set_user_attr("phasesweep_fingerprint", fp)
+        study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:
-        raise RuntimeError(
+        # A zero-trial study must not permanently bind its semantic identity:
+        # nothing was ever evaluated under the old fingerprint, so rebinding
+        # cannot mix results. This includes a process that died after recording
+        # its trial target but before Optuna created the first trial.
+        if not study.get_trials(deepcopy=False):
+            log.warning(
+                "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
+                "ever ran under the previous config.",
+                study.study_name,
+                existing,
+                fp,
+            )
+            study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
+            return fp
+        raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
             f"old study, or rename the phase."
         )
+    return fp
 
 
 log = logging.getLogger("phasesweep.engine.guards")
@@ -400,118 +630,923 @@ def _trial_dir_for_reaping(
     return Path(stored)
 
 
-def _confirm_or_reap_stale_trials(
+def _read_trial_process_identity(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+) -> StaleProcessIdentity:
+    """Read one complete process identity bound to its persisted attempt.
+
+    :param optuna.trial.FrozenTrial trial: RUNNING or terminal trial whose
+        process identity is being read for stale-trial recovery.
+    :param Path trial_dir: Persisted trial directory expected to contain the
+        durable process identity files.
+    :param str study_name: Study name, used only for diagnostics.
+    :return StaleProcessIdentity: Process identity bound to the trial's
+        persisted attempt id.
+    :raises ProcessCleanupUncertainError: The trial has no valid persisted
+        attempt id, or its durable process identity is missing, malformed,
+        partial, or belongs to a different attempt.
+    """
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+        )
+    try:
+        return read_stale_process_identity(
+            trial_dir,
+            expected_attempt_id=attempt_id,
+        )
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: its durable "
+            f"process identity is missing, malformed, partial, or belongs to another attempt. "
+            f"trial_dir={trial_dir}."
+        ) from exc
+
+
+ATTEMPT_REGISTRY_SCHEMA_VERSION = 1
+_ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "experiment",
+        "phase",
+        "study_name",
+        "storage",
+        "trial_number",
+        "trial_dir",
+        "generation_id",
+    }
+)
+
+
+def _register_active_attempt(
+    experiment: Experiment,
+    *,
+    attempt_id: str,
+    phase_name: str,
+    study_name: str,
+    trial_number: int,
+    trial_dir: Path,
+    generation_id: str,
+) -> None:
+    """Best-effort durable registration of a newly allocated attempt.
+
+    The entry binds the attempt to the *producing* phase name, study name,
+    and storage URL, so preflight can find and resolve it even after the
+    phase was renamed or removed, or the storage URL changed (review
+    v0.5.17 / blocker 3). A write failure only loses that cross-config
+    coverage for this attempt — the per-phase reaper still recovers it under
+    the same config — so it is logged, not raised.
+
+    Args:
+        experiment: Parsed experiment config (supplies the registry root).
+        attempt_id: Immutable attempt identity; also the entry filename.
+        phase_name: Phase the attempt belongs to, as configured *now*.
+        study_name: Fully qualified Optuna study name.
+        trial_number: Optuna trial number bound to this attempt.
+        trial_dir: Resolved per-trial directory holding lifecycle/identity.
+        generation_id: Engine invocation identity.
+
+    """
+    entry = {
+        "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "experiment": experiment.experiment,
+        "phase": phase_name,
+        "study_name": study_name,
+        "storage": experiment.storage,
+        "trial_number": trial_number,
+        "trial_dir": str(trial_dir),
+        "generation_id": generation_id,
+    }
+    try:
+        attempts_dir = _attempts_dir(experiment)
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            attempts_dir / f"{attempt_id}.json",
+            json.dumps(entry, sort_keys=True) + "\n",
+        )
+    except OSError:
+        log.warning(
+            "Could not register active attempt %s in the experiment attempt "
+            "registry; recovery after a phase rename/removal will not see it.",
+            attempt_id,
+        )
+
+
+def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
+    """Best-effort removal of a registry entry whose trial is durably terminal.
+
+    Args:
+        experiment: Parsed experiment config (supplies the registry root).
+        attempt_id: Attempt whose Optuna trial reached a terminal state.
+
+    """
+    with contextlib.suppress(OSError):
+        (_attempts_dir(experiment) / f"{attempt_id}.json").unlink(missing_ok=True)
+
+
+def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
+    """Load and validate one attempt registry entry.
+
+    :param Path entry_path: Registry entry file to parse.
+    :return dict[str, Any]: The validated entry payload.
+    :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
+        — recovery cannot know whether a process from it is still alive.
+    """
+    try:
+        payload = strict_json_loads(entry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} is unreadable or malformed. "
+            "Recovery cannot prove whether a process from this attempt is still "
+            "alive. Investigate the attempt's trial directory, then delete the "
+            "entry file if you are certain nothing is running."
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
+        or payload.get("schema_version") != ATTEMPT_REGISTRY_SCHEMA_VERSION
+        or not isinstance(payload.get("attempt_id"), str)
+        or not isinstance(payload.get("trial_dir"), str)
+        or not isinstance(payload.get("study_name"), str)
+        or type(payload.get("trial_number")) is not int
+    ):
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has an unsupported or partial "
+            "schema. Delete the entry file only if you are certain no process "
+            "from this attempt is running."
+        )
+    return payload
+
+
+def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Path) -> None:
+    """Prove no live process can remain from one registered attempt.
+
+    Mirrors :func:`_resolve_attempt_for_reaping` but works from the registry
+    entry instead of Optuna user attrs, so it needs neither the producing
+    phase to still exist in the config nor the producing storage to be
+    reachable.
+
+    :param dict[str, Any] entry: Validated registry entry payload.
+    :param Path entry_path: Entry file, used only for diagnostics.
+    :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
+    """
+    attempt_id = entry["attempt_id"]
+    trial_dir = Path(entry["trial_dir"])
+    if not trial_dir.is_dir():
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} points at a missing trial "
+            f"directory {trial_dir}; its process state cannot be verified. "
+            "Delete the entry file only if you are certain nothing is running."
+        )
+    try:
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has a malformed lifecycle record in {trial_dir}."
+        ) from exc
+    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+        return
+    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+        return
+    try:
+        identity = read_stale_process_identity(trial_dir, expected_attempt_id=attempt_id)
+    except (OSError, ValueError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} has a missing or malformed "
+            f"process identity in {trial_dir}."
+        ) from exc
+    if not cleanup_stale_trial_process(identity):
+        raise ProcessCleanupUncertainError(
+            f"Registered attempt {attempt_id} (phase {entry['phase']!r}, from "
+            f"{entry_path}) may still have a live process group. "
+            f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}. "
+            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
+            "re-run phasesweep."
+        )
+    log.warning(
+        "Cleared orphaned group for registered attempt %s (pid=%s pgid=%s)",
+        attempt_id,
+        identity.pid,
+        identity.pgid,
+    )
+
+
+def _parsed_trial_outcome(value: Any) -> tuple[int, str, str | None] | None:
+    """Return the ordered outcome fields when a trial attr is well formed.
+
+    :param Any value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
+    :return tuple[int, str, str | None] | None: ``(sequence, outcome, cause)``
+        when ``value`` is a dict with the current schema version, a positive
+        int ``sequence``, an ``outcome`` in :data:`_TRIAL_OUTCOMES`, and a
+        ``cause`` that is ``None`` or ``str``; ``None`` otherwise.
+    """
+    if not isinstance(value, dict):
+        return None
+    schema_version = value.get("schema_version")
+    sequence = value.get("sequence")
+    outcome = value.get("outcome")
+    cause = value.get("cause")
+    if (
+        schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
+        or type(sequence) is not int
+        or sequence < 1
+        or outcome not in _TRIAL_OUTCOMES
+        or (cause is not None and not isinstance(cause, str))
+    ):
+        return None
+    return sequence, outcome, cause
+
+
+def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Persist a failure-policy outcome before marking a stale trial ``FAIL``.
+
+    An objective may have written its outcome immediately before the
+    orchestrator died. Preserve a recorded fatal exception; convert a
+    not-yet-committed success/prune to failure because recovery is about to
+    commit the trial as ``FAIL``. Malformed or duplicate records are replaced
+    with a fresh sequence so current-schema validation can still diagnose any
+    other corrupt row without stranding this stale process.
+
+    :param optuna.Study study: Study containing ``trial``, used to read every
+        trial's recorded outcome and assign a fresh sequence if needed.
+    :param optuna.trial.FrozenTrial trial: Stale RUNNING trial about to be
+        marked ``FAIL``.
+    :raises RuntimeError: The outcome could not be written to trial user
+        attrs; the trial is left ``RUNNING`` rather than risk silently
+        dropping the failure from ``max_consecutive_failures``.
+    """
+    trials = study.get_trials(deepcopy=False)
+    parsed_by_trial = {
+        candidate.number: parsed
+        for candidate in trials
+        if (parsed := _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR)))
+        is not None
+    }
+    used_sequences = [parsed[0] for parsed in parsed_by_trial.values()]
+    existing = parsed_by_trial.get(trial.number)
+    if existing is not None and used_sequences.count(existing[0]) == 1:
+        sequence, outcome, cause = existing
+        if outcome not in {"failure", "fatal"}:
+            outcome = "failure"
+            cause = "orchestrator stopped before Optuna committed the terminal trial state"
+    else:
+        sequence = max(used_sequences, default=0) + 1
+        outcome = "failure"
+        cause = "stale RUNNING trial recovered after its orchestrator stopped"
+
+    payload: dict[str, Any] = {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+    }
+    if cause is not None:
+        payload["cause"] = cause
+    try:
+        active_trial = optuna.Trial(study, trial._trial_id)
+        active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Process cleanup completed for stale RUNNING trial {trial.number} in study "
+            f"{study.study_name!r}, but its durable failure outcome could not be recorded. "
+            "The trial remains RUNNING so a later retry cannot silently omit this failure "
+            "from max_consecutive_failures."
+        ) from exc
+
+
+def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) -> str:
+    """Mark the entry's Optuna trial FAIL through its *recorded* storage.
+
+    Uses the study name and storage URL captured at allocation, not the
+    current config, so a renamed phase or changed storage URL still reaches
+    the right study.
+
+    :param dict[str, Any] entry: Validated registry entry payload.
+    :param Path entry_path: Entry file, used only for diagnostics.
+    :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
+        ``"terminal"`` when nothing needed to change (trial already terminal,
+        study gone, or in-memory storage), or ``"unreachable"`` when the
+        recorded storage could not be reached and the entry must be retained
+        for a later retry.
+    """
+    storage_url = entry["storage"]
+    if storage_url is None:
+        # In-memory storage died with its orchestrator; nothing to update.
+        return "terminal"
+    from phasesweep.engine.optuna import _resolve_storage
+
+    try:
+        study = optuna.load_study(
+            study_name=entry["study_name"],
+            storage=_resolve_storage(storage_url),
+        )
+    except KeyError:
+        # The study no longer exists; there is no RUNNING trial to fix.
+        return "terminal"
+    except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
+        log.warning(
+            "Attempt registry entry %s references storage that cannot be "
+            "reached right now; the stale trial will be retried on a later run.",
+            entry_path,
+        )
+        return "unreachable"
+    trials = study.get_trials(deepcopy=False)
+    trial = next((t for t in trials if t.number == entry["trial_number"]), None)
+    if trial is None or trial.state != optuna.trial.TrialState.RUNNING:
+        return "terminal"
+    if trial.user_attrs.get(ATTEMPT_ID_ATTR) != entry["attempt_id"]:
+        # The RUNNING trial belongs to a different attempt than this entry;
+        # leave it for that attempt's own recovery evidence.
+        return "terminal"
+    _record_stale_trial_failure(study, trial)
+    try:
+        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
+            f"but its stale RUNNING trial {trial.number} in study "
+            f"{entry['study_name']!r} could not be marked FAIL. Refusing to "
+            "continue with an inconsistent study."
+        ) from exc
+    log.warning(
+        "Reaped stale RUNNING trial %d in study %s via the attempt registry",
+        trial.number,
+        entry["study_name"],
+    )
+    return "reaped"
+
+
+def _preflight_active_attempts(
+    experiment: Experiment,
+    report: _PreflightCleanupReport,
+) -> None:
+    """Resolve every registered nonterminal attempt before any launch.
+
+    Runs before the per-phase study loop and is deliberately independent of
+    the current phase graph: a stale attempt whose phase was renamed or
+    removed, or whose storage URL changed, is still discovered, its process
+    group verified/cleaned, and its recorded study repaired (review v0.5.17 /
+    blocker 3).
+
+    :param Experiment experiment: Parsed experiment whose registry is scanned.
+    :param _PreflightCleanupReport report: Shared cleanup-evidence collector.
+    :raises ProcessCleanupUncertainError: A registered attempt could not be
+        proven safe.
+    """
+    attempts_dir = _attempts_dir(experiment)
+    if not attempts_dir.is_dir():
+        return
+    for entry_path in sorted(attempts_dir.glob("*.json")):
+        entry = _load_attempt_entry(entry_path)
+        attempt_id = entry["attempt_id"]
+        try:
+            _registry_attempt_process_is_resolved(entry, entry_path)
+        except ProcessCleanupUncertainError as exc:
+            report.uncertain_attempt_ids.add(attempt_id)
+            report.mark_uncertain(exc)
+            raise
+        outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+        if outcome == "reaped":
+            report.recovered_attempt_ids.add(attempt_id)
+        if outcome != "unreachable":
+            with contextlib.suppress(OSError):
+                entry_path.unlink(missing_ok=True)
+
+
+def _attempt_lifecycle_for_reaping(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+) -> AttemptLifecycle | None:
+    """Read the durable attempt lifecycle record bound to a stale trial.
+
+    :param optuna.trial.FrozenTrial trial: Trial being inspected for recovery.
+    :param Path trial_dir: Persisted trial directory.
+    :param str study_name: Study name, used only for diagnostics.
+    :return AttemptLifecycle | None: Validated record, or ``None`` for legacy
+        attempts that never wrote one.
+    :raises ProcessCleanupUncertainError: The trial has no valid persisted
+        attempt id, or the record is malformed or belongs to another attempt.
+    """
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+        )
+    try:
+        return read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to recover trial {trial.number} in study {study_name}: its attempt "
+            f"lifecycle record is malformed or belongs to another attempt. "
+            f"trial_dir={trial_dir}."
+        ) from exc
+
+
+def _resolve_attempt_for_reaping(
+    trial: optuna.trial.FrozenTrial,
+    trial_dir: Path,
+    study_name: str,
+    *,
+    inspect_only: bool = False,
+) -> None:
+    """Prove that failing one stale RUNNING trial cannot leak a live process.
+
+    Resolution order (review v0.5.17 / blocker 2):
+
+    1. A durable ``exited`` lifecycle with confirmed cleanup means the
+       supervised group was already proven gone by the launching orchestrator
+       — the crash landed between process exit and the Optuna terminal
+       commit. Safe to fail without signalling anything.
+    2. A retained process identity means a process was launched — verify and
+       clean it the fail-closed way.
+    3. A durable ``allocated`` lifecycle with no identity means no process
+       was ever created (the worker died queued for a GPU). Safe to fail.
+    4. Anything else keeps today's fail-closed behavior.
+
+    :param optuna.trial.FrozenTrial trial: Stale RUNNING trial being resolved.
+    :param Path trial_dir: Persisted trial directory.
+    :param str study_name: Study name, used only for diagnostics.
+    :param bool inspect_only: When ``True``, never signal a process — only
+        prove the same resolution the confirming call would take (used by
+        ``mcp recover-run`` preflight).
+    :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
+    """
+    lifecycle = _attempt_lifecycle_for_reaping(trial, trial_dir, study_name)
+    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+        log.warning(
+            "Trial %d in study %s exited (rc=%s) before its terminal state was "
+            "committed; failing it without signalling.",
+            trial.number,
+            study_name,
+            lifecycle.return_code,
+        )
+        return
+    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+        # A missing identity is exactly what 'allocated' predicts: the worker
+        # died queued (e.g. waiting for a GPU) before any process existed. A
+        # present-but-unreadable identity instead falls through to the strict
+        # reader below and fails closed — a launch had begun.
+        log.warning(
+            "Trial %d in study %s was allocated but no process was ever launched "
+            "(orchestrator died while queued); failing it without signalling.",
+            trial.number,
+            study_name,
+        )
+        return
+    identity = _read_trial_process_identity(trial, trial_dir, study_name)
+    if inspect_only:
+        return
+    safe_to_fail = cleanup_stale_trial_process(identity)
+    if not safe_to_fail:
+        raise ProcessCleanupUncertainError(
+            f"Refusing to mark RUNNING trial {trial.number}: stale process cleanup "
+            f"could not prove the process group is gone. trial_dir={trial_dir} "
+            f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
+            "process may still be holding GPU memory. Investigate "
+            f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
+            f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
+            "phasesweep."
+        )
+    log.warning(
+        "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
+        trial.number,
+        identity.pid,
+        identity.pgid,
+    )
+
+
+def _reap_stale_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
     *,
-    reap: bool,
+    recovered_attempt_ids: set[str] | None = None,
+    uncertain_attempt_ids: set[str] | None = None,
 ) -> int:
-    """Confirm cleanup for RUNNING trials and optionally mark them failed."""
+    """Mark RUNNING trials as FAIL after killing orphaned process groups.
+
+    :param optuna.Study study: Study whose stale RUNNING trials should be reaped.
+    :param Experiment experiment: Experiment used to locate trial directories.
+    :param str phase_name: Name of the phase containing the stale trials.
+    :param set[str] | None recovered_attempt_ids: Optional collector for exact
+        attempt identities whose durable state was changed to FAIL.
+    :param set[str] | None uncertain_attempt_ids: Optional collector for exact
+        attempt identities whose cleanup could not be proven.
+    :return int: Number of stale RUNNING trials marked as failed.
+    """
     count = 0
-    for trial in study.get_trials(deepcopy=False):
+    try:
+        trials = study.get_trials(deepcopy=False)
+    except Exception as exc:
+        raise ProcessCleanupUncertainError(
+            f"Could not inspect study {study.study_name!r} for stale RUNNING trials."
+        ) from exc
+    for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
+        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        try:
+            trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
 
-        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+            if TRIAL_DIR_ATTR in trial.user_attrs:
+                _resolve_attempt_for_reaping(trial, trial_dir, study.study_name)
+        except ProcessCleanupUncertainError:
+            if uncertain_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
+                uncertain_attempt_ids.add(attempt_id)
+            raise
 
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is not None or identity.pgid is not None:
-            safe_to_fail = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
-            if not safe_to_fail:
-                action = "mark RUNNING trial" if reap else "confirm cleanup for RUNNING trial"
-                raise ProcessCleanupUncertainError(
-                    f"Refusing to {action} {trial.number}: stale process cleanup "
-                    f"could not prove the process group is gone. trial_dir={trial_dir} "
-                    f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
-                    "process may still be holding GPU memory. Investigate "
-                    f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
-                    f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
-                    "phasesweep."
-                )
-            log.warning(
-                "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
-                trial.number,
-                identity.pid,
-                identity.pgid,
-            )
+        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
+            _record_cleanup_recovery(study, trial)
+        _record_stale_trial_failure(study, trial)
+        try:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Stale process cleanup completed for RUNNING trial {trial.number}, "
+                f"but Optuna state could not be updated to FAIL. Refusing to continue "
+                f"with an inconsistent study. trial_dir={trial_dir}"
+            ) from exc
 
-        if reap:
-            if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False:
-                _record_cleanup_recovery(study, trial)
-            try:
-                study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Stale process cleanup completed for RUNNING trial {trial.number}, "
-                    f"but Optuna state could not be updated to FAIL. Refusing to continue "
-                    f"with an inconsistent study. trial_dir={trial_dir}"
-                ) from exc
+        if recovered_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
+            recovered_attempt_ids.add(attempt_id)
 
-            log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
-        else:
-            log.warning(
-                "Confirmed cleanup for stale RUNNING trial %d in study %s",
-                trial.number,
-                study.study_name,
-            )
+        log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
         count += 1
     return count
 
 
-def _confirm_stale_running_trials(
+def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaMismatchError:
+    """Build the actionable error used for malformed durable policy state.
+
+    :param optuna.Study study: Study whose durable state is inconsistent,
+        used to name the study in the message.
+    :param str detail: Specific description of the malformed state.
+    :return StudySchemaMismatchError: Constructed error for the caller to
+        raise, instructing them to use a new experiment name or
+        archive/delete the inconsistent study.
+    """
+    return StudySchemaMismatchError(
+        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}. "
+        "Use a new experiment name, or archive/delete the inconsistent study before "
+        "running again."
+    )
+
+
+def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
+    """Validate and reconstruct the durable consecutive-failure state.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
+        per-trial outcome attrs are read and validated.
+    :return _PhasePolicyState: Reconstructed state: the highest recorded
+        outcome sequence, the consecutive-failure count since the last
+        recovery boundary, the recovered abort sequence (if any), and the
+        first fatal trial's number/sequence/cause (if any).
+    :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
+        trial's outcome attr is malformed, two trials share a completion
+        sequence, or the recovery boundary exceeds the largest recorded
+        sequence.
+    """
+    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
+    recovery_boundary = 0
+    recovered_abort_sequence: int | None = None
+    if recovery is not None:
+        if not isinstance(recovery, dict):
+            raise _phase_policy_schema_error(
+                study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
+            )
+        schema_version = recovery.get("schema_version")
+        raw_recovery_boundary = recovery.get("start_after_sequence")
+        raw_recovered_abort_sequence = recovery.get("recovered_abort_sequence")
+        recovery_target = recovery.get("trial_target")
+        if (
+            schema_version != PHASE_RECOVERY_SCHEMA_VERSION
+            or type(raw_recovery_boundary) is not int
+            or raw_recovery_boundary < 1
+            or type(raw_recovered_abort_sequence) is not int
+            or raw_recovered_abort_sequence < 1
+            or raw_recovered_abort_sequence > raw_recovery_boundary
+            or type(recovery_target) is not int
+            or recovery_target < 1
+        ):
+            raise _phase_policy_schema_error(
+                study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
+            )
+        recovery_boundary = raw_recovery_boundary
+        recovered_abort_sequence = raw_recovered_abort_sequence
+
+    events: list[tuple[int, int, str, str | None]] = []
+    seen_sequences: dict[int, int] = {}
+    for trial in study.get_trials(deepcopy=False):
+        raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
+        parsed = _parsed_trial_outcome(raw)
+        if trial.state.is_finished() and parsed is None:
+            raise _phase_policy_schema_error(
+                study,
+                f"terminal trial {trial.number} has missing or malformed "
+                f"{TRIAL_OUTCOME_ATTR!r}: {raw!r}",
+            )
+        if parsed is None:
+            continue
+        sequence, outcome, cause = parsed
+        other_trial = seen_sequences.get(sequence)
+        if other_trial is not None:
+            raise _phase_policy_schema_error(
+                study,
+                f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
+            )
+        seen_sequences[sequence] = trial.number
+        events.append((sequence, trial.number, outcome, cause))
+
+    events.sort()
+    max_sequence = events[-1][0] if events else 0
+    if recovery_boundary > max_sequence:
+        raise _phase_policy_schema_error(
+            study,
+            f"{PHASE_RECOVERY_ATTR!r} starts after sequence {recovery_boundary}, "
+            f"but the largest recorded sequence is {max_sequence}",
+        )
+
+    consecutive_failures = 0
+    fatal_trial_number: int | None = None
+    fatal_sequence: int | None = None
+    fatal_cause: str | None = None
+    for sequence, trial_number, outcome, cause in events:
+        if sequence <= recovery_boundary:
+            continue
+        if outcome == "success":
+            consecutive_failures = 0
+        elif outcome in {"failure", "fatal"}:
+            consecutive_failures += 1
+        if outcome == "fatal" and fatal_trial_number is None:
+            fatal_trial_number = trial_number
+            fatal_sequence = sequence
+            fatal_cause = cause
+
+    return _PhasePolicyState(
+        max_sequence=max_sequence,
+        consecutive_failures=consecutive_failures,
+        recovered_abort_sequence=recovered_abort_sequence,
+        fatal_trial_number=fatal_trial_number,
+        fatal_sequence=fatal_sequence,
+        fatal_cause=fatal_cause,
+    )
+
+
+def _validate_study_schema(study: optuna.Study) -> None:
+    """Initialize an empty study or reject populated incompatible storage."""
+    trials = study.get_trials(deepcopy=False)
+    version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
+    if not trials and version is None:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        return
+    if version == STUDY_SCHEMA_VERSION:
+        _load_phase_policy_state(study)
+        return
+
+    trial_numbers = [trial.number for trial in trials]
+    detail = "missing" if version is None else repr(version)
+    raise StudySchemaMismatchError(
+        f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
+        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
+        "Use a new experiment name, or archive/delete the old study before running again."
+    )
+
+
+def _accepted_trial_target(study: optuna.Study) -> int:
+    """Return the durable target, inferring old current-schema studies from history.
+
+    :param optuna.Study study: Study whose accepted trial target is read.
+    :return int: The stored ``phasesweep_trial_target`` user attr, or the
+        number of finished trials when no target has been recorded yet.
+    :raises StudySchemaMismatchError: The stored target is not a positive int,
+        or is lower than the number of already-finished trials.
+    """
+    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
+    if stored is None:
+        return finished
+    if type(stored) is not int or stored < 1 or finished > stored:
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
+            f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
+            "the inconsistent study before running again."
+        )
+    return stored
+
+
+def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
+    """Reject a target lower than the study's durable accepted target.
+
+    :param optuna.Study study: Existing study whose accepted target is checked.
+    :param Phase phase: Phase config supplying the requested ``n_trials`` target.
+    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+        study's durable accepted target.
+    """
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials < accepted_target:
+        raise TrialTargetRegressionError(
+            f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
+            f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
+            "target or a new experiment name."
+        )
+
+
+def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
+    """Reject any cross-process continuation of a partially complete stateful study.
+
+    TPE and CMA-ES suggestions depend on process-local RNG/optimizer state that
+    Optuna storage does not persist. Recreating a seeded sampler in a fresh
+    process restarts that stream, so a mid-target resume can exactly repeat
+    already-evaluated startup suggestions and spend the remaining budget on
+    duplicates. Until PhaseSweep persists real sampler continuation state, a
+    stateful phase is restartable only before its first terminal trial or after
+    reaching its accepted target.
+
+    :param optuna.Study study: Existing study whose finished-trial count is checked.
+    :param Phase phase: Phase config supplying the sampler type and trial target.
+    :raises SamplerContinuationUnsupportedError: The phase uses a stateful sampler
+        (``tpe`` or ``cmaes``) and either raises its previously accepted trial
+        target or was interrupted before reaching it.
+    """
+    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    if phase.sampler.type not in {"tpe", "cmaes"} or finished == 0:
+        return
+
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials > accepted_target:
+        raise SamplerContinuationUnsupportedError(
+            f"Phase {phase.name!r} uses {phase.sampler.type!r} and raises its accepted target "
+            f"from {accepted_target} to {phase.n_trials} terminal trial(s). PhaseSweep cannot "
+            "reproduce this sampler's process-local continuation state safely. Use a new "
+            "experiment name, or run the full target in one invocation."
+        )
+    if finished < accepted_target:
+        raise SamplerContinuationUnsupportedError(
+            f"Phase {phase.name!r} uses {phase.sampler.type!r} and was interrupted at "
+            f"{finished}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
+            "this sampler's exact process-local continuation state, so resuming could "
+            "re-evaluate identical suggestions and waste the remaining budget. Use a new "
+            "experiment name (optionally with a stateless random/grid sampler), or run the "
+            "full target in one uninterrupted invocation."
+        )
+
+
+def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
+    """Persist the highest accepted target before the phase launches work.
+
+    :param optuna.Study study: Study whose accepted trial target is stored.
+    :param Phase phase: Phase config supplying the new ``n_trials`` target.
+    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+        study's already-accepted target.
+    """
+    accepted_target = _accepted_trial_target(study)
+    if phase.n_trials < accepted_target:
+        raise TrialTargetRegressionError(
+            f"Phase {phase.name!r} cannot lower its accepted trial target from "
+            f"{accepted_target} to {phase.n_trials}."
+        )
+    if phase.n_trials != study.user_attrs.get(TRIAL_TARGET_ATTR):
+        study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+
+
+def _preflight_existing_studies(
+    experiment: Experiment,
+    *,
+    cleanup_report: _PreflightCleanupReport | None = None,
+    from_phase: str | None = None,
+) -> dict[str, optuna.Study]:
+    """Validate and reap every existing declared phase study before launch.
+
+    :param Experiment experiment: Parsed experiment whose declared phases are inspected.
+    :param _PreflightCleanupReport | None cleanup_report: Optional shared report to
+        accumulate cleanup evidence into; a fresh one is created if omitted.
+    :param str | None from_phase: Optional resume point. Recovery and schema checks
+        still cover every phase; trial-target validation starts at this reached phase.
+    :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
+        with no durable study yet are omitted).
+    :raises StudyStorageUnavailableError: A phase's persistent storage could not
+        be inspected.
+    :raises StudySchemaMismatchError: A phase's study uses an incompatible
+        storage schema.
+    :raises TrialTargetRegressionError: A phase's study already accepted a
+        higher trial target than the current config requests.
+    :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
+        confirmed safe for a phase's study.
+    :raises RuntimeError: Multiple studies failed preflight for mixed reasons
+        not covered by a single common exception type.
+    """
+    report = cleanup_report or _PreflightCleanupReport()
+    studies: dict[str, optuna.Study] = {}
+    errors: list[Exception] = []
+    # The registry scan runs FIRST and is independent of the declared phase
+    # list, so attempts from renamed/removed phases or changed storage URLs
+    # are recovered before any current-config validation or launch (review
+    # v0.5.17 / blocker 3).
+    try:
+        _preflight_active_attempts(experiment, report)
+    except Exception as exc:
+        errors.append(exc)
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        try:
+            study = _load_existing_phase_study(experiment, phase)
+        except Exception as exc:
+            unavailable = StudyStorageUnavailableError(
+                f"Could not inspect persistent study storage for phase {phase.name!r}."
+            )
+            unavailable.__cause__ = exc
+            report.mark_uncertain(unavailable)
+            errors.append(unavailable)
+            continue
+        if study is None:
+            continue
+        studies[phase.name] = study
+        try:
+            _reap_stale_trials(
+                study,
+                experiment,
+                phase.name,
+                recovered_attempt_ids=report.recovered_attempt_ids,
+                uncertain_attempt_ids=report.uncertain_attempt_ids,
+            )
+        except Exception as exc:
+            if isinstance(exc, ProcessCleanupUncertainError):
+                report.mark_uncertain(exc)
+            errors.append(exc)
+            continue
+        try:
+            _validate_study_schema(study)
+            if reached:
+                _validate_trial_target(study, phase)
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        first = errors[0]
+        if len(errors) == 1:
+            raise first
+        message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
+            str(error) for error in errors
+        )
+        if all(isinstance(error, StudySchemaMismatchError) for error in errors):
+            raise StudySchemaMismatchError(message) from first
+        if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
+            raise StudyStorageUnavailableError(message) from first
+        if all(isinstance(error, TrialTargetRegressionError) for error in errors):
+            raise TrialTargetRegressionError(message) from first
+        cleanup_error = next(
+            (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
+            None,
+        )
+        if cleanup_error is not None:
+            raise ProcessCleanupUncertainError(message) from cleanup_error
+        raise RuntimeError(message) from first
+    return studies
+
+
+def _inspect_stale_running_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
 ) -> int:
-    """Confirm cleanup evidence for RUNNING trials without changing Optuna state.
+    """Count stale RUNNING trials without signaling processes or writing state.
 
-    Used by ``mcp-recover-run`` preflight mode. The follow-up ``--confirm`` call
+    Used by ``mcp recover-run`` preflight mode. The follow-up ``--confirm`` call
     must still find the same RUNNING trials so it can reap them and persist
     recovery evidence atomically with clearing MCP cleanup uncertainty.
+
+    :param optuna.Study study: Study whose stale RUNNING trials should be inspected.
+    :param Experiment experiment: Experiment used to locate trial directories.
+    :param str phase_name: Name of the phase containing the stale trials.
+    :return int: Number of stale RUNNING trials found.
     """
-    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=False)
-
-
-def _reap_stale_trials(study: optuna.Study, experiment: Experiment, phase_name: str) -> int:
-    """Mark RUNNING trials as FAIL on startup, killing orphaned process groups.
-
-    Uses the per-trial identity files left by ``run_supervised`` (review v0.5.2 /
-    blocker 7): pid + starttime for the safe path, pgid as the fallback when the
-    root PID has exited but descendants are still alive.
-
-    The trial directory is normally loaded from the trial's
-    ``phasesweep_trial_dir`` user attribute (review v0.5.3 / blocker 4) so the
-    reaper works correctly even if the user changed ``experiment.workdir`` or
-    invoked phasesweep from a different cwd. If that attr is absent, the trial
-    died before the current launch path could start a subprocess, so the reaper
-    falls back to the canonical trial directory and marks the trial failed.
-
-    **Fail-closed contract** (review v0.5.7 / blocker 2): if
-    :func:`kill_stale_group` returns ``False`` we cannot prove the leaked
-    process group is gone. Marking the trial ``FAIL`` would let new trials
-    schedule onto a GPU still held by the leaked process. We raise a
-    ``ProcessCleanupUncertainError`` instead so the operator sees a loud failure and can investigate manually. Pre-v0.5.8 we logged the survivor and continued.
-
-    Args:
-        study: Optuna study for the phase being recovered.
-        experiment: Parsed experiment.
-        phase_name: Name of the phase being recovered.
-
-    Returns:
-        The number of RUNNING trials successfully reaped (i.e. cleanup
-        confirmed AND ``study.tell(...FAIL)`` succeeded).
-
-    Raises:
-        ProcessCleanupUncertainError: Cleanup of a stale process group could not be confirmed.
-        RuntimeError: ``study.tell`` could not persist the FAIL state after cleanup was confirmed.
-
-    """
-    return _confirm_or_reap_stale_trials(study, experiment, phase_name, reap=True)
+    count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+        if TRIAL_DIR_ATTR in trial.user_attrs:
+            _resolve_attempt_for_reaping(trial, trial_dir, study.study_name, inspect_only=True)
+        count += 1
+    return count
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
-    """Return trial numbers already consumed as cleanup recovery evidence."""
+    """Return trial numbers already consumed as cleanup recovery evidence.
+
+    :param optuna.Study study: Study containing the cleanup recovery ledger.
+    :return set[int]: Valid non-negative trial numbers recorded in the ledger.
+    """
     raw = study.user_attrs.get(CLEANUP_RECOVERED_TRIALS_ATTR)
     if not isinstance(raw, list):
         return set()
@@ -519,7 +1554,11 @@ def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
 
 
 def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Persist that previously uncertain cleanup evidence has been consumed."""
+    """Persist that previously uncertain cleanup evidence has been consumed.
+
+    :param optuna.Study study: Study whose cleanup recovery ledger should be updated.
+    :param optuna.trial.FrozenTrial trial: Trial whose cleanup evidence was consumed.
+    """
     recovered = sorted(_cleanup_recovered_trial_numbers(study) | {trial.number})
     try:
         study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
@@ -529,6 +1568,41 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
             "but the study-level cleanup recovery ledger could not be updated. "
             "Refusing to clear MCP cleanup uncertainty without consuming the trial evidence."
         ) from exc
+
+
+def _previously_recovered_uncertain_trial_count(study: optuna.Study, generation_id: str) -> int:
+    """Count this generation's cleanup-uncertain trials a prior recovery pass consumed.
+
+    Recovery durably records each confirmed trial in the study-level ledger
+    before the CLI can persist its run-level recovery record or clear the
+    cleanup-uncertainty marker. A crash in that window must not erase the
+    evidence: the retry skips these trials as already recovered, and without
+    this count the trial-level-evidence guard would refuse to clear cleanup
+    uncertainty forever (review v0.5.17 gap hunt).
+
+    The count is scoped to ``generation_id`` — detached MCP runs use their run
+    id as the generation id — so a *different* run's already-consumed evidence
+    cannot clear this run's uncertainty; that cross-run refusal stays
+    fail-closed.
+
+    :param optuna.Study study: Study whose ledger and trials are inspected.
+    :param str generation_id: Generation identity of the run being recovered.
+    :return int: This generation's terminal trials that record cleanup
+        uncertainty and appear in the durable recovery ledger.
+    """
+    recovered = _cleanup_recovered_trial_numbers(study)
+    if not recovered:
+        return 0
+    count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if (
+            trial.state.is_finished()
+            and trial.number in recovered
+            and trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False
+            and trial.user_attrs.get(GENERATION_ID_ATTR) == generation_id
+        ):
+            count += 1
+    return count
 
 
 def _trial_dir_for_cleanup_recovery(
@@ -552,12 +1626,30 @@ def _trial_dir_for_cleanup_recovery(
     return Path(stored)
 
 
+def _iter_cleanup_uncertain_trials(
+    study: optuna.Study,
+) -> Iterator[tuple[optuna.trial.FrozenTrial, Path, StaleProcessIdentity]]:
+    """Yield unconsumed terminal trials with their validated process identity.
+
+    :param optuna.Study study: Study whose cleanup evidence should be inspected.
+    :return Iterator: Eligible trial, persisted trial directory, and process identity.
+    """
+    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
+    for trial in study.get_trials(deepcopy=False):
+        if (
+            trial.state.is_finished()
+            and trial.number not in recovered_trial_numbers
+            and trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False
+        ):
+            trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+            identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
+            yield trial, trial_dir, identity
+
+
 def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
-    *,
-    consume: bool = True,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
 
@@ -569,30 +1661,12 @@ def _recover_cleanup_uncertain_trials(
     :param optuna.Study study: Existing Optuna study for the phase being recovered.
     :param Experiment experiment: Parsed experiment, used for diagnostics.
     :param str phase_name: Name of the phase being recovered.
-    :param bool consume: When true, mark recovered trial evidence as consumed.
     :return int: Number of cleanup-uncertain terminal trials confirmed clean.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
     recovered = 0
-    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
-    for trial in study.get_trials(deepcopy=False):
-        if not trial.state.is_finished():
-            continue
-        if trial.number in recovered_trial_numbers:
-            continue
-        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
-            continue
-
-        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-        identity = read_stale_process_identity(trial_dir)
-        if identity.pid is None and identity.pgid is None:
-            raise ProcessCleanupUncertainError(
-                f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
-                f"study {study.study_name}: no persisted process identity was found "
-                f"under trial_dir={trial_dir}. A leaked process group cannot be "
-                "ruled out."
-            )
-        safe_to_clear = kill_stale_group(identity.pid, identity.starttime, pgid=identity.pgid)
+    for trial, trial_dir, identity in _iter_cleanup_uncertain_trials(study):
+        safe_to_clear = cleanup_stale_trial_process(identity)
         if not safe_to_clear:
             raise ProcessCleanupUncertainError(
                 f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
@@ -600,9 +1674,7 @@ def _recover_cleanup_uncertain_trials(
                 f"experiment={experiment.experiment} phase={phase_name} "
                 f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
             )
-        if consume:
-            _record_cleanup_recovery(study, trial)
-            recovered_trial_numbers.add(trial.number)
+        _record_cleanup_recovery(study, trial)
         recovered += 1
         log.warning(
             "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
@@ -615,12 +1687,12 @@ def _recover_cleanup_uncertain_trials(
     return recovered
 
 
-def _reap_skipped_phase(experiment: Experiment, phase: Phase) -> None:
-    """Reap stale RUNNING trials for a phase skipped by ``--from-phase``.
+def _inspect_cleanup_uncertain_trials(study: optuna.Study) -> int:
+    """Count recoverable terminal cleanup evidence without signals or writes.
 
-    :param Experiment experiment: Parsed experiment config containing storage details.
-    :param Phase phase: Phase being skipped and recovered before loading its winner.
+    :param optuna.Study study: Existing study inspected by recovery preflight.
+    :return int: Number of unconsumed terminal trials that record cleanup uncertainty.
+    :raises ProcessCleanupUncertainError: A trial lacks the persisted identity
+        required for a safe confirmed recovery.
     """
-    if experiment.storage is None:
-        return
-    _reap_stale_trials(_create_phase_study(experiment, phase), experiment, phase.name)
+    return sum(1 for _ in _iter_cleanup_uncertain_trials(study))

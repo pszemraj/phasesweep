@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import math
 import string
 from pathlib import Path
 from typing import Any, Literal
@@ -24,8 +23,8 @@ from phasesweep.config.search import (
     _placeholder_values_for,
     _validate_sampler_search_space,
 )
-from phasesweep.evidence.models import Extractor, Gate
-from phasesweep.runtime.files import storage_backend
+from phasesweep.evidence.models import Extractor, Gate, ObjectiveExtractor
+from phasesweep.runtime.files import storage_backend, storage_is_in_memory
 
 
 class Metric(_Frozen):
@@ -33,7 +32,7 @@ class Metric(_Frozen):
 
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
-    extractor: Extractor = Field(discriminator="type")
+    extractor: ObjectiveExtractor = Field(discriminator="type")
 
 
 class Constraint(_Frozen):
@@ -143,9 +142,10 @@ class Phase(_Frozen):
         default="single_per_trial",
         description=(
             "CUDA visibility policy for trial subprocesses. single_per_trial leases "
-            "one visible CUDA token per trial. whole_node requires n_jobs=1 and "
-            "leases every configured or detected visible token for the trial. none "
-            "disables phasesweep CUDA isolation and GPU host locks."
+            "one visible CUDA token per trial. whole_node requires n_jobs=1 plus an "
+            "explicit gpu_ids or gpu_devices list and leases every configured token "
+            "for the trial. none disables phasesweep CUDA isolation and GPU host "
+            "locks."
         ),
     )
     gpu_ids: list[int] | None = Field(
@@ -193,7 +193,11 @@ class Phase(_Frozen):
     @field_validator("gpu_devices")
     @classmethod
     def _gpu_devices_non_empty_tokens(cls, value: list[str] | None) -> list[str] | None:
-        """Normalize and validate explicit CUDA device tokens."""
+        """Normalize and validate explicit CUDA device tokens.
+
+        :param list[str] | None value: Candidate CUDA device tokens, or ``None``.
+        :return list[str] | None: Stripped CUDA device tokens, or ``None``.
+        """
         if value is None:
             return None
         normalized = [token.strip() for token in value]
@@ -218,6 +222,13 @@ class Phase(_Frozen):
             raise ValueError(
                 "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
                 "the full configured CUDA-visible device set."
+            )
+        if self.gpu_policy == "whole_node" and self.gpu_ids is None and self.gpu_devices is None:
+            raise ValueError(
+                "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
+                "list: the whole-node device set is the trainer's world size — a "
+                "semantic input, not a throughput knob — so it cannot be left to "
+                "ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection."
             )
         if self.gpu_policy == "none":
             if self.gpu_ids is not None or self.gpu_devices is not None:
@@ -337,17 +348,15 @@ class Phase(_Frozen):
                     f"Phase {self.name!r}: timeout_seconds_per_trial is required unless "
                     "allow_unbounded_trials: true is set."
                 )
-        elif not math.isfinite(self.timeout_seconds_per_trial):
-            raise ValueError(
-                f"Phase {self.name!r}: timeout_seconds_per_trial must be finite, "
-                f"got {self.timeout_seconds_per_trial!r}."
+        else:
+            _require_finite(
+                f"Phase {self.name!r}: timeout_seconds_per_trial",
+                self.timeout_seconds_per_trial,
             )
-        if self.timeout_seconds_per_phase is not None and not math.isfinite(
-            self.timeout_seconds_per_phase
-        ):
-            raise ValueError(
-                f"Phase {self.name!r}: timeout_seconds_per_phase must be finite, "
-                f"got {self.timeout_seconds_per_phase!r}."
+        if self.timeout_seconds_per_phase is not None:
+            _require_finite(
+                f"Phase {self.name!r}: timeout_seconds_per_phase",
+                self.timeout_seconds_per_phase,
             )
         if not self.allow_seed_search:
             seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
@@ -360,6 +369,61 @@ class Phase(_Frozen):
         return self
 
 
+class ExecutionContext(_Frozen):
+    """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
+
+    Without this block, the trainer inherits the orchestrator's *entire*
+    ambient environment and current working directory — two unbounded
+    implicit semantic inputs that never contribute to study identity, so one
+    persistent study can silently mix evaluations from different trainers,
+    datasets, or credentials. Declaring the contract makes both explicit,
+    passes them to the trainer deterministically, and binds them into the
+    semantic fingerprint.
+    """
+
+    cwd: str | None = Field(
+        default=None,
+        description=(
+            "Working directory for every trainer subprocess. Relative paths "
+            "resolve against the invocation cwd at launch (same rule as "
+            "workdir); prefer an absolute path so CLI and MCP invocations "
+            "agree. When set, the RESOLVED path joins the semantic "
+            "fingerprint, so the same study can never mix trainers reached "
+            "through different working directories. When unset, trainers run "
+            "in the invocation cwd and the fingerprint records the context as "
+            "unbound (null)."
+        ),
+    )
+    inherit_env: Literal["all", "none"] | list[str] = Field(
+        default="all",
+        description=(
+            "Which ambient environment variables the trainer inherits. 'all' "
+            "(default) preserves the historical full-inheritance behavior. "
+            "'none' starts from a minimal documented base (PATH, HOME, LANG, "
+            "LC_ALL, TMPDIR, USER, LOGNAME, TZ). A list inherits the base "
+            "plus exactly the named variables. Configured `env` values are "
+            "always applied on top and are always fingerprinted; the "
+            "inherit contract (mode/names, not ambient values) is "
+            "fingerprinted too."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_inherit_names(self) -> ExecutionContext:
+        """Reject empty or whitespace-only inherited-variable names.
+
+        :raises ValueError: A listed variable name is empty or padded.
+        :return ExecutionContext: Self, unchanged.
+        """
+        if isinstance(self.inherit_env, list):
+            bad = [name for name in self.inherit_env if not name or name != name.strip()]
+            if bad:
+                raise ValueError(f"inherit_env names must be nonempty and unpadded: {bad!r}")
+            if len(set(self.inherit_env)) != len(self.inherit_env):
+                raise ValueError("inherit_env names must be unique.")
+        return self
+
+
 class Experiment(_Frozen):
     """Top-level experiment: trial command, metric, constraints, and ordered phases."""
 
@@ -368,10 +432,26 @@ class Experiment(_Frozen):
         default=None,
         description=(
             "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
-            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts. "
+            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
+            "(RDB backends additionally require allow_external_rdb_single_host: true; "
+            "see below). "
             "Null for non-resumable in-memory runs (not recommended). "
             "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
             "scheme intentionally so study identity stays stable across n_jobs changes."
+        ),
+    )
+    # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
+    # read as "enables multi-host operation," but the flag actually acknowledges the
+    # opposite — that this external relational-DB storage is still coordinated
+    # host-locally, with every process confined to ONE host.
+    allow_external_rdb_single_host: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge the loss of PhaseSweep's host-local-filesystem-based "
+            "coordination guarantees (locks, generation pointers) when storage is a "
+            "shared relational backend (e.g. postgresql://, mysql://). Set this to true "
+            "only when every process that will ever touch this storage and workdir "
+            "runs on a single host."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
@@ -381,13 +461,42 @@ class Experiment(_Frozen):
             "{phase}, {run_name}, {overrides_path}."
         )
     )
+    provenance: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Operator-supplied trainer/data/dependency identity included in persistent-study "
+            "fingerprints. Values must change whenever trial meaning changes outside this YAML."
+        ),
+    )
     override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
+    execution: ExecutionContext = Field(
+        default_factory=ExecutionContext,
+        description=(
+            "Explicit trainer execution context: working directory and "
+            "environment-inheritance contract (review v0.5.17 / blocker 4)."
+        ),
+    )
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_persistent_provenance(self) -> Experiment:
+        """Require meaningful external-input identity for persistent study reuse."""
+        invalid = [
+            key for key, value in self.provenance.items() if not key.strip() or not value.strip()
+        ]
+        if invalid:
+            raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
+        if self.storage is not None and not self.provenance:
+            raise ValueError(
+                "Persistent storage requires a nonempty provenance mapping that identifies "
+                "the trainer, data, and dependency revision used by this experiment."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_run_timeout(self) -> Experiment:
@@ -396,12 +505,8 @@ class Experiment(_Frozen):
         :raises ValueError: If ``timeout_seconds_per_run`` is non-finite.
         :return Experiment: Self, unchanged.
         """
-        if self.timeout_seconds_per_run is not None and not math.isfinite(
-            self.timeout_seconds_per_run
-        ):
-            raise ValueError(
-                f"timeout_seconds_per_run must be finite, got {self.timeout_seconds_per_run!r}."
-            )
+        if self.timeout_seconds_per_run is not None:
+            _require_finite("timeout_seconds_per_run", self.timeout_seconds_per_run)
         return self
 
     @field_validator("experiment")
@@ -426,11 +531,11 @@ class Experiment(_Frozen):
 
         Each phase is checked for:
           * local fixed/sampled key collision (review v0.5.2 / blocker 5)
-          * transitive inherited locked-key collisions (v0.5 review item #4)
-          * unresolved multi-parent locked-key collisions (v0.5 review item #5)
-          * sampler / search-space compatibility (v0.5.2 / blocker 2)
-          * grid divisibility for float params (v0.5.2 / blocker 4)
-          * SQLite + parallel n_jobs (v0.5.2 / blocker 6)
+          * transitive inherited locked-key collisions (review v0.5.2 / item 4)
+          * unresolved multi-parent locked-key collisions (review v0.5.2 / item 5)
+          * sampler / search-space compatibility (review v0.5.2 / blocker 2)
+          * grid divisibility for float params (review v0.5.2 / blocker 4)
+          * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
 
         Returns:
             Self, unchanged. Pydantic post-init validator protocol; raises
@@ -460,7 +565,7 @@ class Experiment(_Frozen):
                     f"{phase.promotion.min_delta_vs!r}, which is not a prior phase."
                 )
 
-            # Local same-phase collision (blocker 5): sampling a key that the
+            # Local same-phase collision (review v0.5.2 / blocker 5): sampling a key that the
             # same phase also lists as fixed silently lets sampled win — that's
             # not "fixed" in any meaningful sense.
             local_collisions = set(phase.fixed_overrides) & set(phase.search_space)
@@ -495,20 +600,6 @@ class Experiment(_Frozen):
                     "inside the applying phase."
                 )
 
-            # Local dotted-key namespace collision (review v0.5.3 / blocker 5):
-            # `{model: llama, model.depth: 16}` is silently corrupting in every
-            # render format we support. Reject at config-load.
-            local_keys = set(phase.fixed_overrides) | set(phase.search_space.keys()) | contract_keys
-            prefix_collisions = _find_prefix_collisions(local_keys)
-            if prefix_collisions:
-                pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
-                raise ValueError(
-                    f"Phase {phase.name!r} has dotted-key namespace collision(s): "
-                    f"{pairs}. A key and a sub-key cannot both be overridden — the "
-                    "rendered command would be contradictory (argparse/Hydra) or the "
-                    "json_file would have to be both a scalar and a nested object."
-                )
-
             # Transitive inherited locked keys + multi-parent collision detection.
             inherited_keys: set[str] = set()
             parent_owners: dict[str, list[str]] = {}
@@ -541,10 +632,8 @@ class Experiment(_Frozen):
                     f"or drop the inherit."
                 )
 
-            # Inherited / local dotted-key prefix collision (review v0.5.3 /
-            # blocker 5). E.g. parent locks `model` and child samples
-            # `model.depth`, or vice-versa. Same render-time corruption hazard
-            # as the local-only case but caught across the inheritance graph.
+            # A scalar key and one of its dotted subkeys cannot coexist in any
+            # supported render format, whether both are local or one is inherited.
             combined_keys = (
                 inherited_keys
                 | contract_keys
@@ -561,13 +650,22 @@ class Experiment(_Frozen):
                     "inheritance chain."
                 )
 
-            # Sampler/search-space compatibility (blocker 2): catch at config-load
+            # Sampler/search-space compatibility (review v0.5.2 / blocker 2): catch at config-load
             # so `phasesweep validate` is meaningful, not at first trial launch.
             _validate_sampler_search_space(phase)
 
-            # Storage policy (blocker 6): SQLite + parallel writes deadlocks under
+            # Storage policy (review v0.5.2 / blocker 6): SQLite + parallel writes deadlocks under
             # contention; we no longer auto-remap to JournalStorage. Tell the user.
-            _validate_storage_policy(self.storage, phase)
+            # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
+            # shared RDB storage across hosts silently breaks lock/generation-pointer
+            # safety unless explicitly acknowledged.
+            _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
+
+            # JSON wire serializability (review v0.5.17 / finding B): the
+            # template preflight below renders with write_files=False, so it
+            # never calls write_json_file and never proves the composed values
+            # can actually be encoded. Check them explicitly here.
+            _validate_json_file_override_values(self, phase)
 
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
@@ -589,32 +687,53 @@ class Experiment(_Frozen):
         return self
 
 
-def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
-    """Reject SQLite storage with parallel ``n_jobs`` (review v0.5.2 / blocker 6).
+def _validate_storage_policy(
+    storage: str | None, phase: Phase, allow_external_rdb_single_host: bool
+) -> None:
+    """Reject SQLite+parallel storage and unacknowledged multi-host RDB storage.
 
-    SQLite serializes writers; concurrent Optuna trials cause ``database is locked``
-    errors. Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
-    but that fragmented study identity behind a single URL — the same config could
-    point at two different studies depending on ``n_jobs``. Now we require the user
-    to pick the scheme explicitly.
+    Two independent policies are enforced here:
 
-    The check uses :func:`phasesweep.runtime.files.storage_backend` so all
-    SQLAlchemy SQLite dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...)
-    are rejected. Earlier versions only matched the bare ``sqlite:///`` prefix
-    and let driver-qualified URLs through unsafely (review v0.5.7 / blocker 1).
+    1. SQLite + parallel ``n_jobs`` (review v0.5.2 / blocker 6): SQLite serializes
+       writers; concurrent Optuna trials cause ``database is locked`` errors.
+       Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
+       but that fragmented study identity behind a single URL — the same config
+       could point at two different studies depending on ``n_jobs``. Now we
+       require the user to pick the scheme explicitly.
+    2. Unacknowledged multi-host-capable storage (review v0.5.14 / item D): PhaseSweep's
+       coordination (locks, generation pointers) is host-local-filesystem based.
+       Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
+       silently breaks those safety guarantees, so any backend other than
+       ``sqlite``/``journal`` is rejected unless the operator explicitly sets
+       ``allow_external_rdb_single_host: true``. In-memory storage (``None`` or the
+       bare ``":memory:"``/URI-memory sentinels recognized by
+       :func:`phasesweep.runtime.files.storage_is_in_memory`) is exempt: it
+       cannot be shared across hosts in the first place.
+
+    Both checks use :func:`phasesweep.runtime.files.storage_backend` so all
+    SQLAlchemy dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...) are
+    classified consistently. Earlier versions only matched the bare
+    ``sqlite:///`` prefix and let driver-qualified URLs through unsafely
+    (review v0.5.7 / blocker 1).
 
     Args:
         storage: The experiment-level storage URL, or ``None`` (in-memory).
         phase: The phase being validated; its ``n_jobs`` decides whether the
-            SQLite restriction applies.
+            SQLite-parallel restriction applies.
+        allow_external_rdb_single_host: Experiment-level acknowledgement that every
+            process touching this storage and workdir runs on a single host,
+            required to use any non-file-backed (RDB) storage.
 
     Raises:
-        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite.
+        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite, or
+            ``storage`` is not in-memory, resolves to a backend other than
+            ``sqlite``/``journal``, and ``allow_external_rdb_single_host`` is not set.
 
     """
     if storage is None:
         return
-    if phase.n_jobs > 1 and storage_backend(storage) == "sqlite":
+    backend = storage_backend(storage)
+    if phase.n_jobs > 1 and backend == "sqlite":
         raise ValueError(
             f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage "
             f"({storage!r}). SQLite serializes writers and will deadlock under "
@@ -623,6 +742,132 @@ def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
             "postgresql://... for durable storage and dashboard access from a "
             "single phasesweep orchestrator."
         )
+    if (
+        not storage_is_in_memory(storage)
+        and backend not in {"sqlite", "journal"}
+        and not allow_external_rdb_single_host
+    ):
+        raise ValueError(
+            f"storage {storage!r} resolves to backend {backend!r}, a shared "
+            "relational store. PhaseSweep's coordination (locks, generation "
+            "pointers) is host-local-filesystem based, so pointing multiple "
+            f"hosts at one shared {backend} storage silently breaks those safety "
+            "guarantees. Set allow_external_rdb_single_host: true only when every "
+            "process that will ever touch this storage and workdir runs on a "
+            "single host — this acknowledges the storage is external, not that "
+            "coordination is distributed; otherwise use storage: "
+            "journal:///path.journal for a single-host parallel sweep, or "
+            "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
+        )
+
+
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _first_json_unserializable(value: Any, _seen: set[int] | None = None) -> Any | None:
+    """Return the first object inside ``value`` that strict JSON cannot represent.
+
+    Used only to turn a bare ``TypeError`` from :func:`json.dumps` into a
+    message that names the offending *type* rather than repeating the encoder's
+    generic complaint. Containers are tracked by identity so a recursive YAML
+    anchor cannot spin this into a ``RecursionError``.
+
+    :param Any value: Composed override value to inspect.
+    :param set[int] | None _seen: Internal recursion guard of container ids.
+    :return Any | None: The offending object, or ``None`` when every leaf is a
+        JSON scalar.
+    """
+    if isinstance(value, _JSON_SCALARS):
+        return None
+    seen = set() if _seen is None else _seen
+    if id(value) in seen:
+        return None
+    seen.add(id(value))
+    if isinstance(value, dict):
+        for key, item in value.items():
+            # json.dumps stringifies scalar keys but rejects anything else.
+            if not isinstance(key, _JSON_SCALARS):
+                return key
+            found = _first_json_unserializable(item, seen)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_json_unserializable(item, seen)
+            if found is not None:
+                return found
+        return None
+    return value
+
+
+def _validate_json_file_override_values(experiment: Experiment, phase: Phase) -> None:
+    """Reject ``json_file`` override values the wire serializer cannot encode.
+
+    ``override_format: json_file`` writes the composed overrides through
+    :func:`phasesweep.runtime.commands.write_json_file`, which uses a strict
+    ``json.dumps`` with no ``default=`` fallback. Nothing else proved those
+    values encodable before the first real trial: the template preflight in
+    :func:`_validate_trial_command_template` renders with ``write_files=False``,
+    which skips ``write_json_file`` entirely. So a YAML like ``cutoff:
+    2024-01-01`` — PyYAML resolves that to :class:`datetime.date`, not to a
+    string — loaded clean, passed ``phasesweep validate``, and then killed the
+    first trial in ``json.dumps`` (review v0.5.17 / finding B).
+
+    Only the statically-known layers are checked, in composition order:
+    contract ``fixed_overrides`` then phase ``fixed_overrides``. Sampled values
+    need no check (``CategoricalParam`` already restricts choices to Optuna
+    scalars, which are exactly the JSON scalars, and float/int params yield
+    numbers), and inherited values are themselves composed from an earlier
+    phase's already-validated layers.
+
+    :param Experiment experiment: Experiment being validated; supplies
+        ``override_format`` and the contract definitions.
+    :param Phase phase: Phase whose composed fixed values are checked.
+    :raises ValueError: A composed value cannot be encoded by the canonical
+        strict serializer.
+    """
+    if experiment.override_format != "json_file":
+        return
+
+    # Lazy import to avoid a circular config <-> runtime cycle.
+    from phasesweep.runtime.commands import dump_overrides_json
+
+    composed: dict[str, tuple[str, Any]] = {}
+    for contract_name in phase.contracts:
+        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
+            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
+    for key, value in phase.fixed_overrides.items():
+        composed[key] = ("fixed_overrides", value)
+
+    for key, (origin, value) in composed.items():
+        try:
+            dump_overrides_json(value)
+        except (TypeError, ValueError) as exc:
+            offender = _first_json_unserializable(value) if isinstance(exc, TypeError) else None
+            detail = (
+                f"type {type(offender).__name__}"
+                if offender is not None
+                else f"{type(exc).__name__}: {exc}"
+            )
+            # TypeError covers YAML-native-object cases (date/datetime, etc.);
+            # ValueError here is the strict encoder's allow_nan=False rejecting
+            # a non-finite float (.inf/.nan). The two remedies are unrelated, so
+            # the hint text must not conflate them.
+            hint = (
+                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
+                "into Python date/datetime objects; quote the value in YAML "
+                '(e.g. "2024-01-01") to keep it a JSON string.'
+                if isinstance(exc, TypeError)
+                else "JSON has no representation for non-finite floats; use a "
+                'finite value, or quote it in YAML (e.g. "inf") if the trial '
+                "command should receive it as text."
+            )
+            raise ValueError(
+                f"Phase {phase.name!r}: override_format='json_file' but {origin} key "
+                f"{key!r} holds a value the overrides.json serializer cannot encode "
+                f"({detail}): {value!r}. {hint}"
+            ) from exc
 
 
 def _format_field_names(template: str) -> set[str]:
@@ -776,14 +1021,35 @@ class SuiteDefaults(_Frozen):
     """Shared defaults applied to every study in a suite."""
 
     storage: str | None = None
+    allow_external_rdb_single_host: bool = False
     workdir: str = "./runs"
     trial_command: str | None = None
+    provenance: dict[str, str] = Field(default_factory=dict)
     override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
+    execution: ExecutionContext = Field(default_factory=ExecutionContext)
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+
+def _validate_suite_component_name(kind: str, value: str) -> str:
+    """Validate a suite or study name used in the compiled experiment namespace.
+
+    :param str kind: Human-readable component kind for the validation error.
+    :param str value: Candidate component name.
+    :raises ValueError: If ``value`` contains the reserved ``__`` separator.
+    :return str: The safe component name, unchanged.
+    """
+    if "__" in value:
+        raise ValueError(
+            f"{kind} name {value!r} must not contain '__': the compiled component "
+            "experiment is named '<suite>__<study>', so a double underscore inside "
+            "either part makes two different suite/study pairs share one artifact "
+            "namespace, study identity, and fingerprint."
+        )
+    return _validate_safe_name(kind, value)
 
 
 class StudySpec(_Frozen):
@@ -792,14 +1058,17 @@ class StudySpec(_Frozen):
     name: str
     depends_on: list[str] = Field(default_factory=list)
     storage: str | None = None
+    allow_external_rdb_single_host: bool | None = None
     workdir: str | None = None
     trial_command: str | None = None
+    provenance: dict[str, str] | None = None
     override_format: Literal["argparse", "hydra", "json_file"] | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
     contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] | None = None
+    execution: ExecutionContext | None = None
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
     promotion: Promotion | None = None
 
@@ -809,10 +1078,10 @@ class StudySpec(_Frozen):
         """Validate study names used as experiment-name suffixes and path components.
 
         :param str value: Candidate study name.
-        :raises ValueError: If ``value`` is not a safe name.
+        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated study name, unchanged.
         """
-        return _validate_safe_name("Study", value)
+        return _validate_suite_component_name("Study", value)
 
 
 class Suite(_Frozen):
@@ -828,23 +1097,28 @@ class Suite(_Frozen):
         """Validate suite names used as output path and experiment-name prefixes.
 
         :param str value: Candidate suite name.
-        :raises ValueError: If ``value`` is not a safe name.
+        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated suite name, unchanged.
         """
-        return _validate_safe_name("Suite", value)
+        return _validate_suite_component_name("Suite", value)
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:
-        """Require unique, prior-only study dependencies.
+        """Require prior-only dependencies and comparable promotion metrics.
 
-        :raises ValueError: If study names duplicate or dependencies point forward.
+        :raises ValueError: If study names duplicate, dependencies point forward,
+            or a promotion compares different resolved metric contracts.
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
         phases_by_study: dict[str, set[str]] = {}
+        metrics_by_study: dict[str, Metric | None] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
+            resolved_metric = (
+                study.metric if "metric" in study.model_fields_set else self.defaults.metric
+            )
             for dep in study.depends_on:
                 if dep not in seen:
                     raise ValueError(
@@ -863,8 +1137,22 @@ class Suite(_Frozen):
                         f"Study {study.name!r} promotion references missing baseline phase "
                         f"{selector!r}."
                     )
+                baseline_metric = metrics_by_study[baseline_study]
+                if (
+                    resolved_metric is not None
+                    and baseline_metric is not None
+                    and resolved_metric != baseline_metric
+                ):
+                    raise ValueError(
+                        f"Study {study.name!r} promotion against {selector!r} requires the "
+                        "same resolved metric contract, but the candidate resolves to "
+                        f"{resolved_metric.model_dump(mode='json')!r} and the baseline "
+                        f"resolves to {baseline_metric.model_dump(mode='json')!r}. Put the "
+                        "shared metric in suite.defaults or make both study metrics identical."
+                    )
             seen.add(study.name)
             phases_by_study[study.name] = {phase.name for phase in study.phases}
+            metrics_by_study[study.name] = resolved_metric
         return self
 
     def experiment_for_study(self, study: StudySpec) -> Experiment:
@@ -906,14 +1194,17 @@ class Suite(_Frozen):
         return Experiment(
             experiment=f"{self.suite}__{study.name}",
             storage=value("storage"),
+            allow_external_rdb_single_host=value("allow_external_rdb_single_host", required=True),
             workdir=value("workdir", required=True),
             trial_command=value("trial_command", required=True),
+            provenance=value("provenance") or {},
             override_format=value("override_format", required=True),
             metric=value("metric", required=True),
             constraints=value("constraints") or [],
             contracts=contracts,
             phases=copy.deepcopy(study.phases),
             env=env,
+            execution=value("execution") or ExecutionContext(),
             timeout_seconds_per_run=value("timeout_seconds_per_run"),
         )
 

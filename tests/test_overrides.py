@@ -1,28 +1,32 @@
 from __future__ import annotations
 
+import datetime
 import shlex
 
 import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.runtime.commands import format_argparse, format_hydra, render_command
+from phasesweep.runtime.commands import (
+    dump_overrides_json,
+    format_argparse,
+    format_hydra,
+    render_command,
+    write_json_file,
+)
 from tests.conftest import copy_fake_train, write_yaml
 
 
-def test_hydra_basic():
-    s = format_hydra({"n_layers": 8, "lr": 3e-4})
-    assert s == "n_layers=8 lr=0.0003"
-
-
-def test_hydra_dotted():
-    s = format_hydra({"model.n_layers": 12})
-    assert s == "model.n_layers=12"
-
-
-def test_hydra_bool():
-    s = format_hydra({"flag": True, "off": False})
-    assert s == "flag=true off=false"
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({"n_layers": 8, "lr": 3e-4}, "n_layers=8 lr=0.0003", id="basic"),
+        pytest.param({"model.n_layers": 12}, "model.n_layers=12", id="dotted-key"),
+        pytest.param({"flag": True, "off": False}, "flag=true off=false", id="booleans"),
+    ],
+)
+def test_hydra_scalar_rendering(overrides: dict[str, object], expected: str) -> None:
+    assert format_hydra(overrides) == expected
 
 
 def test_hydra_quotes_string_values_for_hydra_grammar():
@@ -86,7 +90,7 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: { type: json, path: r.json, key: x }
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
           - name: p
             n_trials: 1
@@ -97,6 +101,123 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
 
     with pytest.raises(ValidationError, match="override_format='hydra'.*json_file"):
         load_experiment(p)
+
+
+def _json_file_yaml(tmp_path, body: str):
+    """Write a minimal json_file-format config with caller-supplied phase/contract body."""
+    return write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        trial_command: "python train.py --overrides {{overrides_path}}"
+        override_format: json_file
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+{body}
+        """,
+    )
+
+
+def test_write_json_file_uses_the_canonical_strict_serializer(tmp_path):
+    """The wire artifact and the load-time check must share one encoder."""
+    path = write_json_file({"a.b": 1, "c": "x"}, tmp_path)
+
+    assert path.read_text() == dump_overrides_json({"a": {"b": 1}, "c": "x"})
+    with pytest.raises(TypeError):
+        dump_overrides_json({"cutoff": datetime.date(2024, 1, 1)})
+    with pytest.raises(TypeError):
+        write_json_file({"cutoff": datetime.date(2024, 1, 1)}, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("inf"), float("-inf"), float("nan")],
+    ids=["inf", "-inf", "nan"],
+)
+def test_dump_overrides_json_and_write_json_file_reject_non_finite_floats(tmp_path, value):
+    """allow_nan=False must reject values ``json.dumps`` would otherwise render as the
+    non-standard Infinity/-Infinity/NaN tokens ``strict_json_loads`` refuses to parse
+    (review v0.5.17 / finding B)."""
+    with pytest.raises(ValueError):
+        dump_overrides_json({"x": value})
+    with pytest.raises(ValueError):
+        write_json_file({"x": value}, tmp_path)
+
+
+def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
+    """An unquoted YAML date becomes datetime.date, which overrides.json cannot encode."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              cutoff: 2024-01-01
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="Phase 'p'.*'cutoff'.*cannot encode.*type date"):
+        load_experiment(p)
+
+
+def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
+    """Contract-supplied values are composed into the same artifact and checked too."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        contracts:
+          frozen:
+            fixed_overrides:
+              cutoff: 2024-01-01
+        phases:
+          - name: p
+            n_trials: 1
+            contracts: [frozen]
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
+        load_experiment(p)
+
+
+def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
+    """YAML .inf resolves to a non-finite float, which the strict encoder
+    (allow_nan=False) rejects; this must surface at load time, not at the
+    first trial's json.dumps."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              threshold: .inf
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="Phase 'p'.*'threshold'.*cannot encode.*non-finite"):
+        load_experiment(p)
+
+
+def test_json_file_accepts_quoted_date_like_override(tmp_path):
+    """Quoting keeps the value a string, which is exactly the documented fix."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              cutoff: "2024-01-01"
+        """,
+    )
+
+    exp = load_experiment(p)
+
+    assert exp.phases[0].fixed_overrides["cutoff"] == "2024-01-01"
 
 
 # ---- migrated from version-named files ----
@@ -110,12 +231,13 @@ def test_effective_overrides_include_fixed(tmp_path):
     yaml_text = f"""
 experiment: eff_override_test
 storage: sqlite:///{db_path}
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: arch
     fixed_overrides:
@@ -155,7 +277,7 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: arch
             n_trials: 1
@@ -177,8 +299,17 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         load_experiment(p)
 
 
-def test_multi_parent_collision_unresolved_errors(tmp_path):
-    """Two independent parents both lock 'lr'; child must resolve via fixed_overrides."""
+@pytest.mark.parametrize(
+    ("resolution", "valid"),
+    [
+        pytest.param("", False, id="unresolved"),
+        pytest.param(
+            "fixed_overrides:\n              lr: 5.0e-4\n            ", True, id="resolved"
+        ),
+    ],
+)
+def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: str, valid: bool):
+    """A child must explicitly resolve a key locked by multiple parents."""
     p = write_yaml(
         tmp_path,
         f"""
@@ -188,7 +319,7 @@ def test_multi_parent_collision_unresolved_errors(tmp_path):
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
           - name: a
             n_trials: 1
@@ -200,44 +331,14 @@ def test_multi_parent_collision_unresolved_errors(tmp_path):
               lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
           - name: c
             inherits: [a, b]
-            n_trials: 1
+            {resolution}n_trials: 1
             search_space:
               dropout: {{ type: float, low: 0, high: 0.5 }}
         """,
     )
-    with pytest.raises(ValidationError, match="conflicting locked key"):
-        load_experiment(p)
-
-
-def test_multi_parent_collision_resolved_by_fixed_override(tmp_path):
-    """Same conflict but child explicitly resolves with fixed_overrides — accepted."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
-        phases:
-          - name: a
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: b
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: c
-            inherits: [a, b]
-            fixed_overrides:
-              lr: 5.0e-4
-            n_trials: 1
-            search_space:
-              dropout: {{ type: float, low: 0, high: 0.5 }}
-        """,
-    )
-    exp = load_experiment(p)  # must not raise
+    if not valid:
+        with pytest.raises(ValidationError, match="conflicting locked key"):
+            load_experiment(p)
+        return
+    exp = load_experiment(p)
     assert exp.phases[-1].fixed_overrides["lr"] == 5.0e-4

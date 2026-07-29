@@ -7,13 +7,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from phasesweep import load_experiment
+from phasesweep import load_config, load_experiment
 from phasesweep.config import (
     Experiment,
     IntParam,
-    JsonExtractor,
+    LogRegexExtractor,
     Metric,
     Phase,
+    Suite,
 )
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
@@ -45,7 +46,13 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert result is None, case
 
 
-def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path:
+def _storage_policy_config(
+    tmp_path: Path,
+    *,
+    storage: str,
+    n_jobs: int,
+    allow_external_rdb_single_host: bool | None = None,
+) -> Path:
     parallel = (
         f"""
             n_jobs: {n_jobs}
@@ -53,17 +60,24 @@ def _storage_policy_config(tmp_path: Path, *, storage: str, n_jobs: int) -> Path
         if n_jobs > 1
         else ""
     )
+    external_rdb_single_host = (
+        f"\n        allow_external_rdb_single_host: "
+        f"{'true' if allow_external_rdb_single_host else 'false'}"
+        if allow_external_rdb_single_host is not None
+        else ""
+    )
     return write_yaml(
         tmp_path,
         f"""
         experiment: t
-        storage: {storage}
+        storage: {storage}{external_rdb_single_host}
+        provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
         metric:
           name: x
           goal: minimize
-          extractor: {{ type: json, path: r.json, key: x }}
+          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
         phases:
           - name: p
             n_trials: 1{parallel}
@@ -98,15 +112,128 @@ def test_validate_storage_parallel_policy(
         load_experiment(p)
 
 
+@pytest.mark.parametrize(
+    ("storage", "allow_external_rdb_single_host", "raises"),
+    [
+        ("postgresql://user:pass@host/db", None, True),
+        ("postgresql://user:pass@host/db", False, True),
+        ("postgresql://user:pass@host/db", True, False),
+        ("mysql+pymysql://user:pass@host/db", None, True),
+        ("mysql+pymysql://user:pass@host/db", True, False),
+        ("sqlite:///{tmp}/phases.db", None, False),
+        ("sqlite:///{tmp}/phases.db", False, False),
+        ("journal:///{tmp}/phases.journal", None, False),
+    ],
+    ids=[
+        "postgres_default_rejected",
+        "postgres_explicit_false_rejected",
+        "postgres_acknowledged_ok",
+        "mysql_default_rejected",
+        "mysql_acknowledged_ok",
+        "sqlite_unaffected_default",
+        "sqlite_unaffected_explicit_false",
+        "journal_unaffected",
+    ],
+)
+def test_validate_storage_external_rdb_single_host_policy(
+    tmp_path: Path,
+    storage: str,
+    allow_external_rdb_single_host: bool | None,
+    raises: bool,
+) -> None:
+    """A storage backend other than sqlite/journal requires an explicit
+    allow_external_rdb_single_host: true acknowledgement (review v0.5.15 / item E,
+    renamed from allow_unsafe_multihost per review v0.5.14 / item D); sqlite and
+    journal storage are unaffected regardless of the flag's value."""
+    p = _storage_policy_config(
+        tmp_path,
+        storage=storage.format(tmp=tmp_path),
+        n_jobs=1,
+        allow_external_rdb_single_host=allow_external_rdb_single_host,
+    )
+    if raises:
+        with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+            load_experiment(p)
+    else:
+        load_experiment(p)
+
+
+def test_external_rdb_storage_error_is_actionable() -> None:
+    """The rejection must name the detected backend, state that PhaseSweep's
+    coordination is single-host, and say how to acknowledge the risk."""
+    with pytest.raises(ValueError) as exc_info:
+        Experiment(
+            experiment="t",
+            storage="postgresql://user:pass@host/db",
+            provenance={"revision": "test-fixture-v1"},
+            trial_command="echo {overrides}",
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
+            phases=[
+                Phase(  # type: ignore[arg-type]
+                    name="p",
+                    n_trials=2,
+                    search_space={"x": IntParam(type="int", low=0, high=1)},
+                )
+            ],
+        )
+    message = str(exc_info.value)
+    assert "postgresql" in message
+    assert "host-local-filesystem" in message
+    assert "allow_external_rdb_single_host: true" in message
+    assert "single host" in message
+
+
+def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
+    """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
+    study's Experiment exactly like ``storage`` and other defaulted fields
+    (see ``Suite.experiment_for_study``); a study can still opt out and hit
+    the same Experiment-level rejection as a standalone config."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: external_rdb_suite
+            defaults:
+              storage: postgresql://user:pass@host/db
+              allow_external_rdb_single_host: true
+              trial_command: "echo"
+              provenance: {revision: default-v1}
+              metric:
+                name: x
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
+            studies:
+              - name: inherited
+                phases: [{name: p, n_trials: 1}]
+              - name: opted_out
+                allow_external_rdb_single_host: false
+                phases: [{name: p, n_trials: 1}]
+            """,
+        )
+    )
+
+    assert isinstance(config, Suite)
+    inherited_study, opted_out_study = config.studies
+
+    inherited = config.experiment_for_study(inherited_study)
+    assert inherited.storage == "postgresql://user:pass@host/db"
+    assert inherited.allow_external_rdb_single_host is True
+
+    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+        config.experiment_for_study(opted_out_study)
+
+
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     """File-based backends resolve to absolute paths so equivalent URL spellings
     (relative paths, ``..`` segments) produce one stable lock identity. None
     in returns None out (in-memory has no shared backend to collide on).
 
-    SQLite-dialect collapse and RDB pass-through are pinned by sibling tests
-    in this file (``test_storage_backend_collapses_sqlalchemy_dialects``,
-    ``test_canonical_storage_identity_rdb_passes_through``); this test only
-    pins the path-resolution and None-handling contract.
+    SQLite-dialect collapse and RDB canonicalization are pinned by sibling
+    tests in this file (``test_storage_backend_collapses_sqlalchemy_dialects``,
+    ``test_equivalent_rdb_urls_share_one_identity``); this test only pins the
+    path-resolution and None-handling contract.
     """
     # SQLite path with `..` must be resolved away.
     sqlite_id = canonical_storage_identity(f"sqlite:///{tmp_path}/sub/../db.sqlite3")
@@ -129,8 +256,11 @@ def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
         Experiment(
             experiment="t",
             storage="sqlite:///test.db",
+            provenance={"revision": "test-fixture-v1"},
             trial_command="echo {overrides}",
-            metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+            ),
             phases=[
                 Phase(  # type: ignore[arg-type]
                     name="p",
@@ -160,11 +290,119 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
         make_experiment(workdir=tmp_path / "runs", storage=storage, n_jobs=2)
 
 
-def test_canonical_storage_identity_rdb_passes_through() -> None:
-    """RDB URLs are not rewritten — same-host advisory lock has no business
-    second-guessing a remote DB URL."""
-    url = "postgresql://u:p@host/db"
-    assert canonical_storage_identity(url) == url
+@pytest.mark.parametrize(
+    ("label", "left", "right"),
+    [
+        (
+            "password rotation",
+            "postgresql://sweep:old-secret@db.internal:5432/studies",
+            "postgresql://sweep:new-secret@db.internal:5432/studies",
+        ),
+        (
+            "query order",
+            "postgresql://sweep@db.internal/studies?a=1&b=2",
+            "postgresql://sweep@db.internal/studies?b=2&a=1",
+        ),
+        (
+            "connection-only options ignored",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal/studies"
+            "?application_name=phasesweep&connect_timeout=10&sslmode=require"
+            "&keepalives_idle=30&target_session_attrs=read-write",
+        ),
+        (
+            "default vs explicit postgres port",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal:5432/studies",
+        ),
+        (
+            "default vs explicit mysql port",
+            "mysql://sweep@db.internal/studies",
+            "mysql://sweep@db.internal:3306/studies",
+        ),
+        (
+            "host case",
+            "postgresql://sweep@DB.Internal/studies",
+            "postgresql://sweep@db.internal/studies",
+        ),
+        (
+            "psycopg driver spelling",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql+psycopg://sweep@db.internal/studies",
+        ),
+        (
+            "psycopg2 driver spelling",
+            "postgresql+psycopg://sweep@db.internal/studies",
+            "postgresql+psycopg2://sweep@db.internal/studies",
+        ),
+    ],
+)
+def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: str) -> None:
+    """Equivalent spellings of one external database must share one lock identity.
+
+    Before v0.5.18 the raw URL string was hashed into the same-host lock path,
+    so a rotated password or a reordered query silently split the lock and let
+    two orchestrators write the same study (review v0.5.17 / blocker 5).
+    """
+    identity = canonical_storage_identity(left)
+    assert identity is not None
+    assert identity == canonical_storage_identity(right), label
+
+
+@pytest.mark.parametrize(
+    ("label", "left", "right"),
+    [
+        ("database", "postgresql://u@h/db_a", "postgresql://u@h/db_b"),
+        ("host", "postgresql://u@host_a/db", "postgresql://u@host_b/db"),
+        ("user", "postgresql://user_a@h/db", "postgresql://user_b@h/db"),
+        ("non-default port", "postgresql://u@h:5432/db", "postgresql://u@h:6432/db"),
+        ("dialect family", "postgresql://u@h/db", "mysql://u@h/db"),
+        (
+            "unix socket vs tcp",
+            "postgresql://u@/db?host=/var/run/postgresql",
+            "postgresql://u@/db",
+        ),
+        (
+            "different unix socket dir",
+            "postgresql://u@/db?host=/var/run/postgresql",
+            "postgresql://u@/db?host=/tmp",
+        ),
+    ],
+)
+def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right: str) -> None:
+    """Canonicalization must not over-collide onto genuinely different targets."""
+    assert canonical_storage_identity(left) != canonical_storage_identity(right), label
+
+
+def test_rdb_identity_excludes_credentials_and_keeps_socket_path() -> None:
+    """The password never reaches the lock identity; ``host=`` (unix socket) does."""
+    identity = canonical_storage_identity(
+        "postgresql://sweep:hunter2@/studies?host=/var/run/postgresql&connect_timeout=10"
+    )
+
+    assert identity is not None
+    assert "hunter2" not in identity
+    assert "connect_timeout" not in identity
+    assert "sweep" in identity
+    assert "studies" in identity
+    # The socket directory is identity-bearing, percent-encoded in the identity.
+    assert "%2Fvar%2Frun%2Fpostgresql" in identity
+
+
+def test_rdb_identity_is_deterministic_and_prefixed() -> None:
+    """The emitted form is stable across calls and self-describing."""
+    url = "postgresql+psycopg2://sweep:pw@DB.Internal/studies?application_name=x&b=2&a=1"
+
+    identity = canonical_storage_identity(url)
+
+    assert identity == "rdb://postgresql://sweep@db.internal:5432/studies?a=1&b=2"
+    assert identity == canonical_storage_identity(url)
+
+
+def test_unparseable_storage_identity_falls_back_to_raw_string() -> None:
+    """Lock-path derivation must never crash on a URL SQLAlchemy cannot parse."""
+    for storage in ("not a url", "://", "postgres_but_not_a_url"):
+        assert canonical_storage_identity(storage) == storage
 
 
 def test_file_url_path_preserves_absolute_paths() -> None:

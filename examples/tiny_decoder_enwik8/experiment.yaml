@@ -1,9 +1,12 @@
-# PhaseSweep smoke sweep for a tiny Enwik8 decoder trainer backed by https://github.com/pszemraj/decoder-pytorch-template.
+# Full PhaseSweep example for a tiny Enwik8 decoder trainer backed by https://github.com/pszemraj/decoder-pytorch-template.
 #
 # The trainer accepts YAML configs, so this example uses PhaseSweep's json_file override format plus run_trial.py to compose a per-trial YAML file.
 
-experiment: tiny_decoder_enwik8_hparam_smoke
+experiment: tiny_decoder_enwik8_hparams
 storage: sqlite:///./examples/tiny_decoder_enwik8/runs/phases.db
+provenance:
+  trainer: "run-trial-v1+decoder-template@9c90a551"
+  data: "enwik8-template-download"
 workdir: ./examples/tiny_decoder_enwik8/runs/trials
 trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/base.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
 override_format: json_file
@@ -14,9 +17,13 @@ metric:
   name: val_loss
   goal: minimize
   extractor:
-    type: json
+    type: json_envelope
     path: result.json
-    key: val_loss
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+    checkpoint: final.pt
+    expected_step: 1000
 
 phases:
   - name: optimizer_scale

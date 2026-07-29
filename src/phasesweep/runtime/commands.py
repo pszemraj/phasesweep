@@ -32,7 +32,12 @@ def _stringify(value: Any) -> str:
 
 
 def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar."""
+    """Render a value for Hydra/OmegaConf override grammar.
+
+    :param Any value: Scalar or list-like value to render.
+    :raises TypeError: If the value cannot be represented by the supported grammar.
+    :return str: Hydra-compatible representation of the value.
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -83,6 +88,32 @@ def format_argparse(overrides: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def dump_overrides_json(payload: Any) -> str:
+    """Serialize an override payload with the canonical strict JSON encoder.
+
+    This is the single definition of "representable as a phasesweep override on
+    the ``json_file`` wire". :func:`write_json_file` writes exactly this text,
+    and config load runs every statically-known override value through the same
+    call so a YAML scalar that PyYAML turned into a non-JSON Python object (an
+    unquoted ``2024-01-01`` becomes :class:`datetime.date`) is rejected by
+    ``phasesweep validate`` instead of by ``json.dumps`` inside the first real
+    trial (review v0.5.17 / finding B). Keep the encoder options here and
+    nowhere else — a second, laxer serializer is how the audit artifact and the
+    wire artifact drift apart.
+
+    :param Any payload: Value or mapping to serialize.
+    :raises TypeError: The payload contains something the strict encoder cannot
+        represent (``default=`` is deliberately not set).
+    :raises ValueError: The payload contains a non-finite float (``inf``,
+        ``-inf``, or ``nan``) — ``allow_nan=False`` rejects the values Python's
+        ``json.dumps`` would otherwise render as the non-standard
+        ``Infinity``/``-Infinity``/``NaN`` tokens, which this repo's own
+        :func:`phasesweep.runtime.json.strict_json_loads` refuses to parse.
+    :return str: Sorted, two-space-indented JSON text with no trailing newline.
+    """
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+
+
 def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
     """Write a JSON overrides file with dotted keys expanded into nested dicts.
 
@@ -108,7 +139,7 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
             raise ValueError(f"Cannot expand override {k!r}: it would replace a nested object.")
         cur[parts[-1]] = v
     path = trial_dir / "overrides.json"
-    path.write_text(json.dumps(nested, indent=2, sort_keys=True))
+    path.write_text(dump_overrides_json(nested))
     return path
 
 
@@ -138,8 +169,8 @@ def render_command(
             ``overrides.json`` file when ``fmt == "json_file"``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
         phase: Phase name, used for ``{phase}``.
-        run_name: Composite ``<experiment>-<phase>-<trial_id>`` identifier used
-            for ``{run_name}``.
+        run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
+            identifier used for ``{run_name}``.
         write_files: When ``False``, render paths without writing
             ``overrides.json``. Used by dry-run previews so they are
             filesystem-pure.

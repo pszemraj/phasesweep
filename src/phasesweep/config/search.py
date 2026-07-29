@@ -84,21 +84,33 @@ class CategoricalParam(_Frozen):
 
     @field_validator("choices")
     @classmethod
-    def _choices_are_optuna_scalars(cls, choices: list[Any]) -> list[Any]:
-        """Reject categorical choices Optuna can't store (lists, dicts, NaN, ...).
+    def _choices_are_unique_optuna_scalars(cls, choices: list[Any]) -> list[Any]:
+        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and duplicates.
+
+        Optuna keeps a duplicated choice verbatim — ``CategoricalDistribution([1, 1, 2])``
+        has three choices and ``GridSampler`` enumerates three points — so
+        ``[1, 1, 2]`` used to run three trials over two distinct assignments and
+        still report the grid complete (review v0.5.17 / finding C). Duplicates
+        also silently double a choice's sampling weight under TPE/random.
+
+        Uniqueness is type-aware: ``1``, ``1.0``, and ``true`` are three
+        different overrides on the wire even though Python calls them equal, so
+        the identity key is ``(type name, repr)`` rather than the value itself.
 
         Args:
             choices: The candidate choices list pre-validation.
 
         Returns:
             The same list, unchanged. Raises ``ValueError`` if any element is
-            not an Optuna-compatible scalar.
+            not an Optuna-compatible scalar, is a non-finite float, or repeats
+            an earlier choice.
 
         """
         # Optuna only accepts None|bool|int|float|str as categorical choices.
         # Anything else (lists, dicts, custom objects) fails at suggest time.
         allowed = (str, int, float, bool, type(None))
-        for c in choices:
+        first_index: dict[tuple[str, str], int] = {}
+        for index, c in enumerate(choices):
             if not isinstance(c, allowed):
                 raise ValueError(
                     "categorical choices must be Optuna-compatible scalars "
@@ -107,6 +119,17 @@ class CategoricalParam(_Frozen):
                 )
             if isinstance(c, float) and not math.isfinite(c):
                 raise ValueError(f"categorical float choices must be finite; got {c!r}")
+            identity = (type(c).__name__, repr(c))
+            if identity in first_index:
+                raise ValueError(
+                    f"categorical choices must be unique; {c!r} appears at index "
+                    f"{first_index[identity]} and index {index}. A repeated choice "
+                    "inflates grid cardinality (the phase runs an extra trial on an "
+                    "assignment it already evaluated, yet still reports a complete "
+                    "grid) and doubles that value's sampling weight. Uniqueness is "
+                    "type-aware: 1, 1.0, and true remain three distinct choices."
+                )
+            first_index[identity] = index
         return choices
 
 
@@ -133,6 +156,14 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     * Grid sampler with float param missing ``step``.
     * Grid sampler with float ``(high - low)`` not an integer multiple of ``step`` —
       naive enumeration emits values above ``high`` (review v0.5.2 / blocker 4).
+    * Grid sampler with a float param whose enumerated points collapse under the
+      12-decimal canonical rounding, which would make the cardinality below
+      overcount the distinct configurations (review v0.5.17 / finding C).
+
+    The cardinality is a product of the enumerated value-list lengths, so it is
+    only truthful while those lists are duplicate-free. Categorical duplicates
+    are rejected by :class:`CategoricalParam` and float collapse by
+    :func:`grid_search_space`, both before this product is taken.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
@@ -145,10 +176,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                 f"categorical parameters: {cats}. Use sampler.type='tpe' or "
                 f"remove the categorical params from this phase."
             )
-        # Optional dependency check at config-load (review v0.5.6 / non-blocking
-        # hardening item). Without this, the import error fires from
-        # ``_build_sampler`` mid-run, *after* ``phasesweep validate`` already
-        # said the config is fine.
         try:
             import cmaes  # type: ignore[import-untyped]  # noqa: F401
         except ImportError as exc:
@@ -163,7 +190,12 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             len(values)
             for values in grid_search_space(phase.search_space, phase_name=phase.name).values()
         )
-        if not phase.allow_partial_grid and phase.n_trials < cardinality:
+        if phase.n_trials > cardinality:
+            raise ValueError(
+                f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
+                f"cardinality {cardinality}."
+            )
+        if not phase.allow_partial_grid and phase.n_trials != cardinality:
             raise ValueError(
                 f"Phase {phase.name!r}: grid sampler has {cardinality} combinations "
                 f"but n_trials={phase.n_trials}. Grid phases run the full matrix by "
@@ -235,7 +267,22 @@ def grid_search_space(
                 )
             _validate_float_grid_divides(phase_name, name, param)
             n_steps = int(round((param.high - param.low) / param.step))
-            grid[name] = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
+            values = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
+            # Post-canonicalization collapse (review v0.5.17 / finding C): the
+            # round(..., 12) above maps adjacent points onto the same float once
+            # the step drops below ~1e-12, so the grid would publish fewer unique
+            # configurations than the cardinality check counts — the same
+            # "complete grid" lie duplicate categorical choices produced.
+            unique = len(set(values))
+            if unique != len(values):
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid float param {name!r} collapses to "
+                    f"{unique} unique value(s) instead of {len(values)} after rounding "
+                    f"to 12 decimal places (low={param.low}, high={param.high}, "
+                    f"step={param.step}). Rescale the parameter — sweep an exponent or "
+                    "a multiplier — so adjacent grid points differ by more than 1e-12."
+                )
+            grid[name] = values
         else:  # pragma: no cover
             raise ValueError(f"Unhandled param type for grid: {param!r}")
     return grid

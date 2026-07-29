@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -10,9 +11,19 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
-from phasesweep.engine.state import FEASIBLE_ATTR, Winner, constraint_attr
-
-WINNER_TIE_EPS = 1e-12
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FEASIBLE_ATTR,
+    GATES_ATTR,
+    GENERATION_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
+    Winner,
+    WinnerSource,
+    WinnerSourceKind,
+    _winner_common_payload,
+    _winner_source_or_default,
+    constraint_attr,
+)
 
 
 @dataclass
@@ -26,6 +37,13 @@ class SelectedTrial:
     params: dict[str, Any]
     metric: float
     constraints: dict[str, float] = field(default_factory=dict)
+    gates: list[dict[str, Any]] = field(default_factory=list)
+    generation_id: str = ""
+    attempt_id: str = ""
+    # Frozen evidence provenance recorded when the trial's objective was
+    # extracted (review v0.5.17 / finding F); None for trials persisted
+    # before the record existed.
+    objective_provenance: dict[str, Any] | None = None
 
 
 class NoFeasibleTrialError(RuntimeError):
@@ -40,7 +58,14 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
       2. Trial's metric must be finite.
       3. All constraint values (read from user_attrs) must satisfy bounds.
       4. Among survivors, argmin/argmax on metric.
-      5. Ties (within absolute eps 1e-12) broken by lower trial_number.
+      5. Ties — exact float equality only — broken by lower trial_number.
+
+    Ordering is exact, never approximate. An earlier absolute epsilon (1e-12)
+    folded everything within that distance of the optimum into one "tie" band,
+    which silently reordered any objective whose natural scale sits at or below
+    1e-12: two genuinely different results at 1e-13 and 3e-13 ranked by trial
+    number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
+    way to know a config's meaningful resolution, so it does not guess one.
 
     Args:
         study: Optuna study for the phase whose winner we want.
@@ -50,7 +75,7 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
-        constraint readings).
+        constraint readings, and persisted evidence-gate results).
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
@@ -68,8 +93,14 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             continue
         if not t.user_attrs.get(FEASIBLE_ATTR, False):
             continue
+        generation_id = t.user_attrs.get(GENERATION_ID_ATTR)
+        attempt_id = t.user_attrs.get(ATTEMPT_ID_ATTR)
+        if not isinstance(generation_id, str) or not generation_id:
+            continue
+        if not isinstance(attempt_id, str) or not attempt_id:
+            continue
         # Re-verify constraints from user_attrs in case rules changed or stored
-        # values are non-finite (defense in depth — review item #3).
+        # values are non-finite (defense in depth — review v0.5.2 / item 3).
         ok = True
         for name, c in constraints_by_name.items():
             v = t.user_attrs.get(constraint_attr(name))
@@ -99,20 +130,46 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         if minimize
         else max(_trial_value(t) for t in survivors)
     )
-    near_best = [t for t in survivors if abs(_trial_value(t) - best_value) <= WINNER_TIE_EPS]
-    best = min(near_best, key=lambda t: t.number)
+    # Exact equality, not a tolerance band (review v0.5.17 / finding H).
+    tied = [t for t in survivors if _trial_value(t) == best_value]
+    best = min(tied, key=lambda t: t.number)
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
     }
     selected_value = best.value
     assert selected_value is not None  # same invariant
+    raw_gates = best.user_attrs.get(GATES_ATTR)
+    gates: list[dict[str, Any]] = []
+    if isinstance(raw_gates, str) and raw_gates:
+        try:
+            parsed_gates = json.loads(raw_gates)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed_gates, list):
+                gates = [item for item in parsed_gates if isinstance(item, dict)]
+
+    provenance: dict[str, Any] | None = None
+    raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
+    if isinstance(raw_provenance, str) and raw_provenance:
+        try:
+            parsed_provenance = json.loads(raw_provenance)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed_provenance, dict):
+                provenance = parsed_provenance
 
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
         metric=float(selected_value),
         constraints=constraint_vals,
+        gates=gates,
+        generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
+        attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
+        objective_provenance=provenance,
     )
 
 
@@ -143,6 +200,9 @@ def _gates_pass(gates: list[dict[str, Any]]) -> bool:
 def _clone_winner_from_baseline(
     baseline: Winner,
     *,
+    source_kind: WinnerSourceKind,
+    source_phase: str,
+    source_study: str | None = None,
     phase_fingerprint: str | None,
     completion: dict[str, Any] | None = None,
     promotion: dict[str, Any] | None = None,
@@ -150,12 +210,16 @@ def _clone_winner_from_baseline(
     """Clone a baseline winner for exposure under another phase/study.
 
     :param Winner baseline: Winner to copy into the exposed result slot.
+    :param WinnerSourceKind source_kind: Why the baseline supplies this exposure slot.
+    :param str source_phase: Phase containing the baseline source trial.
+    :param str | None source_study: Suite study containing the source trial, if applicable.
     :param str | None phase_fingerprint: Fingerprint to assign to the clone.
     :param dict[str, Any] | None completion: Optional completion payload to
         store instead of the baseline completion.
     :param dict[str, Any] | None promotion: Optional promotion audit payload.
     :return Winner: Cloned winner with copied mutable payloads.
     """
+    baseline_source = _winner_source_or_default(baseline, source_phase, study=source_study)
     return Winner(
         trial_number=baseline.trial_number,
         params=dict(baseline.params),
@@ -166,6 +230,21 @@ def _clone_winner_from_baseline(
         completion=dict(completion or baseline.completion),
         promotion=promotion,
         phase_fingerprint=phase_fingerprint,
+        generation_id=baseline.generation_id,
+        attempt_id=baseline.attempt_id,
+        objective_provenance=(
+            dict(baseline.objective_provenance)
+            if baseline.objective_provenance is not None
+            else None
+        ),
+        source=WinnerSource(
+            kind=source_kind,
+            phase=baseline_source.phase,
+            trial_number=baseline_source.trial_number,
+            generation_id=baseline_source.generation_id,
+            attempt_id=baseline_source.attempt_id,
+            study=source_study or baseline_source.study,
+        ),
     )
 
 
@@ -217,16 +296,9 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     """
     payload = {
         "name": name,
-        "trial_number": winner.trial_number,
         "metric": winner.metric,
-        "params": winner.params,
-        "effective_overrides": winner.effective_overrides,
-        "constraints": winner.constraints,
-        "gates": winner.gates,
-        "completion": winner.completion,
+        **_winner_common_payload(winner, name),
     }
-    if winner.promotion is not None:
-        payload["promotion"] = winner.promotion
     return payload
 
 
@@ -248,11 +320,6 @@ def _apply_promotion(
     promotion = phase.promotion
     if promotion is None:
         return candidate, None
-    if promotion.min_delta_vs not in winners:
-        raise RuntimeError(
-            f"Phase {phase.name!r} promotion references unknown baseline "
-            f"{promotion.min_delta_vs!r}."
-        )
 
     baseline = winners[promotion.min_delta_vs]
     promoted, improvement, gates_passed, reason = _evaluate_promotion_rule(
@@ -297,6 +364,11 @@ def _apply_promotion(
         "phase": phase.name,
         "baseline": promotion.min_delta_vs,
         "candidate_trial_number": candidate.trial_number,
+        "candidate_generation_id": candidate.generation_id,
+        "candidate_attempt_id": candidate.attempt_id,
+        "baseline_trial_number": baseline.trial_number,
+        "baseline_generation_id": baseline.generation_id,
+        "baseline_attempt_id": baseline.attempt_id,
         "exposed_trial_number": exposed_trial_number,
         "exposed_source": exposed_source,
         "candidate_metric": candidate.metric,
@@ -335,6 +407,8 @@ def _apply_promotion(
     return (
         _clone_winner_from_baseline(
             baseline,
+            source_kind="promotion_baseline",
+            source_phase=promotion.min_delta_vs,
             phase_fingerprint=candidate.phase_fingerprint,
             completion=candidate.completion,
             promotion=decision,
@@ -424,6 +498,12 @@ def _apply_study_promotion(
         "study": study_name,
         "phase": final_phase,
         "baseline": baseline_label,
+        "candidate_trial_number": candidate.trial_number,
+        "candidate_generation_id": candidate.generation_id,
+        "candidate_attempt_id": candidate.attempt_id,
+        "baseline_trial_number": baseline.trial_number,
+        "baseline_generation_id": baseline.generation_id,
+        "baseline_attempt_id": baseline.attempt_id,
         "candidate_metric": candidate.metric,
         "baseline_metric": baseline.metric,
         "min_delta": promotion.min_delta,
@@ -432,6 +512,21 @@ def _apply_study_promotion(
         "gates_passed": gates_passed,
         "promoted": promoted,
         "on_fail": promotion.on_fail,
+        "action": "promote" if promoted else promotion.on_fail,
+        "exposed_source": (
+            "candidate"
+            if promoted
+            else "baseline"
+            if promotion.on_fail == "continue_baseline"
+            else None
+        ),
+        "exposed_trial_number": (
+            candidate.trial_number
+            if promoted
+            else baseline.trial_number
+            if promotion.on_fail == "continue_baseline"
+            else None
+        ),
     }
     if promoted:
         log.info(
@@ -459,6 +554,11 @@ def _apply_study_promotion(
     exposed = dict(study_winners)
     exposed[final_phase] = _clone_winner_from_baseline(
         baseline,
+        source_kind="suite_baseline",
+        source_phase=baseline.source.phase if baseline.source is not None else baseline_label,
+        source_study=baseline_label.partition(".")[0],
         phase_fingerprint=candidate.phase_fingerprint,
+        completion=candidate.completion,
+        promotion=decision,
     )
     return exposed, decision

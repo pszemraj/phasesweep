@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP
@@ -91,7 +92,11 @@ def mcp_experiment_config_text(
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
-    storage = f"storage: sqlite:///{tmp_path}/{name}.db\n" if with_storage else ""
+    storage = (
+        f"storage: sqlite:///{tmp_path}/{name}.db\nprovenance: {{revision: test-fixture-v1}}\n"
+        if with_storage
+        else ""
+    )
     return f"""\
 experiment: {name}
 {storage}workdir: {tmp_path}/runs/{name}
@@ -99,7 +104,7 @@ trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
 metric:
   name: loss
   goal: minimize
-  extractor: {{ type: json, path: r.json, key: loss }}
+  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
 phases:
 {phases}"""
 
@@ -114,13 +119,14 @@ def slow_mcp_config_text(
     return f"""\
 experiment: {name}
 storage: sqlite:///{tmp_path}/{name}.db
+provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
 trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
 override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
-  extractor: {{ type: json, path: result.json, key: eval_loss }}
+  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
 phases:
   - name: p
     n_trials: 1
@@ -135,30 +141,13 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     return PhaseSweepMCP(registry, store), registry, store
 
 
-def wait_for_mcp_state(
-    app: PhaseSweepMCP,
-    run_id: str,
-    *,
-    want: set[str],
-    timeout: float,
-) -> str:
-    deadline = time.time() + timeout
-    state = "unknown"
-    while time.time() < deadline:
-        state = app.status(run_id=run_id)["run"]["state"]
-        if state in want:
-            return state
-        time.sleep(0.3)
-    return state
-
-
 def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: float) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         status = app.status(run_id=run_id)
         if status["run"]["state"] in {"succeeded", "failed", "cancelled"}:
             return status["run"]["state"]
-        if status["phases"][0]["running"] >= 1:
+        if status["phases"][0]["running_trials_total"] >= 1:
             return "running"
         time.sleep(0.2)
     return "timeout"
@@ -189,7 +178,6 @@ def assert_no_sensitive(payload: Any, sensitive: Iterable[str]) -> None:
 
 
 def make_run_handle(
-    store: RunStore,
     *,
     run_id: str,
     experiment_id: str = "exp",
@@ -208,8 +196,6 @@ def make_run_handle(
             pgid=None,
             pid_starttime=None,
             started_at=utc_now_iso(),
-            log_path=str(store.log_path(run_id)),
-            status_path=str(store.status_path(run_id)),
             launch_state=launch_state,
             allow_cancel=allow_cancel,
         )
@@ -222,11 +208,41 @@ def make_run_handle(
         pgid=process_id,
         pid_starttime=read_proc_starttime(process_id) if starttime is None else starttime,
         started_at=utc_now_iso(),
-        log_path=str(store.log_path(run_id)),
-        status_path=str(store.status_path(run_id)),
         launch_state=launch_state,
         allow_cancel=allow_cancel,
     )
+
+
+def claim_runner_handle(
+    store: RunStore,
+    *,
+    run_id: str,
+    config_sha256: str,
+    started_at: str,
+    experiment_id: str = "srv",
+) -> None:
+    """Create the launch reservation a real MCP server owns before spawning."""
+    store.create(
+        RunHandle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=started_at,
+            launch_state="launching",
+        )
+    )
+
+
+def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
+    """Invoke the detached runner in-process and restore the caller's directory."""
+    original = Path.cwd()
+    try:
+        return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
+    finally:
+        os.chdir(original)
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:

@@ -1,98 +1,99 @@
-# Config Guide
+# Config guide
 
-A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and writes the artifacts that configured extractors read.
+A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and provides the evidence that configured extractors read.
 
-For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml).
+For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml). If a config that used to load now fails validation, see [upgrading existing configs](#upgrading-existing-configs).
 
-- [Experiment Keys](#experiment-keys)
-- [Phase Keys](#phase-keys)
-- [Search Parameters](#search-parameters)
-- [Override Formats](#override-formats)
-- [Trainer Contract](#trainer-contract)
-- [Override Order](#override-order)
-- [Extractors](#extractors)
-- [Evidence Gates](#evidence-gates)
-- [Promotion](#promotion)
-- [Suites](#suites)
-- [Validation](#validation)
-
-## Experiment Keys
+## Experiment keys
 
 The top level of a single experiment describes identity, storage, the trial command contract, the objective, and the ordered phase plan. `experiment` is more than a display name: it is used in Optuna study names, output paths, and same-host lock identity, so it is restricted to ASCII `[A-Za-z0-9_-]+`.
 
-`storage` controls whether a run can resume. `null` is in-memory and non-resumable. `sqlite:///path.db` is durable for sequential `n_jobs == 1` studies, but SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Use `journal:///path.journal` for same-host parallel work, or an Optuna-supported RDB URL such as `postgresql://...` when you need durable external storage.
+`storage` selects the Optuna backend. `null` creates an in-memory study, `sqlite:///path.db` provides persistence for sequential `n_jobs == 1` studies, `journal:///path.journal` supports same-host parallel work, and an Optuna-supported RDB URL such as `postgresql://...` provides external storage. SQLite with parallel trials is rejected because concurrent Optuna writers are not a safe local parallel backend. Study reuse, top-ups, and `--from-phase` behavior are covered under [fingerprints and resume](runtime.md#fingerprints-and-resume).
 
-`trial_command` is the command template for one trial. The supported placeholders are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`. phasesweep validates the template at config load, then shell-quotes rendered override values. It does not teach your trainer to parse the chosen format; your trainer must already understand `argparse`, `hydra`, or the JSON file path you selected with `override_format`.
+An RDB `storage` URL is rejected at config validation unless `allow_external_rdb_single_host: true` also acknowledges the single-host requirement explained under [multi-host storage](runtime.md#concurrency-model).
 
-`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value, but constraints are selection filters only: current samplers do not receive feasibility guidance, and infeasible trials cannot be selected as the phase winner. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
+Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
 
-## Phase Keys
+`trial_command` is the command template for one trial. phasesweep validates the template at config load and shell-quotes rendered override values. The [config reference](config_reference.yaml) defines the supported placeholders; the parser boundary is explained under [override formats](#override-formats).
+
+`provenance` is the operator-declared identity of inputs that the command string cannot describe, such as the trainer revision, base config, dataset, dependency lock, container, tokenizer, or starting checkpoint. Persistent storage requires at least one nonempty entry. PhaseSweep includes the complete mapping in every phase fingerprint, so change its values whenever any external input changes; use a new experiment name when results from the old and new provenance should remain separate. PhaseSweep does not infer imports or hash arbitrary shell-command inputs.
+
+`metric` defines the objective name, optimization direction, and extractor. `constraints` are additional finite scalar extractors with inclusive `min` and/or `max` bounds. A trial that violates a constraint is still recorded as a completed evaluation with its raw objective value. Current samplers receive that objective without feasibility guidance; infeasible trials cannot become the phase winner and count toward `max_consecutive_failures`. `contracts` are named bundles of fixed overrides and gates that phases can opt into when you need immutable comparison conditions across multiple phases.
+
+The MCP API reports the configured extractor's guarantees through explicit [objective-evidence assurance fields](mcp.md#objective-evidence-assurance).
+
+The remaining top-level keys: `workdir` (default `./runs`) is the output root laid out in [runtime behavior](runtime.md#output-layout); `override_format` selects the trainer boundary covered in [override formats](#override-formats); `env` adds environment variables to every trial subprocess (included in semantic fingerprints); `timeout_seconds_per_run` is the whole-experiment wallclock guard described with the other timeouts in [runtime behavior](runtime.md#process-management).
+
+`execution` declares the trainer's execution context explicitly instead of inheriting it silently. `execution.cwd` sets the working directory every trainer subprocess runs in; when set, the resolved path joins the semantic fingerprint, so one persistent study can never mix trainers reached through different working directories (a relative `trial_command` like `python trainer.py` means different code from different directories). Prefer an absolute path - a relative value resolves from the invocation directory, and two invocation directories then count as two incompatible execution contexts by design. When unset, trainers run in the invocation cwd and the fingerprint records the context as unbound, preserving historical behavior. `execution.inherit_env` controls which ambient environment variables trainers inherit: `all` (default, historical behavior), `none` (a minimal documented base: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `USER`, `LOGNAME`, `TZ`), or a list of names inherited on top of that base - use a narrowed contract to keep unrelated host variables and secrets out of trainer subprocesses. The inherit contract (mode or sorted names) joins the fingerprint; ambient *values* are never hashed, so put values that change trial meaning in `env`, which is always fingerprinted. Configured `env` entries apply on top of whatever is inherited.
+
+For normal CLI runs, relative `workdir` values, relative `execution.cwd` values, and file-backed storage paths resolve from the directory where `phasesweep` was invoked, not from the config file's directory. Relative paths used by `trial_command` resolve from the trainer's effective working directory: `execution.cwd` when set, otherwise the invocation directory. Invoke a relative-path config from one stable intended directory; changing cwd can silently select a different artifact tree, study, or trainer. `phasesweep validate` checks the command template but does not require referenced executables or paths to exist. File storage URLs use three slashes for relative paths (`sqlite:///runs.db`, `journal:///runs.journal`) and four for absolute POSIX paths (`sqlite:////tmp/runs.db`). MCP-launched runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
+
+## Phase keys
 
 Each phase is one Optuna study in an ordered chain. A phase may inherit winners from earlier phases; those inherited values become locked overrides for the current phase and for descendants. This greedy structure is useful for inspectable staged searches, but it is not a substitute for joint optimization when dimensions interact strongly.
 
-- `name`: required phase name matching ASCII `[A-Za-z0-9_-]+`.
-- `inherits`: prior phase names whose exposed winners become fixed overrides.
-- `fixed_overrides`: hard-coded overrides for every trial in the phase.
-- `contracts`: top-level contracts applied to the phase. Contract keys cannot be resampled or locally overridden.
-- `search_space`: override-key to sampler spec. Dotted keys such as `model.depth` are allowed.
-- `n_trials`: terminal trial-attempt budget; Optuna `COMPLETE`, `FAIL`, and `PRUNED` trials all consume it. Increasing it later is a compatible top-up.
-- `n_jobs`: parallel trials inside the phase.
-- `gpu_policy`: `single_per_trial` leases one CUDA-visible token per trial, `whole_node` requires `n_jobs: 1` and exposes all configured or detected tokens to the trial, and `none` disables phasesweep CUDA isolation and GPU locks.
-- `gpu_ids`: explicit non-negative CUDA device indices such as `[0, 1]`.
-- `gpu_devices`: explicit opaque `CUDA_VISIBLE_DEVICES` tokens such as GPU UUIDs or MIG instance IDs. Use either `gpu_ids` or `gpu_devices`, not both. When both are omitted, ambient `CUDA_VISIBLE_DEVICES` tokens or `nvidia-smi` numeric output are auto-detected, including for `n_jobs == 1`.
-- `max_consecutive_failures`: abort threshold for consecutive failed or infeasible trials.
-- `sampler`: `tpe`, `random`, `grid`, or `cmaes`. `cmaes` is installed with the core package and is useful for continuous numeric phases.
-- `timeout_seconds_per_trial`: per-trial process-group timeout. `null` requires `allow_unbounded_trials: true`.
-- `timeout_seconds_per_phase`: hard phase wallclock guard. The budget caps Optuna scheduling, GPU-lease waiting, and active trial subprocess runtime.
-- `allow_incomplete_on_timeout`: select from completed trials after a phase or run timeout. Defaults to fail-closed.
-- `allow_partial_grid`: permit `n_trials` smaller than the grid cardinality.
-- `allow_seed_search`: permit `seed` or `*.seed` in `search_space`.
-- `gates`: evidence checks evaluated after metric and constraint extraction.
-- `promotion`: compare the phase winner against an earlier exposed winner before downstream use.
-- `comment`: design note shown by CLI commands. It is excluded from fingerprints.
+Each phase declares a search space and trial-attempt budget, with optional fixed overrides, inherited winners, contracts, evidence gates, and promotion rules. The [config reference](config_reference.yaml) lists the exact phase fields and constraints. GPU allocation, timeouts, cleanup, and study top-ups are covered in [runtime behavior](runtime.md).
 
-## Search Parameters
+## Search parameters
 
-`search_space` is a mapping from trainer override key to a typed parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing `model` while sampling `model.depth`, because no supported override format can represent that cleanly.
+`search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
-```yaml
-search_space:
-  lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-  depth: { type: int, low: 4, high: 16, step: 4 }
-  activation: { type: categorical, choices: [gelu, relu] }
-```
+Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be unique under a type-aware identity: `1`, `1.0`, and `true` stay three distinct choices even though Python compares them equal, but the same value listed twice is rejected. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
-Float and integer bounds must be finite. Categorical choices must be Optuna-compatible scalars: `null`, booleans, integers, finite floats, or strings. Grid phases require a full grid unless `allow_partial_grid: true`; float grids require `step` and an evenly divisible interval. CMA-ES supports continuous numeric spaces only, so categorical parameters are rejected when `sampler.type: cmaes`.
-
-## Override Formats
+## Override formats
 
 > [!IMPORTANT]
 > The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
-| Format      | Template placeholder | Trainer receives                     | Use when                                                         |
-| ----------- | -------------------- | ------------------------------------ | ---------------------------------------------------------------- |
-| `argparse`  | `{overrides}`        | `--key value` pairs                  | New scripts using `argparse`, Click, Typer, or similar parsers.  |
-| `hydra`     | `{overrides}`        | `key=value` tokens                   | Compatibility for existing Hydra/OmegaConf applications.         |
-| `json_file` | `{overrides_path}`   | Path to `<trial_dir>/overrides.json` | Recommended for structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
+| Format | Use when |
+| --- | --- |
+| `argparse` | New scripts using `argparse`, Click, Typer, or similar parsers. |
+| `hydra` | Existing Hydra/OmegaConf applications. |
+| `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
-When a phase has inherited, fixed, or sampled overrides, `argparse` and `hydra` commands must include `{overrides}`. `json_file` commands must include `{overrides_path}`. Config validation rejects missing placeholders before any trial launches.
+Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Validation and dry-run still do not write `overrides.json`, but config load now encodes every statically known composed value - contract then phase `fixed_overrides` - through the same strict serializer the real trial uses, so a value YAML resolved into a non-JSON Python object is named and rejected before any trial starts. The most common case is an unquoted date: `cutoff: 2024-01-01` is a `datetime.date`, not a string. Quote it.
 
-`json_file` is the most robust trainer boundary because it preserves JSON types without relying on a command-line grammar. Hydra compatibility quotes string and list values for OmegaConf override parsing, but complex structured values should use `json_file` rather than Hydra CLI overrides.
+## Trainer contract
 
-## Trainer Contract
-
-The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trainer must:
+The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Parse the selected [override format](#override-formats).
-- Write the metric artifact under `{trial_dir}` so the configured extractor can read it.
+- Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
 - Exit nonzero when the trial failed and should be recorded as failed.
-- Use `PHASESWEEP_RUN_NAME` or the configured `run_name_template` when W&B extractors or W&B gates need to find the run.
+- When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
+- For a `json_envelope` extractor, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into the result envelope. PhaseSweep verifies all three before accepting its objective.
 
-Metric extractor failures, non-finite metrics, nonzero exits, and missing required evidence fail the trial. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance.
+The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is also set to the attempt ID so W&B evidence lookup uses an immutable identity instead of a reusable label. GPU assignment can override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order.
 
-## Override Order
+Metric extractor failures, non-finite metrics, nonzero exits, and missing objective or constraint evidence fail the trial. Gate failures follow the separate [evidence gate](#evidence-gates) policy. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution - an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
 
-![override composition](images/diagramD_override.png)
+### Result envelope
+
+A `json_envelope` trainer publishes this versioned shape after successful evaluation:
+
+```json
+{
+  "schema_version": 1,
+  "status": "complete",
+  "generation_id": "<current generation ID>",
+  "attempt_id": "<current attempt ID>",
+  "overrides_sha256": "<current resolved-overrides digest>",
+  "objective": {
+    "name": "val_loss",
+    "split": "validation",
+    "value": 0.123
+  },
+  "evaluation": {
+    "policy": "final_checkpoint",
+    "checkpoint": "final.pt",
+    "step": 1000
+  }
+}
+```
+
+Copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values listed in the [config reference](config_reference.yaml). The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+
+## Override order
 
 Within one trial, later layers override earlier layers:
 
@@ -105,94 +106,218 @@ A child phase may intentionally reset an inherited key with `fixed_overrides`. A
 
 ## Extractors
 
-Extractors turn trial artifacts into finite floats. JSON and log extractors read files under `{trial_dir}`. W&B extractors poll a completed run summary by name, so the trainer and config must agree on the run naming template.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, and evaluation policy. Every envelope must declare a checkpoint and step; their values are bound only when the extractor config declares `checkpoint` or `expected_step`. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
 
-For agent-facing workflows, keep extractor inputs to scalar summaries. Do not mix validation labels, target/dependent-variable values, prediction dumps, dataset paths, tokens, or full metric histories into the same artifact that stores the objective metric. MCP reads only the configured scalar, but small result artifacts are easier to inspect without leaking data into an agent chat or troubleshooting paste.
+For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
-JSON extractors read a dotted key from a file under `{trial_dir}`:
+The [config reference](config_reference.yaml) defines each extractor shape, including JSON keys, log capture groups, W&B terminal-state handling, and polling timeouts.
 
-```yaml
-extractor: { type: json, path: result.json, key: eval.loss }
-```
+## Evidence gates
 
-Log regex extractors read a captured numeric group named `value`:
-
-```yaml
-extractor:
-  type: log_regex
-  file: stdout.log
-  pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)'
-  select: last
-```
-
-W&B extractors poll a completed run summary. The trainer should use `PHASESWEEP_RUN_NAME` or the same `run_name_template`.
-
-```yaml
-extractor:
-  type: wandb
-  entity: my-team
-  project: tiny-lm
-  run_name_template: '{experiment}-{phase}-{trial_id}'
-  metric_key: eval/loss
-  timeout_seconds: 300
-```
-
-## Evidence Gates
-
-Supported gates are `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, and `wandb_summary_required`. Gate failures mark the trial `FAIL` unless promotion has `requires_gates: false`, where they are advisory evidence.
+Evidence gates validate local artifacts or W&B summary values after extraction. Local file gates share the trial directory's attempt-location scoping but do not parse an identity envelope; a stale or copied artifact can therefore satisfy a gate if the trainer places it in the current trial directory. Gate failures mark the trial `FAIL` unless that phase has a promotion with `requires_gates: false`, where they are advisory evidence. A suite study's promotion is applied after its component experiment finishes, so suite-level `requires_gates: false` does not make component gates advisory; a failed gate has already failed the trial. The [config reference](config_reference.yaml) defines the available gate shapes.
 
 `json_equals` is type-strict, so `true`, `1`, and `1.0` are distinct. Use `json_scalar_bound` for numeric comparisons where integer and float representations should both pass.
 
-`artifact_size` requires `source: file|directory|json`. File and directory sources measure materialized bytes. JSON source reads an integer byte estimate from `path` plus `key`.
-
 ## Promotion
 
-Promotion decides whether a phase or suite study winner is exposed downstream. The comparison uses signed improvement: for `minimize`, improvement is `baseline.metric - candidate.metric`; for `maximize`, it is `candidate.metric - baseline.metric`. The candidate promotes when improvement is at least `min_delta` and required gates passed.
+Promotion decides whether a phase or suite study winner is exposed downstream. The comparison uses signed improvement: for `minimize`, improvement is `baseline.metric - candidate.metric`; for `maximize`, it is `candidate.metric - baseline.metric`. The candidate promotes when improvement is at least the configured threshold and required gates passed.
 
-```yaml
-promotion:
-  min_delta_vs: baseline
-  min_delta: 0.01
-  requires_gates: true
-  on_fail: stop
-```
-
-`on_fail` can be `stop`, `skip`, or `continue_baseline`. Every promotion writes `<phase>/promotion.yaml`; exposed winners include the decision in `winner.yaml` and `summary.yaml`.
+For a phase promotion failure, `stop` raises an error, `skip` ends the remaining phases and permits a partial experiment summary, and `continue_baseline` exposes a clone of the baseline winner. Every evaluated phase promotion writes `<phase>/promotion.yaml`; an exposed candidate or baseline clone is written to `winner.yaml` and included in `summary.yaml`. Winner records keep the exposure phase separate from `winner_source`, which identifies the concrete source phase and trial; promotion metadata retains the rejected candidate.
 
 ## Suites
 
-Suites group independent or dependency-ordered studies under one run plan. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`.
+Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`; study `provenance` replaces default `provenance` when supplied, and explicit `null` clears it. See the [worked configs](../examples/).
 
-```yaml
-suite: coreamp_ablation
-defaults:
-  workdir: ./runs
-  trial_command: "python train.py --out {trial_dir}/result.json {overrides}"
-  metric:
-    name: bpb
-    goal: minimize
-    extractor: { type: json, path: result.json, key: eval.bpb }
+Suite-level `run.log` and the compatibility projection `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Every invocation claims an immutable `suite_generations/<id>/` namespace selected through `last_successful_suite_generation.yaml`; the [runtime output contract](runtime.md#output-layout) covers publication integrity and historical reads. `show-winners` prints stored promotion decisions and comments, and labels the result historical when the current compiled suite differs.
 
-studies:
-  - name: baseline
-    phases:
-      - name: lr
-        n_trials: 8
-        search_space:
-          lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
+Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final exposed phase. The candidate and baseline studies must resolve to identical metric contracts - name, goal, and extractor configuration - so promotion cannot subtract unrelated values. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions live in the suite-generation summary, not in a per-study `promotion.yaml`; `show-winners` never substitutes raw candidate winners from the compiled experiments. `timeout_seconds_per_run` applies independently to each compiled study and resets before the next one; there is no suite-wide deadline. `--from-phase` supports only single-experiment configs.
 
-  - name: candidate
-    depends_on: [baseline]
-    promotion: { min_delta_vs: baseline, min_delta: 0.01, on_fail: stop }
-    phases:
-      - name: lr
-        n_trials: 8
-        search_space:
-          lr: { type: float, low: 1.0e-5, high: 1.0e-3, log: true }
+## Upgrading existing configs
+
+Config models are strict (`extra="forbid"`), so most config changes below fail at load instead of warning: `phasesweep validate <config>` reports them before any trial runs. Artifact-only changes are labeled separately. Fix config failures in the order listed; the objective-extractor change is the only one that also requires trainer code.
+
+### `metric.extractor` no longer accepts `type: json`
+
+```text
+metric.extractor
+  Input tag 'json' found using 'type' does not match any of the expected tags: 'json_envelope', 'log_regex', 'wandb'
 ```
 
-Suite runs write `<workdir>/<suite>/run.log` and `suite_summary.yaml`. Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final phase.
+A primary objective read from a local JSON file must now use `json_envelope`. Plain `json` is unchanged for `constraints`, which are not the objective and do not carry attempt identity.
 
-## Validation
+**This is not a YAML-only edit.** `json_envelope` requires the trainer to publish the [result envelope](#result-envelope), echoing `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` from its environment; PhaseSweep verifies all three plus the objective name, split, and evaluation policy before accepting a value. Update the trainer first, then the config:
 
-Config-load validation rejects graph errors, duplicate YAML keys, unknown object keys, unsafe override keys, dotted-key prefix collisions, sampler/search-space mismatches, SQLite parallel writes, seed searches by default, partial grids by default, missing override placeholders, non-finite bounds, and unknown contracts. Resume checks reject stale studies and incompatible persisted winners.
+```yaml
+# before
+metric:
+  extractor: {type: json, path: result.json, key: val_loss}
+
+# after
+metric:
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+```
+
+[examples/tiny_decoder_enwik8/run_trial.py](../examples/tiny_decoder_enwik8/run_trial.py) is a worked trainer-side implementation. If you cannot change the trainer, `log_regex` remains available for an objective, at the weakest assurance tier - see the assurance flags under [experiment keys](#experiment-keys).
+
+### `provenance` is required whenever `storage` is set
+
+```text
+Value error, Persistent storage requires a nonempty provenance mapping that identifies
+the trainer, data, and dependency revision used by this experiment.
+```
+
+Persistent storage means results outlive the process that produced them, so PhaseSweep now requires the inputs the command string cannot describe to be declared. Add at least one nonempty key/value pair; every entry participates in the phase fingerprint, so declaring a value you will change frequently will invalidate resume.
+
+```yaml
+storage: sqlite:///runs.db
+provenance:
+  trainer_rev: a1b2c3d
+  dataset: enwik8-2011-09-01
+```
+
+### RDB storage requires an explicit single-host acknowledgement
+
+```text
+Value error, storage 'postgresql://...' resolves to backend 'postgresql', a shared
+relational store. ... Set allow_external_rdb_single_host: true ...
+```
+
+PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+
+### Fingerprints now include the execution contract
+
+Every semantic fingerprint (phase schema v3, experiment schema v2, suite schema v2) now includes the trainer execution context: the resolved `execution.cwd` (or `null` when unbound) and the `execution.inherit_env` contract. Populated studies created under earlier schemas fail the fingerprint check on their next resume or top-up:
+
+```text
+StudyFingerprintMismatchError: Study 'exp::phase' was created with a different phase config ...
+```
+
+Nothing about your trainer semantics changed if you never set `execution`; the identity schema did. Finish or archive in-flight studies under the old release, or use a new experiment name for work started under this one. Published generation summaries from earlier releases are likewise reported as historical (`published_config_matches_current: false`) rather than reinterpreted.
+
+### Categorical `choices` must be unique
+
+```text
+phases.0.search_space.x.CategoricalParam.choices
+  Value error, categorical choices must be unique; 1 appears at index 0 and index 1.
+```
+
+A repeated choice was previously kept verbatim. For a grid phase that inflated the cardinality, so `choices: [1, 1, 2]` with `n_trials: 3` ran three trials over two distinct assignments and still reported the matrix complete; under TPE or random sampling it doubled that value's weight. Before initializing a study, delete the repeat and lower `n_trials` to the new cardinality. For a populated persistent study, changing the choices changes its fingerprint and lowering the accepted trial target is rejected; use a new experiment name or separate storage instead. Uniqueness is type-aware, so `[1, 1.0, true]` is still three choices - they render as three different values at the trainer boundary.
+
+The same completeness rule now covers generated float grids: a `step` small enough that adjacent points collapse under the 12-decimal canonical rounding (`low: 0.0, high: 1.0e-12, step: 1.0e-13`) is rejected rather than silently enumerating repeats. Sweep an exponent or a multiplier rather than values that fine.
+
+### `json_file` override values are checked against the JSON serializer at load
+
+```text
+Value error, Phase 'p': override_format='json_file' but fixed_overrides key 'cutoff'
+holds a value the overrides.json serializer cannot encode (type date) ...
+```
+
+`override_format: json_file` writes overrides through a strict `json.dumps`. Config validation and dry-run do not write `overrides.json`, so a value YAML resolved into a non-JSON Python object used to load clean, pass `phasesweep validate`, and then kill the first real trial. Contract and phase `fixed_overrides` are now encoded through that same serializer at load, and the error names the phase, the origin layer, the key, and the offending type. The same gate rejects non-finite floats: YAML `.inf`/`.nan` would serialize as the non-standard `Infinity`/`NaN` tokens the trial-side reader refuses to parse, so they fail at load with the same shaped error - use a finite value, or quote it if the trainer should receive it as text.
+
+The usual cause is an unquoted YAML scalar that PyYAML resolves to `date`, `datetime`, or `time`. Quote it:
+
+```yaml
+# before - datetime.date, not a string
+fixed_overrides:
+  cutoff: 2024-01-01
+
+# after
+fixed_overrides:
+  cutoff: "2024-01-01"
+```
+
+### Generation summaries are now versioned result manifests
+
+This is a workdir-artifact change, not a config-load failure. New publications use the [versioned generation manifest and authoritative pointer](runtime.md#output-layout).
+
+Results published by older builds (summaries without `schema_version`) remain readable through the previous identity-only check - nothing to migrate. But note the interpretation change: status and winner reads now report a published result under the metric name, goal, and phase comments *it* recorded, and add `published_config_matches_current` so an edited config is flagged instead of silently relabeling historical evidence. For a single experiment, run-control edits (`n_trials` top-ups, comments, throughput knobs) do not flag drift, while edits to the metric, extractor, search spaces, phase names/order, or inheritance do. Suite results use the stricter [suite fingerprint behavior](runtime.md#fingerprints-and-resume).
+
+Suite summaries added hash-verified component anchors in schema 3; the [runtime output contract](runtime.md#output-layout) defines current validation. Suite results published at schema 1/2 stay readable through the identity-only check; the next successful `run_suite` republishes at schema 3 with the anchors in place.
+
+### `whole_node` phases require an explicit device set
+
+```text
+gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices list
+```
+
+Under `whole_node` the device set is the trainer's world size - it changes the global batch size and therefore the loss - so it can no longer be left to ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` detection. Add the explicit list. The set's *size* now also joins the phase fingerprint (its spelling does not), so an existing `whole_node` study resumes only with the same device count.
+
+### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
+
+```text
+metric.extractor.wandb.run_name_template
+  Extra inputs are not permitted
+metric.extractor.wandb.timeout_seconds
+  Input should be greater than or equal to 1
+metric.extractor.wandb.timeout_seconds
+  Input should be a finite number
+```
+
+Both apply to the `wandb` extractor and the `wandb_summary_required` gate. W&B evidence is addressed by the immutable `WANDB_RUN_ID` (set to the attempt ID), so a name template can no longer affect which run is read - delete the key. `PHASESWEEP_RUN_NAME` is still injected if you want a human-readable display name, which the trainer sets itself. A `timeout_seconds` under 1 could expire before a single poll, reporting missing evidence for a run that was merely still uploading; raise it to at least `1`. `poll_seconds` and `timeout_seconds` must also be finite: `.inf` used to pass the floor check and then crash the first poll with a misleading credentials diagnosis. There is no "wait forever" - pick a large finite budget.
+
+### Suite and study names may no longer contain `__`
+
+```text
+suite
+  Value error, Suite name 'nightly__sweep' must not contain '__': the compiled
+  component experiment is named '<suite>__<study>', so a double underscore inside
+  either part makes two different suite/study pairs share one artifact namespace,
+  study identity, and fingerprint.
+```
+
+`Suite.suite` and every `StudySpec.name` are still restricted to nonempty ASCII `[A-Za-z0-9_-]+`, but a literal `__` anywhere in the name is now also rejected, because the compiled component experiment is named `<suite>__<study>` - a `__` inside either part would let two different suite/study pairs collide on one artifact namespace, study identity, and fingerprint. A study name with `__` fails the identical check under `studies.<n>.name`, with `Study` in place of `Suite` in the message. Rename any suite or study name that used `__` as a separator to `-` or a single `_`.
+
+```yaml
+# before
+suite: nightly__sweep
+studies:
+  - name: lr
+    phases: [{name: eval, n_trials: 1}]
+
+# after
+suite: nightly-sweep
+studies:
+  - name: lr
+    phases: [{name: eval, n_trials: 1}]
+```
+
+### Suite promotion requires the candidate and baseline to resolve to the same metric contract
+
+```text
+Value error, Study 'candidate' promotion against 'baseline' requires the same
+resolved metric contract, but the candidate resolves to {'name': 'loss', ...}
+and the baseline resolves to {'name': 'loss', ...}. Put the shared metric in
+suite.defaults or make both study metrics identical.
+```
+
+A suite study's `promotion.min_delta_vs` compares `baseline.metric` and `candidate.metric` directly, so if the two studies resolve to different `Metric` objects - a different `name`, `goal`, or `extractor` configuration - the subtraction would compare unrelated scalars. Config validation now rejects that mismatch instead of silently computing a meaningless delta. The elided `{...}` portions of the error are each study's fully resolved metric (`Metric.model_dump(mode="json")`), so you can see exactly which field diverged. Give the candidate and baseline the same metric, normally by declaring it once in `suite.defaults.metric` and letting both studies inherit it instead of restating it per study.
+
+```yaml
+# before - candidate's extractor pattern differs from the baseline's
+suite: incompatible_metrics
+defaults:
+  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
+studies:
+  - name: baseline
+    phases: [{name: baseline_eval, n_trials: 1}]
+  - name: candidate
+    metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.]+)'}}
+    promotion: {min_delta_vs: baseline}
+    phases: [{name: candidate_eval, n_trials: 1}]
+
+# after - candidate inherits the shared metric instead of restating it
+suite: incompatible_metrics
+defaults:
+  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
+studies:
+  - name: baseline
+    phases: [{name: baseline_eval, n_trials: 1}]
+  - name: candidate
+    promotion: {min_delta_vs: baseline}
+    phases: [{name: candidate_eval, n_trials: 1}]
+```

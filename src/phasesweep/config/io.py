@@ -46,17 +46,22 @@ def _construct_mapping_strict(
         The constructed mapping.
 
     Raises:
-        yaml.constructor.ConstructorError: ``node`` is not a mapping, has an
-            unhashable key, or has a duplicate key.
+        yaml.constructor.ConstructorError: A key is unhashable or duplicated.
 
     """
-    if not isinstance(node, yaml.MappingNode):  # pragma: no cover - safety net
-        raise yaml.constructor.ConstructorError(
-            None, None, f"expected a mapping node, found {node.id}", node.start_mark
-        )
-
-    mapping: dict[Any, Any] = {}
-    for key_node, value_node in node.value:
+    literal_keys: dict[Any, None] = {}
+    merge_key_seen = False
+    for key_node, _value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            if merge_key_seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found duplicate key '<<'",
+                    key_node.start_mark,
+                )
+            merge_key_seen = True
+            continue
         key = loader.construct_object(key_node, deep=deep)
         try:
             hash(key)
@@ -67,15 +72,16 @@ def _construct_mapping_strict(
                 f"found unhashable key: {exc}",
                 key_node.start_mark,
             ) from None
-        if key in mapping:
+        if key in literal_keys:
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",
                 node.start_mark,
                 f"found duplicate key {key!r}",
                 key_node.start_mark,
             )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        literal_keys[key] = None
+
+    return yaml.constructor.SafeConstructor.construct_mapping(loader, node, deep=deep)
 
 
 _StrictMappingLoader.add_constructor(
@@ -99,17 +105,6 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     if not isinstance(data, dict):
         raise ValueError(f"{source}: top level must be a mapping.")
     return data
-
-
-def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
-    """Load a YAML file as a strict mapping.
-
-    :param str | Path path: Filesystem path to the YAML file.
-    :raises ValueError: If parsing fails or the top level is not a mapping.
-    :return dict[str, Any]: Parsed top-level YAML mapping.
-    """
-    path_obj = Path(path)
-    return _load_yaml_mapping_from_text(path_obj.read_text(), path_obj)
 
 
 def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
@@ -144,10 +139,8 @@ def load_config(path: str | Path) -> Config:
         :class:`Suite` for configs with a top-level ``suite`` key.
 
     """
-    data = _load_yaml_mapping(path)
-    if "suite" in data:
-        return Suite.model_validate(data)
-    return Experiment.model_validate(data)
+    path_obj = Path(path)
+    return load_config_bytes(path_obj.read_bytes(), source=path_obj)
 
 
 def load_experiment(path: str | Path) -> Experiment:
@@ -170,7 +163,7 @@ def load_experiment(path: str | Path) -> Experiment:
             mapping keys, or any Pydantic / cross-phase validation failure.
 
     """
-    data = _load_yaml_mapping(path)
-    if "suite" in data:
+    config = load_config(path)
+    if isinstance(config, Suite):
         raise ValueError(f"{path}: expected a single experiment config, got a suite config.")
-    return Experiment.model_validate(data)
+    return config
