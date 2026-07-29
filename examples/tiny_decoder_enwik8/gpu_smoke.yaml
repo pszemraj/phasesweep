@@ -1,5 +1,5 @@
 # Two-trial CUDA smoke sweep for validating the real trainer integration quickly.
-# It uses the upstream test model and writes only local artifacts under /tmp.
+# It uses the upstream test model and writes its experiment outputs under /tmp.
 
 experiment: tiny_decoder_enwik8_gpu_smoke
 storage: null

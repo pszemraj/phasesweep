@@ -1256,7 +1256,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
 
 
 def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Winner]]:
-    """Run every study in a suite in dependency order.
+    """Run every study in declaration order after validating prior dependencies.
 
     :param Suite suite: Parsed suite config.
     :param bool dry_run: If ``True``, preview each study without launching subprocesses.

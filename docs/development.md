@@ -27,9 +27,29 @@ The package is organized by behavior:
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
 
-The control flow of a typical run is as follows:
+The control flow of a typical run is:
 
-![control flow](images/diagramC_controlflow.png)
+```mermaid
+flowchart TD
+    cli["CLI run"] --> dispatch["run_config"]
+    dispatch -->|Experiment| experiment["execute experiment"]
+    dispatch -->|Suite| suite["run_suite"]
+    suite -->|"declaration order; dependencies must name prior studies"| experiment
+    experiment --> phase["_run_phase"]
+    phase --> optimize["study.optimize / objective"]
+    optimize --> launch["launch_trial / supervised trainer"]
+    launch --> evidence["extract_trial_result"]
+    evidence --> select["select_winner"]
+    select --> promote["_apply_promotion"]
+    promote --> winner["_save_winner"]
+    winner --> more{"more phases?"}
+    more -->|yes| phase
+    more -->|no| summary["write generation summary"]
+    summary --> publish["_publish_generation validates result graph"]
+    publish --> pointer["commit last_successful_generation pointer"]
+```
+
+For suites, each executed component experiment completes this publication sequence before suite promotion is evaluated. After the declared-study loop completes, the engine validates and publishes the suite summary through its own last-success pointer.
 
 ## Test map
 
@@ -43,7 +63,7 @@ Tests are organized by behavior:
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`, `tests/test_publication_transaction.py`: timeout policy, contracts, evidence gates, promotion, suites, publication transactions, and read-only engine views.
 - `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
-- `tests/test_tiny_decoder_example.py`: adapter composition, final-checkpoint result envelopes, and example config invariants.
+- `tests/test_tiny_decoder_example.py`: adapter composition, attempt-scoped final-checkpoint result envelopes, zero-seed handling, and empty-validation rejection.
 - `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.
 
 ## Tracked TODOs

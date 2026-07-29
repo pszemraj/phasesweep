@@ -21,7 +21,7 @@ This is an orchestration example, not a PyTorch training-template recommendation
 
 ## CLI smoke sweep
 
-For a genuinely short GPU integration check, run the dedicated two-trial config first. It explicitly leases CUDA device `0`, runs 10 training batches per trial, disables W&B, has bounded trial/run timeouts, and writes only local artifacts under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
+For a genuinely short GPU integration check, run the dedicated two-trial config first. It explicitly leases CUDA device `0`, runs 10 training batches per trial, disables W&B, has bounded trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/gpu_smoke.yaml
@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and reuse matter. Pointing the smoke config at a scratch SQLite file (and adding `provenance`) gives it persistent bookkeeping and satisfied-target no-op replay; testing top-ups or abort recovery also requires changing the trial target or producing the corresponding failure state.
+The smoke config deliberately uses in-memory Optuna storage so every invocation runs both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies final-checkpoint evaluation actually used CUDA rather than merely showing that PhaseSweep leased a GPU. `show-winners` reads the persisted last-success artifacts; a separate later `status` process cannot reconstruct the completed in-memory trial counts. The full config below uses SQLite when persistent status and reuse matter. Pointing the smoke config at a scratch SQLite file (and adding `provenance`) gives it persistent bookkeeping and satisfied-target no-op replay. The shipped two-choice grid is exhausted after its two trials, so raising only `n_trials` is invalid. To exercise top-up behavior, expand the grid before the first run, set `allow_partial_grid: true`, start with `n_trials` below the unchanged grid cardinality, then raise only the trial target. Testing abort recovery requires producing the corresponding failure state.
 
 Use the full three-phase example only when you intentionally want the longer experiment:
 
