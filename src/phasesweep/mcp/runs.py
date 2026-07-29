@@ -57,6 +57,21 @@ __all__ = [
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 
 
+def _read_json_object(path: Path) -> dict | None:
+    """Read a JSON object, returning ``None`` for missing or malformed files.
+
+    :param Path path: JSON file to read.
+    :return dict | None: Parsed object, or ``None`` when unavailable or invalid.
+    """
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def write_status_file(status_path: Path, payload: dict) -> None:
     """Atomically write a detached-run terminal status payload.
 
@@ -311,9 +326,12 @@ class RunStore:
         """
         if not SAFE_NAME_PATTERN.fullmatch(expected_run_id):
             return None
+        payload = _read_json_object(path)
+        if payload is None:
+            return None
         try:
-            handle = RunHandle(**json.loads(path.read_text()))
-        except (OSError, json.JSONDecodeError, TypeError, KeyError, ValueError):
+            handle = RunHandle(**payload)
+        except (TypeError, KeyError, ValueError):
             return None
         if handle.run_id != expected_run_id:
             return None
@@ -652,14 +670,8 @@ class RunStore:
         :param RunHandle handle: Run handle whose status file should be read.
         :return dict | None: Decoded JSON payload, or ``None`` when absent or malformed.
         """
-        path = self.status_path(handle.run_id)
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(payload, dict):
+        payload = _read_json_object(self.status_path(handle.run_id))
+        if payload is None:
             return None
         if payload.get("run_id") != handle.run_id:
             return None
@@ -729,14 +741,8 @@ class RunStore:
             ``config_sha256``, and ``cleanup_confirmed`` fields match this
             handle; ``None`` otherwise.
         """
-        path = self.cleanup_recovery_path(handle.run_id)
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(payload, dict):
+        payload = _read_json_object(self.cleanup_recovery_path(handle.run_id))
+        if payload is None:
             return None
         if not (
             payload.get("run_id") == handle.run_id
@@ -755,14 +761,8 @@ class RunStore:
         :param RunHandle handle: Run handle whose cleanup marker should be read.
         :return ProcessIdentity | None: Valid marker identity, or ``None`` if unavailable.
         """
-        path = self.cleanup_uncertain_path(handle.run_id)
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(payload, dict):
+        payload = _read_json_object(self.cleanup_uncertain_path(handle.run_id))
+        if payload is None:
             return None
         if payload.get("run_id") != handle.run_id:
             return None
