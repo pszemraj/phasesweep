@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
-from phasesweep.engine.state import Winner, _load_winner
+from phasesweep.engine.state import Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
@@ -458,11 +458,7 @@ class GetStatusResult(_ToolPayload):
     """Structured output for get_status."""
 
     experiment_id: ExperimentId
-    result_source: Literal[
-        "current_shared_study",
-        "frozen_run_snapshot",
-        "terminal_snapshot_unavailable",
-    ]
+    result_source: ResultSource
     current_generation_id: str | None = Field(
         description=(
             "Most recent generation id known to this experiment; may be failed or "
@@ -525,7 +521,7 @@ class AwaitRunResult(GetStatusResult):
 class WinnerSourcePayload(_ToolPayload):
     """Concrete trial that supplies an exposed winner."""
 
-    kind: Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+    kind: WinnerSourceKind
     phase: PhaseName
     trial_number: int = Field(ge=0)
     study: str | None = None
@@ -575,11 +571,7 @@ class GetWinnersResult(_ToolPayload):
 
     experiment_id: ExperimentId
     run_id: RunId | None
-    result_source: Literal[
-        "current_shared_study",
-        "frozen_run_snapshot",
-        "terminal_snapshot_unavailable",
-    ]
+    result_source: ResultSource
     metric: MetricPayload
     declared_phase_count: int = Field(ge=0)
     winner_count: int = Field(ge=0)

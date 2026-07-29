@@ -12,8 +12,8 @@ from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import _winner_source_or_default
+from phasesweep.mcp.registry import VisibleParamsPolicy
 
-VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
     "frozen_run_snapshot",

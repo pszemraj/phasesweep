@@ -17,6 +17,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     Winner,
     WinnerSource,
+    WinnerSourceKind,
     _generation_record_path,
     _winner_source_or_default,
 )
@@ -97,7 +98,7 @@ class StatusSnapshot(_SnapshotModel):
 class WinnerSourceSnapshot(_SnapshotModel):
     """Concrete source trial for an exposed phase winner."""
 
-    kind: Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+    kind: WinnerSourceKind
     phase: str
     trial_number: int
     generation_id: str | None = None
