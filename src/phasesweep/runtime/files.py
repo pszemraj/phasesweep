@@ -448,6 +448,14 @@ def open_directory_fd(
     to be owner-only — only the final component is validated against the private
     owner/mode policy, and only when ``private_final`` is true.
 
+    The walk runs with shutdown signals deferred (see
+    :func:`phasesweep.runtime.process.defer_shutdown_signals`), so
+    ``PhaseSweepShutdown`` cannot land between the per-component descriptor
+    handoffs and strand an intermediate descriptor. A shutdown that arrives
+    mid-walk is serviced when the walk finishes: the just-opened final
+    descriptor is closed here before the shutdown propagates, so the caller
+    never owns a descriptor it does not receive.
+
     :param Path path: Directory to open, resolved lexically (not through
         the filesystem) before walking.
     :param bool create: Whether to ``mkdir`` any missing path component instead
@@ -466,6 +474,39 @@ def open_directory_fd(
         component is not a real directory, a component changed between its
         pre-open stat and the open, or the final component fails the
         private policy when ``private_final`` is true.
+    """
+    from phasesweep.runtime.process import defer_shutdown_signals
+
+    result_fd = -1
+    try:
+        with defer_shutdown_signals():
+            result_fd = _walk_directory_fd(
+                path,
+                create=create,
+                private_final=private_final,
+                umask_created_dirs=umask_created_dirs,
+            )
+    except BaseException:
+        if result_fd >= 0:
+            os.close(result_fd)
+        raise
+    return result_fd
+
+
+def _walk_directory_fd(
+    path: Path,
+    *,
+    create: bool,
+    private_final: bool,
+    umask_created_dirs: bool,
+) -> int:
+    """Perform the component walk for :func:`open_directory_fd`.
+
+    :param Path path: Directory to open.
+    :param bool create: Whether to create missing components.
+    :param bool private_final: Whether the final component must be private.
+    :param bool umask_created_dirs: Whether the umask governs created dirs.
+    :return int: Open descriptor for the final directory; caller closes it.
     """
     absolute = absolute_path(path)
     parts = absolute.parts[1:]
@@ -514,14 +555,15 @@ def open_directory_fd(
                 raise UnsafePrivatePathError(
                     f"Private path component {component_path} changed while it was opened."
                 )
-            # Hand ownership to ``next_fd`` BEFORE closing the old descriptor.
-            # ``_shutdown_handler`` raises ``PhaseSweepShutdown`` from a Python
-            # signal handler, so an exception can land on any bytecode boundary
-            # in this loop. Closing first left ``current_fd`` naming a closed
-            # descriptor until the very next store, and the ``finally`` below
-            # then closed it again -- turning a shutdown into ``OSError: [Errno
-            # 9] Bad file descriptor`` and masking the real cause. In this
-            # order every boundary leaves ``current_fd`` open and closed once.
+            # Shutdown signals are deferred for the whole walk (see
+            # ``open_directory_fd``), so ``PhaseSweepShutdown`` cannot land
+            # between these statements. Historically it could: closing before
+            # the store left ``current_fd`` naming a closed descriptor and
+            # turned a shutdown into ``OSError: [Errno 9] Bad file
+            # descriptor`` in the ``finally`` below, while storing before the
+            # close leaked ``previous_fd`` on the reverse boundary. The
+            # assign-first order stays so an exception raised by ``os.close``
+            # itself still cannot double-close.
             previous_fd = current_fd
             current_fd = next_fd
             os.close(previous_fd)

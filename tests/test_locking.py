@@ -499,6 +499,45 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
     assert fired
 
 
+def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGTERM during the walk is deferred and no descriptor leaks.
+
+    Without ``defer_shutdown_signals`` around the walk, the handler's
+    ``PhaseSweepShutdown`` could land on the bytecode boundary between the
+    descriptor-handoff store and the close of the previous descriptor,
+    stranding an open fd until process exit — invisible in one-shot
+    processes, an accumulating leak for a long-running embedder now that
+    ``open_directory_fd`` is public API. The signal must queue until the
+    walk finishes and the completed final descriptor must be closed before
+    the shutdown propagates to the caller.
+    """
+    from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+
+    target = tmp_path / "nested" / "dir"
+    target.mkdir(parents=True)
+    real_open = os.open
+    fired = False
+
+    def open_then_sigterm(*args: object, **kwargs: object) -> int:
+        nonlocal fired
+        fd = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        if not fired and kwargs.get("dir_fd") is not None:
+            fired = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        return fd
+
+    monkeypatch.setattr(os, "open", open_then_sigterm)
+    before = set(os.listdir("/proc/self/fd"))
+    with signal_handler_scope(), pytest.raises(PhaseSweepShutdown):
+        runtime_files.open_directory_fd(target, create=False, private_final=False)
+    assert fired
+    after = set(os.listdir("/proc/self/fd"))
+    assert after <= before
+
+
 def test_run_lock_blocks_even_when_processes_target_different_phases(
     tmp_path: Path,
 ) -> None:
