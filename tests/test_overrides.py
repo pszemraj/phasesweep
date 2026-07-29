@@ -265,8 +265,17 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         load_experiment(p)
 
 
-def test_multi_parent_collision_unresolved_errors(tmp_path):
-    """Two independent parents both lock 'lr'; child must resolve via fixed_overrides."""
+@pytest.mark.parametrize(
+    ("resolution", "valid"),
+    [
+        pytest.param("", False, id="unresolved"),
+        pytest.param(
+            "fixed_overrides:\n              lr: 5.0e-4\n            ", True, id="resolved"
+        ),
+    ],
+)
+def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: str, valid: bool):
+    """A child must explicitly resolve a key locked by multiple parents."""
     p = write_yaml(
         tmp_path,
         f"""
@@ -288,44 +297,14 @@ def test_multi_parent_collision_unresolved_errors(tmp_path):
               lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
           - name: c
             inherits: [a, b]
-            n_trials: 1
+            {resolution}n_trials: 1
             search_space:
               dropout: {{ type: float, low: 0, high: 0.5 }}
         """,
     )
-    with pytest.raises(ValidationError, match="conflicting locked key"):
-        load_experiment(p)
-
-
-def test_multi_parent_collision_resolved_by_fixed_override(tmp_path):
-    """Same conflict but child explicitly resolves with fixed_overrides — accepted."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: a
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: b
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: c
-            inherits: [a, b]
-            fixed_overrides:
-              lr: 5.0e-4
-            n_trials: 1
-            search_space:
-              dropout: {{ type: float, low: 0, high: 0.5 }}
-        """,
-    )
-    exp = load_experiment(p)  # must not raise
+    if not valid:
+        with pytest.raises(ValidationError, match="conflicting locked key"):
+            load_experiment(p)
+        return
+    exp = load_experiment(p)
     assert exp.phases[-1].fixed_overrides["lr"] == 5.0e-4

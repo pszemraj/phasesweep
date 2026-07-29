@@ -762,39 +762,33 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     assert len(data["phase_fingerprint"]) == 64  # SHA-256 hex digest
 
 
-def test_from_phase_rejects_stale_parent_winner_after_search_space_change(
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param(
+            {"arch_low": 1, "arch_high": 4},
+            {"arch_low": 12, "arch_high": 16},
+            id="search-space",
+        ),
+        pytest.param(
+            {"arch_fixed_overrides": {"width": 64}},
+            {"arch_fixed_overrides": {"width": 128}},
+            id="fixed-overrides",
+        ),
+    ],
+)
+def test_from_phase_rejects_stale_parent_winner(
     tmp_path: Path,
+    before: dict[str, object],
+    after: dict[str, object],
 ) -> None:
-    """The reviewer's primary scenario: run fully, edit the parent's search
-    space between runs, then ``--from-phase`` the child. The old winner is
-    incompatible with the new parent config and must be refused.
-    """
+    """Changing a skipped parent's semantics must invalidate its winner."""
     trainer = write_constant_trainer(tmp_path)
     workdir = tmp_path / "runs"
-    exp_v1 = _two_phase_experiment(workdir=workdir, trainer=trainer, arch_low=1, arch_high=4)
+    exp_v1 = _two_phase_experiment(workdir=workdir, trainer=trainer, **before)
     run_experiment(exp_v1)
 
-    exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, arch_low=12, arch_high=16)
-    with pytest.raises(RuntimeError, match="different phase config"):
-        run_experiment(exp_v2, from_phase="lr")
-
-
-def test_from_phase_rejects_stale_parent_winner_after_fixed_override_change(
-    tmp_path: Path,
-) -> None:
-    """Same idea, different mutation: editing parent ``fixed_overrides``
-    between runs must invalidate the skipped winner.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    workdir = tmp_path / "runs"
-    exp_v1 = _two_phase_experiment(
-        workdir=workdir, trainer=trainer, arch_fixed_overrides={"width": 64}
-    )
-    run_experiment(exp_v1)
-
-    exp_v2 = _two_phase_experiment(
-        workdir=workdir, trainer=trainer, arch_fixed_overrides={"width": 128}
-    )
+    exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, **after)
     with pytest.raises(RuntimeError, match="different phase config"):
         run_experiment(exp_v2, from_phase="lr")
 

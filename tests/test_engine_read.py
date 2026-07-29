@@ -341,11 +341,16 @@ def test_read_status_pinned_read_of_unpublished_generation_is_not_marked_publish
     assert status["phases"][0]["winner_present"] is True
 
 
-def test_objective_evidence_assurance_json_envelope_without_declared_checkpoint(
+@pytest.mark.parametrize(
+    "declared", [pytest.param(False, id="undeclared"), pytest.param(True, id="declared")]
+)
+def test_objective_evidence_assurance_json_envelope_checkpoint_binding(
     tmp_path: Path,
+    declared: bool,
 ) -> None:
-    """An undeclared checkpoint/expected_step must never be reported as bound."""
+    """Checkpoint assurance must reflect whether values were declared."""
     exp = _experiment(tmp_path)
+    identity = {"checkpoint": "ckpt-42", "expected_step": 1000} if declared else {}
     exp = exp.model_copy(
         update={
             "metric": Metric(
@@ -357,6 +362,7 @@ def test_objective_evidence_assurance_json_envelope_without_declared_checkpoint(
                     objective_name="loss",
                     split="test",
                     policy="test",
+                    **identity,
                 ),
             )
         }
@@ -372,50 +378,10 @@ def test_objective_evidence_assurance_json_envelope_without_declared_checkpoint(
         "objective_name_bound": True,
         "split_bound": True,
         "evaluation_policy_bound": True,
-        "checkpoint_declared": False,
-        "checkpoint_value_bound": False,
-        "expected_step_declared": False,
-        "expected_step_value_bound": False,
-    }
-
-
-def test_objective_evidence_assurance_json_envelope_with_declared_checkpoint(
-    tmp_path: Path,
-) -> None:
-    """A declared checkpoint/expected_step is reported as genuinely value-bound."""
-    exp = _experiment(tmp_path)
-    exp = exp.model_copy(
-        update={
-            "metric": Metric(
-                name="loss",
-                goal="minimize",
-                extractor=JsonEnvelopeExtractor(
-                    type="json_envelope",
-                    path="result.json",
-                    objective_name="loss",
-                    split="test",
-                    policy="test",
-                    checkpoint="ckpt-42",
-                    expected_step=1000,
-                ),
-            )
-        }
-    )
-
-    status = read_status(exp)
-
-    assert status["metric"]["objective_evidence"] == {
-        "kind": "json_envelope",
-        "attempt_location_scoped": True,
-        "attempt_identity_bound": True,
-        "source_identity_keyed": False,
-        "objective_name_bound": True,
-        "split_bound": True,
-        "evaluation_policy_bound": True,
-        "checkpoint_declared": True,
-        "checkpoint_value_bound": True,
-        "expected_step_declared": True,
-        "expected_step_value_bound": True,
+        "checkpoint_declared": declared,
+        "checkpoint_value_bound": declared,
+        "expected_step_declared": declared,
+        "expected_step_value_bound": declared,
     }
 
 
