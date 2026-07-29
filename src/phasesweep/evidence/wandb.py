@@ -28,12 +28,15 @@ class WandbRunTerminalError(RuntimeError):
 
 @dataclass(frozen=True)
 class WandbSetupError(RuntimeError):
-    """Raised when the W&B API client cannot be constructed.
+    """Raised when the W&B API client cannot be constructed at all.
 
-    Client construction reads local credentials and settings — its failures
-    are deterministic setup problems (bad api key file, broken settings), not
-    transient request errors, so retrying the poll loop would only burn the
-    budget repeating them (review v0.5.17 / finding D).
+    Only a failure to construct the *first* client of a poll is classified
+    this way: nothing has worked yet, so bad credentials or broken settings
+    are the plausible cause and retrying would only burn the budget (review
+    v0.5.17 / finding D). Once one construction has succeeded, a later
+    failure inside the same poll cannot be a deterministic setup problem —
+    the SDK's constructor performs a network round-trip, so mid-poll failures
+    are transient request errors and are retried like any other poll error.
     """
 
     run_id: str
@@ -61,8 +64,10 @@ def poll_wandb_summary(
         one second after this budget expires.
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
-    :raises WandbSetupError: If the API client cannot be constructed (bad
-        credentials/settings) — a deterministic setup failure, not retried.
+    :raises WandbSetupError: If the first API client of this poll cannot be
+        constructed (bad credentials/settings) — a deterministic setup
+        failure, not retried. Construction failures after one client has
+        already been built are treated as transient and retried.
     :raises WandbRunTerminalError: If the run crashes, fails, or is killed.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
     :return dict[str, Any]: Terminal run summary values.
@@ -73,32 +78,39 @@ def poll_wandb_summary(
     deadline = time.monotonic() + timeout_seconds
     last_err: Exception | None = None
     required = tuple(required_keys)
+    api_constructed = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
             break
         # W&B accepts an integer request timeout. Bound each request by the
         # remaining monotonic budget so a late poll cannot extend the overall
-        # wait by another full timeout interval. Construction happens inside
-        # the typed error boundary: a credential/settings failure here must
-        # surface as a classified setup error, not escape the extractor's
-        # error model (review v0.5.17 / finding D).
+        # wait by another full timeout interval. Constructing per iteration
+        # means construction failures happen mid-poll too; the SDK's
+        # constructor performs a network round-trip, so only the first
+        # failure (nothing has worked yet) is classified as a deterministic
+        # setup error — later ones are transient and must not abort a poll
+        # the budget could still absorb (review v0.5.17 / finding D).
         try:
             api = Api(timeout=max(1, ceil(remaining)))
         except Exception as exc:  # noqa: BLE001 - classified into the typed error model
-            raise WandbSetupError(run_id, str(exc)) from exc
-        try:
-            run = api.run(path)
-            if run.state in {"crashed", "failed", "killed"}:
-                raise WandbRunTerminalError(run_id, run.state)
-            if run.state == "finished":
-                summary = dict(run.summary)
-                if not wait_for_keys or all(key in summary for key in required):
-                    return summary
-        except WandbRunTerminalError:
-            raise
-        except Exception as exc:  # noqa: BLE001
+            if not api_constructed:
+                raise WandbSetupError(run_id, str(exc)) from exc
             last_err = exc
+        else:
+            api_constructed = True
+            try:
+                run = api.run(path)
+                if run.state in {"crashed", "failed", "killed"}:
+                    raise WandbRunTerminalError(run_id, run.state)
+                if run.state == "finished":
+                    summary = dict(run.summary)
+                    if not wait_for_keys or all(key in summary for key in required):
+                        return summary
+            except WandbRunTerminalError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
         sleep_seconds = max(0.0, deadline - time.monotonic())
         time.sleep(min(poll_seconds, sleep_seconds))
     raise WandbPollTimeout(run_id, timeout_seconds, last_err)

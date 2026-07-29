@@ -639,6 +639,83 @@ def test_wandb_api_constructor_failure_is_typed_extractor_error(
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
+def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """A mid-poll ``Api(...)`` failure is transient, not a setup error.
+
+    Construction happens every iteration (budget-aware request timeouts) and
+    performs a network round-trip, so once one client has been built a later
+    constructor failure must be retried like any other poll error instead of
+    aborting the wait with most of the budget unspent.
+    """
+    wandb_mod = types.ModuleType("wandb")
+    apis_mod = types.ModuleType("wandb.apis")
+    public_mod = types.ModuleType("wandb.apis.public")
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, timeout=None):
+            constructions["count"] += 1
+            if constructions["count"] == 2:
+                raise ConnectionError("transient network blip during Api construction")
+
+        def run(self, path):
+            if constructions["count"] < 3:
+                return _FakeRun(state="running", summary={})
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    public_mod.Api = Api
+    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
+    apis_mod.public = public_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
+    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
+    assert constructions["count"] == 3
+
+
+@pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
+@pytest.mark.parametrize("field", ["poll_seconds", "timeout_seconds"])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_wandb_time_budgets_must_be_finite(model, field, value):
+    """Non-finite poll/timeout budgets must fail validation, not first use.
+
+    ``ge=1.0``/``gt=0.0`` alone admit ``.inf``, which previously survived
+    ``phasesweep validate`` and then crashed the first poll inside the setup
+    error boundary (``ceil(inf)``) with a misleading credentials diagnosis.
+    """
+    common = {
+        "type": "wandb" if model is WandbExtractor else "wandb_summary_required",
+        "entity": "me",
+        "project": "proj",
+        field: value,
+    }
+    if model is WandbExtractor:
+        common["metric_key"] = "eval/loss"
+    else:
+        common["keys"] = ["eval/loss"]
+    with pytest.raises(ValidationError, match="finite"):
+        model(**common)
+
+
 def test_wandb_extractor_poll_budget_is_capped_by_phase_deadline(fake_wandb, tmp_path):
     """A 60s W&B poll budget must shrink to the remaining phase/run budget.
 

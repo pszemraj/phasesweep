@@ -113,8 +113,8 @@ class WandbExtractor(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
-    poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=1.0)
+    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
@@ -330,8 +330,8 @@ class WandbSummaryRequiredGate(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
     keys: list[str] = Field(min_length=1)
-    poll_seconds: float = Field(default=2.0, gt=0.0)
-    timeout_seconds: float = Field(default=120.0, ge=1.0)
+    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 Gate = Annotated[
