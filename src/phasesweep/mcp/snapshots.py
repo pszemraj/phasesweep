@@ -147,6 +147,38 @@ def _winner_source_snapshot(
     )
 
 
+def _winner_snapshot(
+    phase: str,
+    winner: PhaseWinnerView | Winner,
+) -> WinnerSnapshot:
+    """Freeze either engine winner representation into one validated snapshot.
+
+    :param str phase: Phase under which the winner is exposed.
+    :param PhaseWinnerView | Winner winner: Winner representation to serialize.
+    :return WinnerSnapshot: Validated path-free winner snapshot.
+    """
+    if isinstance(winner, Winner):
+        gates_passed = (
+            all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
+        )
+        incomplete = bool(winner.completion.get("incomplete", False))
+    else:
+        gates_passed = winner.gates_passed
+        incomplete = winner.incomplete
+    return WinnerSnapshot(
+        phase=phase,
+        trial_number=winner.trial_number,
+        metric=winner.metric,
+        params=dict(winner.params),
+        gates_passed=gates_passed,
+        incomplete=incomplete,
+        generation_id=winner.generation_id,
+        attempt_id=winner.attempt_id,
+        source=_winner_source_snapshot(winner, phase=phase),
+        promotion=winner.promotion,
+    )
+
+
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
@@ -314,8 +346,7 @@ def capture_result_snapshot(
         # outcome (review v0.5.16 / blocker 2); freeze exactly what it
         # returned instead of re-reading the winner files.
         winner_snapshots = [
-            _winner_snapshot_from_engine(phase_name, winner)
-            for phase_name, winner in engine_winners.items()
+            _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
     else:
         # Winners must be scoped to the generation this snapshot *represents*,
@@ -323,18 +354,7 @@ def capture_result_snapshot(
         # wants exactly its own generation's winners even when a newer
         # generation has since become current (review v0.5.15 / blocker 3).
         winner_snapshots = [
-            WinnerSnapshot(
-                phase=winner.phase,
-                trial_number=winner.trial_number,
-                metric=winner.metric,
-                params=winner.params,
-                gates_passed=winner.gates_passed,
-                incomplete=winner.incomplete,
-                generation_id=winner.generation_id,
-                attempt_id=winner.attempt_id,
-                source=_winner_source_snapshot(winner, phase=winner.phase),
-                promotion=winner.promotion,
-            )
+            _winner_snapshot(winner.phase, winner)
             for winner in read_winners(
                 experiment, generation_id=status["represented_generation_id"]
             )
@@ -352,29 +372,6 @@ def capture_result_snapshot(
         winners=winner_snapshots,
     )
     return snapshot.model_dump(mode="json")
-
-
-def _winner_snapshot_from_engine(phase_name: str, winner: Winner) -> WinnerSnapshot:
-    """Freeze one engine-returned :class:`Winner` as a path-free snapshot.
-
-    :param str phase_name: Phase the engine exposed this winner under.
-    :param Winner winner: Engine winner object from the terminal report.
-    :return WinnerSnapshot: Validated snapshot of the engine's own outcome.
-    """
-    return WinnerSnapshot(
-        phase=phase_name,
-        trial_number=winner.trial_number,
-        metric=winner.metric,
-        params=dict(winner.params),
-        gates_passed=(
-            all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
-        ),
-        incomplete=bool(winner.completion.get("incomplete", False)),
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-        source=_winner_source_snapshot(winner, phase=phase_name),
-        promotion=winner.promotion,
-    )
 
 
 def finalize_result_snapshot(
