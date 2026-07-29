@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP
@@ -210,6 +211,38 @@ def make_run_handle(
         launch_state=launch_state,
         allow_cancel=allow_cancel,
     )
+
+
+def claim_runner_handle(
+    store: RunStore,
+    *,
+    run_id: str,
+    config_sha256: str,
+    started_at: str,
+    experiment_id: str = "srv",
+) -> None:
+    """Create the launch reservation a real MCP server owns before spawning."""
+    store.create(
+        RunHandle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            config_sha256=config_sha256,
+            pid=None,
+            pgid=None,
+            pid_starttime=None,
+            started_at=started_at,
+            launch_state="launching",
+        )
+    )
+
+
+def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
+    """Invoke the detached runner in-process and restore the caller's directory."""
+    original = Path.cwd()
+    try:
+        return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
+    finally:
+        os.chdir(original)
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:

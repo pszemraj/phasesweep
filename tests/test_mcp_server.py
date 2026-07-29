@@ -51,7 +51,6 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runner import main as _runner_main
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
     TOOL_LAUNCH_SWEEP,
@@ -69,10 +68,12 @@ from phasesweep.runtime.process import (
 )
 from tests.conftest import make_experiment, write_constant_trainer
 from tests.mcp_helpers import (
+    claim_runner_handle,
     make_mcp_app,
     make_run_handle,
     mcp_experiment_config_text,
     patch_popen_capture,
+    runner_main,
     write_mcp_catalog,
     write_run_status,
 )
@@ -92,48 +93,6 @@ def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None)
         {"srv": config},
         allow=allow,
         filename="srv.catalog.yaml",
-    )
-
-
-def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
-    """Invoke the detached runner in-process with the project cwd it requires.
-
-    The real runner is spawned in the server's state directory and enters its
-    ``--cwd`` argument itself, so an in-process call must supply one and put
-    the interpreter back where it started.
-
-    :param list[str] argv: Runner arguments excluding ``--cwd``.
-    :param Path | None cwd: Project directory to pass; defaults to this
-        process's own directory, which is where the runner used to start.
-    :return int: The runner's exit code.
-    """
-    original = Path.cwd()
-    try:
-        return _runner_main([*argv, "--cwd", str(original if cwd is None else cwd)])
-    finally:
-        os.chdir(original)
-
-
-def _claim_runner_handle(
-    store: RunStore,
-    *,
-    run_id: str,
-    config_sha256: str,
-    started_at: str,
-    experiment_id: str = "srv",
-) -> None:
-    """Create the server-owned launch reservation expected by ``runner_main``."""
-    store.create(
-        RunHandle(
-            run_id=run_id,
-            experiment_id=experiment_id,
-            config_sha256=config_sha256,
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
-            started_at=started_at,
-            launch_state="launching",
-        )
     )
 
 
@@ -577,7 +536,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     run_id = "srv-recover"
     started_at = "2026-06-24T00:00:00Z"
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
@@ -1434,7 +1393,7 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     run_id = "r1"
     status_path = store.status_path(run_id)
     started_at = "2026-06-24T00:00:00Z"
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256="0" * 64,
@@ -1496,7 +1455,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     snapshot_path.write_bytes(config.read_bytes())
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     started_at = "2026-06-24T00:00:00Z"
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
@@ -1580,7 +1539,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     run_id = "srv-schema-mismatch"
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     started_at = "2026-06-24T00:00:00Z"
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
@@ -1624,7 +1583,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     status_path = store.status_path(run_id)
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     started_at = "2026-06-24T00:00:00Z"
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
@@ -1672,7 +1631,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     status_path = store.status_path(run_id)
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     started_at = "2026-06-24T00:00:00Z"
-    _claim_runner_handle(
+    claim_runner_handle(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
