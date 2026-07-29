@@ -104,9 +104,14 @@ def dump_overrides_json(payload: Any) -> str:
     :param Any payload: Value or mapping to serialize.
     :raises TypeError: The payload contains something the strict encoder cannot
         represent (``default=`` is deliberately not set).
+    :raises ValueError: The payload contains a non-finite float (``inf``,
+        ``-inf``, or ``nan``) — ``allow_nan=False`` rejects the values Python's
+        ``json.dumps`` would otherwise render as the non-standard
+        ``Infinity``/``-Infinity``/``NaN`` tokens, which this repo's own
+        :func:`phasesweep.runtime.json.strict_json_loads` refuses to parse.
     :return str: Sorted, two-space-indented JSON text with no trailing newline.
     """
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 
 def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:

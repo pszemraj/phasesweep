@@ -131,6 +131,21 @@ def test_write_json_file_uses_the_canonical_strict_serializer(tmp_path):
         write_json_file({"cutoff": datetime.date(2024, 1, 1)}, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [float("inf"), float("-inf"), float("nan")],
+    ids=["inf", "-inf", "nan"],
+)
+def test_dump_overrides_json_and_write_json_file_reject_non_finite_floats(tmp_path, value):
+    """allow_nan=False must reject values ``json.dumps`` would otherwise render as the
+    non-standard Infinity/-Infinity/NaN tokens ``strict_json_loads`` refuses to parse
+    (review v0.5.17 / finding B)."""
+    with pytest.raises(ValueError):
+        dump_overrides_json({"x": value})
+    with pytest.raises(ValueError):
+        write_json_file({"x": value}, tmp_path)
+
+
 def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
     """An unquoted YAML date becomes datetime.date, which overrides.json cannot encode."""
     p = _json_file_yaml(
@@ -165,6 +180,25 @@ def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
     )
 
     with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
+        load_experiment(p)
+
+
+def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
+    """YAML .inf resolves to a non-finite float, which the strict encoder
+    (allow_nan=False) rejects; this must surface at load time, not at the
+    first trial's json.dumps."""
+    p = _json_file_yaml(
+        tmp_path,
+        """
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides:
+              threshold: .inf
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="Phase 'p'.*'threshold'.*cannot encode.*non-finite"):
         load_experiment(p)
 
 

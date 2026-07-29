@@ -850,12 +850,23 @@ def _validate_json_file_override_values(experiment: Experiment, phase: Phase) ->
                 if offender is not None
                 else f"{type(exc).__name__}: {exc}"
             )
+            # TypeError covers YAML-native-object cases (date/datetime, etc.);
+            # ValueError here is the strict encoder's allow_nan=False rejecting
+            # a non-finite float (.inf/.nan). The two remedies are unrelated, so
+            # the hint text must not conflate them.
+            hint = (
+                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
+                "into Python date/datetime objects; quote the value in YAML "
+                '(e.g. "2024-01-01") to keep it a JSON string.'
+                if isinstance(exc, TypeError)
+                else "JSON has no representation for non-finite floats; use a "
+                'finite value, or quote it in YAML (e.g. "inf") if the trial '
+                "command should receive it as text."
+            )
             raise ValueError(
                 f"Phase {phase.name!r}: override_format='json_file' but {origin} key "
                 f"{key!r} holds a value the overrides.json serializer cannot encode "
-                f"({detail}): {value!r}. YAML resolves unquoted scalars such as "
-                "2024-01-01 or 12:30:00 into Python date/datetime objects; quote the "
-                'value in YAML (e.g. "2024-01-01") to keep it a JSON string.'
+                f"({detail}): {value!r}. {hint}"
             ) from exc
 
 
