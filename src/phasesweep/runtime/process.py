@@ -1632,7 +1632,12 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     :param int | None saved_starttime: Recorded Linux process start time.
     :return bool: Whether the identity still names a live non-zombie process.
     """
-    return pid is not None and is_same_process(pid, saved_starttime) and not is_pid_zombie(pid)
+    if pid is None or not is_pid_alive(pid):
+        return False
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
+        return False
+    return stat is None or stat.state != "Z"
 
 
 def reap_child(pid: int) -> bool:
