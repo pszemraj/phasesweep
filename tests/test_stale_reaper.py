@@ -526,7 +526,7 @@ def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path)
             stale.wait(timeout=5)
 
 
-def test_kill_stale_group_escalates_to_sigkill(tmp_path):
+def test_kill_stale_group_escalates_to_sigkill():
     """A child that ignores SIGTERM must still be killed within the grace window."""
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test (uses /proc starttime)")

@@ -399,38 +399,18 @@ def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
     assert list(state.iterdir()) == []
 
 
-def test_open_lock_file_closes_descriptor_on_shutdown_during_fdopen_handoff(
+@pytest.mark.parametrize(
+    ("opener_name", "filename"),
+    [
+        pytest.param("open_lock_file", "run.lock", id="lock-file"),
+        pytest.param("open_private_text", "status.json", id="private-text"),
+    ],
+)
+def test_private_open_closes_descriptor_on_shutdown_during_fdopen_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A deferred shutdown aborting fd handoff must close the returned stream."""
-    from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
-
-    lock_root = tmp_path / "locks"
-    lock_root.mkdir(mode=0o700)
-    lock_root.chmod(0o700)
-    opened_fd: int | None = None
-    real_fdopen = os.fdopen
-
-    def shutdown_during_wrap(fd: int, *args: object, **kwargs: object) -> object:
-        nonlocal opened_fd
-        opened_fd = fd
-        _shutdown_handler(signal.SIGTERM, None)
-        return real_fdopen(fd, *args, **kwargs)
-
-    monkeypatch.setattr(os, "fdopen", shutdown_during_wrap)
-
-    with pytest.raises(PhaseSweepShutdown):
-        runtime_files.open_lock_file(lock_root / "run.lock")
-
-    assert opened_fd is not None
-    with pytest.raises(OSError, match="Bad file descriptor"):
-        os.fstat(opened_fd)
-
-
-def test_open_private_text_closes_descriptor_on_shutdown_during_fdopen_handoff(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    opener_name: str,
+    filename: str,
 ) -> None:
     """A deferred shutdown aborting fd handoff must close the returned stream."""
     from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
@@ -438,7 +418,6 @@ def test_open_private_text_closes_descriptor_on_shutdown_during_fdopen_handoff(
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     state.chmod(0o700)
-    path = state / "status.json"
     opened_fd: int | None = None
     real_fdopen = os.fdopen
 
@@ -451,7 +430,7 @@ def test_open_private_text_closes_descriptor_on_shutdown_during_fdopen_handoff(
     monkeypatch.setattr(os, "fdopen", shutdown_during_wrap)
 
     with pytest.raises(PhaseSweepShutdown):
-        runtime_files.open_private_text(path)
+        getattr(runtime_files, opener_name)(state / filename)
 
     assert opened_fd is not None
     with pytest.raises(OSError, match="Bad file descriptor"):

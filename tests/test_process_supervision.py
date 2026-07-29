@@ -556,42 +556,20 @@ def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
     assert fired
 
 
-def test_supervisor_main_exits_without_exec_on_ack_pipe_eof(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Parent death before the ack payload must not let the supervisor exec anything.
-
-    Adapts the old three-arg pre-ack contract test to the new two-arg
-    ready/ack protocol (review v0.5.15 / blocker 1): with the ack pipe closed
-    before any payload is sent (simulating parent death), ``main()`` must
-    return 75 without ever calling ``os.execve``.
-    """
-    exec_calls: list[tuple[object, ...]] = []
-    monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
-
-    ready_read, ready_write = os.pipe()
-    ack_read, ack_write = os.pipe()
-    os.close(ack_write)  # Simulate parent death: EOF with no payload ever sent.
-
-    exit_code = supervisor.main([str(ready_write), str(ack_read)])
-
-    assert os.read(ready_read, 1) == b"R"  # Readiness was still signaled first.
-    # 75 = supervisor's malformed/EOF-payload exit -- see supervisor.main() docstring.
-    assert exit_code == 75
-    assert exec_calls == []
-    os.close(ready_read)
-
-
 def _frame(body: bytes) -> bytes:
     """Build one length-prefixed supervisor payload frame for test fixtures."""
-    return f"{len(body):010d}".encode("ascii") + body
+    return f"{len(body):0{supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 
 @pytest.mark.parametrize(
     "raw_payload",
     [
-        pytest.param(b"NOTALENGTH", id="bad_header"),
-        pytest.param(f"{10:010d}".encode("ascii") + b"{}", id="truncated_body"),
+        pytest.param(None, id="eof"),
+        pytest.param(b"X" * supervisor._HEADER_LEN, id="bad_header"),
+        pytest.param(
+            f"{10:0{supervisor._HEADER_LEN}d}".encode("ascii") + b"{}",
+            id="truncated_body",
+        ),
         pytest.param(_frame(b"[1, 2, 3]"), id="non_dict_json"),
         pytest.param(
             _frame(json.dumps({"cmd": "true", "env": {"X": 1}}).encode("utf-8")),
@@ -600,16 +578,16 @@ def _frame(body: bytes) -> bytes:
     ],
 )
 def test_supervisor_main_rejects_malformed_payload(
-    monkeypatch: pytest.MonkeyPatch, raw_payload: bytes
+    monkeypatch: pytest.MonkeyPatch, raw_payload: bytes | None
 ) -> None:
-    """Any payload shape violation must return 75 without ever execing (review
-    v0.5.15 / blocker 1)."""
+    """EOF or any payload-shape violation must return 75 without execing."""
     exec_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
 
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
-    os.write(ack_write, raw_payload)
+    if raw_payload is not None:
+        os.write(ack_write, raw_payload)
     os.close(ack_write)
 
     exit_code = supervisor.main([str(ready_write), str(ack_read)])
@@ -980,7 +958,7 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
     assert elapsed < 2 * grace - 0.2, f"escalation took {elapsed:.2f}s; grace not shared"
 
 
-def test_terminate_process_groups_reports_per_group_verdicts(tmp_path: Path) -> None:
+def test_terminate_process_groups_reports_per_group_verdicts() -> None:
     """An already-gone group confirms instantly; a live group still gets killed."""
     dead = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
     dead.wait()
@@ -1119,49 +1097,37 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
     assert member_sets == [{11}, {22}]
 
 
+@pytest.mark.parametrize(
+    ("kill_error", "group_survives", "expected", "required_signals"),
+    [
+        pytest.param(None, True, False, {signal.SIGTERM, signal.SIGKILL}, id="survives-sigkill"),
+        pytest.param(ProcessLookupError, False, True, {signal.SIGTERM}, id="already-gone"),
+        pytest.param(PermissionError, False, False, {signal.SIGTERM}, id="permission-denied"),
+    ],
+)
 def test_terminate_process_group_reports_cleanup_status(
     monkeypatch: pytest.MonkeyPatch,
+    kill_error: type[OSError] | None,
+    group_survives: bool,
+    expected: bool,
+    required_signals: set[signal.Signals],
 ) -> None:
     """Group termination reports confirmed cleanup only when it can prove it."""
+    calls: list[tuple[int, int]] = []
 
-    def group_survives(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
-        def fake_killpg(pgid: int, sig: int) -> None:
-            calls.append((pgid, sig))
+    def fake_killpg(pgid: int, sig: int) -> None:
+        calls.append((pgid, sig))
+        if kill_error is not None:
+            raise kill_error
 
-        mp.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
-        mp.setattr(
-            "phasesweep.runtime.process._process_group_alive_with_members",
-            lambda pgid, member_pids: True,
-        )
+    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._process_group_alive_with_members",
+        lambda pgid, member_pids: group_survives,
+    )
 
-    def already_gone(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
-        def raise_lookup(pgid: int, sig: int) -> None:
-            calls.append((pgid, sig))
-            raise ProcessLookupError
-
-        mp.setattr("phasesweep.runtime.process.os.killpg", raise_lookup)
-
-    def permission_denied(mp: pytest.MonkeyPatch, calls: list[tuple[int, int]]) -> None:
-        def raise_perm(pgid: int, sig: int) -> None:
-            calls.append((pgid, sig))
-            raise PermissionError
-
-        mp.setattr("phasesweep.runtime.process.os.killpg", raise_perm)
-
-    cases = [
-        ("survives_sigkill", group_survives, False, {signal.SIGTERM, signal.SIGKILL}),
-        ("already_gone", already_gone, True, {signal.SIGTERM}),
-        ("permission_denied", permission_denied, False, {signal.SIGTERM}),
-    ]
-
-    for case, arrange, expected, required_signals in cases:
-        calls: list[tuple[int, int]] = []
-        with monkeypatch.context() as mp:
-            arrange(mp, calls)
-            assert _terminate_process_group(1234, grace_seconds=0.0) is expected, case
-
-        sent_signals = {sig for _, sig in calls}
-        assert required_signals.issubset(sent_signals), case
+    assert _terminate_process_group(1234, grace_seconds=0.0) is expected
+    assert required_signals.issubset({sig for _, sig in calls})
 
 
 def test_reaper_raises_when_cleanup_uncertain(
