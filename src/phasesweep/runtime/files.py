@@ -208,7 +208,18 @@ def open_lock_file(path: Path) -> IO[str]:
 
 
 def _open_lock_file(path: Path) -> IO[str]:
-    """Open and validate a lock file while shutdown is deferred."""
+    """Open and validate a lock file while shutdown is deferred.
+
+    Unlocked core of :func:`open_lock_file`, called from within its
+    ``defer_shutdown_signals`` context.
+
+    :param Path path: Lock file path to open or create.
+    :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
+        validated lock file.
+    :raises UnsafeLockPathError: If the platform lacks ``O_NOFOLLOW``, the
+        parent directory is missing or unsafe, the leaf name is unsafe, or
+        the file fails the regular-file/ownership/mode checks.
+    """
     require_posix_runtime()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -661,7 +672,16 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
 
 
 def _open_private_text(path: Path, mode: str) -> IO[str]:
-    """Open and validate a private text file while shutdown is deferred."""
+    """Open and validate a private text file while shutdown is deferred.
+
+    Unlocked core of :func:`open_private_text`, called from within its
+    ``defer_shutdown_signals`` context with an already-validated ``mode``.
+
+    :param Path path: File to open.
+    :param str mode: ``"w"``, ``"a"``, or exclusive-create ``"x"``.
+    :return IO[str]: Open text handle.
+    :raises UnsafePrivatePathError: If the file or its parent path is unsafe.
+    """
     parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
     leaf = leaf_name(path)
     flags = os.O_WRONLY | os.O_CLOEXEC | nofollow_flag()

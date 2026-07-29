@@ -839,7 +839,14 @@ def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Pat
 
 
 def _parsed_trial_outcome(value: Any) -> tuple[int, str, str | None] | None:
-    """Return the ordered outcome fields when a trial attr is well formed."""
+    """Return the ordered outcome fields when a trial attr is well formed.
+
+    :param Any value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
+    :return tuple[int, str, str | None] | None: ``(sequence, outcome, cause)``
+        when ``value`` is a dict with the current schema version, a positive
+        int ``sequence``, an ``outcome`` in :data:`_TRIAL_OUTCOMES`, and a
+        ``cause`` that is ``None`` or ``str``; ``None`` otherwise.
+    """
     if not isinstance(value, dict):
         return None
     schema_version = value.get("schema_version")
@@ -866,6 +873,14 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     commit the trial as ``FAIL``. Malformed or duplicate records are replaced
     with a fresh sequence so current-schema validation can still diagnose any
     other corrupt row without stranding this stale process.
+
+    :param optuna.Study study: Study containing ``trial``, used to read every
+        trial's recorded outcome and assign a fresh sequence if needed.
+    :param optuna.trial.FrozenTrial trial: Stale RUNNING trial about to be
+        marked ``FAIL``.
+    :raises RuntimeError: The outcome could not be written to trial user
+        attrs; the trial is left ``RUNNING`` rather than risk silently
+        dropping the failure from ``max_consecutive_failures``.
     """
     trials = study.get_trials(deepcopy=False)
     parsed_by_trial = {
@@ -1170,7 +1185,15 @@ def _reap_stale_trials(
 
 
 def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaMismatchError:
-    """Build the actionable error used for malformed durable policy state."""
+    """Build the actionable error used for malformed durable policy state.
+
+    :param optuna.Study study: Study whose durable state is inconsistent,
+        used to name the study in the message.
+    :param str detail: Specific description of the malformed state.
+    :return StudySchemaMismatchError: Constructed error for the caller to
+        raise, instructing them to use a new experiment name or
+        archive/delete the inconsistent study.
+    """
     return StudySchemaMismatchError(
         f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}. "
         "Use a new experiment name, or archive/delete the inconsistent study before "
@@ -1179,7 +1202,19 @@ def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaM
 
 
 def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
-    """Validate and reconstruct the durable consecutive-failure state."""
+    """Validate and reconstruct the durable consecutive-failure state.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
+        per-trial outcome attrs are read and validated.
+    :return _PhasePolicyState: Reconstructed state: the highest recorded
+        outcome sequence, the consecutive-failure count since the last
+        recovery boundary, the recovered abort sequence (if any), and the
+        first fatal trial's number/sequence/cause (if any).
+    :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
+        trial's outcome attr is malformed, two trials share a completion
+        sequence, or the recovery boundary exceeds the largest recorded
+        sequence.
+    """
     recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
     recovery_boundary = 0
     recovered_abort_sequence: int | None = None

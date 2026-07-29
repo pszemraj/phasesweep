@@ -160,7 +160,19 @@ def _active_phase_abort(
     *,
     recovered_abort_sequence: int | None,
 ) -> dict[str, Any] | None:
-    """Return the validated active abort record, clearing a superseded marker."""
+    """Return the validated active abort record, clearing a superseded marker.
+
+    :param optuna.Study study: Study whose ``PHASE_ABORT_ATTR`` user attr is
+        read and, when superseded, cleared.
+    :param int | None recovered_abort_sequence: Completion sequence of an
+        already-acknowledged recovery, or ``None``. When it equals the
+        persisted record's ``completion_sequence``, that record is cleared
+        and treated as superseded.
+    :raises StudySchemaMismatchError: The persisted attr is not a dict, or its
+        fields fail schema validation.
+    :return dict[str, Any] | None: The validated abort record, or ``None`` if
+        no abort is persisted or the persisted one was just superseded.
+    """
     raw = study.user_attrs.get(PHASE_ABORT_ATTR)
     if raw is None:
         return None
@@ -201,7 +213,19 @@ def _failure_policy_abort_record(
     completion_sequence: int,
     trial_target: int,
 ) -> dict[str, Any]:
-    """Build a durable consecutive-failure abort record."""
+    """Build a durable consecutive-failure abort record.
+
+    :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
+        recorded threshold and cause message.
+    :param int consecutive_failures: Observed consecutive failure/infeasible
+        count that tripped the policy.
+    :param int completion_sequence: Orchestrator completion sequence at which
+        the trip was observed.
+    :param int trial_target: Durable accepted ``n_trials`` target to attach
+        to the record.
+    :return dict[str, Any]: A ``schema_version=1`` abort record ready to
+        persist as ``PHASE_ABORT_ATTR``.
+    """
     return {
         "schema_version": 1,
         "policy": "max_consecutive_failures",
@@ -217,7 +241,15 @@ def _failure_policy_abort_record(
 
 
 def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None:
-    """Explain how to make an explicit recovery attempt after a durable abort."""
+    """Explain how to make an explicit recovery attempt after a durable abort.
+
+    :param Phase phase: Phase whose accepted trial target is quoted in the
+        message.
+    :param dict[str, Any] abort_record: Persisted abort record; supplies
+        ``trial_target`` and ``cause``.
+    :raises NoFeasibleTrialError: Always; this function never returns
+        normally.
+    """
     trial_target = abort_record["trial_target"]
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
@@ -422,6 +454,28 @@ def _run_phase(
         counter changes or the objective returns, so a restarted process can
         reconstruct the same streak. Any persistence failure aborts this
         invocation; it is never downgraded to a warning.
+
+        A no-op if ``trial.number`` is already in ``recorded_outcomes``.
+        Mutates ``_run_phase``'s enclosing ``_consecutive_failures``,
+        ``_completion_sequence``, and ``recorded_outcomes``, and — once a
+        threshold or fatal outcome trips — sets ``abort["flag"]`` and, the
+        first time only, persists an abort record to ``study``'s
+        ``PHASE_ABORT_ATTR``.
+
+        Args:
+            trial: The Optuna trial whose terminal outcome is being recorded.
+            outcome: One of ``"success"``, ``"failure"``, ``"pruned"``, or
+                ``"fatal"``.
+            cause: Optional human-readable explanation stored on the outcome
+                payload.
+            fatal_policy: Optional policy name stored on the outcome payload
+                and, when ``outcome`` is ``"fatal"``, on the resulting abort
+                record.
+
+        Raises:
+            _PolicyStateWriteError: The trial outcome or the phase abort
+                marker could not be persisted to storage.
+
         """
         nonlocal _consecutive_failures, _completion_sequence
         with _failure_lock:
@@ -708,7 +762,21 @@ def _run_phase(
         return result.metric
 
     def objective(trial: optuna.Trial) -> float:
-        """Classify and durably order every terminal objective outcome."""
+        """Classify and durably order every terminal objective outcome.
+
+        Delegates to ``_execute_objective``, then routes any exception it
+        raises through ``_record_outcome`` (and, for fatal cases,
+        ``_record_fatal_abort``) before re-raising the original exception
+        unchanged.
+
+        Args:
+            trial: The active Optuna trial being evaluated.
+
+        Returns:
+            The metric from ``_execute_objective`` when the trial completes
+            without raising.
+
+        """
         try:
             return _execute_objective(trial)
         except _PolicyStateWriteError as exc:
