@@ -109,7 +109,6 @@ def lock_dir() -> Path:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Default lock directory {path} is unsafe.") from exc
-    _lock_policy(path)
     return path
 
 
@@ -764,25 +763,13 @@ def _private_atomic_writer(
         os.close(parent_fd)
 
 
-@contextlib.contextmanager
-def private_atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
-    """Atomically replace a private UTF-8 text file.
-
-    :param Path path: Destination path to replace.
-    :param str | None newline: Newline handling passed to ``open``.
-    :return Iterator[IO[str]]: Writable text handle.
-    """
-    with _private_atomic_writer(path, newline=newline) as handle:
-        yield handle
-
-
 def private_atomic_write_text(path: Path, text: str) -> None:
     """Atomically replace a private UTF-8 text file.
 
     :param Path path: Destination path to replace.
     :param str text: Text to write.
     """
-    with private_atomic_text_writer(path) as handle:
+    with _private_atomic_writer(path) as handle:
         handle.write(text)
 
 
