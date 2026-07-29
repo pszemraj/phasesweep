@@ -1,6 +1,6 @@
 # phasesweep MCP server
 
-`phasesweep-mcp` and `phasesweep mcp serve` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) using the [supported MCP runtime](runtime.md#platform-support). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and uses the server's tools. The server sends the packaged workflow as initialization instructions and also exposes a read-only catalog resource and workflow prompt for clients that support them.
+`phasesweep-mcp` and `phasesweep mcp serve` expose a phasesweep experiment to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) using the [supported MCP runtime](runtime.md#platform-support). The agent can launch a sweep, monitor it, and read the winning hyperparameters. It never supplies, edits, or sees a `trial_command`, `env`, `storage`, or `workdir`. It picks an experiment from a human-curated catalog by id and uses the server's tools.
 
 For install commands, client config, and pasteable agent instructions, use [MCP agent setup](mcp_setup.md).
 

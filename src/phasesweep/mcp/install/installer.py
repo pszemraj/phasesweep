@@ -930,29 +930,8 @@ def run(
 
 # --- check-install: read-only verification (review v0.5.15 / item G) ---
 
-# CheckStatus vocabulary printed by `phasesweep mcp check-install` (see
-# check_install() and docs/mcp_setup.md's check-install section, kept in sync
-# with this table):
-#
-#   status           triggered when                                    attention?
-#   ---------------  -------------------------------------------------  ----------
-#   ok               launcher executable resolves (path is executable,  no
-#                     or `uvx` is on PATH in --launcher uvx mode) and
-#                     the configured --catalog is a readable file
-#   missing          launcher path no longer exists, or `uvx` is not     yes
-#                     on PATH
-#   not-executable   launcher path exists but lacks the execute bit      yes
-#   catalog-missing  launcher resolves but its configured --catalog      yes
-#                     path is absent or is not a readable file
-#   unmanaged        an entry exists but was not written by this         no
-#                     installer (foreign shape); left unprobed
-#   not-configured   no phasesweep MCP entry exists for this target      no
-#   unreadable       config path/entry could not be safely resolved,     yes
-#                     read, or parsed
-#
-# An entry can be broken in several ways at once; the executable status wins,
-# because a launcher that cannot start never reads its catalog (review v0.5.16).
-# _CHECK_ATTENTION_STATUSES below is the authoritative needs-attention set.
+# User-facing status semantics live in docs/mcp_setup.md#4-verify.
+# `_CHECK_ATTENTION_STATUSES` is the implementation's needs-attention set.
 CheckStatus: TypeAlias = Literal[
     "ok",
     "missing",
