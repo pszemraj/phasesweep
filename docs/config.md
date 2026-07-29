@@ -217,7 +217,7 @@ Value error, Phase 'p': override_format='json_file' but fixed_overrides key 'cut
 holds a value the overrides.json serializer cannot encode (type date) ...
 ```
 
-`override_format: json_file` writes overrides through a strict `json.dumps`. Config validation and dry-run do not write `overrides.json`, so a value YAML resolved into a non-JSON Python object used to load clean, pass `phasesweep validate`, and then kill the first real trial. Contract and phase `fixed_overrides` are now encoded through that same serializer at load, and the error names the phase, the origin layer, the key, and the offending type.
+`override_format: json_file` writes overrides through a strict `json.dumps`. Config validation and dry-run do not write `overrides.json`, so a value YAML resolved into a non-JSON Python object used to load clean, pass `phasesweep validate`, and then kill the first real trial. Contract and phase `fixed_overrides` are now encoded through that same serializer at load, and the error names the phase, the origin layer, the key, and the offending type. The same gate rejects non-finite floats: YAML `.inf`/`.nan` would serialize as the non-standard `Infinity`/`NaN` tokens the trial-side reader refuses to parse, so they fail at load with the same shaped error - use a finite value, or quote it if the trainer should receive it as text.
 
 The usual cause is an unquoted YAML scalar that PyYAML resolves to `date`, `datetime`, or `time`. Quote it:
 
@@ -254,6 +254,70 @@ metric.extractor.wandb.run_name_template
   Extra inputs are not permitted
 metric.extractor.wandb.timeout_seconds
   Input should be greater than or equal to 1
+metric.extractor.wandb.timeout_seconds
+  Input should be a finite number
 ```
 
-Both apply to the `wandb` extractor and the `wandb_summary_required` gate. W&B evidence is addressed by the immutable `WANDB_RUN_ID` (set to the attempt ID), so a name template can no longer affect which run is read - delete the key. `PHASESWEEP_RUN_NAME` is still injected if you want a human-readable display name, which the trainer sets itself. A `timeout_seconds` under 1 could expire before a single poll, reporting missing evidence for a run that was merely still uploading; raise it to at least `1`.
+Both apply to the `wandb` extractor and the `wandb_summary_required` gate. W&B evidence is addressed by the immutable `WANDB_RUN_ID` (set to the attempt ID), so a name template can no longer affect which run is read - delete the key. `PHASESWEEP_RUN_NAME` is still injected if you want a human-readable display name, which the trainer sets itself. A `timeout_seconds` under 1 could expire before a single poll, reporting missing evidence for a run that was merely still uploading; raise it to at least `1`. `poll_seconds` and `timeout_seconds` must also be finite: `.inf` used to pass the floor check and then crash the first poll with a misleading credentials diagnosis. There is no "wait forever" - pick a large finite budget.
+
+### Suite and study names may no longer contain `__`
+
+```text
+suite
+  Value error, Suite name 'nightly__sweep' must not contain '__': the compiled
+  component experiment is named '<suite>__<study>', so a double underscore inside
+  either part makes two different suite/study pairs share one artifact namespace,
+  study identity, and fingerprint.
+```
+
+`Suite.suite` and every `StudySpec.name` are still restricted to nonempty ASCII `[A-Za-z0-9_-]+`, but a literal `__` anywhere in the name is now also rejected, because the compiled component experiment is named `<suite>__<study>` - a `__` inside either part would let two different suite/study pairs collide on one artifact namespace, study identity, and fingerprint. A study name with `__` fails the identical check under `studies.<n>.name`, with `Study` in place of `Suite` in the message. Rename any suite or study name that used `__` as a separator to `-` or a single `_`.
+
+```yaml
+# before
+suite: nightly__sweep
+studies:
+  - name: lr
+    phases: [{name: eval, n_trials: 1}]
+
+# after
+suite: nightly-sweep
+studies:
+  - name: lr
+    phases: [{name: eval, n_trials: 1}]
+```
+
+### Suite promotion requires the candidate and baseline to resolve to the same metric contract
+
+```text
+Value error, Study 'candidate' promotion against 'baseline' requires the same
+resolved metric contract, but the candidate resolves to {'name': 'loss', ...}
+and the baseline resolves to {'name': 'loss', ...}. Put the shared metric in
+suite.defaults or make both study metrics identical.
+```
+
+A suite study's `promotion.min_delta_vs` compares `baseline.metric` and `candidate.metric` directly, so if the two studies resolve to different `Metric` objects - a different `name`, `goal`, or `extractor` configuration - the subtraction would compare unrelated scalars. Config validation now rejects that mismatch instead of silently computing a meaningless delta. The elided `{...}` portions of the error are each study's fully resolved metric (`Metric.model_dump(mode="json")`), so you can see exactly which field diverged. Give the candidate and baseline the same metric, normally by declaring it once in `suite.defaults.metric` and letting both studies inherit it instead of restating it per study.
+
+```yaml
+# before - candidate's extractor pattern differs from the baseline's
+suite: incompatible_metrics
+defaults:
+  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
+studies:
+  - name: baseline
+    phases: [{name: baseline_eval, n_trials: 1}]
+  - name: candidate
+    metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.]+)'}}
+    promotion: {min_delta_vs: baseline}
+    phases: [{name: candidate_eval, n_trials: 1}]
+
+# after - candidate inherits the shared metric instead of restating it
+suite: incompatible_metrics
+defaults:
+  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
+studies:
+  - name: baseline
+    phases: [{name: baseline_eval, n_trials: 1}]
+  - name: candidate
+    promotion: {min_delta_vs: baseline}
+    phases: [{name: candidate_eval, n_trials: 1}]
+```
