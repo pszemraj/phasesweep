@@ -1591,6 +1591,26 @@ def _trial_dir_for_cleanup_recovery(
     return Path(stored)
 
 
+def _iter_cleanup_uncertain_trials(
+    study: optuna.Study,
+) -> Iterator[tuple[optuna.trial.FrozenTrial, Path, StaleProcessIdentity]]:
+    """Yield unconsumed terminal trials with their validated process identity.
+
+    :param optuna.Study study: Study whose cleanup evidence should be inspected.
+    :return Iterator: Eligible trial, persisted trial directory, and process identity.
+    """
+    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
+    for trial in study.get_trials(deepcopy=False):
+        if (
+            trial.state.is_finished()
+            and trial.number not in recovered_trial_numbers
+            and trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False
+        ):
+            trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+            identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
+            yield trial, trial_dir, identity
+
+
 def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
@@ -1610,17 +1630,7 @@ def _recover_cleanup_uncertain_trials(
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
     recovered = 0
-    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
-    for trial in study.get_trials(deepcopy=False):
-        if not trial.state.is_finished():
-            continue
-        if trial.number in recovered_trial_numbers:
-            continue
-        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
-            continue
-
-        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-        identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
+    for trial, trial_dir, identity in _iter_cleanup_uncertain_trials(study):
         safe_to_clear = cleanup_stale_trial_process(identity)
         if not safe_to_clear:
             raise ProcessCleanupUncertainError(
@@ -1630,7 +1640,6 @@ def _recover_cleanup_uncertain_trials(
                 f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
             )
         _record_cleanup_recovery(study, trial)
-        recovered_trial_numbers.add(trial.number)
         recovered += 1
         log.warning(
             "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
@@ -1651,16 +1660,4 @@ def _inspect_cleanup_uncertain_trials(study: optuna.Study) -> int:
     :raises ProcessCleanupUncertainError: A trial lacks the persisted identity
         required for a safe confirmed recovery.
     """
-    count = 0
-    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
-    for trial in study.get_trials(deepcopy=False):
-        if not trial.state.is_finished():
-            continue
-        if trial.number in recovered_trial_numbers:
-            continue
-        if trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is not False:
-            continue
-        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-        _read_trial_process_identity(trial, trial_dir, study.study_name)
-        count += 1
-    return count
+    return sum(1 for _ in _iter_cleanup_uncertain_trials(study))
