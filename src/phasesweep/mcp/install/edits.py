@@ -101,6 +101,30 @@ def _stat_token(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _snapshot_from_fd(fd: int) -> _TextSnapshot | None:
+    """Read and decode a stable regular-file snapshot from an owned descriptor.
+
+    :param int fd: Open descriptor whose ownership transfers to this function.
+    :return _TextSnapshot | None: Stable UTF-8 snapshot, or ``None`` when unusable.
+    """
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            raw = handle.read()
+            after = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    if _stat_token(before) != _stat_token(after):
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        return None
+    return _TextSnapshot(True, text, raw, _stat_token(after))
+
+
 def _read_editable_text(path: Path) -> _TextSnapshot | None:
     """Read a stable regular non-symlink file, or describe a missing target.
 
@@ -119,22 +143,7 @@ def _read_editable_text(path: Path) -> _TextSnapshot | None:
     except OSError:
         return None
 
-    try:
-        with os.fdopen(fd, "rb") as handle:
-            before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                return None
-            raw = handle.read()
-            after = os.fstat(handle.fileno())
-    except OSError:
-        return None
-    if _stat_token(before) != _stat_token(after):
-        return None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeError:
-        return None
-    return _TextSnapshot(True, text, raw, _stat_token(after))
+    return _snapshot_from_fd(fd)
 
 
 def _edit_lock_path(path: Path) -> Path:
@@ -198,22 +207,7 @@ def _read_editable_text_at(parent_fd: int, leaf: str) -> _TextSnapshot | None:
     except OSError:
         return None
 
-    try:
-        with os.fdopen(fd, "rb") as handle:
-            before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                return None
-            raw = handle.read()
-            after = os.fstat(handle.fileno())
-    except OSError:
-        return None
-    if _stat_token(before) != _stat_token(after):
-        return None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeError:
-        return None
-    return _TextSnapshot(True, text, raw, _stat_token(after))
+    return _snapshot_from_fd(fd)
 
 
 def _snapshot_matches(parent_fd: int, leaf: str, expected: _TextSnapshot) -> bool:

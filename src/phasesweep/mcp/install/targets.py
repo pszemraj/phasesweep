@@ -204,16 +204,14 @@ def _entry_argv(style: EntryStyle, value: dict[str, object]) -> list[str] | None
     return argv
 
 
-def _is_phasesweep_argv(argv: object) -> bool:
+def _is_phasesweep_argv(argv: list[str]) -> bool:
     """Return whether a full command argv matches one recognized launcher shape.
 
-    :param object argv: Candidate argv, executable first, as written by ``mcp_entry``.
+    :param list[str] argv: Candidate argv, executable first, as written by ``mcp_entry``.
     :return bool: True for the 3-element absolute-path launcher
         (``phasesweep-mcp --catalog PATH``) or the 6-element pinned uvx launcher
         (``uvx --from phasesweep[mcp]==VERSION phasesweep-mcp --catalog PATH``).
     """
-    if not isinstance(argv, list):
-        return False
     if len(argv) == 3:
         command, flag, catalog = argv
         return (
@@ -226,7 +224,6 @@ def _is_phasesweep_argv(argv: object) -> bool:
         return (
             command == "uvx"
             and from_flag == "--from"
-            and isinstance(pin, str)
             and _UVX_PIN_PATTERN.match(pin) is not None
             and entrypoint == "phasesweep-mcp"
             and flag == "--catalog"
@@ -235,26 +232,22 @@ def _is_phasesweep_argv(argv: object) -> bool:
     return False
 
 
-def _is_absolute_phasesweep_command(value: object) -> bool:
+def _is_absolute_phasesweep_command(value: str) -> bool:
     """Return whether ``value`` is an absolute phasesweep MCP executable path.
 
-    :param object value: Candidate command value.
+    :param str value: Candidate command value.
     :return bool: True when the value is an absolute path named ``phasesweep-mcp``.
     """
-    return (
-        isinstance(value, str)
-        and Path(value).is_absolute()
-        and Path(value).name == "phasesweep-mcp"
-    )
+    return Path(value).is_absolute() and Path(value).name == "phasesweep-mcp"
 
 
-def _is_absolute_path(value: object) -> bool:
+def _is_absolute_path(value: str) -> bool:
     """Return whether ``value`` is a non-empty absolute path string.
 
-    :param object value: Candidate path value.
+    :param str value: Candidate path value.
     :return bool: True when the value is a non-empty absolute path string.
     """
-    return isinstance(value, str) and bool(value) and Path(value).is_absolute()
+    return bool(value) and Path(value).is_absolute()
 
 
 def codex_toml_content(
