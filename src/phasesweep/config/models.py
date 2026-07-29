@@ -1023,6 +1023,24 @@ class SuiteDefaults(_Frozen):
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
 
 
+def _validate_suite_component_name(kind: str, value: str) -> str:
+    """Validate a suite or study name used in the compiled experiment namespace.
+
+    :param str kind: Human-readable component kind for the validation error.
+    :param str value: Candidate component name.
+    :raises ValueError: If ``value`` contains the reserved ``__`` separator.
+    :return str: The safe component name, unchanged.
+    """
+    if "__" in value:
+        raise ValueError(
+            f"{kind} name {value!r} must not contain '__': the compiled component "
+            "experiment is named '<suite>__<study>', so a double underscore inside "
+            "either part makes two different suite/study pairs share one artifact "
+            "namespace, study identity, and fingerprint."
+        )
+    return _validate_safe_name(kind, value)
+
+
 class StudySpec(_Frozen):
     """One experiment-like study inside a suite run plan."""
 
@@ -1052,14 +1070,7 @@ class StudySpec(_Frozen):
         :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated study name, unchanged.
         """
-        if "__" in value:
-            raise ValueError(
-                f"Study name {value!r} must not contain '__': the compiled component "
-                "experiment is named '<suite>__<study>', so a double underscore inside "
-                "either part makes two different suite/study pairs share one artifact "
-                "namespace, study identity, and fingerprint."
-            )
-        return _validate_safe_name("Study", value)
+        return _validate_suite_component_name("Study", value)
 
 
 class Suite(_Frozen):
@@ -1078,14 +1089,7 @@ class Suite(_Frozen):
         :raises ValueError: If ``value`` is not a safe name or contains ``__``.
         :return str: The validated suite name, unchanged.
         """
-        if "__" in value:
-            raise ValueError(
-                f"Suite name {value!r} must not contain '__': the compiled component "
-                "experiment is named '<suite>__<study>', so a double underscore inside "
-                "either part makes two different suite/study pairs share one artifact "
-                "namespace, study identity, and fingerprint."
-            )
-        return _validate_safe_name("Suite", value)
+        return _validate_suite_component_name("Suite", value)
 
     @model_validator(mode="after")
     def _validate_study_graph(self) -> Suite:

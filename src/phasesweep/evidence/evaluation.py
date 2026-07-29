@@ -8,7 +8,6 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +157,7 @@ def _extract_json(
     except UnicodeError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
-    except (JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         target = ctx.trial_dir / cfg.path
         raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
     except OSError as exc:
@@ -201,7 +200,7 @@ def _extract_json_envelope(
         raise ExtractorError(f"JSON envelope not found: {target}") from exc
     except UnicodeError as exc:
         raise ExtractorError(f"JSON envelope at {target} is not valid UTF-8: {exc}") from exc
-    except (JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read JSON envelope at {target}: {exc}") from exc
