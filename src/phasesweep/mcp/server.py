@@ -97,13 +97,15 @@ AWAIT_RECHECK_SECONDS = 30
 # to the next tool in the workflow by literal name.
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the human-curated experiments this server can run: ids, descriptions, "
-    "phase names, optimization metric, and authorized capabilities. Read-only. Start here. If "
-    "next_cursor is non-null, call again with it. Then call "
+    "phase names, optimization metric with objective-evidence assurance, and authorized "
+    "capabilities. Read-only. Start here. If next_cursor is non-null, call again with it. "
+    "Then call "
     f"{TOOL_VALIDATE_CONFIG} on the id you plan to use."
 )
 DESCRIPTION_VALIDATE_CONFIG = (
     "Re-check that the cataloged config has not changed, then inspect it before launching: "
-    "authorized capabilities plus per-phase names, terminal-attempt targets, "
+    "metric with objective-evidence assurance, authorized capabilities, and per-phase names, "
+    "terminal-attempt targets, "
     "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
     "Call once while planning an experiment; "
     f"{TOOL_LAUNCH_SWEEP} independently refuses a changed config, so unchanged "
@@ -130,15 +132,16 @@ DESCRIPTION_LAUNCH_SWEEP = (
 DESCRIPTION_GET_STATUS = (
     "Per-phase trial progress and the run process state (running / succeeded / "
     "failed / cancelled). If run.recovery_required is true, stop monitoring and report "
-    "it to the user: operator recovery is required, and the run will not become terminal "
-    "on its own. Provide exactly one of experiment_id or run_id; after a "
+    "the run to the user for operator attention. Provide exactly one of experiment_id or "
+    "run_id; after a "
     "launch, always use the run_id so catalog edits cannot redirect monitoring. "
     "State counts are dense and explicitly split into cumulative, before-run, and this-run "
     "dimensions; remaining_trials is already computed. "
     "current_generation_id and published_generation_id are always the actual pointers, never "
     "forced to a queried run_id; represented_generation_id is the generation whose winner_present "
-    "and summary_present this payload shows - a run_id itself when querying by run_id, otherwise "
-    "published_generation_id. is_published is true only when represented_generation_id is the "
+    "and summary_present this payload shows - normally a run_id itself when querying by run_id, "
+    "otherwise published_generation_id. A config-only unavailable placeholder sets all generation "
+    "ids to null. is_published is true only when represented_generation_id is the "
     "actual published one; a run_id whose own publication failed still reports its own "
     "this-run counts and winners with is_published=false. "
     "trial_data_available=false means zero counts are not trustworthy. result_source names "
@@ -181,8 +184,9 @@ DESCRIPTION_AWAIT_RUN = (
     "running, call again with the same run_id. Returns the same payload as "
     f"{TOOL_GET_STATUS} plus changed and reason (recovery_required / terminal / "
     f"phase_completed / timeout). If reason is recovery_required, stop waiting and "
-    "report it to the user: the run needs operator recovery and will not become terminal "
-    f"on its own. If reason is terminal, call {TOOL_GET_WINNERS} with the same run_id. "
+    "report the run to the user for operator attention. A launch handoff observed "
+    f"mid-transition can still settle. If reason is terminal, call {TOOL_GET_WINNERS} "
+    "with the same run_id. "
     f"If reason is phase_completed, call {TOOL_AWAIT_RUN} again with the same run_id. "
     "At timeout, changed may still be true when trial counts advanced without another stop "
     "condition; report that progress and call this tool again while the run is running. "
@@ -368,13 +372,17 @@ class RunPayload(_ToolPayload):
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
     recovery_required: bool = Field(
         description=(
-            "True when cleanup is uncertain and only the operator can run "
-            "phasesweep mcp recover-run; the run remains state=running until recovery."
+            "True when the agent must stop monitoring and report an unresolved launch, "
+            "uncertain cleanup, or interrupted snapshot finalization to the operator. "
+            "A launch handoff observed mid-transition can still settle."
         )
     )
     failure: FailurePayload | None = Field(
         default=None,
-        description="Safe terminal failure category and next action; null while running or successful.",
+        description=(
+            "Safe actionable failure category and next action; null when no actionable "
+            "failure is attached."
+        ),
     )
 
 
@@ -445,8 +453,8 @@ class GetStatusResult(_ToolPayload):
     represented_generation_id: str | None = Field(
         description=(
             "The generation whose winner_present, summary_present, and this-run trial "
-            "counts this payload shows: the queried run_id itself when one was given, "
-            "otherwise published_generation_id."
+            "counts this payload shows: normally the queried run_id when one was given, "
+            "otherwise published_generation_id. Null for a config-only unavailable placeholder."
         )
     )
     is_published: bool = Field(
@@ -570,7 +578,7 @@ class CancelSweepResult(_ToolPayload):
         ),
     )
     recovery_required: bool = Field(
-        description="Whether operator-only cleanup recovery is required after this call."
+        description="Whether this run requires operator attention after the cancellation call."
     )
 
 
