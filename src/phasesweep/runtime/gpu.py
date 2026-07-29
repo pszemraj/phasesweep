@@ -29,7 +29,7 @@ import re
 import subprocess
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,41 +138,12 @@ def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
     unlock_file(lease.handle)
 
 
-def _detect_gpu_ids() -> list[int]:
-    """Probe ``nvidia-smi`` for visible CUDA device indices.
+def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
+    """Probe ``nvidia-smi`` once for visible indices and usable device UUIDs.
 
     Returns:
-        Numeric device indices reported by ``nvidia-smi --query-gpu=index``,
-        or an empty list if the binary is missing, times out, or returns a
-        nonzero exit code (this is normal on CPU-only machines).
-
-    """
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if out.returncode != 0:
-            return []
-        return [int(x.strip()) for x in out.stdout.strip().splitlines() if x.strip().isdigit()]
-    except FileNotFoundError:
-        return []
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def _detect_gpu_uuid_map() -> dict[str, str]:
-    """Probe ``nvidia-smi`` for the index-to-UUID map of the visible CUDA devices.
-
-    Returns:
-        Mapping of decimal device index (as a string) to the ``GPU-...`` UUID
-        reported by ``nvidia-smi --query-gpu=index,uuid``, or an empty mapping
-        if the binary is missing, times out, or returns a nonzero exit code
-        (this is normal on CPU-only machines). Mirrors :func:`_detect_gpu_ids`:
-        every failure degrades to "unknown", never to a raised exception.
+        Numeric indices plus the subset mapped to a ``GPU-...`` or ``MIG-...``
+        identity. Both are empty when the probe is unavailable.
 
     """
     try:
@@ -184,15 +155,18 @@ def _detect_gpu_uuid_map() -> dict[str, str]:
             check=False,
         )
         if out.returncode != 0:
-            return {}
+            return [], {}
     except FileNotFoundError:
-        return {}
+        return [], {}
     except Exception:  # noqa: BLE001
-        return {}
+        return [], {}
+    ids: list[int] = []
     uuid_map: dict[str, str] = {}
     for line in out.stdout.strip().splitlines():
         index, _, uuid = line.partition(",")
         index, uuid = index.strip(), uuid.strip()
+        if index.isdigit():
+            ids.append(int(index))
         # Require a real device-identity shape. Restricted drivers (vGPU,
         # locked-down containers) report "[N/A]"/"[Not Supported]" for every
         # index; accepting those would map ALL indices to one identity and
@@ -200,7 +174,12 @@ def _detect_gpu_uuid_map() -> dict[str, str]:
         # v0.5.17 gap hunt).
         if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
-    return uuid_map
+    return ids, uuid_map
+
+
+def _detect_gpu_uuid_map() -> dict[str, str]:
+    """Return the usable index-to-UUID portion of one GPU inventory probe."""
+    return _detect_gpu_inventory()[1]
 
 
 def _nvidia_driver_reports_gpus() -> bool:
@@ -236,7 +215,11 @@ def _is_abbreviated_gpu_uuid(token: str) -> bool:
     return token.startswith("GPU-") and len(token) < _FULL_GPU_UUID_LENGTH
 
 
-def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
+def _resolve_lock_identities(
+    devices: list[GpuDevice],
+    *,
+    uuid_map: dict[str, str] | None = None,
+) -> list[GpuDevice]:
     """Bind each device to the canonical physical GPU its host lock keys on.
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
@@ -249,6 +232,7 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
 
     Args:
         devices: Devices built from configured, ambient, or detected tokens.
+        uuid_map: Already-probed index-to-UUID map, when available.
 
     Returns:
         The same devices with ``lock_token`` populated, deduplicated by lock
@@ -267,7 +251,8 @@ def _resolve_lock_identities(devices: list[GpuDevice]) -> list[GpuDevice]:
         # Full opaque token sets are already canonical: no probe, no ambiguity.
         return _dedupe_by_lock_identity(devices)
 
-    uuid_map = _detect_gpu_uuid_map()
+    if uuid_map is None:
+        uuid_map = _detect_gpu_uuid_map()
     if not uuid_map:
         opaque = [device.visible_token for device in devices if not device.visible_token.isdigit()]
         if numeric and opaque:
@@ -427,20 +412,21 @@ class GpuPool:
 
         # Explicit IDs always win, even at n_jobs==1.
         if explicit_ids is not None:
-            ids = list(dict.fromkeys(explicit_ids))
-            devices = _resolve_lock_identities([GpuDevice(str(gpu_id)) for gpu_id in ids])
+            devices = _resolve_lock_identities(_normalize_devices(explicit_ids))
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
         if explicit_devices is not None:
-            devices = _resolve_lock_identities(_dedupe_devices(explicit_devices))
+            devices = _resolve_lock_identities(_normalize_devices(explicit_devices))
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 
         user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        detected_uuid_map: dict[str, str] | None = None
         if user_cvd is not None:
             devices = _devices_from_cuda_visible_devices(user_cvd)
         else:
-            devices = [GpuDevice(str(gpu_id)) for gpu_id in _detect_gpu_ids()]
+            detected_ids, detected_uuid_map = _detect_gpu_inventory()
+            devices = _normalize_devices(detected_ids)
         if not devices:
             if n_jobs <= 1:
                 if _nvidia_driver_reports_gpus():
@@ -469,7 +455,7 @@ class GpuPool:
                 "explicitly in the phase config, or set allow_no_gpu_isolation: true "
                 "if this is an intentional CPU-only parallel sweep."
             )
-        devices = _resolve_lock_identities(devices)
+        devices = _resolve_lock_identities(devices, uuid_map=detected_uuid_map)
         _log_pool_size(n_jobs, [device.visible_token for device in devices], "available")
         return cls(devices=devices, whole_node=policy == "whole_node")
 
@@ -629,10 +615,10 @@ class GpuPool:
             self._release(acquired)
 
 
-def _dedupe_devices(tokens: list[str]) -> list[GpuDevice]:
+def _normalize_devices(tokens: Iterable[int | str]) -> list[GpuDevice]:
     """Deduplicate non-empty CUDA device tokens while preserving order.
 
-    :param list[str] tokens: CUDA device tokens to normalize and deduplicate.
+    :param Iterable[int | str] tokens: CUDA device tokens to normalize and deduplicate.
     :return list[GpuDevice]: Unique non-empty devices in their original order.
     """
     devices: list[GpuDevice] = []
@@ -658,7 +644,7 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
         return []
     if "-1" in raw:
         raise RuntimeError("CUDA_VISIBLE_DEVICES=-1 cannot be mixed with visible device tokens.")
-    return _dedupe_devices(raw)
+    return _normalize_devices(raw)
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:

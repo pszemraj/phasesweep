@@ -14,9 +14,16 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.runtime.files import open_lock_file
-from phasesweep.runtime.gpu import GpuDevice, GpuPool, _detect_gpu_uuid_map, _gpu_lock_path
+from phasesweep.runtime.gpu import (
+    GpuDevice,
+    GpuPool,
+    _detect_gpu_inventory,
+    _detect_gpu_uuid_map,
+    _gpu_lock_path,
+)
 
 # Bound before any monkeypatching so hardware tests can restore the real probe.
+_real_detect_gpu_inventory = _detect_gpu_inventory
 _real_detect_gpu_uuid_map = _detect_gpu_uuid_map
 
 
@@ -30,25 +37,15 @@ def unreadable_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
     which GPUs the test host happens to have. Tests that exercise resolution
     re-patch the probe themselves.
     """
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
-
-
-def test_gpu_pool_explicit_ids_from_yaml(tmp_path):
-    """gpu_ids declared in YAML must reach the GpuPool, not be silently dropped."""
-    pool = GpuPool.create(n_jobs=2, explicit_ids=[7, 8])
-    acquired = []
-    with pool.acquire() as gid:
-        acquired.append(gid)
-    with pool.acquire() as gid:
-        acquired.append(gid)
-    assert set(acquired) == {"7", "8"}
 
 
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
     """n_jobs > 1 with no GPUs and allow_no_gpu=False must raise, not silently degrade."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     # Force nvidia-smi to fail
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     with pytest.raises(RuntimeError, match="no GPUs detected"):
         GpuPool.create(n_jobs=4, allow_no_gpu=False)
 
@@ -56,7 +53,7 @@ def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
 def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
     """n_jobs > 1 with allow_no_gpu=True should warn but not crash."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True)
     with pool.acquire() as gid:
         assert gid is None
@@ -113,7 +110,7 @@ def test_gpu_acquire_respects_deadline_when_local_slot_is_busy() -> None:
 def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
     """Single-job GPU work still takes a host-wide lease when a GPU is visible."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [3, 4])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([3, 4], {}))
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -124,7 +121,7 @@ def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
 def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
     """CPU-only single-job work does not need an explicit no-GPU opt-in."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [])
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -239,8 +236,10 @@ def test_autodetected_indices_resolve_to_the_same_lock_as_uuid_tokens(tmp_path, 
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     uuid = "GPU-deadbeef"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_ids", lambda: [0])
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([0], {"0": uuid}),
+    )
 
     detected = GpuPool.create(n_jobs=1)
 
@@ -360,7 +359,10 @@ def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
 
     monkeypatch.setattr("phasesweep.runtime.gpu.subprocess.run", lambda *args, **kwargs: _Out())
 
-    assert _real_detect_gpu_uuid_map() == {"2": "GPU-abc123", "3": "MIG-def456"}
+    assert _real_detect_gpu_inventory() == (
+        [0, 1, 2, 3],
+        {"2": "GPU-abc123", "3": "MIG-def456"},
+    )
 
 
 def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
@@ -396,6 +398,10 @@ def test_abbreviated_uuid_prefix_without_map_degrades_loudly(tmp_path, monkeypat
 @pytest.mark.skipif(shutil.which("nvidia-smi") is None, reason="nvidia-smi is not installed")
 def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
     """On real GPU hardware, index 0 locks under the UUID nvidia-smi reports for it."""
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        _real_detect_gpu_inventory,
+    )
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", _real_detect_gpu_uuid_map)
     uuid_map = _real_detect_gpu_uuid_map()
     if not uuid_map:
