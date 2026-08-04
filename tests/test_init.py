@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -79,6 +80,28 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     # Lone surrogates raise UnicodeEncodeError here; a real path does not.
     Path(experiment.workdir).mkdir(parents=True)
     assert Path(experiment.workdir) == runs_dir
+
+
+def test_init_prints_next_commands_with_the_expanded_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Printed commands must name the written file, not the raw ``-o`` value.
+
+    Shell quoting suppresses ``~`` expansion, so echoing the unexpanded option
+    value produces commands that address a different, nonexistent path.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", "~/experiments/starter.yaml"])
+
+    assert result.exit_code == 0, result.output
+    written = tmp_path / "experiments" / "starter.yaml"
+    assert written.is_file()
+    assert f"phasesweep validate {written}" in result.output
+    assert f"phasesweep run {written} --dry-run" in result.output
+    assert f"phasesweep mcp init-catalog --from {written}" in result.output
+    assert "~" not in result.output
 
 
 def test_init_refuses_to_replace_existing_file(tmp_path: Path) -> None:

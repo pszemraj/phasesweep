@@ -138,7 +138,8 @@ def init(output: Path) -> None:
 
     :param Path output: Destination YAML path; existing paths are never replaced.
     """
-    target = output.expanduser().absolute()
+    expanded = output.expanduser()
+    target = expanded.absolute()
     if target.exists() or target.is_symlink():
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
@@ -150,7 +151,10 @@ def init(output: Path) -> None:
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2) from None
 
-    config_arg = shlex.quote(str(output))
+    # Quote the expanded path, never the raw option value: shell quoting
+    # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
+    # different (nonexistent) file than the one just written.
+    config_arg = shlex.quote(str(expanded))
     click.echo(f"Wrote starter experiment to {target}")
     click.echo("\nNext:")
     click.echo(f"  phasesweep validate {config_arg}")
