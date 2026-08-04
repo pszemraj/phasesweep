@@ -624,39 +624,6 @@ def test_search_space_accepts_well_formed_keys() -> None:
         assert good_key in phase.search_space
 
 
-def test_cmaes_phase_rejected_at_config_load_when_package_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CMA-ES availability is part of config validation, not first-trial launch."""
-    import builtins
-
-    real_import = builtins.__import__
-
-    def fake_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if name == "cmaes":
-            raise ImportError("simulated missing cmaes package")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    with pytest.raises(ValidationError, match=r"cmaes.*not installed"):
-        make_experiment(
-            sampler=Sampler(type="cmaes", seed=0),
-            search_space={"x": IntParam(type="int", low=0, high=10)},
-        )
-
-
-def test_cmaes_phase_loads_when_package_present() -> None:
-    """A CMA-ES phase loads when the base dependency is importable."""
-    import cmaes  # noqa: F401
-
-    exp = make_experiment(
-        sampler=Sampler(type="cmaes", seed=0),
-        search_space={"x": IntParam(type="int", low=0, high=10)},
-    )
-    assert exp.phases[0].sampler.type == "cmaes"
-
-
 def test_inherit_search_space_collision_errors(tmp_path):
     body = """
 experiment: t

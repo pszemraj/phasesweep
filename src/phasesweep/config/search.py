@@ -176,14 +176,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                 f"categorical parameters: {cats}. Use sampler.type='tpe' or "
                 f"remove the categorical params from this phase."
             )
-        try:
-            import cmaes  # type: ignore[import-untyped]  # noqa: F401
-        except ImportError as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: sampler.type='cmaes' requires the "
-                "'cmaes' package, which is not installed. Reinstall phasesweep "
-                "or install it directly with `pip install cmaes`."
-            ) from exc
 
     if sampler_type == "grid":
         cardinality = math.prod(
@@ -255,7 +247,7 @@ def grid_search_space(
                     f"log-scale int param {name!r}."
                 )
             grid[name] = list(range(param.low, param.high + 1, param.step))
-        elif isinstance(param, FloatParam):
+        else:
             if param.log:
                 raise ValueError(
                     f"Phase {phase_name!r}: grid sampler does not support "
@@ -283,8 +275,6 @@ def grid_search_space(
                     "a multiplier — so adjacent grid points differ by more than 1e-12."
                 )
             grid[name] = values
-        else:  # pragma: no cover
-            raise ValueError(f"Unhandled param type for grid: {param!r}")
     return grid
 
 
@@ -298,18 +288,12 @@ def _placeholder_value_for(param: SearchParam) -> Any:
         For ``FloatParam`` the interval midpoint; for ``IntParam`` the
         integer midpoint; for ``CategoricalParam`` the first listed choice.
 
-    Raises:
-        ValueError: Unrecognised parameter subclass (defensive; the union is
-            closed in practice).
-
     """
     if isinstance(param, FloatParam):
         return (param.low + param.high) / 2
     if isinstance(param, IntParam):
         return (param.low + param.high) // 2
-    if isinstance(param, CategoricalParam):
-        return param.choices[0]
-    raise ValueError(f"Unhandled param: {param!r}")  # pragma: no cover
+    return param.choices[0]
 
 
 def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:
