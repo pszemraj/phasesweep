@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 import yaml
 from click.testing import CliRunner
+from optuna import create_study
 
 from phasesweep import load_experiment
 from phasesweep.cli import _starter_experiment_text
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.registry import Registry
+from phasesweep.runtime.files import sqlite_uri_filename_path
 
 
 def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
@@ -27,7 +29,9 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         experiment = load_experiment(config_path)
         assert experiment.experiment == "phasesweep_starter"
         assert Path(experiment.workdir).is_absolute()
-        assert experiment.storage == f"sqlite:///{config_path.parent / 'runs' / 'phases.db'}"
+        assert experiment.storage == (
+            f"sqlite:///file:{config_path.parent / 'runs' / 'phases.db'}?uri=true"
+        )
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
         assert experiment.phases[1].inherits == ["depth"]
@@ -71,7 +75,7 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     rendered = yaml.safe_load(_starter_experiment_text(output))
     runs_dir = output.parent / "runs"
     assert rendered["workdir"] == str(runs_dir)
-    assert rendered["storage"] == f"sqlite:///{runs_dir / 'phases.db'}"
+    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -80,6 +84,23 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     # Lone surrogates raise UnicodeEncodeError here; a real path does not.
     Path(experiment.workdir).mkdir(parents=True)
     assert Path(experiment.workdir) == runs_dir
+
+
+def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
+    project = tmp_path / "local?sweeps"
+    output = project / "experiment.yaml"
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    experiment = load_experiment(output)
+    database = project / "runs" / "phases.db"
+    assert sqlite_uri_filename_path(experiment.storage) == str(database)
+
+    database.parent.mkdir()
+    create_study(storage=experiment.storage, study_name="path_check")
+    assert database.is_file()
+    assert not (tmp_path / "local").exists()
 
 
 def test_init_prints_next_commands_with_the_expanded_path(

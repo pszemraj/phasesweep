@@ -12,6 +12,7 @@ import shlex
 import sys
 from importlib import resources
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 import yaml
@@ -105,14 +106,14 @@ def _starter_experiment_text(target: Path) -> str:
         .read_text(encoding="utf-8")
     )
     runs_dir = target.parent / "runs"
+    storage_path = quote(str(runs_dir / "phases.db"), safe="/")
     # JSON and YAML double-quoted scalars share escaping for valid Unicode.
-    # Keeping non-ASCII characters literal avoids JSON's non-BMP UTF-16
-    # surrogate pairs, which YAML decodes into lone surrogates that later break
-    # any filesystem call on the rendered workdir/storage paths.
+    # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
+    # pairs; the SQLite URI percent-encodes its path for unambiguous URL parsing.
     replacements = {
         "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir), ensure_ascii=False),
         "__PHASESWEEP_STORAGE__": json.dumps(
-            f"sqlite:///{runs_dir / 'phases.db'}", ensure_ascii=False
+            f"sqlite:///file:{storage_path}?uri=true", ensure_ascii=False
         ),
     }
     for placeholder, value in replacements.items():
