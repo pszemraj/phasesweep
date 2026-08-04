@@ -105,9 +105,15 @@ def _starter_experiment_text(target: Path) -> str:
         .read_text(encoding="utf-8")
     )
     runs_dir = target.parent / "runs"
+    # JSON and YAML double-quoted scalars share escaping for valid Unicode.
+    # Keeping non-ASCII characters literal avoids JSON's non-BMP UTF-16
+    # surrogate pairs, which YAML decodes into lone surrogates that later break
+    # any filesystem call on the rendered workdir/storage paths.
     replacements = {
-        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir)),
-        "__PHASESWEEP_STORAGE__": json.dumps(f"sqlite:///{runs_dir / 'phases.db'}"),
+        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir), ensure_ascii=False),
+        "__PHASESWEEP_STORAGE__": json.dumps(
+            f"sqlite:///{runs_dir / 'phases.db'}", ensure_ascii=False
+        ),
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)

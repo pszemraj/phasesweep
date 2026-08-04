@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
 from click.testing import CliRunner
 
 from phasesweep import load_experiment
+from phasesweep.cli import _starter_experiment_text
 from phasesweep.cli import main as cli_main
 from phasesweep.mcp.registry import Registry
 
@@ -51,6 +53,32 @@ def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> No
     assert output.is_file()
     experiment = load_experiment(output)
     assert Path(experiment.workdir) == output.parent / "runs"
+
+
+def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
+    """Rendered paths must survive YAML decoding byte-for-byte.
+
+    ``json.dumps`` with the default ``ensure_ascii=True`` escapes a non-BMP
+    character as a UTF-16 surrogate pair, which a YAML double-quoted scalar
+    decodes into lone surrogates; every later filesystem call on the decoded
+    workdir then fails with ``UnicodeEncodeError``.
+    """
+    project = tmp_path / "\U0001f680 sweeps"
+    project.mkdir()
+    output = project / "experiment.yaml"
+
+    rendered = yaml.safe_load(_starter_experiment_text(output))
+    runs_dir = output.parent / "runs"
+    assert rendered["workdir"] == str(runs_dir)
+    assert rendered["storage"] == f"sqlite:///{runs_dir / 'phases.db'}"
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    experiment = load_experiment(output)
+    # Lone surrogates raise UnicodeEncodeError here; a real path does not.
+    Path(experiment.workdir).mkdir(parents=True)
+    assert Path(experiment.workdir) == runs_dir
 
 
 def test_init_refuses_to_replace_existing_file(tmp_path: Path) -> None:
