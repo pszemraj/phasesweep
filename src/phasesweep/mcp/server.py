@@ -585,6 +585,28 @@ def _run_next_action(run: RunPayload | None) -> NextAction | None:
     return cast(NextAction, TOOL_GET_RUN_RESULTS)
 
 
+def _status_next_action(result: GetRunStatusResult) -> NextAction | None:
+    """Choose the normal follow-up for one status read.
+
+    ``run`` is null only for an experiment-scoped read that found no live run:
+    the experiment either never ran under this server or every run of it is
+    already terminal. Deferring to :func:`_run_next_action` there would answer
+    "nothing left to do" even when finished work is on disk, so a published
+    winner steers the agent to the results tool instead. With no winner
+    anywhere there is genuinely nothing further to read, and null keeps its
+    documented meaning.
+
+    :param GetRunStatusResult result: Status payload whose transition is chosen.
+    :return NextAction | None: Monitoring or result tool, or null when no
+        automatic step is safe or useful.
+    """
+    if result.run is not None:
+        return _run_next_action(result.run)
+    if any(phase.winner_present for phase in result.phases):
+        return cast(NextAction, TOOL_GET_RUN_RESULTS)
+    return None
+
+
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
     """Compute wall seconds for a run: launch-to-now while running, total when terminal.
 
@@ -2004,7 +2026,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         result = GetRunStatusResult.model_validate(
             await asyncio.to_thread(app.status, experiment_id=experiment_id, run_id=run_id)
         )
-        return result.model_copy(update={"next_action": _run_next_action(result.run)})
+        return result.model_copy(update={"next_action": _status_next_action(result)})
 
     @mcp.tool(
         name=TOOL_AWAIT_RUN,

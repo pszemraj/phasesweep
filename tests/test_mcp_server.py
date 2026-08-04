@@ -53,9 +53,14 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
+    TOOL_AWAIT_RUN,
+    TOOL_GET_RUN_RESULTS,
+    TOOL_GET_RUN_STATUS,
     TOOL_LAUNCH_RUN,
+    GetRunStatusResult,
     PhaseSweepMCP,
     _safe_tool,
+    _status_next_action,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.runtime.process import (
@@ -1212,6 +1217,83 @@ def test_read_tools_require_exactly_one_identifier(tmp_path: Path, method_name: 
         method(experiment_id="srv", run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
         method(run_id="nope-123")
+
+
+def test_experiment_status_next_action_steers_a_finished_experiment_to_results(
+    tmp_path: Path,
+) -> None:
+    """A completed experiment must not report "nothing left to do".
+
+    ``live_run_for`` matches only running handles, so an experiment-scoped
+    status read of a finished sweep carries ``run: null``. Deriving
+    ``next_action`` from the run alone would answer null - the agent's documented
+    stop signal - while the winners sit on disk unread.
+    """
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-finished"
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.create(
+        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
+    )
+    write_run_status(store, run_id, returncode=0, cleanup_confirmed=True)
+
+    before = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+
+    assert before.run is None
+    assert not any(phase.winner_present for phase in before.phases)
+    assert _status_next_action(before) is None  # nothing has produced results yet
+
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+    )
+
+    after = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+
+    assert after.run is None
+    assert _status_next_action(after) == TOOL_GET_RUN_RESULTS
+
+
+def test_experiment_status_next_action_awaits_a_live_run(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-live"
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.create(
+        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
+    )
+
+    result = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+
+    assert result.run is not None
+    assert result.run.state == "running"
+    assert _status_next_action(result) == TOOL_AWAIT_RUN
+
+
+def test_get_run_status_tool_chains_a_finished_experiment_to_results(tmp_path: Path) -> None:
+    """The registered tool, not only the helper, must emit the follow-up."""
+    pytest.importorskip("mcp")
+
+    from phasesweep.mcp.server import build_server
+
+    config = _config(tmp_path)
+    app, registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    reg = registry.get("srv")
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+    )
+    server = build_server(app)
+
+    result = asyncio.run(server._tool_manager.get_tool(TOOL_GET_RUN_STATUS).fn(experiment_id="srv"))
+
+    assert result.run is None
+    assert result.next_action == TOOL_GET_RUN_RESULTS
 
 
 def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:

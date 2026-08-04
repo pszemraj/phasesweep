@@ -51,7 +51,7 @@ The cap counts MCP-launched runs recorded in `state_dir`; it does not count a co
 
 MCP annotations mirror the effects in the table. Permissions, closed input schemas, and safety gates are enforced server-side even when a client ignores those hints.
 
-Every structured tool result also carries `next_action`, containing the normal next tool name when another automatic workflow step is safe and `null` when the workflow is complete or user/operator input is required. `inspect_experiment` always returns `null` there: only the user may authorize a launch, so the server never proposes `launch_run` as an automatic next step.
+Every structured tool result also carries `next_action`, containing the normal next tool name when another automatic workflow step is safe and `null` when the workflow is complete or user/operator input is required. An experiment-scoped `get_run_status` with no live run returns `get_run_results` when phase winners exist. `inspect_experiment` always returns `null` there: only the user may authorize a launch, so the server never proposes `launch_run` as an automatic next step.
 
 ### Run state and recovery
 
