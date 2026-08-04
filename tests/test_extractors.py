@@ -793,3 +793,41 @@ def test_gate_results_mark_only_deadline_caused_failures(fake_wandb, tmp_path):
     assert capped.deadline_exhausted is True
     assert expired.deadline_exhausted is True
     assert ordinary.deadline_exhausted is False
+
+
+def test_deadline_capped_extractor_error_keeps_underlying_diagnostic(fake_wandb, tmp_path):
+    """A deadline-attributed W&B failure must still name the real error.
+
+    The rewrap that blames an exhausted budget used to discard the extractor's
+    own message, so an expired API key or a wrong entity/project surfaced to the
+    operator as a pure timeout: they would raise ``timeout_seconds`` and rerun
+    into the identical failure forever.
+    """
+    fake_wandb(lambda _path: (_ for _ in ()).throw(ConnectionError("401 unauthorized")))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    with pytest.raises(DeadlineExceededError) as excinfo:
+        run_extractor(
+            make_trial_context(tmp_path),
+            cfg,
+            deadline=time.monotonic() + 0.05,
+        )
+
+    message = str(excinfo.value)
+    # Both halves must survive: the causal attribution the engine keys off, and
+    # the diagnostic that says more budget would not have helped.
+    assert "deadline exhausted" in message
+    assert "401 unauthorized" in message
+    assert "eval/loss" in message
+    # trial.py records ``f"metric extractor: {exc}"`` verbatim as failure_reason,
+    # so the message above is exactly what lands in the Optuna user attrs.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ExtractorError)
+    assert "401 unauthorized" in str(cause)

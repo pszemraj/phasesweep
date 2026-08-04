@@ -565,9 +565,18 @@ def run_extractor(
         # two would require re-polling past the deadline, which is exactly what
         # the budget forbids, so a genuinely missing run that happens to be
         # capped is reported as deadline exhaustion.
+        #
+        # The extractor's own diagnostic is appended verbatim rather than
+        # replaced: the capped poll may have been failing all along for a
+        # reason no extra budget would fix (expired API key, wrong
+        # entity/project), and that detail — which already embeds
+        # WandbPollTimeout.last_error — is the only thing that stops an
+        # operator from raising timeout_seconds and rerunning into the same
+        # wall.
         if deadline_capped and isinstance(exc.__cause__, WandbPollTimeout):
             raise DeadlineExceededError(
-                "Phase/run wallclock deadline exhausted while polling W&B evidence."
+                "Phase/run wallclock deadline exhausted while polling W&B evidence. "
+                f"Underlying extractor error: {exc}"
             ) from exc
         raise
     if provenance is not None:
