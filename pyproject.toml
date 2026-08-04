@@ -64,6 +64,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"phasesweep" = ["templates/*.yaml"]
 "phasesweep.mcp" = ["agent_prompt.md"]
 
 [tool.ruff]

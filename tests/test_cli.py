@@ -30,7 +30,7 @@ def test_help_registers_commands_and_options() -> None:
     assert result.exit_code == 0
     assert "-h, --help" in result.output
     assert "recover-run" not in result.output
-    for command in ("mcp", "run", "show-winners", "status", "validate"):
+    for command in ("init", "mcp", "run", "show-winners", "status", "validate"):
         assert command in result.output
 
     for command in ("run", "validate", "show-winners", "status"):
@@ -39,6 +39,10 @@ def test_help_registers_commands_and_options() -> None:
         assert "Usage:" in result.output
         assert "CONFIG" in result.output
         assert "-h, --help" in result.output
+
+    init_help = runner.invoke(cli_main, ["init", "--help"], terminal_width=120)
+    assert init_help.exit_code == 0
+    assert "-o, --output FILE" in init_help.output
 
     recovery_help = runner.invoke(cli_main, ["mcp", "recover-run", "--help"], terminal_width=120)
     assert recovery_help.exit_code == 0

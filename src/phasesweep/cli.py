@@ -10,6 +10,7 @@ import os
 import secrets
 import shlex
 import sys
+from importlib import resources
 from pathlib import Path
 
 import click
@@ -85,6 +86,65 @@ def _configure_logging(verbose: bool) -> None:
 @click.version_option(package_name="phasesweep")
 def main() -> None:
     """Run the phasesweep command line interface."""
+
+
+def _starter_experiment_text(target: Path) -> str:
+    """Render the packaged starter config with target-local absolute paths.
+
+    :param Path target: Absolute destination for the starter YAML.
+    :return str: Rendered annotated YAML text.
+    """
+    template = (
+        resources.files("phasesweep")
+        .joinpath("templates", "starter_experiment.yaml")
+        .read_text(encoding="utf-8")
+    )
+    runs_dir = target.parent / "runs"
+    replacements = {
+        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir)),
+        "__PHASESWEEP_STORAGE__": json.dumps(f"sqlite:///{runs_dir / 'phases.db'}"),
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template
+
+
+@main.command(
+    context_settings=CONTEXT_SETTINGS,
+    help="Write a runnable two-phase starter experiment without overwriting files.",
+    short_help="Create a starter experiment.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("experiment.yaml"),
+    show_default=True,
+    help="Starter YAML destination.",
+)
+def init(output: Path) -> None:
+    """Write an annotated starter experiment and print the review commands.
+
+    :param Path output: Destination YAML path; existing paths are never replaced.
+    """
+    target = output.expanduser().absolute()
+    if target.exists() or target.is_symlink():
+        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+        raise click.exceptions.Exit(2)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("x", encoding="utf-8") as handle:
+            handle.write(_starter_experiment_text(target))
+    except FileExistsError:
+        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+        raise click.exceptions.Exit(2) from None
+
+    config_arg = shlex.quote(str(output))
+    click.echo(f"Wrote starter experiment to {target}")
+    click.echo("\nNext:")
+    click.echo(f"  phasesweep validate {config_arg}")
+    click.echo(f"  phasesweep run {config_arg} --dry-run")
+    click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
 
 
 @main.command(

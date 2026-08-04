@@ -14,6 +14,7 @@ def test_public_package_metadata() -> None:
     """Public metadata should advertise supported entry points and package data."""
     package = resources.files("phasesweep")
     assert package.joinpath("py.typed").is_file()
+    assert package.joinpath("templates", "starter_experiment.yaml").is_file()
     assert package.joinpath("mcp", "agent_prompt.md").is_file()
 
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
@@ -26,6 +27,7 @@ def test_public_package_metadata() -> None:
         "phasesweep-mcp": "phasesweep.mcp.server:main",
     }
     assert package_data["*"] == ["py.typed"]
+    assert package_data["phasesweep"] == ["templates/*.yaml"]
     assert package_data["phasesweep.mcp"] == ["agent_prompt.md"]
 
 
