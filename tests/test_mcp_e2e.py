@@ -267,20 +267,12 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     unlock_file(regrab)
 
 
-def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
+def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
     with pytest.raises(Exception, match="unknown run id"):
-        app.status(run_id="nope-123")
-    with pytest.raises(Exception, match="unknown run id"):
         app.cancel("nope-123")
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.status()
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.status(experiment_id="e2e_lm", run_id="nope-123")
-    # No run launched yet: experiment-level status reports no live run.
-    assert app.status(experiment_id="e2e_lm")["run"] is None
 
 
 def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:

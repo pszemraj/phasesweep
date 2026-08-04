@@ -189,26 +189,18 @@ def make_run_handle(
     visible_params_at_launch: VisibleParamsPolicy | None = "none",
 ) -> RunHandle:
     if launch_state == "launching":
-        return RunHandle(
-            run_id=run_id,
-            experiment_id=experiment_id,
-            config_sha256=config_sha256,
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
-            started_at=utc_now_iso(),
-            launch_state=launch_state,
-            allow_cancel=allow_cancel,
-            visible_params_at_launch=visible_params_at_launch,
-        )
-    process_id = os.getpid() if pid is None else pid
+        process_id = None
+        process_starttime = None
+    else:
+        process_id = os.getpid() if pid is None else pid
+        process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
         run_id=run_id,
         experiment_id=experiment_id,
         config_sha256=config_sha256,
         pid=process_id,
         pgid=process_id,
-        pid_starttime=read_proc_starttime(process_id) if starttime is None else starttime,
+        pid_starttime=process_starttime,
         started_at=utc_now_iso(),
         launch_state=launch_state,
         allow_cancel=allow_cancel,
@@ -269,6 +261,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         assert stdout is not None and not getattr(stdout, "closed", True)
         captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
         return DummyProc()
 
     monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)

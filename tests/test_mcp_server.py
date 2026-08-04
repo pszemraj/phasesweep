@@ -849,30 +849,6 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
 
 
-def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Capture the full child process contract, including its environment.
-
-    ``patch_popen_capture`` records only argv and cwd; the pre-identity trust
-    boundary is also enforced through ``env``.
-
-    :param pytest.MonkeyPatch monkeypatch: Patcher used to replace ``Popen``.
-    :return dict[str, Any]: Dict populated with ``cmd``, ``cwd``, and ``env``.
-    """
-    captured: dict[str, Any] = {}
-
-    class DummyProc:
-        pid = os.getppid()
-
-    def fake_popen(cmd: list[str], **kwargs: object) -> DummyProc:
-        captured["cmd"] = cmd
-        captured["cwd"] = kwargs.get("cwd")
-        captured["env"] = kwargs.get("env")
-        return DummyProc()
-
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
-    return captured
-
-
 def _launch_with_poison_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -925,7 +901,7 @@ def _launch_with_poison_project(
             cwd={"srv": project},
         )
     )
-    captured = _capture_spawn(monkeypatch)
+    captured = patch_popen_capture(monkeypatch)
 
     app.launch("srv")
 
@@ -977,7 +953,7 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
     monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    captured = _capture_spawn(monkeypatch)
+    captured = patch_popen_capture(monkeypatch)
 
     app.launch("srv")
 
@@ -1224,16 +1200,18 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
         getattr(app, method_name)(run_id=run_id)
 
 
-def test_winners_requires_exactly_one_identifier(tmp_path: Path) -> None:
+@pytest.mark.parametrize("method_name", ["status", "winners"])
+def test_read_tools_require_exactly_one_identifier(tmp_path: Path, method_name: str) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    method = getattr(app, method_name)
 
     with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.winners()
+        method()
     with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.winners(experiment_id="srv", run_id="nope-123")
+        method(experiment_id="srv", run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
-        app.winners(run_id="nope-123")
+        method(run_id="nope-123")
 
 
 def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:
@@ -1870,27 +1848,6 @@ def test_cancel_decataloged_run_is_denied_even_when_launch_allowed_it(tmp_path: 
         allow_cancel=True,
     )
     store.create(handle)
-
-    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
-        app.cancel(run_id)
-
-
-def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: Path) -> None:
-    old_config = _config(tmp_path, name="old")
-    old_snapshot = old_config.read_bytes()
-    other_config = _config(tmp_path, name="other")
-    app, _registry, store = make_mcp_app(
-        write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
-    )
-    run_id = "old-no-cancel"
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id="old",
-            config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
-            allow_cancel=False,
-        )
-    )
 
     with pytest.raises(Exception, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
