@@ -61,22 +61,23 @@ class TrialResult:
 
 # Minimal environment base used when the execution contract narrows
 # inheritance below "all": enough for a shell + interpreter to start and
-# write temp files, plus the CUDA visibility value consumed by GPU isolation.
-_BASE_INHERITED_ENV = (
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "USER",
-    "LOGNAME",
-    "TZ",
-    # GPU discovery and locking consume the ambient visibility contract even
-    # when trainer inheritance is narrowed. Dropping an explicit empty/-1
-    # value here would make every GPU visible again in the child after the
-    # pool deliberately selected no devices and took no locks.
-    "CUDA_VISIBLE_DEVICES",
-)
+# write temp files, nothing that can carry semantic configuration.
+#
+# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
+# trains on CPU or GPU, so admitting the ambient value would let two operators
+# running the identical config from differently-exported shells write
+# CPU-trained and GPU-trained evaluations into one study under one semantic
+# fingerprint — exactly the unfingerprinted ambient input the narrowed
+# contracts exist to exclude (the fingerprint covers the contract's mode/names
+# and configured ``env``, never ambient values). Bind trainer visibility with
+# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
+# also drives GPU pool discovery, or name the variable in an ``inherit_env``
+# list to opt its ambient value in explicitly.
+_BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
+
+# Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
+# contract reports the divergence once per phase instead of once per trial.
+_DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
 
 def _trainer_environment(experiment: Experiment) -> dict[str, str]:
@@ -100,6 +101,53 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     return env
+
+
+def _warn_dropped_cuda_visibility(
+    *,
+    experiment: Experiment,
+    phase_name: str,
+    env: dict[str, str],
+    gpu_id: int | str | None,
+) -> None:
+    """Warn once when the trainer's GPU visibility diverges from the parent's.
+
+    The narrowed ``inherit_env`` contracts drop the ambient
+    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`_BASE_INHERITED_ENV`). When
+    the phase also assigns no device — ``gpu_policy: none``, or a pool that
+    found nothing to lease — the child is left with no visibility binding and
+    can therefore use host GPUs the parent had hidden, holding no GPU host
+    lock. That is a real hazard, but it is a *configuration* hazard: the fix is
+    a fingerprinted ``env`` entry, not a silent ambient read. Say so once
+    rather than papering over it.
+
+    Args:
+        experiment: Parsed experiment supplying the inherit contract.
+        phase_name: Phase whose trials are affected, used for the warn-once key.
+        env: Composed trainer environment, after GPU assignment.
+        gpu_id: Device token assigned by the pool, or ``None`` when the pool
+            leased nothing for this trial.
+
+    """
+    if gpu_id is not None or "CUDA_VISIBLE_DEVICES" in env:
+        return
+    ambient = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if ambient is None:
+        return
+    key = (experiment.experiment, phase_name, ambient)
+    if key in _DROPPED_CUDA_VISIBILITY_WARNED:
+        return
+    _DROPPED_CUDA_VISIBILITY_WARNED.add(key)
+    log.warning(
+        "[%s] ambient CUDA_VISIBLE_DEVICES=%r is outside the "
+        "execution.inherit_env=%r contract and this phase leases no device, so trials "
+        "will see every host GPU and hold no GPU host lock. Set a top-level "
+        "env.CUDA_VISIBLE_DEVICES to bind trainer visibility — it is fingerprinted and "
+        "also drives GPU pool discovery, so lock set and trainer visibility stay in step.",
+        phase_name,
+        ambient,
+        experiment.execution.inherit_env,
+    )
 
 
 def _resolved_execution_cwd(experiment: Experiment) -> Path | None:
@@ -280,6 +328,10 @@ def launch_trial(
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         log.debug("[%s/trial_%d] GPU assigned: %s", phase_name, trial_id, gpu_id)
+
+    _warn_dropped_cuda_visibility(
+        experiment=experiment, phase_name=phase_name, env=env, gpu_id=gpu_id
+    )
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 

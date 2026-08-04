@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -133,14 +134,19 @@ def test_launch_trial_inherit_env_none_filters_ambient(
     assert env["PATH"] == os.environ["PATH"]
 
 
-@pytest.mark.parametrize("disabled_visibility", ["", "-1"])
-def test_launch_trial_narrow_env_preserves_disabled_cuda_visibility(
+@pytest.mark.parametrize("ambient_visibility", ["", "-1", "3"])
+def test_launch_trial_narrow_env_drops_ambient_cuda_visibility(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    disabled_visibility: str,
+    ambient_visibility: str,
 ) -> None:
-    """A narrowed child cannot regain GPUs that the parent explicitly hid."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", disabled_visibility)
+    """Ambient GPU visibility is an unfingerprinted semantic input under a strict contract.
+
+    Two operators running the identical config from differently-exported
+    shells must not write CPU-trained and GPU-trained evaluations into one
+    study under one semantic fingerprint.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_visibility)
 
     env = _capture_launch_env(
         tmp_path,
@@ -149,7 +155,91 @@ def test_launch_trial_narrow_env_preserves_disabled_cuda_visibility(
         gpu_id=None,
     )
 
-    assert env["CUDA_VISIBLE_DEVICES"] == disabled_visibility
+    assert "CUDA_VISIBLE_DEVICES" not in env
+
+
+def test_launch_trial_inherit_env_all_still_passes_cuda_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default permissive contract keeps forwarding operator GPU selection."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+
+    env = _capture_launch_env(tmp_path, monkeypatch, gpu_id=None)
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
+
+
+def test_launch_trial_inherit_env_list_can_opt_into_cuda_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Naming the variable in the fingerprinted contract admits it explicitly."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(inherit_env=["CUDA_VISIBLE_DEVICES"]),
+        gpu_id=None,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
+
+
+def test_launch_trial_configured_env_binds_cuda_visibility_under_strict_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fingerprinted escape hatch beats the ambient value it replaces."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        experiment_env={"CUDA_VISIBLE_DEVICES": "-1"},
+        execution=ExecutionContext(inherit_env="none"),
+        gpu_id=None,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
+
+
+def test_launch_trial_warns_once_when_ambient_visibility_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dropping ambient visibility with no device leased is reported, not silent."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        for _ in range(2):
+            _capture_launch_env(
+                tmp_path,
+                monkeypatch,
+                execution=ExecutionContext(inherit_env="none"),
+                gpu_id=None,
+            )
+
+    warnings = [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
+    assert len(warnings) == 1
+    assert "env.CUDA_VISIBLE_DEVICES" in warnings[0].getMessage()
+
+
+def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An assigned device already binds visibility and holds a lock."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        env = _capture_launch_env(
+            tmp_path,
+            monkeypatch,
+            execution=ExecutionContext(inherit_env="none"),
+            gpu_id=2,
+        )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
 
 
 def test_launch_trial_inherit_env_list_adds_exactly_named(
