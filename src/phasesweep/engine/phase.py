@@ -61,7 +61,7 @@ from phasesweep.engine.trial import (
     launch_trial,
 )
 from phasesweep.runtime.commands import render_command
-from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
 
 log = logging.getLogger("phasesweep.engine.phase")
@@ -388,6 +388,7 @@ def _run_phase(
         explicit_devices=phase.gpu_devices,
         allow_no_gpu=phase.allow_no_gpu_isolation,
         policy=phase.gpu_policy,
+        cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"),
     )
 
     assert policy_state is not None
@@ -696,7 +697,7 @@ def _run_phase(
                         )
 
                     raise cleanup_error
-        except TimeoutError as exc:
+        except GpuLeaseTimeoutError as exc:
             deadline_exhausted["flag"] = True
             raise TrialExecutionError(str(exc)) from exc
 

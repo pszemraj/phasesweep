@@ -120,7 +120,7 @@ The whole lock namespace is derived from the environment (`PHASESWEEP_LOCK_DIR`,
 
 CUDA device tokens also take per-device host locks. The policies are:
 
-- `single_per_trial` (default): lease explicit `gpu_ids`, explicit `gpu_devices`, ambient `CUDA_VISIBLE_DEVICES` tokens, or auto-detected `nvidia-smi` numeric devices, even for `n_jobs == 1`. This prevents independent local phasesweep runs from double-booking the same GPU.
+- `single_per_trial` (default): lease explicit `gpu_ids`, explicit `gpu_devices`, top-level `env.CUDA_VISIBLE_DEVICES`, ambient `CUDA_VISIBLE_DEVICES` tokens, or auto-detected `nvidia-smi` numeric devices, even for `n_jobs == 1`. Configured `env` takes precedence over ambient visibility, matching the trainer environment. This prevents independent local phasesweep runs from double-booking the same GPU.
 - `whole_node`: require `n_jobs: 1` plus an explicit `gpu_ids` or `gpu_devices` list, lease every configured token, and expose the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches. The set must be explicit because its size is the trainer's world size - a semantic input, not a throughput knob.
 - `none`: never change `CUDA_VISIBLE_DEVICES` or acquire GPU locks. Parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler.
 

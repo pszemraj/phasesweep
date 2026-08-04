@@ -133,6 +133,25 @@ def test_launch_trial_inherit_env_none_filters_ambient(
     assert env["PATH"] == os.environ["PATH"]
 
 
+@pytest.mark.parametrize("disabled_visibility", ["", "-1"])
+def test_launch_trial_narrow_env_preserves_disabled_cuda_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disabled_visibility: str,
+) -> None:
+    """A narrowed child cannot regain GPUs that the parent explicitly hid."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", disabled_visibility)
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(inherit_env="none"),
+        gpu_id=None,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == disabled_visibility
+
+
 def test_launch_trial_inherit_env_list_adds_exactly_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

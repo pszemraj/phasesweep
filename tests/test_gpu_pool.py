@@ -215,13 +215,27 @@ def test_mig_cuda_visible_devices_get_safe_lock_names(monkeypatch, tmp_path):
         assert locks[0].name.startswith("gpu_MIG-GPU-deadbeef_3_0_")
 
 
-def test_cuda_visible_devices_minus_one_is_no_visible_gpu(monkeypatch):
+def test_cuda_visible_devices_minus_one_is_no_visible_gpu(monkeypatch, caplog):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    pool = GpuPool.create(n_jobs=1)
+    with caplog.at_level(logging.INFO, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
         assert gid is None
+    assert any("exposes no devices" in record.message for record in caplog.records)
+    assert not any("nvidia-smi detected no GPUs" in record.message for record in caplog.records)
+
+
+def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> None:
+    """Pool locks follow the trainer's configured environment override."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+
+    pool = GpuPool.create(n_jobs=1, cuda_visible_devices="GPU-configured")
+
+    with pool.acquire() as gid:
+        assert gid == "GPU-configured"
 
 
 def test_explicit_gpu_devices_preserve_tokens_and_dedupe():

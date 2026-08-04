@@ -61,8 +61,22 @@ class TrialResult:
 
 # Minimal environment base used when the execution contract narrows
 # inheritance below "all": enough for a shell + interpreter to start and
-# write temp files, nothing that can carry semantic configuration.
-_BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
+# write temp files, plus the CUDA visibility value consumed by GPU isolation.
+_BASE_INHERITED_ENV = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "TZ",
+    # GPU discovery and locking consume the ambient visibility contract even
+    # when trainer inheritance is narrowed. Dropping an explicit empty/-1
+    # value here would make every GPU visible again in the child after the
+    # pool deliberately selected no devices and took no locks.
+    "CUDA_VISIBLE_DEVICES",
+)
 
 
 def _trainer_environment(experiment: Experiment) -> dict[str, str]:

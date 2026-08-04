@@ -43,6 +43,10 @@ log = logging.getLogger("phasesweep.runtime.gpu")
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+class GpuLeaseTimeoutError(TimeoutError):
+    """Raised only when a GPU lease wait exhausts its wallclock deadline."""
+
+
 @dataclass(frozen=True)
 class GpuDevice:
     """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem.
@@ -377,6 +381,7 @@ class GpuPool:
         explicit_devices: list[str] | None = None,
         allow_no_gpu: bool = False,
         policy: GpuPolicy = "single_per_trial",
+        cuda_visible_devices: str | None = None,
     ) -> GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
 
@@ -394,6 +399,8 @@ class GpuPool:
                 token per trial. ``whole_node`` leases all tokens for one trial
                 and exposes them comma-joined. ``none`` disables CUDA isolation
                 and GPU locks.
+            cuda_visible_devices: Configured trainer-environment override for
+                ``CUDA_VISIBLE_DEVICES``. When omitted, the ambient value is used.
 
         Returns:
             A configured :class:`GpuPool`. The pool is "active" (hands out
@@ -471,7 +478,11 @@ class GpuPool:
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 
-        user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        user_cvd = (
+            cuda_visible_devices
+            if cuda_visible_devices is not None
+            else os.environ.get("CUDA_VISIBLE_DEVICES")
+        )
         detected_uuid_map: dict[str, str] | None = None
         if user_cvd is not None:
             devices = _devices_from_cuda_visible_devices(user_cvd)
@@ -480,7 +491,12 @@ class GpuPool:
             devices = _normalize_devices(detected_ids)
         if not devices:
             if n_jobs <= 1:
-                if _nvidia_driver_reports_gpus():
+                if user_cvd is not None:
+                    log.info(
+                        "CUDA_VISIBLE_DEVICES exposes no devices; single-job phase "
+                        "will preserve that visibility without GPU host locks."
+                    )
+                elif _nvidia_driver_reports_gpus():
                     # The kernel driver knows about GPUs, so the empty probe is
                     # a broken nvidia-smi, not a CPU-only host: this phase will
                     # run with no CUDA_VISIBLE_DEVICES binding and hold zero
@@ -520,7 +536,7 @@ class GpuPool:
             return None
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
-            raise TimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
+            raise GpuLeaseTimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
         return remaining
 
     def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
@@ -587,13 +603,14 @@ class GpuPool:
                 self._whole_node_in_use = True
 
             leases: list[_HostGpuLease] = []
-            try:
-                for device in self._devices:
-                    lease = _try_host_gpu_lease(device)
-                    if lease is None:
-                        raise TimeoutError
-                    leases.append(lease)
-            except TimeoutError:
+            all_leased = True
+            for device in self._devices:
+                lease = _try_host_gpu_lease(device)
+                if lease is None:
+                    all_leased = False
+                    break
+                leases.append(lease)
+            if not all_leased:
                 for lease in leases:
                     _release_host_gpu_lease(lease)
                 with self._condition:
@@ -656,7 +673,7 @@ class GpuPool:
             pool is inactive.
 
         Raises:
-            TimeoutError: ``deadline`` expired before a GPU could be leased.
+            GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
 
         """
         acquired = self._acquire(deadline=deadline)

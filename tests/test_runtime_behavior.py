@@ -2012,6 +2012,31 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
         run_experiment(experiment)
 
 
+def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only GPU-lease timeout is deadline policy; launch timeouts stay fatal."""
+    storage = f"sqlite:///{tmp_path / 'timeout-cause.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        n_trials=1,
+        gpu_policy="none",
+        timeout_seconds_per_phase=100.0,
+    )
+
+    def unrelated_timeout(**_kwargs: object) -> None:
+        raise TimeoutError("injected non-deadline launch timeout")
+
+    monkeypatch.setattr("phasesweep.engine.phase.launch_trial", unrelated_timeout)
+
+    with pytest.raises(TimeoutError, match="injected non-deadline launch timeout"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
+
+
 def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
