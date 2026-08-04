@@ -21,13 +21,16 @@ July 2026; quirks worth keeping in mind:
 
 Generated entries bind the absolute ``phasesweep-mcp`` executable from the
 environment running the installer. :func:`is_managed_mcp_entry` recognizes
-that exact generated shape so uninstall and re-install stay reversible.
+that exact generated shape - plus the pinned ``uvx`` shape earlier versions
+wrote, which is recognized but never generated - so uninstall and re-install
+stay reversible for entries written by any released version.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -35,6 +38,11 @@ from pathlib import Path
 from typing import Literal
 
 SERVER_NAME = "phasesweep"
+
+# Legacy recognition only (see `_is_phasesweep_argv`): the removed ``--launcher uvx``
+# mode wrote a pinned requirement such as "phasesweep[mcp]==1.2.3" naming the PyPI
+# distribution. Nothing here is ever written by this version.
+_LEGACY_UVX_PIN_PATTERN = re.compile(r"^phasesweep\[mcp\]==[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 
 MARKDOWN_START = "<!-- PHASESWEEP_START -->"
 MARKDOWN_END = "<!-- PHASESWEEP_END -->"
@@ -107,7 +115,9 @@ def mcp_entry(
 def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     """Return whether a JSON member has exactly the shape this installer writes.
 
-    Recognizes the absolute-path launcher this installer writes.
+    Recognizes the absolute-path launcher this installer writes, plus the
+    pinned ``uvx`` launcher earlier versions wrote, so an upgraded install can
+    still remove or repair those entries.
 
     Ownership is inferred from the exact entry shape alone; no receipt records
     which entries this installer actually wrote. A hand-authored entry that
@@ -183,17 +193,37 @@ def _entry_argv(style: EntryStyle, value: dict[str, object]) -> list[str] | None
 def _is_phasesweep_argv(argv: list[str]) -> bool:
     """Return whether a full command argv matches one recognized launcher shape.
 
-    :param list[str] argv: Candidate argv, executable first, as written by ``mcp_entry``.
-    :return bool: True for ``phasesweep-mcp --catalog PATH`` using absolute paths.
+    The 3-element absolute-path shape is what :func:`mcp_entry` writes. The
+    6-element pinned-uvx shape is legacy recognition only: the ``--launcher
+    uvx`` mode that wrote it is gone, but entries it wrote are still on disk in
+    upgraded installs, and without recognizing them ``uninstall`` would refuse
+    to remove them and ``install`` would refuse to replace them, leaving no
+    phasesweep command able to repair the client config.
+
+    :param list[str] argv: Candidate argv, executable first, as written by ``mcp_entry``
+        or by the removed ``uvx`` launcher mode.
+    :return bool: True for ``phasesweep-mcp --catalog PATH`` using absolute paths,
+        or for the legacy ``uvx --from phasesweep[mcp]==VERSION phasesweep-mcp
+        --catalog PATH``.
     """
-    if len(argv) != 3:
-        return False
-    command, flag, catalog = argv
-    return (
-        _is_absolute_phasesweep_command(command)
-        and flag == "--catalog"
-        and _is_absolute_path(catalog)
-    )
+    if len(argv) == 3:
+        command, flag, catalog = argv
+        return (
+            _is_absolute_phasesweep_command(command)
+            and flag == "--catalog"
+            and _is_absolute_path(catalog)
+        )
+    if len(argv) == 6:
+        command, from_flag, pin, entrypoint, flag, catalog = argv
+        return (
+            command == "uvx"
+            and from_flag == "--from"
+            and _LEGACY_UVX_PIN_PATTERN.match(pin) is not None
+            and entrypoint == "phasesweep-mcp"
+            and flag == "--catalog"
+            and _is_absolute_path(catalog)
+        )
+    return False
 
 
 def _is_absolute_phasesweep_command(value: str) -> bool:

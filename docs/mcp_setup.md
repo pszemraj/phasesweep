@@ -107,7 +107,7 @@ After replacing or recreating the conda environment, rerun `phasesweep mcp insta
 
 ## Breaking development installs
 
-The package is not published and this MCP surface intentionally carries no deprecated tool aliases or launcher migration layer. If a client was configured by an earlier development build, rerun `phasesweep mcp install` and restart the client; cached old tool names disappear on restart. If the current installer reports the old entry as unmanaged, remove that one `phasesweep` client entry manually, rerun the installer, and restart. This is the complete migration policy.
+The package is not published and this MCP surface intentionally carries no deprecated tool aliases or launcher migration layer. If a client was configured by an earlier development build, rerun `phasesweep mcp install` and restart the client; cached old tool names disappear on restart. Entries written by an earlier development build's removed launcher modes are recognized as installer-managed and replaced or removed automatically. If the current installer reports the old entry as unmanaged, remove that one `phasesweep` client entry manually, rerun the installer, and restart. This is the complete migration policy.
 
 ## Troubleshooting
 

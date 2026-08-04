@@ -983,11 +983,23 @@ class LauncherCheck:
 def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
     """Probe whether one configured launcher executable actually resolves.
 
-    :param str command: Absolute launcher executable path.
+    :param str command: Configured launcher executable: an absolute path for
+        entries this version writes, or a bare program name for the legacy
+        pinned-uvx entries earlier versions wrote.
     :return tuple[CheckStatus, str | None]: ``("ok", None)``, or a status
         needing attention with actionable repair guidance.
     """
     path = Path(command)
+    if not path.is_absolute():
+        # Only the legacy pinned-uvx entry shape reaches here; it names a program the
+        # client resolves from PATH, so resolve it the same way rather than against cwd.
+        resolved = shutil.which(command)
+        if resolved is None:
+            return "missing", (
+                f"{command} is not on PATH; rerun `phasesweep mcp install` to replace this "
+                "legacy entry with an absolute launcher path (--dry-run previews the repair)"
+            )
+        path = Path(resolved)
     if not path.is_file():
         return "missing", (
             f"{command} no longer exists; rerun `phasesweep mcp install` from the correct "
@@ -1024,8 +1036,9 @@ def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | N
 def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     """Read one target's configured phasesweep MCP entry and probe it.
 
-    Read-only counterpart to :func:`_apply_mcp`: recognizes entries written by
-    the absolute-path installer, reports an entry this installer does not own as
+    Read-only counterpart to :func:`_apply_mcp`: recognizes every entry shape
+    :func:`is_managed_mcp_entry` owns (including the legacy pinned-uvx entries
+    earlier versions wrote), reports an entry this installer does not own as
     ``unmanaged`` without probing it, and never edits the client file. Probes
     both the launcher executable and the configured ``--catalog`` path, the
     executable first because it fails earlier at launch.
