@@ -559,6 +559,12 @@ def run_extractor(
     try:
         value = fn(ctx, cfg, provenance)
     except ExtractorError as exc:
+        # Attribution here is deliberately optimistic: a capped timeout that
+        # expires is blamed on the deadline even though the run's summary might
+        # never have arrived under the full timeout either. Distinguishing the
+        # two would require re-polling past the deadline, which is exactly what
+        # the budget forbids, so a genuinely missing run that happens to be
+        # capped is reported as deadline exhaustion.
         if deadline_capped and isinstance(exc.__cause__, WandbPollTimeout):
             raise DeadlineExceededError(
                 "Phase/run wallclock deadline exhausted while polling W&B evidence."
@@ -776,7 +782,6 @@ def evaluate_gates(
     """
     results: list[GateResult] = []
     for gate in gates:
-        fn = _GATE_DISPATCH[type(gate)]
         remaining = _remaining_budget_seconds(deadline)
         deadline_capped = False
         if remaining is not None:
@@ -798,5 +803,6 @@ def evaluate_gates(
         if isinstance(gate, WandbSummaryRequiredGate):
             results.append(_wandb_summary_required(ctx, gate, deadline_capped=deadline_capped))
         else:
-            results.append(fn(ctx, gate))
+            # Unknown gate types raise KeyError here rather than being skipped.
+            results.append(_GATE_DISPATCH[type(gate)](ctx, gate))
     return results
