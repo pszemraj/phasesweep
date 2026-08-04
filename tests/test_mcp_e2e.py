@@ -290,7 +290,10 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         line for line in initialization.instructions.splitlines() if line[:1].isdigit()
     ]
     assert len(numbered_rules) == 7
-    assert "list_experiments` -> `inspect_experiment` -> `launch_run`" in numbered_rules[0]
+    assert "follow `next_cursor` until it is null" in numbered_rules[0]
+    assert "call `inspect_experiment` before proposing a run" in numbered_rules[0]
+    assert "Follow each result's `next_action`" in numbered_rules[1]
+    assert "repeat `await_run` while directed" in numbered_rules[1]
     assert "operator recovery is required" in numbered_rules[4]
     assert "convergence, trends, robustness, causality" in numbered_rules[6]
     tools = asyncio.run(server.list_tools())
