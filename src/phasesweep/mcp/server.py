@@ -96,7 +96,10 @@ MAX_LIST_LIMIT = 100
 AWAIT_DEFAULT_TIMEOUT_SECONDS = 20
 AWAIT_MIN_TIMEOUT_SECONDS = 5
 AWAIT_MAX_TIMEOUT_SECONDS = 600
-AWAIT_RECHECK_SECONDS = 30
+# Recheck cadence inside one await. Kept at the minimum timeout so a
+# default-length wait rechecks run state several times mid-wait instead of only
+# at entry and at the deadline.
+AWAIT_RECHECK_SECONDS = 5
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -883,9 +886,10 @@ class PhaseSweepMCP:
         no new state, no side effects. Returns early when the run reaches a
         terminal state, operator recovery is required, or a phase gains a
         winner; otherwise returns the current status when the (clamped)
-        timeout elapses. Each recheck re-resolves the run from disk, so state
-        written while this request is active is observed. After a server
-        restart, a fresh call resumes from the same durable run.
+        timeout elapses. Rechecks run every ``AWAIT_RECHECK_SECONDS`` (or at
+        the deadline, whichever comes first) and re-resolve the run from disk,
+        so state written while this request is active is observed. After a
+        server restart, a fresh call resumes from the same durable run.
 
         :param str run_id: Detached run id to wait on.
         :param int timeout_seconds: Requested wait, clamped to

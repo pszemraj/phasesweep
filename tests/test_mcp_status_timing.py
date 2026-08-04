@@ -17,6 +17,7 @@ from phasesweep.engine.state import _generation_winner_path, _winner_path
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
+    AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     AWAIT_RECHECK_SECONDS,
@@ -265,11 +266,12 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
 
 def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
     """Replace await_run's deadline clock and recheck sleep with a manual clock."""
-    clock = {"now": 0.0, "sleeps": 0.0}
+    clock = {"now": 0.0, "sleeps": 0.0, "pauses": 0.0}
 
     async def advance(seconds: float) -> None:
         clock["now"] += seconds
         clock["sleeps"] += seconds
+        clock["pauses"] += 1
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
     monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
@@ -312,6 +314,23 @@ def test_await_run_times_out_with_unchanged_status(
     assert result["changed"] is False
     assert result["run"]["state"] == "running"
     assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
+
+
+def test_await_run_rechecks_mid_wait_at_the_default_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = _fake_clock(monkeypatch)
+
+    result = asyncio.run(app.await_run("r1"))
+
+    assert result["reason"] == "timeout"
+    assert clock["sleeps"] == pytest.approx(AWAIT_DEFAULT_TIMEOUT_SECONDS)
+    # The recheck cadence must divide the default wait into more than one pause,
+    # otherwise status is only read at entry and at the deadline.
+    assert AWAIT_RECHECK_SECONDS < AWAIT_DEFAULT_TIMEOUT_SECONDS
+    assert clock["pauses"] == AWAIT_DEFAULT_TIMEOUT_SECONDS / AWAIT_RECHECK_SECONDS
+    assert clock["pauses"] > 1
 
 
 def test_await_run_reports_failed_trial_progress_at_timeout(
