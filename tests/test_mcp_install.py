@@ -1023,6 +1023,27 @@ def test_installer_returns_failure_when_post_install_verification_is_not_ok(
     assert "need manual attention" in captured.err
 
 
+def test_installer_verifies_launchers_when_an_earlier_step_needed_attention(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    # A commented opencode config cannot be edited safely, so that target's step
+    # needs manual attention; the claude target still gets written and must
+    # still be verified.
+    (project / "opencode.json").write_text('{\n  // keep\n  "mcp": {}\n}\n')
+
+    code = installer.run("install", project, catalog, ["opencode", "claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "skipped" in captured.out
+    assert "verification:" in captured.out
+    assert "Claude Code" in captured.out
+    assert "need manual attention" in captured.err
+
+
 def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()

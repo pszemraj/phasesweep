@@ -908,7 +908,10 @@ def run(
                     click.echo(f"      {line}")
             if not result.ok:
                 attention += 1
-    if mode == "install" and not dry_run and "mcp" in integrations and attention == 0:
+    # Verification runs regardless of earlier per-step failures: a run where one
+    # target failed is exactly where the remaining targets' launchers most need
+    # checking. A non-ok check still adds to `attention` (and so to the exit code).
+    if mode == "install" and not dry_run and "mcp" in integrations:
         click.echo("\nverification:")
         for target in targets:
             verification = _check_target_launcher(target)
