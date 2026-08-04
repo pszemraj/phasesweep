@@ -170,7 +170,7 @@
 #   cwd: str | None = null
 #   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null leaves the trainer in the orchestrator's invocation directory. When set for an MCP catalog entry, the path must be absolute.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
-#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ, and CUDA_VISIBLE_DEVICES; a list of names adds exactly those variables to that base set. CUDA_VISIBLE_DEVICES remains in the base because GPU discovery and locking consume the same visibility contract. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
+#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ, and CUDA_VISIBLE_DEVICES; a list of names adds exactly those variables to that base set. CUDA_VISIBLE_DEVICES remains in the base because GPU discovery and locking consume the same visibility contract, so narrowed contracts now pass the ambient value through where they previously did not; override it under `env` to hide it. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.

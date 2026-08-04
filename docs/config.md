@@ -235,6 +235,10 @@ StudyFingerprintMismatchError: Study 'exp::phase' was created with a different p
 
 Nothing about your trainer semantics changed if you never set `execution`; the identity schema did. Finish or archive in-flight studies under the old release, or use a new experiment name for work started under this one. Published generation summaries from earlier releases are likewise reported as historical (`published_config_matches_current: false`) rather than reinterpreted.
 
+### `CUDA_VISIBLE_DEVICES` is always in the narrowed inheritance base
+
+`CUDA_VISIBLE_DEVICES` now belongs to the minimal base that `inherit_env: none` and list contracts start from, so GPU isolation holds even under narrowed inheritance - dropping an explicit empty or `-1` value would otherwise make every device visible again in the child after the pool deliberately selected none. Configs that already narrow inheritance therefore pass the ambient value through where they previously did not; the contract is unchanged, so no fingerprint moves and no study is invalidated. If a trainer must not see the ambient value, set `CUDA_VISIBLE_DEVICES` explicitly under top-level `env`, which applies last and also drives pool discovery.
+
 ### Categorical `choices` must be unique
 
 ```text
