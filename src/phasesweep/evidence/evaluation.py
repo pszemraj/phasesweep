@@ -716,6 +716,9 @@ def _wandb_summary_required(
 
     :param TrialContext ctx: Trial context containing the immutable W&B run id.
     :param WandbSummaryRequiredGate gate: Gate config for W&B lookup and keys.
+    :param bool deadline_capped: Whether the phase/run deadline shortened this
+        gate's polling timeout; a timeout failure is then attributed to
+        deadline exhaustion rather than to missing evidence.
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
