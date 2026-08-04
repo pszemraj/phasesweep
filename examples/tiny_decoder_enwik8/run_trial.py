@@ -159,26 +159,6 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
     }
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically publish one JSON artifact in its destination directory.
-
-    Deliberately stdlib-only. The envelope is a contract about the *bytes* a
-    trainer writes, so any trainer in any language can satisfy it; importing a
-    phasesweep helper here would make this example a worse template than the
-    contract it demonstrates.
-    """
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _write_result(
     trial_dir: Path,
     overrides_sha256: str,
@@ -230,7 +210,10 @@ def _write_result(
         "schema_version": 1,
         "status": "complete",
     }
-    _atomic_write_json(trial_dir / "result.json", result)
+    (trial_dir / "result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _run_template(template_root: Path, config_path: Path) -> None:

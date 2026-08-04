@@ -91,7 +91,6 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "schema_version": 1,
         "status": "complete",
     }
-    assert list(trial_dir.glob(".result.json.*.tmp")) == []
 
 
 def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:

@@ -6,7 +6,6 @@ import argparse
 import json
 import math
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -38,33 +37,14 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
     return out
 
 
-def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Flatten nested override JSON into dotted keys.
-
-    :param dict[str, Any] d: Nested override mapping loaded from JSON.
-    :param str prefix: Existing dotted prefix used during recursion.
-    :return dict[str, Any]: Flat mapping where nested keys are joined with dots.
-    """
-    out: dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-        if isinstance(v, dict):
-            out.update(_flatten(v, key))
-        else:
-            out[key] = v
-    return out
-
-
 def main() -> None:
     """Run the toy trainer end-to-end: parse args, compute metrics, write result.json."""
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True)
-    p.add_argument("--overrides-path", default=None)
     p.add_argument("--n_layers", type=int)
     p.add_argument("--lr", type=float)
     p.add_argument("--weight_decay", type=float)
     p.add_argument("--dropout", type=float)
-    p.add_argument("--fail", action="store_true", help="simulate a crash")
     p.add_argument(
         "--sleep",
         type=float,
@@ -73,24 +53,14 @@ def main() -> None:
     )
     args, rest = p.parse_known_args()
 
-    overrides: dict[str, Any] = {}
-    if args.overrides_path:
-        overrides = _flatten(json.loads(Path(args.overrides_path).read_text()))
-
-    overrides.update(
-        {
-            "n_layers": args.n_layers,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "dropout": args.dropout,
-        }
-    )
+    overrides: dict[str, Any] = {
+        "n_layers": args.n_layers,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "dropout": args.dropout,
+    }
     overrides = {k: v for k, v in overrides.items() if v is not None}
     overrides.update(_parse_kv(rest))
-
-    if args.fail:
-        print("simulated failure", file=sys.stderr)
-        sys.exit(3)
 
     if args.sleep > 0:
         time.sleep(args.sleep)
