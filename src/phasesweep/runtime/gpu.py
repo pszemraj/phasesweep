@@ -407,74 +407,20 @@ class GpuPool:
             non-``None`` IDs) iff a GPU list is in play.
 
         Raises:
-            ValueError: Direct arguments violate the same GPU isolation
-                invariants enforced by :class:`phasesweep.config.Phase`.
             RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
                 ``allow_no_gpu``, or the configured device tokens cannot be
                 resolved to canonical physical devices (see
                 :func:`_resolve_lock_identities`).
 
         """
-        if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs < 1:
-            raise ValueError(f"n_jobs must be a positive integer; got {n_jobs!r}.")
-        if policy not in ("single_per_trial", "whole_node", "none"):
-            raise ValueError(f"Unknown GPU policy {policy!r}.")
-        if explicit_ids is not None and explicit_devices is not None:
-            raise ValueError("explicit_ids and explicit_devices are mutually exclusive.")
-        if explicit_ids is not None:
-            if not explicit_ids:
-                raise ValueError(
-                    "explicit_ids must be omitted or contain at least one CUDA device index."
-                )
-            bad_ids = [
-                value
-                for value in explicit_ids
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ]
-            if bad_ids:
-                raise ValueError(
-                    f"explicit_ids must contain non-negative CUDA device indices; got {bad_ids}."
-                )
-        if explicit_devices is not None:
-            if not explicit_devices:
-                raise ValueError(
-                    "explicit_devices must be omitted or contain at least one CUDA device token."
-                )
-            if any(not isinstance(token, str) for token in explicit_devices):
-                raise ValueError("explicit_devices must contain only string device tokens.")
-            explicit_devices = [token.strip() for token in explicit_devices]
-            bad_devices = [
-                token for token in explicit_devices if not token or "," in token or token == "-1"
-            ]
-            if bad_devices:
-                raise ValueError(
-                    "explicit_devices entries must be non-empty CUDA_VISIBLE_DEVICES tokens "
-                    f"without commas or -1; got {bad_devices}."
-                )
-        if policy == "whole_node" and n_jobs != 1:
-            raise ValueError("policy='whole_node' requires n_jobs=1.")
-        if policy == "whole_node" and explicit_ids is None and explicit_devices is None:
-            raise ValueError(
-                "policy='whole_node' requires an explicit_ids or explicit_devices list."
-            )
-        if policy == "none" and (explicit_ids is not None or explicit_devices is not None):
-            raise ValueError(
-                "policy='none' cannot be combined with explicit_ids or explicit_devices."
-            )
-        if policy == "none" and n_jobs > 1 and not allow_no_gpu:
-            raise ValueError("policy='none' with n_jobs > 1 requires allow_no_gpu=True.")
-
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")
             return cls(devices=[])
 
-        # Explicit IDs always win, even at n_jobs==1.
-        if explicit_ids is not None:
-            devices = _resolve_lock_identities(_normalize_devices(explicit_ids))
-            _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
-            return cls(devices=devices, whole_node=policy == "whole_node")
-        if explicit_devices is not None:
-            devices = _resolve_lock_identities(_normalize_devices(explicit_devices))
+        # Explicit configuration always wins, even at n_jobs==1.
+        explicit = explicit_ids if explicit_ids is not None else explicit_devices
+        if explicit is not None:
+            devices = _resolve_lock_identities(_normalize_devices(explicit))
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 

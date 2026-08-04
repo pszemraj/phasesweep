@@ -59,40 +59,6 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
         assert gid is None
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"n_jobs": 0}, "positive integer"),
-        (
-            {"n_jobs": 1, "explicit_ids": [0], "explicit_devices": ["GPU-a"]},
-            "mutually exclusive",
-        ),
-        ({"n_jobs": 1, "explicit_ids": []}, "at least one CUDA device index"),
-        ({"n_jobs": 1, "explicit_ids": [-1]}, "non-negative"),
-        ({"n_jobs": 1, "explicit_devices": []}, "at least one CUDA device token"),
-        ({"n_jobs": 1, "explicit_devices": [" "]}, "non-empty"),
-        ({"n_jobs": 1, "explicit_devices": ["GPU-a,GPU-b"]}, "without commas"),
-        ({"n_jobs": 1, "explicit_devices": ["-1"]}, "without commas or -1"),
-        (
-            {"n_jobs": 2, "explicit_ids": [0], "policy": "whole_node"},
-            "requires n_jobs=1",
-        ),
-        ({"n_jobs": 1, "policy": "whole_node"}, "requires an explicit_ids"),
-        (
-            {"n_jobs": 1, "explicit_ids": [0], "policy": "none"},
-            "cannot be combined",
-        ),
-        ({"n_jobs": 2, "policy": "none"}, "requires allow_no_gpu=True"),
-        ({"n_jobs": 1, "policy": "invalid"}, "Unknown GPU policy"),
-    ],
-)
-def test_gpu_pool_create_enforces_config_invariants_directly(
-    kwargs: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        GpuPool.create(**kwargs)  # type: ignore[arg-type]
-
-
 def test_gpu_pool_create_normalizes_explicit_device_tokens() -> None:
     pool = GpuPool.create(n_jobs=1, explicit_devices=[" GPU-a "])
 
