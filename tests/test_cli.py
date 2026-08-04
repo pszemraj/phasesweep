@@ -19,6 +19,7 @@ from phasesweep.engine.state import (
     _last_successful_generation_path,
     _winner_path,
 )
+from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import write_trainer, write_yaml
 
@@ -110,6 +111,36 @@ def test_recover_run_expands_user_state_dir(
     assert result.exit_code != 0
     assert "unknown run id: missing" in result.output
     assert "not an existing MCP state directory" not in result.output
+
+
+def test_recover_run_surfaces_host_error_suggestion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unusable host must report the remediation, not only the diagnosis.
+
+    ``require_linux_mcp_host`` carries its fix in ``CatalogError.suggestion``;
+    rendering only the message would leave the operator with a run stuck in
+    ``recovery_required`` and nothing to act on.
+    """
+    RunStore(tmp_path / "state")
+
+    def refuse_host() -> None:
+        raise CatalogError(
+            "cannot read this process's Linux /proc start time",
+            suggestion="mount /proc with process stat access",
+        )
+
+    monkeypatch.setattr("phasesweep.cli.require_linux_mcp_host", refuse_host)
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(tmp_path / "state"), "--run-id", "missing"],
+    )
+
+    assert result.exit_code != 0
+    assert "cannot read this process's Linux /proc start time" in result.output
+    assert "fix: mount /proc with process stat access" in result.output
 
 
 @pytest.mark.parametrize(

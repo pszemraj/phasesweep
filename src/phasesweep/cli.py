@@ -422,6 +422,22 @@ def mcp() -> None:
     """Run MCP operator commands."""
 
 
+def _catalog_error_text(exc: CatalogError) -> str:
+    """Render a catalog error together with its actionable fix.
+
+    ``CatalogError`` carries the remediation in ``suggestion``; formatting the
+    exception alone silently drops it and leaves the operator with a diagnosis
+    but no instruction. Matches the ``fix:`` line ``mcp check`` prints per
+    entry. Operator-facing: messages and suggestions may include paths.
+
+    :param CatalogError exc: Raised catalog error to render.
+    :return str: Message, plus a trailing ``fix:`` line when a suggestion exists.
+    """
+    if exc.suggestion:
+        return f"{exc}\nfix: {exc.suggestion}"
+    return str(exc)
+
+
 @mcp.command(
     name="recover-run",
     context_settings=CONTEXT_SETTINGS,
@@ -457,7 +473,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     try:
         require_linux_mcp_host()
     except CatalogError as exc:
-        raise click.ClickException(str(exc)) from None
+        raise click.ClickException(_catalog_error_text(exc)) from None
     try:
         store = RunStore.open_existing(state_dir)
     except ValueError as exc:
@@ -806,7 +822,7 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     try:
         report = check_catalog(catalog)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp check: {exc}", err=True)
+        click.echo(f"phasesweep mcp check: {_catalog_error_text(exc)}", err=True)
         ctx.exit(2)
     _echo_catalog_report(report)
     if not report.ok:
@@ -924,9 +940,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
             return False
         fsync_directory(output.parent)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
-        if exc.suggestion:
-            click.echo(f"fix: {exc.suggestion}", err=True)
+        click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False
     except OSError as exc:
         click.echo(f"phasesweep mcp init-catalog: cannot write {output}: {exc}", err=True)
@@ -1044,7 +1058,7 @@ def install(
         try:
             report = check_catalog(catalog_path)
         except CatalogError as exc:
-            click.echo(f"phasesweep mcp install: {exc}", err=True)
+            click.echo(f"phasesweep mcp install: {_catalog_error_text(exc)}", err=True)
             ctx.exit(2)
         if not report.ok:
             _echo_catalog_report(report)
