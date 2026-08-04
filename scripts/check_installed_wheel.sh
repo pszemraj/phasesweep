@@ -33,6 +33,12 @@ export PATH="$install_root/bin:$PATH"
 export PYTHONPATH="$site_packages${PYTHONPATH:+:$PYTHONPATH}"
 cd "$project_dir"
 
+command -v phasesweep >/dev/null
+command -v phasesweep-mcp >/dev/null
+test -f "$site_packages/phasesweep/py.typed"
+test -f "$site_packages/phasesweep/templates/starter_experiment.yaml"
+test -f "$site_packages/phasesweep/mcp/agent_prompt.md"
+
 phasesweep init
 phasesweep validate experiment.yaml
 phasesweep run experiment.yaml --dry-run
