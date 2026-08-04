@@ -151,6 +151,14 @@ def run_config(
 def config_status(config: Config) -> dict[str, Any]:
     """Collect read-only status for an experiment or suite config.
 
+    For an :class:`~phasesweep.config.Experiment` this returns
+    :func:`experiment_status` verbatim. For a :class:`~phasesweep.config.Suite`
+    it returns ``{kind: "suite", suite, workdir, studies}`` where each study is
+    ``{name, depends_on, status}`` and ``status`` is that study's compiled
+    experiment status — the same payload, generation identity included, that a
+    standalone experiment reports. The suite envelope itself carries no
+    generation identity: suite-level generations are not a status concept here.
+
     :param Config config: Parsed experiment or suite config to inspect.
     :return dict[str, Any]: Read-only status payload for the config.
     """
@@ -1233,13 +1241,41 @@ def _publish_generation(
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
     """Collect read-only status for one experiment config.
 
-    Resolves the last-success pointer exactly once and reuses that captured
-    id for every phase's winner-path lookup, so this one status object can
-    never mix generation A's identity with generation B's artifacts (review
-    v0.5.15 / blocker 3).
+    Built on a single :func:`phasesweep.engine.read.read_status` call, which
+    resolves the current pointer and the last-success pointer exactly once each
+    and reuses both for every phase's winner-path and trial-count lookup, so
+    one status object can never mix generation A's identity with generation B's
+    artifacts (review v0.5.15 / blocker 3).
+
+    The returned mapping is the single experiment status snapshot shared by
+    every caller: ``phasesweep status <experiment>`` renders it directly, and
+    :func:`config_status` embeds it unchanged under ``studies[*].status`` for a
+    suite, so a suite study reports the same generation identity a standalone
+    experiment does. Its keys are exactly, in order:
+
+    * ``kind``: always ``"experiment"``.
+    * ``experiment``: configured experiment name.
+    * ``workdir``: experiment artifact root.
+    * ``current_generation_id``, ``published_generation_id``,
+      ``represented_generation_id``, ``is_published``: the identity split
+      defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
+      the represented generation is the published one).
+    * ``phases``: one payload per phase in declaration order, each with
+      ``trials``, ``running``, ``n_trials``, ``completed``,
+      ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
+      and ``winner`` (path string or ``None``).
+
+    ``read_status``'s summary-derived fields (``metric``, ``result_context``,
+    ``published_config_matches_current``, ``summary_present``) are deliberately
+    *not* part of this payload: they are the MCP read view's contract, and the
+    per-study cost of computing them here is one small YAML read plus a config
+    fingerprint, negligible beside the per-phase Optuna storage reads this call
+    already performs. ``tests/test_engine_status_shape.py`` pins both key sets
+    so neither can drift silently again.
 
     :param Experiment experiment: Parsed experiment config to inspect.
-    :return dict[str, Any]: Status payload including phase winner paths and trial counts.
+    :return dict[str, Any]: Status payload with generation identity plus per-phase
+        winner paths and trial counts, as enumerated above.
     """
     status = read_status(experiment, _include_winner_paths=True)
     return {
