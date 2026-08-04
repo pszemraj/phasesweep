@@ -1739,14 +1739,28 @@ class PhaseSweepMCP:
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Return whether launch-time and current policy permit cancellation.
 
+        A catalog edit may revoke cancellation but never grant it, so a still
+        cataloged id is intersected with the permission frozen at launch.
+
+        When the id is gone from the catalog there is no current policy to
+        intersect with, and the launch-time permission stands alone. Refusing
+        there would strand a live detached runner: ``_resolve_read_target``
+        still reports it as ``running`` from its snapshot, and
+        ``phasesweep mcp recover-run`` refuses while the runner is alive, so
+        the operator would be left hunting the PGID by hand. Cancellation is
+        risk-reducing and was authorized when this run started.
+
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
-        :return bool: Whether both launch-time and current permission are true.
+        :return bool: Whether both launch-time and current permission are true,
+            or the launch-time permission alone when the id is no longer cataloged.
         """
-        try:
-            current_allowed = self._registry.get(handle.experiment_id).allow_cancel
-        except UnknownExperimentError:
+        if not handle.allow_cancel:
+            # A launch-time denial is permanent for this run.
             return False
-        return handle.allow_cancel and current_allowed
+        try:
+            return self._registry.get(handle.experiment_id).allow_cancel
+        except UnknownExperimentError:
+            return True
 
 
 F = TypeVar("F", bound=Callable[..., Any])

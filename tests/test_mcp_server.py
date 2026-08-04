@@ -1833,7 +1833,17 @@ def test_cancel_cannot_be_enabled_after_launch(tmp_path: Path) -> None:
         app.cancel(run_id)
 
 
-def test_cancel_decataloged_run_is_denied_even_when_launch_allowed_it(tmp_path: Path) -> None:
+def test_cancel_decataloged_run_uses_launch_time_permission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removed catalog entry must not strand a live detached runner.
+
+    Status reads still resolve the run from its snapshot and report it running,
+    and ``phasesweep mcp recover-run`` refuses while the runner is alive, so a
+    hard deny here would leave no supported way to stop the sweep. There is no
+    current policy to intersect with, and cancelling is risk-reducing.
+    """
     old_config = _config(tmp_path, name="old")
     old_snapshot = old_config.read_bytes()
     other_config = _config(tmp_path, name="other")
@@ -1848,6 +1858,47 @@ def test_cancel_decataloged_run_is_denied_even_when_launch_allowed_it(tmp_path: 
         allow_cancel=True,
     )
     store.create(handle)
+    assert store.state(handle) == "running"
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        write_run_status(
+            store,
+            run_id,
+            returncode=143,
+            error_class="cancelled",
+            cleanup_confirmed=True,
+        )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+
+    result = app.cancel(run_id)
+
+    assert result == {
+        "run_id": run_id,
+        "state": "cancelled",
+        "cleanup_confirmed": True,
+        "recovery_required": False,
+    }
+
+
+def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Path) -> None:
+    """Removing the entry cannot grant authority the launch never had."""
+    old_config = _config(tmp_path, name="old")
+    old_snapshot = old_config.read_bytes()
+    other_config = _config(tmp_path, name="other")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
+    )
+    run_id = "old-running-no-permission"
+    store.create(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id="old",
+            config_sha256=hashlib.sha256(old_snapshot).hexdigest(),
+            allow_cancel=False,
+        )
+    )
 
     with pytest.raises(Exception, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
