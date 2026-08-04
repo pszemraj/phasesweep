@@ -30,7 +30,7 @@ from phasesweep.engine.guards import (
     _verify_fingerprint,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
-from phasesweep.engine.read import _phase_status_payloads
+from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import (
     _apply_promotion,
     _apply_study_promotion,
@@ -52,7 +52,6 @@ from phasesweep.engine.state import (
     _generation_summary_path,
     _generation_winner_path,
     _generations_dir,
-    _last_successful_generation_id,
     _last_successful_generation_path,
     _last_successful_suite_generation_path,
     _load_winner,
@@ -1242,16 +1241,16 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload including phase winner paths and trial counts.
     """
-    published_generation_id = _last_successful_generation_id(experiment)
+    status = read_status(experiment, _include_winner_paths=True)
     return {
         "kind": "experiment",
-        "experiment": experiment.experiment,
+        "experiment": status["experiment"],
         "workdir": str(_experiment_dir(experiment)),
-        "phases": _phase_status_payloads(
-            experiment,
-            include_winner_path=True,
-            winner_scope_generation_id=published_generation_id,
-        ),
+        "current_generation_id": status["current_generation_id"],
+        "published_generation_id": status["published_generation_id"],
+        "represented_generation_id": status["represented_generation_id"],
+        "is_published": status["is_published"],
+        "phases": status["phases"],
     }
 
 

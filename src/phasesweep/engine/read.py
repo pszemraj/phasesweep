@@ -325,7 +325,12 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     return None
 
 
-def read_status(experiment: Experiment, *, generation_id: str | None = None) -> dict[str, Any]:
+def read_status(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+    _include_winner_paths: bool = False,
+) -> dict[str, Any]:
     """Per-phase trial counts and winner presence, with no paths in the output.
 
     Trial counts come from ``_phase_trial_stats``, which reports empty counts
@@ -379,6 +384,8 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
             default), ``represented_generation_id`` is the captured
             ``published_generation_id`` and ``generation_trials`` scopes to
             the captured ``current_generation_id``.
+        _include_winner_paths: Internal CLI adapter flag selecting the
+            path-bearing phase payload used by :func:`config_status`.
 
     Returns:
         A path-free mapping with the experiment name, the four identity
@@ -474,7 +481,7 @@ def read_status(experiment: Experiment, *, generation_id: str | None = None) -> 
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
-            include_winner_path=False,
+            include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={
                 name: (
