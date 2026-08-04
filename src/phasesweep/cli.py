@@ -140,20 +140,43 @@ def init(output: Path) -> None:
     :param Path output: Destination YAML path; existing paths are never replaced.
     :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
         file or symlink, including when it appears between the check and the
-        exclusive create.
+        atomic publication.
     """
     expanded = output.expanduser()
     target = expanded.absolute()
     if target.exists() or target.is_symlink():
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    text = _starter_experiment_text(target)
+    staged: Path | None = None
     try:
-        with target.open("x", encoding="utf-8") as handle:
-            handle.write(_starter_experiment_text(target))
-    except FileExistsError:
-        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-        raise click.exceptions.Exit(2) from None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle = None
+        for _ in range(10):
+            candidate = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {target}")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            os.link(staged, target)
+        except FileExistsError:
+            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+            raise click.exceptions.Exit(2) from None
+        fsync_directory(target.parent)
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
 
     # Quote the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a

@@ -145,3 +145,41 @@ def test_init_refuses_broken_symlink(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.is_symlink()
+
+
+def test_init_write_failure_does_not_claim_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "experiment.yaml"
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("phasesweep.cli.os.fsync", fail_fsync)
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert isinstance(result.exception, OSError)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
+
+
+def test_init_losing_publish_race_preserves_other_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "experiment.yaml"
+
+    def lose_publish_race(_source: Path, destination: Path) -> None:
+        destination.write_text("other process\n")
+        raise FileExistsError(destination)
+
+    monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 2
+    assert "refusing to overwrite" in result.output
+    assert output.read_text() == "other process\n"
+    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
