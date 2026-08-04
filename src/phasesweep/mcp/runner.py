@@ -222,22 +222,15 @@ def _safe_failure_payload(
     error: BaseException,
     *,
     stage: str | None,
-    cause: BaseException | None = None,
 ) -> dict[str, object]:
-    """Map an error and optional secondary cause to one stable agent failure.
+    """Map an error to one stable agent failure.
 
     :param BaseException error: Primary exception to classify.
     :param str | None stage: Stage forwarded to :func:`_base_failure_payload`
-        for both ``error`` and, when present, ``cause``.
-    :param BaseException | None cause: Secondary exception distinct from
-        ``error``; when given, its own classified payload is nested under
-        the returned payload's ``"cause"`` key.
-    :return dict[str, object]: The primary failure payload, with a nested
-        ``cause`` payload added when ``cause`` is given and is not ``error``.
+        for ``error``.
+    :return dict[str, object]: The validated primary failure payload.
     """
     payload = _base_failure_payload(error, stage=stage)
-    if cause is not None and cause is not error:
-        payload["cause"] = _base_failure_payload(cause, stage=stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
@@ -410,16 +403,6 @@ def _persist_spawned_handle(
     )
 
 
-def _resolve_under(base: Path, path: Path) -> Path:
-    """Resolve a server-supplied path the way the project directory would have.
-
-    :param Path base: Experiment project directory passed as ``--cwd``.
-    :param Path path: Path argument received from the server.
-    :return Path: ``path`` unchanged when absolute, otherwise joined onto ``base``.
-    """
-    return path if path.is_absolute() else base / path
-
-
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json.
 
@@ -441,14 +424,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
 
-    # This process starts in the server's state directory, so a relative path
-    # argument would no longer mean what it meant when the child inherited the
-    # project directory as its cwd. Bind every path to --cwd instead, before
-    # anything reads or writes.
+    # The server supplies absolute paths because this process starts in the
+    # server-owned state directory rather than the experiment directory.
     project_cwd = args.cwd.expanduser()
-    config_path = _resolve_under(project_cwd, args.config)
-    status_path = _resolve_under(project_cwd, args.status_path)
-    state_dir = _resolve_under(project_cwd, args.state_dir)
+    config_path = args.config
+    status_path = args.status_path
+    state_dir = args.state_dir
 
     # This process's stdout/stderr are the server-redirected run log. Log to
     # stderr; never print to stdout here. (The engine's own run.log under the

@@ -1468,17 +1468,15 @@ class PhaseSweepMCP:
         self,
         reg: RegisteredExperiment,
         run_id: str,
-        data: bytes | None = None,
+        data: bytes,
     ) -> Path:
         """Exclusively create the immutable config snapshot before publishing its run.
 
         :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
         :param str run_id: Run id whose snapshot path should be used.
-        :param bytes | None data: Already-verified config bytes, if available.
+        :param bytes data: Already-verified config bytes.
         :return Path: Written config snapshot path consumed by the detached runner.
         """
-        if data is None:
-            data = self._current_config_bytes(reg)
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
             with open_private_text(snapshot_path, "x") as output:

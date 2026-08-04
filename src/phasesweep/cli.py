@@ -40,7 +40,12 @@ from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import agent_ids
-from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
+from phasesweep.mcp.registry import (
+    CatalogCheckReport,
+    Registry,
+    _require_linux_mcp_host,
+    check_catalog,
+)
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
@@ -50,7 +55,6 @@ from phasesweep.runtime.process import (
     install_signal_handlers,
     is_same_live_process,
     kill_stale_group,
-    read_proc_starttime,
 )
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -440,16 +444,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
     """
     state_dir = state_dir.expanduser().resolve()
-    if not sys.platform.startswith("linux"):
-        raise click.ClickException(
-            "MCP recovery is supported only on Linux because safe process cleanup "
-            "requires /proc process identities"
-        )
-    if read_proc_starttime(os.getpid()) is None:
-        raise click.ClickException(
-            "MCP recovery cannot read this process's Linux /proc start time; "
-            "mount /proc with process stat access before retrying"
-        )
+    try:
+        _require_linux_mcp_host()
+    except CatalogError as exc:
+        raise click.ClickException(str(exc)) from None
     try:
         store = RunStore.open_existing(state_dir)
     except ValueError as exc:

@@ -1000,19 +1000,13 @@ def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | N
 
     A launcher that starts fine still fails at handshake time when its catalog
     was moved, renamed, or deleted, so ``check-install`` inspects the argument
-    as well as the executable (review v0.5.16). Every managed shape ends in
-    ``--catalog <absolute path>``; anything else is a shape this function does
-    not own and is reported rather than guessed at.
+    as well as the executable (review v0.5.16). The caller has already verified
+    that every managed shape ends in ``--catalog <absolute path>``.
 
     :param Sequence[str] args: Configured launcher argv after the executable.
     :return tuple[CheckStatus, str | None]: ``("ok", None)``, or
         ``("catalog-missing", ...)`` with actionable repair guidance.
     """
-    if len(args) < 2 or args[-2] != "--catalog":
-        return "catalog-missing", (
-            "the configured entry passes no --catalog argument; rerun "
-            "`phasesweep mcp install --catalog PATH` with the catalog this client should use"
-        )
     catalog = args[-1]
     path = Path(catalog)
     if not path.is_file() or not os.access(path, os.R_OK):
