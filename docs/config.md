@@ -1,6 +1,6 @@
 # Config guide
 
-A phasesweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and provides the evidence that configured extractors read.
+A PhaseSweep config is the contract between the orchestrator and your trainer. The orchestrator chooses parameter values, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer parses overrides, runs the experiment, and provides the evidence that configured extractors read.
 
 For every field, type, default, enum value, and validation constraint, use [config_reference.yaml](config_reference.yaml). If a config that used to load now fails validation, see [upgrading existing configs](#upgrading-existing-configs).
 
@@ -14,7 +14,7 @@ An RDB `storage` URL is rejected at config validation unless `allow_external_rdb
 
 Storage holds Optuna study state. `workdir` holds trial logs and result artifacts plus persisted winners, promotion decisions, and summaries.
 
-`trial_command` is the command template for one trial. phasesweep validates the template at config load and shell-quotes rendered override values. The [config reference](config_reference.yaml) defines the supported placeholders; the parser boundary is explained under [override formats](#override-formats).
+`trial_command` is the command template for one trial. PhaseSweep validates the template at config load and shell-quotes rendered override values. The [config reference](config_reference.yaml) defines the supported placeholders; the parser boundary is explained under [override formats](#override-formats).
 
 `provenance` is the operator-declared identity of inputs that the command string cannot describe, such as the trainer revision, base config, dataset, dependency lock, container, tokenizer, or starting checkpoint. Persistent storage requires at least one nonempty entry. PhaseSweep includes the complete mapping in every phase fingerprint, so change its values whenever any external input changes; use a new experiment name when results from the old and new provenance should remain separate. PhaseSweep does not infer imports or hash arbitrary shell-command inputs.
 
@@ -24,7 +24,7 @@ The MCP API reports the configured extractor's guarantees through explicit [obje
 
 The remaining top-level keys: `workdir` (default `./runs`) is the output root laid out in [runtime behavior](runtime.md#output-layout); `override_format` selects the trainer boundary covered in [override formats](#override-formats); `env` adds environment variables to every trial subprocess (included in semantic fingerprints); `timeout_seconds_per_run` is the whole-experiment wallclock guard described with the other timeouts in [runtime behavior](runtime.md#process-management).
 
-`execution` declares the trainer's execution context explicitly instead of inheriting it silently. `execution.cwd` sets the working directory every trainer subprocess runs in; when set, the resolved path joins the semantic fingerprint, so one persistent study can never mix trainers reached through different working directories (a relative `trial_command` like `python trainer.py` means different code from different directories). Prefer an absolute path - a relative value resolves from the invocation directory, and two invocation directories then count as two incompatible execution contexts by design. When unset, trainers run in the invocation cwd and the fingerprint records the context as unbound, preserving historical behavior. `execution.inherit_env` controls which ambient environment variables trainers inherit: `all` (default, historical behavior), `none` (a minimal documented base: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `USER`, `LOGNAME`, `TZ`), or a list of names inherited on top of that base - use a narrowed contract to keep unrelated host variables and secrets out of trainer subprocesses. The inherit contract (mode or sorted names) joins the fingerprint; ambient *values* are never hashed, so put values that change trial meaning in `env`, which is always fingerprinted. Configured `env` entries apply on top of whatever is inherited.
+`execution` declares the trainer's execution context explicitly instead of inheriting it silently. `execution.cwd` sets the working directory every trainer subprocess runs in; when set, the resolved path joins the semantic fingerprint, so one persistent study can never mix trainers reached through different working directories (a relative `trial_command` like `python trainer.py` means different code from different directories). Prefer an absolute path - a relative value resolves from the invocation directory, and two invocation directories then count as two incompatible execution contexts by design. When unset, trainers run in the invocation cwd and the fingerprint records the context as unbound, preserving historical behavior. `execution.inherit_env` controls which ambient environment variables trainers inherit: `all` (default, historical behavior), `none` (the minimal base listed in the [config reference](config_reference.yaml)), or a list of names inherited on top of that base - use a narrowed contract to keep unrelated host variables and secrets out of trainer subprocesses. The inherit contract (mode or sorted names) joins the fingerprint; ambient *values* are never hashed, so put values that change trial meaning in `env`, which is always fingerprinted. Configured `env` entries apply on top of whatever is inherited.
 
 For normal CLI runs, relative `workdir` values, relative `execution.cwd` values, and file-backed storage paths resolve from the directory where `phasesweep` was invoked, not from the config file's directory. Relative paths used by `trial_command` resolve from the trainer's effective working directory: `execution.cwd` when set, otherwise the invocation directory. Invoke a relative-path config from one stable intended directory; changing cwd can silently select a different artifact tree, study, or trainer. `phasesweep validate` checks the command template but does not require referenced executables or paths to exist. File storage URLs use three slashes for relative paths (`sqlite:///runs.db`, `journal:///runs.journal`) and four for absolute POSIX paths (`sqlite:////tmp/runs.db`). MCP-launched runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
 
@@ -36,14 +36,14 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 ## Search parameters
 
-`search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. phasesweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
+`search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. PhaseSweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
 Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be unique under a type-aware identity: `1`, `1.0`, and `true` stay three distinct choices even though Python compares them equal, but the same value listed twice is rejected. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
 ## Override formats
 
 > [!IMPORTANT]
-> The program launched by `trial_command` must parse the selected format. phasesweep renders values and validates placeholders; it does not adapt your trainer's CLI.
+> The program launched by `trial_command` must parse the selected format. PhaseSweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
 | Format | Use when |
 | --- | --- |
@@ -51,11 +51,11 @@ Use categorical parameters for explicit choices and integer or float parameters 
 | `hydra` | Existing Hydra/OmegaConf applications. |
 | `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
-Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Validation and dry-run still do not write `overrides.json`, but config load now encodes every statically known composed value - contract then phase `fixed_overrides` - through the same strict serializer the real trial uses, so a value YAML resolved into a non-JSON Python object is named and rejected before any trial starts. The most common case is an unquoted date: `cutoff: 2024-01-01` is a `datetime.date`, not a string. Quote it.
+Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Config load checks every statically known composed value with the same strict serializer used for real trials; see [JSON file override validation](#json-file-override-validation) for YAML scalar pitfalls.
 
 ## Trainer contract
 
-The command in `trial_command` is the training or evaluation program for one trial. phasesweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
+The command in `trial_command` is the training or evaluation program for one trial. PhaseSweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Parse the selected [override format](#override-formats).
 - Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
@@ -65,7 +65,7 @@ The command in `trial_command` is the training or evaluation program for one tri
 
 The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. `CUDA_VISIBLE_DEVICES` is always retained in the minimal base because GPU discovery and host locking consume that same visibility contract; dropping an explicit empty or `-1` value would make GPUs visible again in a narrowed child environment without taking locks. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is also set to the attempt ID so W&B evidence lookup uses an immutable identity instead of a reusable label. GPU assignment can override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order. A top-level `env.CUDA_VISIBLE_DEVICES` override is also used for pool discovery, so the lock set and trainer visibility cannot diverge.
 
-Metric extractor failures, non-finite metrics, nonzero exits, and missing objective or constraint evidence fail the trial. Gate failures follow the separate [evidence gate](#evidence-gates) policy. Constraint bound violations are different: they produce completed but infeasible trials. phasesweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution - an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
+Metric extractor failures, non-finite metrics, nonzero exits, and missing objective or constraint evidence fail the trial. Gate failures follow the separate [evidence gate](#evidence-gates) policy. Constraint bound violations are different: they produce completed but infeasible trials. PhaseSweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution - an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
 
 ### Result envelope
 
@@ -112,6 +112,12 @@ For agent-facing artifact boundaries, see the [MCP security model](mcp.md#securi
 
 The [config reference](config_reference.yaml) defines each extractor shape, including JSON keys, log capture groups, W&B terminal-state handling, and polling timeouts.
 
+W&B extractors and gates require the optional dependency in the active environment:
+
+```bash
+pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+```
+
 ## Evidence gates
 
 Evidence gates validate local artifacts or W&B summary values after extraction. Local file gates share the trial directory's attempt-location scoping but do not parse an identity envelope; a stale or copied artifact can therefore satisfy a gate if the trainer places it in the current trial directory. Gate failures mark the trial `FAIL` unless that phase has a promotion with `requires_gates: false`, where they are advisory evidence. A suite study's promotion is applied after its component experiment finishes, so suite-level `requires_gates: false` does not make component gates advisory; a failed gate has already failed the trial. The [config reference](config_reference.yaml) defines the available gate shapes.
@@ -126,7 +132,37 @@ For a phase promotion failure, `stop` raises an error, `skip` ends the remaining
 
 ## Suites
 
-Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`; study `provenance` replaces default `provenance` when supplied, and explicit `null` clears it. See the [worked configs](../examples/).
+Suites run studies sequentially in declaration order. `depends_on` requires a prior study to have produced an exposed result; it does not pass winner overrides into the dependent study. Each study compiles to a normal experiment named `<suite>__<study>`, using defaults from `suite.defaults` when the study omits a field. Study `env` values merge over default `env`; study `contracts` merge over default `contracts`; study `provenance` replaces default `provenance` when supplied, and explicit `null` clears it.
+
+This shape compares two independently tuned optimizers under one metric contract and exposes the baseline when the candidate does not improve it:
+
+```yaml
+suite: optimizer_comparison
+defaults:
+  workdir: ./runs
+  trial_command: "python train.py {overrides}"
+  metric:
+    name: val_loss
+    goal: minimize
+    extractor: {type: log_regex, pattern: 'val_loss=(?P<value>[0-9.eE+-]+)'}
+studies:
+  - name: adamw
+    phases:
+      - name: learning_rate
+        n_trials: 8
+        fixed_overrides: {optimizer: adamw}
+        search_space:
+          lr: {type: float, low: 1.0e-5, high: 1.0e-2, log: true}
+  - name: sgd
+    depends_on: [adamw]
+    promotion: {min_delta_vs: adamw, min_delta: 0.0, on_fail: continue_baseline}
+    phases:
+      - name: learning_rate
+        n_trials: 8
+        fixed_overrides: {optimizer: sgd}
+        search_space:
+          lr: {type: float, low: 1.0e-4, high: 1.0, log: true}
+```
 
 Suite-level `run.log` and the compatibility projection `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Every invocation claims an immutable `suite_generations/<id>/` namespace selected through `last_successful_suite_generation.yaml`; the [runtime output contract](runtime.md#output-layout) covers publication integrity and historical reads. `show-winners` prints stored promotion decisions and comments, and labels the result historical when the current compiled suite differs.
 
@@ -210,7 +246,7 @@ A repeated choice was previously kept verbatim. For a grid phase that inflated t
 
 The same completeness rule now covers generated float grids: a `step` small enough that adjacent points collapse under the 12-decimal canonical rounding (`low: 0.0, high: 1.0e-12, step: 1.0e-13`) is rejected rather than silently enumerating repeats. Sweep an exponent or a multiplier rather than values that fine.
 
-### `json_file` override values are checked against the JSON serializer at load
+### JSON file override validation
 
 ```text
 Value error, Phase 'p': override_format='json_file' but fixed_overrides key 'cutoff'

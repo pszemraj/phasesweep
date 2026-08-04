@@ -1,10 +1,10 @@
 # Tiny Decoder Enwik8 example
 
-This example runs a tiny Enwik8 decoder training sweep with phasesweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The trainer accepts YAML config files but not per-key CLI overrides, so `run_trial.py` adapts phasesweep's `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three phases tune optimizer scale, regularization, and training stability.
+This example runs a tiny Enwik8 decoder training sweep with PhaseSweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The trainer accepts YAML config files but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three phases tune optimizer scale, regularization, and training stability.
 
 ## Setup
 
-From the phasesweep repo root, [install phasesweep](../../README.md#install), then prepare the pinned trainer:
+From the PhaseSweep repo root, [install PhaseSweep](../../README.md#install-and-try-it), then prepare the pinned trainer:
 
 ```bash
 git submodule update --init examples/tiny_decoder_enwik8/upstream
@@ -13,9 +13,9 @@ pip install -e examples/tiny_decoder_enwik8/upstream
 
 The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` runs the trainer with the upstream checkout as its working directory, which is how `base.yaml`'s relative `data_path: data/enwik8.gz` resolves.
 
-For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install) as well.
+For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
-The submodule pins the external trainer revision used by this example without copying its source into phasesweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this phasesweep example.
+The submodule pins the external trainer revision used by this example without copying its source into PhaseSweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this PhaseSweep example.
 
 This is an orchestration example, not a PyTorch training-template recommendation. The pinned trainer's known portability and numerical limitations are listed under [development work](../../docs/development.md#tracked-todos); fix them upstream, then update the submodule pointer here.
 
@@ -58,7 +58,7 @@ phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml --dry
 phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-Restart the selected client after installation, then ask it to list the available phasesweep experiments. `phasesweep mcp serve` is a stdio JSON-RPC endpoint for MCP clients, not an interactive terminal interface; use `mcp check` for a direct startup preflight.
+Restart the selected client after installation, then ask it to list the available PhaseSweep experiments. `phasesweep mcp serve` is a stdio JSON-RPC endpoint for MCP clients, not an interactive terminal interface; use `mcp check` for a direct startup preflight.
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
 

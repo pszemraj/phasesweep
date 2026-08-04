@@ -31,7 +31,7 @@ The command writes `catalog.yaml` with side effects disabled and winner values r
 - `allow.launch`, `allow.cancel`, and `allow.from_phase`;
 - the catalog state directory and each experiment working directory.
 
-Add another `--from` for each experiment. Use `-o` to choose another catalog filename. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules.
+Add another `--from` for each experiment. Use `-o` to choose another catalog filename. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
 
 ### 3. Connect a client
 
@@ -58,20 +58,12 @@ A working connection returns only catalog-approved experiment IDs, descriptions,
 
 By default, `--type all` installs two independent integrations:
 
-- an MCP server entry whose command is the absolute `phasesweep-mcp` executable from the environment running the installer and whose only argument is the reviewed catalog path;
+- an MCP server entry whose command is the absolute `phasesweep-mcp` executable from the environment running the installer and whose arguments are `--catalog` plus the reviewed catalog path;
 - a marker-fenced copy of the packaged seven-rule agent instructions where the client supports project instructions.
 
 Project scope is used where the client reliably supports it. Claude Desktop and Codex MCP entries are user-scoped, and the plan labels them before confirmation. Shared instruction files contain one package-managed block with multiple client owners; if a later install updates that shared prompt, the plan names the existing owners affected.
 
 `phasesweep mcp uninstall` removes only recognizable installer-managed entries and ownership blocks. Unmanaged same-name entries are reported and left untouched. The [installer preservation contract](mcp.md#installer-file-preservation-contract) documents symlinks, locking, JSON reserialization, markers, ownership, and manual-merge behavior.
-
-## What the agent can and cannot do
-
-The MCP surface has eight tools: `list_experiments`, `inspect_experiment`, `get_latest_run`, `get_run_status`, `await_run`, `get_run_results`, `launch_run`, and `cancel_run`.
-
-The agent can discover approved experiments, inspect safe phase metadata, launch only when the catalog permits it and the user authorizes it, monitor a durable run ID, read policy-filtered terminal winners, and request cancellation only when permitted.
-
-The agent cannot provide or edit a config path, trainer command, storage URL, environment, workdir, search space, or safety waiver. It cannot read raw trainer logs or arbitrary result files. Catalog edits can narrow historical visibility and cancellation authority but cannot broaden what a run had at launch. See the [security model](mcp.md#security-model).
 
 ## Unattended installation
 

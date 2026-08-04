@@ -1,4 +1,4 @@
-# phasesweep configuration reference
+# PhaseSweep configuration reference
 #
 # This is a hand-written per-key contract, not a config template. Every line is commented so the file cannot be mistaken for a runnable experiment or suite.
 # A UTF-8 YAML mapping with a top-level `suite` key is parsed as a Suite; any other top-level mapping is parsed as an Experiment.
@@ -103,7 +103,7 @@
 
 # gpu_ids: list[int] | None = null
 # If set, a nonempty list of non-negative CUDA indices. Mutually exclusive with gpu_devices and forbidden by gpu_policy: "none"; duplicates are removed in first-seen order.
-# If both explicit lists are null, phasesweep uses ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection.
+# If both explicit lists are null, PhaseSweep uses top-level env.CUDA_VISIBLE_DEVICES when present, otherwise ambient CUDA_VISIBLE_DEVICES, otherwise nvidia-smi detection. An explicit empty string or `-1` exposes no devices and suppresses auto-detection.
 
 # gpu_devices: list[str] | None = null
 # If set, a nonempty list of CUDA_VISIBLE_DEVICES tokens, including GPU/MIG UUIDs. Tokens are stripped, cannot be empty, contain commas, or equal `-1`, and are deduplicated in first-seen order.
@@ -154,19 +154,21 @@
 # promotion: Promotion | None = null
 # Compares this phase's candidate winner with a prior exposed phase winner before exposing it downstream. Promotion keys and outcomes are defined below.
 
+# EXPERIMENT ROOT, continued
+
 # timeout_seconds_per_run: float | None = null (>= 0 and finite when set)
 # Per-invocation experiment budget shared across phases. Like the phase budget, it covers GPU waits, supervisor/trainer work, extraction, and gates; enforcement is cooperative at stage boundaries, and W&B polling is capped to the remaining budget.
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
-# Applied over the ambient variables selected by execution.inherit_env. phasesweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial.
+# Applied over the ambient variables selected by execution.inherit_env. PhaseSweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
 
 # execution: ExecutionContext = {}
 # Explicit trainer execution contract; it joins the semantic fingerprint, so changing either key invalidates resumable studies. ExecutionContext keys:
 #   cwd: str | None = null
-#   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null leaves the trainer in the orchestrator's invocation directory. MCP catalog entries require an absolute path here, mirroring the workdir rule.
+#   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null leaves the trainer in the orchestrator's invocation directory. When set for an MCP catalog entry, the path must be absolute.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
 #   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ, and CUDA_VISIBLE_DEVICES; a list of names adds exactly those variables to that base set. CUDA_VISIBLE_DEVICES remains in the base because GPU discovery and locking consume the same visibility contract. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
 

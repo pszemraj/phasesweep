@@ -1,7 +1,7 @@
 Use PhaseSweep only through the operator-approved experiment catalog.
 
-1. Follow the canonical workflow: `list_experiments` -> `inspect_experiment` -> `launch_run` -> `await_run` -> `get_run_results`.
-2. Save the `run_id` returned by `launch_run` and use it for every post-launch call; use `get_latest_run` only to recover a lost ID.
+1. Call `list_experiments`, follow `next_cursor` until it is null, and call `inspect_experiment` before proposing a run.
+2. Follow each result's `next_action` and stop when it is null. After `launch_run`, save its `run_id`, repeat `await_run` while directed, and then call `get_run_results`; use `get_latest_run` only to recover a lost ID.
 3. Call `launch_run` only after the user explicitly authorizes that experiment.
 4. Never automatically cancel a run or launch a replacement run.
 5. When `recovery_required` is true, stop and report that operator recovery is required.
