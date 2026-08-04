@@ -21,6 +21,18 @@ from phasesweep.runtime import files as runtime_files
 from tests.conftest import make_experiment
 
 
+def test_missing_nofollow_is_a_platform_capability_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(runtime_files.os, "O_NOFOLLOW")
+
+    with pytest.raises(
+        runtime_files.PlatformCapabilityError,
+        match="without following symlinks",
+    ):
+        runtime_files.nofollow_flag()
+
+
 def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

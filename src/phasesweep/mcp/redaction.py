@@ -201,7 +201,10 @@ def status_payload(
         terminal_trials_this_run = (
             generation_counts["COMPLETE"] + generation_counts["PRUNED"] + generation_counts["FAIL"]
         )
-        terminal_trials_before_run = terminal_trials_total - terminal_trials_this_run
+        terminal_trials_before_run = max(
+            0,
+            terminal_trials_total - terminal_trials_this_run,
+        )
         target_terminal_trials = int(phase["n_trials"])
         phases.append(
             {

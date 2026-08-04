@@ -26,6 +26,7 @@ from phasesweep.config import (
 )
 from phasesweep.engine import read_winner, run_experiment
 from phasesweep.engine.run import ExperimentRunOutcome
+from phasesweep.engine.selection import _apply_promotion
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
@@ -252,6 +253,26 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="promotion references 'typo'.*prior phase"):
         load_config(p)
+
+
+def test_phase_promotion_runtime_reports_unknown_baseline(tmp_path: Path) -> None:
+    """Runtime corruption reports the missing selector instead of a bare KeyError."""
+    experiment = make_experiment(workdir=tmp_path)
+    phase_data = experiment.phases[0].model_dump()
+    phase_data["promotion"] = {"min_delta_vs": "missing"}
+    phase = Phase.model_validate(phase_data)
+    candidate = Winner(
+        trial_number=0,
+        params={},
+        effective_overrides={},
+        metric=1.0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"unknown min_delta_vs baseline 'missing'.*available prior phase winners: none",
+    ):
+        _apply_promotion(experiment, phase, candidate, {})
 
 
 def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:

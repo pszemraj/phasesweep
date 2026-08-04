@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -410,7 +410,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
 def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocking_tool: str
 ) -> None:
-    """The real SDK dispatch must keep await responsive during blocking work."""
+    """The real SDK dispatch keeps await responsive under a manual clock."""
     pytest.importorskip("mcp")
     from mcp import types
 
@@ -434,13 +434,32 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         }
     )
 
+    class ManualClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.blocking_started = threading.Event()
+            self.release_blocking = threading.Event()
+
+        def block(self, seconds: float) -> None:
+            self.blocking_started.set()
+            if not self.release_blocking.wait(timeout=1.0):
+                raise AssertionError("blocking MCP call monopolized the event loop")
+            self.now += seconds
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = ManualClock()
+
     async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
         del timeout_seconds
-        await asyncio.sleep(0.02)
+        while not clock.blocking_started.is_set():
+            await asyncio.sleep(0)
+        clock.advance(0.02)
         return awaited
 
     def blocking_cancel(run_id: str) -> dict:
-        time.sleep(0.3)
+        clock.block(0.3)
         return {
             "run_id": run_id,
             "state": "cancelled",
@@ -450,7 +469,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     def blocking_launch(experiment_id: str, from_phase: str | None = None) -> dict:
         del from_phase
-        time.sleep(0.3)
+        clock.block(0.3)
         return {"run_id": "r2", "experiment_id": experiment_id, "state": "running"}
 
     monkeypatch.setattr(app, "await_run", quick_await)
@@ -476,11 +495,13 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     )
 
     async def dispatch_concurrently() -> tuple[float, object, object]:
-        started = time.perf_counter()
+        started = clock.now
         await_task = asyncio.create_task(handler(await_request))
         blocking_task = asyncio.create_task(handler(blocking_request))
         await_result = await await_task
-        await_elapsed = time.perf_counter() - started
+        await_elapsed = clock.now - started
+        assert not blocking_task.done()
+        clock.release_blocking.set()
         blocking_result = await blocking_task
         return await_elapsed, await_result.root, blocking_result.root
 

@@ -59,6 +59,46 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
         assert gid is None
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n_jobs": 0}, "positive integer"),
+        (
+            {"n_jobs": 1, "explicit_ids": [0], "explicit_devices": ["GPU-a"]},
+            "mutually exclusive",
+        ),
+        ({"n_jobs": 1, "explicit_ids": []}, "at least one CUDA device index"),
+        ({"n_jobs": 1, "explicit_ids": [-1]}, "non-negative"),
+        ({"n_jobs": 1, "explicit_devices": []}, "at least one CUDA device token"),
+        ({"n_jobs": 1, "explicit_devices": [" "]}, "non-empty"),
+        ({"n_jobs": 1, "explicit_devices": ["GPU-a,GPU-b"]}, "without commas"),
+        ({"n_jobs": 1, "explicit_devices": ["-1"]}, "without commas or -1"),
+        (
+            {"n_jobs": 2, "explicit_ids": [0], "policy": "whole_node"},
+            "requires n_jobs=1",
+        ),
+        ({"n_jobs": 1, "policy": "whole_node"}, "requires an explicit_ids"),
+        (
+            {"n_jobs": 1, "explicit_ids": [0], "policy": "none"},
+            "cannot be combined",
+        ),
+        ({"n_jobs": 2, "policy": "none"}, "requires allow_no_gpu=True"),
+        ({"n_jobs": 1, "policy": "invalid"}, "Unknown GPU policy"),
+    ],
+)
+def test_gpu_pool_create_enforces_config_invariants_directly(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        GpuPool.create(**kwargs)  # type: ignore[arg-type]
+
+
+def test_gpu_pool_create_normalizes_explicit_device_tokens() -> None:
+    pool = GpuPool.create(n_jobs=1, explicit_devices=[" GPU-a "])
+
+    assert [device.visible_token for device in pool._devices] == ["GPU-a"]
+
+
 def test_explicit_gpu_ids_honored_for_single_job():
     """A single-job phase with gpu_ids=[3] must isolate to GPU 3, not no-op."""
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
@@ -127,6 +167,20 @@ def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
 
     with pool.acquire() as gid:
         assert gid is None
+
+
+def test_single_job_warns_when_nvidia_smi_is_broken_on_gpu_host(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1)
+
+    assert pool._devices == []
+    assert any("running WITHOUT CUDA isolation" in record.message for record in caplog.records)
 
 
 def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):

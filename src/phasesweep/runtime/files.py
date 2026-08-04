@@ -37,6 +37,10 @@ class UnsafePrivatePathError(RuntimeError):
     """Raised when a private directory or file is not safe to mutate."""
 
 
+class PlatformCapabilityError(RuntimeError):
+    """Raised when the host lacks a capability required for safe operation."""
+
+
 @dataclass(frozen=True)
 class _LockPolicy:
     """Ownership and mode expected for one lock namespace."""
@@ -50,7 +54,7 @@ class _LockPolicy:
 def require_posix_runtime() -> None:
     """Raise a clear error when execution is attempted on an unsupported platform."""
     if not _supports_posix_runtime_features():
-        raise RuntimeError(POSIX_RUNTIME_ERROR)
+        raise PlatformCapabilityError(POSIX_RUNTIME_ERROR)
 
 
 def _supports_posix_runtime_features(
@@ -197,9 +201,10 @@ def open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises UnsafeLockPathError: If the platform lacks ``O_NOFOLLOW``, the
-        parent directory is missing or unsafe, the leaf name is unsafe, or
-        the file fails the regular-file/ownership/mode checks.
+    :raises PlatformCapabilityError: If the platform lacks ``O_NOFOLLOW``.
+    :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
+        the leaf name is unsafe, or the file fails the regular-file/ownership/
+        mode checks.
     """
     from phasesweep.runtime.process import defer_shutdown_signals
 
@@ -216,14 +221,17 @@ def _open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises UnsafeLockPathError: If the platform lacks ``O_NOFOLLOW``, the
-        parent directory is missing or unsafe, the leaf name is unsafe, or
-        the file fails the regular-file/ownership/mode checks.
+    :raises PlatformCapabilityError: If the platform lacks ``O_NOFOLLOW``.
+    :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
+        the leaf name is unsafe, or the file fails the regular-file/ownership/
+        mode checks.
     """
     require_posix_runtime()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
-        raise UnsafeLockPathError("This platform cannot safely open lock files without symlinks.")
+        raise PlatformCapabilityError(
+            "This platform cannot safely open lock files without following symlinks."
+        )
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
@@ -360,7 +368,7 @@ def nofollow_flag() -> int:
     """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
-        raise UnsafePrivatePathError(
+        raise PlatformCapabilityError(
             "This platform cannot safely access private files without following symlinks."
         )
     return nofollow

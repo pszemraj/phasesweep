@@ -14,6 +14,7 @@ import yaml
 
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import _generation_winner_path, _winner_path
+from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
     AWAIT_MAX_TIMEOUT_SECONDS,
@@ -135,6 +136,38 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     assert phase["target_already_satisfied"] is True
     assert phase["remaining_trials"] == 0
     assert phase["trial_data_available"] is True
+
+
+def test_status_floors_inconsistent_historical_terminal_count() -> None:
+    """A partial snapshot cannot expose a negative pre-run trial count."""
+    status = {
+        "current_generation_id": "generation-current",
+        "published_generation_id": None,
+        "represented_generation_id": "generation-current",
+        "is_published": False,
+        "metric": {"name": "loss", "goal": "minimize"},
+        "summary_present": False,
+        "phases": [
+            {
+                "phase": "p",
+                "n_trials": 3,
+                "trials": {"COMPLETE": 1},
+                "generation_trials": {"COMPLETE": 2},
+                "winner_present": False,
+                "trial_data_available": True,
+            }
+        ],
+    }
+
+    payload = status_payload(
+        "srv",
+        status,
+        None,
+        result_source="current_shared_study",
+        elapsed_seconds=None,
+    )
+
+    assert payload["phases"][0]["terminal_trials_before_run"] == 0
 
 
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:

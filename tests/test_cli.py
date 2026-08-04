@@ -58,7 +58,15 @@ def test_help_registers_commands_and_options() -> None:
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
-    for command in ("check", "init-catalog", "install", "recover-run", "serve", "uninstall"):
+    for command in (
+        "check",
+        "check-install",
+        "init-catalog",
+        "install",
+        "recover-run",
+        "serve",
+        "uninstall",
+    ):
         assert command in mcp_help.output
     assert "--catalog PATH" not in mcp_help.output
 
@@ -69,6 +77,14 @@ def test_help_registers_commands_and_options() -> None:
     check_help = runner.invoke(cli_main, ["mcp", "check", "--help"], terminal_width=120)
     assert check_help.exit_code == 0
     assert "--catalog PATH" in check_help.output
+
+    check_install_help = runner.invoke(
+        cli_main,
+        ["mcp", "check-install", "--help"],
+        terminal_width=120,
+    )
+    assert check_install_help.exit_code == 0
+    assert "--agent" in check_install_help.output
 
     init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)
     assert init_help.exit_code == 0

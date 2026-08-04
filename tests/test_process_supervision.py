@@ -21,6 +21,7 @@ from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
+    ATTEMPT_LIFECYCLE_FILE,
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
@@ -144,6 +145,54 @@ def test_run_supervised_retains_identity_and_records_exit_on_success(tmp_path: P
     assert lifecycle.state == "exited"
     assert lifecycle.return_code == 0
     assert lifecycle.cleanup_confirmed is True
+
+
+def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> None:
+    trial_dir = tmp_path / "trial"
+    (trial_dir / ATTEMPT_LIFECYCLE_FILE).mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="is unreadable"):
+        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("{", "Malformed attempt lifecycle record"),
+        ("[]", "must be a JSON object"),
+        (
+            '{"schema_version": 2, "attempt_id": "expected", "state": "allocated"}',
+            "Unsupported attempt lifecycle schema",
+        ),
+        (
+            '{"schema_version": 1, "attempt_id": "other", "state": "allocated"}',
+            "belongs to another attempt",
+        ),
+        (
+            '{"schema_version": 1, "attempt_id": "expected", "state": "launching"}',
+            "Unknown attempt lifecycle state",
+        ),
+        (
+            '{"schema_version": 1, "attempt_id": "expected", "state": "exited", '
+            '"return_code": true}',
+            "field 'return_code' is invalid",
+        ),
+        (
+            '{"schema_version": 1, "attempt_id": "expected", "state": "exited", '
+            '"return_code": 0, "cleanup_confirmed": 1}',
+            "field 'cleanup_confirmed' is invalid",
+        ),
+    ],
+)
+def test_read_attempt_lifecycle_rejects_every_malformed_shape(
+    tmp_path: Path, payload: str, message: str
+) -> None:
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text(payload)
+
+    with pytest.raises(ValueError, match=message):
+        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
 
 
 def test_run_supervised_terminates_child_when_identity_write_fails(

@@ -321,7 +321,14 @@ def _apply_promotion(
     if promotion is None:
         return candidate, None
 
-    baseline = winners[promotion.min_delta_vs]
+    try:
+        baseline = winners[promotion.min_delta_vs]
+    except KeyError:
+        available = ", ".join(repr(name) for name in sorted(winners)) or "none"
+        raise RuntimeError(
+            f"Phase {phase.name!r} promotion references unknown min_delta_vs baseline "
+            f"{promotion.min_delta_vs!r}; available prior phase winners: {available}."
+        ) from None
     promoted, improvement, gates_passed, reason = _evaluate_promotion_rule(
         goal=experiment.metric.goal,
         promotion=promotion,
