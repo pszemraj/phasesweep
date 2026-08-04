@@ -42,7 +42,7 @@ from phasesweep.runtime.process import read_proc_starttime
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
 
-def _require_linux_mcp_host() -> None:
+def require_linux_mcp_host() -> None:
     """Require Linux process identity semantics for autonomous MCP control.
 
     :raises CatalogError: If the host cannot provide Linux ``/proc`` process
@@ -486,7 +486,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
-    _require_linux_mcp_host()
+    require_linux_mcp_host()
     catalog, base = _parse_catalog(catalog_path)
     seen: set[str] = set()
     namespace_owners: dict[str, str] = {}
@@ -555,7 +555,7 @@ class Registry:
             An immutable :class:`Registry`.
 
         """
-        _require_linux_mcp_host()
+        require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
         items: dict[str, RegisteredExperiment] = {}
         # Two catalog ids must never govern one engine experiment: the MCP

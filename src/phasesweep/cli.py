@@ -43,8 +43,8 @@ from phasesweep.mcp.install.targets import agent_ids
 from phasesweep.mcp.registry import (
     CatalogCheckReport,
     Registry,
-    _require_linux_mcp_host,
     check_catalog,
+    require_linux_mcp_host,
 )
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
@@ -445,7 +445,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     """
     state_dir = state_dir.expanduser().resolve()
     try:
-        _require_linux_mcp_host()
+        require_linux_mcp_host()
     except CatalogError as exc:
         raise click.ClickException(str(exc)) from None
     try:
