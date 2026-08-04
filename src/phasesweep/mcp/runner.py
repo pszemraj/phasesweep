@@ -387,6 +387,9 @@ def _persist_spawned_handle(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux "
             "/proc start time is unavailable"
         )
+    pending = store.get(run_id)
+    if pending is None:
+        raise RuntimeError(f"cannot persist runner identity for unknown run {run_id!r}")
     store.update(
         RunHandle(
             run_id=run_id,
@@ -398,6 +401,7 @@ def _persist_spawned_handle(
             started_at=started_at,
             launch_state="spawned",
             allow_cancel=allow_cancel,
+            visible_params_at_launch=pending.visible_params_at_launch,
             # Binds pid/pid_starttime to this boot: after a reboot the pair can
             # name an unrelated process, and a reader that knows the boot
             # differs can rule the runner dead without signalling anything.

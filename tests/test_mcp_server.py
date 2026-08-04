@@ -87,11 +87,18 @@ def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> 
     return path
 
 
-def _catalog(tmp_path: Path, config: Path, allow: dict[str, bool] | None = None) -> Path:
+def _catalog(
+    tmp_path: Path,
+    config: Path,
+    allow: dict[str, bool] | None = None,
+    *,
+    visible_params: object | None = None,
+) -> Path:
     return write_mcp_catalog(
         tmp_path,
         {"srv": config},
         allow=allow,
+        visible_params=None if visible_params is None else {"srv": visible_params},
         filename="srv.catalog.yaml",
     )
 
@@ -457,7 +464,14 @@ def test_launch_passes_config_snapshot_to_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        _catalog(
+            tmp_path,
+            config,
+            allow=ALLOW_SIDE_EFFECTS,
+            visible_params=["lr"],
+        )
+    )
     captured = patch_popen_capture(monkeypatch)
     original_create = store.create
     snapshots_before_publish: list[bytes] = []
@@ -485,6 +499,8 @@ def test_launch_passes_config_snapshot_to_runner(
     handle = store.get(result["run_id"])
     assert handle is not None
     assert handle.launch_state == "spawned"
+    assert handle.allow_cancel is True
+    assert handle.visible_params_at_launch == ["lr"]
     assert cmd[cmd.index("--started-at") + 1] == handle.started_at
 
 
@@ -1045,7 +1061,13 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     handle = replace(
-        make_run_handle(run_id="srv-boot", experiment_id="srv", pid=999999, starttime=111),
+        make_run_handle(
+            run_id="srv-boot",
+            experiment_id="srv",
+            pid=999999,
+            starttime=111,
+            allow_cancel=True,
+        ),
         boot_id="0" * len(current_boot) if current_boot != "0" * len(current_boot) else "1",
     )
     store.create(handle)
@@ -1235,6 +1257,77 @@ def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:
     )
 
     assert visible_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": 0.001}
+
+
+@pytest.mark.parametrize(
+    ("launch_policy", "current_policy", "expected"),
+    [
+        pytest.param("none", "all", "<redacted>", id="later-loosening-cannot-reveal"),
+        pytest.param("all", "none", "<redacted>", id="later-tightening-redacts"),
+        pytest.param(["lr"], "all", 0.001, id="launch-allowlist-remains-visible"),
+        pytest.param("all", ["lr"], 0.001, id="current-allowlist-restricts"),
+    ],
+)
+def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
+    tmp_path: Path,
+    launch_policy: object,
+    current_policy: object,
+    expected: object,
+) -> None:
+    config = _config(tmp_path)
+    catalog = _catalog(tmp_path, config, visible_params=launch_policy)
+    launch_registry = Registry.load(catalog)
+    store = RunStore(launch_registry.state_dir)
+    reg = launch_registry.get("srv")
+    run_id = "srv-historical"
+    snapshot = config.read_bytes()
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.create(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            visible_params_at_launch=reg.visible_params,
+        )
+    )
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+        generation_id=run_id,
+    )
+
+    _catalog(tmp_path, config, visible_params=current_policy)
+    restarted = PhaseSweepMCP(Registry.load(catalog), store)
+
+    assert restarted.winners(run_id=run_id)["phases"][0]["params"]["lr"] == expected
+
+
+def test_legacy_run_without_visibility_never_falls_back_to_current_catalog(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, visible_params="all"))
+    reg = registry.get("srv")
+    run_id = "srv-legacy"
+    snapshot = config.read_bytes()
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.create(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            visible_params_at_launch=None,
+        )
+    )
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+        generation_id=run_id,
+    )
+
+    assert app.winners(run_id=run_id)["phases"][0]["params"] == {"lr": "<redacted>"}
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
@@ -1736,6 +1829,7 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
+            allow_cancel=True,
         )
     )
 
@@ -1743,14 +1837,29 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
         app.cancel(run_id)
 
 
-def test_cancel_decataloged_run_uses_launch_time_permission(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cancel_cannot_be_enabled_after_launch(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-launch-denied-cancel"
+    store.create(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            allow_cancel=False,
+        )
+    )
+
+    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
+        app.cancel(run_id)
+
+
+def test_cancel_decataloged_run_is_denied_even_when_launch_allowed_it(tmp_path: Path) -> None:
     old_config = _config(tmp_path, name="old")
     old_snapshot = old_config.read_bytes()
     other_config = _config(tmp_path, name="other")
-    app, registry, store = make_mcp_app(
+    app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
     )
     run_id = "old-running"
@@ -1762,27 +1871,8 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     )
     store.create(handle)
 
-    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
-        write_run_status(
-            store,
-            run_id,
-            returncode=143,
-            error_class="cancelled",
-            cleanup_confirmed=True,
-        )
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
-
-    result = app.cancel(run_id)
-
-    assert result == {
-        "run_id": run_id,
-        "state": "cancelled",
-        "cleanup_confirmed": True,
-        "recovery_required": False,
-    }
-    assert not store.cleanup_uncertain_path(run_id).exists()
+    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
+        app.cancel(run_id)
 
 
 def test_cancel_decataloged_run_without_launch_time_permission_denied(tmp_path: Path) -> None:
@@ -1818,6 +1908,7 @@ def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        allow_cancel=True,
         pid=999999,
         starttime=111,
     )
@@ -1855,6 +1946,7 @@ def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        allow_cancel=True,
     )
     store.create(handle)
 
@@ -1887,6 +1979,7 @@ def test_cancel_requires_runner_status_cleanup_confirmation(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        allow_cancel=True,
     )
     store.create(handle)
 
@@ -1925,6 +2018,7 @@ def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        allow_cancel=True,
     )
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
@@ -1964,6 +2058,7 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        allow_cancel=True,
     )
     store.create(handle)
     barrier = threading.Barrier(2)

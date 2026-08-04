@@ -51,8 +51,13 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
     UnknownRunError,
 )
-from phasesweep.mcp.redaction import ResultSource, status_payload, winners_payload
-from phasesweep.mcp.registry import RegisteredExperiment, Registry
+from phasesweep.mcp.redaction import (
+    ResultSource,
+    intersect_visible_params,
+    status_payload,
+    winners_payload,
+)
+from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     RunHandle,
@@ -1096,15 +1101,6 @@ class PhaseSweepMCP:
             run_id=run_id,
             include_run=False,
         )
-        try:
-            visible_params = self._registry.get(target_id).visible_params
-        except UnknownExperimentError:
-            if run_id is None:
-                raise
-            # A run snapshot remains readable after the operator removes
-            # its catalog entry. Without a current visibility policy,
-            # default to the strict redacted posture.
-            visible_params = "none"
         snapshot, result_source = self._result_snapshot_view(experiment, handle)
         if snapshot is not None:
             winner_views = snapshot.winner_views()
@@ -1123,6 +1119,10 @@ class PhaseSweepMCP:
             )
             represented_generation_id = status["represented_generation_id"]
             winner_views = read_winners(experiment, generation_id=represented_generation_id)
+        authority_handle = handle
+        if authority_handle is None and represented_generation_id is not None:
+            authority_handle = self._runs.get(represented_generation_id)
+        visible_params = self._effective_visible_params(target_id, authority_handle)
         result = winners_payload(
             target_id,
             winner_views,
@@ -1139,6 +1139,26 @@ class PhaseSweepMCP:
         )
         result["failure"] = self._run_failure_payload(handle) if handle is not None else None
         return result
+
+    def _effective_visible_params(
+        self,
+        experiment_id: str,
+        handle: RunHandle | None,
+    ) -> VisibleParamsPolicy:
+        """Resolve current or launch/current-intersected winner visibility.
+
+        :param str experiment_id: Catalog id associated with the represented results.
+        :param RunHandle | None handle: MCP run whose generation is represented, if any.
+        :return VisibleParamsPolicy: Effective sampled-parameter visibility.
+        """
+        try:
+            current_policy = self._registry.get(experiment_id).visible_params
+        except UnknownExperimentError:
+            return "none"
+        if handle is None:
+            return current_policy
+        launch_policy = handle.visible_params_at_launch or "none"
+        return intersect_visible_params(launch_policy, current_policy)
 
     def _result_snapshot_view(
         self,
@@ -1534,6 +1554,11 @@ class PhaseSweepMCP:
             started_at=utc_now_iso(),
             launch_state="launching",
             allow_cancel=reg.allow_cancel,
+            visible_params_at_launch=(
+                list(reg.visible_params)
+                if isinstance(reg.visible_params, list)
+                else reg.visible_params
+            ),
         )
 
     def _record_launch_failure(
@@ -1715,7 +1740,8 @@ class PhaseSweepMCP:
             pid_starttime=read_proc_starttime(proc.pid),
             started_at=pending.started_at,
             launch_state="spawned",
-            allow_cancel=reg.allow_cancel,
+            allow_cancel=pending.allow_cancel,
+            visible_params_at_launch=pending.visible_params_at_launch,
             boot_id=read_boot_id(),
         )
         return handle
@@ -1735,15 +1761,16 @@ class PhaseSweepMCP:
         return state_dir
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether the current catalog or launch handle permits cancellation.
+        """Return whether launch-time and current policy permit cancellation.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
-        :return bool: Current catalog permission, or the launch-time permission if unregistered.
+        :return bool: Whether both launch-time and current permission are true.
         """
         try:
-            return self._registry.get(handle.experiment_id).allow_cancel
+            current_allowed = self._registry.get(handle.experiment_id).allow_cancel
         except UnknownExperimentError:
-            return handle.allow_cancel
+            return False
+        return handle.allow_cancel and current_allowed
 
 
 F = TypeVar("F", bound=Callable[..., Any])

@@ -126,6 +126,10 @@ class RunHandle:
     started_at: str  # ISO-8601 UTC
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
+    # ``None`` is reserved for handles written before launch-time visibility
+    # was persisted. Readers treat it as ``none`` rather than consulting the
+    # current catalog, which could reveal values hidden at launch.
+    visible_params_at_launch: Literal["none", "all"] | list[str] | None = None
     # Boot that pid/pid_starttime belong to; None off-Linux and in handles
     # written before boot ids were recorded.
     boot_id: str | None = None
@@ -273,6 +277,7 @@ class RunStore:
             "config_sha256",
             "started_at",
             "allow_cancel",
+            "visible_params_at_launch",
         )
         changed = [
             name for name in immutable_fields if getattr(current, name) != getattr(handle, name)
@@ -338,6 +343,18 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
             return None
         if type(handle.allow_cancel) is not bool:
+            return None
+        visible_params = handle.visible_params_at_launch
+        if isinstance(visible_params, str):
+            if visible_params not in {"none", "all"}:
+                return None
+        elif isinstance(visible_params, list):
+            if (
+                not all(type(key) is str and key and key == key.strip() for key in visible_params)
+                or len(set(visible_params)) != len(visible_params)
+            ):
+                return None
+        elif visible_params is not None:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None

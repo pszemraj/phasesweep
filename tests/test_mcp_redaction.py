@@ -11,7 +11,7 @@ import pytest
 
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import WinnerSource
-from phasesweep.mcp.redaction import winners_payload
+from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
@@ -223,6 +223,25 @@ def test_winners_payload_applies_visible_params_policy(
     phase = _winners_payload("redact_me", [view], visible_params=policy)["phases"][0]
     assert phase["params"] == expected
     assert phase["params_redacted"] is redacted
+
+
+@pytest.mark.parametrize(
+    ("launch_policy", "current_policy", "expected"),
+    [
+        ("none", "all", "none"),
+        ("all", "none", "none"),
+        ("all", ["lr"], ["lr"]),
+        (["lr", "depth"], "all", ["lr", "depth"]),
+        (["lr", "depth"], ["depth", "dropout"], ["depth"]),
+        ([], "all", []),
+    ],
+)
+def test_visible_params_intersection_never_broadens_either_policy(
+    launch_policy: object,
+    current_policy: object,
+    expected: object,
+) -> None:
+    assert intersect_visible_params(launch_policy, current_policy) == expected  # type: ignore[arg-type]
 
 
 def test_winners_payload_computes_phase_completeness_and_provenance() -> None:

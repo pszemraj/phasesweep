@@ -38,9 +38,16 @@ def _earlier_boot_id() -> str:
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1")
+    handle = make_run_handle(
+        run_id="exp-1",
+        allow_cancel=True,
+        visible_params_at_launch=["lr", "depth"],
+    )
     store.create(handle)
     assert store.get("exp-1") == handle
+    persisted = json.loads((tmp_path / "state" / "runs" / "exp-1.json").read_text())
+    assert persisted["allow_cancel"] is True
+    assert persisted["visible_params_at_launch"] == ["lr", "depth"]
     assert store.get("missing") is None
 
 
@@ -97,8 +104,30 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
     assert store.get("exp-1") == spawned
     with pytest.raises(ValueError, match="immutable field"):
         store.update(replace(spawned, experiment_id="other"))
+    with pytest.raises(ValueError, match="immutable field"):
+        store.update(replace(spawned, visible_params_at_launch="all"))
     with pytest.raises(ValueError, match="launching-to-spawned"):
         store.update(replace(spawned, pid=os.getppid(), pgid=os.getppid()))
+
+
+def test_legacy_handle_missing_launch_authority_loads_fail_closed(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    payload = asdict(
+        make_run_handle(
+            run_id="exp-legacy",
+            allow_cancel=True,
+            visible_params_at_launch="all",
+        )
+    )
+    payload.pop("allow_cancel")
+    payload.pop("visible_params_at_launch")
+    (tmp_path / "state" / "runs" / "exp-legacy.json").write_text(json.dumps(payload))
+
+    loaded = store.get("exp-legacy")
+
+    assert loaded is not None
+    assert loaded.allow_cancel is False
+    assert loaded.visible_params_at_launch is None
 
 
 def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path: Path) -> None:
@@ -212,6 +241,11 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
         ("started_at", "2026-07-17T12:00:00"),
         ("boot_id", ""),
         ("boot_id", 12345),
+        ("visible_params_at_launch", "some"),
+        ("visible_params_at_launch", [""]),
+        ("visible_params_at_launch", ["lr", "lr"]),
+        ("visible_params_at_launch", ["lr", 1]),
+        ("visible_params_at_launch", {"lr": True}),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:

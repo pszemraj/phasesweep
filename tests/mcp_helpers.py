@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.mcp import runner as mcp_runner
-from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP
 from phasesweep.mcp.time import utc_now_iso
@@ -186,6 +186,7 @@ def make_run_handle(
     starttime: int | None = None,
     launch_state: RunLaunchState = "spawned",
     allow_cancel: bool = False,
+    visible_params_at_launch: VisibleParamsPolicy | None = "none",
 ) -> RunHandle:
     if launch_state == "launching":
         return RunHandle(
@@ -198,6 +199,7 @@ def make_run_handle(
             started_at=utc_now_iso(),
             launch_state=launch_state,
             allow_cancel=allow_cancel,
+            visible_params_at_launch=visible_params_at_launch,
         )
     process_id = os.getpid() if pid is None else pid
     return RunHandle(
@@ -210,6 +212,7 @@ def make_run_handle(
         started_at=utc_now_iso(),
         launch_state=launch_state,
         allow_cancel=allow_cancel,
+        visible_params_at_launch=visible_params_at_launch,
     )
 
 
@@ -220,6 +223,7 @@ def claim_runner_handle(
     config_sha256: str,
     started_at: str,
     experiment_id: str = "srv",
+    visible_params_at_launch: VisibleParamsPolicy | None = "none",
 ) -> None:
     """Create the launch reservation a real MCP server owns before spawning."""
     store.create(
@@ -232,6 +236,7 @@ def claim_runner_handle(
             pid_starttime=None,
             started_at=started_at,
             launch_state="launching",
+            visible_params_at_launch=visible_params_at_launch,
         )
     )
 

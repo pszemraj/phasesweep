@@ -861,6 +861,7 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
         config_sha256="a" * 64,
         started_at=started_at,
         experiment_id="cancel_me",
+        visible_params_at_launch=["lr"],
     )
 
     mcp_runner._persist_spawned_handle(
@@ -876,6 +877,7 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
     assert handle is not None
     assert handle.boot_id is not None
     assert handle.boot_id == read_boot_id()
+    assert handle.visible_params_at_launch == ["lr"]
 
 
 def _runner_argv(store: RunStore, *, run_id: str, config: Path, started_at: str) -> list[str]:

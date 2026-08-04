@@ -23,6 +23,26 @@ ResultSource: TypeAlias = Literal[
 _TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
 
 
+def intersect_visible_params(
+    launch_policy: VisibleParamsPolicy,
+    current_policy: VisibleParamsPolicy,
+) -> VisibleParamsPolicy:
+    """Return the non-escalating intersection of two visibility policies.
+
+    :param VisibleParamsPolicy launch_policy: Visibility authorized when the run launched.
+    :param VisibleParamsPolicy current_policy: Visibility authorized by the current catalog.
+    :return VisibleParamsPolicy: Policy no broader than either input.
+    """
+    if launch_policy == "none" or current_policy == "none":
+        return "none"
+    if launch_policy == "all":
+        return current_policy
+    if current_policy == "all":
+        return launch_policy
+    current_keys = set(current_policy)
+    return [key for key in launch_policy if key in current_keys]
+
+
 def _visible_winner_params(
     params: dict[str, Any], policy: VisibleParamsPolicy
 ) -> tuple[dict[str, Any], bool]:
