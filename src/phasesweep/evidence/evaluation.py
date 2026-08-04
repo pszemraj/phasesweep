@@ -776,10 +776,7 @@ def evaluate_gates(
     """
     results: list[GateResult] = []
     for gate in gates:
-        fn = _GATE_DISPATCH.get(type(gate))
-        if fn is None:  # pragma: no cover - closed union
-            results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
-            continue
+        fn = _GATE_DISPATCH[type(gate)]
         remaining = _remaining_budget_seconds(deadline)
         deadline_capped = False
         if remaining is not None:

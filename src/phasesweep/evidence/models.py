@@ -106,15 +106,20 @@ class LogRegexExtractor(_TrialPathModel):
     select: Literal["last", "first", "min", "max"] = "last"
 
 
-class WandbExtractor(_Frozen):
+class _WandbSummarySource(_Frozen):
+    """Shared location and polling contract for one W&B run summary."""
+
+    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
+    project: str = Field(min_length=1, pattern=r"^[^/]+$")
+    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
+
+
+class WandbExtractor(_WandbSummarySource):
     """Extract a scalar from this attempt's finished W&B run summary."""
 
     type: Literal["wandb"]
-    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
-    project: str = Field(min_length=1, pattern=r"^[^/]+$")
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
@@ -323,15 +328,11 @@ class Sha256Gate(_TrialPathModel):
         return value.lower()
 
 
-class WandbSummaryRequiredGate(_Frozen):
+class WandbSummaryRequiredGate(_WandbSummarySource):
     """Require keys in this attempt's finished W&B run summary."""
 
     type: Literal["wandb_summary_required"]
-    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
-    project: str = Field(min_length=1, pattern=r"^[^/]+$")
     keys: list[str] = Field(min_length=1)
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 Gate = Annotated[
