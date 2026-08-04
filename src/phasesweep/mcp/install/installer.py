@@ -878,6 +878,9 @@ def run(
         return 2
 
     attention = 0
+    # Targets whose MCP step already reported a problem; verification re-reads the
+    # same config and must not count that one problem a second time.
+    mcp_needs_attention: set[str] = set()
     instruction_dry_run_state: dict[Path, str] | None = {} if dry_run else None
     for target in targets:
         click.echo(f"  {target.display_name}")
@@ -908,9 +911,14 @@ def run(
                     click.echo(f"      {line}")
             if not result.ok:
                 attention += 1
+                if kind == "mcp":
+                    mcp_needs_attention.add(target.id)
     # Verification runs regardless of earlier per-step failures: a run where one
     # target failed is exactly where the remaining targets' launchers most need
-    # checking. A non-ok check still adds to `attention` (and so to the exit code).
+    # checking. It is reported for every selected target, but only adds to
+    # `attention` (and so to the exit code) for a problem no earlier step already
+    # counted, using the same needs-attention predicate as `check_install` so both
+    # commands reach the same verdict on the same on-disk state.
     if mode == "install" and not dry_run and "mcp" in integrations:
         click.echo("\nverification:")
         for target in targets:
@@ -919,7 +927,7 @@ def run(
             if verification.detail:
                 for line in verification.detail.splitlines():
                     click.echo(f"    {line}")
-            if verification.status != "ok":
+            if not verification.ok and target.id not in mcp_needs_attention:
                 attention += 1
     click.echo("")
     if attention:

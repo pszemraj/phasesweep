@@ -1131,7 +1131,7 @@ def test_installer_returns_failure_when_post_install_verification_is_not_ok(
             target.mcp.path,
             None,
             (),
-            "not-configured",
+            "missing",
             "written entry could not be verified",
         ),
     )
@@ -1140,9 +1140,31 @@ def test_installer_returns_failure_when_post_install_verification_is_not_ok(
 
     captured = capsys.readouterr()
     assert code == 1
-    assert "not-configured" in captured.out
+    assert "missing" in captured.out
     assert "written entry could not be verified" in captured.out
-    assert "need manual attention" in captured.err
+    assert "1 step(s) need manual attention" in captured.err
+
+
+def test_installer_verification_uses_the_check_install_attention_predicate(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    target = _target(project, "claude")
+    # Statuses `check-install` accepts must not make `install` disagree with it.
+    monkeypatch.setattr(
+        installer,
+        "_check_target_launcher",
+        lambda _target: installer.LauncherCheck(target.mcp.path, None, (), "unmanaged", None),
+    )
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "unmanaged" in captured.out
+    assert "need manual attention" not in captured.err
 
 
 def test_installer_verifies_launchers_when_an_earlier_step_needed_attention(
@@ -1163,7 +1185,58 @@ def test_installer_verifies_launchers_when_an_earlier_step_needed_attention(
     assert "skipped" in captured.out
     assert "verification:" in captured.out
     assert "Claude Code" in captured.out
-    assert "need manual attention" in captured.err
+    # The unreadable opencode config is one problem, counted once, even though
+    # verification re-reads and re-reports it.
+    assert "1 step(s) need manual attention" in captured.err
+
+
+def test_installer_counts_one_attention_for_one_unmanaged_json_entry(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, {"command": "hand-authored"})
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "conflict" in captured.out
+    assert "verification:" in captured.out
+    assert "unmanaged" in captured.out
+    assert "1 step(s) need manual attention" in captured.err
+
+    # `check-install` reads the same on-disk state and must not contradict the
+    # verification section it shares with `install`.
+    capsys.readouterr()
+    assert installer.check_install(project, ["claude"]) == 0
+
+
+def test_installer_counts_one_attention_for_one_unmanaged_codex_table(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    config = _target(project, "codex").mcp.path
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[mcp_servers.phasesweep]\ncommand = "hand-authored"\n')
+
+    code = installer.run(
+        "install",
+        project,
+        catalog,
+        ["codex", "claude"],
+        "mcp",
+        yes=True,
+        allow_user_scope=True,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "1 step(s) need manual attention" in captured.err
+    assert "hand-authored" in config.read_text()
+
+    capsys.readouterr()
+    assert installer.check_install(project, ["codex", "claude"]) == 0
 
 
 def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, capsys):
