@@ -342,6 +342,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "next await an active run" in descriptions[TOOL_GET_RUN_STATUS]
     assert "stop if recovery_required" in descriptions[TOOL_GET_RUN_STATUS]
     assert "repeat while running" in descriptions[TOOL_AWAIT_RUN]
+    assert "client-safe 20-second wait" in descriptions[TOOL_AWAIT_RUN]
     assert "stop immediately for recovery_required" in descriptions[TOOL_AWAIT_RUN]
     assert "this ends the normal workflow" in descriptions[TOOL_GET_RUN_RESULTS]
     assert "winner-only data" in descriptions[TOOL_GET_RUN_RESULTS]
@@ -369,6 +370,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert schemas[TOOL_AWAIT_RUN]["required"] == ["run_id"]
     assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
     timeout_schema = schemas[TOOL_AWAIT_RUN]["properties"]["timeout_seconds"]
+    assert AWAIT_DEFAULT_TIMEOUT_SECONDS == 20
     assert timeout_schema["default"] == AWAIT_DEFAULT_TIMEOUT_SECONDS
     assert timeout_schema["minimum"] == AWAIT_MIN_TIMEOUT_SECONDS
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS

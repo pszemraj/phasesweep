@@ -90,9 +90,10 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
-# await_run blocks server-side so one call replaces dozens of polls; the cap
-# keeps a response inside common client tool timeouts.
-AWAIT_DEFAULT_TIMEOUT_SECONDS = 120
+# await_run blocks server-side so one call replaces many status polls. Keep the
+# default below common 30-second MCP client deadlines; callers with a longer
+# tool-call budget can opt into the larger supported range.
+AWAIT_DEFAULT_TIMEOUT_SECONDS = 20
 AWAIT_MIN_TIMEOUT_SECONDS = 5
 AWAIT_MAX_TIMEOUT_SECONDS = 600
 AWAIT_RECHECK_SECONDS = 30
@@ -139,8 +140,10 @@ DESCRIPTION_CANCEL_RUN = (
 )
 DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
-    "recovery. Call after launch_run and repeat while running; next call get_run_results when "
-    "terminal. Read-only: always reuse the run_id and stop immediately for recovery_required."
+    "recovery. Call after launch_run and repeat while running; omit timeout_seconds for a "
+    "client-safe 20-second wait, and request longer waits only when the client permits them. "
+    "Next call get_run_results when terminal. Read-only: always reuse the run_id and stop "
+    "immediately for recovery_required."
 )
 
 ExperimentId = Annotated[
