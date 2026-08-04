@@ -59,7 +59,7 @@ A working connection returns only catalog-approved experiment IDs, descriptions,
 By default, `--type all` installs two independent integrations:
 
 - an MCP server entry whose command is the absolute `phasesweep-mcp` executable from the environment running the installer and whose arguments are `--catalog` plus the reviewed catalog path;
-- a marker-fenced copy of the packaged seven-rule agent instructions where the client supports project instructions.
+- a marker-fenced copy of the packaged nine-rule agent instructions where the client supports project instructions.
 
 Project scope is used where the client reliably supports it. Claude Desktop and Codex MCP entries are user-scoped, and the plan labels them before confirmation. Shared instruction files contain one package-managed block with multiple client owners; if a later install updates that shared prompt, the plan names the existing owners affected.
 
