@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 import types
 from dataclasses import replace
 
@@ -17,8 +18,8 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.evidence import ExtractorError, run_extractor
-from phasesweep.evidence.evaluation import extractor_config_fingerprint
+from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
+from phasesweep.evidence.evaluation import DeadlineExceededError, extractor_config_fingerprint
 from tests.conftest import make_trial_context
 
 
@@ -735,7 +736,7 @@ def test_wandb_extractor_poll_budget_is_capped_by_phase_deadline(fake_wandb, tmp
     )
 
     started = _time.monotonic()
-    with pytest.raises(ExtractorError):
+    with pytest.raises(DeadlineExceededError):
         run_extractor(
             make_trial_context(tmp_path),
             cfg,
@@ -759,7 +760,36 @@ def test_wandb_extractor_rejects_expired_deadline_before_polling(fake_wandb, tmp
         timeout_seconds=60,
     )
 
-    with pytest.raises(ExtractorError, match="wallclock deadline exceeded"):
+    with pytest.raises(DeadlineExceededError, match="wallclock deadline exceeded"):
         run_extractor(make_trial_context(tmp_path), cfg, deadline=0.0)
 
     assert timeouts == []
+
+
+def test_gate_results_mark_only_deadline_caused_failures(fake_wandb, tmp_path):
+    """Gate failures carry a causal deadline marker, not an elapsed-clock guess."""
+    fake_wandb(lambda _path: (_ for _ in ()).throw(ConnectionError("unreachable")))
+    ctx = make_trial_context(tmp_path)
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        entity="team",
+        project="proj",
+        keys=["eval/loss"],
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    capped = evaluate_gates(ctx, [gate], deadline=time.monotonic() + 0.05)[0]
+    expired = evaluate_gates(
+        ctx,
+        [JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)],
+        deadline=0.0,
+    )[0]
+    ordinary = evaluate_gates(
+        ctx,
+        [JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)],
+    )[0]
+
+    assert capped.deadline_exhausted is True
+    assert expired.deadline_exhausted is True
+    assert ordinary.deadline_exhausted is False

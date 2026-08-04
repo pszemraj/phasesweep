@@ -17,6 +17,7 @@ from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.evidence.evaluation import (
+    DeadlineExceededError,
     ExtractorError,
     GateResult,
     TrialContext,
@@ -52,6 +53,10 @@ class TrialResult:
     # extractor config fingerprint plus source digest / remote summary subset
     # (review v0.5.17 / finding F). None when metric extraction failed.
     objective_provenance: dict[str, Any] | None = None
+    # True only when the phase/run deadline directly caused this result to
+    # fail, rather than merely having elapsed by the time another failure was
+    # observed.
+    deadline_exhausted: bool = False
 
 
 # Minimal environment base used when the execution contract narrows
@@ -132,6 +137,7 @@ def _failed_trial(
     failure_reason: str,
     constraints: dict[str, float] | None = None,
     gate_results: list[GateResult] | None = None,
+    deadline_exhausted: bool = False,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
 
@@ -146,6 +152,7 @@ def _failed_trial(
         failure_reason: Human-readable cause; surfaced in logs and Optuna user attrs.
         constraints: Constraint readings collected before the failure, if any.
         gate_results: Evidence gate results collected before the failure, if any.
+        deadline_exhausted: Whether the phase/run deadline caused the failure.
 
     Returns:
         A :class:`TrialResult` with ``metric=None`` and ``feasible=False``.
@@ -159,6 +166,7 @@ def _failed_trial(
         feasible=False,
         failure_reason=failure_reason,
         gate_results=gate_results,
+        deadline_exhausted=deadline_exhausted,
     )
 
 
@@ -364,6 +372,7 @@ def extract_trial_result(
                 f"phase/run wallclock deadline exceeded before {stage}; the trainer "
                 "finished but its evidence could not be evaluated within the budget"
             ),
+            deadline_exhausted=True,
         )
 
     if rc != 0 and failure_reason is None:
@@ -383,6 +392,19 @@ def extract_trial_result(
             experiment.metric.extractor,
             deadline=deadline,
             provenance=objective_provenance,
+        )
+    except DeadlineExceededError as exc:
+        log.warning(
+            "[%s/trial_%d] metric extraction exceeded deadline: %s",
+            executed.ctx.phase,
+            executed.ctx.trial_id,
+            exc,
+        )
+        return _failed_trial(
+            rc=rc,
+            duration=duration,
+            failure_reason=f"metric extractor: {exc}",
+            deadline_exhausted=True,
         )
     except ExtractorError as exc:
         log.warning(
@@ -415,6 +437,21 @@ def extract_trial_result(
             return expired
         try:
             v = run_extractor(executed.ctx, c.extractor, deadline=deadline)
+        except DeadlineExceededError as exc:
+            log.warning(
+                "[%s/trial_%d] constraint %s extraction exceeded deadline: %s",
+                executed.ctx.phase,
+                executed.ctx.trial_id,
+                c.name,
+                exc,
+            )
+            return _failed_trial(
+                rc=rc,
+                duration=duration,
+                failure_reason=f"constraint extractor {c.name!r}: {exc}",
+                constraints=constraint_values,
+                deadline_exhausted=True,
+            )
         except ExtractorError as exc:
             log.warning(
                 "[%s/trial_%d] constraint %s extraction failed: %s",
@@ -465,6 +502,7 @@ def extract_trial_result(
             failure_reason=f"evidence gates failed: {detail}",
             constraints=constraint_values,
             gate_results=gate_results,
+            deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
         )
 
     # Final boundary check: a slow last stage must not let a trial publish a

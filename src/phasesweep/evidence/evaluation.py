@@ -113,6 +113,10 @@ class ExtractorError(RuntimeError):
     """
 
 
+class DeadlineExceededError(ExtractorError):
+    """Raised when the phase/run deadline directly prevents extraction."""
+
+
 @dataclass(frozen=True)
 class TrialContext:
     """Everything an extractor might need to find a trial's result."""
@@ -542,10 +546,24 @@ def run_extractor(
         )
     remaining = _remaining_budget_seconds(deadline)
     if remaining is not None and remaining <= 0.0:
-        raise ExtractorError("Phase/run wallclock deadline exceeded before evidence extraction.")
+        raise DeadlineExceededError(
+            "Phase/run wallclock deadline exceeded before evidence extraction."
+        )
+    deadline_capped = (
+        remaining is not None
+        and isinstance(cfg, WandbExtractor)
+        and remaining < cfg.timeout_seconds
+    )
     if remaining is not None and isinstance(cfg, WandbExtractor):
         cfg = cfg.model_copy(update={"timeout_seconds": min(cfg.timeout_seconds, remaining)})
-    value = fn(ctx, cfg, provenance)
+    try:
+        value = fn(ctx, cfg, provenance)
+    except ExtractorError as exc:
+        if deadline_capped and isinstance(exc.__cause__, WandbPollTimeout):
+            raise DeadlineExceededError(
+                "Phase/run wallclock deadline exhausted while polling W&B evidence."
+            ) from exc
+        raise
     if provenance is not None:
         provenance["recorded_at"] = _utc_now_iso()
     return value
@@ -558,6 +576,7 @@ class GateResult:
     gate_type: str
     passed: bool
     detail: str
+    deadline_exhausted: bool = False
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
@@ -681,7 +700,12 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     return GateResult(gate.type, False, f"{gate.path} sha256 {digest} != {gate.sha256}")
 
 
-def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -> GateResult:
+def _wandb_summary_required(
+    ctx: TrialContext,
+    gate: WandbSummaryRequiredGate,
+    *,
+    deadline_capped: bool = False,
+) -> GateResult:
     """Check that a finished W&B run summary contains required keys.
 
     :param TrialContext ctx: Trial context containing the immutable W&B run id.
@@ -711,7 +735,12 @@ def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -
         detail = f"W&B run {ctx.attempt_id!r} not ready within {gate.timeout_seconds}s"
         if exc.last_error is not None:
             detail += f"; last error: {exc.last_error}"
-        return GateResult(gate.type, False, detail)
+        return GateResult(
+            gate.type,
+            False,
+            detail,
+            deadline_exhausted=deadline_capped,
+        )
 
     missing = [key for key in gate.keys if key not in summary]
     if not missing:
@@ -752,6 +781,7 @@ def evaluate_gates(
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
         remaining = _remaining_budget_seconds(deadline)
+        deadline_capped = False
         if remaining is not None:
             if remaining <= 0.0:
                 results.append(
@@ -759,12 +789,19 @@ def evaluate_gates(
                         gate.type,
                         False,
                         "phase/run wallclock deadline exceeded before this gate ran",
+                        deadline_exhausted=True,
                     )
                 )
                 continue
             if isinstance(gate, WandbSummaryRequiredGate):
+                deadline_capped = remaining < gate.timeout_seconds
                 gate = gate.model_copy(
                     update={"timeout_seconds": min(gate.timeout_seconds, remaining)}
                 )
-        results.append(fn(ctx, gate))
+        if isinstance(gate, WandbSummaryRequiredGate):
+            results.append(
+                _wandb_summary_required(ctx, gate, deadline_capped=deadline_capped)
+            )
+        else:
+            results.append(fn(ctx, gate))
     return results

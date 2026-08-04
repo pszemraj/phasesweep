@@ -710,13 +710,10 @@ def _run_phase(
             enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
             deadline=optimize_deadline,
         )
-        if (
-            result.failure_reason
-            and optimize_deadline is not None
-            and time.monotonic() >= optimize_deadline
-        ):
-            # The deadline was a factor in this failure; make sure phase-level
-            # accounting reports a timeout rather than "no feasible trial".
+        if result.deadline_exhausted:
+            # Preserve causal attribution from extraction/gate enforcement.
+            # Merely observing another failure after the clock elapsed must
+            # not relabel it as a timeout.
             deadline_exhausted["flag"] = True
 
         trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
@@ -910,9 +907,15 @@ def _run_phase(
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
     completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
-    timeout_observed = deadline_exhausted["flag"] or (
-        optimize_deadline is not None and time.monotonic() >= optimize_deadline
+    scheduler_deadline_exhausted = (
+        optimize_deadline is not None
+        and finished_after < phase.n_trials
+        and not abort["flag"]
+        and time.monotonic() >= optimize_deadline
     )
+    if scheduler_deadline_exhausted:
+        deadline_exhausted["flag"] = True
+    timeout_observed = deadline_exhausted["flag"]
     timed_out_incomplete = timeout_observed and finished_after < phase.n_trials
     accepted_partial_timeout = (
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials

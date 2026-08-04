@@ -1947,6 +1947,69 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     assert result.feasible is False
     assert result.failure_reason is not None
     assert "wallclock deadline exceeded" in result.failure_reason
+    assert result.deadline_exhausted is True
+
+
+def test_process_failure_after_deadline_is_not_relabelled(tmp_path: Path) -> None:
+    """An elapsed clock is not causal when the trainer already failed."""
+    experiment = make_experiment(workdir=tmp_path)
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=1,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(
+            return_code=1,
+            timed_out=False,
+            pid=123,
+            duration_seconds=0.1,
+            failure_reason="trainer failed",
+        ),
+    )
+
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=executed,
+        deadline=time.monotonic() - 1.0,
+    )
+
+    assert result.failure_reason == "trainer failed"
+    assert result.deadline_exhausted is False
+
+
+def test_elapsed_phase_clock_does_not_relabel_completed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal ordinary failure stays NoFeasible after the phase clock advances."""
+    import types
+
+    import phasesweep.engine.phase as phase_mod
+
+    real_now = time.monotonic()
+    calls = iter([real_now, real_now, real_now + 1_000.0])
+    monkeypatch.setattr(
+        phase_mod,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: next(calls, real_now + 1_000.0)),
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command="false {overrides}",
+        n_trials=1,
+        max_consecutive_failures=10,
+        timeout_seconds_per_phase=100.0,
+    )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
 
 
 def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
