@@ -1337,6 +1337,95 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert completion["timeout_scope"] == "phase"
 
 
+@pytest.mark.parametrize("clock_elapses", [True, False])
+def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock_elapses: bool
+) -> None:
+    """Only an elapsed clock lets a failure-aborted phase publish a partial winner.
+
+    The failing trial exits on its own before its wallclock-capped subprocess
+    timeout fires, so no per-trial cause sets ``deadline_exhausted``, and the
+    same trial trips ``max_consecutive_failures``. When the phase clock also
+    elapses while that trial is in flight, only the scheduler-level check can
+    observe the deadline, and timeout precedence must still publish the earlier
+    successful trial. With budget left, nothing is relabelled: the streak abort
+    stands and the phase fails.
+    """
+    import types
+
+    import phasesweep.engine.phase as phase_mod
+
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, sys
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+            print("x=1.0")
+        else:
+            sys.exit(1)
+        """,
+    )
+    exp = Experiment(
+        experiment="phase_scheduler_deadline_with_abort",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                max_consecutive_failures=1,
+                timeout_seconds_per_phase=600.0,
+                allow_incomplete_on_timeout=True,
+                search_space={},
+            )
+        ],
+    )
+
+    # Only the phase module's clock is virtualised: the real clock still bounds
+    # Optuna's own timeout, GPU leases, and extraction, so no other code path
+    # can attribute a deadline here.
+    offset = {"seconds": 0.0}
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        phase_mod,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: real_monotonic() + offset["seconds"]),
+    )
+    real_launch_trial = phase_mod.launch_trial
+
+    def launch_and_burn_the_budget(**kwargs: object) -> object:
+        executed = real_launch_trial(**kwargs)
+        if clock_elapses and kwargs["trial_id"] == 1:
+            offset["seconds"] = 10_000.0
+        return executed
+
+    monkeypatch.setattr(phase_mod, "launch_trial", launch_and_burn_the_budget)
+
+    if not clock_elapses:
+        with pytest.raises(NoFeasibleTrialError, match="aborted after 1 consecutive failures"):
+            run_experiment(exp)
+        return
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].trial_number == 0
+    completion = winners["p"].completion
+    assert completion["requested_trials"] == 3
+    assert completion["finished_trials"] == 2
+    assert completion["completed_trials"] == 1
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+    assert completion["timeout_scope"] == "phase"
+
+
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
     accepted = _sleeping_score_experiment(
         tmp_path,

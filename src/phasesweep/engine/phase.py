@@ -908,10 +908,19 @@ def _run_phase(
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
     completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
+    # Scheduler-level deadline causality: the phase is short of its trial
+    # target and the clock is spent, so the budget — not the observation order
+    # — is what left work undone. Being short of the target is the whole test:
+    # a phase whose every requested trial is terminal is not relabelled just
+    # because the clock happened to elapse before the last one was observed.
+    # A tripped ``abort["flag"]`` deliberately does NOT veto this. When a
+    # wallclock timeout and ``max_consecutive_failures`` become true in the
+    # same phase, timeout handling takes precedence (docs/runtime.md), which is
+    # what lets ``allow_incomplete_on_timeout`` publish the partial winner the
+    # earlier successful trials already earned instead of discarding it.
     scheduler_deadline_exhausted = (
         optimize_deadline is not None
         and finished_after < phase.n_trials
-        and not abort["flag"]
         and time.monotonic() >= optimize_deadline
     )
     if scheduler_deadline_exhausted:
@@ -943,10 +952,16 @@ def _run_phase(
         )
     persisted_abort = study.user_attrs.get(PHASE_ABORT_ATTR)
     if persisted_abort is not None:
-        # Only an explicitly accepted partial timeout can reach selection
-        # with a newly tripped failure marker. Record a boundary as durable
-        # evidence that timeout precedence consumed this streak; otherwise an
-        # identical read-only rerun would reconstruct and re-raise the abort.
+        # Only an explicitly accepted partial timeout can reach selection with
+        # a newly tripped failure marker: the abort raise above is skipped
+        # exactly when ``timed_out_incomplete`` holds, and being short of the
+        # trial target then forces ``accepted_partial_timeout``. That timeout
+        # may have been attributed by a trial-level cause (refused launch,
+        # capped subprocess, stage-boundary check) or by the scheduler-level
+        # check above, which does not defer to the abort. Record a boundary as
+        # durable evidence that timeout precedence consumed this streak;
+        # otherwise an identical read-only rerun would reconstruct and re-raise
+        # the abort.
         if accepted_partial_timeout:
             current_policy_state = _load_phase_policy_state(study)
             study.set_user_attr(
