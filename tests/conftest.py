@@ -24,10 +24,17 @@ from phasesweep.config import (
     Phase,
 )
 from phasesweep.evidence import TrialContext
+from phasesweep.runtime.process import _read_proc_stat
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+
+
+def is_pid_zombie(pid: int) -> bool:
+    """Return whether a test subprocess has exited but awaits parent reaping."""
+    stat = _read_proc_stat(Path("/proc") / str(pid))
+    return stat is not None and stat.state == "Z"
 
 
 @pytest.fixture(autouse=True)

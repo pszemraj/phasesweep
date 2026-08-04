@@ -35,13 +35,12 @@ from phasesweep.runtime.process import (
     cleanup_stale_trial_process,
     defer_shutdown_signals,
     is_pid_alive,
-    is_pid_zombie,
     read_attempt_lifecycle,
     read_stale_process_identity,
     reap_child,
     run_supervised,
 )
-from tests.conftest import make_experiment
+from tests.conftest import is_pid_zombie, make_experiment
 
 
 def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -654,11 +653,7 @@ def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> 
         calls.append((pid, flags))
         return (0, 0)
 
-    def fail_if_proc_polled(pid: int) -> bool:
-        raise AssertionError(f"reap_child should not poll /proc for pid {pid}")
-
     monkeypatch.setattr("phasesweep.runtime.process.os.waitpid", fake_waitpid)
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_zombie", fail_if_proc_polled)
 
     assert reap_child(12345) is False
 

@@ -1573,58 +1573,6 @@ def is_pid_alive(pid: int) -> bool:
         return True  # exists but owned by another user
 
 
-def is_same_process(pid: int, saved_starttime: int | None) -> bool:
-    """Check whether `pid` is the same process that recorded `saved_starttime`.
-
-    When no starttime was recorded, this falls back to a PID-alive check. When
-    a starttime was recorded but the current proc entry is unreadable, identity
-    is unknown and this fails closed instead of treating the PID as a match.
-
-    Args:
-        pid: PID read from a stale ``trial_dir/pid`` file.
-        saved_starttime: Starttime read from the matching ``pid_starttime``
-            file, or ``None`` if unavailable.
-
-    Returns:
-        ``True`` if ``pid`` is alive AND (no saved starttime, OR the current
-        ``/proc`` starttime matches the saved value). ``False`` if the PID is
-        dead, has been reused by an unrelated process, or cannot be verified.
-
-    """
-    if not is_pid_alive(pid):
-        return False
-    if saved_starttime is None:
-        # No starttime to verify — fall back to alive-only (best effort).
-        return True
-    current_starttime = read_proc_starttime(pid)
-    if current_starttime is None:
-        return False
-    return current_starttime == saved_starttime
-
-
-def is_pid_zombie(pid: int) -> bool:
-    """Return whether ``pid`` is a zombie (exited but not yet reaped by its parent).
-
-    A zombie still answers ``kill(pid, 0)`` because it occupies the PID table,
-    so :func:`is_pid_alive` and :func:`is_same_process` both report it as alive.
-    For a liveness decision it is effectively dead — it holds no resources and
-    is doing no work. This reads ``/proc/<pid>/stat`` (state is the first field
-    after the ``)`` that closes ``comm``) and returns ``True`` only for state
-    ``Z``. On non-Linux (no ``/proc``) it returns ``False``, preserving the
-    legacy alive-only semantics used elsewhere.
-
-    Args:
-        pid: Process ID to probe.
-
-    Returns:
-        ``True`` if the process exists and is a zombie; ``False`` if it is live,
-        gone, or undeterminable (non-Linux).
-
-    """
-    stat = _read_proc_stat(Path("/proc") / str(pid))
-    return stat is not None and stat.state == "Z"
-
-
 def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     """Return whether a PID identifies the same live, non-zombie process.
 

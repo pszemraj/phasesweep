@@ -52,7 +52,6 @@ from phasesweep.runtime.process import (
     _read_proc_stat,
     _write_process_identity,
     cleanup_stale_trial_process,
-    is_same_process,
     kill_stale_group,
     read_boot_id,
     read_proc_starttime,
@@ -109,40 +108,6 @@ def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
     assert stat.state == "S"
     assert stat.pgrp == 4321
     assert stat.starttime == 987654
-
-
-def test_is_same_process_rejects_dead_pid():
-    """A definitely-dead PID should not be identified as the same process."""
-    assert not is_same_process(999999999, saved_starttime=12345)
-
-
-def test_is_same_process_with_matching_starttime():
-    """Our own PID with our own starttime should match."""
-    import os
-
-    pid = os.getpid()
-    st = read_proc_starttime(pid)
-    if st is not None:
-        assert is_same_process(pid, st)
-
-
-def test_is_same_process_rejects_wrong_starttime():
-    """Our own PID with a wrong starttime should NOT match."""
-    import os
-
-    pid = os.getpid()
-    st = read_proc_starttime(pid)
-    if st is not None:
-        assert not is_same_process(pid, st + 999999)
-
-
-def test_is_same_process_rejects_unreadable_current_starttime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda _pid: None)
-
-    assert not is_same_process(12345, saved_starttime=111)
 
 
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
