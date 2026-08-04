@@ -434,7 +434,15 @@ def _run_phase(
             study.stop()
 
     def _raise_if_fatal_aborted() -> None:
-        """Re-raise the first fatal worker exception with its original traceback."""
+        """Re-raise the first fatal worker exception with its original traceback.
+
+        A no-op when no worker recorded a fatal abort.
+
+        Raises:
+            BaseException: The exception ``_record_fatal_abort`` captured
+                first, re-raised with its original worker traceback.
+
+        """
         with _fatal_abort_lock:
             error = fatal_abort["exception"]
         if error is not None:

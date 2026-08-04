@@ -30,6 +30,11 @@ class FloatParam(_Frozen):
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
 
+        Raises:
+            ValueError: ``low`` or ``high`` is non-finite, ``low > high``,
+                ``log`` is set with ``low <= 0``, ``step`` is non-finite or
+                ``<= 0``, or ``log`` and ``step`` are combined.
+
         """
         _require_finite("float param low", self.low)
         _require_finite("float param high", self.high)
@@ -61,6 +66,11 @@ class IntParam(_Frozen):
 
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
+
+        Raises:
+            ValueError: ``low > high``, ``log`` is set with ``low <= 0``,
+                ``step <= 0``, or ``log`` is combined with ``step != 1`` (which
+                Optuna's ``IntDistribution`` rejects at construction time).
 
         """
         if self.low > self.high:
@@ -101,9 +111,13 @@ class CategoricalParam(_Frozen):
             choices: The candidate choices list pre-validation.
 
         Returns:
-            The same list, unchanged. Raises ``ValueError`` if any element is
-            not an Optuna-compatible scalar, is a non-finite float, or repeats
-            an earlier choice.
+            The same list, unchanged.
+
+        Raises:
+            ValueError: An element is not an Optuna-compatible scalar
+                (``None``/``bool``/``int``/``float``/``str``), is a non-finite
+                float, or repeats an earlier choice under the type-aware
+                identity key.
 
         """
         # Optuna only accepts None|bool|int|float|str as categorical choices.
@@ -173,6 +187,13 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     only truthful while those lists are duplicate-free. Categorical duplicates
     are rejected by :class:`CategoricalParam` and float collapse by
     :func:`grid_search_space`, both before this product is taken.
+
+    :param Phase phase: Phase whose sampler and search space are checked together.
+    :raises ValueError: If the CMA-ES sampler is paired with categorical params or
+        the ``cmaes`` package is not importable, if the grid sampler cannot
+        enumerate a parameter (raised by :func:`grid_search_space`), or if
+        ``n_trials`` exceeds the grid cardinality or does not equal it without
+        ``allow_partial_grid``.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space

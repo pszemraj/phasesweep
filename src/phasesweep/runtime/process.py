@@ -1295,6 +1295,11 @@ def run_supervised(
     uses the recomputed remainder, never the original duration. Cleanup
     grace after a timeout is explicitly post-deadline time.
 
+    Once the supervisor is spawned, launch failures — an expired deadline, a
+    failed identity write, a failed payload delivery — never propagate: the
+    group is terminated and the failure is reported through the returned
+    :class:`ProcessResult`.
+
     Args:
         cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
         env: Full process environment for the subprocess.
@@ -1314,6 +1319,11 @@ def run_supervised(
         timeout flag, ``failure_reason`` (set on timeout or descendant
         survival), and ``cleanup_confirmed`` (``False`` when SIGKILL did not
         confirm the group is gone).
+
+    Raises:
+        RuntimeError: The supervisor never signalled readiness, or signalled an
+            unexpected byte, so no process group was ever created.
+        OSError: The supervisor process or its pipes could not be created.
 
     """
     import time

@@ -934,6 +934,9 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         study gone, or in-memory storage), or ``"unreachable"`` when the
         recorded storage could not be reached and the entry must be retained
         for a later retry.
+    :raises RuntimeError: The stale RUNNING trial could not be marked FAIL, or
+        its durable failure outcome could not be recorded; the study is left
+        inconsistent rather than silently dropping the failure.
     """
     storage_url = entry["storage"]
     if storage_url is None:
@@ -1142,6 +1145,11 @@ def _reap_stale_trials(
     :param set[str] | None uncertain_attempt_ids: Optional collector for exact
         attempt identities whose cleanup could not be proven.
     :return int: Number of stale RUNNING trials marked as failed.
+    :raises ProcessCleanupUncertainError: The study's trials cannot be
+        inspected, or a stale trial's directory, attempt identity, or process
+        cleanup could not be proven safe.
+    :raises RuntimeError: Cleanup succeeded but Optuna could not be updated to
+        ``FAIL``; refusing to continue with an inconsistent study.
     """
     count = 0
     try:
@@ -1302,7 +1310,14 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
 
 
 def _validate_study_schema(study: optuna.Study) -> None:
-    """Initialize an empty study or reject populated incompatible storage."""
+    """Initialize an empty study or reject populated incompatible storage.
+
+    :param optuna.Study study: Study whose durable schema attr is stamped (when
+        empty and unstamped) or validated against the current schema version.
+    :raises StudySchemaMismatchError: The study already holds trials or a schema
+        stamp from an unsupported version, or its durable failure-policy state
+        is malformed.
+    """
     trials = study.get_trials(deepcopy=False)
     version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
     if not trials and version is None:
@@ -1558,6 +1573,9 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
 
     :param optuna.Study study: Study whose cleanup recovery ledger should be updated.
     :param optuna.trial.FrozenTrial trial: Trial whose cleanup evidence was consumed.
+    :raises RuntimeError: The ledger could not be written; MCP cleanup
+        uncertainty stays set rather than being cleared without consuming the
+        trial evidence.
     """
     recovered = sorted(_cleanup_recovered_trial_numbers(study) | {trial.number})
     try:

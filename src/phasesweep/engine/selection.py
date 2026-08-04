@@ -316,6 +316,8 @@ def _apply_promotion(
     :param dict[str, Winner] winners: Winners from previous phases.
     :return tuple[Winner | None, dict[str, Any] | None]: Exposed winner and
         promotion audit payload, or ``None`` values when no rule applies.
+    :raises RuntimeError: The rule's ``min_delta_vs`` names a phase with no
+        winner among ``winners``.
     """
     promotion = phase.promotion
     if promotion is None:
@@ -437,6 +439,9 @@ def _study_phase_winner(
     :param str selector: Baseline selector, either a study name or
         ``"study.phase"``.
     :return tuple[str, Winner]: Resolved baseline label and winner.
+    :raises RuntimeError: The selector names an unknown baseline study, a
+        baseline study that exposed no winners, or a phase absent from that
+        study's winners.
     """
     if "." in selector:
         baseline_study, phase_name = selector.split(".", 1)
@@ -478,6 +483,9 @@ def _apply_study_promotion(
         studies in the suite.
     :return tuple[dict[str, Winner] | None, dict[str, Any] | None]: Exposed
         study winners and promotion decision payload.
+    :raises RuntimeError: The study produced no winner to promote, its rule
+        failed with ``on_fail: stop``, or the baseline selector cannot be
+        resolved against ``prior_results``.
     """
     study_spec = next(study for study in suite.studies if study.name == study_name)
     promotion = study_spec.promotion

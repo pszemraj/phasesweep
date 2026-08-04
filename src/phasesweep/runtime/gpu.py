@@ -477,6 +477,8 @@ class GpuPool:
 
         :param float | None deadline: Optional ``time.monotonic()`` deadline.
         :return float | None: Remaining seconds, or ``None`` when no deadline is active.
+        :raises GpuLeaseTimeoutError: The deadline has already passed, so
+            waiting further would overrun the phase/run wallclock budget.
         """
         if deadline is None:
             return None

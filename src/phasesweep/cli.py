@@ -137,6 +137,9 @@ def init(output: Path) -> None:
     """Write an annotated starter experiment and print the review commands.
 
     :param Path output: Destination YAML path; existing paths are never replaced.
+    :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
+        file or symlink, including when it appears between the check and the
+        exclusive create.
     """
     expanded = output.expanduser()
     target = expanded.absolute()
@@ -284,7 +287,13 @@ def show_winners(config_path: Path) -> None:
 
 
 def _show_suite_winners(suite: Suite) -> None:
-    """Print the authoritative exposed winners from the last successful suite run."""
+    """Print the authoritative exposed winners from the last successful suite run.
+
+    :param Suite suite: Compiled suite whose published summary is rendered.
+    :raises click.ClickException: If the published summary cannot be read, or its
+        study, phase, or annotation records are malformed; raw component-experiment
+        winners are never substituted for it.
+    """
     summary_path = _published_suite_summary_path(suite)
     if summary_path is None or not summary_path.is_file():
         click.echo("(no successful suite result yet)")
@@ -468,6 +477,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
+    :raises click.ClickException: If the host is not a supported MCP host, the state
+        directory or run id is unknown, the launch outcome is still unresolved, no
+        immutable terminal snapshot exists, runner identity cannot rule out PID
+        reuse, the runner still appears live, the run config snapshot is missing or
+        does not match its recorded digest, no trial-level cleanup evidence can be
+        confirmed, or study recovery fails with a ``RuntimeError``.
     """
     state_dir = state_dir.expanduser().resolve()
     try:
@@ -898,6 +913,9 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
+    :raises FileExistsError: If ten randomized staging names all collide beside
+        ``output``; handled by this function's own ``OSError`` branch, which reports
+        the failure and returns ``False`` rather than propagating.
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():

@@ -52,7 +52,12 @@ class _LockPolicy:
 
 
 def require_posix_runtime() -> None:
-    """Raise a clear error when execution is attempted on an unsupported platform."""
+    """Raise a clear error when execution is attempted on an unsupported platform.
+
+    :raises PlatformCapabilityError: The host is not POSIX or lacks
+        ``os.killpg``/``fcntl``, so process groups and ``flock`` are
+        unavailable.
+    """
     if not _supports_posix_runtime_features():
         raise PlatformCapabilityError(POSIX_RUNTIME_ERROR)
 
@@ -99,6 +104,10 @@ def lock_dir() -> Path:
     by phasesweep.
 
     :return Path: Directory used for host-local lock files.
+    :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
+        contains a symlinked component, or fails the private/shared
+        ownership-and-mode check; or the default lock directory under the
+        user's cache cannot be created as owner-only.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -365,7 +374,13 @@ def fsync_directory(path: Path) -> None:
 
 
 def nofollow_flag() -> int:
-    """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable."""
+    """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable.
+
+    :return int: The platform's ``os.O_NOFOLLOW`` open flag.
+    :raises PlatformCapabilityError: The platform does not define
+        ``O_NOFOLLOW``, so private files cannot be opened without following
+        symlinks.
+    """
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise PlatformCapabilityError(
@@ -526,6 +541,13 @@ def _walk_directory_fd(
     :param bool private_final: Whether the final component must be private.
     :param bool umask_created_dirs: Whether the umask governs created dirs.
     :return int: Open descriptor for the final directory; caller closes it.
+    :raises UnsafePrivatePathError: ``path`` is the filesystem root, a
+        component is not a real directory (symlink or other entry), a component
+        was swapped while it was being opened, or the final directory fails the
+        owner-only mode/ownership check.
+    :raises FileNotFoundError: A component is missing and ``create`` is false.
+    :raises PlatformCapabilityError: The platform does not provide
+        ``O_NOFOLLOW``.
     """
     absolute = absolute_path(path)
     parts = absolute.parts[1:]

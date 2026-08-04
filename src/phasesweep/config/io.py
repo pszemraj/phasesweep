@@ -117,6 +117,13 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
     Returns:
         :class:`Experiment` or :class:`Suite` parsed from exactly ``data``.
 
+    Raises:
+        ValueError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
+            duplicate mapping keys rejected by the strict loader), or the top level
+            is not a mapping.
+        pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
+            :class:`Experiment` model validation.
+
     """
     try:
         text = data.decode("utf-8")

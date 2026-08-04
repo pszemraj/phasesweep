@@ -837,6 +837,8 @@ def run(
     :param CatalogCheckReport | None catalog_report: Validated entries summarized in the plan.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
+    :raises ValueError: If an MCP install is requested without a validated
+        catalog path.
     """
     if mode == "install" and integration != "instructions" and catalog is None:
         raise ValueError("installing MCP entries requires a validated catalog path")

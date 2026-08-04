@@ -233,6 +233,8 @@ def _trial_dir_for(
     :param str | None generation_id: Current engine invocation id.
     :param str | None attempt_id: Current subprocess attempt id.
     :return Path: Directory for the trial artifacts.
+    :raises ValueError: Exactly one of ``generation_id`` and ``attempt_id`` was
+        supplied; a uniquely scoped directory needs both.
     """
     if generation_id is None and attempt_id is None:
         return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"

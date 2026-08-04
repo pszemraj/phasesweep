@@ -302,6 +302,10 @@ def _write_status(
     :param dict payload: Status payload containing run id, return code, and error class.
     :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
     :param str | None result_snapshot_error: Capture error class when no snapshot exists.
+    :raises RuntimeError: Raised and handled in-process when no snapshot was
+        captured; it never reaches the caller, because a missing snapshot is
+        recorded as ``result_snapshot_state="failed"`` instead of failing the
+        already-durable terminal evidence.
     """
     # A catchable shutdown may arrive after the durable pending write. Defer it
     # until the complete/failed replacement is durable so cancellation cannot
@@ -370,6 +374,9 @@ def _persist_spawned_handle(
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
     :param bool allow_cancel: Cancel permission frozen at launch time.
+    :raises RuntimeError: If Linux ``/proc`` start time is unavailable, so the
+        handle could not be made PID-reuse safe, or the server never created a
+        pending handle for ``run_id``.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -408,6 +415,14 @@ def main(argv: list[str] | None = None) -> int:
 
     :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
     :return int: Process exit code, zero on successful sweep completion.
+    :raises RuntimeError: The per-run config snapshot could not be read or did
+        not match its recorded hash.
+    :raises PhaseSweepShutdown: The run was cancelled; re-raised after the
+        cancellation cause is recorded in status.json.
+    :raises ProcessCleanupUncertainError: Child-process cleanup could not be
+        confirmed; re-raised after status.json records the uncertainty.
+    :raises BaseException: Whatever the handle write or engine run raised,
+        re-raised after its terminal cause reaches status.json.
     """
     parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)

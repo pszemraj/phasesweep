@@ -21,6 +21,8 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
     :param list[tuple[str, Any]] pairs: Parsed members in source order.
     :return dict[str, Any]: Mapping containing each unique member.
+    :raises ValueError: A member name repeats, which the standard ``json``
+        parser would silently resolve last-wins.
     """
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -35,6 +37,8 @@ def _finite_float(value: str) -> float:
 
     :param str value: Raw JSON numeric token.
     :return float: Finite parsed value.
+    :raises ValueError: The token is not a valid float, or it overflows to
+        infinity.
     """
     parsed = float(value)
     if not math.isfinite(parsed):

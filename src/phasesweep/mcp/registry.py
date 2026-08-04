@@ -107,6 +107,7 @@ class _Entry(_CatalogModel):
 
         :param str value: Operator-authored catalog id.
         :return str: The validated id.
+        :raises ValueError: If the id is not ``[A-Za-z0-9_-]+``.
         """
         # The id appears in run ids and handle filenames, so keep it path-safe
         # even though the operator writes it.
@@ -121,6 +122,8 @@ class _Entry(_CatalogModel):
 
         :param VisibleParamsPolicy value: Policy string or parameter-name allowlist.
         :return VisibleParamsPolicy: A valid policy string or deduplicated, stripped allowlist.
+        :raises ValueError: If a string policy is neither ``'none'`` nor ``'all'``,
+            or an allowlist contains a blank key.
         """
         if isinstance(value, str):
             if value not in {"none", "all"}:
@@ -275,6 +278,9 @@ def _require_mcp_stable_paths(
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     :param Path config_dir: Directory of the experiment config, used to compute
         concrete fix suggestions for ``phasesweep mcp check``.
+    :raises CatalogError: If storage is absent or in-memory, ``workdir`` or
+        ``execution.cwd`` is relative, the storage backend is not local SQLite
+        or JournalStorage, or its file path is empty or relative.
     """
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
@@ -350,6 +356,8 @@ def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return tuple[_Catalog, Path]: Parsed catalog and its base directory for
         resolving relative entry paths.
+    :raises CatalogError: If the file cannot be read, is not a YAML mapping, or
+        fails catalog schema validation.
     """
     try:
         raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
@@ -368,6 +376,9 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param Path base: Directory containing the catalog file.
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
+    :raises CatalogError: If the config path or ``cwd`` does not exist, the
+        config cannot be parsed, it is a suite rather than an experiment, or it
+        fails the MCP path-stability rules.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -542,18 +553,18 @@ class Registry:
     def load(cls, catalog_path: Path) -> Registry:
         """Parse and validate a catalog file.
 
-        Raises ``CatalogError`` on any problem so the server refuses to start
-        with a bad catalog. Per entry: the config path exists, ``load_config``
-        accepts it, it is an :class:`Experiment` (suites are out of scope for
-        v1), and its storage is a persistent local SQLite/Journal file (the MCP
-        layer is local-node only in this version).
+        Every problem is reported as ``CatalogError`` so the server refuses to
+        start with a bad catalog. Per entry: the config path exists,
+        ``load_config`` accepts it, it is an :class:`Experiment` (suites are out
+        of scope for v1), and its storage is a persistent local SQLite/Journal
+        file (the MCP layer is local-node only in this version).
 
-        Args:
-            catalog_path: Path to the operator-authored catalog YAML.
-
-        Returns:
-            An immutable :class:`Registry`.
-
+        :param Path catalog_path: Path to the operator-authored catalog YAML.
+        :return Registry: Immutable registry of validated catalog entries.
+        :raises CatalogError: If the host is not a supported Linux MCP host, the
+            catalog cannot be parsed, an id is duplicated, an entry fails
+            validation, two entries claim one engine namespace, or the state
+            directory cannot be prepared.
         """
         require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
@@ -582,6 +593,7 @@ class Registry:
 
         :param str experiment_id: Agent-visible catalog id.
         :return RegisteredExperiment: Validated registry entry for the id.
+        :raises UnknownExperimentError: If no catalog entry has that id.
         """
         try:
             return self._items[experiment_id]

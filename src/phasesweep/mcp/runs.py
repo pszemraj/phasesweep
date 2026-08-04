@@ -267,7 +267,13 @@ class RunStore:
         fsync_directory(target.parent)
 
     def update(self, handle: RunHandle) -> None:
-        """Persist the one legal launching-to-spawned identity transition."""
+        """Persist the one legal launching-to-spawned identity transition.
+
+        :param RunHandle handle: Updated identity for an already-created run.
+        :raises FileNotFoundError: If no handle was created for ``handle.run_id``.
+        :raises ValueError: If the update changes an immutable field, or is not
+            a launching-to-spawned transition.
+        """
         current = self.get(handle.run_id)
         if current is None:
             raise FileNotFoundError(f"Run {handle.run_id!r} has not been created.")

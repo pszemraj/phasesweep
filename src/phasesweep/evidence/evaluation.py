@@ -76,6 +76,14 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance (review v0.5.17 / finding F).
+    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
+        file under ``trial_dir``.
+    :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
+        failing segment as the argument.
+    :raises OSError: If the resolved file exists but cannot be read.
+    :raises UnicodeDecodeError: If the file bytes are not valid UTF-8.
+    :raises ValueError: If the contents are not strict JSON (malformed document,
+        duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
     target = trial_dir / relative_path

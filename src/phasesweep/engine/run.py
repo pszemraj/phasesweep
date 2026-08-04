@@ -140,6 +140,8 @@ def run_config(
     :param bool dry_run: If ``True``, preview commands without launching subprocesses.
     :return dict[str, Winner] | dict[str, dict[str, Winner]]: Experiment winners, or suite
         study winners keyed by study name.
+    :raises RuntimeError: ``from_phase`` was given for a suite config, which
+        has no single phase sequence to resume.
     """
     if isinstance(config, Suite):
         if from_phase is not None:
@@ -272,6 +274,13 @@ def _run_experiment_outcome(
         diagnostic callback; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
     :return ExperimentRunOutcome: Winners bound to the publishing generation id.
+    :raises ProcessCleanupUncertainError: The run failed and post-failure
+        reconciliation could not confirm process cleanup; the original failure
+        is chained as the cause but is unsafe to handle on its own.
+    :raises BaseException: The run's own failure, re-raised unchanged after the
+        generation is durably recorded as failed — or, when reconciliation was
+        interrupted by ``KeyboardInterrupt``, ``SystemExit``, or
+        ``GeneratorExit``, that control-flow exception chained from it.
     """
     require_posix_runtime()
 
@@ -494,6 +503,13 @@ def _run_experiment_inner(
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
 
+    Raises:
+        TimeoutError: The whole-run wallclock deadline expired before a phase
+            could start.
+        RuntimeError: A phase's promotion decision was ``stop``.
+        FileNotFoundError: A skipped phase has no persisted ``winner.yaml``
+            (re-raised on non-dry-run; dry runs substitute a placeholder).
+
     """
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
@@ -645,6 +661,12 @@ def _preflight_skipped_winners(
     :param str | None from_phase: First phase that the new generation will execute.
     :param float | None run_deadline: Whole-run monotonic deadline, when configured.
     :return dict[str, Winner]: Compatible skipped winners in declaration order.
+    :raises TimeoutError: The whole-run wallclock deadline expired before a
+        skipped phase could be validated.
+    :raises ValueError: ``from_phase`` names no phase in the experiment.
+    :raises FileNotFoundError: A skipped phase has no persisted ``winner.yaml``.
+    :raises RuntimeError: A skipped phase's persisted winner is unfingerprinted
+        or its fingerprint disagrees with the current config.
     """
     if from_phase is None:
         return {}
@@ -1296,6 +1318,11 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     :param Suite suite: Parsed suite config.
     :param bool dry_run: If ``True``, preview each study without launching subprocesses.
     :return dict[str, dict[str, Winner]]: Winners keyed by study name, then phase name.
+    :raises RuntimeError: A study declares a dependency that exposed no
+        winners, so the suite refuses to start it.
+    :raises BaseException: Whatever a component run or the publication
+        transaction raised, re-raised after the suite generation is durably
+        recorded as ``failed`` (or ``publication_failed``).
     """
     results: dict[str, dict[str, Winner]] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}

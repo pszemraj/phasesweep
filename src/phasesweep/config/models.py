@@ -173,8 +173,12 @@ class Phase(_Frozen):
             value: The candidate ``gpu_ids`` list, or ``None``.
 
         Returns:
-            The same value, unchanged. Raises ``ValueError`` if any element
-            is negative.
+            The same value, unchanged.
+
+        Raises:
+            ValueError: ``value`` is an empty list, or any element is negative
+                (``CUDA_VISIBLE_DEVICES=-1`` hides all devices and would silently
+                disable GPU isolation).
 
         """
         if value is None:
@@ -196,6 +200,8 @@ class Phase(_Frozen):
         """Normalize and validate explicit CUDA device tokens.
 
         :param list[str] | None value: Candidate CUDA device tokens, or ``None``.
+        :raises ValueError: If ``value`` is an empty list, or any stripped token is
+            empty, contains a comma, or is ``-1``.
         :return list[str] | None: Stripped CUDA device tokens, or ``None``.
         """
         if value is None:
@@ -215,7 +221,14 @@ class Phase(_Frozen):
 
     @model_validator(mode="after")
     def _validate_gpu_isolation_config(self) -> Phase:
-        """Reject ambiguous explicit GPU isolation settings."""
+        """Reject ambiguous explicit GPU isolation settings.
+
+        :raises ValueError: If ``gpu_ids`` and ``gpu_devices`` are both set, if
+            ``gpu_policy='whole_node'`` is combined with ``n_jobs != 1`` or lacks an
+            explicit device list, or if ``gpu_policy='none'`` is combined with a
+            device list or with ``n_jobs > 1`` without ``allow_no_gpu_isolation``.
+        :return Phase: Self, unchanged.
+        """
         if self.gpu_ids is not None and self.gpu_devices is not None:
             raise ValueError("gpu_ids and gpu_devices are mutually exclusive.")
         if self.gpu_policy == "whole_node" and self.n_jobs != 1:
@@ -485,7 +498,12 @@ class Experiment(_Frozen):
 
     @model_validator(mode="after")
     def _validate_persistent_provenance(self) -> Experiment:
-        """Require meaningful external-input identity for persistent study reuse."""
+        """Require meaningful external-input identity for persistent study reuse.
+
+        :raises ValueError: If any provenance key or value is blank, or if
+            ``storage`` is set while ``provenance`` is empty.
+        :return Experiment: Self, unchanged.
+        """
         invalid = [
             key for key, value in self.provenance.items() if not key.strip() or not value.strip()
         ]
@@ -538,8 +556,18 @@ class Experiment(_Frozen):
           * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
 
         Returns:
-            Self, unchanged. Pydantic post-init validator protocol; raises
-            ``ValueError`` on any inconsistency listed above.
+            Self, unchanged. Pydantic post-init validator protocol.
+
+        Raises:
+            ValueError: A phase name is duplicated; a phase references an unknown
+                contract, a non-prior inherit, or a non-prior promotion baseline; a
+                key is both fixed and sampled locally, claimed by two applied
+                contracts, or overrides a contract-locked key; inherited locked keys
+                conflict across parents or are re-sampled; a key and one of its
+                dotted subkeys collide; the metric and constraint names are not all
+                distinct; or any of the delegated per-phase checks (sampler/search
+                space, storage policy, JSON-file override encodability, trial command
+                template) rejects the phase.
 
         """
         seen: dict[str, Phase] = {}

@@ -384,6 +384,10 @@ def finalize_result_snapshot(
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
+    :raises RuntimeError: If the cleanup report names more recovered attempts
+        than the snapshot counts as RUNNING, for a phase or for the represented
+        generation.
+    :raises ValidationError: If ``snapshot`` is not a valid ``RunResultSnapshot``.
     """
     parsed = RunResultSnapshot.model_validate(snapshot)
     confirmed = set(confirmed_attempt_ids)

@@ -125,6 +125,13 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
     Returns:
         The path to the written ``overrides.json`` file.
 
+    Raises:
+        ValueError: A dotted key collides with an existing scalar or would
+            replace a nested object built by another key, or the payload
+            contains a non-finite float.
+        TypeError: The payload contains a value the strict encoder cannot
+            represent.
+
     """
     nested: dict[str, Any] = {}
     for k, v in overrides.items():

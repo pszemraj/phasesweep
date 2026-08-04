@@ -560,6 +560,8 @@ def _cursor_offset(cursor: str | None) -> int:
 
     :param str | None cursor: Cursor supplied by the agent.
     :return int: Zero-based catalog offset.
+    :raises McpToolError: If the cursor is not a non-negative integer produced
+        by ``list_experiments``.
     """
     if cursor is None:
         return 0
@@ -764,6 +766,8 @@ class PhaseSweepMCP:
         :param int limit: Maximum catalog entries to return.
         :param str | None cursor: Optional pagination cursor returned by a prior call.
         :return dict[str, Any]: Catalog page safe for the agent.
+        :raises McpToolError: If ``limit`` is outside ``1..MAX_LIST_LIMIT``, or
+            the cursor is not one this tool returned.
         """
         if limit < 1 or limit > MAX_LIST_LIMIT:
             raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
@@ -1035,6 +1039,10 @@ class PhaseSweepMCP:
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
         :return tuple: Target id, parsed experiment, optional run payload, and handle.
+        :raises McpToolError: If neither or both of ``experiment_id`` and
+            ``run_id`` were provided.
+        :raises UnknownRunError: If ``run_id`` names no persisted run.
+        :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
         """
         if (experiment_id is None) == (run_id is None):
             provided = "neither" if experiment_id is None else "both"
@@ -1070,6 +1078,9 @@ class PhaseSweepMCP:
 
         :param RunHandle handle: Persisted run identity whose snapshot should be loaded.
         :return Experiment: Parsed experiment from the launched per-run snapshot.
+        :raises RunSnapshotUnavailableError: If the snapshot is missing,
+            unreadable, not an experiment, or no longer matches the hash
+            recorded in the handle.
         """
         snapshot_path = self._runs.config_snapshot_path(handle.run_id)
         try:
@@ -1233,6 +1244,17 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog experiment id to launch.
         :param str | None from_phase: Optional phase to resume from after earlier winners exist.
         :return dict[str, Any]: Launch result containing run id, experiment id, and running state.
+        :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
+        :raises PermissionDeniedError: If the entry does not allow launching, or
+            does not allow ``from_phase`` resumes.
+        :raises InvalidPhaseError: If ``from_phase`` names no phase of this experiment.
+        :raises ResumeNotReadyError: If an earlier phase has no compatible winner.
+        :raises LaunchInProgressError: If another launch currently holds the launch lock.
+        :raises ExperimentBusyError: If this experiment already has a live run.
+        :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
+        :raises ConfigChangedError: If the cataloged config changed since startup.
+        :raises RuntimeError: If no unused run id could be minted, or the spawned
+            runner has no Linux ``/proc`` start time to make cancellation PID-reuse safe.
         """
         args = {"experiment_id": experiment_id, "from_phase": from_phase}
         resolved: dict[str, Any] = {}
@@ -1357,6 +1379,10 @@ class PhaseSweepMCP:
 
         :param str run_id: Detached run id to cancel.
         :return dict[str, Any]: Cancellation result containing final state and optional cleanup confirmation.
+        :raises UnknownRunError: If ``run_id`` names no persisted run.
+        :raises PermissionDeniedError: If the run's entry did not allow cancel at launch time.
+        :raises RunLaunchUnsettledError: If the launch has not yet persisted a
+            process identity, so there is nothing safe to signal.
         """
         args = {"run_id": run_id}
         resolved: dict[str, Any] = {}
@@ -1460,6 +1486,9 @@ class PhaseSweepMCP:
 
         :param RegisteredExperiment reg: Registered experiment being resumed.
         :param str from_phase: Requested phase to resume from.
+        :raises ResumeNotReadyError: If an earlier phase has no persisted
+            winner, or its stored winner is unreadable or incompatible with the
+            current config.
         """
         names = reg.phase_names
         winners: dict[str, Winner] = {}
@@ -1503,6 +1532,10 @@ class PhaseSweepMCP:
         :param str run_id: Run id whose snapshot path should be used.
         :param bytes data: Already-verified config bytes.
         :return Path: Written config snapshot path consumed by the detached runner.
+        :raises FileExistsError: If that run id's snapshot path is already
+            taken, so the caller can mint another id.
+        :raises RuntimeError: If the snapshot could not be written durably for
+            any other reason.
         """
         snapshot_path = self._runs.config_snapshot_path(run_id)
         try:
@@ -1907,7 +1940,12 @@ def _strict_tool_inputs(mcp: Any) -> None:
 
 
 def _verify_strict_tool_inputs(mcp: Any) -> None:
-    """Fail startup if FastMCP internals did not keep the strict schemas."""
+    """Fail startup if FastMCP internals did not keep the strict schemas.
+
+    :param Any mcp: Configured FastMCP server whose registered tools are inspected.
+    :raises RuntimeError: If any tool still accepts undeclared input keys, a
+        read tool is unregistered, or a read tool lost its exactly-one-of schema.
+    """
     expected_one_of = [
         {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
         {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
