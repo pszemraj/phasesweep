@@ -766,7 +766,10 @@ def _wandb_summary_required(
     return GateResult(gate.type, False, f"W&B summary missing {missing}")
 
 
-_GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
+# Single registry of handled gate types. Signatures are not uniform — the W&B
+# gate additionally accepts the ``deadline_capped`` keyword — so the value type
+# is left open rather than pinned to the two-positional-argument shape.
+_GATE_DISPATCH: dict[type, Callable[..., GateResult]] = {
     RequiredFileGate: _required_file,
     JsonEqualsGate: _json_equals,
     JsonScalarBoundGate: _json_scalar_bound,
@@ -794,6 +797,15 @@ def evaluate_gates(
     """
     results: list[GateResult] = []
     for gate in gates:
+        fn = _GATE_DISPATCH.get(type(gate))
+        if fn is None:
+            # Unreachable from config today (``Gate`` is a closed pydantic
+            # union whose every member is registered above), but a new member
+            # added without a dispatch entry must degrade to one failing gate
+            # rather than raise a KeyError that escapes the objective and
+            # aborts the whole phase mid-sweep.
+            results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
+            continue
         remaining = _remaining_budget_seconds(deadline)
         deadline_capped = False
         if remaining is not None:
@@ -813,8 +825,9 @@ def evaluate_gates(
                     update={"timeout_seconds": min(gate.timeout_seconds, remaining)}
                 )
         if isinstance(gate, WandbSummaryRequiredGate):
-            results.append(_wandb_summary_required(ctx, gate, deadline_capped=deadline_capped))
+            # Dispatched through the table like every other gate; only the
+            # extra deadline-attribution keyword is specific to this one.
+            results.append(fn(ctx, gate, deadline_capped=deadline_capped))
         else:
-            # Unknown gate types raise KeyError here rather than being skipped.
-            results.append(_GATE_DISPATCH[type(gate)](ctx, gate))
+            results.append(fn(ctx, gate))
     return results

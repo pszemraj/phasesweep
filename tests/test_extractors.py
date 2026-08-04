@@ -831,3 +831,35 @@ def test_deadline_capped_extractor_error_keeps_underlying_diagnostic(fake_wandb,
     cause = excinfo.value.__cause__
     assert isinstance(cause, ExtractorError)
     assert "401 unauthorized" in str(cause)
+
+
+class _UnregisteredGate:
+    """Stand-in for a ``Gate`` union member with no ``_GATE_DISPATCH`` entry."""
+
+    type = "unregistered"
+
+    def __repr__(self) -> str:
+        return "_UnregisteredGate()"
+
+
+@pytest.mark.parametrize("deadline", [None, 0.0, "future"])
+def test_unregistered_gate_type_fails_instead_of_raising(tmp_path, deadline):
+    """An unhandled gate type degrades to one failing gate, never a KeyError.
+
+    A bare ``_GATE_DISPATCH[type(gate)]`` lookup raises ``KeyError``, which is
+    not an ``ExtractorError`` and is not in Optuna's ``catch=`` tuple, so it
+    would escape the objective and abort the entire phase and run mid-sweep.
+    """
+    ctx = make_trial_context(tmp_path)
+    resolved = time.monotonic() + 5.0 if deadline == "future" else deadline
+    known = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
+
+    results = evaluate_gates(ctx, [_UnregisteredGate(), known], deadline=resolved)  # type: ignore[list-item]
+
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert results[0].gate_type == "_UnregisteredGate"
+    assert "unknown gate" in results[0].detail
+    # Evaluation continues past the unknown gate rather than aborting the trial.
+    assert results[1].gate_type == "json_equals"
+    assert results[1].passed is False
