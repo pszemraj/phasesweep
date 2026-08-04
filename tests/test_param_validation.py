@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
 import warnings
 from pathlib import Path
@@ -622,6 +623,53 @@ def test_search_space_accepts_well_formed_keys() -> None:
             search_space={good_key: FloatParam(type="float", low=0.0, high=1.0)},
         )
         assert good_key in phase.search_space
+
+
+def test_cmaes_phase_rejected_at_config_load_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CMA-ES availability is part of config validation, not mid-run sampler build.
+
+    ``cmaes`` is a declared hard dependency, but a declared dependency is not
+    an enforced one. If the preflight is dropped, a broken environment passes
+    ``phasesweep validate`` and fails inside ``_build_sampler`` instead —
+    after the generation is claimed and earlier phases have burned GPU time.
+    """
+    # A None entry makes `import cmaes` raise ImportError without touching
+    # any other import, and monkeypatch restores the real module after.
+    monkeypatch.setitem(sys.modules, "cmaes", None)
+
+    with pytest.raises(ValidationError, match=r"cmaes.*not installed"):
+        make_experiment(
+            sampler=Sampler(type="cmaes", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+
+def test_cmaes_missing_package_error_names_the_install_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rejection tells the operator exactly how to repair the environment."""
+    monkeypatch.setitem(sys.modules, "cmaes", None)
+
+    with pytest.raises(ValidationError) as excinfo:
+        make_experiment(
+            sampler=Sampler(type="cmaes", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    assert "pip install cmaes" in str(excinfo.value)
+
+
+def test_cmaes_phase_loads_when_package_present() -> None:
+    """A CMA-ES phase loads when the base dependency is importable."""
+    import cmaes  # noqa: F401
+
+    exp = make_experiment(
+        sampler=Sampler(type="cmaes", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    assert exp.phases[0].sampler.type == "cmaes"
 
 
 def test_inherit_search_space_collision_errors(tmp_path):

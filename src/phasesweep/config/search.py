@@ -151,6 +151,15 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
+    * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
+      hard dependency, but a declared dependency is not an enforced one: an
+      environment can lose it (partial install, manual uninstall, a checkout
+      run without installing). Without this preflight the failure surfaces
+      inside ``optuna.samplers.CmaEsSampler`` during ``_build_sampler``, i.e.
+      after the generation is claimed, the experiment lock is held, and earlier
+      phases have already burned GPU time — and with an Optuna-internal message
+      instead of an install hint. This is an environment check, not a
+      closed-contract type check; do not "simplify" it away.
     * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
       not enumerate log-spaced values.
     * Grid sampler with float param missing ``step``.
@@ -176,6 +185,14 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                 f"categorical parameters: {cats}. Use sampler.type='tpe' or "
                 f"remove the categorical params from this phase."
             )
+        try:
+            import cmaes  # type: ignore[import-untyped]  # noqa: F401
+        except ImportError as exc:
+            raise ValueError(
+                f"Phase {phase.name!r}: sampler.type='cmaes' requires the "
+                "'cmaes' package, which is not installed. Reinstall phasesweep "
+                "or install it directly with `pip install cmaes`."
+            ) from exc
 
     if sampler_type == "grid":
         cardinality = math.prod(
