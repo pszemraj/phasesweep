@@ -289,13 +289,17 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     numbered_rules = [
         line for line in initialization.instructions.splitlines() if line[:1].isdigit()
     ]
-    assert len(numbered_rules) == 7
+    assert len(numbered_rules) == 9
     assert "follow `next_cursor` until it is null" in numbered_rules[0]
     assert "call `inspect_experiment` before proposing a run" in numbered_rules[0]
     assert "Follow each result's `next_action`" in numbered_rules[1]
     assert "repeat `await_run` while directed" in numbered_rules[1]
     assert "operator recovery is required" in numbered_rules[4]
     assert "convergence, trends, robustness, causality" in numbered_rules[6]
+    assert "Never edit an experiment config yourself" in numbered_rules[7]
+    assert "search space, samplers, gates" in numbered_rules[7]
+    assert "Never open raw datasets" in numbered_rules[8]
+    assert "trainer logs, raw result files, W&B dashboards" in numbered_rules[8]
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,

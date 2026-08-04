@@ -123,7 +123,7 @@ The package is not published and this MCP surface intentionally carries no depre
 
 - [MCP operator reference](mcp.md): catalog schema, tool payloads, run lifecycle, recovery, authorization, auditing, security, and installer semantics.
 - [Runtime behavior](runtime.md): platform support, process supervision, storage, locks, GPU isolation, and output layout.
-- [Packaged agent instructions](../src/phasesweep/mcp/agent_prompt.md): the seven rules installed into supported project instruction files.
+- [Packaged agent instructions](../src/phasesweep/mcp/agent_prompt.md): the nine rules installed into supported project instruction files.
 
 For a manual stdio entry, use the absolute values printed by `which phasesweep-mcp` and your reviewed catalog:
 
