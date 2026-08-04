@@ -74,7 +74,7 @@ def winners_payload(
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
 ) -> dict[str, Any]:
-    """Build the ``get_winners`` payload from path-free phase-winner views.
+    """Build the ``get_run_results`` payload from path-free phase-winner views.
 
     MCP output exposes sampled ``params`` only, and values are redacted unless
     the catalog explicitly allows them. ``effective_overrides`` can include
@@ -161,7 +161,7 @@ def status_payload(
     result_source: ResultSource,
     elapsed_seconds: int | None,
 ) -> dict[str, Any]:
-    """Build the ``get_status`` payload from the path-free read_status dict.
+    """Build the ``get_run_status`` payload from the path-free read_status dict.
 
     ``status`` is the read_status output (already path-free). ``run`` is the
     process-level state for a specific run_id, or None for an experiment-level

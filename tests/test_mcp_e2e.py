@@ -21,13 +21,13 @@ from phasesweep.mcp.server import (
     DEFAULT_LIST_LIMIT,
     PROMPT_RUN_AND_MONITOR,
     TOOL_AWAIT_RUN,
-    TOOL_CANCEL_SWEEP,
+    TOOL_CANCEL_RUN,
     TOOL_GET_LATEST_RUN,
-    TOOL_GET_STATUS,
-    TOOL_GET_WINNERS,
-    TOOL_LAUNCH_SWEEP,
+    TOOL_GET_RUN_RESULTS,
+    TOOL_GET_RUN_STATUS,
+    TOOL_INSPECT_EXPERIMENT,
+    TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
-    TOOL_VALIDATE_CONFIG,
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
@@ -225,7 +225,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
         with pytest.raises(Exception, match="max_concurrent_runs=1") as exc_info:
             app.launch("slowb")
         assert run_a in str(exc_info.value)
-        assert "phasesweep_await_run" in str(exc_info.value)
+        assert "await_run" in str(exc_info.value)
         # Freeing the slot lets the other experiment launch.
         assert app.cancel(run_a)["state"] == "cancelled"
         result = app.launch("slowb")
@@ -294,74 +294,85 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.instructions == agent_prompt_text(strip=True)
-    assert "unchanged relaunches do not need another validation call" in initialization.instructions
-    assert "reason: recovery_required" in initialization.instructions
-    assert "do not claim convergence, trends, robustness" in initialization.instructions
+    numbered_rules = [
+        line for line in initialization.instructions.splitlines() if line[:1].isdigit()
+    ]
+    assert len(numbered_rules) == 7
+    assert "list_experiments` -> `inspect_experiment` -> `launch_run`" in numbered_rules[0]
+    assert "operator recovery is required" in numbered_rules[4]
+    assert "convergence, trends, robustness, causality" in numbered_rules[6]
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
-        TOOL_VALIDATE_CONFIG,
+        TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
-        TOOL_GET_STATUS,
+        TOOL_GET_RUN_STATUS,
         TOOL_AWAIT_RUN,
-        TOOL_GET_WINNERS,
-        TOOL_LAUNCH_SWEEP,
-        TOOL_CANCEL_SWEEP,
+        TOOL_GET_RUN_RESULTS,
+        TOOL_LAUNCH_RUN,
+        TOOL_CANCEL_RUN,
     }
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
+    listed = server._tool_manager.get_tool(TOOL_LIST_EXPERIMENTS).fn()
+    assert listed.next_action == TOOL_INSPECT_EXPERIMENT
+    latest = asyncio.run(
+        server._tool_manager.get_tool(TOOL_GET_LATEST_RUN).fn(experiment_id="e2e_lm")
+    )
+    assert latest.next_action is None
     for tool_name in (
-        TOOL_VALIDATE_CONFIG,
+        TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
-        TOOL_GET_STATUS,
+        TOOL_GET_RUN_STATUS,
         TOOL_AWAIT_RUN,
-        TOOL_GET_WINNERS,
-        TOOL_LAUNCH_SWEEP,
-        TOOL_CANCEL_SWEEP,
+        TOOL_GET_RUN_RESULTS,
+        TOOL_LAUNCH_RUN,
+        TOOL_CANCEL_RUN,
     ):
         assert server._tool_manager.get_tool(tool_name).is_async is True
 
     descriptions = {t.name: t.description for t in tools}
-    assert (
-        "unchanged relaunches do not need another validation call"
-        in descriptions[TOOL_VALIDATE_CONFIG]
-    )
-    assert "terminal-attempt targets" in descriptions[TOOL_VALIDATE_CONFIG]
-    assert "independently re-checks config identity" in descriptions[TOOL_LAUNCH_SWEEP]
-    assert "If found=false" in descriptions[TOOL_GET_LATEST_RUN]
-    assert "run.recovery_required" in descriptions[TOOL_GET_STATUS]
-    assert "reason is recovery_required" in descriptions[TOOL_AWAIT_RUN]
-    assert "reason is terminal" in descriptions[TOOL_AWAIT_RUN]
-    assert "reason is phase_completed" in descriptions[TOOL_AWAIT_RUN]
-    assert "changed may still be true" in descriptions[TOOL_AWAIT_RUN]
-    assert "not search ranges or non-winning trial history" in descriptions[TOOL_GET_WINNERS]
+    assert "Call this first" in descriptions[TOOL_LIST_EXPERIMENTS]
+    assert "then call inspect_experiment" in descriptions[TOOL_LIST_EXPERIMENTS]
+    assert "before launch_run" in descriptions[TOOL_INSPECT_EXPERIMENT]
+    assert "config identity" in descriptions[TOOL_INSPECT_EXPERIMENT]
+    assert "recover a lost run_id" in descriptions[TOOL_GET_LATEST_RUN]
+    assert "found=false never authorizes" in descriptions[TOOL_GET_LATEST_RUN]
+    assert "next await an active run" in descriptions[TOOL_GET_RUN_STATUS]
+    assert "stop if recovery_required" in descriptions[TOOL_GET_RUN_STATUS]
+    assert "repeat while running" in descriptions[TOOL_AWAIT_RUN]
+    assert "stop immediately for recovery_required" in descriptions[TOOL_AWAIT_RUN]
+    assert "this ends the normal workflow" in descriptions[TOOL_GET_RUN_RESULTS]
+    assert "winner-only data" in descriptions[TOOL_GET_RUN_RESULTS]
+    assert "explicit user authorization" in descriptions[TOOL_LAUNCH_RUN]
+    assert "Never retry permission" in descriptions[TOOL_LAUNCH_RUN]
+    assert "only when the user explicitly asks" in descriptions[TOOL_CANCEL_RUN]
+    assert "Never cancel automatically" in descriptions[TOOL_CANCEL_RUN]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
     # could not call the tools. Lock the shapes in.
     schemas = {t.name: t.inputSchema for t in tools}
     assert all(schema.get("additionalProperties") is False for schema in schemas.values())
-    assert sorted(schemas[TOOL_LAUNCH_SWEEP]["properties"]) == ["experiment_id", "from_phase"]
-    assert schemas[TOOL_LAUNCH_SWEEP]["required"] == ["experiment_id"]
-    assert (
-        schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
-    )
-    assert schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["description"]
-    assert sorted(schemas[TOOL_GET_STATUS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_STATUS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_STATUS]
-    assert sorted(schemas[TOOL_GET_WINNERS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_WINNERS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_WINNERS]
-    assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
+    assert sorted(schemas[TOOL_LAUNCH_RUN]["properties"]) == ["experiment_id", "from_phase"]
+    assert schemas[TOOL_LAUNCH_RUN]["required"] == ["experiment_id"]
+    assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["description"]
+    assert sorted(schemas[TOOL_GET_RUN_STATUS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_RUN_STATUS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_RUN_STATUS]
+    assert sorted(schemas[TOOL_GET_RUN_RESULTS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_RUN_RESULTS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_RUN_RESULTS]
+    assert schemas[TOOL_CANCEL_RUN]["required"] == ["run_id"]
     assert schemas[TOOL_AWAIT_RUN]["required"] == ["run_id"]
     assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
     timeout_schema = schemas[TOOL_AWAIT_RUN]["properties"]["timeout_seconds"]
     assert timeout_schema["default"] == AWAIT_DEFAULT_TIMEOUT_SECONDS
     assert timeout_schema["minimum"] == AWAIT_MIN_TIMEOUT_SECONDS
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
-    assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
+    assert schemas[TOOL_INSPECT_EXPERIMENT]["required"] == ["experiment_id"]
     assert schemas[TOOL_GET_LATEST_RUN]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
@@ -371,13 +382,14 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
     assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
-    assert annotations[TOOL_LAUNCH_SWEEP].readOnlyHint is False
-    assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is True
-    assert annotations[TOOL_LAUNCH_SWEEP].openWorldHint is True
-    assert annotations[TOOL_CANCEL_SWEEP].destructiveHint is True
-    assert annotations[TOOL_CANCEL_SWEEP].idempotentHint is True
+    assert annotations[TOOL_LAUNCH_RUN].readOnlyHint is False
+    assert annotations[TOOL_LAUNCH_RUN].destructiveHint is True
+    assert annotations[TOOL_LAUNCH_RUN].openWorldHint is True
+    assert annotations[TOOL_CANCEL_RUN].destructiveHint is True
+    assert annotations[TOOL_CANCEL_RUN].idempotentHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
+    assert all("next_action" in schema["properties"] for schema in output_schemas.values())
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "recovery_required" in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["enum"]
@@ -390,8 +402,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "found" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
     assert "run" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
-    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_WINNERS])
-    assert "params" in json.dumps(output_schemas[TOOL_GET_WINNERS])
+    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
 
     resources = asyncio.run(server.list_resources())
     assert {str(resource.uri) for resource in resources} == {CATALOG_RESOURCE_URI}
@@ -402,11 +414,11 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     prompts = asyncio.run(server.list_prompts())
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
-    assert "phasesweep_launch_sweep" in str(prompt)
-    assert "target or label columns" in str(prompt)
+    assert "launch_run" in str(prompt)
+    assert "<redacted>" in str(prompt)
 
 
-@pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_SWEEP, TOOL_LAUNCH_SWEEP])
+@pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN])
 def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocking_tool: str
 ) -> None:
@@ -473,7 +485,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         return {"run_id": "r2", "experiment_id": experiment_id, "state": "running"}
 
     monkeypatch.setattr(app, "await_run", quick_await)
-    if blocking_tool == TOOL_CANCEL_SWEEP:
+    if blocking_tool == TOOL_CANCEL_RUN:
         monkeypatch.setattr(app, "cancel", blocking_cancel)
         blocking_arguments = {"run_id": "r1"}
     else:
@@ -528,7 +540,7 @@ def test_fastmcp_tool_errors_are_is_error_results(
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name=TOOL_VALIDATE_CONFIG,
+            name=TOOL_INSPECT_EXPERIMENT,
             arguments={"experiment_id": "missing"},
         )
     )
@@ -549,7 +561,7 @@ def test_fastmcp_tool_errors_are_is_error_results(
         handler(
             types.CallToolRequest(
                 params=types.CallToolRequestParams(
-                    name=TOOL_VALIDATE_CONFIG,
+                    name=TOOL_INSPECT_EXPERIMENT,
                     arguments={"experiment_id": "e2e_lm"},
                 )
             )
@@ -575,7 +587,7 @@ def test_fastmcp_rejects_extra_tool_arguments(tmp_path: Path) -> None:
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name=TOOL_VALIDATE_CONFIG,
+            name=TOOL_INSPECT_EXPERIMENT,
             arguments={"experiment_id": "e2e_lm", "unexpected": True},
         )
     )

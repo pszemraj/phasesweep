@@ -437,9 +437,7 @@ class GpuPool:
                 raise ValueError("explicit_devices must contain only string device tokens.")
             explicit_devices = [token.strip() for token in explicit_devices]
             bad_devices = [
-                token
-                for token in explicit_devices
-                if not token or "," in token or token == "-1"
+                token for token in explicit_devices if not token or "," in token or token == "-1"
             ]
             if bad_devices:
                 raise ValueError(
@@ -457,9 +455,7 @@ class GpuPool:
                 "policy='none' cannot be combined with explicit_ids or explicit_devices."
             )
         if policy == "none" and n_jobs > 1 and not allow_no_gpu:
-            raise ValueError(
-                "policy='none' with n_jobs > 1 requires allow_no_gpu=True."
-            )
+            raise ValueError("policy='none' with n_jobs > 1 requires allow_no_gpu=True.")
 
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")

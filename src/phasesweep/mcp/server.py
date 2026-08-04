@@ -32,7 +32,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.state import Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
-from phasesweep.mcp import agent_prompt_text
+from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import (
@@ -78,14 +78,14 @@ from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc
 log = logging.getLogger("phasesweep.mcp.server")
 
 SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
-TOOL_LIST_EXPERIMENTS = "phasesweep_list_experiments"
-TOOL_VALIDATE_CONFIG = "phasesweep_validate_config"
-TOOL_GET_LATEST_RUN = "phasesweep_get_latest_run"
-TOOL_GET_STATUS = "phasesweep_get_status"
-TOOL_GET_WINNERS = "phasesweep_get_winners"
-TOOL_LAUNCH_SWEEP = "phasesweep_launch_sweep"
-TOOL_CANCEL_SWEEP = "phasesweep_cancel_sweep"
-TOOL_AWAIT_RUN = "phasesweep_await_run"
+TOOL_INSPECT_EXPERIMENT = "inspect_experiment"
+TOOL_GET_LATEST_RUN = "get_latest_run"
+TOOL_GET_RUN_STATUS = "get_run_status"
+TOOL_GET_RUN_RESULTS = "get_run_results"
+TOOL_LAUNCH_RUN = "launch_run"
+TOOL_CANCEL_RUN = "cancel_run"
+TOOL_AWAIT_RUN = "await_run"
+TOOL_LIST_EXPERIMENTS = "list_experiments"
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 DEFAULT_LIST_LIMIT = 50
@@ -101,102 +101,46 @@ AWAIT_RECHECK_SECONDS = 30
 # present on every call even when the user loads no prompt, so each one chains
 # to the next tool in the workflow by literal name.
 DESCRIPTION_LIST_EXPERIMENTS = (
-    "List the human-curated experiments this server can run: ids, descriptions, "
-    "phase names, optimization metric with objective-evidence assurance, and authorized "
-    "capabilities. Read-only. Start here. If next_cursor is non-null, call again with it. "
-    "Then call "
-    f"{TOOL_VALIDATE_CONFIG} on the id you plan to use."
+    "List the operator-approved experiments and their permitted actions. Call this first for "
+    "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
+    "ids returned by this catalog."
 )
-DESCRIPTION_VALIDATE_CONFIG = (
-    "Re-check that the cataloged config has not changed, then inspect it before launching: "
-    "metric with objective-evidence assurance, authorized capabilities, and per-phase names, "
-    "terminal-attempt targets, "
-    "samplers, inherited phases, and search-space keys (never ranges). Read-only. "
-    "Call once while planning an experiment; "
-    f"{TOOL_LAUNCH_SWEEP} independently refuses a changed config, so unchanged "
-    "relaunches do not need another validation call."
+DESCRIPTION_INSPECT_EXPERIMENT = (
+    "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
+    "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
+    "Read-only: launch_run separately rechecks config identity and refuses catalog drift."
 )
 DESCRIPTION_GET_LATEST_RUN = (
-    "Return the single most recently launched MCP run for one catalog experiment, or "
-    "found=false if none exists. Read-only. Use after reconnecting or when a prior run_id "
-    "was lost; this computes the newest run so you must not scan or rank a list. If found=false, "
-    "report that no prior run exists and ask the user before launching a replacement. Then use "
-    f"the returned run_id with {TOOL_AWAIT_RUN}, {TOOL_GET_STATUS}, or {TOOL_GET_WINNERS}."
+    "Return the most recently launched run for one experiment. Call only to recover a lost "
+    "run_id; next use await_run for an active run or get_run_results for a terminal run. "
+    "Read-only: found=false never authorizes launching a replacement."
 )
-DESCRIPTION_LAUNCH_SWEEP = (
-    "Start an experiment's sweep as a detached background run that survives this "
-    f"session. Returns a run_id: save it, then wait on {TOOL_AWAIT_RUN} (or poll "
-    f"{TOOL_GET_STATUS}) with it until the state is terminal. Pass from_phase "
-    "only to resume when earlier phase winners already exist. The launch independently "
-    "re-checks config identity and refuses a config changed since server startup. A "
-    "permission refusal is deliberate catalog policy: report it to the user and do not "
-    "retry or work around it. "
-    "A concurrency-limit refusal is transient and names blocking run_ids: wait on one with "
-    f"{TOOL_AWAIT_RUN}, then retry this launch only after that run is terminal."
+DESCRIPTION_LAUNCH_RUN = (
+    "Launch one approved experiment as a detached run and return its run_id. Call only after "
+    "inspection and explicit user authorization; next call await_run with the returned run_id. "
+    "Never retry permission or config-identity refusals; await named blockers before retrying a "
+    "capacity refusal."
 )
-DESCRIPTION_GET_STATUS = (
-    "Per-phase trial progress and the run process state (running / succeeded / "
-    "failed / cancelled). If run.recovery_required is true, stop monitoring and report "
-    "the run to the user for operator attention. Provide exactly one of experiment_id or "
-    "run_id; after a "
-    "launch, always use the run_id so catalog edits cannot redirect monitoring. "
-    "State counts are dense and explicitly split into cumulative, before-run, and this-run "
-    "dimensions; remaining_trials is already computed. "
-    "current_generation_id and published_generation_id are always the actual pointers, never "
-    "forced to a queried run_id; represented_generation_id is the generation whose winner_present "
-    "and summary_present this payload shows - normally a run_id itself when querying by run_id, "
-    "otherwise published_generation_id. A config-only unavailable placeholder sets all generation "
-    "ids to null. is_published is true only when represented_generation_id is the "
-    "actual published one; a run_id whose own publication failed still reports its own "
-    "this-run counts and winners with is_published=false. "
-    "trial_data_available=false means zero counts are not trustworthy. result_source names "
-    "the provenance; terminal_snapshot_unavailable is a config-only placeholder accompanied "
-    "by an actionable run failure, never mutable study data. A terminal run_id otherwise "
-    "requires the phase counts frozen when that run ended. An experiment_id returns the "
-    "current shared-study view. "
-    f"Read-only. Prefer {TOOL_AWAIT_RUN} for monitoring; when polling this "
-    "instead, wait at least 30 seconds between calls. When terminal, call "
-    f"{TOOL_GET_WINNERS} with the same run_id."
+DESCRIPTION_GET_RUN_STATUS = (
+    "Read process state and per-phase progress for exactly one experiment_id or run_id. Use as a "
+    "single status check when await_run is unsuitable; next await an active run or read terminal "
+    "results. Read-only: after launch always use run_id, and stop if recovery_required is true."
 )
-DESCRIPTION_GET_WINNERS = (
-    "The end of the workflow: per completed phase, the concrete winner_source, "
-    "promotion context, metric value, policy-filtered sampled params, gate status, and "
-    "completeness. winner_source identifies the actual source phase and trial when "
-    "continue_baseline rejects a candidate. "
-    "Phases that completed still report winners when the run later failed or was "
-    "cancelled. Values shown as <redacted> are intentional catalog policy, not "
-    "errors. Provide exactly one of experiment_id or run_id (prefer the launched "
-    "run_id); result_source identifies current, frozen, or unavailable results, and "
-    "missing_phases plus all_phases_have_winners already compute completeness. A "
-    "terminal_snapshot_unavailable result carries an actionable failure and no mutable "
-    "fallback. Terminal run-id winners otherwise stay frozen if the experiment is later "
-    "resumed. This returns "
-    "winners, not search ranges or non-winning trial history: do not infer convergence, trends, "
-    "robustness, or boundary effects from it. Read-only."
+DESCRIPTION_GET_RUN_RESULTS = (
+    "Return terminal per-phase winners, completeness, promotion context, metrics, gates, and "
+    "policy-filtered sampled parameters. Call after a run becomes terminal; this ends the normal "
+    "workflow. Read-only: treat redaction as policy and never infer trends or convergence from "
+    "winner-only data."
 )
-DESCRIPTION_CANCEL_SWEEP = (
-    "Stop a launched run by run_id. Use only when the user asks or to prevent an "
-    "unwanted active sweep. If recovery_required is true, report it to the user; "
-    "recovery is operator-only and no MCP tool can clear it. Repeating a cancel "
-    "is safe but does not replace operator recovery."
+DESCRIPTION_CANCEL_RUN = (
+    "Request bounded cancellation of one launched run. Call only when the user explicitly asks; "
+    "next read get_run_results if cancellation finishes cleanly. Never cancel automatically, and "
+    "stop for operator recovery when recovery_required is true."
 )
 DESCRIPTION_AWAIT_RUN = (
-    "Wait for a launched run to change. Blocks up to timeout_seconds (default "
-    f"{AWAIT_DEFAULT_TIMEOUT_SECONDS}, max {AWAIT_MAX_TIMEOUT_SECONDS}) and returns "
-    "early when operator recovery is required, the run reaches a terminal state, or a "
-    "phase gains a winner; "
-    "otherwise returns the current status at timeout — if the state is still "
-    "running, call again with the same run_id. Returns the same payload as "
-    f"{TOOL_GET_STATUS} plus changed and reason (recovery_required / terminal / "
-    f"phase_completed / timeout). If reason is recovery_required, stop waiting and "
-    "report the run to the user for operator attention. A launch handoff observed "
-    f"mid-transition can still settle. If reason is terminal, call {TOOL_GET_WINNERS} "
-    "with the same run_id. "
-    f"If reason is phase_completed, call {TOOL_AWAIT_RUN} again with the same run_id. "
-    "At timeout, changed may still be true when trial counts advanced without another stop "
-    "condition; report that progress and call this tool again while the run is running. "
-    "Read-only. While waiting, status is rechecked at most once every "
-    f"{AWAIT_RECHECK_SECONDS} seconds. Prefer this over polling {TOOL_GET_STATUS} in a loop."
+    "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
+    "recovery. Call after launch_run and repeat while running; next call get_run_results when "
+    "terminal. Read-only: always reuse the run_id and stop immediately for recovery_required."
 )
 
 ExperimentId = Annotated[
@@ -215,14 +159,12 @@ MaybeExperimentId = Annotated[
 ]
 RunId = Annotated[
     str,
-    Field(
-        description=f"MCP run id returned by {TOOL_LAUNCH_SWEEP}.", pattern=SAFE_NAME_JSON_PATTERN
-    ),
+    Field(description=f"MCP run id returned by {TOOL_LAUNCH_RUN}.", pattern=SAFE_NAME_JSON_PATTERN),
 ]
 MaybeRunId = Annotated[
     str | None,
     Field(
-        description=f"MCP run id returned by {TOOL_LAUNCH_SWEEP}. Provide exactly one of experiment_id or run_id.",
+        description=f"MCP run id returned by {TOOL_LAUNCH_RUN}. Provide exactly one of experiment_id or run_id.",
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
@@ -248,7 +190,7 @@ ListLimit = Annotated[
 MaybeCursor = Annotated[
     str | None,
     Field(
-        description="Opaque pagination cursor returned by a previous phasesweep_list_experiments call.",
+        description=f"Opaque pagination cursor returned by a previous {TOOL_LIST_EXPERIMENTS} call.",
     ),
 ]
 AwaitTimeoutSeconds = Annotated[
@@ -260,6 +202,16 @@ AwaitTimeoutSeconds = Annotated[
         ge=AWAIT_MIN_TIMEOUT_SECONDS,
         le=AWAIT_MAX_TIMEOUT_SECONDS,
     ),
+]
+NextAction = Literal[
+    "list_experiments",
+    "inspect_experiment",
+    "get_latest_run",
+    "get_run_status",
+    "await_run",
+    "get_run_results",
+    "launch_run",
+    "cancel_run",
 ]
 
 # Environment variables that make the interpreter execute code before the
@@ -298,6 +250,15 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _ResultPayload(_ToolPayload):
+    """Top-level tool result with an optional normal workflow transition."""
+
+    next_action: NextAction | None = Field(
+        default=None,
+        description="Normal next tool for this result, or null when operator/user input is needed.",
+    )
+
+
 class ObjectiveEvidencePayload(_ToolPayload, _ObjectiveEvidenceFields):
     """Assurance properties enforced by the configured objective extractor.
 
@@ -334,7 +295,7 @@ class ExperimentSummaryPayload(_ToolPayload):
     capabilities: CapabilitiesPayload
 
 
-class ListExperimentsResult(_ToolPayload):
+class ListExperimentsResult(_ResultPayload):
     """Structured output for list_experiments."""
 
     experiments: list[ExperimentSummaryPayload]
@@ -360,8 +321,8 @@ class PhaseValidationPayload(_ToolPayload):
     search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")
 
 
-class ValidateConfigResult(_ToolPayload):
-    """Structured output for validate_config."""
+class InspectExperimentResult(_ResultPayload):
+    """Structured output for inspect_experiment."""
 
     experiment_id: ExperimentId
     metric: MetricPayload
@@ -391,7 +352,7 @@ class RunPayload(_ToolPayload):
     )
 
 
-class GetLatestRunResult(_ToolPayload):
+class GetLatestRunResult(_ResultPayload):
     """Newest durable run handle for one experiment."""
 
     experiment_id: ExperimentId
@@ -436,8 +397,8 @@ class PhaseStatusPayload(_ToolPayload):
     )
 
 
-class GetStatusResult(_ToolPayload):
-    """Structured output for get_status."""
+class GetRunStatusResult(_ResultPayload):
+    """Structured output for get_run_status."""
 
     experiment_id: ExperimentId
     result_source: ResultSource
@@ -481,8 +442,8 @@ class GetStatusResult(_ToolPayload):
     )
 
 
-class AwaitRunResult(GetStatusResult):
-    """Structured output for await_run: get_status plus what ended the wait."""
+class AwaitRunResult(GetRunStatusResult):
+    """Structured output for await_run: run status plus what ended the wait."""
 
     changed: bool = Field(
         description=(
@@ -548,8 +509,8 @@ class WinnerPhasePayload(_ToolPayload):
     incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
 
 
-class GetWinnersResult(_ToolPayload):
-    """Structured output for get_winners."""
+class GetRunResultsResult(_ResultPayload):
+    """Structured output for get_run_results."""
 
     experiment_id: ExperimentId
     run_id: RunId | None
@@ -563,16 +524,16 @@ class GetWinnersResult(_ToolPayload):
     failure: FailurePayload | None = None
 
 
-class LaunchSweepResult(_ToolPayload):
-    """Structured output for launch_sweep."""
+class LaunchRunResult(_ResultPayload):
+    """Structured output for launch_run."""
 
     run_id: RunId
     experiment_id: ExperimentId
     state: Literal["running"]
 
 
-class CancelSweepResult(_ToolPayload):
-    """Structured output for cancel_sweep."""
+class CancelRunResult(_ResultPayload):
+    """Structured output for cancel_run."""
 
     run_id: RunId
     state: RunState
@@ -598,14 +559,23 @@ def _cursor_offset(cursor: str | None) -> int:
     try:
         offset = int(cursor)
     except ValueError:
-        raise McpToolError(
-            "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
-        ) from None
+        raise McpToolError("invalid cursor; use next_cursor returned by list_experiments") from None
     if offset < 0:
-        raise McpToolError(
-            "invalid cursor; use next_cursor returned by phasesweep_list_experiments"
-        )
+        raise McpToolError("invalid cursor; use next_cursor returned by list_experiments")
     return offset
+
+
+def _run_next_action(run: RunPayload | None) -> NextAction | None:
+    """Choose the normal follow-up for a returned run handle.
+
+    :param RunPayload | None run: Agent-visible run state, when one exists.
+    :return NextAction | None: Monitoring or result tool, or null when no automatic step is safe.
+    """
+    if run is None or run.recovery_required:
+        return None
+    if run.state == "running":
+        return cast(NextAction, TOOL_AWAIT_RUN)
+    return cast(NextAction, TOOL_GET_RUN_RESULTS)
 
 
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
@@ -1327,7 +1297,7 @@ class PhaseSweepMCP:
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
             self._audit_error(
-                TOOL_LAUNCH_SWEEP,
+                TOOL_LAUNCH_RUN,
                 args,
                 exc,
                 resolved=resolved,
@@ -1335,7 +1305,7 @@ class PhaseSweepMCP:
             )
             raise
         self._audit_success(
-            TOOL_LAUNCH_SWEEP,
+            TOOL_LAUNCH_RUN,
             args,
             resolved={"experiment_id": experiment_id, "run_id": handle.run_id},
             state_before=state_before,
@@ -1432,7 +1402,7 @@ class PhaseSweepMCP:
             }
         except Exception as exc:
             self._audit_error(
-                TOOL_CANCEL_SWEEP,
+                TOOL_CANCEL_RUN,
                 args,
                 exc,
                 resolved=resolved,
@@ -1446,7 +1416,7 @@ class PhaseSweepMCP:
         if confirmed is not None:
             state_after["cleanup_confirmed"] = confirmed
         self._audit_success(
-            TOOL_CANCEL_SWEEP,
+            TOOL_CANCEL_RUN,
             args,
             resolved=resolved,
             state_before=state_before,
@@ -1884,7 +1854,7 @@ def _strict_tool_inputs(mcp: Any) -> None:
         arg_model.model_rebuild(force=True)
         tool.parameters = arg_model.model_json_schema(by_alias=True)
 
-    for tool_name in (TOOL_GET_STATUS, TOOL_GET_WINNERS):
+    for tool_name in (TOOL_GET_RUN_STATUS, TOOL_GET_RUN_RESULTS):
         tool = mcp._tool_manager.get_tool(tool_name)
         if tool is not None:
             tool.parameters["oneOf"] = [
@@ -1903,7 +1873,7 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
     for tool in mcp._tool_manager.list_tools():
         if tool.parameters.get("additionalProperties") is not False:
             raise RuntimeError(f"MCP tool {tool.name!r} accepts undeclared input keys")
-    for tool_name in (TOOL_GET_STATUS, TOOL_GET_WINNERS):
+    for tool_name in (TOOL_GET_RUN_STATUS, TOOL_GET_RUN_RESULTS):
         tool = mcp._tool_manager.get_tool(tool_name)
         if tool is None:
             raise RuntimeError(f"MCP tool {tool_name!r} was not registered")
@@ -1941,25 +1911,39 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param MaybeCursor cursor: Optional pagination cursor from a prior result.
         :return ListExperimentsResult: Structured catalog listing.
         """
-        return ListExperimentsResult.model_validate(
+        result = ListExperimentsResult.model_validate(
             app.list_experiments(limit=limit, cursor=cursor)
+        )
+        return result.model_copy(
+            update={
+                "next_action": (
+                    TOOL_LIST_EXPERIMENTS
+                    if result.next_cursor is not None
+                    else TOOL_INSPECT_EXPERIMENT
+                    if result.experiments
+                    else None
+                )
+            }
         )
 
     @mcp.tool(
-        name=TOOL_VALIDATE_CONFIG,
-        description=DESCRIPTION_VALIDATE_CONFIG,
-        annotations=_tool_annotations("Validate Config"),
+        name=TOOL_INSPECT_EXPERIMENT,
+        description=DESCRIPTION_INSPECT_EXPERIMENT,
+        annotations=_tool_annotations("Inspect Experiment"),
         structured_output=True,
     )
     @_safe_tool
-    async def validate_config(experiment_id: ExperimentId) -> ValidateConfigResult:
+    async def inspect_experiment(experiment_id: ExperimentId) -> InspectExperimentResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
-        :return ValidateConfigResult: Structured validation payload.
+        :return InspectExperimentResult: Structured inspection payload.
         """
-        return ValidateConfigResult.model_validate(
+        result = InspectExperimentResult.model_validate(
             await asyncio.to_thread(app.validate, experiment_id)
+        )
+        return result.model_copy(
+            update={"next_action": TOOL_LAUNCH_RUN if result.capabilities.launch else None}
         )
 
     @mcp.tool(
@@ -1975,30 +1959,32 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
         :return GetLatestRunResult: One computed run handle or ``found=false``.
         """
-        return GetLatestRunResult.model_validate(
+        result = GetLatestRunResult.model_validate(
             await asyncio.to_thread(app.latest_run, experiment_id)
         )
+        return result.model_copy(update={"next_action": _run_next_action(result.run)})
 
     @mcp.tool(
-        name=TOOL_GET_STATUS,
-        description=DESCRIPTION_GET_STATUS,
-        annotations=_tool_annotations("Get Status"),
+        name=TOOL_GET_RUN_STATUS,
+        description=DESCRIPTION_GET_RUN_STATUS,
+        annotations=_tool_annotations("Get Run Status"),
         structured_output=True,
     )
     @_safe_tool
-    async def get_status(
+    async def get_run_status(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
-    ) -> GetStatusResult:
+    ) -> GetRunStatusResult:
         """Per-phase trial counts and winner presence, plus the run process state. Provide exactly one of experiment_id or run_id. Read-only.
 
         :param MaybeExperimentId experiment_id: Optional catalog experiment id for experiment-level status.
         :param MaybeRunId run_id: Optional detached run id for run-specific status.
-        :return GetStatusResult: Structured status payload.
+        :return GetRunStatusResult: Structured status payload.
         """
-        return GetStatusResult.model_validate(
+        result = GetRunStatusResult.model_validate(
             await asyncio.to_thread(app.status, experiment_id=experiment_id, run_id=run_id)
         )
+        return result.model_copy(update={"next_action": _run_next_action(result.run)})
 
     @mcp.tool(
         name=TOOL_AWAIT_RUN,
@@ -2017,36 +2003,44 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current status.
         :return AwaitRunResult: Structured status payload plus changed and reason.
         """
-        return AwaitRunResult.model_validate(
+        result = AwaitRunResult.model_validate(
             await app.await_run(run_id, timeout_seconds=timeout_seconds)
         )
+        next_action: NextAction | None
+        if result.reason == "terminal":
+            next_action = cast(NextAction, TOOL_GET_RUN_RESULTS)
+        elif result.reason == "recovery_required":
+            next_action = None
+        else:
+            next_action = cast(NextAction, TOOL_AWAIT_RUN)
+        return result.model_copy(update={"next_action": next_action})
 
     @mcp.tool(
-        name=TOOL_GET_WINNERS,
-        description=DESCRIPTION_GET_WINNERS,
-        annotations=_tool_annotations("Get Winners"),
+        name=TOOL_GET_RUN_RESULTS,
+        description=DESCRIPTION_GET_RUN_RESULTS,
+        annotations=_tool_annotations("Get Run Results"),
         structured_output=True,
     )
     @_safe_tool
-    async def get_winners(
+    async def get_run_results(
         experiment_id: MaybeExperimentId = None,
         run_id: MaybeRunId = None,
-    ) -> GetWinnersResult:
+    ) -> GetRunResultsResult:
         """Return policy-filtered winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Provide exactly one of experiment_id or run_id. Read-only.
 
         :param MaybeExperimentId experiment_id: Optional catalog experiment id whose winners should be read.
         :param MaybeRunId run_id: Optional detached run id whose snapshot should be read.
-        :return GetWinnersResult: Structured winners payload.
+        :return GetRunResultsResult: Structured results payload.
         """
-        return GetWinnersResult.model_validate(
+        return GetRunResultsResult.model_validate(
             await asyncio.to_thread(app.winners, experiment_id=experiment_id, run_id=run_id)
         )
 
     @mcp.tool(
-        name=TOOL_LAUNCH_SWEEP,
-        description=DESCRIPTION_LAUNCH_SWEEP,
+        name=TOOL_LAUNCH_RUN,
+        description=DESCRIPTION_LAUNCH_RUN,
         annotations=_tool_annotations(
-            "Launch Sweep",
+            "Launch Run",
             read_only=False,
             destructive=True,
             idempotent=False,
@@ -2055,41 +2049,45 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    async def launch_sweep(
+    async def launch_run(
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
-    ) -> LaunchSweepResult:
+    ) -> LaunchRunResult:
         """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id.
 
         :param ExperimentId experiment_id: Catalog experiment id to launch.
         :param MaybePhaseName from_phase: Optional phase to resume from.
-        :return LaunchSweepResult: Structured launch result.
+        :return LaunchRunResult: Structured launch result.
         """
-        return LaunchSweepResult.model_validate(
+        result = LaunchRunResult.model_validate(
             await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
         )
+        return result.model_copy(update={"next_action": TOOL_AWAIT_RUN})
 
     @mcp.tool(
-        name=TOOL_CANCEL_SWEEP,
-        description=DESCRIPTION_CANCEL_SWEEP,
+        name=TOOL_CANCEL_RUN,
+        description=DESCRIPTION_CANCEL_RUN,
         annotations=_tool_annotations(
-            "Cancel Sweep",
+            "Cancel Run",
             read_only=False,
             destructive=True,
         ),
         structured_output=True,
     )
     @_safe_tool
-    async def cancel_sweep(run_id: RunId) -> CancelSweepResult:
+    async def cancel_run(run_id: RunId) -> CancelRunResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
 
         :param RunId run_id: Detached run id to cancel.
-        :return CancelSweepResult: Structured cancellation result.
+        :return CancelRunResult: Structured cancellation result.
         """
         # MCP 1.27 invokes synchronous tool functions on the event-loop
         # thread. Cancellation may spend its 30-second grace period waiting
         # for a process group, so isolate it from concurrent await/status calls.
-        return CancelSweepResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
+        result = CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
+        return result.model_copy(
+            update={"next_action": None if result.recovery_required else TOOL_GET_RUN_RESULTS}
+        )
 
     @mcp.resource(
         CATALOG_RESOURCE_URI,
@@ -2142,7 +2140,8 @@ def serve(catalog: Path) -> int:
 
     if importlib.util.find_spec("mcp") is None:
         print(
-            "phasesweep mcp: MCP support is not installed; install with `pip install 'phasesweep[mcp]'`.",
+            f"phasesweep mcp: MCP support is not installed; install with "
+            f"`{MCP_EXTRA_INSTALL_COMMAND}`.",
             file=sys.stderr,
         )
         return 2
@@ -2159,7 +2158,7 @@ def serve(catalog: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Serve via ``python -m phasesweep.mcp.server``.
+    """Serve through the installed ``phasesweep-mcp`` entry point.
 
     :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
     :return int: Process exit code.

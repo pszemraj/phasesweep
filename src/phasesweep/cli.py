@@ -35,6 +35,7 @@ from phasesweep.engine.state import (
     _published_suite_summary_path,
     _published_winner_path_for,
 )
+from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
@@ -556,7 +557,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             "recovery because PID reuse cannot be ruled out"
         )
     if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
+        raise click.ClickException("runner still appears live; use cancel_run first")
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
         raise click.ClickException(f"run config snapshot is missing: {snapshot}")
@@ -583,9 +584,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 and not earlier_boot
                 and is_same_live_process(identity.pid, identity.pid_starttime)
             ):
-                raise click.ClickException(
-                    "runner still appears live; use phasesweep_cancel_sweep first"
-                )
+                raise click.ClickException("runner still appears live; use cancel_run first")
             if (
                 cleanup_recovery_needed
                 and confirm
@@ -1019,17 +1018,6 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 @click.option(
     "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
 )
-@click.option(
-    "--launcher",
-    type=click.Choice(["path", "uvx"]),
-    default="path",
-    show_default=True,
-    help=(
-        "'path' pins the absolute phasesweep-mcp executable from this environment; 'uvx' "
-        "writes a pinned `uvx --from phasesweep[mcp]==<version>` launcher that survives "
-        "moving or recreating that environment (requires uvx on PATH)."
-    ),
-)
 @click.pass_context
 def install(
     ctx: click.Context,
@@ -1040,7 +1028,6 @@ def install(
     yes: bool,
     allow_user_scope: bool,
     dry_run: bool,
-    launcher: str,
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
 
@@ -1056,17 +1043,15 @@ def install(
     :param bool yes: Skip every confirmation prompt.
     :param bool allow_user_scope: Acknowledge unattended user-scoped MCP config writes.
     :param bool dry_run: Preview installer verdicts without changing client files.
-    :param str launcher: ``path`` (absolute executable) or ``uvx`` (pinned
-        version launcher) for the written MCP server command (review
-        v0.5.15 / item G).
     """
     project = project_dir.resolve()
     catalog_path: Path | None = None
+    report: CatalogCheckReport | None = None
     if integration != "instructions":
         if importlib.util.find_spec("mcp") is None:
             click.echo(
                 "phasesweep mcp install: MCP support is not installed; install with "
-                "`pip install 'phasesweep[mcp]'`; no client config was touched.",
+                f"`{MCP_EXTRA_INSTALL_COMMAND}`; no client config was touched.",
                 err=True,
             )
             ctx.exit(2)
@@ -1105,7 +1090,7 @@ def install(
             yes,
             dry_run,
             allow_user_scope,
-            launcher=launcher,  # type: ignore[arg-type]
+            catalog_report=report,
         )
     )
 
@@ -1182,7 +1167,7 @@ def uninstall(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Verify each coding agent's configured phasesweep MCP launcher still resolves: the "
-        "absolute executable exists and is executable, or (uvx mode) 'uvx' is on PATH. "
+        "absolute executable exists and is executable, and the configured catalog is readable. "
         "Read-only; prints repair guidance for anything broken."
     ),
     short_help="Verify configured MCP launchers.",

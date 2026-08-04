@@ -43,7 +43,7 @@ class UnknownExperimentError(McpToolError):
         """
         super().__init__(
             f"unknown experiment id {experiment_id!r}; call "
-            "phasesweep_list_experiments and use an id from its response"
+            "list_experiments and use an id from its response"
         )
 
 
@@ -57,7 +57,7 @@ class UnknownRunError(McpToolError):
         """
         super().__init__(
             f"unknown run id {run_id!r}; use the exact run_id returned by "
-            "phasesweep_launch_sweep. If it was lost, call phasesweep_get_latest_run "
+            "launch_run. If it was lost, call get_latest_run "
             "with the experiment id instead of launching a replacement."
         )
 
@@ -73,7 +73,7 @@ class InvalidPhaseError(McpToolError):
         """
         super().__init__(
             f"phase {phase!r} is not a phase of experiment {experiment_id!r}; call "
-            "phasesweep_validate_config and use a phase name from its response"
+            "inspect_experiment and use a phase name from its response"
         )
 
 
@@ -154,7 +154,7 @@ class ExperimentBusyError(McpToolError):
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
             f"(run_id {run_id!r}). If you just launched and lost the response, this is "
-            "likely that run; monitor it with phasesweep_await_run using "
+            "likely that run; monitor it with await_run using "
             f"run_id {run_id!r}. Cancel it only if the user wants to stop it."
         )
 
@@ -176,7 +176,7 @@ class ConcurrencyLimitError(McpToolError):
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
             f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. Call "
-            "phasesweep_await_run with one of these run_ids, then retry this launch only "
+            "await_run with one of these run_ids, then retry this launch only "
             "after that run is terminal. Ask the user before cancelling a blocking run."
         )
 
@@ -206,7 +206,7 @@ class RunLaunchUnsettledError(McpToolError):
         super().__init__(
             f"run {run_id!r} has not finished publishing a verified runner identity, so "
             "cancellation cannot target it safely. Retry once after a short delay. If "
-            "phasesweep_get_status reports recovery_required, stop retrying and tell the "
+            "get_run_status reports recovery_required, stop retrying and tell the "
             "user that operator recovery is required."
         )
 
@@ -230,6 +230,6 @@ class ResumeNotReadyError(McpToolError):
         """
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} {reason}. Call phasesweep_get_winners "
+            f"earlier phase {missing_phase!r} {reason}. Call get_run_results "
             "for the experiment and resume only after every earlier phase has a winner."
         )

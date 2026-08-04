@@ -1,16 +1,32 @@
 # Development
 
-## Quality gates
+## Source checkout
 
 ```bash
-python -m pip install -e ".[dev]"
+git clone https://github.com/pszemraj/phasesweep.git
+cd phasesweep
+conda create -n phasesweep-dev python=3.11 pip
+conda activate phasesweep-dev
+pip install -e ".[dev,wandb]"
+```
+
+The `mcp` SDK is included in the development extra. Use another conda environment name if desired; all Python-dependent commands must run in the activated environment.
+
+## Quality gates
+
+Run the repository's checks sequentially:
+
+```bash
+pytest
 ruff check .
 ruff format --check .
 mypy src
-pytest
+scripts/check_installed_wheel.sh
 ```
 
-Run `pytest` by itself, with no concurrent `ruff`, `mypy`, or other validation jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise.
+The final script builds a wheel in a temporary directory, installs it into a temporary prefix, and exercises `phasesweep init`, validation, dry-run, and catalog scaffolding without relying on the checkout at runtime. It leaves no build or acceptance artifact in the repository.
+
+Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. There is currently no CI workflow, Makefile, or justfile wrapping these commands.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads the local SQLite schema directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
 
@@ -71,7 +87,7 @@ Tests are organized by behavior:
 - TODO(mcp): Remove the private FastMCP strict-schema patch once the `mcp` SDK exposes a tested public closed-input-schema API; until then keep the optional dependency pinned to the tested 1.27.x range and keep the behavior-level request-handler tests as the safety net.
 - TODO(mcp): Split `mcp/server.py` into SDK-free application logic, schemas, launch lifecycle, and FastMCP adapter modules after the MCP alpha surface stabilizes.
 - TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
-- TODO(mcp): Add an aggregated read-only trial-count path for JournalStorage before recommending very frequent `phasesweep_get_status` polling on very large local studies; external RDB-backed studies remain outside the MCP local-node support scope until multi-host cleanup and locking semantics are designed.
+- TODO(mcp): Add an aggregated read-only trial-count path for JournalStorage before recommending very frequent `get_run_status` polling on very large local studies; external RDB-backed studies remain outside the MCP local-node support scope until multi-host cleanup and locking semantics are designed.
 - TODO(runtime): Design an explicit `trial_budget_mode: complete` before promising `n_trials` successful objective evaluations; the current behavior intentionally matches Optuna's terminal-attempt budget, while a completion budget needs repeated optimize scheduling, a total-attempt safety cap, and clear interactions with pruning, infeasible-but-COMPLETE trials, max-consecutive-failure aborts, and wallclock deadlines.
 - TODO(storage): Re-verify the direct SQLite status-query path, Journal reads, study attributes, trial-state counts, and sampler policies before widening the tested Optuna upper bound.
 - TODO(example): Update the `examples/tiny_decoder_enwik8/upstream` submodule after the trainer template handles `seed: 0`, CPU/MPS autocast as fp32/disabled by default, uses CUDA-only `pin_memory`, moves batches with CUDA-only `non_blocking=True`, accumulates RMSNorm reductions in FP32, rejects overlong causal-mask sequence lengths, and unwraps `torch.compile` modules before checkpointing; keep those PyTorch training changes in the upstream trainer repo rather than patching the gitlink contents here.

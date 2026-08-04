@@ -53,7 +53,7 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
-    TOOL_LAUNCH_SWEEP,
+    TOOL_LAUNCH_RUN,
     PhaseSweepMCP,
     _safe_tool,
 )
@@ -318,7 +318,7 @@ def test_concurrency_limit_error_bounds_actionable_run_ids() -> None:
     for run_id in run_ids[5:]:
         assert repr(run_id) not in message
     assert "2 more active" in message
-    assert "phasesweep_await_run" in message
+    assert "await_run" in message
     assert "only after that run is terminal" in message
 
 
@@ -1406,13 +1406,13 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     busy_message = str(exc_info.value)
     assert launched["run_id"] in busy_message
     assert "lost the response" in busy_message
-    assert "phasesweep_await_run" in busy_message
+    assert "await_run" in busy_message
     assert "Cancel it only if the user wants" in busy_message
 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [record["tool"] for record in records] == [
-        TOOL_LAUNCH_SWEEP,
-        TOOL_LAUNCH_SWEEP,
+        TOOL_LAUNCH_RUN,
+        TOOL_LAUNCH_RUN,
     ]
     assert {record["session_id"] for record in records}
     assert all(record["actor"] == "local-stdio" for record in records)
@@ -1444,7 +1444,7 @@ def test_audit_log_caps_agent_supplied_string_values(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
     audit = AuditLogger(audit_path)
 
-    audit.record(tool=TOOL_LAUNCH_SWEEP, args={"cursor": "x" * 500}, outcome="success")
+    audit.record(tool=TOOL_LAUNCH_RUN, args={"cursor": "x" * 500}, outcome="success")
 
     record = json.loads(audit_path.read_text())
     assert record["args"]["cursor"] == ("x" * 253) + "..."

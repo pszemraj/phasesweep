@@ -12,6 +12,10 @@ from __future__ import annotations
 import functools
 import importlib.resources
 
+MCP_EXTRA_INSTALL_COMMAND = (
+    'pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"'
+)
+
 
 @functools.cache
 def agent_prompt_text(*, strip: bool = False) -> str:

@@ -349,10 +349,9 @@ class RunStore:
             if visible_params not in {"none", "all"}:
                 return None
         elif isinstance(visible_params, list):
-            if (
-                not all(type(key) is str and key and key == key.strip() for key in visible_params)
-                or len(set(visible_params)) != len(visible_params)
-            ):
+            if not all(
+                type(key) is str and key and key == key.strip() for key in visible_params
+            ) or len(set(visible_params)) != len(visible_params):
                 return None
         elif visible_params is not None:
             return None

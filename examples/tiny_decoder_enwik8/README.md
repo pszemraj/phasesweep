@@ -8,7 +8,7 @@ From the phasesweep repo root, [install phasesweep](../../README.md#install), th
 
 ```bash
 git submodule update --init examples/tiny_decoder_enwik8/upstream
-python -m pip install -e examples/tiny_decoder_enwik8/upstream
+pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
 The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` runs the trainer with the upstream checkout as its working directory, which is how `base.yaml`'s relative `data_path: data/enwik8.gz` resolves.

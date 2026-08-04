@@ -1,70 +1,80 @@
-# phasesweep
+# PhaseSweep
 
-> Orchestration layer for YAML-driven, phase-chained hyperparameter sweeps over your own training scripts
+PhaseSweep runs YAML-defined, phase-chained hyperparameter sweeps over your own training script. Your trainer owns the experiment; PhaseSweep decides what to try next, persists each phase winner, and can pass selected winners forward as fixed inputs to later phases.
 
-Your trainer runs the experiments. `phasesweep` decides what to try next. Define phased Optuna sweeps in YAML; a phase can inherit earlier winners as fixed overrides.
+This is useful when a full joint sweep is too expensive or hard to interpret—for example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-keys) explains the inheritance model and its tradeoffs.
 
-Use `phasesweep` when a full joint sweep is too expensive and the search can be broken into inspectable stages, such as architecture depth, then learning rate, then regularization. The [config guide](docs/config.md#phase-keys) explains the tradeoff and inheritance model.
+![PhaseSweep phase DAG](docs/images/diagramA_dag.png)
 
-![dag diagram](docs/images/diagramA_dag.png)
+## Install and try it
 
-## Requirements
-
-- Python 3.11+; see [platform support](docs/runtime.md#platform-support) for real-run and MCP requirements
-- A trainer command that follows the [trainer contract](docs/config.md#trainer-contract)
-- GPU optional; see [GPU concurrency and isolation](docs/runtime.md#concurrency-model)
-
-## Install
-
-phasesweep is currently installed from Git:
+Requirements: Python 3.11+, a POSIX host for real runs, and a trainer that follows the [trainer contract](docs/config.md#trainer-contract). GPUs are optional.
 
 ```bash
-python -m pip install "phasesweep @ git+https://github.com/pszemraj/phasesweep.git"
+pip install git+https://github.com/pszemraj/phasesweep.git
 ```
 
-Optional extras are `wandb`, `mcp`, and `dev`; add one or more inside brackets after `phasesweep`. The [MCP setup](docs/mcp_setup.md#1-install) includes its exact install command.
-
-For local development from a checkout:
+Create and inspect a runnable two-phase starter without cloning this repository:
 
 ```bash
-git clone https://github.com/pszemraj/phasesweep.git
-cd phasesweep
-# activate your Python environment, then:
-python -m pip install -e ".[dev,wandb]"
+mkdir phasesweep-demo
+cd phasesweep-demo
+phasesweep init
+phasesweep validate experiment.yaml
+phasesweep run experiment.yaml --dry-run
 ```
 
-## Quickstart
+`phasesweep init` never overwrites an existing file. Its fake trainer ships inside the installed package, so validation and the dry run work from any directory. When you are ready, replace the trainer command and search spaces in `experiment.yaml`; run it only after reviewing the rendered commands.
 
-To run the bundled toy example from a checkout:
+## Connect an agent
+
+The optional MCP server lets an AI agent work with experiments you have already approved. An agent can discover and inspect catalog entries, launch when permitted and explicitly authorized, wait on a durable run ID, read terminal phase winners, and cancel only when permitted.
+
+Follow the [five-minute MCP setup](docs/mcp_setup.md) to install the optional extra, scaffold and review a catalog, and connect a supported client. The catalog review remains a separate step on purpose.
+
+Three safety properties do not change:
+
+- The human controls the catalog and experiment YAML.
+- The agent operates only by approved experiment ID.
+- Trainer commands, paths, storage, environment, and raw logs are not agent inputs.
+
+After setup, restart the selected client and ask:
+
+```text
+List the available PhaseSweep experiments and their permitted actions.
+Do not launch anything.
+```
+
+## CLI examples
 
 ```bash
-phasesweep validate examples/experiment.yaml
-phasesweep run examples/experiment.yaml --dry-run
-phasesweep run examples/experiment.yaml
-phasesweep show-winners examples/experiment.yaml
-phasesweep status examples/experiment.yaml
+# Create a starter at another path
+phasesweep init -o configs/experiment.yaml
+
+# Inspect before running
+phasesweep validate configs/experiment.yaml
+phasesweep run configs/experiment.yaml --dry-run
+
+# Run and inspect durable results
+phasesweep run configs/experiment.yaml
+phasesweep status configs/experiment.yaml
+phasesweep show-winners configs/experiment.yaml
+
+# Resume at a later phase after its prerequisites have valid winners
+phasesweep run configs/experiment.yaml --from-phase learning_rate
 ```
 
-`validate` and `--dry-run` launch no trials; [validation and dry-run](docs/runtime.md#validation-and-dry-run) defines what each checks. `show-winners` and `status` are [read-only inspection commands](docs/runtime.md#inspection-commands), normally used after the real run.
+`validate`, `run --dry-run`, `status`, and `show-winners` do not launch training trials. See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout.
 
-The bundled example launches a deterministic fake trainer, runs 32 short trials, and writes outputs under `runs/`. For a real-trainer integration, see [examples/tiny_decoder_enwik8](examples/tiny_decoder_enwik8/README.md).
+## Reference
 
-## MCP server (agent integration)
-
-`phasesweep-mcp` lets an AI agent operate experiments you have already reviewed. You keep control of the config, trainer command, search space, and permissions in a catalog; the agent sees stable experiment ids and can validate, launch, monitor, cancel when allowed, and summarize winners without receiving paths, commands, raw logs, storage URLs, or workdirs.
-
-Follow [MCP agent setup](docs/mcp_setup.md) to install the server, create and preflight a catalog, connect a supported client, and give the agent its operating instructions. See [MCP server](docs/mcp.md) for catalog fields, tool behavior, run state, and security boundaries.
-
-## Docs
-
-- [Config guide](docs/config.md): trainer contract, override formats, experiment YAML, suites, search spaces, gates, promotion, extractors.
-- [Config reference](docs/config_reference.yaml): hand-written, non-runnable per-key contract with every type, default, valid value, constraint, interaction, and lifecycle warning.
-- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process cleanup, fingerprints, resume.
-- [MCP server](docs/mcp.md): expose an experiment to an AI agent - catalog format, tools, security model, single-host operation.
-- [MCP agent setup](docs/mcp_setup.md): five steps from install to a working agent - install the `[mcp]` extra, write and preflight a catalog, connect your clients with `phasesweep mcp install`, verify, instruct the agent.
-- [MCP agent workflow](src/phasesweep/mcp/agent_prompt.md): Markdown instructions shipped to supported coding clients.
-- [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer `json_file` integration with a pinned submodule.
-- [Development](docs/development.md): test commands and test-suite map.
+- [Configuration guide](docs/config.md): trainer contract, experiment and suite YAML, search spaces, inheritance, gates, promotion, and extractors.
+- [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
+- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
+- [MCP setup](docs/mcp_setup.md): installed-package agent onboarding.
+- [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, recovery, and installer preservation semantics.
+- [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.
+- [Development](docs/development.md): source checkout, contributor setup, and quality gates.
 
 ## License
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import math
 import os
@@ -112,6 +111,20 @@ def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
     assert '    "theme"' in text  # detected 4-space indent
     assert text.endswith("\n")
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
+
+
+def test_json_install_uninstall_documents_numeric_and_compact_normalization(tmp_path):
+    path = tmp_path / "mcp.json"
+    original = '{"threshold":1e2,"mcpServers":{}}\n'
+    path.write_text(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
+
+    restored = path.read_text()
+    assert restored != original
+    assert '"threshold": 100.0' in restored
+    assert json.loads(restored) == {"threshold": 100.0, "mcpServers": {}}
 
 
 def test_json_member_edits_preserve_crlf(tmp_path):
@@ -455,174 +468,6 @@ def test_entry_styles_and_codex_toml(tmp_path):
     }
 
 
-# --- uvx pinned launcher (review v0.5.15 / item G) ---
-
-UVX_LAUNCHER_ARGS = ["--from", "phasesweep[mcp]==1.2.3", "phasesweep-mcp"]
-
-
-def test_uvx_launcher_entries_are_recognized_managed(tmp_path):
-    catalog = Path("/proj/catalog.yaml")
-
-    stdio = mcp_entry("stdio", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert stdio == {
-        "command": "uvx",
-        "args": [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"],
-    }
-    assert is_managed_mcp_entry("stdio", stdio)
-
-    typed = mcp_entry("stdio-typed", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert is_managed_mcp_entry("stdio-typed", typed)
-
-    opencode = mcp_entry("opencode", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert opencode["command"] == [
-        "uvx",
-        *UVX_LAUNCHER_ARGS,
-        "--catalog",
-        "/proj/catalog.yaml",
-    ]
-    assert is_managed_mcp_entry("opencode", opencode)
-
-    toml_parsed = tomllib.loads(codex_toml_content("uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS))
-    codex_entry = toml_parsed["mcp_servers"]["phasesweep"]
-    assert codex_entry["args"] == [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"]
-    assert is_managed_mcp_entry("stdio", codex_entry)
-
-
-@pytest.mark.parametrize(
-    "launcher_args",
-    [
-        ["--from", "phasesweep[mcp]==1.2.3", "other-entrypoint"],  # wrong entrypoint
-        ["--from", "other-package[mcp]==1.2.3", "phasesweep-mcp"],  # wrong package
-        ["--from", "phasesweep[mcp]==", "phasesweep-mcp"],  # empty version
-        ["--from", "phasesweep==1.2.3", "phasesweep-mcp"],  # missing [mcp] extra
-    ],
-)
-def test_uvx_launcher_entries_reject_malformed_pins(launcher_args):
-    catalog = Path("/proj/catalog.yaml")
-    entry = mcp_entry("stdio", "uvx", catalog, launcher_args=launcher_args)
-    assert not is_managed_mcp_entry("stdio", entry)
-
-
-def test_resolve_uvx_launcher_pins_installed_version(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: "9.9.9")
-
-    command, args = installer.resolve_uvx_launcher()
-
-    assert command == "uvx"
-    assert args == ["--from", "phasesweep[mcp]==9.9.9", "phasesweep-mcp"]
-
-
-def test_resolve_uvx_launcher_requires_uvx_on_path(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
-
-    with pytest.raises(FileNotFoundError, match="cannot find 'uvx'"):
-        installer.resolve_uvx_launcher()
-
-
-def test_resolve_uvx_launcher_requires_installed_distribution(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def missing_version(_name):
-        raise importlib.metadata.PackageNotFoundError("phasesweep")
-
-    monkeypatch.setattr(installer.importlib.metadata, "version", missing_version)
-
-    with pytest.raises(LookupError, match="not an installed distribution"):
-        installer.resolve_uvx_launcher()
-
-
-@pytest.mark.parametrize(
-    "version",
-    [
-        "0.2.1.dev237+g8d1cb1e2b",  # editable checkout: dev release and local segment
-        "1.0.0+local",  # local segment alone
-        "0.0.0",  # placeholder emitted when version discovery fails
-    ],
-)
-def test_resolve_uvx_launcher_refuses_unpublishable_versions(version, monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: version)
-
-    with pytest.raises(LookupError) as exc_info:
-        installer.resolve_uvx_launcher()
-
-    message = str(exc_info.value)
-    assert version in message
-    assert "cannot resolve from a package index" in message
-    assert "omit --launcher uvx" in message
-
-
-def test_installer_uvx_launcher_round_trip_across_json_and_toml(
-    fake_home, tmp_path, capsys, monkeypatch
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-
-    def fake_uvx_launcher():
-        return "uvx", ["--from", "phasesweep[mcp]==7.7.7", "phasesweep-mcp"]
-
-    monkeypatch.setattr(installer, "resolve_uvx_launcher", fake_uvx_launcher)
-    code = installer.run(
-        "install",
-        project,
-        catalog,
-        ["claude", "codex", "opencode"],
-        "mcp",
-        yes=True,
-        allow_user_scope=True,
-        launcher="uvx",
-    )
-    assert code == 0, capsys.readouterr().out
-
-    claude_entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
-    assert claude_entry["command"] == "uvx"
-    assert claude_entry["args"] == [
-        "--from",
-        "phasesweep[mcp]==7.7.7",
-        "phasesweep-mcp",
-        "--catalog",
-        str(catalog),
-    ]
-
-    opencode_entry = json.loads((project / "opencode.json").read_text())["mcp"]["phasesweep"]
-    assert opencode_entry["command"][0] == "uvx"
-    assert "phasesweep[mcp]==7.7.7" in opencode_entry["command"]
-
-    codex_config = fake_home / ".codex" / "config.toml"
-    codex_parsed = tomllib.loads(codex_config.read_text())
-    assert codex_parsed["mcp_servers"]["phasesweep"]["command"] == "uvx"
-    assert "phasesweep[mcp]==7.7.7" in codex_parsed["mcp_servers"]["phasesweep"]["args"]
-
-    assert (
-        installer.run("uninstall", project, None, ["claude", "codex", "opencode"], "mcp", yes=True)
-        == 0
-    )
-    assert "phasesweep" not in json.loads((project / ".mcp.json").read_text())["mcpServers"]
-    assert "phasesweep" not in json.loads((project / "opencode.json").read_text())["mcp"]
-    assert "mcp_servers" not in tomllib.loads(codex_config.read_text())
-
-
-def test_installer_refuses_uvx_launcher_before_edits_when_unresolvable(
-    fake_home, tmp_path, capsys, monkeypatch
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-
-    def missing_uvx():
-        raise FileNotFoundError("cannot find 'uvx' on PATH")
-
-    monkeypatch.setattr(installer, "resolve_uvx_launcher", missing_uvx)
-
-    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True, launcher="uvx")
-
-    assert code == 1
-    assert "no client config was touched" in capsys.readouterr().err
-    assert not (project / ".mcp.json").exists()
-
-
 # --- check-install (review v0.5.15 / item G) ---
 
 
@@ -680,7 +525,7 @@ def test_check_install_reports_missing_executable_with_repair_guidance(fake_home
     assert code == 1
     assert "missing" in captured.out
     assert "no longer exists" in captured.out
-    assert "--launcher uvx" in captured.out
+    assert "correct conda environment" in captured.out
     assert "need attention" in captured.err
 
 
@@ -698,33 +543,6 @@ def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
     assert code == 1
     assert "not-executable" in output
     assert "not executable" in output
-
-
-def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, monkeypatch):
-    project = tmp_path / "proj"
-    project.mkdir()
-    claude = _target(project, "claude")
-    entry = mcp_entry(
-        "stdio",
-        "uvx",
-        _configured_catalog(tmp_path),
-        launcher_args=["--from", "phasesweep[mcp]==1.0.0", "phasesweep-mcp"],
-    )
-    _write_json_entry(claude, entry)
-
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
-    missing_code = installer.check_install(project, ["claude"])
-    missing_output = capsys.readouterr().out
-    assert missing_code == 1
-    assert "not on PATH" in missing_output
-
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    healthy_code = installer.check_install(project, ["claude"])
-    healthy_output = capsys.readouterr().out
-    assert healthy_code == 0
-    assert "uvx" in healthy_output
-    # An on-PATH uvx says nothing about the pinned requirement; the report says so.
-    assert "not verified offline" in healthy_output
 
 
 def test_check_install_reports_missing_catalog(fake_home, tmp_path, capsys):
@@ -940,6 +758,60 @@ def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_pa
     assert instructions.read_text() == original
 
 
+def test_shared_instructions_add_second_owner_without_replacing_prompt(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert installer.run("install", project, None, ["cursor"], "instructions", yes=True) == 0
+    installed = (project / "AGENTS.md").read_text()
+    capsys.readouterr()
+
+    assert installer.run("install", project, None, ["opencode"], "instructions", yes=True) == 0
+    output = capsys.readouterr().out
+    updated = (project / "AGENTS.md").read_text()
+
+    assert "shared block currently owned by: cursor" in output
+    assert "prompt will update" not in output
+    assert updated == installed.replace(
+        "<!-- PHASESWEEP_OWNERS: cursor -->",
+        "<!-- PHASESWEEP_OWNERS: cursor,opencode -->",
+    )
+
+
+def test_shared_instructions_plan_names_owners_when_prompt_will_change(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+
+    assert installer.run("install", project, None, ["cursor"], "instructions", yes=True) == 0
+    original = instructions.read_text()
+    capsys.readouterr()
+    monkeypatch.setattr(installer, "agent_prompt_text", lambda: "Updated PhaseSweep rules.\n")
+
+    assert (
+        installer.run(
+            "install",
+            project,
+            None,
+            ["opencode"],
+            "instructions",
+            yes=True,
+            dry_run=True,
+        )
+        == 0
+    )
+    preview = capsys.readouterr().out
+    assert "shared block prompt will update for existing owners: cursor" in preview
+    assert instructions.read_text() == original
+
+    assert installer.run("install", project, None, ["opencode"], "instructions", yes=True) == 0
+    updated = instructions.read_text()
+    assert "<!-- PHASESWEEP_OWNERS: cursor,opencode -->" in updated
+    assert "Updated PhaseSweep rules." in updated
+
+
 def test_concurrent_shared_instruction_installs_preserve_both_owners(
     fake_home, tmp_path, monkeypatch
 ):
@@ -1075,6 +947,80 @@ def test_installer_refuses_missing_server_command_before_edits(
     assert "no client config was touched" in capsys.readouterr().err
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
+
+
+def test_installer_resolves_server_before_interactive_selection(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def missing_server_command():
+        raise FileNotFoundError("missing executable")
+
+    monkeypatch.setattr(installer, "resolve_server_command", missing_server_command)
+
+    code = installer.run("install", project, catalog, None, "mcp", yes=False)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "missing executable" in captured.err
+    assert "Select coding agents" not in captured.out
+    assert "Proceed?" not in captured.out
+
+
+def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    real_check = installer._check_target_launcher
+    checks = 0
+
+    def observed_check(target):
+        nonlocal checks
+        checks += 1
+        return real_check(target)
+
+    monkeypatch.setattr(installer, "_check_target_launcher", observed_check)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert checks == 1
+    assert "verification:" in output
+    assert "Claude Code" in output
+    assert "ok" in output
+
+
+def test_installer_returns_failure_when_post_install_verification_is_not_ok(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    target = _target(project, "claude")
+
+    monkeypatch.setattr(
+        installer,
+        "_check_target_launcher",
+        lambda _target: installer.LauncherCheck(
+            target.mcp.path,
+            None,
+            (),
+            "not-configured",
+            "written entry could not be verified",
+        ),
+    )
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "not-configured" in captured.out
+    assert "written entry could not be verified" in captured.out
+    assert "need manual attention" in captured.err
 
 
 def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, capsys):
@@ -1476,6 +1422,7 @@ def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
 
     preview = runner.invoke(cli_main, [*args, "--dry-run"])
     assert preview.exit_code == 0, preview.output
+    assert "[user scope]" in preview.output
     assert not target.mcp.path.exists()
 
     refused = runner.invoke(cli_main, [*args, "--yes"])
@@ -1504,7 +1451,11 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
         cli_main, ["mcp", "install", "--agent", "claude", "--type", "all", "--yes"]
     )
     assert install.exit_code == 0, install.output
-    assert "restart your mcp client" in install.output.lower()
+    assert "Restart the selected client(s), then ask:" in install.output
+    assert (
+        "List the available PhaseSweep experiments and their permitted actions." in install.output
+    )
+    assert "Do not launch anything." in install.output
     entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
     assert entry["args"] == ["--catalog", str(project / "catalog.yaml")]
     claude_md = (project / "CLAUDE.md").read_text()
@@ -1583,6 +1534,10 @@ def test_cli_install_provisions_catalog_state_before_client_edits(
     preview = runner.invoke(cli_main, [*args, "--dry-run"])
     assert preview.exit_code == 0, preview.output
     assert "no client files were changed" in preview.output
+    assert f"catalog      {catalog}" in preview.output
+    assert "experiments  1" in preview.output
+    assert "example: read-only" in preview.output
+    assert "launcher" in preview.output and "phasesweep-mcp" in preview.output
     assert (state_dir / "runs").is_dir()
     assert (state_dir / "logs").is_dir()
 
@@ -1683,7 +1638,10 @@ def test_cli_install_requires_mcp_sdk_before_client_edits(
     )
 
     assert result.exit_code == 2
-    assert "pip install 'phasesweep[mcp]'" in result.output
+    assert (
+        'pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"'
+        in result.output
+    )
     assert "no client config was touched" in result.output
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
@@ -1754,6 +1712,7 @@ def test_install_help_is_operator_readable():
         "--dry-run",
     ):
         assert flag in install_help.output
+    assert "--launcher" not in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
 
     uninstall_help = runner.invoke(cli_main, ["mcp", "uninstall", "--help"], terminal_width=120)

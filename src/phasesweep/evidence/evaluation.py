@@ -423,7 +423,7 @@ def _extract_wandb(
         raise ExtractorError(
             "W&B extractor requested but the 'wandb' package is not installed. "
             "Install the wandb extra for the same distribution, for example: "
-            'python -m pip install "phasesweep[wandb] @ '
+            'pip install "phasesweep[wandb] @ '
             'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
     except WandbSetupError as exc:
@@ -799,9 +799,7 @@ def evaluate_gates(
                     update={"timeout_seconds": min(gate.timeout_seconds, remaining)}
                 )
         if isinstance(gate, WandbSummaryRequiredGate):
-            results.append(
-                _wandb_summary_required(ctx, gate, deadline_capped=deadline_capped)
-            )
+            results.append(_wandb_summary_required(ctx, gate, deadline_capped=deadline_capped))
         else:
             results.append(fn(ctx, gate))
     return results
