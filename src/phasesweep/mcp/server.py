@@ -111,7 +111,8 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 )
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
-    "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
+    "inheritance, and search-space keys. Call after list_experiments and before launch_run; "
+    "next_action is always null because only the user may authorize a launch. "
     "Read-only: launch_run separately rechecks config identity and refuses catalog drift."
 )
 DESCRIPTION_GET_LATEST_RUN = (
@@ -1942,13 +1943,13 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
-        :return InspectExperimentResult: Structured inspection payload.
+        :return InspectExperimentResult: Structured inspection payload with a
+            null ``next_action``; the user, not the server, authorizes a launch.
         """
-        result = InspectExperimentResult.model_validate(
+        # next_action stays null (the field default): launching requires explicit
+        # user authorization, so the server never proposes launch_run itself.
+        return InspectExperimentResult.model_validate(
             await asyncio.to_thread(app.validate, experiment_id)
-        )
-        return result.model_copy(
-            update={"next_action": TOOL_LAUNCH_RUN if result.capabilities.launch else None}
         )
 
     @mcp.tool(

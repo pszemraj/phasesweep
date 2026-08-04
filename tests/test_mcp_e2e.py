@@ -415,6 +415,29 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "<redacted>" in str(prompt)
 
 
+def test_inspect_experiment_never_chains_to_launch_run(tmp_path: Path) -> None:
+    """Only the user authorizes a launch, so inspection must not propose one."""
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from phasesweep.mcp.server import build_server
+
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"e2e_lm": _chained_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+    server = build_server(app)
+
+    inspected = asyncio.run(
+        server._tool_manager.get_tool(TOOL_INSPECT_EXPERIMENT).fn(experiment_id="e2e_lm")
+    )
+
+    assert inspected.capabilities.launch is True  # launching is catalog-permitted
+    assert inspected.next_action is None  # and still not suggested
+
+
 @pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN])
 def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocking_tool: str
