@@ -113,10 +113,12 @@ def _warn_dropped_cuda_visibility(
     """Warn once when the trainer's GPU visibility diverges from the parent's.
 
     The narrowed ``inherit_env`` contracts drop the ambient
-    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`_BASE_INHERITED_ENV`). When
-    the phase also assigns no device — ``gpu_policy: none``, or a pool that
-    found nothing to lease — the child is left with no visibility binding and
-    can therefore use host GPUs the parent had hidden, holding no GPU host
+    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`_BASE_INHERITED_ENV`). The
+    GPU pool still reads that ambient value for discovery: it leases and
+    re-binds device tokens, and pins a disable sentinel (``""``/``-1``) into
+    every trial. The remaining unbound case is ``gpu_policy: none``, where the
+    phase deliberately assigns nothing: the child then has no visibility
+    binding and can use host GPUs the parent had hidden, holding no GPU host
     lock. That is a real hazard, but it is a *configuration* hazard: the fix is
     a fingerprinted ``env`` entry, not a silent ambient read. Say so once
     rather than papering over it.

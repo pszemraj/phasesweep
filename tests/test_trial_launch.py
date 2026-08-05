@@ -144,7 +144,9 @@ def test_launch_trial_narrow_env_drops_ambient_cuda_visibility(
 
     Two operators running the identical config from differently-exported
     shells must not write CPU-trained and GPU-trained evaluations into one
-    study under one semantic fingerprint.
+    study under one semantic fingerprint. Note the composed path never leaves
+    a disable sentinel here with ``gpu_id=None``: the GPU pool pins sentinels
+    and passes them as the assigned token (next test).
     """
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_visibility)
 
@@ -156,6 +158,30 @@ def test_launch_trial_narrow_env_drops_ambient_cuda_visibility(
     )
 
     assert "CUDA_VISIBLE_DEVICES" not in env
+
+
+@pytest.mark.parametrize("sentinel", ["", "-1"])
+def test_launch_trial_pool_pinned_sentinel_binds_visibility_under_strict_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
+    """A pool-pinned disable sentinel reaches the trainer despite ``inherit_env: none``.
+
+    The pool leases nothing *because* the sentinel says CUDA is off; handing
+    the trial an unbound environment instead would silently re-expose every
+    host GPU with zero host locks held.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", sentinel)
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(inherit_env="none"),
+        gpu_id=sentinel,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == sentinel
 
 
 def test_launch_trial_inherit_env_all_still_passes_cuda_visibility(

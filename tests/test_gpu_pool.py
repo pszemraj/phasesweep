@@ -16,10 +16,12 @@ from phasesweep.config import (
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
     GpuDevice,
+    GpuLeaseTimeoutError,
     GpuPool,
     _detect_gpu_inventory,
     _detect_gpu_uuid_map,
     _gpu_lock_path,
+    _try_host_gpu_lease,
 )
 
 # Bound before any monkeypatching so hardware tests can restore the real probe.
@@ -105,12 +107,16 @@ def test_none_policy_disables_cuda_isolation(monkeypatch) -> None:
 def test_gpu_acquire_respects_deadline_when_local_slot_is_busy() -> None:
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
 
+    # The dedicated subclass, not just TimeoutError: phase attribution narrows
+    # on it to tell budget exhaustion from infrastructure failure.
     with (
         pool.acquire(),
-        pytest.raises(TimeoutError, match="Wallclock deadline"),
+        pytest.raises(GpuLeaseTimeoutError, match="Wallclock deadline"),
         pool.acquire(deadline=time.monotonic() + 0.02),
     ):
         pass
+
+    assert issubclass(GpuLeaseTimeoutError, TimeoutError)
 
 
 def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
@@ -189,7 +195,9 @@ def test_cuda_visible_devices_minus_one_is_no_visible_gpu(monkeypatch, caplog):
         pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid is None
+        # The sentinel is pinned, not dropped: a narrowed inherit_env contract
+        # must not silently re-expose every host GPU to the trainer.
+        assert gid == "-1"
     assert any("exposes no devices" in record.message for record in caplog.records)
     assert not any("nvidia-smi detected no GPUs" in record.message for record in caplog.records)
 
@@ -427,6 +435,130 @@ def test_abbreviated_uuid_prefix_without_map_degrades_loudly(tmp_path, monkeypat
 
     assert pool._devices[0].lock_identity == "GPU-2b23"
     assert any("abbreviated GPU UUID" in record.message for record in caplog.records)
+
+
+def test_lowercase_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
+    """The resolver compares UUIDs case-insensitively, so the abbreviation gate
+    must too: "gpu-2b23" locking on its own spelling would double-book the card
+    against a run configured with gpu_ids: [0]."""
+    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=["gpu-2b23"])
+    index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
+
+    assert _gpu_lock_path(prefix_pool._devices[0]) == _gpu_lock_path(index_pool._devices[0])
+    # The trainer still sees the configured spelling.
+    assert prefix_pool._devices[0].visible_token == "gpu-2b23"
+
+
+def test_unresolvable_opaque_token_fails_closed(monkeypatch) -> None:
+    """A token that is neither numeric nor GPU-/MIG- shaped gives CUDA nothing
+    to expose while the real GPUs sit unlocked — the opaque equivalent of a
+    nonexistent numeric index, which already fails closed."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,bogus")
+
+    with pytest.raises(RuntimeError, match="not a numeric index"):
+        GpuPool.create(n_jobs=1)
+
+    with pytest.raises(RuntimeError, match="not a numeric index"):
+        GpuPool.create(n_jobs=1, explicit_devices=["bogus"])
+
+
+def test_empty_cuda_visible_devices_sentinel_is_pinned(monkeypatch) -> None:
+    """An ambient "" is a decision that CUDA is off; trials must receive it even
+    when a narrowed inherit_env contract drops the ambient variable."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
+    pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid == ""
+
+
+def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(monkeypatch) -> None:
+    """The opted-in parallel CPU path pins a configured disable the same way."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    pool = GpuPool.create(n_jobs=4, allow_no_gpu=True, cuda_visible_devices="-1")
+
+    with pool.acquire() as gid:
+        assert gid == "-1"
+
+
+def test_lock_layer_failure_does_not_shrink_the_pool(tmp_path, monkeypatch) -> None:
+    """A raising lock layer must hand every candidate back: a silently shrunk
+    pool deadlocks later acquires or relabels them as lease timeouts."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
+    calls = {"n": 0}
+
+    def flaky_lease(device: GpuDevice) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("lock layer failure")
+        return _try_host_gpu_lease(device)
+
+    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", flaky_lease)
+
+    with pytest.raises(OSError, match="lock layer failure"), pool.acquire():
+        pass
+
+    assert [device.visible_token for device in pool._available] == ["3"]
+    with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
+        assert gid == "3"
+
+
+def test_whole_node_lock_layer_failure_releases_partial_leases(tmp_path, monkeypatch) -> None:
+    """A mid-set lock failure must release already-taken host locks and clear
+    the in-use flag, or every later whole-node acquisition deadlocks."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
+    calls = {"n": 0}
+
+    def flaky_lease(device: GpuDevice) -> object:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("lock layer failure")
+        return _try_host_gpu_lease(device)
+
+    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", flaky_lease)
+
+    with pytest.raises(OSError, match="lock layer failure"), pool.acquire():
+        pass
+
+    assert pool._whole_node_in_use is False
+    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", _try_host_gpu_lease)
+    with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
+        assert gid == "0,1"
+
+
+def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
+    """A write failure after flock succeeds must not leak a locked handle that
+    excludes every other run from the GPU."""
+
+    class _Handle:
+        def seek(self, pos: int) -> None:
+            pass
+
+        def truncate(self) -> None:
+            pass
+
+        def write(self, text: str) -> None:
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            pass
+
+    released: list[object] = []
+    monkeypatch.setattr("phasesweep.runtime.gpu.try_lock_file", lambda path: _Handle())
+    monkeypatch.setattr("phasesweep.runtime.gpu.unlock_file", released.append)
+
+    with pytest.raises(OSError, match="disk full"):
+        _try_host_gpu_lease(GpuDevice("0"))
+
+    assert len(released) == 1
 
 
 @pytest.mark.skipif(shutil.which("nvidia-smi") is None, reason="nvidia-smi is not installed")
