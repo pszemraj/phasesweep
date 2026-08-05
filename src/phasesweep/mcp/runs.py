@@ -316,6 +316,23 @@ class RunStore:
             return None
         return self._load_handle(path, expected_run_id=run_id)
 
+    def handle_exists(self, run_id: str) -> bool:
+        """Return whether a persisted handle file exists for ``run_id``, decodable or not.
+
+        :meth:`get` collapses "no such run" and "handle present but
+        undecodable" into ``None``. Authority decisions must tell them apart:
+        a missing handle means the generation was never an MCP-launched run
+        (current catalog policy may legitimately apply), while an undecodable
+        one carries frozen launch authority that can no longer be read and
+        must fail closed.
+
+        :param str run_id: Agent-supplied run id to look up.
+        :return bool: ``True`` when a handle file exists for a well-shaped id.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        return (self._runs_dir / f"{run_id}.json").is_file()
+
     def list_handles(self) -> list[RunHandle]:
         """Load every persisted handle, skipping any that are malformed or partial.
 

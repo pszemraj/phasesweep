@@ -434,7 +434,9 @@ class GetRunStatusResult(_ResultPayload):
         description=(
             "True only when represented_generation_id is not null and equals "
             "published_generation_id. A run_id whose own publication failed reports "
-            "false here while still showing that generation's own winners."
+            "false here while still showing that generation's own winners. For a "
+            "legacy pre-generation workdir every generation id is null and this "
+            "instead reports whether its compatibility winner artifact exists."
         )
     )
     metric: MetricPayload
@@ -930,12 +932,15 @@ class PhaseSweepMCP:
         )
         deadline = time.monotonic() + timeout
         baseline: tuple[Any, ...] | None = None
+        read_seconds = 0.0
         while True:
+            read_started = time.monotonic()
             target_id, status, run, handle, result_source = await asyncio.to_thread(
                 self._read_status_target,
                 experiment_id=None,
                 run_id=run_id,
             )
+            read_seconds = time.monotonic() - read_started
             run = cast(dict[str, Any], run)
             snapshot = _await_snapshot(
                 run["state"],
@@ -950,7 +955,14 @@ class PhaseSweepMCP:
                 reason = "terminal"
             elif _phase_gained_winner(baseline, snapshot):
                 reason = "phase_completed"
-            elif time.monotonic() >= deadline:
+            elif time.monotonic() + read_seconds >= deadline:
+                # Another read as slow as the one just finished would end past
+                # the deadline — that overshoot is what pushes the default
+                # await past the client-side request timeout the default was
+                # chosen to stay under. Return the fresh snapshot in hand:
+                # ordinary fast reads keep the final at-deadline recheck (the
+                # estimate is ~0), so state written during the last wait
+                # window is still observed.
                 reason = "timeout"
             else:
                 await asyncio.sleep(
@@ -1131,9 +1143,20 @@ class PhaseSweepMCP:
             represented_generation_id = status["represented_generation_id"]
             winner_views = read_winners(experiment, generation_id=represented_generation_id)
         authority_handle = handle
+        authority_unreadable = False
         if authority_handle is None and represented_generation_id is not None:
             authority_handle = self._runs.get(represented_generation_id)
-        visible_params = self._effective_visible_params(target_id, authority_handle)
+            authority_unreadable = authority_handle is None and self._runs.handle_exists(
+                represented_generation_id
+            )
+        if authority_unreadable:
+            # The represented generation WAS an MCP-launched run, but its
+            # handle no longer decodes: the frozen launch authority cannot be
+            # read, so fall back to the narrowest policy instead of the
+            # current catalog's, which may be wider than the launch grant.
+            visible_params: VisibleParamsPolicy = "none"
+        else:
+            visible_params = self._effective_visible_params(target_id, authority_handle)
         result = winners_payload(
             target_id,
             winner_views,

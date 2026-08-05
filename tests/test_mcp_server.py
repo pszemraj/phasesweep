@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import types
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -39,7 +40,9 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
     _generation_record_path,
+    _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_path,
     _trial_dir_for,
     _winner_path,
 )
@@ -1403,6 +1406,92 @@ def test_legacy_run_without_visibility_never_falls_back_to_current_catalog(
     )
 
     assert app.winners(run_id=run_id)["phases"][0]["params"] == {"lr": "<redacted>"}
+
+
+def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path: Path) -> None:
+    """A published generation whose run handle no longer decodes must not be
+    rendered under the current catalog policy: the frozen launch authority is
+    unreadable, and the current policy may be wider than the launch grant."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
+    )
+    reg = registry.get("srv")
+    run_id = "srv-corrupt-handle"
+    _write_winner_yaml(
+        reg.experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
+        generation_id=run_id,
+    )
+    # Legacy (pre-manifest) publication: the pointer and summary pass the
+    # identity-only gate, so the experiment-scoped read represents run_id.
+    summary_path = _generation_summary_path(reg.experiment, run_id)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        yaml.safe_dump({"experiment": reg.experiment.experiment, "generation_id": run_id})
+    )
+    pointer = _last_successful_generation_path(reg.experiment)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        yaml.safe_dump({"experiment": reg.experiment.experiment, "generation_id": run_id})
+    )
+    # The handle file exists but no longer decodes.
+    handle_path = store._runs_dir / f"{run_id}.json"
+    handle_path.parent.mkdir(parents=True, exist_ok=True)
+    handle_path.write_text("{ not json")
+
+    winners = app.winners(experiment_id="srv")
+
+    assert winners["phases"][0]["params"] == {"lr": "<redacted>"}
+
+
+def test_await_run_never_starts_a_status_read_past_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow status read must not launch after the deadline: that overshoot is
+    what pushes the default await past the client-side request timeout the
+    default was chosen to stay under. The just-collected snapshot is returned."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-await-bound"
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.create(
+        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
+    )
+
+    clock = {"now": 0.0}
+    read_starts: list[float] = []
+    real_read = app._read_status_target
+
+    def slow_read(**kwargs: Any) -> Any:
+        read_starts.append(clock["now"])
+        result = real_read(**kwargs)
+        clock["now"] += 4.9  # one disk read burns nearly the whole 5s budget
+        return result
+
+    async def virtual_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(app, "_read_status_target", slow_read)
+    monkeypatch.setattr(
+        "phasesweep.mcp.server.time", types.SimpleNamespace(monotonic=lambda: clock["now"])
+    )
+    monkeypatch.setattr(
+        "phasesweep.mcp.server.asyncio",
+        types.SimpleNamespace(sleep=virtual_sleep, to_thread=asyncio.to_thread),
+    )
+
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=5))
+
+    assert awaited["reason"] == "timeout"
+    assert awaited["run"]["state"] == "running"
+    # A second equally slow read would have returned at 9.8 virtual seconds,
+    # far past the 5s deadline; instead the await returns the first read's
+    # snapshot as soon as the cost estimate rules another read out.
+    assert read_starts == [0.0]
+    assert clock["now"] == pytest.approx(4.9)
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
