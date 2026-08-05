@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,12 @@ from tests.mcp_helpers import (
 )
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+# Hard ceilings for the monitoring loops below. Both are far above the real
+# cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
+# tool dispatch), so they only trip on a regression that would otherwise hang
+# pytest indefinitely instead of failing.
+MONITOR_DEADLINE_SECONDS = 300.0
+DISPATCH_DEADLINE_SECONDS = 30.0
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -114,11 +121,19 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        while True:
+        # Bounded: a run that never reaches a terminal state must fail this
+        # test with the last state it reported, not hang pytest forever.
+        deadline = time.monotonic() + MONITOR_DEADLINE_SECONDS
+        state = "unobserved"
+        while state not in {"succeeded", "failed", "cancelled"}:
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"run {run_id} never reached a terminal state within "
+                    f"{MONITOR_DEADLINE_SECONDS}s; last state {state!r}; log:\n"
+                    f"{store.log_path(run_id).read_text()}"
+                )
             awaited = asyncio.run(app.await_run(run_id))
             state = awaited["run"]["state"]
-            if state in {"succeeded", "failed", "cancelled"}:
-                break
         log = store.log_path(run_id).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
@@ -489,7 +504,16 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
         del timeout_seconds
+        # Bounded: if the blocking tool never reaches its blocking section the
+        # regression must surface as a failure, not as a pytest hang.
+        deadline = time.monotonic() + DISPATCH_DEADLINE_SECONDS
         while not clock.blocking_started.is_set():
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"{blocking_tool} never entered its blocking section within "
+                    f"{DISPATCH_DEADLINE_SECONDS}s; last observed run state "
+                    f"{awaited['run']['state']!r}, manual clock at {clock.now}"
+                )
             await asyncio.sleep(0)
         clock.advance(0.02)
         return awaited

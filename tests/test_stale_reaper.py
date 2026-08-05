@@ -52,6 +52,7 @@ from phasesweep.runtime.process import (
     _read_proc_stat,
     _write_process_identity,
     cleanup_stale_trial_process,
+    is_same_live_process,
     kill_stale_group,
     read_boot_id,
     read_proc_starttime,
@@ -108,6 +109,35 @@ def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
     assert stat.state == "S"
     assert stat.pgrp == 4321
     assert stat.starttime == 987654
+
+
+def test_is_same_live_process_fails_closed_when_proc_entry_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable ``/proc/<pid>/stat`` must never confirm process identity.
+
+    The PID is alive and the saved starttime is genuinely ours, so the only
+    thing that changes is that the ``/proc`` read is denied. Identity is then
+    unverifiable, and callers (stale-trial cleanup, MCP run supervision) must
+    see ``False`` - never a permissive ``True`` and never a raised
+    ``PermissionError`` from a liveness probe.
+    """
+    pid = os.getpid()
+    saved_starttime = read_proc_starttime(pid)
+    if saved_starttime is None:
+        pytest.skip("/proc process identity is unavailable on this platform")
+    assert is_same_live_process(pid, saved_starttime) is True  # control: readable /proc matches
+
+    real_read_bytes = Path.read_bytes
+
+    def deny_proc_reads(self: Path, *args: object, **kwargs: object) -> bytes:
+        if str(self).startswith("/proc/"):
+            raise PermissionError(f"{self} is unreadable")
+        return real_read_bytes(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_bytes", deny_proc_reads)
+
+    assert is_same_live_process(pid, saved_starttime) is False
 
 
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
