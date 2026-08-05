@@ -91,6 +91,42 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "schema_version": 1,
         "status": "complete",
     }
+    assert list(trial_dir.glob(".result.json.*.tmp")) == []
+
+
+def test_wrapper_never_publishes_a_truncated_result(tmp_path, monkeypatch) -> None:
+    """A write interrupted before the rename must not leave a partial result.json.
+
+    The phase timeout/cancel path SIGKILLs trainers, so a non-atomic write can
+    leave truncated bytes that the extractor misreports as a parse error.
+    """
+    wrapper = _load_wrapper()
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError("interrupted before the rename")
+
+    monkeypatch.setattr(wrapper.os, "fsync", fail_fsync)
+    monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
+    monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "abc123")
+
+    with pytest.raises(OSError, match="interrupted before the rename"):
+        wrapper._write_result(
+            trial_dir,
+            "abc123",
+            {
+                "checkpoint": "final.pt",
+                "device_type": "cuda",
+                "policy": "final_checkpoint",
+                "step": 1000,
+                "val_loss": 0.25,
+            },
+        )
+
+    assert not (trial_dir / "result.json").exists()
+    assert list(trial_dir.glob(".result.json.*.tmp")) == []
 
 
 def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
