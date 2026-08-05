@@ -50,6 +50,7 @@ from phasesweep.mcp.install.targets import (
     TOML_START,
     AgentTarget,
     _entry_argv,
+    _is_absolute_phasesweep_command,
     agent_targets,
     codex_toml_content,
     is_managed_mcp_entry,
@@ -756,6 +757,62 @@ def _integrations(integration: Literal["mcp", "instructions", "all"]) -> tuple[I
     return (integration,)
 
 
+def _mcp_plan_note(target: AgentTarget, command: str, catalog: Path) -> str:
+    """Describe the MCP entry already on disk and what installing will do to it.
+
+    Answers the only question the plan cannot leave to the post-apply verdicts:
+    whether confirming rewrites an entry that is already there. Classification
+    reuses :func:`_check_target_launcher`, the same read-only reader
+    ``check-install`` and the post-install verification section use, so the
+    pre-confirmation plan cannot disagree with them about the same on-disk
+    state.
+
+    :param AgentTarget target: Client whose MCP config the plan would edit.
+    :param str command: Absolute ``phasesweep-mcp`` executable to be pinned.
+    :param Path catalog: Absolute catalog path the installed entry will pass.
+    :return str: Plan note, possibly spanning several lines.
+    """
+    check = _check_target_launcher(target)
+    if check.status == "not-configured":
+        return "no existing phasesweep entry; installing creates one"
+    if check.status == "unmanaged":
+        return (
+            "an existing phasesweep entry is not a shape this installer owns; it will be left "
+            "untouched and printed for manual merge"
+        )
+    if check.status == "unreadable" or check.executable is None:
+        # No argv was recovered, so there is no existing invocation to describe.
+        return (
+            "the existing config could not be read as a phasesweep entry; it will be left "
+            "untouched and the entry printed for manual merge"
+        )
+    current = shlex.join([check.executable, *check.args])
+    planned = shlex.join([command, "--catalog", str(catalog)])
+    if current == planned:
+        return "an existing phasesweep entry already matches this plan; it stays unchanged"
+    shape = (
+        "an existing phasesweep entry"
+        if _is_absolute_phasesweep_command(check.executable)
+        else "a recognized legacy launcher entry"
+    )
+    return (
+        f"{shape} WILL BE REWRITTEN to this environment's pinned executable\n"
+        f"from: {current}\n"
+        f"to:   {planned}"
+    )
+
+
+def _echo_plan_note(note: str) -> None:
+    """Print one plan note under its integration line, indenting continuations.
+
+    :param str note: Note text, possibly spanning several lines.
+    """
+    first, *rest = note.splitlines()
+    click.echo(f"    {'':<13} note: {first}")
+    for line in rest:
+        click.echo(f"    {'':<13}       {line}")
+
+
 def _print_plan(
     targets: Sequence[AgentTarget],
     integrations: tuple[Integration, ...],
@@ -768,6 +825,10 @@ def _print_plan(
     catalog_report: CatalogCheckReport | None,
 ) -> None:
     """Print what will be written or removed before touching anything.
+
+    MCP installs additionally state, per target, whether an entry is already
+    configured and whether confirming rewrites it, so an operator never learns
+    of a rewrite only from the verdicts printed after confirming.
 
     :param Sequence[AgentTarget] targets: Selected agent targets.
     :param tuple[Integration, ...] integrations: Integrations to apply.
@@ -804,11 +865,13 @@ def _print_plan(
             scope = " [user scope]" if integration == "mcp" and target.mcp.scope == "user" else ""
             click.echo(f"    {integration:<13} {path}{scope}")
             if notice and mode == "install":
-                click.echo(f"    {'':<13} note: {notice}")
+                _echo_plan_note(notice)
+            if integration == "mcp" and mode == "install" and catalog is not None:
+                _echo_plan_note(_mcp_plan_note(target, command, catalog))
             if integration == "instructions":
                 shared_note = _instruction_plan_note(target, project, mode)
                 if shared_note:
-                    click.echo(f"    {'':<13} note: {shared_note}")
+                    _echo_plan_note(shared_note)
     click.echo("")
 
 
@@ -969,6 +1032,14 @@ _CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset(
     {"missing", "not-executable", "catalog-missing", "unreadable"}
 )
 
+# A legacy pinned-launcher entry that resolves here still resolves its launcher from
+# whatever PATH the client is started with, so `ok` alone would overstate the check.
+_LEGACY_LAUNCHER_NOTE = (
+    "recognized legacy launcher form, not the pinned absolute phasesweep-mcp executable; it "
+    "resolved from this shell's PATH, but the client may launch with a different one; rerun "
+    "`phasesweep mcp install` to pin this environment's executable"
+)
+
 
 @dataclass(frozen=True)
 class LauncherCheck:
@@ -1051,7 +1122,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     earlier versions wrote), reports an entry this installer does not own as
     ``unmanaged`` without probing it, and never edits the client file. Probes
     both the launcher executable and the configured ``--catalog`` path, the
-    executable first because it fails earlier at launch.
+    executable first because it fails earlier at launch. A legacy entry that
+    passes both probes stays ``ok`` but carries
+    :data:`_LEGACY_LAUNCHER_NOTE`, because resolving its launcher here says
+    nothing about the PATH the client will launch with.
 
     :param AgentTarget target: Client to inspect.
     :return LauncherCheck: Verification outcome for this target.
@@ -1143,6 +1217,8 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     status, detail = _probe_launcher_executable(command)
     if status == "ok":
         status, detail = _probe_configured_catalog(args)
+        if status == "ok" and not _is_absolute_phasesweep_command(command):
+            detail = _LEGACY_LAUNCHER_NOTE
     return LauncherCheck(spec.path, command, tuple(args), status, detail)
 
 

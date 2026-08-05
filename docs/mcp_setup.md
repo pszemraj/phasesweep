@@ -39,7 +39,7 @@ Add another `--from` for each experiment. Use `-o` to choose another catalog fil
 phasesweep mcp install
 ```
 
-The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, and user-scoped edits. After confirmation it applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
+The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config — including whether a recognized legacy launcher entry will be rewritten to the pinned executable, shown before the confirmation prompt. After confirmation it applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
 
 The supported clients are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode. A missing catalog is never created implicitly; return to the review step instead.
 
@@ -93,7 +93,7 @@ phasesweep mcp check-install
 phasesweep mcp check-install --agent claude
 ```
 
-The report distinguishes a healthy entry (`ok`), missing or non-executable launchers, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
+The report distinguishes a healthy entry (`ok`), missing or non-executable launchers, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
 
 For CI, explicit catalog review, or troubleshooting, run:
 

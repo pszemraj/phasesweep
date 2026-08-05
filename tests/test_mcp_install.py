@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import stat
 import threading
 import tomllib
@@ -667,6 +668,36 @@ def test_check_install_reports_legacy_uvx_launcher_missing_from_path(fake_home, 
     assert "need attention" in captured.err
 
 
+def test_check_install_never_mutates_the_config_it_reports_on(
+    fake_home, tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    monkeypatch.setenv("PATH", str(_executable(tmp_path, name="uvx").parent))
+    catalog = _configured_catalog(tmp_path)
+    claude = _target(project, "claude")
+    states = {
+        "healthy": (mcp_entry("stdio", str(script), catalog), 0),
+        "legacy": (_legacy_uvx_entry("stdio", catalog), 0),
+        "stale": (mcp_entry("stdio", str(tmp_path / "gone" / "phasesweep-mcp"), catalog), 1),
+    }
+    reports = {}
+
+    for name, (entry, expected_code) in states.items():
+        _write_json_entry(claude, entry)
+        before = claude.mcp.path.read_bytes()
+        assert installer.check_install(project, ["claude"]) == expected_code, name
+        reports[name] = capsys.readouterr().out
+        assert claude.mcp.path.read_bytes() == before, name
+
+    # A legacy entry passes both probes, so it stays ok/exit 0, but never without
+    # the caveat that it is not the pinned absolute executable.
+    assert "recognized legacy launcher form" in reports["legacy"]
+    assert "rerun `phasesweep mcp install`" in reports["legacy"]
+    assert "recognized legacy launcher form" not in reports["healthy"]
+
+
 def test_check_install_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1092,6 +1123,74 @@ def test_installer_repairs_legacy_uvx_entry_on_reinstall(fake_home, tmp_path, ca
     assert entry == mcp_entry("stdio", installer.resolve_server_command(), catalog)
 
 
+def test_install_plan_states_the_existing_entry_state_per_target(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    preview = partial(
+        installer.run, "install", project, catalog, ["claude"], "mcp", yes=True, dry_run=True
+    )
+
+    assert preview() == 0
+    assert "no existing phasesweep entry" in capsys.readouterr().out
+
+    assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    capsys.readouterr()
+    assert preview() == 0
+    assert "already matches this plan" in capsys.readouterr().out
+
+    _write_json_entry(claude, mcp_entry("stdio", "/elsewhere/bin/phasesweep-mcp", catalog))
+    assert preview() == 0
+    plan = capsys.readouterr().out
+    assert "WILL BE REWRITTEN" in plan
+    assert "legacy" not in plan
+    assert (
+        f"from: {shlex.join(['/elsewhere/bin/phasesweep-mcp', '--catalog', str(catalog)])}" in plan
+    )
+
+    _write_json_entry(claude, {"command": "hand-authored"})
+    assert preview() == 1
+    assert "not a shape this installer owns" in capsys.readouterr().out
+
+
+def test_install_plan_discloses_a_legacy_entry_rewrite_before_confirming(fake_home, tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, _legacy_uvx_entry("stdio", catalog))
+    before = claude.mcp.path.read_bytes()
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "install",
+            "--catalog",
+            str(catalog),
+            "--project",
+            str(project),
+            "--agent",
+            "claude",
+            "--type",
+            "mcp",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "cancelled; no client files were changed" in result.output
+    assert "a recognized legacy launcher entry WILL BE REWRITTEN" in result.output
+    legacy_argv = shlex.join([*LEGACY_UVX_PREFIX, "--catalog", str(catalog)])
+    pinned_argv = shlex.join([installer.resolve_server_command(), "--catalog", str(catalog)])
+    assert f"from: {legacy_argv}" in result.output
+    assert f"to:   {pinned_argv}" in result.output
+    # The disclosure has to reach the operator before the prompt it informs.
+    assert result.output.index("WILL BE REWRITTEN") < result.output.index("Proceed?")
+    assert claude.mcp.path.read_bytes() == before
+
+
 def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, capsys, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1110,7 +1209,8 @@ def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, ca
 
     output = capsys.readouterr().out
     assert code == 0
-    assert checks == 1
+    # Once to classify the existing entry for the plan, once to verify what was written.
+    assert checks == 2
     assert "verification:" in output
     assert "Claude Code" in output
     assert "ok" in output
