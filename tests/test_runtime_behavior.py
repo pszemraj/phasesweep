@@ -1426,6 +1426,86 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     assert completion["timeout_scope"] == "phase"
 
 
+@pytest.mark.parametrize("lease_timeout", [True, False])
+def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_timeout: bool
+) -> None:
+    """Only ``GpuLeaseTimeoutError`` may relabel a lease wait as wallclock exhaustion.
+
+    Phase attribution narrows on the dedicated subclass. A plain
+    ``TimeoutError`` escaping the lock layer is an infrastructure failure: it
+    must surface as a fatal abort, never let ``allow_incomplete_on_timeout``
+    publish a partial winner off broken infrastructure. This pins the
+    ``except GpuLeaseTimeoutError`` contract in ``engine/phase.py`` — widening
+    it to ``TimeoutError`` or raising the plain superclass from the pool fails
+    one side of this parametrization.
+    """
+    import contextlib
+
+    import phasesweep.engine.phase as phase_mod
+    from phasesweep.runtime.gpu import GpuLeaseTimeoutError
+
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        print("x=1.0")
+        """,
+    )
+    exp = Experiment(
+        experiment="gpu_lease_timeout_attribution",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                max_consecutive_failures=1,
+                timeout_seconds_per_phase=600.0,
+                allow_incomplete_on_timeout=True,
+                search_space={},
+            )
+        ],
+    )
+
+    exc_type = GpuLeaseTimeoutError if lease_timeout else TimeoutError
+
+    class _FailingSecondLeasePool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @contextlib.contextmanager
+        def acquire(self, *, deadline: float | None = None):
+            self.calls += 1
+            if self.calls > 1:
+                raise exc_type("GPU lease wait exhausted")
+            yield None
+
+    monkeypatch.setattr(
+        phase_mod.GpuPool, "create", classmethod(lambda cls, **kwargs: _FailingSecondLeasePool())
+    )
+
+    if not lease_timeout:
+        with pytest.raises(TimeoutError, match="GPU lease wait exhausted"):
+            run_experiment(exp)
+        return
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].trial_number == 0
+    completion = winners["p"].completion
+    assert completion["incomplete"] is True
+    assert completion["reason"] == "timeout"
+
+
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
     accepted = _sleeping_score_experiment(
         tmp_path,
