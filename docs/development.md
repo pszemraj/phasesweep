@@ -24,7 +24,7 @@ mypy src
 scripts/check_installed_wheel.sh
 ```
 
-The final script builds a wheel in a temporary directory, installs it into a temporary prefix, checks both console entry points and packaged data, and exercises `phasesweep init`, validation, dry-run, and catalog scaffolding without relying on the checkout at runtime. It leaves no build or acceptance artifact in the repository.
+The final script builds a wheel in a temporary directory, installs it into a temporary prefix, asserts the installed version matches the one `git describe` implies for the checkout, checks both console entry points and packaged data, and exercises `phasesweep init`, validation, dry-run, and catalog scaffolding without relying on the checkout at runtime. Every assertion prints a `check_installed_wheel:` diagnostic before exiting non-zero. It leaves no build or acceptance artifact in the repository.
 
 Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. There is currently no CI workflow, Makefile, or justfile wrapping these commands.
 
