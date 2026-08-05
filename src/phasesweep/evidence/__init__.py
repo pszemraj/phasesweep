@@ -1,6 +1,7 @@
 """Metric extraction and evidence gate evaluation."""
 
 from phasesweep.evidence.evaluation import (
+    DeadlineExceededError,
     ExtractorError,
     GateResult,
     TrialContext,
@@ -9,6 +10,7 @@ from phasesweep.evidence.evaluation import (
 )
 
 __all__ = [
+    "DeadlineExceededError",
     "ExtractorError",
     "GateResult",
     "TrialContext",
