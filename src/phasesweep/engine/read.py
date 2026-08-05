@@ -325,13 +325,48 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     return None
 
 
+def _legacy_publication_present(experiment: Experiment) -> bool:
+    """Whether a pre-generation workdir already holds a published winner.
+
+    Layouts written before generation metadata existed have no
+    ``generation.yaml`` and so no last-success pointer to validate: their
+    per-phase ``winner.yaml`` *is* the publication. The pointer-identity
+    comparison that decides ``is_published`` everywhere else has nothing to
+    compare there and used to report "never published" beside a real winner
+    path, which an upgrading operator reads as data loss. Winner paths are
+    resolved through the same helper the per-phase payload uses, so
+    ``is_published`` and ``winner_present`` can never disagree.
+
+    :param Experiment experiment: Experiment whose legacy winner files are probed.
+    :return bool: ``True`` when the legacy fallback resolves at least one
+        existing ``winner.yaml``; ``False`` for an untouched workdir and for
+        every workdir that has a ``generation.yaml`` (there the pointer, not
+        the compatibility projection, is authoritative, so an unpublished
+        generation stays unpublished).
+    """
+    return any(
+        (winner_path := _published_winner_path_for(experiment, None, phase.name)) is not None
+        and winner_path.is_file()
+        for phase in experiment.phases
+    )
+
+
 def read_status(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
     _include_winner_paths: bool = False,
 ) -> dict[str, Any]:
-    """Per-phase trial counts and winner presence, with no paths in the output.
+    """Per-phase trial counts and winner presence for one experiment.
+
+    The payload is path-free **only while ``_include_winner_paths`` is
+    ``False``** (the default): setting it swaps in the operator-facing phase
+    payload, whose ``winner`` field is an absolute filesystem path. Every
+    MCP-facing caller must therefore leave it ``False`` -- the redaction layer
+    in ``phasesweep.mcp.redaction`` takes this function's default-mode output
+    as already path-free and does not strip paths itself. The flag exists for
+    :func:`phasesweep.engine.run.experiment_status` / ``config_status``, whose
+    CLI and suite consumers are trusted with local paths.
 
     Trial counts come from ``_phase_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
@@ -358,10 +393,18 @@ def read_status(
     - ``represented_generation_id``: the generation whose winner/summary
       facts this payload actually shows -- ``generation_id`` itself when
       pinned, otherwise the captured ``published_generation_id``.
-    - ``is_published``: ``True`` only when ``represented_generation_id`` is
-      not ``None`` and equals ``published_generation_id``. A pinned read of a
+    - ``is_published``: ``True`` when ``represented_generation_id`` is not
+      ``None`` and equals ``published_generation_id``. A pinned read of a
       failed-publication generation is ``is_published: False`` while still
-      showing that generation's own (unpublished) winners.
+      showing that generation's own (unpublished) winners. The one case with
+      no generation identity to compare is a pre-generation legacy workdir
+      (no ``generation.yaml`` at all): there the compatibility
+      ``winner.yaml`` is the publication, so ``is_published`` follows
+      :func:`_legacy_publication_present` and stays consistent with the
+      ``winner_present`` reported beside it, while all three identity fields
+      remain ``None`` because no generation id exists to report. A workdir
+      that *does* have ``generation.yaml`` but no validated last-success
+      pointer is unpublished as before.
 
     Winner/summary facts (``winner_present``, top-level ``summary_present``)
     scope to ``represented_generation_id``. ``generation_trials`` scopes to
@@ -372,27 +415,27 @@ def read_status(
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
 
-    Args:
-        experiment: Parsed experiment config whose phases are inspected.
-        generation_id: Optional invocation identity to pin the read's
-            *represented* generation: ``represented_generation_id`` and the
-            ``generation_trials``/winner/summary scope all equal this id,
-            while ``current_generation_id`` and ``published_generation_id``
-            remain the actual (possibly different) pointers. Used by callers
-            (e.g. MCP per-run reads) that already know which generation they
-            mean and want its own view of itself. When omitted (the
-            default), ``represented_generation_id`` is the captured
-            ``published_generation_id`` and ``generation_trials`` scopes to
-            the captured ``current_generation_id``.
-        _include_winner_paths: Internal CLI adapter flag selecting the
-            path-bearing phase payload used by :func:`config_status`.
-
-    Returns:
-        A path-free mapping with the experiment name, the four identity
-        fields above, the metric descriptor, a per-phase list of trial counts
-        plus winner presence, and whether the represented summary has been
-        written. The metric descriptor is the *represented generation's own*
-        recorded metric whenever its summary declares one
+    :param Experiment experiment: Parsed experiment config whose phases are inspected.
+    :param str | None generation_id: Optional invocation identity to pin the
+        read's *represented* generation: ``represented_generation_id`` and the
+        ``generation_trials``/winner/summary scope all equal this id, while
+        ``current_generation_id`` and ``published_generation_id`` remain the
+        actual (possibly different) pointers. Used by callers (e.g. MCP
+        per-run reads) that already know which generation they mean and want
+        its own view of itself. When omitted (the default),
+        ``represented_generation_id`` is the captured
+        ``published_generation_id`` and ``generation_trials`` scopes to the
+        captured ``current_generation_id``.
+    :param bool _include_winner_paths: Internal CLI adapter flag selecting the
+        path-bearing phase payload used by :func:`config_status`. Leave
+        ``False`` for any agent-visible caller: ``True`` puts absolute winner
+        paths in the returned mapping.
+    :return dict[str, Any]: A mapping with the experiment name, the four
+        identity fields above, the metric descriptor, a per-phase list of
+        trial counts plus winner presence, and whether the represented summary
+        has been written -- path-free unless ``_include_winner_paths`` is set.
+        The metric descriptor is the *represented generation's own* recorded
+        metric whenever its summary declares one
         (``result_context: "represented_generation"``), falling back to the
         current config only when no summary semantics exist
         (``result_context: "current_config"``) — a published x/minimize
@@ -401,7 +444,6 @@ def read_status(
         the summary's recorded config fingerprint against the current
         config's semantic fingerprint; ``None`` when the represented summary
         records no fingerprint.
-
     """
     current_generation_id = _current_pointer_generation_id(experiment)
     published_generation_id = _last_successful_generation_id(experiment)
@@ -418,10 +460,15 @@ def read_status(
         winner_scope_generation_id = generation_id
         pinned = True
 
-    is_published = (
-        represented_generation_id is not None
-        and represented_generation_id == published_generation_id
-    )
+    if represented_generation_id is None:
+        # Only an unpinned read reaches here (a pinned read always represents
+        # its own id), so this is either a workdir with nothing published --
+        # ``False``, unchanged -- or a pre-generation legacy layout whose
+        # compatibility ``winner.yaml`` is itself the publication and has no
+        # pointer identity to compare against.
+        is_published = _legacy_publication_present(experiment)
+    else:
+        is_published = represented_generation_id == published_generation_id
 
     phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
     summary_path: Path | None

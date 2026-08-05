@@ -22,6 +22,7 @@ from phasesweep.config import (
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
+from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import (
     _generation_path,
     _generation_record_path,
@@ -339,6 +340,93 @@ def test_read_status_pinned_read_of_unpublished_generation_is_not_marked_publish
     assert status["is_published"] is False
     # The orphaned generation's own winner is still readable pinned.
     assert status["phases"][0]["winner_present"] is True
+
+
+def test_read_status_legacy_workdir_without_generation_metadata_is_published(
+    tmp_path: Path,
+) -> None:
+    """A pre-generation workdir's ``winner.yaml`` is the publication, so say so.
+
+    Legacy layouts have no ``generation.yaml`` and therefore no pointer
+    identity to compare, which used to report ``is_published: False`` right
+    next to a real winner path -- an upgrading operator read "never
+    published" about a published result. The three identity fields stay
+    ``None`` (there is genuinely no generation id to report; none is
+    fabricated) while ``is_published`` follows the winner actually on disk.
+    """
+    exp = _experiment(tmp_path)
+    legacy_winner = _winner_path(exp, "p")
+    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
+    legacy_winner.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 2,
+                "metric": {"loss": 0.3, "goal": "minimize"},
+                "params": {"lr": 0.003},
+                "effective_overrides": {"lr": 0.003},
+                "completion": {"incomplete": False},
+            }
+        )
+    )
+    assert not _generation_path(exp).exists()
+
+    status = read_status(exp)
+
+    assert status["current_generation_id"] is None
+    assert status["published_generation_id"] is None
+    assert status["represented_generation_id"] is None
+    assert status["is_published"] is True
+    assert status["phases"][0]["winner_present"] is True
+
+    # The path-bearing CLI/suite view derives from the same read and must not
+    # contradict its own winner path either.
+    cli_status = experiment_status(exp)
+    assert cli_status["is_published"] is True
+    assert cli_status["phases"][0]["winner"] == str(legacy_winner)
+
+
+def test_read_status_untouched_workdir_is_not_published(tmp_path: Path) -> None:
+    """No generation metadata *and* no legacy winner is still "nothing published"."""
+    exp = _experiment(tmp_path)
+
+    status = read_status(exp)
+
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+
+
+def test_read_status_unpublished_generation_is_not_published(tmp_path: Path) -> None:
+    """A generation-aware workdir that never published keeps ``is_published: False``.
+
+    The legacy fallback must not leak into layouts that *do* carry generation
+    metadata: once ``generation.yaml`` exists, a stale compatibility
+    ``winner.yaml`` is not authoritative.
+    """
+    exp = _experiment(tmp_path)
+    _generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
+    _generation_path(exp).write_text(yaml.safe_dump({"generation_id": "generation-running"}))
+    legacy_winner = _winner_path(exp, "p")
+    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
+    legacy_winner.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 2,
+                "metric": {"loss": 0.3, "goal": "minimize"},
+                "params": {"lr": 0.003},
+                "effective_overrides": {"lr": 0.003},
+                "completion": {"incomplete": False},
+            }
+        )
+    )
+
+    status = read_status(exp)
+
+    assert status["current_generation_id"] == "generation-running"
+    assert status["published_generation_id"] is None
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
 
 
 @pytest.mark.parametrize(

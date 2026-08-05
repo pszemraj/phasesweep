@@ -1281,7 +1281,11 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``current_generation_id``, ``published_generation_id``,
       ``represented_generation_id``, ``is_published``: the identity split
       defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
-      the represented generation is the published one).
+      the represented generation is the published one). A pre-generation
+      legacy workdir has no generation ids to report and leaves all three
+      null, but its compatibility ``winner.yaml`` still counts as published,
+      so ``is_published`` never contradicts the ``winner`` path shown beside
+      it.
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
