@@ -220,6 +220,21 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
+    """Return a cleanup-marker clear that fails once, then delegates normally."""
+    real_clear = RunStore.clear_cleanup_uncertain
+    clear_calls = 0
+
+    def interrupt_first_clear(candidate_store: RunStore, candidate: RunHandle) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise RuntimeError("interrupted before clearing cleanup marker")
+        real_clear(candidate_store, candidate)
+
+    return interrupt_first_clear
+
+
 def _stage_stale_running_recovery_scaffold(
     tmp_path: Path,
     *,
@@ -2947,17 +2962,11 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
         monkeypatch=monkeypatch,
     )
 
-    real_clear = RunStore.clear_cleanup_uncertain
-    clear_calls = 0
-
-    def interrupt_first_clear(candidate_store: RunStore, candidate: RunHandle) -> None:
-        nonlocal clear_calls
-        clear_calls += 1
-        if clear_calls == 1:
-            raise RuntimeError("interrupted before clearing cleanup marker")
-        real_clear(candidate_store, candidate)
-
-    monkeypatch.setattr(RunStore, "clear_cleanup_uncertain", interrupt_first_clear)
+    monkeypatch.setattr(
+        RunStore,
+        "clear_cleanup_uncertain",
+        _interrupt_first_cleanup_clear(),
+    )
     runner = CliRunner()
 
     first = runner.invoke(cli_main, command)
@@ -3180,17 +3189,11 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True
     )
 
-    real_clear = RunStore.clear_cleanup_uncertain
-    clear_calls = 0
-
-    def interrupt_first_clear(candidate_store: RunStore, candidate: RunHandle) -> None:
-        nonlocal clear_calls
-        clear_calls += 1
-        if clear_calls == 1:
-            raise RuntimeError("interrupted before clearing cleanup marker")
-        real_clear(candidate_store, candidate)
-
-    monkeypatch.setattr(RunStore, "clear_cleanup_uncertain", interrupt_first_clear)
+    monkeypatch.setattr(
+        RunStore,
+        "clear_cleanup_uncertain",
+        _interrupt_first_cleanup_clear(),
+    )
     runner = CliRunner()
 
     first = runner.invoke(cli_main, command)
