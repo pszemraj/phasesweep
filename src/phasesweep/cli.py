@@ -7,6 +7,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import sys
@@ -117,9 +118,11 @@ def _starter_experiment_text(target: Path) -> str:
             f"sqlite:///file:{storage_path}?uri=true", ensure_ascii=False
         ),
     }
-    for placeholder, value in replacements.items():
-        template = template.replace(placeholder, value)
-    return template
+    # Substitute every placeholder in one pass. Sequential str.replace calls
+    # rescan text a previous call already inserted, so a destination path that
+    # contains a placeholder literal would silently corrupt the rendered config.
+    pattern = re.compile("|".join(re.escape(placeholder) for placeholder in replacements))
+    return pattern.sub(lambda match: replacements[match.group(0)], template)
 
 
 @contextlib.contextmanager
@@ -175,7 +178,8 @@ def init(output: Path) -> None:
     :param Path output: Destination YAML path; existing paths are never replaced.
     :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
         file or symlink, including when it appears between the check and the
-        atomic publication.
+        atomic publication, and when staging or publishing fails with an
+        ``OSError`` such as a permission, disk-space, or hard-link error.
     """
     expanded = output.expanduser()
     target = expanded.absolute()
@@ -183,13 +187,22 @@ def init(output: Path) -> None:
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
     text = _starter_experiment_text(target)
-    with _staged_text(target, text) as staged:
-        try:
-            os.link(staged, target)
-        except FileExistsError:
-            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-            raise click.exceptions.Exit(2) from None
-        fsync_directory(target.parent)
+    try:
+        with _staged_text(target, text) as staged:
+            try:
+                os.link(staged, target)
+            except FileExistsError:
+                click.echo(
+                    f"phasesweep init: refusing to overwrite existing path {target}", err=True
+                )
+                raise click.exceptions.Exit(2) from None
+            fsync_directory(target.parent)
+    except OSError as exc:
+        # `phasesweep init` is the first command a new user runs; an unwritable
+        # directory or a filesystem without hard links must report one line, not
+        # a traceback.
+        click.echo(f"phasesweep init: cannot write {target}: {exc}", err=True)
+        raise click.exceptions.Exit(2) from None
 
     # Quote the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a

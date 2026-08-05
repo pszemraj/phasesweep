@@ -86,6 +86,29 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     assert Path(experiment.workdir) == runs_dir
 
 
+def test_init_renders_destinations_containing_placeholder_literals(tmp_path: Path) -> None:
+    """Placeholder substitution must never rescan text it already inserted.
+
+    Replacing the placeholders one after another lets a destination path that
+    contains a placeholder literal be rewritten by a later replacement, which
+    corrupts a config that ``init`` still reports as written.
+    """
+    project = tmp_path / "__PHASESWEEP_STORAGE__"
+    output = project / "experiment.yaml"
+    runs_dir = project / "runs"
+
+    rendered = yaml.safe_load(_starter_experiment_text(output))
+
+    assert rendered["workdir"] == str(runs_dir)
+    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    experiment = load_experiment(output)
+    assert Path(experiment.workdir) == runs_dir
+
+
 def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
     project = tmp_path / "local?sweeps"
     output = project / "experiment.yaml"
@@ -160,7 +183,35 @@ def test_init_write_failure_does_not_claim_destination(
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
-    assert isinstance(result.exception, OSError)
+    assert result.exit_code == 2
+    assert f"phasesweep init: cannot write {output}: fsync failed" in result.output
+    assert not output.exists()
+    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
+
+
+def test_init_reports_publish_errors_without_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hard-link failure is a user-facing error, not a traceback.
+
+    ``init`` is the first command a new user runs, and ``os.link`` fails with
+    ``EPERM`` on filesystems without hard links, not only with
+    ``FileExistsError``.
+    """
+    output = tmp_path / "experiment.yaml"
+
+    def deny_hard_link(_source: Path, _destination: Path) -> None:
+        raise PermissionError("hard links are not supported")
+
+    monkeypatch.setattr("phasesweep.cli.os.link", deny_hard_link)
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert f"phasesweep init: cannot write {output}: hard links are not supported" in result.output
+    assert "Traceback" not in result.output
     assert not output.exists()
     assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
 
