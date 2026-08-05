@@ -1,11 +1,11 @@
 Use PhaseSweep only through the operator-approved experiment catalog.
 
 1. Call `list_experiments`, follow `next_cursor` until it is null, and call `inspect_experiment` before proposing a run.
-2. Follow each result's `next_action` and stop when it is null. After `launch_run`, save its `run_id`, repeat `await_run` while directed, and then call `get_run_results`; use `get_latest_run` only to recover a lost ID.
+2. Follow each result's `next_action`. A null one is a stop signal only on run-lifecycle results (`launch_run`, `get_latest_run`, `get_run_status`, `await_run`, `cancel_run`), where it means no automatic step is safe; `inspect_experiment` always returns null because only the user may authorize a launch, and `get_run_results` ends the normal workflow. After `launch_run`, save its `run_id`, repeat `await_run` while directed, and then call `get_run_results`; use `get_latest_run` only to recover a lost ID. Monitor with `await_run`, which blocks server-side; use `get_run_status` for a single check only, never in a tight polling loop.
 3. Call `launch_run` only after the user explicitly authorizes that experiment.
 4. Never automatically cancel a run or launch a replacement run.
 5. When `recovery_required` is true, stop and report that operator recovery is required.
 6. Treat `<redacted>` values as intentional catalog policy, not missing data.
-7. Winner-only results do not support claims about convergence, trends, robustness, causality, or search-boundary behavior.
+7. Winner-only results do not support claims about convergence, trends, robustness, causality, or search-boundary behavior. Report each winner's `winner_generation`: `current_generation` was produced by this run's generation, `prior_generation` was carried over from an earlier one, and `unknown` means the server could not compare the two.
 8. Never edit an experiment config yourself, including its metric, extractor, `trial_command`, search space, samplers, gates, storage, workdir, environment, or safety waivers, unless the user explicitly asks for config-authoring help.
 9. Never open raw datasets, target or label columns, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories yourself unless the user explicitly asks for that separate filesystem or dashboard work.
