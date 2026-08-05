@@ -10,6 +10,7 @@ import os
 import secrets
 import shlex
 import sys
+from collections.abc import Iterator
 from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
@@ -121,6 +122,40 @@ def _starter_experiment_text(target: Path) -> str:
     return template
 
 
+@contextlib.contextmanager
+def _staged_text(destination: Path, text: str) -> Iterator[Path]:
+    """Write and fsync text beside a destination without publishing it.
+
+    :param Path destination: Eventual destination used to locate and name the staging file.
+    :param str text: Complete UTF-8 text to stage.
+    :raises FileExistsError: If ten randomized staging names collide.
+    :return Iterator[Path]: Staging path, removed when the context exits.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged: Path | None = None
+    try:
+        handle = None
+        for _ in range(10):
+            candidate = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {destination}")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield staged
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+
+
 @main.command(
     context_settings=CONTEXT_SETTINGS,
     help="Write a runnable two-phase starter experiment without overwriting files.",
@@ -148,35 +183,13 @@ def init(output: Path) -> None:
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
     text = _starter_experiment_text(target)
-    staged: Path | None = None
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        handle = None
-        for _ in range(10):
-            candidate = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                handle = candidate.open("x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {target}")
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-
+    with _staged_text(target, text) as staged:
         try:
             os.link(staged, target)
         except FileExistsError:
             click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
             raise click.exceptions.Exit(2) from None
         fsync_directory(target.parent)
-    finally:
-        if staged is not None:
-            with contextlib.suppress(OSError):
-                staged.unlink()
 
     # Quote the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
@@ -950,47 +963,26 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
         )
         return False
 
-    staged: Path | None = None
     try:
         text = scaffold_catalog_text(output, from_configs)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        handle = None
-        for _ in range(10):
-            candidate = output.with_name(f".{output.name}.{secrets.token_hex(8)}.tmp")
+        with _staged_text(output, text) as staged:
+            Registry.load(staged)
             try:
-                handle = candidate.open("x", encoding="utf-8")
+                os.link(staged, output)
             except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {output}")
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-
-        Registry.load(staged)
-        try:
-            os.link(staged, output)
-        except FileExistsError:
-            click.echo(
-                f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
-                "Pass -o to choose another name.",
-                err=True,
-            )
-            return False
-        fsync_directory(output.parent)
+                click.echo(
+                    f"phasesweep mcp init-catalog: {output} already exists; refusing to "
+                    "overwrite. Pass -o to choose another name.",
+                    err=True,
+                )
+                return False
+            fsync_directory(output.parent)
     except CatalogError as exc:
         click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False
     except OSError as exc:
         click.echo(f"phasesweep mcp init-catalog: cannot write {output}: {exc}", err=True)
         return False
-    finally:
-        if staged is not None:
-            with contextlib.suppress(OSError):
-                staged.unlink()
     click.echo(f"wrote {output}")
     return True
 
