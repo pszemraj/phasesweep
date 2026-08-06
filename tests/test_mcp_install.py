@@ -114,7 +114,7 @@ def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
 
 
-def test_json_install_uninstall_documents_numeric_and_compact_normalization(tmp_path):
+def test_json_install_uninstall_keeps_numeric_tokens_and_normalizes_key_spacing(tmp_path):
     path = tmp_path / "mcp.json"
     original = '{"threshold":1e2,"mcpServers":{}}\n'
     path.write_text(original)
@@ -123,9 +123,73 @@ def test_json_install_uninstall_documents_numeric_and_compact_normalization(tmp_
     assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
 
     restored = path.read_text()
+    # The unrelated float keeps its source spelling; only the compact key
+    # spacing and indentation normalize, so the file is not byte-identical.
+    assert '"threshold": 1e2' in restored
     assert restored != original
-    assert '"threshold": 100.0' in restored
     assert json.loads(restored) == {"threshold": 100.0, "mcpServers": {}}
+
+
+@pytest.mark.parametrize("token", ["1e2", "2.5E-3", "0.30000000000000004", "1.50", "-1.0e+02"])
+def test_json_member_edits_preserve_unrelated_float_tokens(tmp_path, token):
+    path = tmp_path / "mcp.json"
+    path.write_text('{\n  "threshold": ' + token + ',\n  "mcpServers": {}\n}\n')
+    expected = json.loads(token)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+    installed = path.read_text()
+    assert f'"threshold": {token}' in installed
+    assert json.loads(installed) == {"threshold": expected, "mcpServers": {"phasesweep": ENTRY}}
+
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
+    restored = path.read_text()
+    assert f'"threshold": {token}' in restored
+    assert json.loads(restored) == {"threshold": expected, "mcpServers": {}}
+
+
+def test_merge_json_member_preserves_nested_float_tokens(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"weights":[1.50,{"decay":2.5E-3}],"mcpServers":{}}\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+
+    installed = path.read_text()
+    assert "1.50" in installed
+    assert "2.5E-3" in installed
+    assert json.loads(installed) == {
+        "weights": [1.5, {"decay": 0.0025}],
+        "mcpServers": {"phasesweep": ENTRY},
+    }
+    # Raw float tokens elsewhere in the document leave "unchanged" detection
+    # intact: the managed entry itself contains no numbers.
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
+    assert path.read_text() == installed
+
+
+def test_json_member_edits_survive_a_string_colliding_with_the_float_placeholder(tmp_path):
+    path = tmp_path / "mcp.json"
+    collision = f"{install_edits._RAW_FLOAT_PREFIX}0__"
+    path.write_text('{"note":"' + collision + '","threshold":1.50,"mcpServers":{}}\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+
+    installed = path.read_text()
+    assert '"threshold": 1.50' in installed
+    assert json.loads(installed) == {
+        "note": collision,
+        "threshold": 1.5,
+        "mcpServers": {"phasesweep": ENTRY},
+    }
+
+
+@pytest.mark.parametrize("token", [b"Infinity", b"-Infinity", b"NaN"])
+def test_merge_json_member_still_rejects_nonfinite_constants(tmp_path, token):
+    path = tmp_path / "mcp.json"
+    original = b'{"threshold":' + token + b',"mcpServers":{}}\n'
+    path.write_bytes(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "skipped"
+    assert path.read_bytes() == original
 
 
 def test_json_member_edits_preserve_crlf(tmp_path):

@@ -125,7 +125,7 @@ Ownership of a JSON entry is inferred from the exact generated shape; no receipt
 Preservation depends on the file format:
 
 - Marker-fenced instruction text and the managed Codex TOML block preserve unrelated bytes according to their marker contract.
-- Strict JSON client files may be reserialized during install or uninstall. The editor preserves key order, detected indentation and newline style, final-newline state, and file permissions, but compact formatting and numeric spelling may normalize. For example, `1e2` may become `100.0`.
+- Strict JSON client files may be reserialized during install or uninstall. The editor preserves key order, every number's source spelling (`1e2` stays `1e2`, `1.50` stays `1.50`), detected indentation and newline style, final-newline state, and file permissions, but compact formatting may normalize. For example, `{"a":1}` may become `{"a": 1}`.
 - Duplicate keys, comments, JSON5, non-finite values, and overflowing numbers are refused rather than guessed at.
 - Empty files and empty JSON containers remain after uninstall because whole-file creation ownership is not persisted.
 
