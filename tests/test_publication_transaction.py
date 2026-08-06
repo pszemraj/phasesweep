@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import stat
 from collections.abc import Iterator
@@ -33,6 +34,7 @@ from phasesweep.config import IntParam, Phase, Sampler, Suite
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, read_status, read_winner
 from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
+    PublicationPointer,
     _generation_dir,
     _generation_path,
     _generation_record_path,
@@ -41,6 +43,8 @@ from phasesweep.engine.state import (
     _last_successful_generation_id,
     _last_successful_generation_path,
     _last_successful_suite_generation_id,
+    _resolve_publication_pointer,
+    _resolve_suite_publication_pointer,
     _suite_generation_path,
     _suite_generation_record_path,
     _suite_generation_summary_path,
@@ -741,6 +745,10 @@ def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
 
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
+    # The pointer file itself is still there, so this is corruption of a
+    # recorded publication -- never an experiment that has published nothing
+    # (review v0.5.18 / finding F4).
+    assert _resolve_publication_pointer(experiment).state == "failed"
 
 
 def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_path: Path) -> None:
@@ -793,6 +801,185 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
     # Unlike the pre-v0.5.15 design, this has no effect: the record is not consulted.
     assert _last_successful_generation_id(experiment) == generation_id
     assert read_winner(experiment, "p") is not None
+
+
+# --------------------------------------------------------------------------
+# Publication integrity tri-state (review v0.5.18 / finding F4). "Nothing
+# published" and "the recorded publication no longer validates" are different
+# facts and must never collapse into the same answer: reporting corruption as
+# a fresh tree invites a re-run, which advances the pointer and leaves the
+# corruption flagged nowhere.
+# --------------------------------------------------------------------------
+
+
+def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path) -> None:
+    """A valid publication resolves ``ok`` with its generation id and no error."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    assert _resolve_publication_pointer(experiment) == PublicationPointer(
+        state="ok", generation_id=generation_id, error=None
+    )
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert "publication_error" not in status
+    assert status["published_generation_id"] == generation_id
+
+
+def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: Path) -> None:
+    """A tree that never published is healthy, not corrupt."""
+    experiment = _stored_experiment(tmp_path)
+
+    assert _resolve_publication_pointer(experiment) == PublicationPointer(
+        state="absent", generation_id=None, error=None
+    )
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "absent"
+    assert "publication_error" not in status
+    assert status["published_generation_id"] is None
+    assert status["is_published"] is False
+
+
+def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
+    """The F4 reproduction: a tampered winner must not read as "nothing published"."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert "does not match its recorded hash" in pointer.error
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert "does not match its recorded hash" in status["publication_error"]
+    # Nothing is fabricated: the no-publication facts stay exactly as they read
+    # today, only the integrity verdict is new.
+    assert status["published_generation_id"] is None
+    assert status["represented_generation_id"] is None
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    # The boolean-blind wrapper keeps its fail-closed contract for path callers.
+    assert _last_successful_generation_id(experiment) is None
+
+
+@pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
+def test_tampered_provenance_file_is_reported_as_a_failed_publication(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """The F6 provenance files feed the same tri-state as any other artifact."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    target = _generation_dir(experiment, generation_id) / filename
+    target.write_bytes(target.read_bytes() + b"\n# tampered\n")
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert "does not match its recorded hash" in pointer.error
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert "does not match its recorded hash" in status["publication_error"]
+
+
+def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path) -> None:
+    """The pointer is the publication authority; an orphaned namespace is not one."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    _last_successful_generation_path(experiment).unlink()
+    assert _generation_summary_path(experiment, generation_id).is_file()
+
+    assert _resolve_publication_pointer(experiment) == PublicationPointer(
+        state="absent", generation_id=None, error=None
+    )
+    assert read_status(experiment)["publication_integrity"] == "absent"
+
+
+def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
+    """A pointer whose whole target namespace is gone is corruption, not a fresh tree."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    shutil.rmtree(_generation_dir(experiment, generation_id))
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert status["publication_error"] == pointer.error
+
+
+def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
+    """The tri-state must not soften the raise the resume/rebind path depends on."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+
+    with pytest.raises(RuntimeError, match="does not match its recorded hash"):
+        _last_successful_generation_id(experiment, raise_on_manifest_error=True)
+
+
+def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
+    tmp_path: Path,
+) -> None:
+    """The suite pointer gets the same tri-state as the experiment pointer."""
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    generation_id = _last_successful_suite_generation_id(suite)
+    assert generation_id is not None
+
+    assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
+        state="ok", generation_id=generation_id, error=None
+    )
+
+    summary = yaml.safe_load(_suite_generation_summary_path(suite, generation_id).read_text())
+    component_path = Path(summary["studies"][0]["component_summary_path"])
+    component_path.write_text(component_path.read_text() + "\n# tampered\n")
+
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert _last_successful_suite_generation_id(suite) is None
+
+
+def test_suite_publication_pointer_reports_absent_before_anything_publishes(
+    tmp_path: Path,
+) -> None:
+    """A suite that never published reports absent, like the experiment pointer."""
+    suite = _stored_suite_config(tmp_path)
+
+    assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
+        state="absent", generation_id=None, error=None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -857,11 +1044,15 @@ def test_read_status_single_captures_the_published_pointer(
 
     calls: list[int] = []
 
-    def swapping_resolver(_experiment: object) -> str | None:
+    def swapping_resolver(_experiment: object) -> PublicationPointer:
         calls.append(1)
-        return real_generation if len(calls) == 1 else "generation-does-not-exist"
+        return PublicationPointer(
+            state="ok",
+            generation_id=real_generation if len(calls) == 1 else "generation-does-not-exist",
+            error=None,
+        )
 
-    monkeypatch.setattr("phasesweep.engine.read._last_successful_generation_id", swapping_resolver)
+    monkeypatch.setattr("phasesweep.engine.read._resolve_publication_pointer", swapping_resolver)
 
     status = read_status(experiment)
 

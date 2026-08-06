@@ -47,6 +47,22 @@ class ArtifactRootRebindError(PhaseSweepError):
     """
 
 
+class PublicationIntegrityError(PhaseSweepError):
+    """Raised when a recorded publication exists but no longer validates.
+
+    Strictly a *reporting* failure, raised by the read-only surfaces
+    (``phasesweep status``, ``phasesweep show-winners``) so a corrupt result
+    tree exits non-zero instead of reading like a tree that never published
+    (review v0.5.18 / finding F4). It never blocks ``phasesweep run``:
+    generation namespaces are immutable, so a forward run cannot overwrite the
+    corrupt one, and the resume path already raises the same manifest error
+    when it loads winners. The message must therefore carry both the
+    validation error and the reason not to re-run - a successful re-run
+    advances the last-success pointer past the corrupt generation, after which
+    nothing reports it at all.
+    """
+
+
 class StudyStorageUnavailableError(PhaseSweepError):
     """Raised when persistent study storage cannot be inspected during preflight."""
 

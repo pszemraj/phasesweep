@@ -42,6 +42,7 @@ from phasesweep.engine.state import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_id,
     _last_successful_generation_path,
     _trial_dir_for,
     _winner_path,
@@ -1275,6 +1276,60 @@ def test_experiment_status_next_action_steers_a_finished_experiment_to_results(
 
     assert after.run is None
     assert _status_next_action(after) == TOOL_GET_RUN_RESULTS
+
+
+def test_status_and_winners_carry_the_publication_integrity_verdict(tmp_path: Path) -> None:
+    """Review v0.5.18 / finding F4: an agent must distinguish corrupt from fresh.
+
+    Both read surfaces reported a corrupt publication exactly like a workdir
+    that had never published, so an agent would cheerfully propose the one
+    action that destroys the evidence.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    config = tmp_path / "srv.yaml"
+    experiment = make_experiment(
+        experiment="srv",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={},
+            )
+        ],
+    )
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+
+    fresh = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+    assert fresh.publication_integrity == "absent"
+    assert app.winners(experiment_id="srv")["publication_integrity"] == "absent"
+
+    run_experiment(experiment)
+
+    healthy = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+    assert healthy.publication_integrity == "ok"
+    assert healthy.is_published is True
+    assert app.winners(experiment_id="srv")["publication_integrity"] == "ok"
+
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+
+    payload = app.status(experiment_id="srv")
+    corrupt = GetRunStatusResult.model_validate(payload)
+    assert corrupt.publication_integrity == "failed"
+    assert corrupt.published_generation_id is None
+    assert corrupt.is_published is False
+    winners = app.winners(experiment_id="srv")
+    assert winners["publication_integrity"] == "failed"
+    # The verdict is a closed enum, so nothing path-shaped rides along with it.
+    serialized = json.dumps([payload, winners], default=str)
+    assert str(tmp_path) not in serialized
 
 
 def test_experiment_status_next_action_awaits_a_live_run(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.engine.state import _winner_source_or_default
+from phasesweep.engine.state import PublicationState, _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
 
 ResultSource: TypeAlias = Literal[
@@ -70,6 +70,7 @@ def winners_payload(
     metric: dict[str, Any],
     declared_phases: list[str],
     result_source: ResultSource,
+    publication_integrity: PublicationState,
     run_id: str | None = None,
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
@@ -87,6 +88,10 @@ def winners_payload(
     :param list[str] declared_phases: All phase names in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
+    :param PublicationState publication_integrity: Whether the experiment's
+        last-success pointer is valid, absent, or names a generation that no
+        longer validates. An empty winner list means two very different things
+        under ``"absent"`` and ``"failed"`` (review v0.5.18 / finding F4).
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
@@ -144,6 +149,7 @@ def winners_payload(
         "experiment_id": experiment_id,
         "run_id": run_id,
         "result_source": result_source,
+        "publication_integrity": publication_integrity,
         "metric": metric,
         "declared_phase_count": len(declared_phases),
         "winner_count": len(views),
@@ -179,6 +185,12 @@ def status_payload(
     ``is_published`` says whether the represented generation is the actual
     published one -- ``False`` for a pinned read of a failed-publication
     generation, even though its winners still show.
+
+    ``publication_integrity`` carries the tri-state verdict through unchanged
+    (review v0.5.18 / finding F4). The accompanying ``publication_error`` is
+    deliberately *not* forwarded: the enum is what an agent must branch on,
+    and the free-text detail belongs to the operator-facing CLI, which is the
+    surface trusted with local specifics.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
@@ -230,6 +242,7 @@ def status_payload(
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
+        "publication_integrity": status["publication_integrity"],
         "metric": status["metric"],
         "phases": phases,
         "summary_present": status["summary_present"],

@@ -1309,6 +1309,13 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       null, but its compatibility ``winner.yaml`` still counts as published,
       so ``is_published`` never contradicts the ``winner`` path shown beside
       it.
+    * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"``, and
+      ``publication_error`` beside it only when ``"failed"`` -- the one
+      conditional key in this payload (review v0.5.18 / finding F4). Published
+      results that no longer validate are reported as corrupt rather than as
+      an experiment that never published; the CLI turns ``"failed"`` into a
+      non-zero exit through :class:`~phasesweep.engine.PublicationIntegrityError`
+      after printing this payload.
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
@@ -1327,6 +1334,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
         winner paths and trial counts, as enumerated above.
     """
     status = read_status(experiment, _include_winner_paths=True)
+    integrity = status["publication_integrity"]
     return {
         "kind": "experiment",
         "experiment": status["experiment"],
@@ -1335,6 +1343,8 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
+        "publication_integrity": integrity,
+        **({"publication_error": status["publication_error"]} if integrity == "failed" else {}),
         "phases": status["phases"],
     }
 

@@ -33,6 +33,9 @@ log = logging.getLogger("phasesweep.engine.state")
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
 
+PublicationState = Literal["ok", "absent", "failed"]
+"""Verdict on a last-success pointer: valid, never written, or no longer valid."""
+
 
 @dataclass(frozen=True)
 class WinnerSource:
@@ -822,26 +825,6 @@ def _validate_generation_provenance_files(
         raise fail("reproducibility artifact does not anchor the config snapshot it published")
 
 
-def _generation_manifest_is_valid(
-    generation_dir: Path,
-    generation_id: str,
-    summary: Mapping[str, Any],
-) -> bool:
-    """Validate a generation manifest before trusting its publication pointer.
-
-    :param Path generation_dir: The generation's immutable namespace directory.
-    :param str generation_id: Generation id the summary claims.
-    :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :return bool: Whether the manifest currently validates.
-    """
-    try:
-        _validate_generation_manifest(generation_dir, generation_id, summary)
-    except RuntimeError as exc:
-        log.warning("%s", exc)
-        return False
-    return True
-
-
 def _read_pointer_target(
     pointer_path: Path,
     *,
@@ -889,7 +872,7 @@ def _read_pointer_target_summary(
     fails closed on the pointer target's own immutable *summary*: it must
     parse as a mapping naming this exact owner and id. Callers holding a
     schema-versioned summary additionally validate the complete artifact
-    manifest (:func:`_generation_manifest_is_valid`; review v0.5.16 /
+    manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
     blocker 3) — this helper only performs the identity gate common to
     experiment and suite pointers.
 
@@ -914,48 +897,102 @@ def _read_pointer_target_summary(
     return None
 
 
-def _last_successful_generation_id(
+@dataclass(frozen=True)
+class PublicationPointer:
+    """Tri-state resolution of one last-success publication pointer.
+
+    "Nothing was ever published" and "the recorded publication no longer
+    validates" are different operational facts with opposite remedies, and
+    collapsing both into ``None`` made a corrupt result tree indistinguishable
+    from a fresh one (review v0.5.18 / finding F4). The reporting surfaces
+    resolve through this type; path-construction helpers keep the boolean
+    :func:`_last_successful_generation_id` view, since both non-``ok`` states
+    mean the same thing to them: nothing may be read as published.
+
+    ``error`` is deliberately path-free so MCP payloads can carry it.
+    """
+
+    state: PublicationState
+    generation_id: str | None
+    """Pointer target id: the published generation when ``ok``, the generation
+    whose validation failed when ``failed``, ``None`` when ``absent`` or when
+    the pointer itself is the unreadable part."""
+    error: str | None
+    """Validation diagnostic; set if and only if ``state`` is ``failed``."""
+
+
+def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
+    """Classify a pointer whose own payload could not be resolved to a target.
+
+    A pointer file is written once, atomically, after its target validates, so
+    a file that exists but does not name a target this owner published is
+    tampering or corruption -- not an owner that has published nothing.
+
+    :param Path pointer_path: Last-success pointer whose read just failed.
+    :param str owner_label: Human-readable owner for the diagnostic text.
+    :return PublicationPointer: ``absent`` when no pointer file exists,
+        ``failed`` when one exists but cannot be resolved.
+    """
+    if not pointer_path.exists():
+        return PublicationPointer(state="absent", generation_id=None, error=None)
+    return PublicationPointer(
+        state="failed",
+        generation_id=None,
+        error=(
+            f"The last-success pointer for {owner_label} is unreadable, malformed, "
+            "or does not name a generation this owner published."
+        ),
+    )
+
+
+def _resolve_publication_pointer(
     experiment: Experiment,
     *,
     raise_on_manifest_error: bool = False,
-) -> str | None:
-    """Read and validate the last-success pointer, failing closed on mismatch.
+) -> PublicationPointer:
+    """Resolve the last-success pointer to ``ok`` / ``absent`` / ``failed``.
 
     The pointer is authoritative only when its target's own immutable summary
     parses and names this exact experiment and generation (review v0.5.15 /
     blocker 3) -- not when the per-generation lifecycle record says so, since
     that record is now written *after* this pointer commits and would
     otherwise create a crash window where a committed publication reads as
-    nothing-published. A malformed, tampered, or missing target is treated as
-    "nothing published" rather than trusted for path construction or result
-    reads.
+    nothing-published.
 
     For schema-versioned summaries the target's complete artifact manifest is
-    additionally validated -- every listed winner/promotion artifact must
-    exist, hash to its recorded content, and cross-check against the summary
-    (review v0.5.16 / blocker 3). Validation runs on every authoritative read:
+    additionally validated -- every listed winner/promotion artifact plus the
+    claim-time provenance files must exist, hash to their recorded content,
+    and cross-check against the summary (review v0.5.16 / blocker 3, review
+    v0.5.18 / finding F6). Validation runs on every authoritative read:
     generation directories are write-once by PhaseSweep convention, but the
     filesystem does not enforce immutability and a long-lived reader must
     notice later corruption or operator edits. Pre-manifest legacy summaries
     keep the identity-only gate.
 
+    Every way of failing that validation -- an unresolvable pointer, a
+    missing/tampered target summary, a broken manifest -- resolves to
+    ``failed``, never ``absent``: the pointer's existence is durable evidence
+    that this tree once held a result, and a caller told "nothing published"
+    would re-run over it and advance the pointer past the corruption.
+
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a versioned publication's
-        manifest error for an actionable resume failure instead of returning
-        ``None`` as read-only status APIs require.
-    :return str | None: The last-successful generation id, or ``None`` if the
-        pointer or its target summary is missing, unreadable, malformed,
-        unsafely named, owned by another experiment, or fails manifest
-        validation.
+        manifest error for an actionable resume failure instead of reporting
+        it as ``failed``, as read-only status APIs require. Only the manifest
+        branch raises; every other failure still resolves to ``failed``.
+    :raises RuntimeError: ``raise_on_manifest_error`` is set and the target's
+        artifact manifest does not validate.
+    :return PublicationPointer: The tri-state verdict for this experiment.
     """
+    pointer_path = _last_successful_generation_path(experiment)
     generation_id = _read_pointer_target(
-        _last_successful_generation_path(experiment),
+        pointer_path,
         id_key="generation_id",
         owner_key="experiment",
         owner_name=experiment.experiment,
     )
     if generation_id is None:
-        return None
+        return _unresolvable_pointer(pointer_path, f"experiment {experiment.experiment!r}")
     summary = _read_pointer_target_summary(
         _generation_summary_path(experiment, generation_id),
         id_key="generation_id",
@@ -964,17 +1001,62 @@ def _last_successful_generation_id(
         owner_name=experiment.experiment,
     )
     if summary is None:
-        return None
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Generation {generation_id!r} summary is missing, unreadable, or does not "
+                f"name experiment {experiment.experiment!r} and this generation."
+            ),
+        )
     if "schema_version" in summary:
         generation_dir = _generation_dir(experiment, generation_id)
         if raise_on_manifest_error:
             _validate_generation_manifest(generation_dir, generation_id, summary)
-        elif not _generation_manifest_is_valid(generation_dir, generation_id, summary):
+        else:
             # A versioned summary must validate its complete artifact manifest
             # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
             # the identity-only gate above; see docs/config.md's upgrade notes.
-            return None
-    return generation_id
+            try:
+                _validate_generation_manifest(generation_dir, generation_id, summary)
+            except RuntimeError as exc:
+                log.warning("%s", exc)
+                return PublicationPointer(
+                    state="failed", generation_id=generation_id, error=str(exc)
+                )
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None)
+
+
+def _last_successful_generation_id(
+    experiment: Experiment,
+    *,
+    raise_on_manifest_error: bool = False,
+) -> str | None:
+    """Return the last-success generation id, failing closed on any invalidity.
+
+    The boolean-blind view of :func:`_resolve_publication_pointer`, kept for
+    the path-construction and resume callers to which "never published" and
+    "published but corrupt" mean the same thing: nothing here may be read as
+    published. Every caller that *reports* publication state to an operator or
+    agent must use the tri-state resolver instead (review v0.5.18 / finding
+    F4).
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param bool raise_on_manifest_error: Re-raise a versioned publication's
+        manifest error for an actionable resume failure instead of returning
+        ``None`` as read-only status APIs require.
+    :raises RuntimeError: ``raise_on_manifest_error`` is set and the target's
+        artifact manifest does not validate.
+    :return str | None: The last-successful generation id, or ``None`` if the
+        pointer or its target summary is missing, unreadable, malformed,
+        unsafely named, owned by another experiment, or fails manifest
+        validation.
+    """
+    pointer = _resolve_publication_pointer(
+        experiment,
+        raise_on_manifest_error=raise_on_manifest_error,
+    )
+    return pointer.generation_id if pointer.state == "ok" else None
 
 
 def _published_winner_path_for(
@@ -1171,27 +1253,29 @@ def _last_successful_suite_generation_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "last_successful_suite_generation.yaml"
 
 
-def _last_successful_suite_generation_id(suite: Suite) -> str | None:
-    """Read and validate the suite last-success pointer, failing closed on mismatch.
+def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
+    """Resolve the suite last-success pointer to ``ok`` / ``absent`` / ``failed``.
 
-    Applies the same artifact-validating protocol as
-    :func:`_last_successful_generation_id`: the pointer is authoritative only
-    when its target's own immutable summary parses and names this exact suite
-    and suite generation (review v0.5.15 / blocker 3), not when the
-    per-suite-generation lifecycle record says so.
+    Suite mirror of :func:`_resolve_publication_pointer`, including its F4
+    rule that every way of failing validation resolves to ``failed`` rather
+    than ``absent``: the pointer is authoritative only when its target's own
+    immutable summary parses and names this exact suite and suite generation
+    (review v0.5.15 / blocker 3), not when the per-suite-generation lifecycle
+    record says so, and a schema-current summary must additionally anchor its
+    winner facts to the hash-covered component summaries it recorded.
 
     :param Suite suite: Suite config with artifact root details.
-    :return str | None: The last-successful suite generation id, or ``None``
-        when the pointer or its target summary fails validation.
+    :return PublicationPointer: The tri-state verdict for this suite.
     """
+    pointer_path = _last_successful_suite_generation_path(suite)
     generation_id = _read_pointer_target(
-        _last_successful_suite_generation_path(suite),
+        pointer_path,
         id_key="suite_generation_id",
         owner_key="suite",
         owner_name=suite.suite,
     )
     if generation_id is None:
-        return None
+        return _unresolvable_pointer(pointer_path, f"suite {suite.suite!r}")
     summary = _read_pointer_target_summary(
         _suite_generation_summary_path(suite, generation_id),
         id_key="suite_generation_id",
@@ -1200,10 +1284,24 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
         owner_name=suite.suite,
     )
     if summary is None:
-        return None
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Suite generation {generation_id!r} summary is missing, unreadable, or does "
+                f"not name suite {suite.suite!r} and this suite generation."
+            ),
+        )
     if summary.get("schema_version") not in (None, 1, 2, SUITE_SUMMARY_SCHEMA_VERSION):
         # A summary from a newer schema must not be silently misread.
-        return None
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Suite generation {generation_id!r} summary declares unsupported "
+                f"schema_version {summary.get('schema_version')!r}."
+            ),
+        )
     if summary.get("schema_version") == SUITE_SUMMARY_SCHEMA_VERSION:
         # The summary's own winner facts must be anchored to the hash-covered
         # component artifacts it recorded at publication, so an edited or
@@ -1214,13 +1312,28 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
         # summaries keep the identity-only gate above.
         try:
             _validate_suite_summary_integrity(generation_id, summary)
-        except RuntimeError:
+        except RuntimeError as exc:
             log.warning(
                 "Suite last-success pointer target failed integrity validation",
                 exc_info=True,
             )
-            return None
-    return generation_id
+            return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None)
+
+
+def _last_successful_suite_generation_id(suite: Suite) -> str | None:
+    """Return the last-success suite generation id, failing closed on any invalidity.
+
+    The boolean-blind view of :func:`_resolve_suite_publication_pointer`, kept
+    for path-construction callers; surfaces that *report* suite publication
+    state use the tri-state resolver (review v0.5.18 / finding F4).
+
+    :param Suite suite: Suite config with artifact root details.
+    :return str | None: The last-successful suite generation id, or ``None``
+        when the pointer or its target summary fails validation.
+    """
+    pointer = _resolve_suite_publication_pointer(suite)
+    return pointer.generation_id if pointer.state == "ok" else None
 
 
 def _validate_suite_summary_integrity(
@@ -1417,6 +1530,33 @@ def _validate_suite_summary_integrity(
                 )
 
 
+def _published_suite_summary_path_for(
+    suite: Suite,
+    published_generation_id: str | None,
+) -> Path | None:
+    """Resolve the authoritative suite summary from an already-captured published id.
+
+    Same legacy-fallback semantics as :func:`_published_suite_summary_path`,
+    but takes the caller's already-resolved suite last-success id instead of
+    re-reading the pointer, so a caller that has already made a decision from
+    one resolution (e.g. the CLI's publication-integrity check) cannot then
+    render a summary belonging to a different one.
+
+    :param Suite suite: Suite config with artifact root details.
+    :param str | None published_generation_id: Already-resolved suite
+        last-success id, or ``None`` when none validated.
+    :return Path | None: The generation-scoped suite summary path when
+        ``published_generation_id`` is given; the legacy compatibility summary
+        path when no suite generation has ever been published; ``None`` when a
+        suite generation exists but none has completed successfully yet.
+    """
+    if published_generation_id is not None:
+        return _suite_generation_summary_path(suite, published_generation_id)
+    if _suite_generation_path(suite).is_file():
+        return None
+    return _suite_summary_path(suite)
+
+
 def _published_suite_summary_path(suite: Suite) -> Path | None:
     """Return the authoritative last-success suite summary, with legacy fallback.
 
@@ -1426,12 +1566,7 @@ def _published_suite_summary_path(suite: Suite) -> Path | None:
         path when no suite generation has ever been published; ``None`` when a
         suite generation exists but none has completed successfully yet.
     """
-    generation_id = _last_successful_suite_generation_id(suite)
-    if generation_id is not None:
-        return _suite_generation_summary_path(suite, generation_id)
-    if _suite_generation_path(suite).is_file():
-        return None
-    return _suite_summary_path(suite)
+    return _published_suite_summary_path_for(suite, _last_successful_suite_generation_id(suite))
 
 
 def _suite_log_path(suite: Suite) -> Path:

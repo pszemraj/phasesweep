@@ -15,6 +15,7 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    PublicationState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -90,6 +91,15 @@ class StatusSnapshot(_SnapshotModel):
     published_generation_id: str | None = None
     represented_generation_id: str | None = None
     is_published: bool = False
+    publication_integrity: PublicationState = "absent"
+    """Publication verdict at capture time.
+
+    Defaults to ``"absent"`` so snapshots frozen before this field existed
+    still parse, pairing with the ``is_published: False`` default they already
+    carry: a legacy snapshot recorded no verdict, and inventing ``"ok"`` for it
+    would be the fail-open answer.
+    """
+
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
@@ -245,6 +255,10 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
             published_generation_id=None,
             represented_generation_id=None,
             is_published=False,
+            # Nothing was read from disk here, so no publication was resolved:
+            # report the same verdict a never-published tree does rather than
+            # implying this placeholder inspected one.
+            publication_integrity="absent",
             metric=MetricSnapshot(
                 name=experiment.metric.name,
                 goal=experiment.metric.goal,
@@ -365,6 +379,7 @@ def capture_result_snapshot(
             published_generation_id=status["published_generation_id"],
             represented_generation_id=status["represented_generation_id"],
             is_published=status["is_published"],
+            publication_integrity=status["publication_integrity"],
             metric=status["metric"],
             phases=status["phases"],
             summary_present=status["summary_present"],

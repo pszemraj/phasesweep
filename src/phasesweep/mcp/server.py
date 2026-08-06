@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import read_status, read_winners
-from phasesweep.engine.state import Winner, WinnerSourceKind, _load_winner
+from phasesweep.engine.state import PublicationState, Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
@@ -178,6 +178,20 @@ MaybeRunId = Annotated[
 PhaseName = Annotated[
     str,
     Field(description="Phase name from the experiment config.", pattern=SAFE_NAME_JSON_PATTERN),
+]
+PublicationIntegrity = Annotated[
+    PublicationState,
+    Field(
+        description=(
+            "Whether this experiment's recorded publication still validates. 'ok': it does. "
+            "'absent': nothing has ever published here, which is normal for a new experiment "
+            "and for one whose first run has not finished. 'failed': a publication WAS "
+            "recorded but its artifacts no longer validate, so every result field reads as "
+            "if nothing published. On 'failed', report the corruption to the operator and do "
+            "not launch a run against this experiment: a successful run advances the "
+            "publication pointer past the corrupt result and nothing reports it afterwards."
+        )
+    ),
 ]
 MaybePhaseName = Annotated[
     str | None,
@@ -439,6 +453,7 @@ class GetRunStatusResult(_ResultPayload):
             "instead reports whether its compatibility winner artifact exists."
         )
     )
+    publication_integrity: PublicationIntegrity
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
@@ -524,6 +539,7 @@ class GetRunResultsResult(_ResultPayload):
     experiment_id: ExperimentId
     run_id: RunId | None
     result_source: ResultSource
+    publication_integrity: PublicationIntegrity
     metric: MetricPayload
     declared_phase_count: int = Field(ge=0)
     winner_count: int = Field(ge=0)
@@ -1115,6 +1131,12 @@ class PhaseSweepMCP:
         that run recorded. Run-specific reads must not drift when the cataloged
         config changes or a later run resumes the shared studies.
 
+        The payload carries ``publication_integrity`` so an empty winner list
+        is never ambiguous: ``"absent"`` means nothing has published yet,
+        ``"failed"`` means a recorded publication no longer validates and the
+        agent must stop rather than propose another run (review v0.5.18 /
+        finding F4).
+
         :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
         :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
@@ -1125,9 +1147,11 @@ class PhaseSweepMCP:
             include_run=False,
         )
         snapshot, result_source = self._result_snapshot_view(experiment, handle)
+        publication_integrity: PublicationState
         if snapshot is not None:
             winner_views = snapshot.winner_views()
             represented_generation_id = snapshot.status.represented_generation_id
+            publication_integrity = snapshot.status.publication_integrity
         else:
             # Resolve the represented generation once via read_status, then
             # reuse that exact id for read_winners: two independent pointer
@@ -1141,6 +1165,7 @@ class PhaseSweepMCP:
                 generation_id=handle.run_id if handle is not None else None,
             )
             represented_generation_id = status["represented_generation_id"]
+            publication_integrity = status["publication_integrity"]
             winner_views = read_winners(experiment, generation_id=represented_generation_id)
         authority_handle = handle
         authority_unreadable = False
@@ -1167,6 +1192,7 @@ class PhaseSweepMCP:
             },
             declared_phases=[phase.name for phase in experiment.phases],
             result_source=result_source,
+            publication_integrity=publication_integrity,
             run_id=run_id,
             represented_generation_id=represented_generation_id,
             visible_params=visible_params,

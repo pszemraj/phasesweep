@@ -36,6 +36,7 @@ def _winners_payload(
         metric={"name": "loss", "goal": "minimize"},
         declared_phases=["p"],
         result_source="current_shared_study",
+        publication_integrity="ok",
         visible_params=visible_params,  # type: ignore[arg-type]
     )
 
@@ -269,6 +270,7 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
         metric={"name": "loss", "goal": "minimize"},
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
+        publication_integrity="ok",
         run_id="exp-run",
         represented_generation_id="generation-new",
     )

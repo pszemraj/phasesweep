@@ -33,6 +33,7 @@ from phasesweep.engine import (
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     _experiment_dir,
+    _generation_dir,
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
@@ -527,6 +528,211 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "Historical experiment result" in result.output
     assert "# original hypothesis" in result.output
     assert "new hypothesis" not in result.output
+
+
+def _published_experiment_config(tmp_path: Path) -> Path:
+    """Write and run a one-phase experiment so its workdir holds a real publication.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return Path: Config path whose experiment has published exactly one generation.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        'parser.add_argument("--out")\n'
+        'parser.add_argument("--x", type=int, default=0)\n'
+        "args, _ = parser.parse_known_args()\n"
+        'print(f"x={args.x}")\n',
+    )
+    return write_yaml(
+        tmp_path,
+        f"""
+        experiment: integrity_cli
+        workdir: {tmp_path}/runs
+        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+        phases:
+          - name: p
+            n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
+            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+        """,
+    )
+
+
+def _corrupt_the_publication(config_path: Path) -> str:
+    """Edit a published winner artifact so its generation manifest stops validating.
+
+    :param Path config_path: Config whose published generation should be corrupted.
+    :return str: The corrupted generation id.
+    """
+    experiment = load_experiment(config_path)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+    return generation_id
+
+
+def test_status_reports_a_corrupt_publication_and_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review v0.5.18 / finding F4: a corrupt publication is not a fresh tree.
+
+    ``status`` used to print a payload byte-identical to a never-run workdir
+    and exit 0, so the operator's natural next move -- re-run -- advanced the
+    pointer and erased the only evidence of corruption.
+    """
+    config_path = _published_experiment_config(tmp_path)
+    run_experiment(load_experiment(config_path))
+    generation_id = _corrupt_the_publication(config_path)
+
+    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    # The payload still prints in full, on stdout, before the boundary reports.
+    payload = yaml.safe_load(captured.out)
+    assert payload["publication_integrity"] == "failed"
+    assert "does not match its recorded hash" in payload["publication_error"]
+    assert payload["published_generation_id"] is None
+    # The diagnostic names the failure and forbids the wrong move explicitly.
+    assert generation_id in captured.err
+    assert "does not match its recorded hash" in captured.err
+    assert "Do not run anything over this tree" in captured.err
+
+
+def test_show_winners_reports_a_corrupt_publication_and_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``show-winners`` must not answer "no winner yet" over a corrupt publication."""
+    config_path = _published_experiment_config(tmp_path)
+    run_experiment(load_experiment(config_path))
+    generation_id = _corrupt_the_publication(config_path)
+
+    exit_code = _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "no winner yet" not in captured.out
+    assert generation_id in captured.err
+    assert "does not match its recorded hash" in captured.err
+    assert "Do not run anything over this tree" in captured.err
+
+
+def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The claim-time provenance files feed the same reporting as any winner."""
+    config_path = _published_experiment_config(tmp_path)
+    run_experiment(load_experiment(config_path))
+    experiment = load_experiment(config_path)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    record = _generation_dir(experiment, generation_id) / "reproducibility.json"
+    record.write_bytes(record.read_bytes() + b"\n")
+
+    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
+    status_captured = capsys.readouterr()
+    assert yaml.safe_load(status_captured.out)["publication_integrity"] == "failed"
+    assert "Do not run anything over this tree" in status_captured.err
+
+    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
+    winners_captured = capsys.readouterr()
+    assert "Do not run anything over this tree" in winners_captured.err
+    assert "Traceback" not in winners_captured.err
+
+
+def test_suite_status_fails_on_a_corrupt_component_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A suite status embeds every study, so one corrupt component fails the read.
+
+    The suite envelope reports no generation identity of its own, so without
+    this the corruption would print inside a study payload and still exit 0.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import argparse\nparser = argparse.ArgumentParser()\n"
+        'parser.add_argument("--out")\nparser.add_argument("--x", type=int, default=0)\n'
+        'args, _ = parser.parse_known_args()\nprint(f"x={args.x}")\n',
+    )
+    config_path = write_yaml(
+        tmp_path,
+        f"""
+        suite: integrity_suite
+        defaults:
+          workdir: {tmp_path}/runs
+          trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          metric:
+            name: x
+            goal: minimize
+            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+        studies:
+          - name: one
+            phases:
+              - name: p
+                n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
+                search_space: {{ x: {{ type: int, low: 0, high: 3 }} }}
+        """,
+    )
+    suite = load_config(config_path)
+    assert isinstance(suite, Suite)
+    # config_status compiles each study independently, so publishing the one
+    # component is enough to give the suite payload a publication to corrupt.
+    component = suite.experiment_for_study(suite.studies[0])
+    run_experiment(component)
+    generation_id = _last_successful_generation_id(component)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(component, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+
+    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    payload = yaml.safe_load(captured.out)
+    assert payload["studies"][0]["status"]["publication_integrity"] == "failed"
+    assert "Do not run anything over this tree" in captured.err
+
+
+def test_status_and_show_winners_stay_successful_without_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A healthy publication and a never-published tree both stay exit 0."""
+    config_path = _published_experiment_config(tmp_path)
+
+    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    fresh = capsys.readouterr()
+    assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
+    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    capsys.readouterr()
+
+    run_experiment(load_experiment(config_path))
+
+    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    published = capsys.readouterr()
+    assert yaml.safe_load(published.out)["publication_integrity"] == "ok"
+    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert "trial_number" in capsys.readouterr().out
 
 
 def _movable_experiment_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:

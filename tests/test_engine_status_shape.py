@@ -16,6 +16,7 @@ from pathlib import Path
 from phasesweep import config_status, load_config, run_experiment
 from phasesweep.config import Suite
 from phasesweep.engine.run import experiment_status
+from phasesweep.engine.state import _generation_winner_path, _last_successful_generation_id
 from tests.conftest import write_trainer, write_yaml
 
 EXPERIMENT_STATUS_KEYS = [
@@ -26,9 +27,29 @@ EXPERIMENT_STATUS_KEYS = [
     "published_generation_id",
     "represented_generation_id",
     "is_published",
+    "publication_integrity",
     "phases",
 ]
 """Exact ordered key set of an experiment status payload."""
+
+FAILED_PUBLICATION_STATUS_KEYS = [
+    "kind",
+    "experiment",
+    "workdir",
+    "current_generation_id",
+    "published_generation_id",
+    "represented_generation_id",
+    "is_published",
+    "publication_integrity",
+    "publication_error",
+    "phases",
+]
+"""Ordered key set when the recorded publication no longer validates.
+
+``publication_error`` is the one conditional key: it appears only alongside
+``publication_integrity: "failed"`` so a healthy payload carries no empty
+error field (review v0.5.18 / finding F4).
+"""
 
 PHASE_STATUS_KEYS = {
     "trials",
@@ -106,6 +127,7 @@ def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     assert not READ_STATUS_ONLY_KEYS & set(payload)
     assert payload["kind"] == "experiment"
     assert payload["is_published"] is True
+    assert payload["publication_integrity"] == "ok"
     assert payload["published_generation_id"] == payload["current_generation_id"]
     assert payload["represented_generation_id"] == payload["published_generation_id"]
 
@@ -161,5 +183,37 @@ def test_suite_config_status_embeds_the_full_experiment_status(tmp_path: Path) -
     assert untouched_status["published_generation_id"] is None
     assert untouched_status["represented_generation_id"] is None
     assert untouched_status["is_published"] is False
+    assert untouched_status["publication_integrity"] == "absent"
     assert untouched_status["phases"][0]["generation_trials"] == {}
     assert untouched_status["phases"][0]["winner"] is None
+
+
+def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
+    tmp_path: Path,
+) -> None:
+    """A publication that no longer validates adds two keys and invents nothing.
+
+    Review v0.5.18 / finding F4: the payload for a corrupt publication used to
+    be byte-identical to a tree that had never published, so the operator's
+    natural next move was to re-run over the evidence.
+    """
+    config = load_config(_write_suite(tmp_path))
+    assert isinstance(config, Suite)
+    experiment = config.experiment_for_study(config.studies[0])
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+
+    payload = config_status(experiment)
+
+    assert list(payload) == FAILED_PUBLICATION_STATUS_KEYS
+    assert not READ_STATUS_ONLY_KEYS & set(payload)
+    assert payload["publication_integrity"] == "failed"
+    assert "does not match its recorded hash" in payload["publication_error"]
+    assert payload["published_generation_id"] is None
+    assert payload["represented_generation_id"] is None
+    assert payload["is_published"] is False
+    assert payload["phases"][0]["winner"] is None

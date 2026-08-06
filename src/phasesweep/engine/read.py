@@ -31,11 +31,11 @@ from phasesweep.engine.state import (
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
-    _last_successful_generation_id,
     _parse_winner_source,
     _published_summary_path_for,
     _published_winner_path,
     _published_winner_path_for,
+    _resolve_publication_pointer,
 )
 from phasesweep.evidence.models import objective_evidence_assurance
 
@@ -82,7 +82,7 @@ def _phase_status_payloads(
     """Build per-phase status payloads for CLI and MCP readers.
 
     ``winner_scope_generation_id`` must already be resolved by the caller
-    exactly once (e.g. a single :func:`phasesweep.engine.state._last_successful_generation_id`
+    exactly once (e.g. a single :func:`phasesweep.engine.state._resolve_publication_pointer`
     call, or a caller-pinned id) and is reused for every phase in this one
     call -- this function never re-resolves the last-success pointer itself,
     so one status object spanning several phases can never mix identities
@@ -405,6 +405,17 @@ def read_status(
       remain ``None`` because no generation id exists to report. A workdir
       that *does* have ``generation.yaml`` but no validated last-success
       pointer is unpublished as before.
+    - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` --
+      *why* ``published_generation_id`` is what it is (review v0.5.18 /
+      finding F4). ``"absent"`` means nothing was ever published, a healthy
+      state for a fresh tree; ``"failed"`` means a last-success pointer exists
+      but its target no longer validates, and is accompanied by a short,
+      path-free ``publication_error``. The two used to be indistinguishable,
+      which invited a re-run over corrupt evidence. A ``"failed"`` payload
+      reports exactly the no-publication facts it always did -- nothing is
+      fabricated from an unvalidated generation -- so ``published_generation_id``
+      is ``None``, ``is_published`` is ``False``, and no winner reads as
+      present.
 
     Winner/summary facts (``winner_present``, top-level ``summary_present``)
     scope to ``represented_generation_id``. ``generation_trials`` scopes to
@@ -431,9 +442,11 @@ def read_status(
         ``False`` for any agent-visible caller: ``True`` puts absolute winner
         paths in the returned mapping.
     :return dict[str, Any]: A mapping with the experiment name, the four
-        identity fields above, the metric descriptor, a per-phase list of
-        trial counts plus winner presence, and whether the represented summary
-        has been written -- path-free unless ``_include_winner_paths`` is set.
+        identity fields above, ``publication_integrity`` (plus
+        ``publication_error`` only when it is ``"failed"``), the metric
+        descriptor, a per-phase list of trial counts plus winner presence, and
+        whether the represented summary has been written -- path-free unless
+        ``_include_winner_paths`` is set.
         The metric descriptor is the *represented generation's own* recorded
         metric whenever its summary declares one
         (``result_context: "represented_generation"``), falling back to the
@@ -446,7 +459,8 @@ def read_status(
         records no fingerprint.
     """
     current_generation_id = _current_pointer_generation_id(experiment)
-    published_generation_id = _last_successful_generation_id(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    published_generation_id = publication.generation_id if publication.state == "ok" else None
 
     if generation_id is None:
         represented_generation_id = published_generation_id
@@ -523,6 +537,8 @@ def read_status(
         "published_generation_id": published_generation_id,
         "represented_generation_id": represented_generation_id,
         "is_published": is_published,
+        "publication_integrity": publication.state,
+        **({"publication_error": publication.error} if publication.state == "failed" else {}),
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
         "metric": metric_payload,

@@ -5,7 +5,8 @@ Use PhaseSweep only through the operator-approved experiment catalog.
 3. Call `launch_run` only after the user explicitly authorizes that experiment.
 4. Never automatically cancel a run or launch a replacement run.
 5. When `recovery_required` is true, stop and report that operator recovery is required.
-6. Treat `<redacted>` values as intentional catalog policy, not missing data.
-7. Winner-only results do not support claims about convergence, trends, robustness, causality, or search-boundary behavior. Report each winner's `winner_generation`: `current_generation` was produced by this run's generation, `prior_generation` was carried over from an earlier one, and `unknown` means the server could not compare the two.
-8. Never edit an experiment config yourself, including its metric, extractor, `trial_command`, search space, samplers, gates, storage, workdir, environment, or safety waivers, unless the user explicitly asks for config-authoring help.
-9. Never open raw datasets, target or label columns, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories yourself unless the user explicitly asks for that separate filesystem or dashboard work.
+6. When `publication_integrity` is `failed`, stop and report that this experiment's published result no longer validates and needs operator inspection; never propose a run to "regenerate" it, which would overwrite the only record of the problem. `absent` is not a problem: it means nothing has published yet.
+7. Treat `<redacted>` values as intentional catalog policy, not missing data.
+8. Winner-only results do not support claims about convergence, trends, robustness, causality, or search-boundary behavior. Report each winner's `winner_generation`: `current_generation` was produced by this run's generation, `prior_generation` was carried over from an earlier one, and `unknown` means the server could not compare the two.
+9. Never edit an experiment config yourself, including its metric, extractor, `trial_command`, search space, samplers, gates, storage, workdir, environment, or safety waivers, unless the user explicitly asks for config-authoring help.
+10. Never open raw datasets, target or label columns, predictions, trainer logs, raw result files, W&B dashboards, or per-trial metric histories yourself unless the user explicitly asks for that separate filesystem or dashboard work.

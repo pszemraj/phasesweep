@@ -153,6 +153,7 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
         metric={"name": "objective", "goal": "minimize"},
         declared_phases=["candidate"],
         result_source="current_shared_study",
+        publication_integrity="ok",
     )["phases"][0]
     assert "trial_number" not in agent_phase
     assert agent_phase["winner_source"] == {

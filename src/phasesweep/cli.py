@@ -15,6 +15,7 @@ import traceback
 from collections.abc import Iterator
 from importlib import resources
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import click
@@ -23,7 +24,12 @@ from pydantic import ValidationError
 
 from phasesweep.config import ConfigError, Experiment, Suite, load_config
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine import PhaseSweepError, config_status, run_config
+from phasesweep.engine import (
+    PhaseSweepError,
+    PublicationIntegrityError,
+    config_status,
+    run_config,
+)
 from phasesweep.engine.guards import (
     _apply_artifact_root_rebind,
     _experiment_lock,
@@ -39,10 +45,13 @@ from phasesweep.engine.guards import (
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
+    _experiment_dir,
     _generation_summary_path,
-    _last_successful_generation_id,
-    _published_suite_summary_path,
+    _published_suite_summary_path_for,
     _published_winner_path_for,
+    _resolve_publication_pointer,
+    _resolve_suite_publication_pointer,
+    _suite_dir,
 )
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
@@ -379,6 +388,64 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
             click.echo(f"{prefix}{line}")
 
 
+def _publication_integrity_error(
+    subject: str,
+    detail: str,
+    namespace_root: Path,
+) -> PublicationIntegrityError:
+    """Build the one diagnostic every corrupt-publication read surface reports.
+
+    Carries the validation failure *and* the reason not to re-run (review
+    v0.5.18 / finding F4): a successful re-run publishes a new generation, the
+    last-success pointer advances past the corrupt one, and nothing reports
+    the corruption afterwards. The immutable namespace is still on disk until
+    then, so inspecting or restoring it first is the whole remedy.
+
+    :param str subject: Experiment or suite the corrupt publication belongs to.
+    :param str detail: Validation error explaining why it no longer validates.
+        Punctuated here rather than at the raising site, since validators
+        return bare reason clauses.
+    :param Path namespace_root: Artifact root holding the generation namespaces
+        the operator must inspect.
+    :return PublicationIntegrityError: Complete single-line operator diagnostic.
+    """
+    detail = detail.rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail = f"{detail}."
+    return PublicationIntegrityError(
+        f"{subject} records a publication that no longer validates: {detail} "
+        f"Do not run anything over this tree until you have inspected or restored the "
+        f"generation namespace under {namespace_root} -- a successful run would advance the "
+        "last-success pointer past the corrupt generation and nothing would report it again."
+    )
+
+
+def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
+    """Escalate a status payload's ``publication_integrity: "failed"`` to an error.
+
+    Reads the status payload that was just rendered rather than re-resolving
+    the pointer, so the exit status can never disagree with what the operator
+    was shown. A suite payload is checked one embedded study at a time: a
+    corrupt component publication is a corrupt suite result.
+
+    :param dict[str, Any] payload: ``config_status`` payload already rendered.
+    :raises PublicationIntegrityError: A reported publication no longer validates.
+    """
+    if payload.get("kind") == "suite":
+        studies = payload.get("studies")
+        for study in studies if isinstance(studies, list) else []:
+            if isinstance(study, dict) and isinstance(study.get("status"), dict):
+                _raise_on_failed_publication(study["status"])
+        return
+    if payload.get("publication_integrity") != "failed":
+        return
+    raise _publication_integrity_error(
+        f"Experiment {str(payload.get('experiment'))!r}",
+        str(payload.get("publication_error")),
+        Path(str(payload.get("workdir"))),
+    )
+
+
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
@@ -402,11 +469,22 @@ def _show_suite_winners(suite: Suite) -> None:
     """Print the authoritative exposed winners from the last successful suite run.
 
     :param Suite suite: Compiled suite whose published summary is rendered.
+    :raises PublicationIntegrityError: The suite last-success pointer names a
+        suite generation that no longer validates. Reported as corruption
+        rather than as "no successful suite result yet", which is what a suite
+        that has genuinely never published reports (review v0.5.18 / finding F4).
     :raises click.ClickException: If the published summary cannot be read, or its
         study, phase, or annotation records are malformed; raw component-experiment
         winners are never substituted for it.
     """
-    summary_path = _published_suite_summary_path(suite)
+    publication = _resolve_suite_publication_pointer(suite)
+    if publication.state == "failed":
+        raise _publication_integrity_error(
+            f"Suite {suite.suite!r}",
+            str(publication.error),
+            _suite_dir(suite),
+        )
+    summary_path = _published_suite_summary_path_for(suite, publication.generation_id)
     if summary_path is None or not summary_path.is_file():
         click.echo("(no successful suite result yet)")
         return
@@ -476,8 +554,21 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     v0.5.16 / blocker 4): old evidence must never be decorated with the
     current config's annotations, and a config that has drifted since
     publication is labeled historical instead of silently reinterpreted.
+
+    :param Experiment experiment: Experiment whose published winners are rendered.
+    :raises PublicationIntegrityError: The last-success pointer names a
+        generation that no longer validates. Nothing is rendered in that case:
+        printing "(no winner yet)" beside a corrupt publication reads as a
+        phase that simply has not run (review v0.5.18 / finding F4).
     """
-    generation_id = _last_successful_generation_id(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    if publication.state == "failed":
+        raise _publication_integrity_error(
+            f"Experiment {experiment.experiment!r}",
+            str(publication.error),
+            _experiment_dir(experiment),
+        )
+    generation_id = publication.generation_id
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if generation_id is not None:
         try:
@@ -528,10 +619,21 @@ def _show_experiment_winners(experiment: Experiment) -> None:
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def status(config_path: Path) -> None:
-    """Print read-only run status for ``config_path``."""
+    """Print read-only run status for ``config_path``.
+
+    The payload is printed first and in full even when it reports a corrupt
+    publication: the operator needs the trial counts and generation identity
+    to decide what to inspect, and the boundary's one-line diagnostic follows
+    on stderr (review v0.5.18 / finding F4).
+
+    :param Path config_path: Experiment or suite YAML file to inspect.
+    :raises PublicationIntegrityError: The reported publication - or, for a
+        suite, any component study's - no longer validates.
+    """
     config = load_config(config_path)
     payload = config_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+    _raise_on_failed_publication(payload)
 
 
 @cli.command(
