@@ -5,9 +5,10 @@ from __future__ import annotations
 import contextlib
 import csv
 import hashlib
+import json
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -15,10 +16,15 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import optuna
 import yaml
 
+from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
-from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+from phasesweep.runtime.files import (
+    atomic_text_writer,
+    fsync_directory,
+    private_atomic_write_text,
+)
 
 if TYPE_CHECKING:
     from phasesweep.engine.read import PhaseWinnerView
@@ -361,8 +367,46 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 2
 SUITE_SUMMARY_SCHEMA_VERSION = 3
+# Provenance files frozen into every generation namespace at claim time
+# (review v0.5.18 / finding F6). The summary used to keep only the config
+# *fingerprint*, so once the operator edited or lost the YAML the digest could
+# prove a mismatch but could not reconstruct the search spaces, fixed
+# overrides, contracts, env, or trial command behind a published winner.
+GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
+GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
+REPRODUCIBILITY_SCHEMA_VERSION = 1
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
+# Manifest kinds that name a file in the generation namespace root rather than
+# a phase. Their entries carry ``path`` instead of ``phase``; a generation
+# published before finding F6 lists neither kind and holds neither file, which
+# is exactly what keeps it valid under the same "listed if and only if
+# present" invariant.
+_GENERATION_FILE_FILENAMES = {
+    "config_snapshot": GENERATION_CONFIG_SNAPSHOT_FILENAME,
+    "reproducibility": GENERATION_REPRODUCIBILITY_FILENAME,
+}
+_MANIFEST_GENERATION_FILE_KINDS = frozenset(_GENERATION_FILE_FILENAMES)
+
+
+def _generation_config_snapshot_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's canonical config snapshot path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's owner-only ``config.snapshot.yaml``.
+    """
+    return _generation_dir(experiment, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
+
+
+def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's shareable reproducibility-record path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's ``reproducibility.json``.
+    """
+    return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
 
 
 def _file_sha256(path: Path) -> str:
@@ -373,6 +417,108 @@ def _file_sha256(path: Path) -> str:
     :raises OSError: The file cannot be read.
     """
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _phase_config_fingerprint(phase: Phase) -> str:
+    """Hash one phase's configured semantics, independent of any winner.
+
+    This is exactly the per-phase element
+    :func:`phasesweep.engine.guards._experiment_semantic_fingerprint` folds
+    into its own digest, hashed on its own so a reproducibility record can
+    localize *which* phase's configuration differs between two generations.
+    It is deliberately not ``winner.yaml``'s ``phase_fingerprint``, which
+    additionally binds each inherited winner's effective overrides and
+    therefore cannot exist before any phase has run.
+
+    :param Phase phase: Phase whose configured semantics are hashed.
+    :return str: SHA-256 hex digest (64 characters) of the canonicalised payload.
+    """
+    # Deferred: ``engine.guards`` imports this module, so a module-level import
+    # here would be circular (same pattern as :func:`_load_winner`).
+    from phasesweep.engine.guards import EXPERIMENT_FINGERPRINT_SCHEMA_VERSION, _semantic_phase_dump
+
+    payload = {
+        "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        "name": phase.name,
+        **_semantic_phase_dump(phase),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_generation_provenance(experiment: Experiment, generation_id: str) -> None:
+    """Freeze the configuration and provenance that produced one generation.
+
+    Written at claim time, immediately after the namespace is created and
+    before any lifecycle state exists, so a generation that later fails still
+    records what configuration ran (review v0.5.18 / finding F6). Two files
+    land side by side:
+
+    * ``config.snapshot.yaml`` -- the canonicalized full config, the
+      experiment's ``model_dump(mode="json")`` rendered as YAML. It is the
+      engine's canonical view, *not* a copy of the operator's file: key order
+      is normalized, defaults are materialized, and comments are not
+      preserved. Because ``env:`` may hold secrets it is written owner-only
+      (0600) through the private atomic writer, even though its directory is
+      deliberately operator-readable (see the trust-boundary note in
+      ``docs/runtime.md``).
+    * ``reproducibility.json`` -- an ordinary umask-governed artifact that is
+      safe to read and share: versions, the semantic fingerprints, the
+      operator-declared ``provenance`` mapping (public by design), and the
+      SHA-256 of the snapshot's bytes. Digests, never values: no env values,
+      no ambient values, and nothing from the snapshot's contents beyond its
+      digest.
+
+    Both files are picked up by :func:`_generation_artifact_manifest` and are
+    therefore hash-covered by the publication manifest.
+
+    :param Experiment experiment: Experiment whose configuration is frozen.
+    :param str generation_id: Freshly claimed generation namespace to write into.
+    :raises OSError: Either file could not be written; the claim must fail
+        rather than run a generation whose configuration is unrecorded.
+    :raises phasesweep.runtime.files.UnsafePrivatePathError: Something already
+        occupies the snapshot path and is not a private, unshared regular file.
+    :raises yaml.YAMLError: The canonicalized config could not be serialized.
+    """
+    # Deferred for the same reason as in :func:`_phase_config_fingerprint`.
+    from phasesweep.engine.guards import (
+        EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        FINGERPRINT_SCHEMA_VERSION,
+        _experiment_semantic_fingerprint,
+    )
+
+    snapshot_path = _generation_config_snapshot_path(experiment, generation_id)
+    private_atomic_write_text(
+        snapshot_path,
+        yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False),
+        require_private_dir=False,
+    )
+    _write_json_atomic(
+        _generation_reproducibility_path(experiment, generation_id),
+        {
+            "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
+            "experiment": experiment.experiment,
+            "generation_id": generation_id,
+            "phasesweep_version": __version__,
+            "schema_versions": {
+                "reproducibility": REPRODUCIBILITY_SCHEMA_VERSION,
+                "generation_summary": GENERATION_SUMMARY_SCHEMA_VERSION,
+                "study_storage": STUDY_SCHEMA_VERSION,
+                "experiment_fingerprint": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+                "phase_fingerprint": FINGERPRINT_SCHEMA_VERSION,
+            },
+            "config_fingerprint": _experiment_semantic_fingerprint(experiment),
+            "phase_config_fingerprints": [
+                {"name": phase.name, "sha256": _phase_config_fingerprint(phase)}
+                for phase in experiment.phases
+            ],
+            "provenance": dict(sorted(experiment.provenance.items())),
+            "config_snapshot": {
+                "path": GENERATION_CONFIG_SNAPSHOT_FILENAME,
+                "sha256": _file_sha256(snapshot_path),
+            },
+        },
+    )
 
 
 def _generation_artifact_manifest(
@@ -386,13 +532,25 @@ def _generation_artifact_manifest(
     phase). The namespace is exclusively claimed by this invocation, so
     everything present is this run's own output.
 
+    The namespace-root provenance files written at claim time
+    (:func:`_write_generation_provenance`) are listed first, under entries
+    that carry ``path`` instead of ``phase``. They are absent -- and so
+    unlisted -- in generations published before finding F6.
+
     :param Experiment experiment: Experiment whose generation is summarized.
     :param str generation_id: Immutable generation namespace to scan.
-    :return list[dict[str, str]]: One ``{"kind", "phase", "sha256"}`` entry
-        per winner/promotion artifact, ordered by phase then kind.
+    :return list[dict[str, str]]: One ``{"kind", "path", "sha256"}`` entry per
+        namespace-root provenance file, then one ``{"kind", "phase",
+        "sha256"}`` entry per winner/promotion artifact ordered by phase then
+        kind.
     """
-    phases_dir = _generation_dir(experiment, generation_id) / "phases"
+    generation_dir = _generation_dir(experiment, generation_id)
     items: list[dict[str, str]] = []
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        artifact = generation_dir / filename
+        if artifact.is_file():
+            items.append({"kind": kind, "path": filename, "sha256": _file_sha256(artifact)})
+    phases_dir = generation_dir / "phases"
     if not phases_dir.is_dir():
         return items
     for phase_dir in sorted(phases_dir.iterdir()):
@@ -420,6 +578,14 @@ def _validate_generation_manifest(
     summary's own winner facts — and the namespace holds nothing the
     manifest does not list. Runs both pre-commit (before the last-success
     pointer may advance) and on every read before a pointer target is trusted.
+
+    The manifest covers two kinds of artifact: phase-scoped winners and
+    promotion decisions (``kind`` + ``phase``), and the namespace-root
+    provenance files frozen at claim time (``kind`` + ``path``; see
+    :func:`_validate_generation_provenance_files`, review v0.5.18 / finding
+    F6). Both obey the same listed-if-and-only-if-present rule, which is what
+    keeps a generation published before either existed valid without a schema
+    bump.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
@@ -451,18 +617,30 @@ def _validate_generation_manifest(
     if not isinstance(raw_artifacts, list):
         raise _fail("summary has no artifact manifest")
     listed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    listed_files: dict[str, Mapping[str, Any]] = {}
     for entry in raw_artifacts:
-        if (
-            not isinstance(entry, Mapping)
-            or entry.get("kind") not in _MANIFEST_ARTIFACT_KINDS
-            or not isinstance(entry.get("phase"), str)
-            or not isinstance(entry.get("sha256"), str)
-        ):
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("sha256"), str):
             raise _fail("summary artifact entry is malformed")
-        key = (str(entry["kind"]), str(entry["phase"]))
+        kind = entry.get("kind")
+        if kind in _MANIFEST_GENERATION_FILE_KINDS:
+            if entry.get("path") != _GENERATION_FILE_FILENAMES[str(kind)]:
+                raise _fail(f"{kind} manifest entry names an unexpected path")
+            if str(kind) in listed_files:
+                raise _fail(f"duplicate artifact entry for {kind}")
+            listed_files[str(kind)] = entry
+            continue
+        if kind not in _MANIFEST_ARTIFACT_KINDS or not isinstance(entry.get("phase"), str):
+            raise _fail("summary artifact entry is malformed")
+        key = (str(kind), str(entry["phase"]))
         if key in listed:
             raise _fail(f"duplicate artifact entry for {key}")
         listed[key] = entry
+    _validate_generation_provenance_files(
+        generation_dir,
+        summary,
+        listed_files,
+        _fail,
+    )
 
     raw_phases = summary.get("phases")
     if not isinstance(raw_phases, list):
@@ -555,6 +733,85 @@ def _validate_generation_manifest(
                         f"namespace contains an unlisted {kind} artifact "
                         f"for phase {phase_dir.name!r}"
                     )
+
+
+def _validate_generation_provenance_files(
+    generation_dir: Path,
+    summary: Mapping[str, Any],
+    listed_files: Mapping[str, Mapping[str, Any]],
+    fail: Callable[[str], RuntimeError],
+) -> None:
+    """Validate a generation's claim-time provenance files against its manifest.
+
+    Extends the manifest invariant -- every listed artifact exists and hashes
+    to its recorded content, and the namespace holds nothing the manifest does
+    not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``
+    (review v0.5.18 / finding F6). The two are all-or-nothing: they are
+    written together at claim time, so a manifest that lists one without the
+    other has been edited. A generation published before those files existed
+    lists neither and holds neither, which passes every check here unchanged.
+
+    Note that the snapshot is owner-only, so a reader who cannot read it
+    cannot validate the publication at all -- the same fail-closed outcome as
+    any other unreadable manifest-listed artifact.
+
+    :param Path generation_dir: The generation's immutable namespace directory.
+    :param Mapping[str, Any] summary: Parsed generation summary payload, whose
+        identity the reproducibility record must agree with.
+    :param Mapping[str, Mapping[str, Any]] listed_files: Manifest entries for
+        the namespace-root provenance files, keyed by kind.
+    :param Callable[[str], RuntimeError] fail: Builder for the caller's
+        uniformly labeled manifest-validation error.
+    :raises RuntimeError: Whatever ``fail`` builds, when a provenance file is
+        listed without its partner, is absent, unreadable, altered,
+        unparsable, or disagrees with the summary's own identity.
+    """
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        if (generation_dir / filename).is_file() and kind not in listed_files:
+            raise fail(f"namespace contains an unlisted {kind} artifact")
+    if not listed_files:
+        return
+    if set(listed_files) != _MANIFEST_GENERATION_FILE_KINDS:
+        raise fail("summary lists only part of the generation provenance record")
+
+    digests: dict[str, str] = {}
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        try:
+            content = (generation_dir / filename).read_bytes()
+        except OSError as exc:
+            raise fail(f"{kind} artifact is missing or unreadable") from exc
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != listed_files[kind]["sha256"]:
+            raise fail(f"{kind} artifact does not match its recorded hash")
+        digests[kind] = digest
+
+    snapshot_path = generation_dir / GENERATION_CONFIG_SNAPSHOT_FILENAME
+    try:
+        snapshot = yaml.safe_load(snapshot_path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise fail("config_snapshot artifact is not parseable") from exc
+    if not isinstance(snapshot, Mapping):
+        raise fail("config_snapshot artifact is not a mapping")
+    if snapshot.get("experiment") != summary.get("experiment"):
+        raise fail("config_snapshot artifact names a different experiment")
+
+    record_path = generation_dir / GENERATION_REPRODUCIBILITY_FILENAME
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise fail("reproducibility artifact is not parseable") from exc
+    if not isinstance(record, Mapping):
+        raise fail("reproducibility artifact is not a mapping")
+    recorded_identity = (record.get("experiment"), record.get("generation_id"))
+    if recorded_identity != (summary.get("experiment"), summary.get("generation_id")):
+        raise fail("reproducibility artifact names a different generation")
+    recorded_snapshot = record.get("config_snapshot")
+    if (
+        not isinstance(recorded_snapshot, Mapping)
+        or recorded_snapshot.get("path") != GENERATION_CONFIG_SNAPSHOT_FILENAME
+        or recorded_snapshot.get("sha256") != digests["config_snapshot"]
+    ):
+        raise fail("reproducibility artifact does not anchor the config snapshot it published")
 
 
 def _generation_manifest_is_valid(
@@ -1186,6 +1443,18 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     """
     with atomic_text_writer(path) as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Atomically write a JSON document to ``path`` with the artifact-tree mode.
+
+    :param Path path: Destination JSON path to replace.
+    :param Any payload: JSON-serializable value to write.
+    :raises TypeError: ``payload`` is not JSON-serializable.
+    :raises OSError: The document could not be staged, written, or renamed.
+    """
+    with atomic_text_writer(path) as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _write_yaml_exclusive(path: Path, payload: Any) -> bool:

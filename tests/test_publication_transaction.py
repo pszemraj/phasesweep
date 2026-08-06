@@ -14,11 +14,14 @@ failures must never replace the primary exception.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import logging
 import os
 import signal
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -30,6 +33,7 @@ from phasesweep.config import IntParam, Phase, Sampler, Suite
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, read_status, read_winner
 from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
+    _generation_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
@@ -56,20 +60,50 @@ print(f"x={args.x}")
 """
 
 
-def _stored_experiment(tmp_path: Path, *, n_trials: int = 1):
+# Provenance files frozen into every generation namespace at claim time
+# (review v0.5.18 / finding F6). Referenced by literal name on purpose: these
+# names are the documented on-disk contract in docs/runtime.md, so renaming
+# them must fail here rather than silently move an operator's evidence.
+_CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
+_REPRODUCIBILITY_NAME = "reproducibility.json"
+_SENTINEL_SECRET = "s3cr3t-sentinel-must-not-be-published"
+
+
+def _stored_experiment(tmp_path: Path, *, n_trials: int = 1, env: dict[str, str] | None = None):
     trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
     return make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        env=env,
         phases=[
             Phase(
                 name="p",
                 n_trials=n_trials,
                 sampler=Sampler(type="random", seed=0),
                 search_space={"x": IntParam(type="int", low=0, high=10)},
+                fixed_overrides={"batch_size": 8},
             )
         ],
+    )
+
+
+@contextlib.contextmanager
+def _umask(mask: int) -> Iterator[None]:
+    """Pin the process umask for one test so mode assertions are deterministic."""
+    previous = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:  # noqa: ANN001
+    """Return one generation's ``(config.snapshot.yaml, reproducibility.json)`` paths."""
+    generation_dir = _generation_dir(experiment, generation_id)
+    return (
+        generation_dir / _CONFIG_SNAPSHOT_NAME,
+        generation_dir / _REPRODUCIBILITY_NAME,
     )
 
 
@@ -1112,6 +1146,283 @@ def test_suite_state_write_failure_preserves_cancellation(
     assert exc_info.value.signum == signal.SIGTERM
     assert exc_info.value.code == 128 + signal.SIGTERM
     assert any("failed to persist terminal failure state" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Generation provenance: the configuration and identity that produced a
+# published result are frozen into its namespace (review v0.5.18 / finding F6).
+# --------------------------------------------------------------------------
+
+
+def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path) -> None:
+    """A published generation keeps the canonical config that produced it, owner-only.
+
+    Before this, a generation kept only the config *fingerprint*: once the
+    operator edited or lost the YAML, the digest could prove a mismatch but
+    could not reconstruct the search spaces, fixed overrides, contracts, env,
+    or trial command behind a published winner.
+    """
+    experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
+    with _umask(0o022):
+        run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot_path, _ = _provenance_paths(experiment, generation_id)
+
+    # The snapshot may hold secrets (``env:``), so it is owner-only even though
+    # its directory is deliberately operator-readable.
+    assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o600
+
+    snapshot = yaml.safe_load(snapshot_path.read_text())
+    assert snapshot == experiment.model_dump(mode="json")
+
+    # Spot-check the values an operator actually needs to reproduce the run.
+    assert snapshot["trial_command"] == experiment.trial_command
+    assert snapshot["env"] == {"TRAINER_TOKEN": _SENTINEL_SECRET}
+    phase = snapshot["phases"][0]
+    assert phase["fixed_overrides"] == {"batch_size": 8}
+    assert phase["search_space"]["x"]["type"] == "int"
+    assert phase["search_space"]["x"]["low"] == 0
+    assert phase["search_space"]["x"]["high"] == 10
+
+
+def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: Path) -> None:
+    """The readable provenance record carries identity and digests, never config values."""
+    experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
+    with _umask(0o022):
+        run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
+
+    # Ordinary umask-governed artifact: safe to read and share, unlike the snapshot.
+    assert stat.S_IMODE(repro_path.stat().st_mode) == 0o644
+
+    raw = repro_path.read_text()
+    record = json.loads(raw)
+    summary = yaml.safe_load(_generation_summary_path(experiment, generation_id).read_text())
+
+    assert record["experiment"] == experiment.experiment
+    assert record["generation_id"] == generation_id
+    assert record["phasesweep_version"] == summary["phasesweep_version"]
+    assert record["config_fingerprint"] == summary["config_fingerprint"]
+    assert record["provenance"] == experiment.provenance
+    assert record["schema_versions"]["generation_summary"] == summary["schema_version"]
+    assert [item["name"] for item in record["phase_config_fingerprints"]] == [
+        phase.name for phase in experiment.phases
+    ]
+    assert all(len(item["sha256"]) == 64 for item in record["phase_config_fingerprints"]), record[
+        "phase_config_fingerprints"
+    ]
+    assert record["config_snapshot"] == {
+        "path": _CONFIG_SNAPSHOT_NAME,
+        "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+    }
+
+    # Digests, never values: nothing from the snapshot's contents leaks here,
+    # least of all a configured env secret.
+    assert _SENTINEL_SECRET not in raw
+    assert "TRAINER_TOKEN" not in raw
+    assert experiment.trial_command not in raw
+
+
+def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:
+    """Both provenance files are manifest-listed with their content hashes.
+
+    Without this the publication validator would reject every new generation:
+    the namespace may hold nothing the manifest does not list.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
+
+    summary = yaml.safe_load(_generation_summary_path(experiment, generation_id).read_text())
+    entries = {item["kind"]: item for item in summary["artifacts"] if "path" in item}
+    assert entries["config_snapshot"] == {
+        "kind": "config_snapshot",
+        "path": _CONFIG_SNAPSHOT_NAME,
+        "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+    }
+    assert entries["reproducibility"] == {
+        "kind": "reproducibility",
+        "path": _REPRODUCIBILITY_NAME,
+        "sha256": hashlib.sha256(repro_path.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
+def test_read_side_rejects_generation_with_tampered_provenance_file(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """Editing or deleting either provenance file invalidates the publication.
+
+    Same failure shape as tampering a winner: the manifest hash no longer
+    matches, so the pointer target is not trusted.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    target = _generation_dir(experiment, generation_id) / filename
+    original = target.read_bytes()
+
+    target.write_bytes(original + b"\n# tampered\n")
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
+
+    target.write_bytes(original)
+    assert _last_successful_generation_id(experiment) == generation_id
+    assert read_winner(experiment, "p") is not None
+
+    target.unlink()
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
+
+
+def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) -> None:
+    """A generation that fails mid-run still records what configuration ran.
+
+    The files are written at claim time precisely so a post-mortem of a failed
+    generation can name its search spaces and trial command.
+    """
+    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        max_consecutive_failures=1,
+    )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    failed_generation = yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+    snapshot_path, repro_path = _provenance_paths(experiment, failed_generation)
+    assert snapshot_path.is_file()
+    assert repro_path.is_file()
+    snapshot = yaml.safe_load(snapshot_path.read_text())
+    assert snapshot == experiment.model_dump(mode="json")
+    assert json.loads(repro_path.read_text())["generation_id"] == failed_generation
+
+
+def test_generation_published_before_provenance_files_existed_stays_valid(
+    tmp_path: Path,
+) -> None:
+    """A pre-F6 namespace -- no provenance files, no manifest entries -- still reads valid.
+
+    Replayed the way the other legacy-compat cases in this module are: publish
+    normally, then rewrite the namespace into the older shape. Dropping only
+    the manifest entries must fail (the namespace would hold unlisted
+    artifacts); dropping the files too is exactly the historical layout and
+    must publish-read cleanly.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    summary["artifacts"] = [
+        item for item in summary["artifacts"] if item["kind"] in ("winner", "promotion")
+    ]
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    # Files present but unlisted: the manifest no longer covers the namespace.
+    assert _last_successful_generation_id(experiment) is None
+
+    snapshot_path.unlink()
+    repro_path.unlink()
+
+    # Neither listed nor present -- the pre-F6 layout, still fully valid.
+    assert _last_successful_generation_id(experiment) == generation_id
+    assert read_winner(experiment, "p") is not None
+
+
+def test_partially_dropped_provenance_record_is_not_a_legacy_namespace(tmp_path: Path) -> None:
+    """Half a provenance record is an edit, not a historical layout.
+
+    The two files are written together at claim time, so a namespace that
+    keeps one and drops the other must fail rather than fall through the
+    pre-F6 compatibility path.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    _, repro_path = _provenance_paths(experiment, generation_id)
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    summary["artifacts"] = [
+        item for item in summary["artifacts"] if item.get("kind") != "reproducibility"
+    ]
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    repro_path.unlink()
+
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "mutate"),
+    [
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {**payload, "generation_id": "not-this-generation"},
+            id="reproducibility-names-another-generation",
+        ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {
+                **payload,
+                "config_snapshot": {**payload["config_snapshot"], "sha256": "0" * 64},
+            },
+            id="reproducibility-unanchors-the-snapshot",
+        ),
+        pytest.param(
+            _CONFIG_SNAPSHOT_NAME,
+            lambda payload: {**payload, "experiment": "some-other-experiment"},
+            id="snapshot-names-another-experiment",
+        ),
+    ],
+)
+def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
+    tmp_path: Path,
+    filename: str,
+    mutate,  # noqa: ANN001
+) -> None:
+    """Re-hashing an edited provenance file into the manifest does not launder it.
+
+    Same escalation the winner artifacts get: an operator who updates the
+    recorded hash after editing still trips the summary cross-checks, so the
+    published record cannot be made to describe a different config or
+    generation.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    target = _generation_dir(experiment, generation_id) / filename
+    if filename == _REPRODUCIBILITY_NAME:
+        target.write_text(json.dumps(mutate(json.loads(target.read_text()))))
+    else:
+        target.write_text(yaml.safe_dump(mutate(yaml.safe_load(target.read_text()))))
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    entry = next(item for item in summary["artifacts"] if item.get("path") == filename)
+    entry["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
 
 
 def test_experiment_state_write_failure_preserves_primary_error(

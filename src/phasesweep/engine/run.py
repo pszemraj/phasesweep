@@ -74,6 +74,7 @@ from phasesweep.engine.state import (
     _validate_generation_manifest,
     _validate_suite_summary_integrity,
     _winner_path,
+    _write_generation_provenance,
     _write_yaml_atomic,
     _write_yaml_exclusive,
 )
@@ -823,6 +824,15 @@ def _preflight_reached_fingerprint(
 def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
     """Create one exclusively owned generation namespace under the experiment lock.
 
+    The claim is only complete once the namespace records the configuration
+    that is about to run: :func:`phasesweep.engine.state._write_generation_provenance`
+    freezes ``config.snapshot.yaml`` and ``reproducibility.json`` before this
+    returns (review v0.5.18 / finding F6), so a generation that later fails
+    preflight, execution, or publication still says what search spaces, fixed
+    overrides, contracts, env, and trial command produced it. A failure
+    writing them fails the claim rather than starting a run whose
+    configuration would be unrecoverable.
+
     :param Experiment experiment: Experiment whose generations root is created if missing.
     :param str | None requested_id: Caller-supplied generation id to claim, or
         ``None`` to mint a fresh random id.
@@ -830,6 +840,8 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
         free, otherwise a freshly minted UUID4 hex string).
     :raises RuntimeError: ``requested_id`` already exists, or no unused random
         id could be minted after 10 attempts.
+    :raises OSError: The generation namespace or its provenance files could not
+        be created.
     """
     root = _generations_dir(experiment)
     root.mkdir(parents=True, exist_ok=True)
@@ -840,6 +852,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
             raise RuntimeError(
                 f"Generation id {requested_id!r} already exists; refusing to overwrite history."
             ) from exc
+        _write_generation_provenance(experiment, requested_id)
         return requested_id
 
     for _ in range(10):
@@ -848,6 +861,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
             _generation_dir(experiment, candidate).mkdir()
         except FileExistsError:
             continue
+        _write_generation_provenance(experiment, candidate)
         return candidate
     raise RuntimeError("Could not mint an unused generation id after 10 attempts.")
 

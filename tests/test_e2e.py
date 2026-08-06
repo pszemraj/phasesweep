@@ -10,12 +10,15 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
+import stat
 from pathlib import Path
 
 import yaml
 
 from phasesweep import load_experiment, run_experiment
+from phasesweep.engine.state import _generation_dir, _last_successful_generation_id
 from tests.conftest import copy_fake_train
 
 REPO = Path(__file__).resolve().parent.parent
@@ -66,6 +69,35 @@ def test_full_sweep_and_replay(tmp_path):
     exp_dir = runs_dir / exp.experiment
     summary = yaml.safe_load((exp_dir / "summary.yaml").read_text())
     assert {p["name"] for p in summary["phases"]} == {"depth", "lr", "regularization"}
+
+    # Frozen configuration and provenance (review v0.5.18 / finding F6): the
+    # published generation keeps the canonical config that produced it, plus a
+    # shareable digests-only record, both covered by the summary manifest.
+    generation_id = _last_successful_generation_id(exp)
+    assert generation_id is not None
+    generation_dir = _generation_dir(exp, generation_id)
+    snapshot_path = generation_dir / "config.snapshot.yaml"
+    repro_path = generation_dir / "reproducibility.json"
+    assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o600
+    assert yaml.safe_load(snapshot_path.read_text()) == exp.model_dump(mode="json")
+
+    record = json.loads(repro_path.read_text())
+    assert [item["name"] for item in record["phase_config_fingerprints"]] == [
+        phase.name for phase in exp.phases
+    ]
+    # Three differently configured phases must not share one digest.
+    assert len({item["sha256"] for item in record["phase_config_fingerprints"]}) == 3
+    assert (
+        record["config_snapshot"]["sha256"]
+        == hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    )
+
+    generation_summary = yaml.safe_load((generation_dir / "summary.yaml").read_text())
+    manifest = {item["kind"]: item for item in generation_summary["artifacts"] if "path" in item}
+    assert manifest["config_snapshot"]["sha256"] == record["config_snapshot"]["sha256"]
+    assert (
+        manifest["reproducibility"]["sha256"] == hashlib.sha256(repro_path.read_bytes()).hexdigest()
+    )
 
     # Frozen objective evidence provenance (review v0.5.17 / finding F): the
     # winner records the digest of the exact evidence file its scalar came from.
