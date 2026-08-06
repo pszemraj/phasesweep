@@ -506,7 +506,7 @@ def test_server_command_preserves_lexical_symlink_name(tmp_path, monkeypatch):
 
 def test_server_command_refuses_missing_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.sys, "executable", str(tmp_path / "env" / "bin" / "python"))
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("PATH", "")
 
     with pytest.raises(FileNotFoundError, match="cannot find an executable"):
         installer.resolve_server_command()
@@ -2100,3 +2100,64 @@ def test_install_help_is_operator_readable():
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
+
+
+# --- executable resolution never depends on the current working directory ---
+
+
+def test_server_command_ignores_relative_path_entries(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    # Empty interpreter directory so the sibling short-circuit cannot answer.
+    interpreter_bin = tmp_path / "interpreter" / "bin"
+    interpreter_bin.mkdir(parents=True)
+    monkeypatch.setattr(install_mod.sys, "executable", str(interpreter_bin / "python"))
+
+    workdir = tmp_path / "workdir"
+    decoy = _executable(workdir / "decoy")
+    real = _executable(tmp_path / "real")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(decoy.parent.relative_to(workdir))
+    monkeypatch.setenv("PATH", os.pathsep.join([relative_entry, str(real.parent)]))
+
+    # The decoy is reachable from this cwd, and comes first on PATH.
+    assert Path(relative_entry, decoy.name).is_file()
+    assert install_mod.resolve_server_command() == str(real)
+
+
+def test_server_command_refuses_relative_only_path(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    interpreter_bin = tmp_path / "interpreter" / "bin"
+    interpreter_bin.mkdir(parents=True)
+    monkeypatch.setattr(install_mod.sys, "executable", str(interpreter_bin / "python"))
+
+    workdir = tmp_path / "workdir"
+    decoy = _executable(workdir / "decoy")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(decoy.parent.relative_to(workdir))
+    # "" and "." are the POSIX spellings of "the current directory".
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", relative_entry]))
+
+    assert Path(relative_entry, decoy.name).is_file()
+    with pytest.raises(FileNotFoundError, match="cannot find an executable"):
+        install_mod.resolve_server_command()
+
+
+def test_probe_launcher_ignores_relative_path_entries(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    workdir = tmp_path / "workdir"
+    launcher = _executable(workdir / "legacy")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(launcher.parent.relative_to(workdir))
+
+    monkeypatch.setenv("PATH", relative_entry)
+    assert Path(relative_entry, launcher.name).is_file()
+    status, detail = install_mod._probe_launcher_executable(launcher.name)
+    assert status == "missing"
+    assert detail
+
+    # Same bare name, same executable: only the PATH entry's shape differs.
+    monkeypatch.setenv("PATH", str(launcher.parent))
+    assert install_mod._probe_launcher_executable(launcher.name) == ("ok", None)

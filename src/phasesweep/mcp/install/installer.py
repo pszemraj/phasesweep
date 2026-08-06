@@ -23,7 +23,7 @@ import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Literal, TypeAlias
 
 import click
@@ -90,21 +90,46 @@ class StepResult:
         return self.action is None or self.action in _OK_ACTIONS
 
 
+def _which_on_absolute_path(command: str) -> str | None:
+    """Look ``command`` up on the absolute ``PATH`` entries only.
+
+    ``PATH`` may carry relative entries -- ``.``, a bare ``bin``, or an empty
+    field, which POSIX reads as the current directory. Resolving through them
+    would make the answer an accident of the directory the caller happened to
+    run from, so they are dropped: a relative-only ``PATH`` resolves nothing
+    here rather than falling back to the unfiltered ``PATH``.
+
+    :param str command: Bare program name to look up.
+    :return str | None: Absolute path to the resolved executable, or ``None``
+        when no absolute ``PATH`` entry provides one.
+    """
+    entries = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and PurePath(entry).is_absolute()
+    ]
+    if not entries:
+        return None
+    return shutil.which(command, path=os.pathsep.join(entries))
+
+
 def resolve_server_command() -> str:
     """Resolve the ``phasesweep-mcp`` executable clients should launch.
 
     Prefer the script beside the running interpreter so ``conda run`` and
     explicit environment executables cannot be redirected by an unrelated
-    ``PATH`` entry.
+    ``PATH`` entry. The ``PATH`` fallback consults only absolute ``PATH``
+    entries (:func:`_which_on_absolute_path`), so the pinned command is never
+    an artifact of the working directory the install ran from.
 
     :return str: Absolute path to an executable ``phasesweep-mcp`` script.
-    :raises FileNotFoundError: If neither the active environment nor ``PATH``
-        contains a launchable script.
+    :raises FileNotFoundError: If neither the active environment nor the
+        absolute ``PATH`` entries contain a launchable script.
     """
     sibling = Path(sys.executable).parent / "phasesweep-mcp"
     if sibling.is_file() and os.access(sibling, os.X_OK):
         return str(sibling.absolute())
-    found = shutil.which("phasesweep-mcp")
+    found = _which_on_absolute_path("phasesweep-mcp")
     if found:
         return str(Path(found).absolute())
     raise FileNotFoundError(
@@ -1064,17 +1089,23 @@ class LauncherCheck:
 def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
     """Probe whether one configured launcher executable actually resolves.
 
+    A bare program name is resolved against the absolute ``PATH`` entries only,
+    so the same entry cannot check out from one working directory and fail from
+    another.
+
     :param str command: Configured launcher executable: an absolute path for
         entries this version writes, or a bare program name for the legacy
-        pinned-uvx entries earlier versions wrote.
+        pinned entries earlier versions wrote.
     :return tuple[CheckStatus, str | None]: ``("ok", None)``, or a status
         needing attention with actionable repair guidance.
     """
     path = Path(command)
     if not path.is_absolute():
-        # Only the legacy pinned-uvx entry shape reaches here; it names a program the
-        # client resolves from PATH, so resolve it the same way rather than against cwd.
-        resolved = shutil.which(command)
+        # Only the legacy pinned entry shape reaches here; it names a program the client
+        # resolves from PATH, so resolve it the same way rather than against cwd. Relative
+        # PATH entries are deliberately ignored, so the verdict never depends on where
+        # check-install was run from.
+        resolved = _which_on_absolute_path(command)
         if resolved is None:
             return "missing", (
                 f"{command} is not on PATH; rerun `phasesweep mcp install` to replace this "
