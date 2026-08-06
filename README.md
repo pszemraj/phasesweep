@@ -6,43 +6,99 @@ This is useful when a full joint sweep is too expensive or hard to interpret. Fo
 
 ![PhaseSweep phase DAG](docs/images/diagramA_dag.png)
 
+## How it works
+
+One YAML file defines an experiment: a trainer command, a metric to optimize, and an ordered list of phases. Each phase sweeps its own small search space, and a phase that `inherits` an earlier one receives that phase's winning parameters as fixed inputs. Abridged from the starter that `phasesweep init` generates (the full file also pins storage, the working directory, and the metric extractor):
+
+```yaml
+experiment: phasesweep_starter
+
+# The trainer is any command. This fake one ships inside the installed
+# package so the starter runs anywhere; replace it with your own later.
+trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
+override_format: argparse
+
+metric:
+  name: eval_loss
+  goal: minimize
+
+phases:
+  - name: depth
+    n_trials: 2
+    sampler: { type: grid }
+    search_space:
+      n_layers: { type: categorical, choices: [6, 8] }
+
+  - name: learning_rate
+    inherits: [depth] # the winning n_layers becomes a fixed input here
+    n_trials: 2
+    sampler: { type: grid }
+    search_space:
+      lr: { type: categorical, choices: [0.0001, 0.0003] }
+```
+
+For every trial, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the command, and reads the metric from the result file the trainer writes. That result file is the only obligation your trainer has; see the [trainer contract](docs/config.md#trainer-contract).
+
 ## Install and try it
 
-Requirements: Python 3.11+, a POSIX host for real runs, and a trainer that follows the [trainer contract](docs/config.md#trainer-contract). GPUs are optional.
+Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
 pip install git+https://github.com/pszemraj/phasesweep.git
+
+mkdir phasesweep-demo && cd phasesweep-demo
+phasesweep init                       # writes the starter experiment.yaml
+phasesweep validate experiment.yaml   # checks it without launching anything
+phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
 
-Create and inspect a runnable two-phase starter without cloning this repository:
+The run log shows the phase chaining directly (abridged):
+
+```text
+[depth/trial_0] python -m phasesweep.examples.fake_train ... --n_layers 8
+[depth/trial_1] python -m phasesweep.examples.fake_train ... --n_layers 6
+phase=depth WINNER trial=0 metric=0.3 params={'n_layers': 8}
+[learning_rate/trial_0] python -m phasesweep.examples.fake_train ... --n_layers 8 --lr 0.0003
+[learning_rate/trial_1] python -m phasesweep.examples.fake_train ... --n_layers 8 --lr 0.0001
+phase=learning_rate WINNER trial=0 metric=0.3 params={'lr': 0.0003}
+```
+
+The `depth` winner's `--n_layers 8` is injected into every `learning_rate` trial as a fixed flag. Winners persist in the working directory, so you can inspect them any time (abridged):
 
 ```bash
-mkdir phasesweep-demo
-cd phasesweep-demo
-phasesweep init
-phasesweep validate experiment.yaml
-phasesweep run experiment.yaml --dry-run
+phasesweep show-winners experiment.yaml
 ```
 
-`phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination. Its fake trainer ships inside the installed package, so validation and the dry run work from any directory. When you are ready, replace the trainer command and search spaces in `experiment.yaml`; run it only after reviewing the rendered commands.
+```yaml
+phase: learning_rate
+metric:
+  eval_loss: 0.3
+  goal: minimize
+trial_number: 0
+params:
+  lr: 0.0003
+effective_overrides:
+  n_layers: 8
+  lr: 0.0003
+# … completion state, fingerprints, and objective provenance follow
+```
+
+## Use your own trainer
+
+Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory, and `{overrides}` carries the parameters in your chosen `override_format`. Have the trainer write the result file your metric extractor reads, per the [trainer contract](docs/config.md#trainer-contract).
+
+Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints every rendered command without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
+
+```bash
+phasesweep status experiment.yaml                           # durable progress, nothing launched
+phasesweep run experiment.yaml --from-phase learning_rate   # resume after prerequisites have valid winners
+```
+
+See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout. The [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer integration.
 
 ## Connect an agent
 
 The optional MCP server connects an AI agent to experiments you have approved without exposing trainer commands, paths, storage, environment, or raw logs. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result. See the [MCP operator reference](docs/mcp.md) for the tool surface and security model.
-
-## CLI examples
-
-```bash
-# Run and inspect durable results
-phasesweep run experiment.yaml
-phasesweep status experiment.yaml
-phasesweep show-winners experiment.yaml
-
-# Resume at a later phase after its prerequisites have valid winners
-phasesweep run experiment.yaml --from-phase learning_rate
-```
-
-`validate`, `run --dry-run`, `status`, and `show-winners` do not launch training trials. See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout.
 
 ## Reference
 
