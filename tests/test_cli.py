@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import textwrap
 from pathlib import Path
 
@@ -11,7 +12,21 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
+from phasesweep.cli import main as cli_boundary
+from phasesweep.engine import (
+    ExperimentLockBusyError,
+    NoFeasibleTrialError,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    SamplerContinuationUnsupportedError,
+    StudyContextConflictError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrialTargetRegressionError,
+    UnsafeProcessCleanupError,
+)
 from phasesweep.engine.state import (
     _generation_path,
     _generation_summary_path,
@@ -453,3 +468,163 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "Historical experiment result" in result.output
     assert "# original hypothesis" in result.output
     assert "new hypothesis" not in result.output
+
+
+def _invoke_cli_boundary(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    debug: bool = False,
+) -> int:
+    """Run the console-script entry point exactly as the installed command does.
+
+    ``CliRunner`` invokes the Click group directly and therefore bypasses the
+    process-level error boundary; these tests must exercise the boundary, so
+    they call it with a patched ``sys.argv`` instead.
+
+    :param list[str] argv: Arguments following the program name.
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to set ``sys.argv`` and
+        the root log level.
+    :param bool debug: Root log level the boundary observes. ``True`` mirrors
+        what ``-v`` produces in a real process; ``_configure_logging`` cannot be
+        used here because ``logging.basicConfig`` is a no-op once pytest's own
+        root handler is installed.
+    :return int: Status the boundary passed to ``sys.exit``.
+    """
+    monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
+    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
+    with pytest.raises(SystemExit) as excinfo:
+        cli_boundary()
+    code = excinfo.value.code
+    return 0 if code is None else int(code)
+
+
+def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Make ``phasesweep run`` reach the engine and fail with ``error``.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
+    :param Exception error: Exception ``run_config`` raises once the CLI calls it.
+    """
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
+    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr("phasesweep.cli.run_config", fail)
+
+
+def test_cli_boundary_reports_config_syntax_error_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A YAML syntax error is bad input: exit 2, the file named, no traceback.
+
+    Bad indentation is one of the two most common YAML mistakes, and PyYAML
+    labels it ``in "<unicode string>"``; without the config loader's own source
+    label the operator cannot tell which file failed.
+    """
+    config_path = tmp_path / "broken.yaml"
+    config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
+
+    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert str(config_path) in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+def test_cli_boundary_reports_expected_run_failure_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An expected operational failure exits 1 with its message and no traceback."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "no feasible trial in phase 'depth'" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+def test_cli_boundary_adds_traceback_for_expected_failure_when_verbose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-v`` keeps the one-line diagnostic and adds the traceback behind it."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path), "-v"], monkeypatch, debug=True)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "no feasible trial in phase 'depth'" in captured.err
+    assert "Traceback" in captured.err
+
+
+def test_cli_boundary_reports_unexpected_failure_as_internal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An exception that is not an expected outcome is a bug: exit 70 with a traceback."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    _stub_run_command(monkeypatch, RuntimeError("injected-internal"))
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 70
+    assert "internal error" in captured.err
+    assert "Traceback" in captured.err
+    assert "injected-internal" in captured.err
+
+
+def test_cli_boundary_leaves_help_exit_status_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--help`` still succeeds through the boundary rather than being trapped."""
+    exit_code = _invoke_cli_boundary(["--help"], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # The program name is whatever Click detects for the running process, so
+    # pin the usage line and body rather than the console-script name.
+    assert "[OPTIONS] COMMAND [ARGS]..." in captured.out
+    assert "Phase-chained hyperparameter sweeps" in captured.out
+
+
+def test_expected_operational_failures_share_one_base() -> None:
+    """Every operator-facing failure the boundary reports without a traceback.
+
+    ``PhaseSweepError`` must stay a ``RuntimeError`` so existing
+    ``except RuntimeError`` handlers keep catching these.
+    """
+    assert issubclass(PhaseSweepError, RuntimeError)
+    for error_type in (
+        NoFeasibleTrialError,
+        ProcessCleanupUncertainError,
+        UnsafeProcessCleanupError,
+        ExperimentLockBusyError,
+        SamplerContinuationUnsupportedError,
+        StudyContextConflictError,
+        StudyFingerprintMismatchError,
+        StudySchemaMismatchError,
+        StudyStorageUnavailableError,
+        TrialTargetRegressionError,
+    ):
+        assert issubclass(error_type, PhaseSweepError), error_type.__name__

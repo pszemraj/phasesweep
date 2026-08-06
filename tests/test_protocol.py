@@ -10,7 +10,7 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep import load_config, run_config
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     ArtifactSizeGate,
     Contract,

@@ -11,7 +11,7 @@ from optuna import create_study
 
 from phasesweep import load_experiment
 from phasesweep.cli import _starter_experiment_text
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.registry import Registry
 from phasesweep.runtime.files import sqlite_uri_filename_path
 

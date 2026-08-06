@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.install import edits as install_edits
 from phasesweep.mcp.install import installer
 from phasesweep.mcp.install.edits import removed_marked_text, updated_marked_text

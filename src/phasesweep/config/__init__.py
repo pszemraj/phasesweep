@@ -1,7 +1,7 @@
 """Config schema and YAML loading APIs."""
 
 from phasesweep.config.common import check_bounds
-from phasesweep.config.io import load_config, load_experiment
+from phasesweep.config.io import ConfigError, load_config, load_experiment
 from phasesweep.config.models import (
     Config,
     Constraint,
@@ -43,6 +43,7 @@ __all__ = [
     "ArtifactSizeGate",
     "CategoricalParam",
     "Config",
+    "ConfigError",
     "Constraint",
     "Contract",
     "ExecutionContext",

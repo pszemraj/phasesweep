@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import sys
+import traceback
 from collections.abc import Iterator
 from importlib import resources
 from pathlib import Path
@@ -18,9 +19,10 @@ from urllib.parse import quote
 
 import click
 import yaml
+from pydantic import ValidationError
 
-from phasesweep.config import Experiment, Suite, load_config
-from phasesweep.engine import config_status, run_config
+from phasesweep.config import ConfigError, Experiment, Suite, load_config
+from phasesweep.engine import PhaseSweepError, config_status, run_config
 from phasesweep.engine.guards import (
     _experiment_lock,
     _experiment_semantic_fingerprint,
@@ -63,6 +65,13 @@ from phasesweep.runtime.process import (
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
 
+# Exit taxonomy for the process-level boundary in main(). Commands that already
+# choose an exit status keep it; these are the codes the boundary itself uses.
+_USAGE_EXIT = 2  # bad input: config or arguments
+_FAILURE_EXIT = 1  # the run itself failed
+_INTERNAL_EXIT = 70  # sysexits EX_SOFTWARE: a phasesweep bug
+_ABORT_EXIT = 130  # 128 + SIGINT
+
 
 def _configure_logging(verbose: bool) -> None:
     """Initialize root logging and tune Optuna's verbosity.
@@ -92,8 +101,53 @@ def _configure_logging(verbose: bool) -> None:
     help="Phase-chained hyperparameter sweeps driven by a YAML file.",
 )
 @click.version_option(package_name="phasesweep")
-def main() -> None:
+def cli() -> None:
     """Run the phasesweep command line interface."""
+
+
+def main() -> None:
+    """Run the CLI behind a process-level error boundary.
+
+    The console entry point, so every failure reaches the operator as a
+    diagnostic rather than a traceback. Click runs in ``standalone_mode=False``
+    so its exceptions surface here instead of being converted inside Click;
+    it still returns the exit status for ``ctx.exit()`` paths, and commands
+    that call ``sys.exit`` themselves raise ``SystemExit``, which is a
+    ``BaseException`` and passes through untouched.
+
+    :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
+        ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
+        bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
+        Click chose.
+    """
+    try:
+        status = cli.main(standalone_mode=False)
+    except click.ClickException as exc:
+        # Includes UsageError, which already carries exit code 2.
+        exc.show()
+        sys.exit(exc.exit_code)
+    except (click.Abort, KeyboardInterrupt):
+        click.echo("Aborted.", err=True)
+        sys.exit(_ABORT_EXIT)
+    except ValidationError as exc:
+        # Pydantic renders every failing field with its location; a traceback
+        # through the model machinery adds nothing to that.
+        click.echo(f"phasesweep: invalid config\n{exc}", err=True)
+        sys.exit(_USAGE_EXIT)
+    except ConfigError as exc:
+        click.echo(f"phasesweep: {exc}", err=True)
+        sys.exit(_USAGE_EXIT)
+    except PhaseSweepError as exc:
+        click.echo(f"phasesweep: {exc}", err=True)
+        # -v (see _configure_logging) means the operator asked for internals.
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            traceback.print_exc()
+        sys.exit(_FAILURE_EXIT)
+    except Exception:  # noqa: BLE001 - the boundary's purpose is to report bugs
+        click.echo("phasesweep: internal error — please report this traceback.", err=True)
+        traceback.print_exc()
+        sys.exit(_INTERNAL_EXIT)
+    sys.exit(status if isinstance(status, int) else 0)
 
 
 def _starter_experiment_text(target: Path) -> str:
@@ -159,7 +213,7 @@ def _staged_text(destination: Path, text: str) -> Iterator[Path]:
                 staged.unlink()
 
 
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Write a runnable two-phase starter experiment without overwriting files.",
     short_help="Create a starter experiment.",
@@ -215,7 +269,7 @@ def init(output: Path) -> None:
     click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
 
 
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Run every phase in a phasesweep experiment config. Use --from-phase to skip earlier "
@@ -270,7 +324,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     run_config(config, from_phase=from_phase, dry_run=dry_run)
 
 
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Validate a phasesweep experiment or suite config without launching any trials.",
     short_help="Validate a config file.",
@@ -317,7 +371,7 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
             click.echo(f"{prefix}{line}")
 
 
-@main.command(
+@cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
     help=(
@@ -459,7 +513,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
             _render_phase_comment(comment, prefix="# ")
 
 
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Print read-only trial counts and phase state for a phasesweep experiment or suite.",
     short_help="Print read-only run status.",
@@ -472,7 +526,7 @@ def status(config_path: Path) -> None:
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
 
 
-@main.group(
+@cli.group(
     context_settings=CONTEXT_SETTINGS,
     help="Manage the optional MCP server and coding-agent integrations.",
     short_help="Manage the MCP server and agent integrations.",

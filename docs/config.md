@@ -170,7 +170,7 @@ Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare s
 
 ## Upgrading existing configs
 
-Config models are strict (`extra="forbid"`), so most config changes below fail at load instead of warning: `phasesweep validate <config>` reports them before any trial runs. Artifact-only changes are labeled separately. Fix config failures in the order listed; the objective-extractor change is the only one that also requires trainer code.
+Config models are strict (`extra="forbid"`), so most config changes below fail at load instead of warning: `phasesweep validate <config>` reports them before any trial runs and exits `2` with the failing file named and no traceback (see [exit taxonomy](runtime.md#validation-and-dry-run)). Artifact-only changes are labeled separately. Fix config failures in the order listed; the objective-extractor change is the only one that also requires trainer code.
 
 ### `metric.extractor` no longer accepts `type: json`
 

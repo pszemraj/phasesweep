@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
+from phasesweep.engine.errors import PhaseSweepError
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     ExtractorError,
@@ -180,7 +181,7 @@ class TrialExecutionError(RuntimeError):
     """
 
 
-class ProcessCleanupUncertainError(RuntimeError):
+class ProcessCleanupUncertainError(PhaseSweepError):
     """Base class for failures where a subprocess group may still be alive."""
 
 

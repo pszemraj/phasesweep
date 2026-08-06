@@ -10,6 +10,15 @@ import yaml
 from phasesweep.config.models import Config, Experiment, Suite
 
 
+class ConfigError(ValueError):
+    """Raised when a config file cannot be read or parsed into a mapping.
+
+    The message always names the source, so the CLI reports it as one line and
+    exits without a traceback. Subclassing ``ValueError`` keeps every existing
+    ``except ValueError`` caller behaving as before.
+    """
+
+
 class _StrictMappingLoader(yaml.SafeLoader):
     """``yaml.SafeLoader`` subclass that rejects duplicate mapping keys.
 
@@ -95,15 +104,20 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
 
     :param str text: YAML text to parse.
     :param str | Path source: Human-readable source label for errors.
-    :raises ValueError: If parsing fails or the top level is not a mapping.
+    :raises ConfigError: If parsing fails or the top level is not a mapping.
     :return dict[str, Any]: Parsed top-level YAML mapping.
     """
     try:
         data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
-    except yaml.constructor.ConstructorError as exc:
-        raise ValueError(f"{source}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        # Covers the strict loader's duplicate-key ConstructorError *and* the
+        # scanner/parser errors PyYAML raises for the two most common YAML
+        # mistakes (bad indentation, unclosed bracket). PyYAML labels those
+        # marks ``in "<unicode string>"``, so without this wrap the operator
+        # never learns which file failed.
+        raise ConfigError(f"{source}: {exc}") from exc
     if not isinstance(data, dict):
-        raise ValueError(f"{source}: top level must be a mapping.")
+        raise ConfigError(f"{source}: top level must be a mapping.")
     return data
 
 
@@ -118,7 +132,7 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
         :class:`Experiment` or :class:`Suite` parsed from exactly ``data``.
 
     Raises:
-        ValueError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
+        ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
             duplicate mapping keys rejected by the strict loader), or the top level
             is not a mapping.
         pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
@@ -128,7 +142,7 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError(f"{source}: config must be UTF-8 text: {exc}") from exc
+        raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
     if "suite" in parsed:
         return Suite.model_validate(parsed)
@@ -144,6 +158,13 @@ def load_config(path: str | Path) -> Config:
     Returns:
         :class:`Experiment` for legacy/current single-study configs, or
         :class:`Suite` for configs with a top-level ``suite`` key.
+
+    Raises:
+        OSError: ``path`` cannot be read.
+        ConfigError: The file is not UTF-8 text, the YAML cannot be parsed
+            (including duplicate mapping keys), or the top level is not a mapping.
+        pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
+            :class:`Experiment` model validation.
 
     """
     path_obj = Path(path)
@@ -166,11 +187,14 @@ def load_experiment(path: str | Path) -> Experiment:
         cross-phase consistency checks applied.
 
     Raises:
-        ValueError: YAML parse error, top-level is not a mapping, duplicate
-            mapping keys, or any Pydantic / cross-phase validation failure.
+        OSError: ``path`` cannot be read.
+        ConfigError: YAML parse error, top-level is not a mapping, duplicate
+            mapping keys, or the file is a suite config rather than a single
+            experiment.
+        pydantic.ValidationError: Any Pydantic / cross-phase validation failure.
 
     """
     config = load_config(path)
     if isinstance(config, Suite):
-        raise ValueError(f"{path}: expected a single experiment config, got a suite config.")
+        raise ConfigError(f"{path}: expected a single experiment config, got a suite config.")
     return config

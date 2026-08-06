@@ -2,6 +2,7 @@
 
 from phasesweep.engine.errors import (
     ExperimentLockBusyError,
+    PhaseSweepError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -29,6 +30,7 @@ from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessC
 __all__ = [
     "ExperimentLockBusyError",
     "NoFeasibleTrialError",
+    "PhaseSweepError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
     "SamplerContinuationUnsupportedError",

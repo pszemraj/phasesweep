@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.scaffold import derive_experiment_id, scaffold_catalog_text

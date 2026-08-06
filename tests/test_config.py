@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment
 from phasesweep.config import (
+    ConfigError,
     ExecutionContext,
     Experiment,
     JsonExtractor,
@@ -408,3 +409,24 @@ def test_suite_and_study_names_reject_double_underscore() -> None:
 
     with pytest.raises(ValidationError, match="must not contain '__'"):
         Suite(suite="sweep__bert", studies=[StudySpec(name="lr", phases=[phase])])
+
+
+def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
+    """A parser/scanner error must carry the file path, not PyYAML's stream label.
+
+    Bad indentation is one of the two most common YAML mistakes. PyYAML marks it
+    ``in "<unicode string>"``, so an unwrapped error leaves an operator with a
+    line number and no file - useless for a suite that loads several configs.
+    """
+    config_path = tmp_path / "broken.yaml"
+    config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path)
+
+    assert str(config_path) in str(excinfo.value)
+
+
+def test_config_error_stays_a_value_error() -> None:
+    """Existing ``except ValueError`` callers must keep catching config failures."""
+    assert issubclass(ConfigError, ValueError)

@@ -11,6 +11,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
+from phasesweep.engine.errors import PhaseSweepError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -46,7 +47,7 @@ class SelectedTrial:
     objective_provenance: dict[str, Any] | None = None
 
 
-class NoFeasibleTrialError(RuntimeError):
+class NoFeasibleTrialError(PhaseSweepError):
     """Raised when no trial in a completed phase satisfies all constraints."""
 
 

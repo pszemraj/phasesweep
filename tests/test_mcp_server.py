@@ -23,7 +23,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.config import Experiment, Phase, load_config
 from phasesweep.engine import (
     NoFeasibleTrialError,
