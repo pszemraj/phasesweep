@@ -374,6 +374,7 @@ def extract_trial_result(
     gates: list[Gate] | None = None,
     enforce_gates: bool = True,
     deadline: float | None = None,
+    trainer_timeout_is_deadline: bool = False,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -407,6 +408,10 @@ def extract_trial_result(
             a single blocking local stage can overrun by at most its own
             duration; W&B polling additionally caps its request budget to the
             remainder.
+        trainer_timeout_is_deadline: ``True`` when the caller capped the
+            trainer's wallclock budget to the remaining phase/run deadline, so
+            a trainer timeout is recorded as ``deadline_exhausted`` instead of
+            an ordinary per-trial limit.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -447,7 +452,12 @@ def extract_trial_result(
         failure_reason = f"non-zero exit code {rc}"
 
     if failure_reason is not None:
-        return _failed_trial(rc=rc, duration=duration, failure_reason=failure_reason)
+        return _failed_trial(
+            rc=rc,
+            duration=duration,
+            failure_reason=failure_reason,
+            deadline_exhausted=trainer_timeout_is_deadline and executed.process.timed_out,
+        )
 
     expired = _deadline_failure("metric extraction")
     if expired is not None:

@@ -671,8 +671,6 @@ def _run_phase(
                     timeout_seconds=timeout_seconds,
                     gpu_id=gpu_id,
                 )
-                if timeout_capped_by_wallclock and executed.process.timed_out:
-                    deadline_exhausted["flag"] = True
 
                 # CRITICAL: this check must happen INSIDE the GPU lease (review
                 # v0.5.11 / blocker 3). Releasing the lease before observing
@@ -718,11 +716,13 @@ def _run_phase(
             gates=_phase_gates(experiment, phase),
             enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
             deadline=optimize_deadline,
+            trainer_timeout_is_deadline=timeout_capped_by_wallclock,
         )
         if result.deadline_exhausted:
-            # Preserve causal attribution from extraction/gate enforcement.
-            # Merely observing another failure after the clock elapsed must
-            # not relabel it as a timeout.
+            # Preserve causal attribution carried by the result: a trainer
+            # killed by the wallclock-capped budget, extraction, or gate
+            # enforcement. Merely observing another failure after the clock
+            # elapsed must not relabel it as a timeout.
             deadline_exhausted["flag"] = True
 
         trial.set_user_attr(FEASIBLE_ATTR, result.feasible)

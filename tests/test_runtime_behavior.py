@@ -2154,6 +2154,48 @@ def test_process_failure_after_deadline_is_not_relabelled(tmp_path: Path) -> Non
     assert result.deadline_exhausted is False
 
 
+@pytest.mark.parametrize(
+    ("capped_by_deadline", "timed_out", "expected"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_trainer_timeout_attribution_follows_wallclock_cap(
+    tmp_path: Path, capped_by_deadline: bool, timed_out: bool, expected: bool
+) -> None:
+    """A killed trainer is deadline-attributed only when its cap was the deadline."""
+    experiment = make_experiment(workdir=tmp_path)
+    failure = "timed out after 1.0s" if timed_out else "trainer failed"
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=1,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(
+            return_code=1,
+            timed_out=timed_out,
+            pid=123,
+            duration_seconds=0.1,
+            failure_reason=failure,
+        ),
+    )
+
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=executed,
+        trainer_timeout_is_deadline=capped_by_deadline,
+    )
+
+    assert result.failure_reason == failure
+    assert result.deadline_exhausted is expected
+
+
 def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
