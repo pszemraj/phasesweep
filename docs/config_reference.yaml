@@ -21,7 +21,7 @@
 
 # workdir: str = "./runs"
 # Output root for trial artifacts, winners, and summaries. Relative paths resolve from the invocation cwd, not the config file.
-# With persistent storage, changing only workdir reuses existing Optuna history while moving newly written artifacts; keep it stable across resumptions.
+# With persistent storage each phase study is bound to the one resolved <workdir>/<experiment> root it publishes into, so re-running the same config against a second workdir is refused instead of producing a divergent second result tree. Keep it stable across resumptions; if you genuinely relocate the artifact tree, move it first and then run `phasesweep rebind-workdir CONFIG`.
 
 # trial_command: str (required)
 # Shell command for one trial. Supported format fields are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`; path-like substitutions and rendered override tokens are shell-quoted.

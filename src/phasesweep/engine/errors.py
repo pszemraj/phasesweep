@@ -25,6 +25,28 @@ class StudyContextConflictError(PhaseSweepError):
     """Raised when an upstream top-up would invalidate a bound descendant study."""
 
 
+class ArtifactRootConflictError(PhaseSweepError):
+    """Raised when a persistent study is bound to a different artifact root.
+
+    Deliberately a sibling of :class:`StudyContextConflictError` rather than a
+    reuse of it: that error means one specific thing (an upstream top-up would
+    invalidate a bound descendant study) and its remedy is a new experiment
+    name, while this one means the offered ``workdir`` is not the publication
+    root this study already claimed and its remedy is either the original
+    ``workdir`` or an explicit ``phasesweep rebind-workdir``.
+    """
+
+
+class ArtifactRootRebindError(PhaseSweepError):
+    """Raised when ``phasesweep rebind-workdir`` refuses to move a binding.
+
+    Covers every refusal of that command: nothing is bound to move, storage is
+    in-memory so no binding exists, or the destination cannot be validated as
+    the experiment's relocated artifact tree. Nothing has been written when
+    this is raised.
+    """
+
+
 class StudyStorageUnavailableError(PhaseSweepError):
     """Raised when persistent study storage cannot be inspected during preflight."""
 

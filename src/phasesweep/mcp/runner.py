@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict
 from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
 from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
     ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
@@ -54,6 +55,7 @@ from phasesweep.runtime.process import (
 
 FailureCode: TypeAlias = Literal[
     "fingerprint_mismatch",
+    "artifact_root_conflict",
     "study_schema_mismatch",
     "storage_unavailable",
     "sampler_continuation_unsupported",
@@ -116,6 +118,21 @@ def _base_failure_payload(
             "remediation": (
                 "Wait briefly, then start a new run; another orchestrator currently owns "
                 "this experiment's consistency lock."
+            ),
+        }
+    if isinstance(error, ArtifactRootConflictError):
+        # Not a fingerprint problem: the study is healthy but bound to another
+        # publication root, and the fingerprint remediation (new experiment
+        # name / archive the study) would destroy that binding's value.
+        return {
+            "code": "artifact_root_conflict",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to run this experiment from the workdir its studies are "
+                "bound to, or to move the artifact tree and run `phasesweep rebind-workdir` "
+                "before retrying."
             ),
         }
     if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):

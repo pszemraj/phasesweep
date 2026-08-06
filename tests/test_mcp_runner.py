@@ -1147,3 +1147,22 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
     assert status["returncode"] == 143
     assert status["error_class"] == "cancelled"
     assert status["cleanup_confirmed"] is True
+
+
+def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> None:
+    """A workdir conflict must carry its own code with the rebind remediation.
+
+    Mapping it to ``fingerprint_mismatch`` would steer the operator toward a
+    new experiment name or archiving a healthy study; falling through to
+    ``internal_error`` would report a plain misconfiguration as a bug.
+    """
+    from phasesweep.engine.errors import ArtifactRootConflictError
+
+    payload = mcp_runner._base_failure_payload(
+        ArtifactRootConflictError("bound to /a, offered /b"), stage="preflight"
+    )
+
+    assert payload["code"] == "artifact_root_conflict"
+    assert payload["retryable"] is False
+    assert payload["actor"] == "operator"
+    assert "rebind-workdir" in str(payload["remediation"])

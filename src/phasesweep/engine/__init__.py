@@ -1,6 +1,8 @@
 """Sweep execution engine API."""
 
 from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    ArtifactRootRebindError,
     ExperimentLockBusyError,
     PhaseSweepError,
     SamplerContinuationUnsupportedError,
@@ -28,6 +30,8 @@ from phasesweep.engine.state import Winner
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
+    "ArtifactRootConflictError",
+    "ArtifactRootRebindError",
     "ExperimentLockBusyError",
     "NoFeasibleTrialError",
     "PhaseSweepError",

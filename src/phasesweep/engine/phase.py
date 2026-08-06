@@ -19,6 +19,7 @@ from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.errors import StudySchemaMismatchError
 from phasesweep.engine.guards import (
     _accepted_trial_target,
+    _bind_study_artifact_root,
     _load_phase_policy_state,
     _reap_stale_trials,
     _record_trial_target,
@@ -295,6 +296,8 @@ def _run_phase(
             trial was infeasible.
         UnsafeProcessCleanupError: A trial's process group could not be
             confirmed dead; phase hard-aborted (review v0.5.11).
+        ArtifactRootConflictError: This phase's persistent study is bound to a
+            different artifact root than the config's workdir offers.
         RuntimeError: Storage / fingerprint / stale-reaper inconsistency.
 
     """
@@ -309,6 +312,10 @@ def _run_phase(
     environment_identity = _environment_identity(experiment)
 
     if not dry_run:
+        # A study this invocation just created was invisible to preflight, so
+        # it claims its publication root here — before any inspection, reaping,
+        # or trial work (review v0.5.19 / finding F5).
+        _bind_study_artifact_root(study, experiment)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
         policy_state = _load_phase_policy_state(study)

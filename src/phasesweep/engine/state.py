@@ -191,6 +191,14 @@ OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# Study-level binding from a persistent study to the one artifact root it
+# publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string
+# (review v0.5.19 / finding F5). ``workdir`` is deliberately outside every
+# semantic fingerprint so a tree stays movable, which without this binding let
+# one study back two divergent publication roots. Claimed on first contact and
+# moved only by ``phasesweep rebind-workdir``; the ``_v1`` suffix leaves room
+# for a future binding payload that is not a bare path string.
+ARTIFACT_ROOT_ATTR = "phasesweep_artifact_root_v1"
 CONSTRAINT_PREFIX = "constraint:"
 
 

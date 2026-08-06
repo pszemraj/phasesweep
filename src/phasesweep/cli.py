@@ -25,14 +25,17 @@ from phasesweep.config import ConfigError, Experiment, Suite, load_config
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import PhaseSweepError, config_status, run_config
 from phasesweep.engine.guards import (
+    _apply_artifact_root_rebind,
     _experiment_lock,
     _experiment_semantic_fingerprint,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
+    _plan_artifact_root_rebinds,
     _previously_recovered_uncertain_trial_count,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
     _suite_fingerprint,
+    _suite_lock,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
@@ -529,6 +532,57 @@ def status(config_path: Path) -> None:
     config = load_config(config_path)
     payload = config_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+
+
+@cli.command(
+    name="rebind-workdir",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Point this config's persistent phase studies at the workdir it now declares, after "
+        "you have already moved or copied the experiment's artifact tree there. Validates the "
+        "destination first and writes nothing if it does not hold the relocated tree."
+    ),
+    short_help="Rebind studies to a moved artifact tree.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+def rebind_workdir(config_path: Path) -> None:
+    """Move each phase study's artifact-root binding to the configured workdir.
+
+    Each persistent phase study is bound to the one artifact root it publishes
+    into, so an ordinary run against a different ``workdir`` is refused rather
+    than allowed to produce a second, divergent publication tree. This is the
+    operator's explicit statement that the tree itself has been relocated. It
+    is a rebind, never a move: PhaseSweep does not copy, delete, or verify the
+    original tree, only that the destination holds a valid relocated one.
+
+    :param Path config_path: Path to the experiment or suite YAML file whose
+        ``workdir`` already names the relocated artifact tree.
+    :raises ArtifactRootRebindError: Storage is in-memory, no phase study is
+        bound, a study cannot be read, or a destination artifact root is
+        missing or does not hold the recorded publication. Nothing is written.
+    :raises ExperimentLockBusyError: Another orchestrator owns one of the
+        experiment (or suite) consistency locks.
+    """
+    config = load_config(config_path)
+    experiments = (
+        [config.experiment_for_study(study) for study in config.studies]
+        if isinstance(config, Suite)
+        else [config]
+    )
+    with contextlib.ExitStack() as locks:
+        # Every lock is held across validation AND application so no other
+        # orchestrator can run, publish, or bind between the two halves. The
+        # locks are non-blocking, so contention reports busy rather than
+        # deadlocking on acquisition order.
+        if isinstance(config, Suite):
+            locks.enter_context(_suite_lock(config))
+        for experiment in experiments:
+            locks.enter_context(_experiment_lock(experiment))
+        plans = _plan_artifact_root_rebinds(experiments)
+        for plan in plans:
+            for study_name, previous, destination in _apply_artifact_root_rebind(plan):
+                origin = previous if previous is not None else "(unbound)"
+                click.echo(f"{study_name}: {origin} -> {destination}")
 
 
 @cli.group(

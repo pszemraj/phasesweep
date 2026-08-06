@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 import textwrap
 from pathlib import Path
 
+import optuna
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -14,6 +16,7 @@ from click.testing import CliRunner
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
+from phasesweep.config import Suite, load_config
 from phasesweep.engine import (
     ExperimentLockBusyError,
     NoFeasibleTrialError,
@@ -28,9 +31,12 @@ from phasesweep.engine import (
     UnsafeProcessCleanupError,
 )
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    _experiment_dir,
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_id,
     _last_successful_generation_path,
     _winner_path,
 )
@@ -46,10 +52,10 @@ def test_help_registers_commands_and_options() -> None:
     assert result.exit_code == 0
     assert "-h, --help" in result.output
     assert "recover-run" not in result.output
-    for command in ("init", "mcp", "run", "show-winners", "status", "validate"):
+    for command in ("init", "mcp", "rebind-workdir", "run", "show-winners", "status", "validate"):
         assert command in result.output
 
-    for command in ("run", "validate", "show-winners", "status"):
+    for command in ("rebind-workdir", "run", "validate", "show-winners", "status"):
         result = runner.invoke(cli_main, [command, "--help"], terminal_width=120)
         assert result.exit_code == 0
         assert "Usage:" in result.output
@@ -521,6 +527,245 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "Historical experiment result" in result.output
     assert "# original hypothesis" in result.output
     assert "new hypothesis" not in result.output
+
+
+def _movable_experiment_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Write two configs that differ only in ``workdir`` and share one SQLite storage.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return tuple[Path, Path, Path, Path]: ``(config_a, config_b, workdir_a, workdir_b)``.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"x": 0.5}))
+        print("x=0.5")
+        """,
+    )
+    workdir_a = tmp_path / "runs_a"
+    workdir_b = tmp_path / "runs_b"
+
+    def config_text(workdir: Path) -> str:
+        return textwrap.dedent(f"""
+            experiment: t
+            storage: sqlite:///{tmp_path}/studies.db
+            provenance: {{revision: test-fixture-v1}}
+            workdir: {workdir}
+            trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+            metric:
+              name: x
+              goal: minimize
+              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            phases:
+              - name: p
+                n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
+                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+            """).lstrip()
+
+    config_a = tmp_path / "exp_a.yaml"
+    config_a.write_text(config_text(workdir_a))
+    config_b = tmp_path / "exp_b.yaml"
+    config_b.write_text(config_text(workdir_b))
+    return config_a, config_b, workdir_a, workdir_b
+
+
+def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The explicit rebind is the only way one study changes publication roots."""
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    shutil.copytree(workdir_a, workdir_b)
+    experiment_b = load_experiment(config_b)
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
+
+    assert result.exit_code == 0, result.output
+    assert "t::p" in result.output
+    assert str(_experiment_dir(experiment_a)) in result.output
+    assert str(_experiment_dir(experiment_b)) in result.output
+    study = optuna.load_study(study_name="t::p", storage=experiment_b.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_b))
+
+    # The relocated root is now the only one this study will publish into.
+    run_experiment(load_experiment(config_b))
+    exit_code = _invoke_cli_boundary(["run", str(config_a)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "rebind-workdir" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        ("drop_pointer", "holds no valid published generation"),
+        ("tamper_winner", "does not match its recorded hash"),
+    ],
+)
+def test_rebind_workdir_refuses_a_destination_without_the_recorded_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+    expected: str,
+) -> None:
+    """An incomplete move must leave the original binding in place.
+
+    Both refusal paths matter: a destination with no last-success pointer at
+    all, and one whose pointer resolves to a generation manifest that no longer
+    validates.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    published = _last_successful_generation_id(experiment_a)
+    assert published is not None
+    shutil.copytree(workdir_a, workdir_b)
+    experiment_b = load_experiment(config_b)
+    if damage == "drop_pointer":
+        _last_successful_generation_path(experiment_b).unlink()
+    else:
+        winner = _generation_winner_path(experiment_b, published, "p")
+        winner.write_text(winner.read_text() + "\n# edited after publication\n")
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert str(_experiment_dir(experiment_b)) in captured.err
+    assert expected in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_refuses_when_no_study_is_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rebinding is never a backdoor for claiming a root a plain run would claim."""
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
+    experiment = load_experiment(config_a)
+    optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    _experiment_dir(experiment).mkdir(parents=True)
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_a)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+
+def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> None:
+    """A suite compiles to one experiment per study, each with its own artifact root."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        open(args.out, "w").write(json.dumps({"x": 1.0}))
+        print("x=1.0")
+        """,
+    )
+
+    def suite_text(workdir: Path) -> str:
+        return textwrap.dedent(f"""
+            suite: s
+            defaults:
+              workdir: {workdir}
+              storage: sqlite:///{tmp_path}/suite.db
+              provenance: {{revision: test-fixture-v1}}
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            studies:
+              - name: ran
+                phases:
+                  - name: p
+                    n_trials: 1
+                    sampler: {{ type: random, seed: 0 }}
+                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+              - name: untouched
+                phases:
+                  - name: p
+                    n_trials: 1
+                    sampler: {{ type: random, seed: 0 }}
+                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+            """).lstrip()
+
+    workdir_a = tmp_path / "runs_a"
+    workdir_b = tmp_path / "runs_b"
+    config_a = tmp_path / "suite_a.yaml"
+    config_a.write_text(suite_text(workdir_a))
+    config_b = tmp_path / "suite_b.yaml"
+    config_b.write_text(suite_text(workdir_b))
+    suite_a = load_config(config_a)
+    assert isinstance(suite_a, Suite)
+    # Only the first study has ever run, so the second contributes no study to
+    # rebind while the first still supplies the binding that authorizes it.
+    run_experiment(suite_a.experiment_for_study(suite_a.studies[0]))
+    shutil.copytree(workdir_a, workdir_b)
+    suite_b = load_config(config_b)
+    assert isinstance(suite_b, Suite)
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
+
+    assert result.exit_code == 0, result.output
+    assert "s__ran::p" in result.output
+    study = optuna.load_study(study_name="s__ran::p", storage=f"sqlite:///{tmp_path}/suite.db")
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
+        _experiment_dir(suite_b.experiment_for_study(suite_b.studies[0]))
+    )
+
+
+def test_rebind_workdir_reports_that_in_memory_storage_binds_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """In-memory studies never persist, so there is no binding to move."""
+    config_path = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        metric:
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: p
+            n_trials: 1
+            search_space: {{}}
+        """,
+    )
+    _experiment_dir(load_experiment(config_path)).mkdir(parents=True)
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "in-memory" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def _invoke_cli_boundary(

@@ -26,6 +26,7 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import (
+    ArtifactRootConflictError,
     NoFeasibleTrialError,
     SamplerContinuationUnsupportedError,
     TrialTargetRegressionError,
@@ -34,10 +35,12 @@ from phasesweep.engine import (
 from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
 from phasesweep.engine.run import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
+    _experiment_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
@@ -739,6 +742,105 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
             from_phase=None,
             existing_studies={"arch": parent_study, "final": grandchild_study},
         )
+
+
+def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
+    """Snapshot every file under an experiment namespace for byte-identity checks.
+
+    :param Path root: Experiment artifact namespace to snapshot.
+    :return dict[str, bytes]: Relative path to file content for every regular file.
+    """
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
+    """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
+    run_experiment(bound)
+    bound_root = _experiment_dir(bound)
+    before = _artifact_tree_bytes(bound_root)
+    assert before
+
+    for phase in bound.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+
+    moved = bound.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    with pytest.raises(ArtifactRootConflictError) as excinfo:
+        run_experiment(moved)
+
+    message = str(excinfo.value)
+    assert str(bound_root) in message
+    assert str(_experiment_dir(moved)) in message
+    assert "rebind-workdir" in message
+    assert _artifact_tree_bytes(bound_root) == before
+    for phase in bound.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+
+
+def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> None:
+    """An equal binding is a no-op: ordinary resume and top-up still work."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    topped_up = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    run_experiment(topped_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+    assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
+
+
+def test_preexisting_unbound_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
+    """A study created before the binding existed is claimed by the first run that sees it."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+    assert (
+        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
+    )
+
+    run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+
+
+def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
+    """Nothing persists to conflict, so an in-memory run stays workdir-mobile."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs_a",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    moved = experiment.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    run_experiment(moved)
+
+    assert _last_successful_generation_id(experiment) is not None
+    assert _last_successful_generation_id(moved) is not None
 
 
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:

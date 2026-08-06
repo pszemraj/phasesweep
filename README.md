@@ -92,7 +92,10 @@ Review before launching real workloads: `phasesweep run experiment.yaml --dry-ru
 ```bash
 phasesweep status experiment.yaml                           # durable progress, nothing launched
 phasesweep run experiment.yaml --from-phase learning_rate   # resume after prerequisites have valid winners
+phasesweep rebind-workdir experiment.yaml                   # after you moved the artifact tree yourself
 ```
+
+On persistent storage each phase study is bound to the one `workdir` it publishes into, so re-running the same config against a different `workdir` is refused rather than allowed to produce a second, divergent result tree. Move the tree first, then `rebind-workdir` points the studies at it.
 
 See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout. The [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer integration.
 
