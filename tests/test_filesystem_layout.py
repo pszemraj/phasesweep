@@ -1,7 +1,11 @@
-"""On-disk layout: <workdir>/<experiment>/<phase>/ namespacing, summary.yaml placement, experiment-name validation."""
+"""On-disk layout: <workdir>/<experiment>/<phase>/ namespacing, summary.yaml placement, experiment-name validation, and the permission modes of atomically written artifacts."""
 
 from __future__ import annotations
 
+import contextlib
+import os
+import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -19,7 +23,22 @@ from phasesweep.engine.state import (
     _phase_dir,
     _summary_path,
 )
+from phasesweep.runtime.files import (
+    atomic_text_writer,
+    atomic_write_text,
+    private_atomic_write_text,
+)
 from tests.conftest import make_experiment, write_constant_trainer
+
+
+@contextlib.contextmanager
+def _umask(mask: int) -> Iterator[None]:
+    """Set the process umask for the duration of a test and restore it after."""
+    previous = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> None:
@@ -109,6 +128,77 @@ def test_experiment_name_accepts_valid() -> None:
             )
         ],
     )
+
+
+@pytest.mark.parametrize(("mask", "expected_mode"), [(0o022, 0o644), (0o077, 0o600)])
+def test_atomic_write_text_applies_process_umask_to_new_artifacts(
+    tmp_path: Path, mask: int, expected_mode: int
+) -> None:
+    """Durable artifacts (``winner.yaml``, ``summary.yaml``, ``trials.csv``, ...)
+    must land with the ordinary umask-governed mode the ``workdir`` trust
+    boundary in ``docs/runtime.md`` promises, not the owner-only mode a
+    ``NamedTemporaryFile`` staging file would carry across ``os.replace``.
+    Parametrizing the umask proves the mode is masked by the kernel rather
+    than hardcoded.
+    """
+    path = tmp_path / "winner.yaml"
+
+    with _umask(mask):
+        atomic_write_text(path, "value: 1\n")
+
+    assert path.read_text(encoding="utf-8") == "value: 1\n"
+    assert stat.S_IMODE(path.stat().st_mode) == expected_mode
+
+
+def test_atomic_write_text_preserves_existing_artifact_mode(tmp_path: Path) -> None:
+    """Rewriting an existing artifact keeps whatever mode the operator left on
+    it, even under a umask that would have created it more restrictively.
+    """
+    path = tmp_path / "summary.yaml"
+    path.write_text("old\n", encoding="utf-8")
+    path.chmod(0o640)
+
+    with _umask(0o077):
+        atomic_write_text(path, "new\n")
+
+    assert path.read_text(encoding="utf-8") == "new\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("mask", [0o000, 0o022])
+def test_private_atomic_write_text_stays_owner_only_under_any_umask(
+    tmp_path: Path, mask: int
+) -> None:
+    """The private writer serves the lock namespace and MCP ``state_dir``, which
+    are deliberately hardened. It must stay ``0600`` regardless of umask — the
+    artifact-tree fix above must never be generalized onto it.
+    """
+    path = tmp_path / "state.json"
+
+    with _umask(mask):
+        private_atomic_write_text(path, "{}\n")
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_atomic_text_writer_leaves_no_temporary_files(tmp_path: Path) -> None:
+    """Staging files are cleaned up on both the commit path and the failure path."""
+    artifacts = tmp_path / "artifacts"
+    committed = artifacts / "trials.csv"
+    with atomic_text_writer(committed) as handle:
+        handle.write("a,b\n")
+    assert sorted(p.name for p in artifacts.iterdir()) == ["trials.csv"]
+
+    failed = artifacts / "aborted.csv"
+    with (
+        pytest.raises(RuntimeError, match="writer exploded"),
+        atomic_text_writer(failed) as handle,
+    ):
+        handle.write("partial")
+        raise RuntimeError("writer exploded")
+
+    assert not failed.exists()
+    assert sorted(p.name for p in artifacts.iterdir()) == ["trials.csv"]
 
 
 @pytest.mark.parametrize("generation_id", ["../escape", "/tmp/escape", ""])

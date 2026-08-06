@@ -8,7 +8,6 @@ import logging
 import os
 import secrets
 import stat
-import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -865,36 +864,87 @@ def private_atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
+def _new_shared_temp_fd(directory: Path, leaf: str) -> tuple[int, Path]:
+    """Create a uniquely-named, umask-governed temporary file next to a destination leaf.
+
+    Opens with ``O_CREAT | O_EXCL`` and a requested mode of ``0o666`` so the
+    kernel applies the process umask at creation time. That is the only
+    race-free way to honor the umask here: ``os.umask`` has no getter, so a
+    read-modify-restore around the create would be visible to every other
+    thread in the ``n_jobs > 1`` trial pool.
+
+    :param Path directory: Existing directory the temporary file is created in.
+    :param str leaf: Final path component of the eventual destination, used
+        only to build a recognizable temporary filename.
+    :return tuple[int, Path]: The open file descriptor (ownership transfers to
+        the caller, who must close it) and the temporary file's path.
+    :raises FileExistsError: If 10 consecutive random names all collide.
+    :raises OSError: If the temporary file cannot be created.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    for _ in range(10):
+        temporary = directory / f".{leaf}.{secrets.token_hex(8)}.tmp"
+        try:
+            return os.open(temporary, flags, 0o666), temporary
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
+
+
 @contextlib.contextmanager
 def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
     """Write text through a same-directory temp file and atomically replace ``path``.
 
+    File modes follow the ``workdir`` trust boundary documented in
+    ``docs/runtime.md``: the experiment artifact tree is deliberately *not*
+    owner-only, because operators and tooling need ordinary access to winners,
+    summaries, and evidence. A fresh destination is therefore created ``0o666``
+    masked by the process umask (``0o644`` under the usual ``0o022``), and a
+    rewrite keeps whatever mode the destination already carried.
+
+    ``tempfile.NamedTemporaryFile`` is deliberately not used for the staging
+    file: it hardcodes ``0o600`` as a security primitive, and ``os.replace``
+    would carry that mode onto every published artifact — leaving ``winner.yaml``
+    and ``process_identity.json`` unreadable to a second operator or to the
+    stale reaper running as another user, while sibling files written by plain
+    ``open`` stayed ``0o644``. The private, genuinely owner-only counterpart is
+    :func:`_private_atomic_writer`.
+
     :param Path path: Destination path that should be replaced atomically.
-    :param str | None newline: Newline handling passed to ``NamedTemporaryFile``.
+    :param str | None newline: Newline handling passed to the text-mode wrapper.
     :return Iterator[IO[str]]: Writable text handle yielded for the caller to populate.
+    :raises FileExistsError: If no unique temporary name can be created.
+    :raises OSError: If the temporary file cannot be created, written, or renamed.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target_mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        target_mode = None
+    fd = -1
     tmp_path: Path | None = None
     replaced = False
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline=newline,
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
+        fd, tmp_path = _new_shared_temp_fd(path.parent, path.name)
+        if target_mode is not None:
+            # Preserve the destination's mode before the rename; a chmod after
+            # os.replace would leave a window where the artifact is published
+            # with the wrong permissions.
+            os.fchmod(fd, target_mode)
+        # Keep the raw descriptor as the sole owner until the outer ``finally``
+        # so a shutdown between wrapping it and invalidating ``fd`` cannot leave
+        # both the stream and the cleanup path closing the same descriptor.
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline, closefd=False)
+        with stream as handle:
             yield handle
             handle.flush()
             os.fsync(handle.fileno())
-        assert tmp_path is not None
         os.replace(tmp_path, path)
         replaced = True
         fsync_directory(path.parent)
     finally:
+        if fd >= 0:
+            os.close(fd)
         if tmp_path is not None and not replaced:
             tmp_path.unlink(missing_ok=True)
 
