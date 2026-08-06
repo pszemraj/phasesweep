@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import signal
 import subprocess
@@ -16,6 +17,7 @@ import pytest
 import yaml
 
 from phasesweep.config import (
+    ExecutionContext,
     Experiment,
     IntParam,
     LogRegexExtractor,
@@ -1275,6 +1277,44 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     assert "p" in winners
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("execution", "persistent", "expected_warnings"),
+    [
+        pytest.param(None, True, 1, id="full-inheritance-persistent"),
+        pytest.param(
+            ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+            True,
+            0,
+            id="narrowed-contract-persistent",
+        ),
+        pytest.param(None, False, 0, id="full-inheritance-in-memory"),
+    ],
+)
+def test_preflight_warns_once_about_unbounded_env_on_persistent_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    execution: ExecutionContext | None,
+    persistent: bool,
+    expected_warnings: int,
+) -> None:
+    """Persisted trials plus ``inherit_env: all`` means ambient drift is unrecorded."""
+    monkeypatch.setattr("phasesweep.engine.guards._FULL_ENV_INHERITANCE_WARNED", set())
+    experiment = make_experiment(
+        experiment="envdrift",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}" if persistent else None,
+        execution=execution,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.guards"):
+        for _ in range(2):
+            _preflight_existing_studies(experiment)
+
+    warnings = [r for r in caplog.records if "inherit_env" in r.getMessage()]
+    assert len(warnings) == expected_warnings
 
 
 def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:

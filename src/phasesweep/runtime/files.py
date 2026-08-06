@@ -797,6 +797,7 @@ def _private_atomic_writer(
     path: Path,
     *,
     newline: str | None = None,
+    require_private_dir: bool = True,
 ) -> Iterator[IO[str]]:
     """Write to a private temporary file, then atomically replace a validated destination.
 
@@ -815,10 +816,18 @@ def _private_atomic_writer(
     :param Path path: Destination path to replace.
     :param str | None newline: Newline handling passed to the text-mode
         ``open`` call.
+    :param bool require_private_dir: Whether the destination directory must
+        itself be owner-only. ``True`` for the hardened namespaces (locks, MCP
+        ``state_dir``). ``False`` for an owner-only FILE inside an
+        operator-trusted directory — the experiment artifact tree, whose
+        directories are deliberately not owner-only (see the trust-boundary
+        note in ``docs/runtime.md``). The file is created ``0600`` and an
+        existing destination is still refused unless it is a private, unshared
+        regular file, either way.
     :return Iterator[IO[str]]: Writable text handle on the temporary file,
         open for the caller to populate before the atomic replace.
     """
-    parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
+    parent_fd = open_directory_fd(path.parent, create=True, private_final=require_private_dir)
     leaf = leaf_name(path)
     fd = -1
     temporary: str | None = None
@@ -854,13 +863,16 @@ def _private_atomic_writer(
         os.close(parent_fd)
 
 
-def private_atomic_write_text(path: Path, text: str) -> None:
+def private_atomic_write_text(path: Path, text: str, *, require_private_dir: bool = True) -> None:
     """Atomically replace a private UTF-8 text file.
 
     :param Path path: Destination path to replace.
     :param str text: Text to write.
+    :param bool require_private_dir: Whether the destination directory must be
+        owner-only too; pass ``False`` to write an owner-only file into an
+        operator-trusted directory such as a trial directory.
     """
-    with _private_atomic_writer(path) as handle:
+    with _private_atomic_writer(path, require_private_dir=require_private_dir) as handle:
         handle.write(text)
 
 

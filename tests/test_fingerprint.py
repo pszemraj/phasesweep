@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import json
+import logging
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,8 @@ from phasesweep.engine import (
 from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
 from phasesweep.engine.run import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
     _generation_path,
@@ -47,6 +51,7 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.engine.trial import _environment_identity
 from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
 
 
@@ -1020,6 +1025,106 @@ def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None
 
     with pytest.raises(RuntimeError, match="invalid or incomplete"):
         _load_winner(exp, exp.phases[0], {})
+
+
+def test_winner_and_trial_attrs_record_trainer_environment_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every trial records which environment produced it; the winner keeps the digest.
+
+    Names are diagnostic and persisted; values are secrets and never leave the
+    process (review v0.5.18 / finding F3).
+    """
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    trainer = write_constant_trainer(tmp_path)
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        env={"PHASESWEEP_TEST_SECRET": "config-secret"},
+        execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+        n_trials=1,
+    )
+
+    run_experiment(exp)
+
+    identity = _environment_identity(exp)
+    data = yaml.safe_load(_winner_path(exp, "p").read_text())
+    assert data["trainer_env_digest"] == identity.digest
+    assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
+
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    attrs = study.get_trials(deepcopy=False)[0].user_attrs
+    names = attrs[TRAINER_ENV_NAMES_ATTR]
+    assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
+    assert names == sorted(names) == list(identity.names)
+    assert {"PHASESWEEP_TEST_SECRET", "PHASESWEEP_TEST_TOKEN"} <= set(names)
+    serialized = json.dumps(attrs, default=str)
+    assert "config-secret" not in serialized
+    assert "ambient-secret" not in serialized
+
+
+def _environment_free_winner_payload(exp: Experiment) -> dict:
+    """Build a valid winner payload that predates environment identity fields."""
+    return {
+        "phase": "p",
+        "metric": {exp.metric.name: 0.5, "goal": exp.metric.goal},
+        "trial_number": 0,
+        "params": {"x": 1},
+        "effective_overrides": {"x": 1},
+        "constraints": {},
+        "gates": [],
+        "completion": {"incomplete": False},
+        "generation_id": "generation-test",
+        "attempt_id": "attempt-test",
+        "winner_source": {
+            "kind": "phase_trial",
+            "phase": "p",
+            "trial_number": 0,
+            "generation_id": "generation-test",
+            "attempt_id": "attempt-test",
+            "study": None,
+        },
+        "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
+    }
+
+
+def test_load_winner_accepts_records_without_environment_identity(tmp_path: Path) -> None:
+    """Pre-existing artifact trees stay loadable; the new fields default to None."""
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(_environment_free_winner_payload(exp), sort_keys=False))
+
+    winner = _load_winner(exp, exp.phases[0], {})
+
+    assert winner.trainer_env_digest is None
+    assert winner.trainer_inherit_env is None
+
+
+@pytest.mark.parametrize("diverged", [True, False])
+def test_load_winner_warns_once_on_inherited_environment_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    diverged: bool,
+) -> None:
+    """Inheriting a winner produced under a different environment is reported once."""
+    monkeypatch.setattr("phasesweep.engine.state._ENVIRONMENT_DRIFT_WARNED", set())
+    exp = make_experiment(workdir=tmp_path / "runs")
+    payload = _environment_free_winner_payload(exp)
+    payload["trainer_env_digest"] = "0" * 64 if diverged else _environment_identity(exp).digest
+    payload["trainer_inherit_env"] = "all"
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.state"):
+        for _ in range(2):
+            _load_winner(exp, exp.phases[0], {})
+
+    warnings = [r for r in caplog.records if "environment" in r.getMessage()]
+    assert len(warnings) == (1 if diverged else 0)
 
 
 def test_save_winner_replace_failure_preserves_existing_file(

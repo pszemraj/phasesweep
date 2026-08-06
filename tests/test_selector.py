@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import optuna
 import pytest
 
@@ -17,6 +19,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
     constraint_attr,
 )
 from tests.conftest import make_experiment
@@ -36,7 +39,7 @@ def _make_study():
     return optuna.create_study(direction="minimize", sampler=optuna.samplers.RandomSampler(seed=0))
 
 
-def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None):
+def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None, env_digest=None):
     distributions: dict = {}
     pvals: dict = {}
     for k, v in (params or {}).items():
@@ -47,6 +50,8 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
     }
+    if env_digest is not None:
+        user_attrs[TRAINER_ENV_DIGEST_ATTR] = env_digest
     for cn, cv in (constraint_vals or {}).items():
         user_attrs[constraint_attr(cn)] = cv
     trial = optuna.trial.create_trial(
@@ -165,6 +170,39 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
 
     assert w.trial_number == 1
     assert w.params == {"x": 1}
+
+
+def test_selection_warns_when_candidates_span_environments(caplog):
+    """A top-up run under a different environment mixes environments in one ranking."""
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
+    _add_trial(study, 0.5, params={"x": 1}, env_digest="b" * 64)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        winner = select_winner(study, exp, phase_name="p")
+
+    assert winner.trial_number == 1
+    warnings = [r for r in caplog.records if "environment" in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage().startswith("[p] ")
+    assert "2 distinct" in warnings[0].getMessage()
+
+
+def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
+    """One environment across the compared trials is the normal case; stay silent."""
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
+    _add_trial(study, 0.5, params={"x": 1}, env_digest="a" * 64)
+    # A trial recorded before the digest existed carries no digest and must not
+    # be counted as a second environment.
+    _add_trial(study, 0.9, params={"x": 2})
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        select_winner(study, exp, phase_name="p")
+
+    assert not [r for r in caplog.records if "environment" in r.getMessage()]
 
 
 def test_rejects_nan_constraint_values_defensively(tmp_path):

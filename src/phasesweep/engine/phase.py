@@ -44,6 +44,8 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
     RETURN_CODE_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -57,6 +59,8 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import (
     TrialExecutionError,
     UnsafeProcessCleanupError,
+    _environment_identity,
+    _inherit_env_contract,
     extract_trial_result,
     launch_trial,
 )
@@ -299,6 +303,10 @@ def _run_phase(
     phase_fingerprint: str
     policy_state = None
     recovery_abort: dict[str, Any] | None = None
+    # The trainer environment is a property of this process and its config, not
+    # of any one trial, so it is composed once per phase execution and stamped
+    # onto every trial (review v0.5.18 / finding F3).
+    environment_identity = _environment_identity(experiment)
 
     if not dry_run:
         _validate_study_schema(study)
@@ -632,6 +640,11 @@ def _run_phase(
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+        # Recorded at allocation so failed trials carry their environment too:
+        # a phase whose every trial died under a broken CUDA stack is only
+        # diagnosable if the failures name the environment they ran under.
+        trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment_identity.digest)
+        trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(environment_identity.names))
 
         # GPU lease covers only subprocess lifetime, not extraction (#2).
         try:
@@ -1033,7 +1046,7 @@ def _select_phase_winner(
     :raises NoFeasibleTrialError: Every terminal trial was infeasible.
     :return Winner: The selected winner with composed overrides and source identity.
     """
-    selected = select_winner(study, experiment)
+    selected = select_winner(study, experiment, phase_name=phase.name)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,
@@ -1054,6 +1067,12 @@ def _select_phase_winner(
             attempt_id=selected.attempt_id,
         ),
         objective_provenance=selected.objective_provenance,
+        # The digest comes from the winning TRIAL — a top-up can select a
+        # trial an earlier invocation ran under another environment — while
+        # the contract is config, identical for every trial in the study
+        # because it is fingerprinted.
+        trainer_env_digest=selected.trainer_env_digest,
+        trainer_inherit_env=_inherit_env_contract(experiment),
     )
 
 

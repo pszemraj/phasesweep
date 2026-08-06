@@ -18,6 +18,7 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -45,13 +46,21 @@ class SelectedTrial:
     # extracted (review v0.5.17 / finding F); None for trials persisted
     # before the record existed.
     objective_provenance: dict[str, Any] | None = None
+    # Digest of the trainer environment this trial ran under (review v0.5.18 /
+    # finding F3); None for trials persisted before the record existed.
+    trainer_env_digest: str | None = None
 
 
 class NoFeasibleTrialError(PhaseSweepError):
     """Raised when no trial in a completed phase satisfies all constraints."""
 
 
-def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
+def select_winner(
+    study: optuna.Study,
+    experiment: Experiment,
+    *,
+    phase_name: str | None = None,
+) -> SelectedTrial:
     """Pick the best feasible completed trial from a phase study.
 
     Rules:
@@ -68,11 +77,19 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
     number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
     way to know a config's meaningful resolution, so it does not guess one.
 
+    Comparability is checked but never enforced: if the compared trials span
+    more than one trainer-environment digest — a top-up ran under a different
+    environment — the ranking mixes environments, and that is reported once
+    per selection (review v0.5.18 / finding F3). It is not an error, because
+    the environment is deliberately outside the semantic fingerprint.
+
     Args:
         study: Optuna study for the phase whose winner we want.
         experiment: Parsed experiment config. Provides the optimization goal
             (minimize/maximize) and the constraint definitions used to filter
             trials.
+        phase_name: Phase label used in the environment-divergence warning;
+            defaults to the study name when the caller has no phase context.
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
@@ -126,6 +143,8 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             "Check stdout/stderr logs in the phase's trial_* directories."
         )
 
+    _warn_mixed_environments(survivors, phase_name=phase_name, study=study)
+
     best_value = (
         min(_trial_value(t) for t in survivors)
         if minimize
@@ -162,6 +181,8 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             if isinstance(parsed_provenance, dict):
                 provenance = parsed_provenance
 
+    env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
+
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
@@ -171,6 +192,42 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
         objective_provenance=provenance,
+        trainer_env_digest=env_digest if isinstance(env_digest, str) and env_digest else None,
+    )
+
+
+def _warn_mixed_environments(
+    survivors: list[optuna.trial.FrozenTrial],
+    *,
+    phase_name: str | None,
+    study: optuna.Study,
+) -> None:
+    """Warn once when the compared trials did not all run under one environment.
+
+    :param list[optuna.trial.FrozenTrial] survivors: Feasible completed trials
+        that form the comparison set for this selection.
+    :param str | None phase_name: Phase label supplied by the caller; the study
+        name is used when it is ``None``.
+    :param optuna.Study study: Study the survivors came from, read only for its
+        name and only when a divergence is being reported.
+    """
+    digests = {
+        digest
+        for trial in survivors
+        if isinstance(digest := trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str) and digest
+    }
+    if len(digests) < 2:
+        return
+    log.warning(
+        "[%s] comparing %d candidate trials that ran under %d distinct trainer "
+        "environments (digests %s). A top-up ran under a different environment, so this "
+        "ranking mixes environments; the environment is outside the study fingerprint by "
+        "design. Re-run the phase under one environment if the difference can move the "
+        "metric.",
+        phase_name or study.study_name,
+        len(survivors),
+        len(digests),
+        ", ".join(sorted(digest[:12] for digest in digests)),
     )
 
 
@@ -237,6 +294,14 @@ def _clone_winner_from_baseline(
             dict(baseline.objective_provenance)
             if baseline.objective_provenance is not None
             else None
+        ),
+        # The exposed result IS the baseline's trial, so it keeps the baseline's
+        # environment identity rather than the candidate phase's.
+        trainer_env_digest=baseline.trainer_env_digest,
+        trainer_inherit_env=(
+            list(baseline.trainer_inherit_env)
+            if isinstance(baseline.trainer_inherit_env, list)
+            else baseline.trainer_inherit_env
         ),
         source=WinnerSource(
             kind=source_kind,

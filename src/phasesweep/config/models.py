@@ -420,6 +420,19 @@ class ExecutionContext(_Frozen):
             "fingerprinted too."
         ),
     )
+    record_env: bool = Field(
+        default=False,
+        description=(
+            "Write the trainer environment into each trial directory as "
+            "`environment.json` (digest, inherit_env contract, and every "
+            "name-value pair). Off by default because those values are "
+            "secrets; the file is created owner-only (0600), unlike the rest "
+            "of the trial directory. Every trial always records the "
+            "environment's SHA-256 digest and its variable NAMES as study "
+            "attributes regardless of this flag, and neither the digest nor "
+            "the values join any semantic fingerprint."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:

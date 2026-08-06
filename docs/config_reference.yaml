@@ -166,11 +166,13 @@
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
 
 # execution: ExecutionContext = {}
-# Explicit trainer execution contract; it joins the semantic fingerprint, so changing either key invalidates resumable studies. ExecutionContext keys:
+# Explicit trainer execution contract; `cwd` and `inherit_env` join the semantic fingerprint, so changing either invalidates resumable studies (`record_env` does not - it changes only what is written). ExecutionContext keys:
 #   cwd: str | None = null
 #   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null leaves the trainer in the orchestrator's invocation directory. When set for an MCP catalog entry, the path must be absolute.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
 #   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds exactly those variables to that base set. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
+#   record_env: bool = false
+#   Write the composed trainer environment to `environment.json` in every trial directory (digest, inherit_env contract, and every name-value pair). Off by default because those values include secrets; the file is created owner-only (0600) inside the otherwise operator-readable trial directory. Independently of this flag, every trial records the environment's SHA-256 digest and its sorted variable NAMES as study attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.

@@ -8,6 +8,7 @@ Split into two phases:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -26,6 +27,7 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.runtime.commands import render_command
+from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import ProcessResult, run_supervised
 
 log = logging.getLogger("phasesweep.engine.trial")
@@ -102,6 +104,108 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     return env
+
+
+def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
+    """Return the ``inherit_env`` contract in its canonical persisted form.
+
+    A list contract is a *set* of names — order carries no meaning — so it is
+    sorted, matching how :func:`phasesweep.engine.guards._execution_identity`
+    canonicalises the same field for fingerprints.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :return str | list[str]: ``"all"``, ``"none"``, or the sorted name list.
+    """
+    contract = experiment.execution.inherit_env
+    return sorted(contract) if isinstance(contract, list) else contract
+
+
+@dataclass(frozen=True)
+class EnvironmentIdentity:
+    """Identity of the exact environment a trial subprocess receives.
+
+    ``values`` exists so one composition serves both the launch and the
+    opt-in ``environment.json`` record; it holds secrets (``HF_TOKEN``,
+    ``AWS_*``, ...) and must never be persisted or logged outside the
+    owner-only record ``execution.record_env`` enables.
+    """
+
+    digest: str
+    names: tuple[str, ...]
+    values: dict[str, str]
+
+
+def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
+    """Fingerprint the environment :func:`_trainer_environment` composes.
+
+    Two trials run under materially different environments (a rotated
+    ``HF_TOKEN``, a different ``PYTHONHASHSEED``, another CUDA stack) are
+    otherwise indistinguishable in the ledger, and a winner gives no clue
+    which environment produced it (review v0.5.18 / finding F3).
+
+    The digest is the SHA-256 of the compact JSON encoding of the
+    ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
+    delimiter join because ``experiment.env`` keys are arbitrary config
+    strings: encoding ``{"A": "B=1"}`` and ``{"A=B": "1"}`` as ``A=B=1``
+    would collide, while JSON string quoting keeps the encoding injective.
+    Sorting makes the digest independent of mapping order.
+
+    This digest is deliberately NOT part of any semantic fingerprint: an
+    environment change must not invalidate a resumable study or block a
+    top-up. Divergence is reported by the selection and winner-load warnings
+    instead.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :return EnvironmentIdentity: Digest, sorted variable names, and the
+        composed name-to-value mapping the digest covers.
+    """
+    env = _trainer_environment(experiment)
+    items = sorted(env.items())
+    encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return EnvironmentIdentity(
+        digest=hashlib.sha256(encoded).hexdigest(),
+        names=tuple(name for name, _ in items),
+        values=env,
+    )
+
+
+def _record_trainer_environment(
+    experiment: Experiment,
+    identity: EnvironmentIdentity,
+    trial_dir: Path,
+) -> None:
+    """Write the opt-in raw environment record for one trial.
+
+    A no-op unless ``execution.record_env`` is set. The record holds ambient
+    *values*, so it is written owner-only (0600) through
+    :func:`phasesweep.runtime.files.private_atomic_write_text` rather than the
+    umask-governed artifact writer the rest of the trial directory uses. Only
+    the file is hardened: the trial directory itself stays operator-trusted, so
+    logs and evidence remain readable by ordinary tooling.
+
+    The recorded mapping is exactly the digest's preimage — the contract-composed
+    environment before the per-trial ``PHASESWEEP_*`` and GPU bindings, which
+    vary by trial and are recoverable from the trial directory itself.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :param EnvironmentIdentity identity: Identity of the composed environment.
+    :param Path trial_dir: Existing trial directory to write into.
+    :raises OSError: The record could not be written.
+    :raises UnsafePrivatePathError: An existing ``environment.json`` is not a
+        private, unshared regular file, so replacing it could leak values.
+    """
+    if not experiment.execution.record_env:
+        return
+    payload = {
+        "digest": identity.digest,
+        "inherit_env": _inherit_env_contract(experiment),
+        "env": identity.values,
+    }
+    private_atomic_write_text(
+        trial_dir / "environment.json",
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        require_private_dir=False,
+    )
 
 
 def _warn_dropped_cuda_visibility(
@@ -277,6 +381,17 @@ def launch_trial(
         :class:`ExecutedTrial` bundling the trial context, the supervised
         :class:`ProcessResult`.
 
+    Raises:
+        TrialExecutionError: The configured ``execution.cwd`` does not resolve
+            to a directory on this host.
+        OSError: A trial artifact (resolved overrides, command record, the
+            opt-in ``environment.json``, or the captured output streams) could
+            not be written. Raised before the trainer starts, so no subprocess
+            is left behind.
+        UnsafePrivatePathError: ``execution.record_env`` is set and an existing
+            ``environment.json`` in the trial directory is not a private,
+            unshared regular file.
+
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
@@ -315,8 +430,13 @@ def launch_trial(
 
     # Environment and working directory follow the explicit execution
     # contract instead of unbounded ambient inheritance (review v0.5.17 /
-    # blocker 4).
-    env = _trainer_environment(experiment)
+    # blocker 4). The identity is computed from the same composition the
+    # subprocess receives, and the opt-in raw record is written before any
+    # per-trial binding is layered on, so the file stays the digest's exact
+    # preimage (review v0.5.18 / finding F3).
+    identity = _environment_identity(experiment)
+    _record_trainer_environment(experiment, identity, workdir)
+    env = dict(identity.values)
     trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
@@ -622,8 +742,6 @@ def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
         Trailing-newline-terminated, sorted, two-space-indented JSON.
 
     """
-    import json
-
     from phasesweep.runtime.commands import dump_overrides_json
 
     if strict:

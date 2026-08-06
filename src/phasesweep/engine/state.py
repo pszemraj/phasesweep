@@ -113,6 +113,14 @@ class Winner:
     # remote summary subset (review v0.5.17 / finding F). None for dry-run
     # placeholders and winners persisted before the record existed.
     objective_provenance: dict[str, Any] | None = None
+    # Identity of the environment the winning trial actually ran under
+    # (review v0.5.18 / finding F3): the SHA-256 of that trial's composed
+    # trainer environment, plus the ``inherit_env`` contract that produced it.
+    # Variable NAMES stay on the trial attrs — the winner file keeps the
+    # compact identity. None for dry-run placeholders, for winners persisted
+    # before the record existed, and for trials that predate it.
+    trainer_env_digest: str | None = None
+    trainer_inherit_env: str | list[str] | None = None
 
 
 def _winner_source_or_default(
@@ -162,6 +170,15 @@ GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance (review v0.5.17 /
 # finding F); written when metric extraction succeeds.
 OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
+# SHA-256 of the exact trainer environment this trial's subprocess received
+# (review v0.5.18 / finding F3). Written at allocation, so failed trials carry
+# it too. Ambient VALUES are never stored here — the digest identifies the
+# environment, the names attr says which variables it contained, and raw values
+# land only in the opt-in owner-only per-trial ``environment.json``.
+TRAINER_ENV_DIGEST_ATTR = "phasesweep_trainer_env_digest"
+# Sorted list of the variable NAMES in that environment: diagnostic, and
+# non-sensitive by construction.
+TRAINER_ENV_NAMES_ATTR = "phasesweep_trainer_env_names"
 RETURN_CODE_ATTR = "phasesweep_return_code"
 DURATION_ATTR = "phasesweep_duration_s"
 OVERRIDES_ATTR = "phasesweep_overrides"
@@ -1294,6 +1311,11 @@ def _save_winner(
     winners always carry a fingerprint by construction in ``_run_phase``;
     placeholder winners (dry-run skip) are never saved.
 
+    ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
+    produced the winning trial (review v0.5.18 / finding F3). Both are
+    ``None`` on winners selected from trials that predate the record; neither
+    ever carries ambient variable values.
+
     Args:
         experiment: Parsed experiment config; supplies the metric name used
             in the persisted payload.
@@ -1312,6 +1334,8 @@ def _save_winner(
         **_winner_common_payload(winner, phase_name),
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
+        "trainer_env_digest": winner.trainer_env_digest,
+        "trainer_inherit_env": winner.trainer_inherit_env,
     }
     _write_yaml_atomic(path, payload)
 
@@ -1381,6 +1405,55 @@ def _save_promotion_decision(
     _write_yaml_atomic(path, decision)
 
 
+# Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
+# same winner twice (preflight, then the run itself) and a suite can inherit it
+# across studies; the operator needs the divergence once, not once per read.
+_ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
+
+
+def _warn_environment_drift(
+    experiment: Experiment,
+    phase_name: str,
+    stored_digest: str | None,
+) -> None:
+    """Warn once when an inherited winner was produced under another environment.
+
+    The environment digest is deliberately outside the semantic fingerprint —
+    an ambient change must not invalidate a study or block a top-up — so this
+    warning is the only signal that a ``--from-phase`` resume is building on a
+    result produced under a different trainer environment (review v0.5.18 /
+    finding F3). Winners without a recorded digest predate the record and are
+    left alone.
+
+    :param Experiment experiment: Parsed experiment supplying the current contract.
+    :param str phase_name: Phase whose winner was loaded, used in the warn-once key.
+    :param str | None stored_digest: Digest recorded on the loaded winner.
+    """
+    if stored_digest is None:
+        return
+    # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
+    # read-only paths that import this module never need.
+    from phasesweep.engine.trial import _environment_identity
+
+    current_digest = _environment_identity(experiment).digest
+    if stored_digest == current_digest:
+        return
+    key = (experiment.experiment, phase_name, stored_digest)
+    if key in _ENVIRONMENT_DRIFT_WARNED:
+        return
+    _ENVIRONMENT_DRIFT_WARNED.add(key)
+    log.warning(
+        "[%s] inherited winner ran under trainer environment %s..., but this process "
+        "composes %s... under execution.inherit_env=%r. The inherited result is being "
+        "reused across an environment change; confirm the difference is irrelevant to "
+        "the metric, or re-run the phase.",
+        phase_name,
+        stored_digest[:12],
+        current_digest[:12],
+        experiment.execution.inherit_env,
+    )
+
+
 def _load_winner(
     experiment: Experiment,
     phase: Phase,
@@ -1397,6 +1470,12 @@ def _load_winner(
     currently-resolved ``inherited_winners`` and refuse the load if either
     (a) the stored winner has no fingerprint at all (legacy or hand-edited),
     or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
+
+    A recorded trainer-environment digest that disagrees with this process's
+    environment is a warning, not a refusal: the environment is outside the
+    semantic fingerprint by design (see :func:`_warn_environment_drift`).
+    Winners written before those fields existed load with them set to
+    ``None``.
 
     Args:
         experiment: Parsed experiment config.
@@ -1490,6 +1569,14 @@ def _load_winner(
     if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
         raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
 
+    stored_env_digest = data.get("trainer_env_digest")
+    if not isinstance(stored_env_digest, str) or not stored_env_digest:
+        stored_env_digest = None
+    stored_inherit_env = data.get("trainer_inherit_env")
+    if not isinstance(stored_inherit_env, str | list):
+        stored_inherit_env = None
+    _warn_environment_drift(experiment, phase.name, stored_env_digest)
+
     try:
         source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
         return Winner(
@@ -1509,6 +1596,12 @@ def _load_winner(
                 dict(data["objective_provenance"])
                 if isinstance(data.get("objective_provenance"), dict)
                 else None
+            ),
+            trainer_env_digest=stored_env_digest,
+            trainer_inherit_env=(
+                [str(name) for name in stored_inherit_env]
+                if isinstance(stored_inherit_env, list)
+                else stored_inherit_env
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:

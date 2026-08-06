@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from phasesweep.config import ExecutionContext
-from phasesweep.engine.trial import TrialExecutionError, launch_trial
+from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
 from phasesweep.runtime.process import ProcessResult
 from tests.conftest import make_experiment
 
@@ -311,3 +313,95 @@ def test_launch_trial_missing_execution_cwd_fails_loudly(
             monkeypatch,
             execution=ExecutionContext(cwd=str(tmp_path / "does_not_exist")),
         )
+
+
+def test_environment_identity_digest_ignores_mapping_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The digest identifies the environment's content, not its insertion order."""
+    monkeypatch.delenv("PHASESWEEP_TEST_AMBIENT_SECRET", raising=False)
+    forward = _environment_identity(
+        make_experiment(
+            env={"ALPHA": "1", "BETA": "2"},
+            execution=ExecutionContext(inherit_env="none"),
+        )
+    )
+    reversed_order = _environment_identity(
+        make_experiment(
+            env={"BETA": "2", "ALPHA": "1"},
+            execution=ExecutionContext(inherit_env="none"),
+        )
+    )
+
+    assert forward.digest == reversed_order.digest
+    assert len(forward.digest) == 64
+
+
+def test_environment_identity_digest_tracks_values_and_name_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different values — and differently-split name/value pairs — are different environments."""
+    monkeypatch.delenv("PHASESWEEP_TEST_AMBIENT_SECRET", raising=False)
+
+    def identity_for(env: dict[str, str]) -> str:
+        return _environment_identity(
+            make_experiment(env=env, execution=ExecutionContext(inherit_env="none"))
+        ).digest
+
+    assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
+    # An injective encoding must not let a name/value boundary shift produce
+    # one digest: "A" -> "B=1" and "A=B" -> "1" are different environments.
+    assert identity_for({"A": "B=1"}) != identity_for({"A=B": "1"})
+
+
+def test_environment_identity_names_are_sorted_and_hold_no_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names are the diagnostic surface; values stay inside the digest only."""
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    identity = _environment_identity(
+        make_experiment(
+            env={"ZULU": "z-secret", "ALPHA": "a-secret"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+        )
+    )
+
+    assert list(identity.names) == sorted(identity.names)
+    assert {"ALPHA", "ZULU", "PHASESWEEP_TEST_TOKEN"} <= set(identity.names)
+    assert not {"a-secret", "z-secret", "ambient-secret"} & set(identity.names)
+
+
+def test_launch_trial_records_private_environment_json_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``record_env: true`` persists the exact environment, owner-only (0600)."""
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    execution = ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"], record_env=True)
+    _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        experiment_env={"CONFIGURED": "value"},
+        execution=execution,
+    )
+
+    path = tmp_path / "trial_0" / "environment.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    identity = _environment_identity(
+        make_experiment(env={"CONFIGURED": "value"}, execution=execution)
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert payload["digest"] == identity.digest
+    assert payload["inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
+    assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
+    assert payload["env"]["CONFIGURED"] == "value"
+    assert sorted(payload["env"]) == list(identity.names)
+
+
+def test_launch_trial_writes_no_environment_json_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Values are secrets: nothing is written unless the operator opts in."""
+    _capture_launch_env(tmp_path, monkeypatch)
+
+    assert not (tmp_path / "trial_0" / "environment.json").exists()

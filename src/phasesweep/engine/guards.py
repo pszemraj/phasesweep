@@ -1433,6 +1433,42 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
 
+# Warn-once keys for :func:`_warn_unbounded_environment_inheritance`; preflight
+# runs again on the run's failure path, and a suite drives it once per study.
+_FULL_ENV_INHERITANCE_WARNED: set[str] = set()
+
+
+def _warn_unbounded_environment_inheritance(experiment: Experiment) -> None:
+    """Warn once when a persisted study inherits the whole ambient environment.
+
+    ``inherit_env: all`` makes every ambient variable an implicit input to
+    trials that outlive this process. Their values are never fingerprinted (and
+    must not be — they hold secrets), so a later top-up under a drifted shell
+    writes into the same study under the same fingerprint, and only the
+    recorded environment digest distinguishes them (review v0.5.18 / finding
+    F3). In-memory studies keep nothing to drift against, so they stay quiet.
+
+    :param Experiment experiment: Parsed experiment whose contract and storage
+        are inspected.
+    """
+    if experiment.execution.inherit_env != "all":
+        return
+    if experiment.storage is None or storage_is_in_memory(experiment.storage):
+        return
+    if experiment.experiment in _FULL_ENV_INHERITANCE_WARNED:
+        return
+    _FULL_ENV_INHERITANCE_WARNED.add(experiment.experiment)
+    log.warning(
+        "[%s] execution.inherit_env='all' with persistent storage: trials persist "
+        "beyond this process while inheriting every ambient variable, so a later "
+        "resume or top-up under a drifted environment reuses the same study and "
+        "fingerprint. Declare an explicit execution.inherit_env list (and put "
+        "meaning-changing values in env, which is fingerprinted) to bound what "
+        "trials can silently depend on.",
+        experiment.experiment,
+    )
+
+
 def _preflight_existing_studies(
     experiment: Experiment,
     *,
@@ -1459,6 +1495,7 @@ def _preflight_existing_studies(
     :raises RuntimeError: Multiple studies failed preflight for mixed reasons
         not covered by a single common exception type.
     """
+    _warn_unbounded_environment_inheritance(experiment)
     report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
