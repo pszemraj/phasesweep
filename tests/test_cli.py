@@ -229,6 +229,49 @@ def test_validate_cli_renders_comment(tmp_path: Path) -> None:
             assert line.lstrip().startswith("#"), f"comment line not prefixed: {line!r}"
 
 
+def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
+    """``phasesweep validate`` states each phase's resume/reproduce contract up front.
+
+    The runtime guard rejects a mid-target TPE/CMA-ES resume, but only after the
+    operator has already been interrupted; the capability line puts the same
+    contract in front of them before any trial runs.
+    """
+    p = tmp_path / "exp.yaml"
+    p.write_text(
+        textwrap.dedent(f"""
+        experiment: t
+        storage: sqlite:///{tmp_path}/phases.db
+        provenance: {{revision: test-fixture-v1}}
+        trial_command: "echo {{overrides}}"
+        metric:
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: depth
+            n_trials: 2
+            sampler: {{ type: grid }}
+            search_space: {{ d: {{ type: categorical, choices: [4, 8] }} }}
+          - name: lr
+            n_trials: 2
+            sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
+            search_space: {{ lr: {{ type: float, low: 0.1, high: 1.0 }} }}
+          - name: wd
+            n_trials: 2
+            sampler: {{ type: random, seed: 3 }}
+            search_space: {{ wd: {{ type: float, low: 0.0, high: 0.3 }} }}
+        """)
+    )
+
+    result = CliRunner().invoke(cli_main, ["validate", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "phase 'depth': sampler=grid (resumable)" in result.output
+    assert (
+        "phase 'lr': sampler=tpe seed=0 (non-resumable: run each target in one invocation)"
+        in result.output
+    )
+    assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
+
+
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     """``show-winners`` prints comment before the winner block so the reader
     frames numerical results against intent. Also covers the no-winner-yet
@@ -356,10 +399,12 @@ metric:
 phases:
   - name: a
     n_trials: 5
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }} }}
   - name: b
     inherits: [a]
     n_trials: 5
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ wd: {{ type: float, low: 0, high: 0.3 }} }}
 """
     exp = load_experiment(write_yaml(tmp_path, body))
@@ -374,6 +419,13 @@ phases:
     assert not (Path(tmp_path / "runs") / "summary.yaml").exists()
     # An example command was logged
     assert any("DRY RUN example command" in r.message for r in caplog.records)
+    # The sampler capability of every phase is disclosed before any trial would run.
+    logged = [r.getMessage() for r in caplog.records]
+    for phase_name in ("a", "b"):
+        assert any(
+            f"phase '{phase_name}': sampler=random seed=0 (resumable, reproducible)" in message
+            for message in logged
+        ), logged
     assert winners["a"].params["lr"] == exp.phases[0].search_space["lr"].low
     assert winners["b"].effective_overrides["lr"] == winners["a"].params["lr"]
 
@@ -404,6 +456,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         phases:
           - name: p
             n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
             search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
         """,
     )

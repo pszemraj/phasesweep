@@ -79,7 +79,7 @@ phases:
   - name: lr
     inherits: [depth]
     n_trials: 3
-    sampler: {{ type: tpe, seed: 0 }}
+    sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """

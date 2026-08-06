@@ -14,6 +14,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
 from phasesweep.engine.errors import (
     ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
@@ -416,6 +417,10 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     :return dict[str, Any]: JSON-serializable semantic phase payload.
     """
     dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
+    # acknowledge_nonresumable is run-control, not semantics: it never changes
+    # what a trial samples or means (on persistent storage its legal value is
+    # fully determined by sampler.type), so it must not invalidate a study.
+    dump["sampler"].pop("acknowledge_nonresumable", None)
     if phase.gpu_policy == "whole_node":
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
         dump["whole_node_device_count"] = len(tokens or [])
@@ -1393,7 +1398,7 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
         target or was interrupted before reaching it.
     """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
-    if phase.sampler.type not in {"tpe", "cmaes"} or finished == 0:
+    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or finished == 0:
         return
 
     accepted_target = _accepted_trial_target(study)

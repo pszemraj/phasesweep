@@ -64,6 +64,7 @@ env:
 phases:
   - name: p
     n_trials: 1
+    sampler: {{ type: random, seed: 0 }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """

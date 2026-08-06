@@ -42,6 +42,40 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be unique under a type-aware identity: `1`, `1.0`, and `true` stay three distinct choices even though Python compares them equal, but the same value listed twice is rejected. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
+## Sampler capability on persistent storage
+
+The `sampler` block is optional and defaults to `type: tpe` with no seed, which is fine for an in-memory run. A persistent `storage` changes that, because the study outlives the process that created it, so each phase must state two things up front rather than discover them mid-sweep:
+
+| Sampler | Seed | `acknowledge_nonresumable` |
+| --- | --- | --- |
+| `grid` | optional (traversal order only) | rejected |
+| `random` | required | rejected |
+| `tpe`, `cmaes` | required | required (`true`) |
+
+An unseeded `tpe`, `random`, or `cmaes` phase draws a different sequence on every invocation, so the durable trials it accumulates cannot be reproduced or explained afterwards. `tpe` and `cmaes` additionally hold process-local sampler state that Optuna storage does not persist: PhaseSweep refuses to resume such a phase mid-target or to raise its `n_trials` later (see [runtime behavior](runtime.md#fingerprints-and-resume)). Setting `acknowledge_nonresumable: true` is your statement that you accept that contract and will run each target in one invocation; setting it on `grid` or `random`, which resume safely, is rejected as meaningless config.
+
+```yaml
+storage: sqlite:///runs.db
+phases:
+  - name: depth
+    n_trials: 4
+    sampler: { type: grid }
+  - name: lr
+    n_trials: 12
+    sampler: { type: tpe, seed: 0, acknowledge_nonresumable: true }
+  - name: weight_decay
+    n_trials: 8
+    sampler: { type: random, seed: 1 }
+```
+
+`phasesweep validate` and `phasesweep run --dry-run` print one capability line per phase so the contract is visible before any trial runs:
+
+```text
+phase 'depth': sampler=grid (resumable)
+phase 'lr': sampler=tpe seed=0 (non-resumable: run each target in one invocation)
+phase 'weight_decay': sampler=random seed=1 (resumable, reproducible)
+```
+
 ## Override formats
 
 > [!IMPORTANT]
@@ -226,6 +260,17 @@ relational store. ... Set allow_external_rdb_single_host: true ...
 ```
 
 PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+
+### Persistent storage now requires a seeded, acknowledged sampler
+
+```text
+Value error, Phase 'lr': sampler.type='tpe' with persistent storage (...) requires an
+explicit sampler.seed. ...
+Value error, Phase 'lr': sampler.type='tpe' with persistent storage (...) requires
+sampler.acknowledge_nonresumable: true. ...
+```
+
+The default `sampler` block (`type: tpe`, no seed) is no longer accepted on persistent storage. Add a `seed` to every `tpe`, `random`, or `cmaes` phase, and `acknowledge_nonresumable: true` to every `tpe` or `cmaes` phase; `grid` phases and in-memory runs are unaffected. See [sampler capability on persistent storage](#sampler-capability-on-persistent-storage) for the reasoning and a worked example. The acknowledgement is run-control, not semantics: it is excluded from phase fingerprints, so adding it does not invalidate an existing study.
 
 ### Fingerprints now include the execution contract
 

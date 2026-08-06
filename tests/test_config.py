@@ -14,6 +14,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
     Suite,
 )
 from tests.conftest import write_yaml
@@ -430,3 +431,120 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
 def test_config_error_stays_a_value_error() -> None:
     """Existing ``except ValueError`` callers must keep catching config failures."""
     assert issubclass(ConfigError, ValueError)
+
+
+def _sampler_policy_yaml(
+    *,
+    storage: str | None,
+    sampler: str | None = None,
+    n_trials: int = 2,
+    search_space: str = "{ lr: { type: float, low: 0.1, high: 1.0 } }",
+) -> str:
+    """Build a one-phase experiment YAML for the persistent-storage sampler policy.
+
+    :param str | None storage: Storage URL to declare, or ``None`` to omit the key.
+    :param str | None sampler: Inline sampler mapping, or ``None`` to omit the block.
+    :param int n_trials: Trial budget for the single phase.
+    :param str search_space: Inline search-space mapping for the single phase.
+    :return str: Complete experiment YAML text.
+    """
+    header = (
+        f"storage: {storage}\nprovenance: {{revision: test-fixture-v1}}\n"
+        if storage is not None
+        else ""
+    )
+    sampler_line = f"    sampler: {sampler}\n" if sampler is not None else ""
+    return (
+        "experiment: t\n"
+        f"{header}"
+        'trial_command: "echo {overrides}"\n'
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        "phases:\n"
+        "  - name: lr\n"
+        f"    n_trials: {n_trials}\n"
+        f"{sampler_line}"
+        f"    search_space: {search_space}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sampler", "message"),
+    [
+        pytest.param(None, "requires an explicit sampler.seed", id="default_tpe_unseeded"),
+        pytest.param("{ type: tpe }", "requires an explicit sampler.seed", id="tpe_unseeded"),
+        pytest.param("{ type: cmaes }", "requires an explicit sampler.seed", id="cmaes_unseeded"),
+        pytest.param("{ type: random }", "requires an explicit sampler.seed", id="random_unseeded"),
+        pytest.param(
+            "{ type: tpe, seed: 0 }",
+            "requires sampler.acknowledge_nonresumable: true",
+            id="tpe_unacknowledged",
+        ),
+        pytest.param(
+            "{ type: cmaes, seed: 1 }",
+            "requires sampler.acknowledge_nonresumable: true",
+            id="cmaes_unacknowledged",
+        ),
+    ],
+)
+def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
+    tmp_path: Path, sampler: str | None, message: str
+) -> None:
+    """Persistent storage must state the sampler contract at config load, not mid-run.
+
+    An unseeded stochastic sampler makes a durable study irreproducible, and
+    TPE/CMA-ES hold process-local state Optuna storage does not persist, so
+    ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
+    only after the operator has already been interrupted.
+    """
+    body = _sampler_policy_yaml(storage=f"sqlite:///{tmp_path}/phases.db", sampler=sampler)
+    with pytest.raises(ValueError, match=message) as excinfo:
+        load_experiment(write_yaml(tmp_path, body))
+    assert "'lr'" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        pytest.param("{ type: tpe, seed: 0, acknowledge_nonresumable: true }", id="tpe"),
+        pytest.param("{ type: cmaes, seed: 1, acknowledge_nonresumable: true }", id="cmaes"),
+        pytest.param("{ type: random, seed: 3 }", id="random_needs_no_acknowledgement"),
+    ],
+)
+def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
+    tmp_path: Path, sampler: str
+) -> None:
+    """A seeded sampler with the required acknowledgement loads unchanged."""
+    body = _sampler_policy_yaml(storage=f"sqlite:///{tmp_path}/phases.db", sampler=sampler)
+    experiment = load_experiment(write_yaml(tmp_path, body))
+    assert experiment.phases[0].sampler.seed is not None
+
+
+def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
+    """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
+    body = _sampler_policy_yaml(
+        storage=f"sqlite:///{tmp_path}/phases.db",
+        sampler="{ type: grid }",
+        n_trials=3,
+        search_space="{ lr: { type: float, low: 0.0, high: 1.0, step: 0.5 } }",
+    )
+    experiment = load_experiment(write_yaml(tmp_path, body))
+    assert experiment.phases[0].sampler.seed is None
+    assert experiment.phases[0].sampler.acknowledge_nonresumable is False
+
+
+@pytest.mark.parametrize("storage", [None, '":memory:"'])
+def test_in_memory_storage_keeps_the_sampler_block_optional(
+    tmp_path: Path, storage: str | None
+) -> None:
+    """Without a durable study there is nothing to resume, so the tpe default stands."""
+    experiment = load_experiment(write_yaml(tmp_path, _sampler_policy_yaml(storage=storage)))
+    assert experiment.phases[0].sampler.type == "tpe"
+    assert experiment.phases[0].sampler.seed is None
+
+
+@pytest.mark.parametrize("sampler_type", ["grid", "random"])
+def test_acknowledge_nonresumable_rejected_on_resumable_samplers(sampler_type: str) -> None:
+    """The acknowledgement states a contract these samplers do not impose."""
+    with pytest.raises(ValidationError, match="acknowledge_nonresumable"):
+        Sampler(type=sampler_type, seed=0, acknowledge_nonresumable=True)  # type: ignore[arg-type]

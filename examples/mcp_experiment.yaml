@@ -45,6 +45,8 @@ phases:
       type: tpe
       seed: 0
       n_startup_trials: 4
+      # TPE state is process-local: this phase's target must run in one invocation.
+      acknowledge_nonresumable: true
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 
@@ -55,6 +57,8 @@ phases:
     sampler:
       type: cmaes
       seed: 1
+      # Same contract as the TPE phase above: run the full target in one go.
+      acknowledge_nonresumable: true
     search_space:
       weight_decay: { type: float, low: 0.0, high: 0.3 }
       dropout: { type: float, low: 0.0, high: 0.3 }

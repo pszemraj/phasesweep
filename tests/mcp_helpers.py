@@ -86,9 +86,12 @@ def mcp_experiment_config_text(
     with_storage: bool = True,
 ) -> str:
     if phases is None:
+        # Seeded random: reproducible and resumable, so it satisfies the
+        # persistent-storage sampler policy without an acknowledgement.
         phases = """\
   - name: p
     n_trials: 1
+    sampler: { type: random, seed: 0 }
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
@@ -130,6 +133,7 @@ metric:
 phases:
   - name: p
     n_trials: 1
+    sampler: {{ type: random, seed: 0 }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """

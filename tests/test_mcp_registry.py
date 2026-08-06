@@ -24,11 +24,13 @@ def _experiment_yaml(tmp_path: Path, *, name: str = "reg_ok", with_storage: bool
     phases = """\
   - name: warmup
     n_trials: 2
+    sampler: { type: random, seed: 0 }
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
   - name: tune
     inherits: [warmup]
     n_trials: 3
+    sampler: { type: random, seed: 1 }
     search_space:
       wd: { type: float, low: 0.0, high: 0.3 }
 """
@@ -330,10 +332,7 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     ("old", "new"),
     [
         ("goal: minimize", "goal: sideways"),
-        (
-            "n_trials: 2\n    search_space:",
-            "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
-        ),
+        ("sampler: { type: random, seed: 0 }", "sampler: { type: nope }"),
     ],
     ids=["invalid_goal", "unknown_sampler"],
 )

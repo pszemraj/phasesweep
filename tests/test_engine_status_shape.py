@@ -81,11 +81,13 @@ def _write_suite(tmp_path: Path) -> Path:
             phases:
               - name: p
                 n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
                 search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
           - name: untouched
             phases:
               - name: p
                 n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
                 search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
         """,
     )

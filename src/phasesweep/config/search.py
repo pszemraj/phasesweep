@@ -150,12 +150,71 @@ class CategoricalParam(_Frozen):
 SearchParam = FloatParam | IntParam | CategoricalParam
 
 
+# Samplers whose suggestions depend on process-local RNG/optimizer state that
+# Optuna storage does not persist. `phasesweep.engine.guards.
+# _validate_sampler_continuation` refuses to resume one of these mid-target, so
+# each trial target must be run in a single invocation.
+NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})
+# Samplers that draw randomly and therefore need an explicit seed to make a
+# durable study reproducible. `grid` is excluded: it enumerates a fixed matrix.
+STOCHASTIC_SAMPLERS = frozenset({"tpe", "random", "cmaes"})
+
+
 class Sampler(_Frozen):
     """Optuna sampler configuration."""
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
     seed: int | None = None
     n_startup_trials: int = Field(default=10, ge=0)  # tpe only
+    acknowledge_nonresumable: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge that this sampler's trial target must run in one "
+            "invocation. TPE and CMA-ES suggestions depend on process-local "
+            "state Optuna storage does not persist, so PhaseSweep refuses to "
+            "resume such a phase mid-target. Required for sampler.type 'tpe' "
+            "or 'cmaes' on persistent storage; rejected for 'grid' and "
+            "'random', which resume safely."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_acknowledgement_applies(self) -> Sampler:
+        """Reject an acknowledgement of a restriction this sampler does not impose.
+
+        :raises ValueError: ``acknowledge_nonresumable`` is set for a sampler
+            type outside :data:`NON_RESUMABLE_SAMPLERS`.
+        :return Sampler: Self, unchanged.
+        """
+        if self.acknowledge_nonresumable and self.type not in NON_RESUMABLE_SAMPLERS:
+            raise ValueError(
+                f"sampler.acknowledge_nonresumable is set for sampler.type={self.type!r}, "
+                "which resumes safely: PhaseSweep reattaches it to an existing study and "
+                "tops the study up. Only "
+                f"{sorted(NON_RESUMABLE_SAMPLERS)} carry the run-the-target-in-one-invocation "
+                "contract this flag acknowledges. Remove acknowledge_nonresumable."
+            )
+        return self
+
+
+def sampler_capability_line(phase: Phase) -> str:
+    """Render the one-line resume/reproduce contract disclosed for ``phase``.
+
+    Shared by ``phasesweep validate`` and ``phasesweep run --dry-run`` so both
+    surfaces state the same contract in the same words before any trial runs.
+
+    :param Phase phase: Phase whose sampler capability is described.
+    :return str: One line naming the phase, sampler type, seed, and capability.
+    """
+    sampler = phase.sampler
+    seed = "" if sampler.seed is None else f" seed={sampler.seed}"
+    if sampler.type in NON_RESUMABLE_SAMPLERS:
+        capability = "non-resumable: run each target in one invocation"
+    elif sampler.seed is None:
+        capability = "resumable"
+    else:
+        capability = "resumable, reproducible"
+    return f"phase {phase.name!r}: sampler={sampler.type}{seed} ({capability})"
 
 
 def _validate_sampler_search_space(phase: Phase) -> None:

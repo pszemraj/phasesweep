@@ -21,6 +21,7 @@ from phasesweep.config import (
     Metric,
     Phase,
     RequiredFileGate,
+    Sampler,
     Sha256Gate,
     Suite,
 )
@@ -240,10 +241,12 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         phases:
           - name: baseline
             n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
             fixed_overrides:
               model.depth: 2
           - name: candidate
             n_trials: 1
+            sampler: {{ type: random, seed: 1 }}
             fixed_overrides:
               model.width: 128
             promotion:
@@ -386,19 +389,26 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
                 name="baseline",
                 n_trials=1,
                 fixed_overrides={"score": 1.0},
+                sampler=Sampler(type="random", seed=0),
                 search_space={},
             ),
             Phase(
                 name="candidate",
                 n_trials=1,
                 fixed_overrides={"score": 2.0},
+                sampler=Sampler(type="random", seed=0),
                 search_space={},
                 promotion={
                     "min_delta_vs": "baseline",
                     "on_fail": "continue_baseline",
                 },
             ),
-            Phase(name="later", n_trials=1, search_space={}),
+            Phase(
+                name="later",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={},
+            ),
         ],
     )
     run_experiment(experiment)

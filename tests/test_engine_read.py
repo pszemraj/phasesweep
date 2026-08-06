@@ -49,6 +49,9 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
             Phase(
                 name="p",
                 n_trials=1,
+                # Seeded random keeps this helper usable with persistent storage,
+                # which rejects an unseeded stochastic sampler.
+                sampler=Sampler(type="random", seed=0),
                 search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
             )
         ],

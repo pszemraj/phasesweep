@@ -22,6 +22,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep.config import ConfigError, Experiment, Suite, load_config
+from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import PhaseSweepError, config_status, run_config
 from phasesweep.engine.guards import (
     _experiment_lock,
@@ -346,7 +347,7 @@ def validate(config_path: Path) -> None:
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
-    """Render phase summaries for ``validate``.
+    """Render phase summaries and sampler capability lines for ``validate``.
 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
@@ -357,6 +358,10 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         click.echo(
             f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}{contracts}"
         )
+        # Capability disclosure (review v0.5.18 / finding F7): state the
+        # resume/reproduce contract before a trial runs, not after an
+        # interrupted operator hits the runtime continuation guard.
+        click.echo(f"{indent}    {sampler_capability_line(p)}")
         _render_phase_comment(p.comment, prefix=f"{indent}    # ")
 
 

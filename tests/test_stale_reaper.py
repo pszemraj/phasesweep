@@ -216,7 +216,12 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
         phases=[
-            Phase(name="a", n_trials=1, search_space={"x": IntParam(type="int", low=0, high=10)})
+            Phase(
+                name="a",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
         ],
     )
 
@@ -263,7 +268,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.eE+-]+)"),
         ),
         phases=[
-            Phase(name="a", n_trials=1, search_space={}),
+            Phase(name="a", n_trials=1, sampler=Sampler(type="random", seed=0), search_space={}),
             Phase(
                 name="b",
                 n_trials=2,
@@ -327,7 +332,9 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
             name="metric",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.]+)"),
         ),
-        phases=[Phase(name="p", n_trials=1, search_space={})],
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0), search_space={})
+        ],
     )
     study = optuna.create_study(study_name="legacy_trial::p", storage=storage, direction="minimize")
     study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
@@ -475,7 +482,9 @@ def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path)
         experiment="legacy_orphan",
         storage=storage,
         workdir=tmp_path / "runs",
-        phases=[Phase(name="p", n_trials=1, search_space={})],
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0), search_space={})
+        ],
     )
     study = optuna.create_study(
         study_name="legacy_orphan::p",
@@ -1213,6 +1222,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
                 Phase(
                     name=phase_name,
                     n_trials=1,
+                    sampler=Sampler(type="random", seed=0),
                     search_space={"x": IntParam(type="int", low=0, high=10)},
                 )
             ],

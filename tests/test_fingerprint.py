@@ -75,6 +75,9 @@ def _two_phase_experiment(
         Phase(
             name="arch",
             n_trials=arch_n_trials,
+            # Seeded random keeps this helper valid with persistent storage,
+            # which rejects an unseeded stochastic sampler.
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=arch_low, high=arch_high)},
             fixed_overrides=arch_fixed_overrides or {},
         ),
@@ -82,6 +85,7 @@ def _two_phase_experiment(
             name="lr",
             inherits=["arch"],
             n_trials=1,
+            sampler=Sampler(type="random", seed=1),
             search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
         ),
     ]
@@ -465,6 +469,32 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     )
 
 
+def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
+    """Toggling the acknowledgement must not move the phase fingerprint.
+
+    The flag never changes what a trial samples or means — on persistent
+    storage its legal value is fully determined by ``sampler.type`` — so
+    acknowledging an existing study's sampler (review v0.5.18 / finding F7)
+    must not invalidate that study.
+    """
+    from phasesweep.engine.guards import _phase_semantic_payload
+
+    plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
+    acknowledged = make_experiment(
+        sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
+    )
+    assert _phase_fingerprint(plain, plain.phases[0], {}) == _phase_fingerprint(
+        acknowledged, acknowledged.phases[0], {}
+    )
+    payload = _phase_semantic_payload(acknowledged, acknowledged.phases[0], {})
+    assert "acknowledge_nonresumable" not in payload["phase"]["sampler"]
+    # The semantic sampler fields still move the fingerprint.
+    reseeded = make_experiment(sampler=Sampler(type="tpe", seed=1, acknowledge_nonresumable=True))
+    assert _phase_fingerprint(acknowledged, acknowledged.phases[0], {}) != _phase_fingerprint(
+        reseeded, reseeded.phases[0], {}
+    )
+
+
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     """End-to-end: run with n_trials=2, then n_trials=4 -> 4 total trials in same study."""
     trainer = write_trainer(
@@ -511,13 +541,16 @@ phases:
 @pytest.mark.parametrize(
     ("sampler", "search_space"),
     [
+        # These cases exist to exercise the stateful samplers on persistent
+        # storage, which requires the config-level non-resumable acknowledgement;
+        # the acknowledgement does not weaken the runtime continuation guard.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
             {"x": IntParam(type="int", low=0, high=10)},
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0),
+            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
             {
                 "x": FloatParam(type="float", low=0.0, high=1.0),
                 "y": FloatParam(type="float", low=0.0, high=1.0),
@@ -580,13 +613,16 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
 @pytest.mark.parametrize(
     ("sampler", "search_space"),
     [
+        # These cases exist to exercise the stateful samplers on persistent
+        # storage, which requires the config-level non-resumable acknowledgement;
+        # the acknowledgement does not weaken the runtime continuation guard.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
             {"x": IntParam(type="int", low=0, high=10)},
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0),
+            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
             {
                 "x": FloatParam(type="float", low=0.0, high=1.0),
                 "y": FloatParam(type="float", low=0.0, high=1.0),

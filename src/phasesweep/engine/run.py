@@ -18,6 +18,7 @@ import yaml
 from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Phase, Suite
 from phasesweep.config.common import _validate_safe_name
+from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.guards import (
     _experiment_lock,
@@ -492,7 +493,8 @@ def _run_experiment_inner(
         experiment: Parsed experiment config.
         from_phase: Optional name of the phase to resume from; earlier phases
             are loaded from disk.
-        dry_run: If ``True``, no subprocesses launch and no ``summary.yaml`` is written.
+        dry_run: If ``True``, no subprocesses launch and no ``summary.yaml`` is
+            written; each phase's sampler capability line is logged up front.
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
@@ -516,6 +518,13 @@ def _run_experiment_inner(
     promotion_decisions: dict[str, dict[str, Any]] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
+
+    if dry_run:
+        # Capability disclosure (review v0.5.18 / finding F7): restate the same
+        # per-phase resume/reproduce contract `phasesweep validate` prints, in
+        # the preview an operator reads immediately before committing to a run.
+        for previewed in experiment.phases:
+            log.info("DRY RUN %s", sampler_capability_line(previewed))
 
     for phase in experiment.phases:
         using_preloaded_winner = (

@@ -24,7 +24,7 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, Phase, load_config
+from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -387,11 +387,13 @@ def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
 RESUMABLE_PHASES = """\
   - name: p
     n_trials: 1
+    sampler: { type: random, seed: 0 }
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
   - name: q
     inherits: [p]
     n_trials: 1
+    sampler: { type: random, seed: 1 }
     search_space:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
@@ -1696,6 +1698,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
                 name="p",
                 n_trials=1,
                 fixed_overrides={"k": 1},
+                sampler=Sampler(type="random", seed=0),
                 search_space={},
             )
         ],
@@ -1771,9 +1774,11 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
         phases="""\
   - name: a
     n_trials: 1
+    sampler: { type: random, seed: 0 }
     search_space: {}
   - name: b
     n_trials: 1
+    sampler: { type: random, seed: 1 }
     search_space: {}
 """,
     )

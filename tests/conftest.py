@@ -22,6 +22,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
 )
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import _read_proc_stat
@@ -99,6 +100,9 @@ def make_experiment(
     If ``phases`` is not given, a single phase named ``"p"`` is created with
     ``search_space={"x": IntParam(0..10)}``. Extra ``**phase_overrides`` are
     forwarded to that default phase (e.g. ``n_trials=4``, ``gpu_ids=[0]``).
+    With persistent ``storage`` and no caller-supplied sampler, that default
+    phase uses ``Sampler(type="random", seed=0)`` so it satisfies the
+    persistent-storage sampler policy.
     """
     if phases is None:
         base: dict[str, Any] = dict(
@@ -107,6 +111,13 @@ def make_experiment(
             search_space={"x": IntParam(type="int", low=0, high=10)},
         )
         base.update(phase_overrides)
+        if storage is not None and "sampler" not in base:
+            # Persistent storage rejects an unseeded stochastic sampler and
+            # requires acknowledge_nonresumable for tpe/cmaes, so the default
+            # tpe sampler cannot be the fixture default here. Seeded random is
+            # stochastic, reproducible, and resumable: it satisfies the policy
+            # without asking every caller to acknowledge anything.
+            base["sampler"] = Sampler(type="random", seed=0)
         phases = [Phase(**base)]  # type: ignore[arg-type]
 
     kwargs: dict[str, Any] = dict(

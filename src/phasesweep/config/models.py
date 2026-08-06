@@ -18,6 +18,8 @@ from phasesweep.config.common import (
     _validate_safe_name,
 )
 from phasesweep.config.search import (
+    NON_RESUMABLE_SAMPLERS,
+    STOCHASTIC_SAMPLERS,
     Sampler,
     SearchParam,
     _placeholder_values_for,
@@ -567,6 +569,8 @@ class Experiment(_Frozen):
           * sampler / search-space compatibility (review v0.5.2 / blocker 2)
           * grid divisibility for float params (review v0.5.2 / blocker 4)
           * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
+          * sampler seed / non-resumable acknowledgement on persistent storage
+            (review v0.5.18 / finding F7)
 
         Returns:
             Self, unchanged. Pydantic post-init validator protocol.
@@ -579,7 +583,8 @@ class Experiment(_Frozen):
                 conflict across parents or are re-sampled; a key and one of its
                 dotted subkeys collide; the metric and constraint names are not all
                 distinct; or any of the delegated per-phase checks (sampler/search
-                space, storage policy, JSON-file override encodability, trial command
+                space, storage policy, sampler seed and non-resumable
+                acknowledgement, JSON-file override encodability, trial command
                 template) rejects the phase.
 
         """
@@ -702,6 +707,13 @@ class Experiment(_Frozen):
             # safety unless explicitly acknowledged.
             _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
 
+            # Sampler reproducibility/resumability contract (review v0.5.18 /
+            # finding F7): a durable study outlives the process that created
+            # it, so an unseeded or non-resumable sampler is a config-level
+            # decision the operator must make before the first trial, not a
+            # surprise the runtime guard springs on them mid-target.
+            _validate_sampler_resumability(self.storage, phase)
+
             # JSON wire serializability (review v0.5.17 / finding B): the
             # template preflight below renders with write_files=False, so it
             # never calls write_json_file and never proves the composed values
@@ -799,6 +811,61 @@ def _validate_storage_policy(
             "coordination is distributed; otherwise use storage: "
             "journal:///path.journal for a single-host parallel sweep, or "
             "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
+        )
+
+
+def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
+    """Require an explicit seed, and a non-resumable acknowledgement, on persistent storage.
+
+    A persistent study outlives the process that created it, which makes two
+    sampler properties operator decisions rather than defaults (review v0.5.18 /
+    finding F7):
+
+    1. Reproducibility. An unseeded ``tpe``/``random``/``cmaes`` phase draws a
+       different sequence on every invocation, so the durable trials it
+       accumulates cannot be reproduced or explained afterwards.
+    2. Resumability. ``tpe`` and ``cmaes`` suggestions depend on process-local
+       RNG/optimizer state Optuna storage does not persist, so
+       :func:`phasesweep.engine.guards._validate_sampler_continuation` hard-rejects
+       resuming such a phase mid-target. That guard fires only *after* the
+       operator has been interrupted; requiring ``acknowledge_nonresumable``
+       here puts the run-the-target-in-one-invocation contract in front of them
+       at config load instead.
+
+    ``grid`` is exempt from both: it enumerates a fixed matrix and resumes from
+    stored grid assignments. In-memory storage (``None`` or the sentinels
+    recognized by :func:`phasesweep.runtime.files.storage_is_in_memory`) is
+    exempt entirely — there is no durable study to reproduce or resume, so the
+    ``sampler`` block stays optional and the ``tpe`` default remains fine.
+
+    :param str | None storage: Experiment-level storage URL, or ``None``.
+    :param Phase phase: Phase whose sampler contract is checked.
+    :raises ValueError: ``storage`` is persistent and the phase's sampler is
+        stochastic without an explicit ``seed``, or is non-resumable without
+        ``acknowledge_nonresumable: true``.
+    """
+    if storage is None or storage_is_in_memory(storage):
+        return
+
+    sampler = phase.sampler
+    if sampler.type in STOCHASTIC_SAMPLERS and sampler.seed is None:
+        raise ValueError(
+            f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
+            f"({storage!r}) requires an explicit sampler.seed. A durable study outlives the "
+            "process that created it, so an unseeded stochastic sampler leaves trials nobody "
+            "can reproduce or explain. Add an integer 'seed' to this phase's sampler block, "
+            "or use sampler.type: grid to enumerate a fixed matrix."
+        )
+    if sampler.type in NON_RESUMABLE_SAMPLERS and not sampler.acknowledge_nonresumable:
+        raise ValueError(
+            f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
+            f"({storage!r}) requires sampler.acknowledge_nonresumable: true. This sampler's "
+            "suggestions depend on process-local state Optuna storage does not persist, so "
+            "PhaseSweep refuses to resume the phase mid-target: an interrupted run cannot be "
+            "continued and n_trials cannot be raised later — each target must run in one "
+            "invocation. Add 'acknowledge_nonresumable: true' to this phase's sampler block "
+            "to accept that contract, or use sampler.type: random with a seed (resumable and "
+            "reproducible) or sampler.type: grid."
         )
 
 

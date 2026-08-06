@@ -58,6 +58,10 @@ pytestmark = pytest.mark.skipif(
     reason="cancel path relies on POSIX process groups + /proc liveness",
 )
 
+# Persistent storage rejects an unseeded stochastic sampler; seeded random is
+# reproducible and resumable, so it needs no non-resumable acknowledgement.
+SEEDED_RANDOM = Sampler(type="random", seed=0)
+
 
 def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
     config = tmp_path / "exp.yaml"
@@ -351,8 +355,14 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         phases=[
-            Phase(name="a", n_trials=1, search_space={}),
-            Phase(name="b", n_trials=1, max_consecutive_failures=1, search_space={}),
+            Phase(name="a", n_trials=1, sampler=SEEDED_RANDOM, search_space={}),
+            Phase(
+                name="b",
+                n_trials=1,
+                max_consecutive_failures=1,
+                sampler=SEEDED_RANDOM,
+                search_space={},
+            ),
         ],
     )
     captured: dict[str, object] = {}
@@ -411,7 +421,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        phases=[Phase(name="p", n_trials=1, search_space={})],
+        phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
     trial = study.ask()
@@ -605,8 +615,10 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     """
     trainer = write_constant_trainer(tmp_path)
     phases = [
-        Phase(name="a", n_trials=1, fixed_overrides={"k": 1}, search_space={}),
-        Phase(name="b", n_trials=1, inherits=["a"], search_space={}),
+        Phase(
+            name="a", n_trials=1, fixed_overrides={"k": 1}, sampler=SEEDED_RANDOM, search_space={}
+        ),
+        Phase(name="b", n_trials=1, inherits=["a"], sampler=SEEDED_RANDOM, search_space={}),
     ]
     experiment = make_experiment(
         workdir=tmp_path / "runs",

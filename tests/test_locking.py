@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import Experiment, FloatParam, IntParam, Phase
+from phasesweep.config import Experiment, FloatParam, IntParam, Phase, Sampler
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.guards import (
@@ -566,12 +566,14 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
         Phase(
             name="arch",
             n_trials=1,
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=1, high=2)},
         ),
         Phase(
             name="lr",
             inherits=["arch"],
             n_trials=1,
+            sampler=Sampler(type="random", seed=1),
             search_space={
                 "lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True),
             },
@@ -581,6 +583,7 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
         Phase(
             name="arch",
             n_trials=2,  # top-up
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=1, high=2)},
         ),
     ]

@@ -143,15 +143,17 @@ def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
             "GridSampler",
             id="grid",
         ),
+        # tpe/cmaes are the point of these two cases, so they carry the
+        # acknowledgement persistent storage requires for a non-resumable sampler.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=3),
+            Sampler(type="tpe", seed=0, n_startup_trials=3, acknowledge_nonresumable=True),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             1,
             "TPESampler",
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0),
+            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
             {"x": IntParam(type="int", low=1, high=2)},
             1,
             "CmaEsSampler",
@@ -282,7 +284,7 @@ phases:
     n_trials: 8
     n_jobs: 4
     allow_no_gpu_isolation: true
-    sampler: {{ type: tpe, seed: 42 }}
+    sampler: {{ type: tpe, seed: 42, acknowledge_nonresumable: true }}
     search_space:
       lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
 """
@@ -321,6 +323,7 @@ phases:
   - name: a
     n_trials: 3
     max_consecutive_failures: 10
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
 """
     yaml_path = tmp_path / "exp.yaml"
@@ -523,6 +526,7 @@ phases:
   - name: a
     n_trials: 2
     max_consecutive_failures: 10
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
 """
     p = tmp_path / "exp.yaml"
@@ -742,6 +746,7 @@ metric:
 phases:
   - name: p
     n_trials: 1
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
 """
     exp = load_experiment(write_yaml(tmp_path, body))
@@ -772,6 +777,7 @@ phases:
   - name: a
     n_trials: 100
     max_consecutive_failures: 3
+    sampler: {{ type: random, seed: 0 }}
     search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
 """
     exp = load_experiment(write_yaml(tmp_path, body))

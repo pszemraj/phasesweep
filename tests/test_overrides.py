@@ -249,7 +249,7 @@ phases:
   - name: opt
     inherits: [arch]
     n_trials: 4
-    sampler: {{ type: tpe, seed: 0 }}
+    sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
     search_space:
       lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
 """

@@ -123,8 +123,11 @@
 #   `grid` rejects log parameters, requires float steps, and requires n_trials to equal cardinality unless allow_partial_grid is true. `cmaes` rejects categorical parameters and requires the installed `cmaes` dependency.
 #   seed: int | None = null
 #   Seed for sampler behavior within one invocation; grid uses it for traversal order. Seeded random draws are keyed by durable trial identity so supported top-up batching does not restart the stream. TPE/CMA-ES top-ups are rejected rather than described as reproducible across process boundaries.
+#   Required when storage is persistent and type is `tpe`, `random`, or `cmaes`: a durable study outlives the process that created it, so an unseeded stochastic draw leaves trials nobody can reproduce. `grid` is exempt. In-memory storage (null or a :memory: sentinel) is exempt entirely and keeps the whole sampler block optional.
 #   n_startup_trials: int = 10 (>= 0)
 #   Used only by TPE; ignored by random, grid, and CMA-ES.
+#   acknowledge_nonresumable: bool = false
+#   Required to be true when storage is persistent and type is `tpe` or `cmaes`. It states that this phase's trial target runs in one invocation: those samplers hold process-local state Optuna storage does not persist, so an interrupted phase cannot be resumed mid-target and n_trials cannot be raised later. Rejected for `grid` and `random`, which resume safely, and unnecessary on in-memory storage. Run-control, not semantics: unlike the rest of the sampler block it is excluded from the phase fingerprint, so acknowledging an existing study does not invalidate it.
 
 # timeout_seconds_per_trial: float | None = 86400.0 (>= 0 and finite when set)
 # Bounds the trainer process group; `0` is an immediate timeout, not disabled. `null` disables this guard only when allow_unbounded_trials is true.

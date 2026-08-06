@@ -81,6 +81,7 @@ def _storage_policy_config(
         phases:
           - name: p
             n_trials: 1{parallel}
+            sampler: {{ type: random, seed: 0 }}
             search_space:
               x: {{ type: int, low: 0, high: 10 }}
         """,
@@ -206,10 +207,10 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
                 extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
             studies:
               - name: inherited
-                phases: [{name: p, n_trials: 1}]
+                phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
               - name: opted_out
                 allow_external_rdb_single_host: false
-                phases: [{name: p, n_trials: 1}]
+                phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
             """,
         )
     )
