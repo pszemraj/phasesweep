@@ -767,15 +767,41 @@ def _reject_bound_descendant_topups(
 ) -> None:
     """Reject upstream top-ups that could invalidate a bound descendant study.
 
+    Reachability follows both semantic edges a phase may declare on a prior
+    phase, not ``inherits`` alone (PR #5 review / reviewer 2 pass 2, blocker 2).
+    ``promotion.min_delta_vs`` is validated only to name a *prior* phase, never
+    an inherited one, so ``A --promotion--> B --inherits--> C`` with ``B`` not
+    inheriting ``A`` is a legal graph. A promotion baseline is a semantic
+    dependency even though it is absent from the promoted phase's own
+    fingerprint: a new baseline winner can flip the promotion decision, and
+    ``on_fail: continue_baseline`` then exposes a clone of the baseline winner -
+    effective overrides included - in the promoted phase's slot, which anything
+    inheriting that phase has already hashed into its bound study. ``stop`` and
+    ``skip`` need the same protection with no inheriting descendant at all: the
+    first turns the top-up into a mid-run failure after the upstream study was
+    already mutated, and the second publishes a new generation that silently
+    omits the promoted phase and everything after it, advancing the last-success
+    pointer past the previously published winners. A phase reached through
+    either edge therefore both extends the reachable set (its exposed winner can
+    change) and joins the bound-study check set.
+
+    Suite-level promotion needs no handling here: each suite study compiles to
+    an independent :class:`Experiment` with its own studies and fingerprints,
+    ``depends_on`` only orders execution, and no fingerprint binds across
+    compiled experiments - so there is no cross-study binding to invalidate.
+
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
     :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`_preflight_existing_studies`.
     :raises StudyContextConflictError: An upstream phase still has unfinished
-        top-up trials remaining while a descendant phase's study is already
-        bound to a published winner fingerprint.
+        top-up trials remaining while a phase depending on it - by inheritance,
+        by promotion baseline, or transitively through either - already has a
+        study bound to a published winner fingerprint.
     """
+    inheritance_kind = "inheritance"
+    promotion_kind = "a promotion baseline"
     for index, phase in _phases_from(experiment, from_phase):
         study = existing_studies.get(phase.name)
         if study is None:
@@ -784,24 +810,48 @@ def _reject_bound_descendant_topups(
         if terminal >= phase.n_trials:
             continue
 
-        descendants: set[str] = set()
-        ancestry = {phase.name}
+        # Reachable phase name -> every dependency-edge kind traversed to reach
+        # it, so the refusal can name what actually binds each dependent study.
+        # The phase itself is reachable through no edge at all.
+        reached: dict[str, frozenset[str]] = {phase.name: frozenset()}
         for candidate in experiment.phases[index + 1 :]:
-            if ancestry.intersection(candidate.inherits):
-                descendants.add(candidate.name)
-                ancestry.add(candidate.name)
+            kinds: set[str] = set()
+            for parent in candidate.inherits:
+                if parent in reached:
+                    kinds.add(inheritance_kind)
+                    kinds |= reached[parent]
+            baseline = None if candidate.promotion is None else candidate.promotion.min_delta_vs
+            if baseline is not None and baseline in reached:
+                kinds.add(promotion_kind)
+                kinds |= reached[baseline]
+            if kinds:
+                reached[candidate.name] = frozenset(kinds)
         bound = [
             name
-            for name in descendants
-            if (dependent := existing_studies.get(name)) is not None
+            for name, kinds_reached in reached.items()
+            if kinds_reached
+            and (dependent := existing_studies.get(name)) is not None
             and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
         ]
         if bound:
+            bound_kinds = frozenset().union(*(reached[name] for name in bound))
+            dependency_text = " and ".join(
+                kind for kind in (inheritance_kind, promotion_kind) if kind in bound_kinds
+            )
+            promotion_note = (
+                " A new baseline winner can flip that promotion decision, which either "
+                "republishes the baseline's own effective overrides in the promoted "
+                "phase's slot or drops the promoted phase and its successors from the "
+                "published result."
+                if promotion_kind in bound_kinds
+                else ""
+            )
             raise StudyContextConflictError(
                 f"Phase {phase.name!r} has {phase.n_trials - terminal} top-up trial(s) "
                 f"remaining, but dependent phase study/studies {bound} are already bound "
-                "to its published winner. Use a new experiment name to run the larger "
-                "upstream budget without mutating this completed phase chain."
+                f"to its published winner via {dependency_text}.{promotion_note} "
+                "Use a new experiment name to run the larger upstream budget without "
+                "mutating this completed phase chain."
             )
 
 

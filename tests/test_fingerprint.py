@@ -25,6 +25,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Promotion,
     Sampler,
 )
 from phasesweep.engine import (
@@ -116,6 +117,72 @@ def _two_phase_experiment(
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         phases=phases,
+    )
+
+
+def _promotion_chain_experiment(
+    *,
+    workdir: Path,
+    trainer: Path,
+    storage: str,
+    on_fail: str,
+    arch_n_trials: int = 1,
+) -> Experiment:
+    """Build an arch --promotion baseline--> mid experiment with no inheritance edge.
+
+    ``mid`` depends on ``arch`` only through ``promotion.min_delta_vs``, which
+    config validation requires to name a *prior* phase rather than an inherited
+    one. The constant trainer makes the delta exactly zero, so the first run
+    promotes (``improvement >= min_delta``) and both phases publish a winner.
+
+    :param Path workdir: Artifact root for the experiment.
+    :param Path trainer: Trainer script invoked by every trial.
+    :param str storage: Optuna storage URL; persistent so studies outlive a run.
+    :param str on_fail: Promotion ``on_fail`` policy for ``mid``.
+    :param int arch_n_trials: Trial target for ``arch``; raise it to request a top-up.
+    :return Experiment: Two-phase experiment linked by a promotion baseline.
+    """
+    return make_experiment(
+        workdir=str(workdir),
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=arch_n_trials,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"depth": IntParam(type="int", low=1, high=4)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(
+                    min_delta_vs="arch",
+                    min_delta=0.0,
+                    requires_gates=False,
+                    on_fail=on_fail,  # type: ignore[arg-type]
+                ),
+            ),
+        ],
+    )
+
+
+def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
+    """Build a stand-in study exposing only what the top-up guard reads.
+
+    :param int completed: Number of terminal trials the study reports.
+    :param str | None fingerprint: Bound phase fingerprint, or ``None`` for a
+        study that has not been bound to a published winner yet.
+    :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
+        surface :func:`_reject_bound_descendant_topups` uses.
+    """
+    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE) for _ in range(completed)]
+    return SimpleNamespace(
+        user_attrs={} if fingerprint is None else {"phasesweep_fingerprint": fingerprint},
+        get_trials=lambda *, deepcopy: trials,
     )
 
 
@@ -769,6 +836,65 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     assert {path: path.read_bytes() for path in protected_paths} == before
 
 
+@pytest.mark.parametrize("on_fail", ["skip", "stop", "continue_baseline"])
+def test_promotion_baseline_top_up_is_rejected_before_bound_chain_mutation(
+    tmp_path: Path, on_fail: str
+) -> None:
+    """A bound promotion dependent makes an upstream top-up a preflight refusal.
+
+    Unguarded, every ``on_fail`` policy mutated ``arch`` first and then failed
+    differently against the new baseline winner: ``stop`` raised mid-run,
+    ``continue_baseline`` republished the baseline's overrides under ``mid``
+    (breaking any bound study inheriting it), and ``skip`` - the worst - still
+    *succeeded*, publishing a generation containing only ``arch`` and advancing
+    the last-success pointer past the previously published ``mid`` winner
+    (PR #5 review / reviewer 2 pass 2, blocker 2). The refusal must land before
+    any of that, and it is unconditional - the guard refuses the top-up rather
+    than predicting whether the new baseline would flip the decision - so a
+    constant trainer pins it.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _promotion_chain_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+        on_fail=on_fail,
+    )
+    winners = run_experiment(experiment)
+    assert set(winners) == {"arch", "mid"}
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    protected_paths = [
+        _summary_path(experiment),
+        _last_successful_generation_path(experiment),
+        _generation_summary_path(experiment, published),
+        _generation_record_path(experiment, published),
+        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+        *(
+            _generation_winner_path(experiment, published, phase.name)
+            for phase in experiment.phases
+        ),
+    ]
+    before = {path: path.read_bytes() for path in protected_paths}
+    parent_before = optuna.load_study(study_name="t::arch", storage=storage).trials
+
+    topped_up = _promotion_chain_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+        on_fail=on_fail,
+        arch_n_trials=4,
+    )
+    with pytest.raises(RuntimeError, match="promotion baseline.*new experiment name"):
+        run_experiment(topped_up)
+
+    parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
+    assert len(parent_after) == len(parent_before) == 1
+    assert _last_successful_generation_id(topped_up) == published
+    assert {path: path.read_bytes() for path in protected_paths} == before
+
+
 def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     """A grandchild study binds its ancestor even when the middle study is absent."""
     experiment = make_experiment(
@@ -794,6 +920,111 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
             from_phase=None,
             existing_studies={"arch": parent_study, "final": grandchild_study},
         )
+
+
+def test_upstream_top_up_detects_a_bound_promotion_baseline_dependent() -> None:
+    """A promotion baseline binds its dependent study with no inheritance edge.
+
+    ``promotion.min_delta_vs`` only has to name a prior phase, so this graph is
+    legal and the dependency is invisible to an inherits-only closure
+    (PR #5 review / reviewer 2 pass 2, blocker 2).
+    """
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="skip"),
+            ),
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"study/studies \['mid'\] are already bound to its published winner "
+        r"via a promotion baseline\.",
+    ):
+        _reject_bound_descendant_topups(
+            experiment,
+            from_phase=None,
+            existing_studies={
+                "arch": _fake_top_up_study(completed=1),
+                "mid": _fake_top_up_study(fingerprint="bound-mid"),
+            },
+        )
+
+
+def test_upstream_top_up_reaches_a_bound_grandchild_through_a_promotion_baseline() -> None:
+    """Mixed promotion/inheritance edges compose, even with no study in between."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(
+                    min_delta_vs="arch", min_delta=0.0, on_fail="continue_baseline"
+                ),
+            ),
+            Phase(name="final", inherits=["mid"], n_trials=1, search_space={}),
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"study/studies \['final'\] are already bound to its published winner "
+        r"via inheritance and a promotion baseline\.",
+    ):
+        _reject_bound_descendant_topups(
+            experiment,
+            from_phase=None,
+            existing_studies={
+                "arch": _fake_top_up_study(completed=1),
+                "final": _fake_top_up_study(fingerprint="bound-final"),
+            },
+        )
+
+
+def test_promotion_baseline_dependent_does_not_block_a_completed_upstream_phase() -> None:
+    """The guard still only fires for a phase that actually has top-up trials left."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="stop"),
+            ),
+        ]
+    )
+
+    _reject_bound_descendant_topups(
+        experiment,
+        from_phase=None,
+        existing_studies={
+            "arch": _fake_top_up_study(completed=2),
+            "mid": _fake_top_up_study(fingerprint="bound-mid"),
+        },
+    )
 
 
 def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
