@@ -37,7 +37,7 @@ phases:
       lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-For every trial, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the command, and reads the metric from the result file the trainer writes. That result file is the only obligation your trainer has; see the [trainer contract](docs/config.md#trainer-contract).
+In this starter, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the packaged fake trainer, and reads its objective from `result.json`. Other trainers can supply objective evidence through JSON envelopes, log extraction, or W&B; see the [trainer contract](docs/config.md#trainer-contract).
 
 ## Install and try it
 
@@ -85,7 +85,7 @@ effective_overrides:
 
 ## Use your own trainer
 
-Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory, and `{overrides}` carries the parameters in your chosen `override_format`. Have the trainer write the result file your metric extractor reads, per the [trainer contract](docs/config.md#trainer-contract).
+Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory. Argparse and Hydra templates use `{overrides}` for the rendered parameters; `json_file` templates use `{overrides_path}`. The trainer must accept that boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
 
 Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints every rendered command without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
 
