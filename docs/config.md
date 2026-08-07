@@ -42,7 +42,7 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 `search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. PhaseSweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
-Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be unique under a type-aware identity: `1`, `1.0`, and `true` stay three distinct choices even though Python compares them equal, but the same value listed twice is rejected. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
+Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be pairwise unequal under plain Python comparison, so `[1, 1.0, true]` is rejected as firmly as a literal repeat: Optuna records a sampled value as its `==` index into `choices`, so choices that compare equal cannot be told apart once persisted and the winner would name a value the trial never ran. Give each choice a value no other choice equals. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
 ## Sampler capability on persistent storage
 
@@ -284,14 +284,17 @@ StudyFingerprintMismatchError: Study 'exp::phase' was created with a different p
 
 Nothing about your trainer semantics changed if you never set `execution`; the identity schema did. Finish or archive in-flight studies under the old release, or use a new experiment name for work started under this one. Published generation summaries from earlier releases are likewise reported as historical (`published_config_matches_current: false`) rather than reinterpreted.
 
-### Categorical `choices` must be unique
+### Categorical `choices` must be pairwise unequal
 
 ```text
 phases.0.search_space.x.CategoricalParam.choices
-  Value error, categorical choices must be unique; 1 appears at index 0 and index 1.
+  Value error, categorical choices must remain distinguishable after Optuna persistence;
+  1.0 at index 1 compares equal to 1 at index 0.
 ```
 
-A repeated choice was previously kept verbatim. For a grid phase that inflated the cardinality, so `choices: [1, 1, 2]` with `n_trials: 3` ran three trials over two distinct assignments and still reported the matrix complete; under TPE or random sampling it doubled that value's weight. Before initializing a study, delete the repeat and lower `n_trials` to the new cardinality. For a populated persistent study, changing the choices changes its fingerprint and lowering the accepted trial target is rejected; use a new experiment name or separate storage instead. Uniqueness is type-aware, so `[1, 1.0, true]` is still three choices - they render as three different values at the trainer boundary.
+A repeated choice was previously kept verbatim. For a grid phase that inflated the cardinality, so `choices: [1, 1, 2]` with `n_trials: 3` ran three trials over two distinct assignments and still reported the matrix complete; under TPE or random sampling it doubled that value's weight. Before initializing a study, delete the repeat and lower `n_trials` to the new cardinality. For a populated persistent study, changing the choices changes its fingerprint and lowering the accepted trial target is rejected; use a new experiment name or separate storage instead.
+
+Uniqueness is judged by plain Python comparison rather than by type, so `[1, 1.0, true]`, `[0, false]`, and `[0.0, -0.0]` are rejected too. Optuna records a sampled categorical as its `==` index into `choices`, which means equal-but-differently-typed choices all persist as the first of them: the trainer ran `--x true` while the recorded trial, the published winner, the overrides every child phase inherits, and the TPE history all said `1`. If you meant to compare a number against a flag, use choices that differ as values - `["1", "1.0", "true"]` as strings, or separate keys.
 
 The same completeness rule now covers generated float grids: a `step` small enough that adjacent points collapse under the 12-decimal canonical rounding (`low: 0.0, high: 1.0e-12, step: 1.0e-13`) is rejected rather than silently enumerating repeats. Sweep an exponent or a multiplier rather than values that fine.
 

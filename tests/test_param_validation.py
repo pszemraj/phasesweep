@@ -268,16 +268,35 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
 
 def test_categorical_choices_reject_duplicates() -> None:
     """A repeated choice inflates cardinality and skews sampling weight."""
-    with pytest.raises(ValidationError, match="choices must be unique"):
+    with pytest.raises(ValidationError, match="must remain distinguishable"):
         CategoricalParam(type="categorical", choices=[1, 1, 2])
-    with pytest.raises(ValidationError, match="index 0 and index 2"):
+    with pytest.raises(ValidationError, match="at index 2 compares equal to 'a' at index 0"):
         CategoricalParam(type="categorical", choices=["a", "b", "a"])
 
 
-def test_categorical_duplicate_identity_is_type_aware() -> None:
-    """1, 1.0, and true compare equal in Python but are distinct trainer overrides."""
-    param = CategoricalParam(type="categorical", choices=[1, 1.0, True])
-    assert [type(c).__name__ for c in param.choices] == ["int", "float", "bool"]
+@pytest.mark.parametrize(
+    ("choices", "message"),
+    [
+        pytest.param([1, 1.0], "1.0 at index 1 compares equal to 1 at index 0", id="int_float"),
+        pytest.param([1, True], "True at index 1 compares equal to 1 at index 0", id="int_bool"),
+        pytest.param([0, False], "False at index 1 compares equal to 0 at index 0", id="zero_bool"),
+        pytest.param(
+            [0.0, -0.0], r"-0\.0 at index 1 compares equal to 0\.0 at index 0", id="signed_zero"
+        ),
+    ],
+)
+def test_categorical_rejects_equal_but_distinct_choices(
+    choices: list[object], message: str
+) -> None:
+    """Optuna's ``==`` index lookup cannot tell equal choices apart once persisted.
+
+    ``CategoricalDistribution`` records a sampled value as ``choices.index(value)``,
+    so ``1``, ``1.0``, and ``True`` all persist as the first equal choice. The
+    trainer would run one value while the published winner and every inherited
+    override claimed another (PR #5 review / reviewer 2, blocker 1).
+    """
+    with pytest.raises(ValidationError, match=message):
+        CategoricalParam(type="categorical", choices=choices)
 
 
 def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:

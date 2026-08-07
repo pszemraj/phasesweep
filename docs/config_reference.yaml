@@ -197,7 +197,7 @@
 # type: Literal["categorical"] (required)
 # choices: list[None | bool | int | finite float | str] (required; min length 1)
 # Lists, mappings, objects, NaN, and infinities are rejected. CMA-ES rejects categorical parameters.
-# Choices must be unique under type-aware comparison: `1` and `1.0` (or `True`) may coexist, but repeating the same typed value is rejected because duplicates silently inflate grid cardinality and skew sampling weights.
+# Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights.
 
 # EXTRACTOR OBJECTS
 # An extractor must use exactly one discriminator shape. Every `path`/`file` below is a nonempty trial-relative path: absolute paths and any `..` component are rejected.

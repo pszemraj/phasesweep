@@ -95,7 +95,7 @@ class CategoricalParam(_Frozen):
     @field_validator("choices")
     @classmethod
     def _choices_are_unique_optuna_scalars(cls, choices: list[Any]) -> list[Any]:
-        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and duplicates.
+        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and equal choices.
 
         Optuna keeps a duplicated choice verbatim — ``CategoricalDistribution([1, 1, 2])``
         has three choices and ``GridSampler`` enumerates three points — so
@@ -103,9 +103,19 @@ class CategoricalParam(_Frozen):
         still report the grid complete (review v0.5.17 / finding C). Duplicates
         also silently double a choice's sampling weight under TPE/random.
 
-        Uniqueness is type-aware: ``1``, ``1.0``, and ``true`` are three
-        different overrides on the wire even though Python calls them equal, so
-        the identity key is ``(type name, repr)`` rather than the value itself.
+        Uniqueness is by plain Python equality, across types, because that is
+        the comparison Optuna itself uses. ``CategoricalDistribution.
+        to_internal_repr`` locates a sampled value with ``choices.index(value)``,
+        i.e. by ``==``, when it records ``FrozenTrial.params``. So choices that
+        are distinct objects but compare equal — ``1``/``1.0``/``True``,
+        ``0``/``False``, ``0.0``/``-0.0`` — all collapse onto the *first* equal
+        choice the moment the trial is recorded. The trainer still receives the
+        live suggested value, but the published winner, the inherited overrides
+        of every child phase, and TPE's own history are rebuilt from the
+        collapsed ``params``: a phase that ran ``--x true`` publishes a winner
+        claiming ``x: 1``. Rejecting equal choices at config load is what makes
+        every accepted choice round-trip identically (PR #5 review / reviewer 2,
+        blocker 1).
 
         Args:
             choices: The candidate choices list pre-validation.
@@ -116,14 +126,12 @@ class CategoricalParam(_Frozen):
         Raises:
             ValueError: An element is not an Optuna-compatible scalar
                 (``None``/``bool``/``int``/``float``/``str``), is a non-finite
-                float, or repeats an earlier choice under the type-aware
-                identity key.
+                float, or compares equal to an earlier choice.
 
         """
         # Optuna only accepts None|bool|int|float|str as categorical choices.
         # Anything else (lists, dicts, custom objects) fails at suggest time.
         allowed = (str, int, float, bool, type(None))
-        first_index: dict[tuple[str, str], int] = {}
         for index, c in enumerate(choices):
             if not isinstance(c, allowed):
                 raise ValueError(
@@ -133,17 +141,25 @@ class CategoricalParam(_Frozen):
                 )
             if isinstance(c, float) and not math.isfinite(c):
                 raise ValueError(f"categorical float choices must be finite; got {c!r}")
-            identity = (type(c).__name__, repr(c))
-            if identity in first_index:
-                raise ValueError(
-                    f"categorical choices must be unique; {c!r} appears at index "
-                    f"{first_index[identity]} and index {index}. A repeated choice "
-                    "inflates grid cardinality (the phase runs an extra trial on an "
-                    "assignment it already evaluated, yet still reports a complete "
-                    "grid) and doubles that value's sampling weight. Uniqueness is "
-                    "type-aware: 1, 1.0, and true remain three distinct choices."
-                )
-            first_index[identity] = index
+            # Pairwise ``==`` rather than a hash/identity key: equal objects of
+            # different types (1 vs 1.0 vs True) are exactly the collision
+            # Optuna's index lookup cannot distinguish, and this also holds if
+            # a choice type ever stops being hashable.
+            for earlier_index in range(index):
+                earlier = choices[earlier_index]
+                if c == earlier:
+                    raise ValueError(
+                        "categorical choices must remain distinguishable after "
+                        f"Optuna persistence; {c!r} at index {index} compares equal "
+                        f"to {earlier!r} at index {earlier_index}. Optuna records a "
+                        "sampled value as its `==` index into choices, so equal "
+                        "choices collapse onto the first of them in "
+                        "FrozenTrial.params, the published winner, and every "
+                        "inherited override. A repeat also inflates grid "
+                        "cardinality (the phase runs an extra trial on an "
+                        "assignment it already evaluated, yet still reports a "
+                        "complete grid) and doubles that value's sampling weight."
+                    )
         return choices
 
 

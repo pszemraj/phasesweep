@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep import load_config, load_experiment, run_experiment, run_suite
 from phasesweep.config import (
@@ -25,7 +28,12 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import TerminalReport, read_status, read_winner
-from phasesweep.engine.optuna import _build_sampler, _create_phase_study, _resolve_storage
+from phasesweep.engine.optuna import (
+    _build_sampler,
+    _create_phase_study,
+    _resolve_storage,
+    _suggest,
+)
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -2288,3 +2296,208 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
 
     assert elapsed < 20.0
     assert not _last_successful_generation_path(exp).exists()
+
+
+# A pairwise-unequal mixed-type choice set. `True` is not equal to 0, 1.5, or
+# "one", so config validation accepts it and Optuna's `choices.index(value)`
+# lookup resolves each sampled value to its own index. That is the property
+# `CategoricalParam` now enforces (PR #5 review / reviewer 2, blocker 1): a
+# choice set containing 1 alongside True would collapse both onto one index the
+# moment Optuna recorded `FrozenTrial.params`.
+_FIDELITY_CHOICES: list[Any] = [0, 1.5, "one", True]
+
+# Trainer losses keyed by the rendered argparse token for each choice, chosen so
+# the bool wins. A bool is the value most likely to be silently downgraded to
+# int on a round trip, so it is the winner every downstream surface must report.
+_FIDELITY_LOSSES = {"0": 3.0, "1.5": 2.0, "one": 1.0, "true": 0.0}
+
+
+def _assert_identical_scalar(actual: Any, expected: Any, *, surface: str) -> None:
+    """Assert two scalars match in both value and concrete type.
+
+    Plain ``==`` is exactly the comparison that cannot see this bug: a winner
+    reporting ``1`` for a trial that ran ``True`` compares equal to the truth.
+
+    :param Any actual: Value read back from the surface under test.
+    :param Any expected: Value the engine actually sampled.
+    :param str surface: Human-readable name of the surface, for the failure message.
+    """
+    assert type(actual) is type(expected) and actual == expected, (
+        f"{surface}: expected {expected!r} ({type(expected).__name__}), "
+        f"got {actual!r} ({type(actual).__name__})"
+    )
+
+
+def _resolved_overrides_by_trial(phase_dir: Path) -> dict[int, dict[str, Any]]:
+    """Read every ``overrides_resolved.json`` under a phase dir, keyed by trial number.
+
+    :param Path phase_dir: ``<workdir>/<experiment>/<phase>``.
+    :return dict[int, dict[str, Any]]: Trial number -> resolved override payload.
+    """
+    resolved: dict[int, dict[str, Any]] = {}
+    for path in sorted(phase_dir.glob("trial_*/overrides_resolved.json")):
+        number = int(path.parent.name.split("__")[0].removeprefix("trial_"))
+        resolved[number] = json.loads(path.read_text())
+    return resolved
+
+
+def test_categorical_value_keeps_its_type_across_every_persisted_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sampled categorical must be byte-identical from trainer input to child phase.
+
+    Differential regression for PR #5 review / reviewer 2, blocker 1. Optuna
+    records a sampled categorical as ``choices.index(value)``, an ``==`` lookup,
+    so a choice set holding Python-equal-but-distinct values published a winner
+    naming a value the trial never ran. The validator now rejects such sets;
+    this proves the surviving guarantee holds end to end for an accepted set:
+    the live suggestion, ``FrozenTrial.params``, ``overrides_resolved.json``,
+    ``winner.yaml``, and the dependent phase's inherited overrides all carry the
+    same value *and* the same type.
+    """
+    trainer = write_trainer(
+        tmp_path,
+        f"""
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--x", required=True)
+        args, _ = ap.parse_known_args()
+        print("x=" + str({_FIDELITY_LOSSES!r}[args.x]))
+        """,
+    )
+    storage_url = f"sqlite:///{tmp_path / 'fidelity.db'}"
+    yaml_path = write_yaml(
+        tmp_path,
+        f"""
+        experiment: categorical_fidelity
+        storage: {storage_url}
+        provenance: {{revision: test-fixture-v1}}
+        workdir: {tmp_path / "runs"}
+        trial_command: "python {trainer} {{overrides}}"
+        metric:
+          name: eval_loss
+          goal: minimize
+          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+        phases:
+          - name: pick
+            n_trials: {len(_FIDELITY_CHOICES)}
+            sampler: {{ type: grid, seed: 0 }}
+            search_space:
+              x: {{ type: categorical, choices: [0, 1.5, "one", true] }}
+          - name: child
+            inherits: [pick]
+            n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
+            search_space: {{}}
+        """,
+    )
+
+    # (a) The live value handed to _composed_overrides, i.e. the trainer input.
+    live: dict[int, Any] = {}
+    real_suggest = _suggest
+
+    def recording_suggest(trial: optuna.Trial, name: str, param: Any) -> Any:
+        value = real_suggest(trial, name, param)
+        live[trial.number] = value
+        return value
+
+    monkeypatch.setattr("phasesweep.engine.phase._suggest", recording_suggest)
+
+    exp = load_experiment(yaml_path)
+    winners = run_experiment(exp)
+
+    # The grid covered every choice exactly once, each with its declared type.
+    assert sorted(((type(v).__name__, v) for v in live.values()), key=repr) == sorted(
+        ((type(c).__name__, c) for c in _FIDELITY_CHOICES), key=repr
+    )
+
+    # (b) FrozenTrial.params, read back out of persistent storage.
+    study = optuna.load_study(study_name="categorical_fidelity::pick", storage=storage_url)
+    assert len(study.trials) == len(_FIDELITY_CHOICES)
+    for trial in study.trials:
+        _assert_identical_scalar(
+            trial.params["x"], live[trial.number], surface=f"FrozenTrial.params[{trial.number}]"
+        )
+
+    # (c) The per-trial resolved-overrides audit artifact.
+    phase_dir = tmp_path / "runs" / "categorical_fidelity" / "pick"
+    resolved = _resolved_overrides_by_trial(phase_dir)
+    assert set(resolved) == set(live)
+    for number, value in live.items():
+        _assert_identical_scalar(
+            resolved[number]["x"], value, surface=f"overrides_resolved.json[{number}]"
+        )
+
+    # (d) The published winner: the bool-valued trial won, and says so.
+    winner_doc = yaml.safe_load(_winner_path(exp, "pick").read_text())
+    _assert_identical_scalar(
+        live[winner_doc["trial_number"]], True, surface="live value of the winning trial"
+    )
+    _assert_identical_scalar(winner_doc["params"]["x"], True, surface="winner.yaml params")
+    _assert_identical_scalar(
+        winner_doc["effective_overrides"]["x"], True, surface="winner.yaml effective_overrides"
+    )
+    _assert_identical_scalar(winners["pick"].params["x"], True, surface="in-memory winner params")
+
+    # (e) What the dependent phase actually inherited and re-published.
+    child_resolved = _resolved_overrides_by_trial(tmp_path / "runs" / "categorical_fidelity/child")
+    assert child_resolved
+    for number, payload in child_resolved.items():
+        _assert_identical_scalar(
+            payload["x"], True, surface=f"inherited overrides_resolved.json[{number}]"
+        )
+    child_doc = yaml.safe_load(_winner_path(exp, "child").read_text())
+    _assert_identical_scalar(
+        child_doc["effective_overrides"]["x"], True, surface="child winner.yaml"
+    )
+    _assert_identical_scalar(
+        winners["child"].effective_overrides["x"], True, surface="in-memory child winner"
+    )
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        pytest.param(Sampler(type="grid", seed=0), id="grid"),
+        pytest.param(Sampler(type="random", seed=0), id="random"),
+        pytest.param(
+            Sampler(type="tpe", seed=0, acknowledge_nonresumable=True),
+            id="tpe",
+        ),
+    ],
+)
+def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
+    tmp_path: Path, sampler: Sampler
+) -> None:
+    """Every sampler's suggestion survives Optuna persistence with its type intact.
+
+    The end-to-end fidelity test above pins grid, the only sampler that visits
+    every choice deterministically. This narrower check runs the real
+    ``_suggest`` under random and TPE too and compares the value the objective
+    received against the value persistent storage hands back
+    (PR #5 review / reviewer 2, blocker 1).
+    """
+    param = CategoricalParam(type="categorical", choices=list(_FIDELITY_CHOICES))
+    storage_url = f"sqlite:///{tmp_path / 'round-trip.db'}"
+    study_name = f"round-trip::{sampler.type}"
+    live: dict[int, Any] = {}
+
+    def objective(trial: optuna.Trial) -> float:
+        live[trial.number] = _suggest(trial, "x", param)
+        return 0.0
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        sampler=_build_sampler(sampler, {"x": param}),
+    )
+    study.optimize(objective, n_trials=len(_FIDELITY_CHOICES))
+
+    loaded = optuna.load_study(study_name=study_name, storage=storage_url)
+    assert len(loaded.trials) == len(_FIDELITY_CHOICES)
+    for trial in loaded.trials:
+        _assert_identical_scalar(
+            trial.params["x"],
+            live[trial.number],
+            surface=f"{sampler.type} FrozenTrial.params[{trial.number}]",
+        )
