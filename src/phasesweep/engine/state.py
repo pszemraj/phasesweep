@@ -833,6 +833,7 @@ def _validate_generation_manifest(
                 generation_dir,
                 generation_id,
                 name,
+                source.get("phase"),
                 payload,
                 _fail,
             )
@@ -861,6 +862,7 @@ def _validate_winner_source_generation(
     generation_dir: Path,
     generation_id: str,
     phase_name: str,
+    source_phase: object,
     payload: Mapping[str, Any],
     fail: Callable[[str], RuntimeError],
 ) -> None:
@@ -889,7 +891,8 @@ def _validate_winner_source_generation(
 
     :param Path generation_dir: The publishing generation's namespace directory.
     :param str generation_id: The publishing generation's own id.
-    :param str phase_name: Phase whose winner payload is being validated.
+    :param str phase_name: Phase exposing the winner being validated.
+    :param object source_phase: Recorded phase that owns the source winner artifact.
     :param Mapping[str, Any] payload: Parsed winner artifact, whose
         ``generation_id``/``attempt_id``/``trial_number`` the caller has
         already checked for well-formedness and internal agreement.
@@ -902,6 +905,8 @@ def _validate_winner_source_generation(
     source_generation = payload["generation_id"]
     if source_generation == generation_id:
         return
+    if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
+        raise fail(f"winner for phase {phase_name!r} has no valid winner_source phase")
     if not SAFE_NAME_PATTERN.fullmatch(source_generation):
         # A corrupt or hostile winner could otherwise steer the lookups below
         # out of the generations root with a traversal component.
@@ -915,13 +920,13 @@ def _validate_winner_source_generation(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r} which does not exist in this tree"
         )
-    source_winner_path = source_dir / "phases" / phase_name / _ARTIFACT_FILENAMES["winner"]
+    source_winner_path = source_dir / "phases" / source_phase / _ARTIFACT_FILENAMES["winner"]
     if not source_winner_path.is_file():
         if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
             raise fail(
                 f"winner for phase {phase_name!r} cites source generation "
                 f"{source_generation!r}, which published but holds no winner record "
-                "for that phase"
+                f"for source phase {source_phase!r}"
             )
         # Unpublished source namespace: the crash-recovery case above.
         return
@@ -930,28 +935,29 @@ def _validate_winner_source_generation(
     except PermissionError as exc:
         raise fail(
             _unreadable_artifact_permission_detail(
-                f"source generation {source_generation!r} winner artifact for phase {phase_name!r}"
+                f"source generation {source_generation!r} winner artifact for phase "
+                f"{source_phase!r}"
             )
         ) from exc
     except OSError as exc:
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is missing or unreadable"
+            f"{source_phase!r} is missing or unreadable"
         ) from exc
     try:
         source_payload = yaml.safe_load(content)
     except yaml.YAMLError as exc:
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is not parseable"
+            f"{source_phase!r} is not parseable"
         ) from exc
     if not isinstance(source_payload, Mapping):
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is not a mapping"
+            f"{source_phase!r} is not a mapping"
         )
     expected = {
-        "phase": phase_name,
+        "phase": source_phase,
         "trial_number": payload.get("trial_number"),
         "generation_id": source_generation,
         "attempt_id": payload.get("attempt_id"),

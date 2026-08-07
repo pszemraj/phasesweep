@@ -25,7 +25,7 @@ from phasesweep.config import (
     Sha256Gate,
     Suite,
 )
-from phasesweep.engine import read_winner, run_experiment
+from phasesweep.engine import read_status, read_winner, run_experiment
 from phasesweep.engine.run import ExperimentRunOutcome
 from phasesweep.engine.selection import _apply_promotion
 from phasesweep.engine.state import (
@@ -189,6 +189,53 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     summary = yaml.safe_load((tmp_path / "runs" / "t" / "summary.yaml").read_text())
     assert summary["promotion_decisions"][0] == decision
     assert summary["phases"][1]["promotion"] == decision
+
+
+def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: Path) -> None:
+    """A baseline clone resolves its artifact under the recorded source phase."""
+    trainer = _write_score_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    baseline = Phase(
+        name="baseline",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        fixed_overrides={"score": 1.0},
+        search_space={},
+    )
+    initial = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[baseline],
+    )
+    baseline_winner = run_experiment(initial)["baseline"]
+
+    extended = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            baseline,
+            Phase(
+                name="candidate",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                fixed_overrides={"score": 0.95},
+                search_space={},
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "min_delta": 0.1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+        ],
+    )
+    candidate_winner = run_experiment(extended)["candidate"]
+
+    assert candidate_winner.source is not None
+    assert candidate_winner.source.phase == "baseline"
+    assert candidate_winner.generation_id == baseline_winner.generation_id
+    assert read_status(extended)["publication_integrity"] == "ok"
 
 
 def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
