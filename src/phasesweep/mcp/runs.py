@@ -321,10 +321,13 @@ class RunStore:
 
         :meth:`get` collapses "no such run" and "handle present but
         undecodable" into ``None``. Authority decisions must tell them apart:
-        a missing handle means the generation was never an MCP-launched run
-        (current catalog policy may legitimately apply), while an undecodable
-        one carries frozen launch authority that can no longer be read and
-        must fail closed.
+        an undecodable handle carries frozen launch authority that can no
+        longer be read and must fail closed. A missing handle alone does *not*
+        prove the id was never an MCP run -- the file may have been deleted
+        while other per-run files survive (:meth:`run_evidence_exists`), or
+        the whole state dir replaced, which only the generation's own
+        durable id-source record can reveal (PR #5 review / P2 missing-handle
+        authority).
 
         :param str run_id: Agent-supplied run id to look up.
         :return bool: ``True`` when a handle file exists for a well-shaped id.
@@ -332,6 +335,34 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
         return (self._runs_dir / f"{run_id}.json").is_file()
+
+    def run_evidence_exists(self, run_id: str) -> bool:
+        """Return whether any durable per-run file besides the handle survives.
+
+        A deleted ``runs/<run_id>.json`` removes the frozen launch-authority
+        record but usually not its siblings: the per-run config snapshot,
+        terminal status, log, and cleanup markers all live under this same
+        state dir. Any survivor proves ``run_id`` *was* a launched MCP run
+        whose authority can no longer be read, so visibility decisions must
+        fail closed instead of treating the id as a never-MCP generation and
+        applying current catalog policy (PR #5 review / P2 missing-handle
+        authority).
+
+        :param str run_id: Agent-supplied run id to look up.
+        :return bool: ``True`` when any per-run file exists for a well-shaped id.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        return any(
+            path.is_file()
+            for path in (
+                self.config_snapshot_path(run_id),
+                self.status_path(run_id),
+                self.log_path(run_id),
+                self.cleanup_uncertain_path(run_id),
+                self.cleanup_recovery_path(run_id),
+            )
+        )
 
     def list_handles(self) -> list[RunHandle]:
         """Load every persisted handle, skipping any that are malformed or partial.

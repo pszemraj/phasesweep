@@ -28,7 +28,7 @@ from phasesweep.engine.run import (
     run_suite,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import Winner, generation_id_source
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
@@ -51,6 +51,7 @@ __all__ = [
     "UnsafeProcessCleanupError",
     "Winner",
     "config_status",
+    "generation_id_source",
     "read_status",
     "read_winner",
     "read_winners",

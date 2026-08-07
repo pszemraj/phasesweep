@@ -849,7 +849,11 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
     preflight, execution, or publication still says what search spaces, fixed
     overrides, contracts, env, and trial command produced it. A failure
     writing them fails the claim rather than starting a run whose
-    configuration would be unrecoverable.
+    configuration would be unrecoverable. The record also freezes whether the
+    id was caller-supplied, so a generation launched under an external
+    authority grant (a detached MCP run) stays recognizable as such even if
+    the launcher's own state is later lost (PR #5 review / P2 missing-handle
+    authority).
 
     :param Experiment experiment: Experiment whose generations root is created if missing.
     :param str | None requested_id: Caller-supplied generation id to claim, or
@@ -870,7 +874,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
             raise RuntimeError(
                 f"Generation id {requested_id!r} already exists; refusing to overwrite history."
             ) from exc
-        _write_generation_provenance(experiment, requested_id)
+        _write_generation_provenance(experiment, requested_id, caller_owned_id=True)
         return requested_id
 
     for _ in range(10):
@@ -879,7 +883,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
             _generation_dir(experiment, candidate).mkdir()
         except FileExistsError:
             continue
-        _write_generation_provenance(experiment, candidate)
+        _write_generation_provenance(experiment, candidate, caller_owned_id=False)
         return candidate
     raise RuntimeError("Could not mint an unused generation id after 10 attempts.")
 

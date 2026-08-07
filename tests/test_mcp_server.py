@@ -24,7 +24,7 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, Phase, Sampler, load_config
+from phasesweep.config import Experiment, IntParam, Phase, Sampler, load_config
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -1467,6 +1467,31 @@ def test_legacy_run_without_visibility_never_falls_back_to_current_catalog(
     assert app.winners(run_id=run_id)["phases"][0]["params"] == {"lr": "<redacted>"}
 
 
+def _represent_legacy_generation(experiment: Experiment, generation_id: str) -> None:
+    """Fabricate an identity-only publication that represents ``generation_id``.
+
+    Legacy (pre-manifest) publication: the pointer and summary pass the
+    identity-only gate, so the experiment-scoped read represents the given
+    generation without a real run.
+    """
+    _write_winner_yaml(
+        experiment,
+        "p",
+        phase_fingerprint=_phase_fingerprint(experiment, experiment.phases[0], {}),
+        generation_id=generation_id,
+    )
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        yaml.safe_dump({"experiment": experiment.experiment, "generation_id": generation_id})
+    )
+    pointer = _last_successful_generation_path(experiment)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(
+        yaml.safe_dump({"experiment": experiment.experiment, "generation_id": generation_id})
+    )
+
+
 def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path: Path) -> None:
     """A published generation whose run handle no longer decodes must not be
     rendered under the current catalog policy: the frozen launch authority is
@@ -1477,24 +1502,7 @@ def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path:
     )
     reg = registry.get("srv")
     run_id = "srv-corrupt-handle"
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-        generation_id=run_id,
-    )
-    # Legacy (pre-manifest) publication: the pointer and summary pass the
-    # identity-only gate, so the experiment-scoped read represents run_id.
-    summary_path = _generation_summary_path(reg.experiment, run_id)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(
-        yaml.safe_dump({"experiment": reg.experiment.experiment, "generation_id": run_id})
-    )
-    pointer = _last_successful_generation_path(reg.experiment)
-    pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(
-        yaml.safe_dump({"experiment": reg.experiment.experiment, "generation_id": run_id})
-    )
+    _represent_legacy_generation(reg.experiment, run_id)
     # The handle file exists but no longer decodes.
     handle_path = store._runs_dir / f"{run_id}.json"
     handle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1503,6 +1511,114 @@ def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path:
     winners = app.winners(experiment_id="srv")
 
     assert winners["phases"][0]["params"] == {"lr": "<redacted>"}
+
+
+@pytest.mark.parametrize(
+    "surviving",
+    [
+        "config_snapshot_path",
+        "status_path",
+        "log_path",
+        "cleanup_uncertain_path",
+        "cleanup_recovery_path",
+    ],
+)
+def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
+    tmp_path: Path, surviving: str
+) -> None:
+    """A deleted handle whose sibling per-run files survive is a launched MCP
+    run with unreadable frozen authority, not a never-MCP generation: the
+    current catalog policy may be wider than the lost launch grant, so the
+    narrowest policy applies (PR #5 review / P2 missing-handle authority)."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
+    )
+    reg = registry.get("srv")
+    run_id = "srv-deleted-handle"
+    _represent_legacy_generation(reg.experiment, run_id)
+    # No handle file at all -- deleted after the run -- but one sibling
+    # per-run file under the same state dir survives it.
+    evidence = getattr(store, surviving)(run_id)
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("orphaned\n")
+
+    winners = app.winners(experiment_id="srv")
+
+    assert winners["phases"][0]["params"] == {"lr": "<redacted>"}
+
+
+def test_generation_with_no_run_evidence_and_no_id_source_keeps_current_policy(
+    tmp_path: Path,
+) -> None:
+    """A legacy tree must not be over-closed: a represented generation with no
+    handle, no surviving per-run file, and no recorded id source predates the
+    provenance marker, and the current catalog policy legitimately applies."""
+    config = _config(tmp_path)
+    app, registry, _store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
+    )
+    reg = registry.get("srv")
+    _represent_legacy_generation(reg.experiment, "legacy-cli-generation")
+
+    winners = app.winners(experiment_id="srv")
+
+    assert winners["phases"][0]["params"] == {"lr": 0.001}
+
+
+def _real_run_app(tmp_path: Path) -> tuple[PhaseSweepMCP, Experiment]:
+    """Build an app over a real runnable experiment cataloged with ``visible_params: all``."""
+    trainer = write_constant_trainer(tmp_path)
+    config = tmp_path / "srv.yaml"
+    experiment = make_experiment(
+        experiment="srv",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+        ],
+    )
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, visible_params="all"))
+    return app, experiment
+
+
+def test_replaced_state_dir_fails_closed_for_a_caller_identified_generation(
+    tmp_path: Path,
+) -> None:
+    """Losing the MCP state dir must not widen visibility: the generation's own
+    reproducibility record proves its id -- and so its launch authority -- was
+    caller-granted, and with no handle answering for that frozen grant the
+    narrowest policy applies (PR #5 review / P2 missing-handle authority)."""
+    app, experiment = _real_run_app(tmp_path)
+    # What the detached runner does: publish under the launcher-granted run id.
+    # The app's store holds nothing for it, as after a state-dir replacement.
+    run_experiment(experiment, generation_id="srv-detached-1")
+
+    winners = app.winners(experiment_id="srv")
+
+    assert winners["phases"][0]["params"] == {"x": "<redacted>"}
+
+
+def test_engine_minted_generation_without_a_handle_uses_current_catalog_policy(
+    tmp_path: Path,
+) -> None:
+    """The durable id-source marker must not over-close: a CLI-launched
+    generation records ``engine``, so with no MCP evidence anywhere the current
+    catalog policy legitimately renders its winner values."""
+    app, experiment = _real_run_app(tmp_path)
+    run_experiment(experiment)
+
+    winners = app.winners(experiment_id="srv")
+
+    params = winners["phases"][0]["params"]
+    assert isinstance(params["x"], int)
 
 
 def test_await_run_never_starts_a_status_read_past_the_deadline(

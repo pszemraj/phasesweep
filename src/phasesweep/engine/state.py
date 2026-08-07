@@ -385,7 +385,14 @@ SUITE_SUMMARY_SCHEMA_VERSION = 3
 # overrides, contracts, env, or trial command behind a published winner.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
-REPRODUCIBILITY_SCHEMA_VERSION = 1
+# Version 2 added ``generation_id_source`` (PR #5 review / P2 missing-handle
+# authority): "caller" marks a generation whose identity -- and therefore
+# launch authority -- was granted by an external launcher, durably enough to
+# survive the loss of that launcher's own state directory.
+REPRODUCIBILITY_SCHEMA_VERSION = 2
+
+GenerationIdSource = Literal["caller", "engine"]
+"""Who supplied a generation's identity: an external launcher, or the engine."""
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
 # Manifest kinds that name a file in the generation namespace root rather than
@@ -457,7 +464,12 @@ def _phase_config_fingerprint(phase: Phase) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _write_generation_provenance(experiment: Experiment, generation_id: str) -> None:
+def _write_generation_provenance(
+    experiment: Experiment,
+    generation_id: str,
+    *,
+    caller_owned_id: bool,
+) -> None:
     """Freeze the configuration and provenance that produced one generation.
 
     Written at claim time, immediately after the namespace is created and
@@ -483,8 +495,19 @@ def _write_generation_provenance(experiment: Experiment, generation_id: str) -> 
     Both files are picked up by :func:`_generation_artifact_manifest` and are
     therefore hash-covered by the publication manifest.
 
+    ``reproducibility.json`` also records ``generation_id_source``: whether the
+    generation's identity was supplied by an external launcher (``"caller"``)
+    or minted by the engine (``"engine"``). A launcher that grants an identity
+    also freezes that run's authority (e.g. the MCP server's winner-visibility
+    grant) in its own state; recording the grant's *existence* here, in the
+    artifact tree the results live in, lets readers detect that frozen
+    authority is unaccounted for even after the launcher's state directory is
+    deleted or replaced (PR #5 review / P2 missing-handle authority).
+
     :param Experiment experiment: Experiment whose configuration is frozen.
     :param str generation_id: Freshly claimed generation namespace to write into.
+    :param bool caller_owned_id: Whether ``generation_id`` was supplied by the
+        caller rather than minted by the engine.
     :raises OSError: Either file could not be written; the claim must fail
         rather than run a generation whose configuration is unrecorded.
     :raises phasesweep.runtime.files.UnsafePrivatePathError: Something already
@@ -510,6 +533,7 @@ def _write_generation_provenance(experiment: Experiment, generation_id: str) -> 
             "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
             "experiment": experiment.experiment,
             "generation_id": generation_id,
+            "generation_id_source": "caller" if caller_owned_id else "engine",
             "phasesweep_version": __version__,
             "schema_versions": {
                 "reproducibility": REPRODUCIBILITY_SCHEMA_VERSION,
@@ -530,6 +554,41 @@ def _write_generation_provenance(experiment: Experiment, generation_id: str) -> 
             },
         },
     )
+
+
+def generation_id_source(experiment: Experiment, generation_id: str) -> GenerationIdSource | None:
+    """Return who supplied one generation's identity, or ``None`` when unrecorded.
+
+    Reads the ``generation_id_source`` field frozen into the generation's
+    ``reproducibility.json`` at claim time. ``"caller"`` means an external
+    launcher granted the identity and holds that run's frozen authority record;
+    a reader that cannot load that record must not substitute mutable current
+    policy for it (PR #5 review / P2 missing-handle authority). ``None`` covers
+    every record that does not positively answer the question: no
+    reproducibility file (generations claimed before the file existed), a
+    pre-version-2 record without the field, or an unreadable/malformed file.
+    ``None`` deliberately does not fail closed -- absence is the normal state
+    of every legacy tree, and tampering with the file inside the artifact tree
+    is already surfaced as a failed publication by the manifest check (and a
+    writer there could read the winner files directly anyway).
+
+    :param Experiment experiment: Experiment whose artifact tree holds the generation.
+    :param str generation_id: Generation namespace identifier to look up.
+    :return GenerationIdSource | None: ``"caller"``, ``"engine"``, or ``None``
+        when no valid record answers.
+    """
+    if not SAFE_NAME_PATTERN.fullmatch(generation_id):
+        return None
+    try:
+        payload = json.loads(
+            _generation_reproducibility_path(experiment, generation_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    source = payload.get("generation_id_source")
+    return cast("GenerationIdSource", source) if source in ("caller", "engine") else None
 
 
 def _generation_artifact_manifest(

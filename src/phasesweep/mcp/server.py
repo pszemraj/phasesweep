@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.engine import read_status, read_winners
+from phasesweep.engine import generation_id_source, read_status, read_winners
 from phasesweep.engine.state import PublicationState, Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
@@ -1171,13 +1171,19 @@ class PhaseSweepMCP:
         authority_unreadable = False
         if authority_handle is None and represented_generation_id is not None:
             authority_handle = self._runs.get(represented_generation_id)
-            authority_unreadable = authority_handle is None and self._runs.handle_exists(
-                represented_generation_id
+            authority_unreadable = authority_handle is None and (
+                self._runs.handle_exists(represented_generation_id)
+                or self._runs.run_evidence_exists(represented_generation_id)
+                or generation_id_source(experiment, represented_generation_id) == "caller"
             )
         if authority_unreadable:
             # The represented generation WAS an MCP-launched run, but its
-            # handle no longer decodes: the frozen launch authority cannot be
-            # read, so fall back to the narrowest policy instead of the
+            # frozen launch authority cannot be read: the handle no longer
+            # decodes, or only sibling per-run files survive its deletion, or
+            # -- proof that outlives the state dir itself -- the generation's
+            # own reproducibility record says its id was caller-granted while
+            # no handle answers for it (PR #5 review / P2 missing-handle
+            # authority). Fall back to the narrowest policy instead of the
             # current catalog's, which may be wider than the launch grant.
             visible_params: VisibleParamsPolicy = "none"
         else:

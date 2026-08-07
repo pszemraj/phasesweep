@@ -31,7 +31,13 @@ import yaml
 import phasesweep.engine.run as engine_run
 from phasesweep import load_config, run_experiment
 from phasesweep.config import IntParam, Phase, Sampler, Suite
-from phasesweep.engine import NoFeasibleTrialError, TerminalReport, read_status, read_winner
+from phasesweep.engine import (
+    NoFeasibleTrialError,
+    TerminalReport,
+    generation_id_source,
+    read_status,
+    read_winner,
+)
 from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
     PublicationPointer,
@@ -1395,6 +1401,10 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
 
     assert record["experiment"] == experiment.experiment
     assert record["generation_id"] == generation_id
+    # A direct-caller run mints its own id; only a launcher-granted identity
+    # records "caller" (PR #5 review / P2 missing-handle authority).
+    assert record["generation_id_source"] == "engine"
+    assert generation_id_source(experiment, generation_id) == "engine"
     assert record["phasesweep_version"] == summary["phasesweep_version"]
     assert record["config_fingerprint"] == summary["config_fingerprint"]
     assert record["provenance"] == experiment.provenance
@@ -1415,6 +1425,34 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
     assert _SENTINEL_SECRET not in raw
     assert "TRAINER_TOKEN" not in raw
     assert experiment.trial_command not in raw
+
+
+def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> None:
+    """A launcher-granted identity survives in the artifact tree itself.
+
+    The launcher (the MCP server) freezes the run's authority in its own state
+    dir; this record is what lets readers detect that such frozen authority
+    exists even after that state dir is deleted or replaced (PR #5 review /
+    P2 missing-handle authority). The reader answers ``None`` -- never a
+    guess -- for ids without a valid record, so legacy trees keep their
+    current-policy behavior.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment, generation_id="launcher-granted-1")
+
+    record = json.loads(
+        (_generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME).read_text()
+    )
+    assert record["generation_id_source"] == "caller"
+    assert generation_id_source(experiment, "launcher-granted-1") == "caller"
+
+    # Unanswerable cases collapse to None: no such generation, and a record
+    # predating the field (schema version 1).
+    assert generation_id_source(experiment, "never-claimed") is None
+    del record["generation_id_source"]
+    record_path = _generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME
+    record_path.write_text(json.dumps(record))
+    assert generation_id_source(experiment, "launcher-granted-1") is None
 
 
 def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:
