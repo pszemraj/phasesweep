@@ -226,9 +226,10 @@ class Phase(_Frozen):
         """Reject ambiguous explicit GPU isolation settings.
 
         :raises ValueError: If ``gpu_ids`` and ``gpu_devices`` are both set, if
-            ``gpu_policy='whole_node'`` is combined with ``n_jobs != 1`` or lacks an
-            explicit device list, or if ``gpu_policy='none'`` is combined with a
-            device list or with ``n_jobs > 1`` without ``allow_no_gpu_isolation``.
+            ``gpu_policy='whole_node'`` is combined with ``n_jobs != 1``, lacks an
+            explicit device list, or repeats a device token, or if
+            ``gpu_policy='none'`` is combined with a device list or with
+            ``n_jobs > 1`` without ``allow_no_gpu_isolation``.
         :return Phase: Self, unchanged.
         """
         if self.gpu_ids is not None and self.gpu_devices is not None:
@@ -245,6 +246,30 @@ class Phase(_Frozen):
                 "semantic input, not a throughput knob — so it cannot be left to "
                 "ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection."
             )
+        if self.gpu_policy == "whole_node":
+            # The phase fingerprint records the DECLARED token count as the
+            # trainer's world size, but the runtime pool normalizes and dedupes
+            # tokens before leasing. A repeated token therefore promises a
+            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity
+            # (PR #5 review / reviewer 2, blocker 2). Tokens are stripped
+            # defensively: ``_gpu_devices_non_empty_tokens`` already strips
+            # ``gpu_devices``, but this validator must not depend on that to
+            # see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
+            declared = self.gpu_ids if self.gpu_ids is not None else self.gpu_devices
+            tokens = [str(token).strip() for token in declared or []]
+            duplicates = sorted({token for token in tokens if tokens.count(token) > 1})
+            if duplicates:
+                field = "gpu_ids" if self.gpu_ids is not None else "gpu_devices"
+                raise ValueError(
+                    "gpu_policy='whole_node' requires unique device tokens because the "
+                    "effective device count is part of experiment semantics; "
+                    f"{field} repeats {duplicates}. The phase fingerprint records the "
+                    "declared device count as the trainer's world size, while the GPU "
+                    "pool leases each token once — so a duplicate would run a smaller "
+                    "world than the study identity claims. List each device once, or "
+                    "use gpu_policy='single_per_trial' if you meant a pool rather than "
+                    "a world size."
+                )
         if self.gpu_policy == "none":
             if self.gpu_ids is not None or self.gpu_devices is not None:
                 raise ValueError(

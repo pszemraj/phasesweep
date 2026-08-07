@@ -102,11 +102,11 @@
 # gpu_policy is semantic: changing it invalidates reuse of an existing persistent phase study. Under whole_node the device-set SIZE is semantic too (it is the trainer's world size); which tokens spell the set remains run-control.
 
 # gpu_ids: list[int] | None = null
-# If set, a nonempty list of non-negative CUDA indices. Mutually exclusive with gpu_devices and forbidden by gpu_policy: "none"; duplicates are removed in first-seen order.
+# If set, a nonempty list of non-negative CUDA indices. Mutually exclusive with gpu_devices and forbidden by gpu_policy: "none". Under single_per_trial, duplicates are removed in first-seen order; under whole_node they are rejected at config load, because the effective device count is the trainer's world size and therefore part of experiment semantics.
 # If both explicit lists are null, PhaseSweep uses top-level env.CUDA_VISIBLE_DEVICES when present, otherwise ambient CUDA_VISIBLE_DEVICES, otherwise nvidia-smi detection. An explicit empty string or `-1` exposes no devices and suppresses auto-detection.
 
 # gpu_devices: list[str] | None = null
-# If set, a nonempty list of CUDA_VISIBLE_DEVICES tokens, including GPU/MIG UUIDs. Tokens are stripped, cannot be empty, contain commas, or equal `-1`, and are deduplicated in first-seen order.
+# If set, a nonempty list of CUDA_VISIBLE_DEVICES tokens, including GPU/MIG UUIDs. Tokens are stripped, cannot be empty, contain commas, or equal `-1`. Under single_per_trial they are deduplicated in first-seen order, including two spellings of one physical GPU that nvidia-smi resolution collapses at pool creation. Under whole_node duplicates are rejected instead: repeated tokens fail at config load, and tokens that resolve to one physical GPU fail closed when the pool is created, because the effective device count is the trainer's world size and therefore part of experiment semantics.
 # Mutually exclusive with gpu_ids and forbidden by gpu_policy: "none".
 
 # allow_no_gpu_isolation: bool = false

@@ -257,6 +257,28 @@ def _resolve_lock_identities(
     *,
     uuid_map: dict[str, str] | None = None,
 ) -> list[GpuDevice]:
+    """Bind each device to its canonical physical GPU and drop alias duplicates.
+
+    Args:
+        devices: Devices built from configured, ambient, or detected tokens.
+        uuid_map: Already-probed index-to-UUID map, when available.
+
+    Returns:
+        The devices from :func:`_bind_lock_identities`, deduplicated by lock
+        identity so one physical device is never leased twice in one pool.
+
+    Raises:
+        RuntimeError: Propagated from :func:`_bind_lock_identities`.
+
+    """
+    return _dedupe_by_lock_identity(_bind_lock_identities(devices, uuid_map=uuid_map))
+
+
+def _bind_lock_identities(
+    devices: list[GpuDevice],
+    *,
+    uuid_map: dict[str, str] | None = None,
+) -> list[GpuDevice]:
     """Bind each device to the canonical physical GPU its host lock keys on.
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
@@ -267,13 +289,20 @@ def _resolve_lock_identities(
     (``GPU-...`` UUIDs, ``MIG-...`` instances) are already canonical and lock on
     themselves; phasesweep does not bind a MIG instance to its parent device.
 
+    Binding is kept separate from deduplication so a caller that must fail
+    closed on aliasing can see which tokens collapsed onto one card before they
+    are silently dropped (:func:`_require_distinct_whole_node_devices`). When
+    ``nvidia-smi`` cannot be read, every device keeps its visible token as its
+    own identity, so no alias is ever *detected* on that path — the degradation
+    is reported as a warning here and must not be mistaken for a collision.
+
     Args:
         devices: Devices built from configured, ambient, or detected tokens.
         uuid_map: Already-probed index-to-UUID map, when available.
 
     Returns:
-        The same devices with ``lock_token`` populated, deduplicated by lock
-        identity so one physical device is never leased twice in one pool.
+        The same devices, in order, with ``lock_token`` populated where a
+        canonical identity could be resolved. No device is dropped.
 
     Raises:
         RuntimeError: A token is neither a numeric index nor a
@@ -289,7 +318,7 @@ def _resolve_lock_identities(
     abbreviated = [device for device in devices if _is_abbreviated_gpu_uuid(device.visible_token)]
     if not numeric and not abbreviated:
         # Full opaque token sets are already canonical: no probe, no ambiguity.
-        return _dedupe_by_lock_identity(devices)
+        return devices
 
     if uuid_map is None:
         uuid_map = _detect_gpu_uuid_map()
@@ -312,7 +341,7 @@ def _resolve_lock_identities(
                 "UUIDs, or fix nvidia-smi.",
                 [device.visible_token for device in abbreviated],
             )
-            return _dedupe_by_lock_identity(devices)
+            return devices
         # No map and one consistent spelling: indices remain their own identity,
         # which still collides with itself across runs on this host — but NOT
         # with a concurrent run whose nvidia-smi probe succeeded and locked the
@@ -326,7 +355,7 @@ def _resolve_lock_identities(
             "them. Fix nvidia-smi (PATH, driver) for every orchestrator on this host.",
             [device.visible_token for device in numeric],
         )
-        return _dedupe_by_lock_identity(devices)
+        return devices
 
     resolved: list[GpuDevice] = []
     for device in devices:
@@ -353,7 +382,7 @@ def _resolve_lock_identities(
                 "CUDA_VISIBLE_DEVICES."
             )
         resolved.append(GpuDevice(visible_token=token, lock_token=uuid))
-    return _dedupe_by_lock_identity(resolved)
+    return resolved
 
 
 def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
@@ -376,6 +405,60 @@ def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
         seen[device.lock_identity] = device.visible_token
         unique.append(device)
     return unique
+
+
+def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDevice]) -> None:
+    """Fail closed when a whole-node device set collapses to fewer physical GPUs.
+
+    Under ``gpu_policy='whole_node'`` the configured token list *declares* the
+    trainer's world size, and that declared count is what the phase fingerprint
+    records (``whole_node_device_count``). Deduplication is therefore not a
+    convenience here: dropping an aliased token would run a 1-GPU world under a
+    2-GPU study identity, and the two runs would be indistinguishable afterwards
+    (PR #5 review / reviewer 2, blocker 2). ``single_per_trial`` is unaffected —
+    there the list is a pool whose size is pure throughput, so dedupe with a
+    warning stays correct.
+
+    Only *actual* collapses are reported. A collapse is visible either as a
+    token that :func:`_normalize_devices` removed (an exact repeat, or an empty
+    token) or as two bound devices sharing one ``lock_identity``. Failed
+    resolution never looks like a collapse: when ``nvidia-smi`` is unreadable,
+    :func:`_bind_lock_identities` leaves every device locking on its own visible
+    token, and those are unique by construction — so a host without a usable
+    UUID map warns and proceeds instead of false-positiving here.
+
+    :param list[str] requested: Stripped device tokens exactly as configured,
+        before normalization dropped anything.
+    :param list[GpuDevice] bound: Normalized devices with lock identities bound
+        but not yet deduplicated.
+    :raises RuntimeError: The configured tokens name fewer distinct physical
+        GPUs than the declared world size.
+    """
+    aliases: list[str] = []
+    first_by_identity: dict[str, str] = {}
+    for device in bound:
+        first = first_by_identity.get(device.lock_identity)
+        if first is None:
+            first_by_identity[device.lock_identity] = device.visible_token
+            continue
+        aliases.append(
+            f"{device.visible_token!r} names the same physical GPU as {first!r} "
+            f"(identity {device.lock_identity!r})"
+        )
+    repeats = sorted({token for token in requested if requested.count(token) > 1})
+    effective = len(first_by_identity)
+    if effective == len(requested):
+        return
+    detail = "; ".join(aliases + ([f"token(s) {repeats} appear more than once"] if repeats else []))
+    raise RuntimeError(
+        f"gpu_policy='whole_node' declares {len(requested)} CUDA device token(s) "
+        f"({requested}) but they resolve to only {effective} distinct physical "
+        f"GPU(s): {detail or 'an empty token was dropped'}. The phase fingerprint "
+        "records the declared count as the trainer's world size, so leasing fewer "
+        "devices would silently run a smaller world under a larger study identity. "
+        "List one distinct GPU per world-size slot, or use "
+        "gpu_policy='single_per_trial' if this list is a pool rather than a world."
+    )
 
 
 class GpuPool:
@@ -461,9 +544,12 @@ class GpuPool:
 
         Raises:
             RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
-                ``allow_no_gpu``, or the configured device tokens cannot be
+                ``allow_no_gpu``, the configured device tokens cannot be
                 resolved to canonical physical devices (see
-                :func:`_resolve_lock_identities`).
+                :func:`_bind_lock_identities`), or ``policy='whole_node'`` and
+                the configured tokens collapse to fewer physical GPUs than the
+                declared world size (see
+                :func:`_require_distinct_whole_node_devices`).
 
         """
         if policy == "none":
@@ -473,7 +559,17 @@ class GpuPool:
         # Explicit configuration always wins, even at n_jobs==1.
         explicit = explicit_ids if explicit_ids is not None else explicit_devices
         if explicit is not None:
-            devices = _resolve_lock_identities(_normalize_devices(explicit))
+            bound = _bind_lock_identities(_normalize_devices(explicit))
+            if policy == "whole_node":
+                # Config validation rejects exactly-repeated tokens, but physical
+                # aliasing (index vs UUID for one card) can only be seen once
+                # nvidia-smi has been probed — which happens here, after the
+                # no-op-republish early return in the phase runner. Fail closed
+                # rather than lease a smaller world than the fingerprint claims.
+                _require_distinct_whole_node_devices(
+                    [str(token).strip() for token in explicit], bound
+                )
+            devices = _dedupe_by_lock_identity(bound)
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 

@@ -675,3 +675,115 @@ def test_gpu_policy_none_rejects_explicit_gpu_lists() -> None:
             gpu_ids=[0],
             search_space={"x": IntParam(type="int", low=0, high=1)},
         )
+
+
+def test_gpu_policy_whole_node_rejects_duplicate_gpu_ids() -> None:
+    """The fingerprint records the declared count, so a repeat is a semantic lie:
+    gpu_ids=[0, 0] would fingerprint a 2-GPU world and lease one card
+    (PR #5 review / reviewer 2, blocker 2)."""
+    with pytest.raises(ValueError, match="whole_node.*requires unique device tokens"):
+        Phase(  # type: ignore[arg-type]
+            name="p",
+            n_trials=1,
+            gpu_policy="whole_node",
+            gpu_ids=[0, 0],
+            search_space={"x": IntParam(type="int", low=0, high=1)},
+        )
+
+
+def test_gpu_policy_whole_node_accepts_distinct_gpu_ids() -> None:
+    phase = Phase(  # type: ignore[arg-type]
+        name="p",
+        n_trials=1,
+        gpu_policy="whole_node",
+        gpu_ids=[0, 1],
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+
+    assert phase.gpu_ids == [0, 1]
+
+
+def test_gpu_policy_whole_node_rejects_duplicate_gpu_devices() -> None:
+    with pytest.raises(ValueError, match="whole_node.*requires unique device tokens"):
+        Phase(  # type: ignore[arg-type]
+            name="p",
+            n_trials=1,
+            gpu_policy="whole_node",
+            gpu_devices=["GPU-uuid-a", "GPU-uuid-a"],
+            search_space={"x": IntParam(type="int", low=0, high=1)},
+        )
+
+
+def test_gpu_policy_whole_node_rejects_duplicate_gpu_devices_after_stripping() -> None:
+    """Whitespace is not a distinguishing feature: the runtime strips tokens
+    before deduping, so the declared count must be counted post-strip too."""
+    with pytest.raises(ValueError, match=r"whole_node.*requires unique device tokens"):
+        Phase(  # type: ignore[arg-type]
+            name="p",
+            n_trials=1,
+            gpu_policy="whole_node",
+            gpu_devices=[" GPU-a ", "GPU-a"],
+            search_space={"x": IntParam(type="int", low=0, high=1)},
+        )
+
+
+def test_single_per_trial_still_accepts_duplicate_device_tokens() -> None:
+    """Dedup stays supported pool behavior: only whole_node's count is semantic."""
+    phase = Phase(  # type: ignore[arg-type]
+        name="p",
+        n_trials=1,
+        gpu_ids=[0, 0, 1],
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+
+    assert phase.gpu_ids == [0, 0, 1]
+
+
+def test_whole_node_rejects_two_tokens_naming_one_physical_gpu(monkeypatch) -> None:
+    """Physical aliasing is invisible to config validation (it needs nvidia-smi),
+    so the pool must fail closed instead of leasing a 1-GPU world under a 2-GPU
+    fingerprint (PR #5 review / reviewer 2, blocker 2)."""
+    uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    with pytest.raises(RuntimeError, match="whole_node.*2 CUDA device token"):
+        GpuPool.create(n_jobs=1, explicit_devices=["0", uuid], policy="whole_node")
+
+
+def test_whole_node_accepts_distinct_physical_gpus(monkeypatch) -> None:
+    uuid_map = {"0": "GPU-aaa11111", "1": "GPU-bbb22222"}
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: uuid_map)
+
+    pool = GpuPool.create(n_jobs=1, explicit_devices=["0", "1"], policy="whole_node")
+
+    assert [device.visible_token for device in pool._devices] == ["0", "1"]
+    with pool.acquire() as gid:
+        assert gid == "0,1"
+
+
+def test_single_per_trial_still_dedupes_aliased_tokens_with_a_warning(monkeypatch, caplog) -> None:
+    """The same alias pair that fails closed under whole_node stays a pool
+    convenience under single_per_trial."""
+    uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1, explicit_devices=["0", uuid])
+
+    assert [device.visible_token for device in pool._devices] == ["0"]
+    assert any("same physical GPU" in record.message for record in caplog.records)
+
+
+def test_whole_node_does_not_fail_closed_when_uuid_resolution_is_unavailable(
+    monkeypatch, caplog
+) -> None:
+    """Without nvidia-smi every token locks on its own spelling, so nothing
+    collapses — the count check must not mistake unresolvable identities for an
+    alias collision."""
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
+
+    assert [device.visible_token for device in pool._devices] == ["0", "1"]
+    assert any("index-to-UUID resolution is unavailable" in r.message for r in caplog.records)
