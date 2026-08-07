@@ -4,11 +4,30 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
-from phasesweep.config.common import _Frozen, _validate_optional_bounds
+from phasesweep.config.common import _Frozen, _require_finite, _validate_optional_bounds
+
+StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
+"""The exact set of values a JSON document can hold at a leaf position.
+
+Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
+``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
+neighbouring type. Anything outside this union — a mapping, a sequence, a
+``datetime.date`` — is not representable in parsed JSON and is rejected at
+config load rather than normalized later.
+"""
 
 
 def _validate_trial_path(value: str) -> str:
@@ -247,12 +266,63 @@ class RequiredFileGate(_TrialPathModel):
 
 
 class JsonEqualsGate(_TrialPathModel, _JsonKeyModel):
-    """Require a JSON key to equal an expected scalar value."""
+    """Require a JSON key to equal an expected JSON scalar.
+
+    ``value`` must be a JSON scalar (``bool``, ``int``, ``float``, ``str``, or
+    ``null``) and is validated strictly, because *type identity is part of this
+    gate's semantics*: :func:`phasesweep.evidence.evaluation._json_equals`
+    compares with ``type(actual) is type(gate.value)``, so ``true``, ``1``, and
+    ``1.0`` are three different gates. Coercion would silently rewrite one into
+    another, so no member of the union coerces.
+
+    Non-scalars (mappings, sequences, YAML dates) are rejected outright rather
+    than merely never matching (PR #5 review / reviewer 2, blocker 4). The
+    study fingerprint hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, which normalizes exactly the values that
+    strict JSON cannot hold: ``{1: "x"}`` and ``{"1": "x"}`` collapse to one
+    digest, as do ``date(2024, 1, 1)`` and ``"2024-01-01"``. Since parsed JSON
+    never yields an int-keyed mapping or a ``date``, those variants could never
+    pass while their surviving twins could — two configs that judge feasibility
+    in mutually exclusive ways would share one phase fingerprint and be allowed
+    to reuse each other's study. Rejecting them at load keeps the fingerprint
+    faithful to runtime behaviour. Non-finite floats (``.nan``, ``.inf``) are
+    rejected for the same reason: JSON has no encoding for them.
+    """
 
     type: Literal["json_equals"]
     path: str
     key: str
-    value: Any
+    value: StrictJsonScalar
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _value_is_json_scalar(cls, value: object) -> object:
+        """Reject values strict JSON cannot hold, naming the offending type.
+
+        Runs before the ``StrictJsonScalar`` union purely for the message: the
+        union alone reports one "input should be a valid <member>" error per
+        member, which never says *why* a mapping or a YAML date is wrong. The
+        union remains the authority on type identity (it is what refuses to
+        coerce ``1`` into ``1.0``); this validator only front-runs the cases a
+        config author actually hits.
+
+        :param object value: Raw expected value straight from the config.
+        :raises ValueError: If ``value`` is not a JSON scalar, or is a
+            non-finite float.
+        :return object: The unchanged value, for the strict union to validate.
+        """
+        if not isinstance(value, (bool, int, float, str, type(None))):
+            raise ValueError(
+                "json_equals gate value must be a JSON scalar (bool, int, float, str, or "
+                f"null); got {type(value).__name__}. Parsed JSON never produces that type, so "
+                "such a gate could never pass, and the study fingerprint would render it "
+                "identically to a value that can — silently sharing one study between two "
+                "configs that disagree on feasibility. YAML dates are the common case: quote "
+                "them ('2024-01-01') to compare against the JSON string."
+            )
+        if isinstance(value, float):
+            _require_finite("json_equals gate value", value)
+        return value
 
 
 class JsonScalarBoundGate(_TrialPathModel, _JsonKeyModel):

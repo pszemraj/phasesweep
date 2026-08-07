@@ -9,7 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from phasesweep import load_config, run_config
+from phasesweep import load_config, load_experiment, run_config
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     ArtifactSizeGate,
@@ -781,6 +781,69 @@ def test_json_equals_gate_requires_matching_json_type(tmp_path: Path) -> None:
     assert [result.passed for result in results] == [True, False, False]
     assert "bool" in results[1].detail
     assert "float" in results[2].detail
+
+
+def _json_equals_gate_yaml(value_literal: str) -> str:
+    """Return an experiment body whose only gate compares against ``value_literal``."""
+    return f"""
+    experiment: t
+    storage: ":memory:"
+    provenance: {{revision: test-fixture-v1}}
+    trial_command: "echo {{overrides}}"
+    metric:
+      name: loss
+      goal: minimize
+      extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
+    phases:
+      - name: a
+        n_trials: 1
+        search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+        gates:
+          - type: json_equals
+            path: result.json
+            key: k
+            value: {value_literal}
+    """
+
+
+@pytest.mark.parametrize(
+    ("value_literal", "message"),
+    [
+        ("2024-01-01", "must be a JSON scalar"),
+        ("{1: x}", "must be a JSON scalar"),
+        ("[1, 2]", "must be a JSON scalar"),
+        (".nan", "must be finite"),
+        (".inf", "must be finite"),
+    ],
+    ids=["yaml_date", "mapping", "sequence", "nan", "inf"],
+)
+def test_json_equals_gate_rejects_non_json_scalars(
+    tmp_path: Path, value_literal: str, message: str
+) -> None:
+    """Non-JSON gate values fail at load, not silently at every trial.
+
+    The YAML loader is a ``SafeLoader`` subclass, so an unquoted ``2024-01-01``
+    arrives as a ``datetime.date`` and an inline ``{1: x}`` keeps its int key.
+    Neither can appear in parsed JSON, so such a gate could never pass — while
+    the phase fingerprint, which hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, renders it identically to the quoted
+    string or string-keyed mapping that *can* pass. Two configs disagreeing on
+    feasibility would share one study (PR #5 review / reviewer 2, blocker 4).
+    """
+    path = write_yaml(tmp_path, _json_equals_gate_yaml(value_literal))
+
+    with pytest.raises(ValueError, match=message) as excinfo:
+        load_experiment(path)
+
+    # The error must locate the offending gate, not just the experiment.
+    assert "phases.0.gates.0.json_equals.value" in str(excinfo.value)
+
+
+def test_json_equals_gate_accepts_quoted_date(tmp_path: Path) -> None:
+    """The documented fix for a rejected YAML date is to quote it."""
+    experiment = load_experiment(write_yaml(tmp_path, _json_equals_gate_yaml("'2024-01-01'")))
+
+    assert experiment.phases[0].gates[0].value == "2024-01-01"
 
 
 def test_artifact_size_gate_reports_bad_sources(tmp_path: Path) -> None:

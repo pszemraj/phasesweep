@@ -21,6 +21,7 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
+    JsonEqualsGate,
     LogRegexExtractor,
     Metric,
     Phase,
@@ -514,6 +515,39 @@ def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
     assert _phase_fingerprint(acknowledged, acknowledged.phases[0], {}) != _phase_fingerprint(
         reseeded, reseeded.phases[0], {}
     )
+
+
+def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
+    """A json_equals gate value's *type* is semantic, so it must be in the digest.
+
+    ``_json_equals`` compares with ``type(actual) is type(gate.value)``, so
+    ``1``, ``"1"``, ``true``, and ``1.0`` accept four disjoint JSON documents.
+    The fingerprint hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, which preserves that distinction only for
+    values strict JSON can hold — which is why ``JsonEqualsGate.value`` is
+    restricted to a strict JSON-scalar union (PR #5 review / reviewer 2,
+    blocker 4). Anything it now rejects (a YAML date, an int-keyed mapping)
+    would have collapsed onto a colliding twin here.
+    """
+
+    def fingerprint_for(value: bool | int | float | str | None) -> str:
+        experiment = make_experiment(
+            gates=[JsonEqualsGate(type="json_equals", path="result.json", key="k", value=value)]
+        )
+        return _phase_fingerprint(experiment, experiment.phases[0], {})
+
+    fingerprints = {
+        "int": fingerprint_for(1),
+        "str": fingerprint_for("1"),
+        "bool": fingerprint_for(True),
+        "float": fingerprint_for(1.0),
+        "null": fingerprint_for(None),
+    }
+
+    assert len(set(fingerprints.values())) == len(fingerprints), fingerprints
+    # The gate participates at all: dropping it is also an edit.
+    ungated = make_experiment()
+    assert _phase_fingerprint(ungated, ungated.phases[0], {}) not in set(fingerprints.values())
 
 
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:

@@ -245,8 +245,8 @@
 # type: Literal["json_equals"] (required)
 # path: str (required)
 # key: str (required)
-# value: Any (required)
-# Equality is type-strict: boolean, integer, and float encodings are distinct. Use json_scalar_bound for numeric comparisons across integer/float JSON values.
+# value: bool | int | float | str | null (required)
+# A strict JSON scalar. Equality is type-strict and nothing is coerced, so boolean, integer, float, and string encodings are distinct. Mappings, sequences, non-finite floats (.nan, .inf), and unquoted YAML dates (2024-01-01 parses as a date, not a string) are rejected at load: parsed JSON cannot hold them, so such a gate could never pass, yet the phase fingerprint would render it identically to a value that can. Quote a date ('2024-01-01') to compare it against a JSON string, and use json_scalar_bound for numeric comparisons across integer/float JSON values.
 
 # type: Literal["json_scalar_bound"] (required)
 # path: str (required)
