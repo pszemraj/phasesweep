@@ -946,7 +946,10 @@ class PublicationPointer:
     :func:`_last_successful_generation_id` view, since both non-``ok`` states
     mean the same thing to them: nothing may be read as published.
 
-    ``error`` is deliberately path-free so MCP payloads can carry it.
+    ``error`` is deliberately path-free: it names artifacts by role rather than
+    location, so any reporting surface could quote it safely -- though the MCP
+    layer forwards only the ``publication_integrity`` enum and leaves the
+    free-text detail to the operator-facing CLI.
     """
 
     state: PublicationState
