@@ -95,13 +95,11 @@ phasesweep run experiment.yaml --from-phase learning_rate   # resume after prere
 phasesweep rebind-workdir experiment.yaml                   # after you moved the artifact tree yourself
 ```
 
-On persistent storage each phase study is bound to the one `workdir` it publishes into, so re-running the same config against a different `workdir` is refused rather than allowed to produce a second, divergent result tree. Move the tree first, then `rebind-workdir` points the studies at it.
-
 See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout. The [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer integration.
 
 ## Connect an agent
 
-The optional MCP server connects an AI agent to experiments you have approved without exposing trainer commands, paths, storage, environment, or raw logs. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result. See the [MCP operator reference](docs/mcp.md) for the tool surface and security model.
+The optional MCP server connects an AI agent to experiments you have approved without exposing trainer commands, paths, storage, environment, or raw logs. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result.
 
 ## Reference
 
