@@ -47,6 +47,7 @@ from phasesweep.mcp.snapshots import (
 from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
+    absorb_shutdown_signals,
     defer_shutdown_signals,
     install_signal_handlers,
     read_boot_id,
@@ -524,28 +525,56 @@ def main(argv: list[str] | None = None) -> int:
         def capture_terminal(report: TerminalReport) -> None:
             """Capture immutable results while ``run_experiment`` still owns its lock.
 
+            The whole body is an absorbed-shutdown critical section (PR #5
+            review / reviewer 2 pass 2, blocker 3). The engine calls this
+            callback inside a diagnostic boundary that swallows
+            :class:`BaseException` on purpose, so a shutdown raised here by the
+            installed handler - :class:`PhaseSweepShutdown` is a
+            :class:`SystemExit`, which the local ``except Exception`` below
+            does not catch - is consumed there and vanishes: an already
+            published run would end with no frozen result, an unrecoverable
+            ``result_snapshot_state="failed"``, and no record of the
+            cancellation at all.
+
+            Absorbing rather than deferring is the point:
+            :func:`defer_shutdown_signals` services the signal at window exit,
+            which is still inside the callback, so the raise would be swallowed
+            just the same. Absorption keeps it pending for the next checkpoint
+            - ``_write_status``'s defer window, which the engine's publication
+            transaction already names as the MCP runner's terminal status write
+            - so the shutdown is honored only after terminal evidence is
+            durable.
+
             :param TerminalReport report: Engine outcome and cleanup evidence.
             """
             nonlocal result_snapshot, result_snapshot_error, terminal_report
-            terminal_report = report
-            status["cleanup_confirmed"] = report.cleanup_confirmed
-            status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
-            if report.primary_error is not None:
-                status["failure"] = _terminal_failure_payload(
-                    report.primary_error,
-                    stage=report.failure_stage,
-                    cleanup_confirmed=report.cleanup_confirmed,
-                )
-            try:
-                result_snapshot = capture_result_snapshot(
-                    config,
-                    generation_id=report.generation_id,
-                    engine_winners=report.winners,
-                )
-            except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
-                result_snapshot_error = type(exc).__name__
-                logging.getLogger("phasesweep.mcp.runner").exception(
-                    "failed to capture terminal result snapshot under the experiment lock"
+            with absorb_shutdown_signals() as absorbed:
+                terminal_report = report
+                status["cleanup_confirmed"] = report.cleanup_confirmed
+                status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
+                if report.primary_error is not None:
+                    status["failure"] = _terminal_failure_payload(
+                        report.primary_error,
+                        stage=report.failure_stage,
+                        cleanup_confirmed=report.cleanup_confirmed,
+                    )
+                try:
+                    result_snapshot = capture_result_snapshot(
+                        config,
+                        generation_id=report.generation_id,
+                        engine_winners=report.winners,
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
+                    result_snapshot_error = type(exc).__name__
+                    logging.getLogger("phasesweep.mcp.runner").exception(
+                        "failed to capture terminal result snapshot under the experiment lock"
+                    )
+            if absorbed.signum is not None:
+                logging.getLogger("phasesweep.mcp.runner").warning(
+                    "shutdown signal %d arrived while the terminal result snapshot was being "
+                    "captured; it was held until the snapshot was safe and will be honored "
+                    "once terminal status is durable",
+                    absorbed.signum,
                 )
 
         run_experiment(

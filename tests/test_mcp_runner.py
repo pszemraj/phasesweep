@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -52,7 +53,12 @@ from phasesweep.runtime.process import (
     read_boot_id,
 )
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
-from tests.mcp_helpers import claim_runner_handle, runner_main, slow_mcp_config_text
+from tests.mcp_helpers import (
+    claim_runner_handle,
+    make_run_handle,
+    runner_main,
+    slow_mcp_config_text,
+)
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -75,6 +81,33 @@ def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
         )
     )
     return config
+
+
+def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
+    """Write a one-trial experiment the detached runner can complete in-process.
+
+    :param Path tmp_path: Directory receiving the trainer, config, and workdir.
+    :param str name: Experiment name, also the catalog id used by the runner.
+    :return tuple[Path, str]: Config path and its SHA-256, as the server pins it.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    config_path = tmp_path / f"{name}.yaml"
+    config_path.write_text(
+        f"""
+experiment: {name}
+workdir: {tmp_path}/runs
+trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+metric:
+  name: x
+  goal: minimize
+  extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+phases:
+  - name: p
+    n_trials: 1
+    search_space: {{}}
+"""
+    )
+    return config_path, hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
 def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path) -> Path:
@@ -718,6 +751,92 @@ phases:
     handle = store.get(run_id)
     assert handle is not None
     assert store.state(handle) == "succeeded"
+
+
+def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end (PR #5 review / reviewer 2 pass 2, blocker 3): cancel loses the race.
+
+    A real SIGTERM is delivered to this process while the terminal snapshot of
+    an already-published generation is being captured. The engine invokes that
+    callback inside a diagnostic boundary that swallows ``BaseException``, so
+    an unabsorbed :class:`PhaseSweepShutdown` would be consumed there and the
+    frozen result destroyed for good: the run would end ``returncode`` 0 with
+    ``result_snapshot_state="failed"``, no snapshot, and no trace of the
+    cancellation - and ``recover-run`` refuses to rebuild a missing snapshot.
+
+    The absorbed window makes the outcome deterministic instead: the snapshot
+    is captured and durably ``complete``, the engine's published outcome is
+    untouched, and only then does the process exit with the POSIX signalled
+    code for the signal it held.
+    """
+    import phasesweep.runtime.process as runtime_process
+
+    # Restores the module's pending-shutdown marker to ``None`` at teardown, so
+    # a failure before the runner services the signal cannot leak an absorbed
+    # shutdown into an unrelated later test.
+    monkeypatch.setattr(runtime_process, "_deferred_shutdown_signum", None)
+
+    config_path, config_sha256 = _constant_trial_config(tmp_path, "cancel_at_capture")
+    real_capture = mcp_runner.capture_result_snapshot
+
+    def capture_under_shutdown(*args: object, **kwargs: object) -> dict:
+        # A real signal through the real installed handler: the absorb window
+        # is the only thing that can keep it from raising through the capture.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_capture(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_runner, "capture_result_snapshot", capture_under_shutdown)
+
+    store = RunStore(tmp_path / "state")
+    run_id = "capture-cancel"
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id="cancel_at_capture",
+    )
+
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
+        runner_main(
+            [
+                "--run-id",
+                run_id,
+                "--config",
+                str(config_path),
+                "--config-sha256",
+                config_sha256,
+                "--status-path",
+                str(store.status_path(run_id)),
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--experiment-id",
+                "cancel_at_capture",
+                "--started-at",
+                started_at,
+            ],
+            cwd=tmp_path,
+        )
+
+    # The shutdown is honored, but only after terminal evidence is durable:
+    # it surfaces out of the terminal status write's own defer window.
+    assert exc_info.value.signum == signal.SIGTERM
+    assert exc_info.value.code == 128 + signal.SIGTERM
+    assert runtime_process._deferred_shutdown_signum is None
+
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    assert [w["phase"] for w in terminal["result_snapshot"]["winners"]] == ["p"]
+    # The engine published before the signal arrived, so its own outcome - and
+    # the terminal status recording it - stay a success.
+    assert terminal["returncode"] == 0
+    assert terminal["error_class"] is None
+    assert terminal["failure"] is None
+    assert _last_successful_generation_id(load_config(config_path)) == run_id
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
