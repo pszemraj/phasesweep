@@ -15,8 +15,6 @@ The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 M
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
-The submodule pins the external trainer revision used by this example without copying its source into PhaseSweep. Treat `upstream/` as external code: update the submodule pointer when you intentionally want a newer trainer, but keep adapter changes in this PhaseSweep example.
-
 This is an orchestration example, not a PyTorch training-template recommendation. The pinned trainer's known portability and numerical limitations are listed under [development work](../../docs/development.md#tracked-todos); fix them upstream, then update the submodule pointer here.
 
 ## CLI smoke sweep
