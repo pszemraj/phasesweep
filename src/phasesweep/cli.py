@@ -647,7 +647,10 @@ def status(config_path: Path) -> None:
         "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
         "publication validates; refuses relocating a published suite. Also the migration path "
         "for a study that predates artifact-root binding: point the config at that study's "
-        "original tree. Writes nothing unless every check passes."
+        "original tree. Writes nothing unless every check passes. Note that a run refused for "
+        "a workdir conflict leaves a failed generation record under the new workdir - remove "
+        "that experiment directory before moving the tree there, or the move nests it one "
+        "level deep."
     ),
     short_help="Rebind studies to a moved artifact tree.",
 )
@@ -676,6 +679,11 @@ def rebind_workdir(config_path: Path) -> None:
     deliberately broader than the cases PhaseSweep can repair (re-review
     v0.5.19 / blocker B2; see the tracked relocation TODO in
     ``docs/development.md``).
+
+    Operational note: a run refused for a workdir conflict has already claimed
+    a generation under the *destination* workdir, so that experiment directory
+    exists and holds a failed generation record. Remove it before moving the
+    tree there, or the move nests the tree one level deep.
 
     :param Path config_path: Path to the experiment or suite YAML file whose
         ``workdir`` already names the artifact tree these studies own.
