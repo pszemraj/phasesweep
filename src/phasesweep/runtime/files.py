@@ -1142,6 +1142,26 @@ def storage_is_in_memory(storage: str | None) -> bool:
     )
 
 
+def sqlite_database_path(storage: str) -> Path | None:
+    """Return the filesystem path of a file-backed SQLite storage URL.
+
+    Lets callers distinguish "the database file does not exist" (so no study
+    can exist in it) from "the file exists but cannot be read right now"
+    (locked, corrupt, permission-denied), which must not be collapsed into
+    absence on paths that authorize mutation.
+
+    :param str storage: SQLite storage URL.
+    :return Path | None: Concrete database file path, or ``None`` for
+        in-memory storage.
+    """
+    if storage_is_in_memory(storage):
+        return None
+    database = file_url_path(storage)
+    if _sqlite_uri_filename_enabled(storage, database):
+        return Path(unquote(urlsplit(database).path)).expanduser()
+    return Path(database).expanduser()
+
+
 def sqlite_readonly_uri(storage: str) -> str | None:
     """Build a ``sqlite3.connect(..., uri=True)`` URI for read-only status reads.
 

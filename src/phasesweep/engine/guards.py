@@ -1597,53 +1597,61 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     _claim_study_artifact_root(study, _artifact_root_identity(experiment))
 
 
-def _bind_artifact_root(experiment: Experiment) -> None:
-    """Bind every already-existing phase study to this config's artifact root.
+def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.Study]:
+    """Load every existing phase study exactly once, then check and claim roots.
 
-    The preflight half of the binding: it runs before stale reaping and before
-    any trial work, so an invocation offering a second publication root never
-    reaps, tops up, or publishes anything and leaves the *bound* tree exactly
-    as it found it. Phases whose study does not exist yet are bound by
-    :func:`_bind_study_artifact_root` when the phase creates them.
+    Discovery on this mutating path is strict and tri-state (PR #5 review /
+    reviewer 2, issue 1): a phase's study is *absent* (storage read fine, no
+    such study), *present* (loaded and returned), or *unavailable* -- and
+    unavailable raises before any claim, reaping, or registry recovery runs.
+    The earlier shape swallowed a read failure here and let the main preflight
+    loop re-read; a transient failure (a brief SQLite lock, an RDB reconnect)
+    could then succeed on that second read, handing stale-trial reaping a
+    study whose artifact-root binding was never checked -- mutation of a
+    wrong-root ledger before the conflict was enforced. The returned mapping
+    is therefore the *only* discovery pass: the study objects that passed the
+    root check here are the exact objects preflight goes on to reap and
+    validate.
 
     Every declared phase is checked before any claim is written (re-review
-    v0.5.19 / blocker B3). Claiming as each phase was checked left the earlier
-    studies of a refused multi-phase run bound to the *rejected* root while
-    the error still said nothing was published. A study that cannot be read at
-    all suppresses the claims for its siblings too: the main preflight loop
-    turns that into :class:`StudyStorageUnavailableError` and aborts, and
-    binding the readable studies for a run that is about to abort would invent
-    a binding the operator never got a run out of. Preflight holds the
-    experiment lock across both passes, so nothing can bind in between.
+    v0.5.19 / blocker B3), so a refused multi-phase run leaves no study bound
+    to the rejected root. Preflight holds the experiment lock across load,
+    check, and claim, so nothing can bind in between. Phases whose study does
+    not exist yet are bound by :func:`_bind_study_artifact_root` when the
+    phase creates them.
 
     :param Experiment experiment: Parsed experiment whose declared phase
-        studies are bound to its resolved artifact root.
+        studies are loaded and bound to its resolved artifact root.
+    :return dict[str, optuna.Study]: Existing studies keyed by phase name
+        (phases with no durable study yet are omitted).
+    :raises StudyStorageUnavailableError: A phase's persistent storage could
+        not be inspected, so whether its study exists -- and what root it is
+        bound to -- cannot be determined.
     :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
         records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, or carries a binding that is not a string.
     """
-    if not _artifact_root_binding_applies(experiment):
-        return
-    claimable: list[optuna.Study] = []
-    unreadable = False
+    loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)
-        except Exception:  # noqa: BLE001 - reported as StudyStorageUnavailableError below
-            # Leave the diagnosis to the main preflight loop, which turns this
-            # into StudyStorageUnavailableError and aborts the run anyway; a
-            # study that cannot be read cannot be bound either way. Keep
-            # checking the remaining phases so a conflict is still reported.
-            unreadable = True
-            continue
-        if study is not None and _artifact_root_claim_needed(study, experiment):
-            claimable.append(study)
-    if unreadable:
-        return
+        except Exception as exc:
+            unavailable = StudyStorageUnavailableError(
+                f"Could not inspect persistent study storage for phase {phase.name!r}."
+            )
+            raise unavailable from exc
+        if study is not None:
+            loaded[phase.name] = study
+    if not _artifact_root_binding_applies(experiment):
+        return loaded
+    claimable = [
+        study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
+    ]
     offered = _artifact_root_identity(experiment)
     for study in claimable:
         _claim_study_artifact_root(study, offered)
+    return loaded
 
 
 @dataclass(frozen=True)
@@ -2037,7 +2045,7 @@ def _preflight_existing_studies(
         predates artifact-root binding, so which workdir owns its evidence
         cannot be inferred; raised on the same terms.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
-        be inspected.
+        be inspected; raised before any claim, reaping, or registry recovery.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
     :raises TrialTargetRegressionError: A phase's study already accepted a
@@ -2048,14 +2056,20 @@ def _preflight_existing_studies(
         not covered by a single common exception type.
     """
     _warn_unbounded_environment_inheritance(experiment)
-    # The artifact-root binding is checked FIRST, for every declared phase, and
-    # raises directly rather than joining the aggregate below: an invocation
-    # offering a second publication root must not reap, inspect, or claim
-    # anything in either tree (review v0.5.19 / finding F5). Claims are written
-    # only after every phase passed that check, so a refusal leaves no phase
-    # bound to the rejected root (re-review v0.5.19 / blocker B3).
-    _bind_artifact_root(experiment)
     report = cleanup_report or _PreflightCleanupReport()
+    # Discovery, root checks, and claims happen in ONE strict pass, and its
+    # study objects are the ones every later step operates on: an invocation
+    # offering a second publication root must not reap, inspect, or claim
+    # anything in either tree (review v0.5.19 / finding F5), and a storage
+    # read that fails must abort rather than let a second, luckier read hand
+    # recovery a study whose root was never checked (PR #5 review /
+    # reviewer 2, issue 1). The storage error still marks cleanup uncertain:
+    # an unreadable ledger cannot prove its attempts are resolved.
+    try:
+        loaded = _load_and_check_artifact_roots(experiment)
+    except StudyStorageUnavailableError as exc:
+        report.mark_uncertain(exc)
+        raise
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase
@@ -2070,16 +2084,7 @@ def _preflight_existing_studies(
     for phase in experiment.phases:
         if phase.name == from_phase:
             reached = True
-        try:
-            study = _load_existing_phase_study(experiment, phase)
-        except Exception as exc:
-            unavailable = StudyStorageUnavailableError(
-                f"Could not inspect persistent study storage for phase {phase.name!r}."
-            )
-            unavailable.__cause__ = exc
-            report.mark_uncertain(unavailable)
-            errors.append(unavailable)
-            continue
+        study = loaded.get(phase.name)
         if study is None:
             continue
         studies[phase.name] = study

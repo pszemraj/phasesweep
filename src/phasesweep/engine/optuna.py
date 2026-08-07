@@ -24,8 +24,14 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.state import GENERATION_ID_ATTR
-from phasesweep.runtime.files import file_url_path, sqlite_readonly_uri, storage_backend
+from phasesweep.runtime.files import (
+    file_url_path,
+    sqlite_database_path,
+    sqlite_readonly_uri,
+    storage_backend,
+)
 
 
 @dataclass(frozen=True)
@@ -243,13 +249,29 @@ def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
 def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     """Return whether a SQLite storage already contains the phase study.
 
+    Strict and tri-state on purpose (PR #5 review / reviewer 2, issue 1):
+    callers use this verdict to decide whether root-binding and recovery
+    guards apply, so "the database could not be read" must never collapse
+    into "the study does not exist" -- a briefly locked file would then skip
+    the artifact-root check for a study that becomes readable one call later.
+    Only two conditions report absence: the database file does not exist, or
+    it exists without Optuna's schema (nothing ever created a study in it).
+    Every other read failure raises. Observational polling keeps its tolerant
+    reader (:func:`_sqlite_phase_trial_stats`), where ``available: false`` is
+    part of the contract.
+
     :param Experiment experiment: Parsed experiment config with SQLite storage.
     :param Phase phase: Phase whose stable study name should be checked.
-    :return bool: ``True`` only when the backing database is readable and contains the study.
+    :return bool: ``True`` when the database contains the study, ``False``
+        when the database or its schema does not exist.
+    :raises StudyStorageUnavailableError: The database file exists but could
+        not be read (locked, corrupt, permission-denied, ...), so whether the
+        study exists cannot be determined.
     """
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
-    if uri is None:
+    database = sqlite_database_path(experiment.storage)
+    if uri is None or database is None or not database.exists():
         return False
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
@@ -260,8 +282,20 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
             ).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error:
-        return False
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            # The file exists but holds no Optuna schema: nothing ever
+            # created a study in it, which is genuine absence.
+            return False
+        raise StudyStorageUnavailableError(
+            f"SQLite storage {database} exists but could not be read while checking for "
+            f"study {_phase_study_name(experiment, phase)!r}."
+        ) from exc
+    except sqlite3.Error as exc:
+        raise StudyStorageUnavailableError(
+            f"SQLite storage {database} exists but could not be read while checking for "
+            f"study {_phase_study_name(experiment, phase)!r}."
+        ) from exc
     return row is not None
 
 
@@ -276,6 +310,9 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose stable study name should be loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
+    :raises StudyStorageUnavailableError: File-backed SQLite storage exists but
+        could not be read, so whether the study exists cannot be determined;
+        callers on mutating paths must abort rather than treat this as absence.
     """
     if experiment.storage is None:
         return None

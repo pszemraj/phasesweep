@@ -10,6 +10,7 @@ import stat
 import sys
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
@@ -34,6 +35,7 @@ from phasesweep.engine import (
     UnsafeProcessCleanupError,
 )
 from phasesweep.engine.guards import _register_active_attempt
+from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -1375,6 +1377,50 @@ def test_rebind_workdir_converges_after_a_partially_applied_rebind(tmp_path: Pat
     for phase_name in ("p", "q"):
         study = optuna.load_study(study_name=f"t::{phase_name}", storage=experiment_b.storage)
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == destination
+
+
+def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A study that cannot be read has to refuse the rebind, not disappear from it.
+
+    Discovery that swallowed the read failure would drop that phase from the
+    plan entirely and exit zero after rebinding only the phases it could see,
+    leaving one study bound to the source tree and the other to the
+    destination (PR #5 review / reviewer 2, issue 1). The tree really is
+    relocated here, so this exact rebind succeeds without the injected
+    failure: the refusal is caused by the unknown binding alone.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_two_phase_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    assert experiment_a.storage is not None
+    shutil.move(str(workdir_a), str(workdir_b))
+    failures: list[str] = []
+
+    def _flaky_load(experiment: Any, phase: Any) -> optuna.Study | None:
+        if phase.name == "q" and not failures:
+            failures.append(phase.name)
+            raise RuntimeError("transient storage failure")
+        return _load_existing_phase_study(experiment, phase)
+
+    monkeypatch.setattr(
+        "phasesweep.engine.guards._load_existing_phase_study",
+        _flaky_load,
+    )
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "Cannot inspect the persistent study" in captured.err
+    assert failures == ["q"]
+    for phase_name in ("p", "q"):
+        study = optuna.load_study(study_name=f"t::{phase_name}", storage=experiment_a.storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
 
 def test_rebind_workdir_reports_that_in_memory_storage_binds_nothing(

@@ -35,14 +35,22 @@ from phasesweep.engine import (
     TrialTargetRegressionError,
     read_winners,
 )
-from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
+from phasesweep.engine.guards import (
+    FINGERPRINT_SCHEMA_VERSION,
+    _phase_fingerprint,
+    _register_active_attempt,
+)
+from phasesweep.engine.optuna import _sqlite_study_exists
 from phasesweep.engine.run import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    ATTEMPT_ID_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
+    _attempts_dir,
     _experiment_dir,
     _generation_path,
     _generation_record_path,
@@ -58,6 +66,7 @@ from phasesweep.engine.state import (
     _winner_path,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
     make_experiment,
@@ -986,6 +995,197 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     for phase in experiment.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Collect an exception plus everything reachable through its chain.
+
+    :param BaseException error: Exception raised by the code under test.
+    :return list[BaseException]: ``error`` and every distinct exception
+        reachable through ``__cause__``/``__context__``.
+    """
+    collected: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if any(current is seen for seen in collected):
+            continue
+        collected.append(current)
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    return collected
+
+
+def _fabricate_interrupted_attempt(
+    experiment: Experiment,
+    storage: str,
+    *,
+    attempt_id: str,
+) -> tuple[str, int, Path]:
+    """Leave one phase study holding a stale RUNNING trial with a registry entry.
+
+    Reproduces an orchestrator that died between allocating an attempt and
+    launching its trainer: the trial stays RUNNING, its durable lifecycle says
+    ``allocated``, and the experiment-level registry still lists it. That is
+    exactly the state recovery is allowed to repair - and must refuse to touch
+    from a wrong-root invocation.
+
+    :param Experiment experiment: Experiment owning the artifact tree and study.
+    :param str storage: Persistent storage URL backing the phase study.
+    :param str attempt_id: Immutable attempt identity to persist everywhere.
+    :return tuple[str, int, Path]: Study name, stale trial number, registry entry path.
+    """
+    phase_name = experiment.phases[0].name
+    study_name = f"{experiment.experiment}::{phase_name}"
+    study = optuna.load_study(study_name=study_name, storage=storage)
+    trial = study.ask()
+    trial_dir = _phase_dir(experiment, phase_name) / f"trial_{trial.number:05d}__stale"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase_name,
+        study_name=study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="g-stale",
+    )
+    return study_name, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"
+
+
+def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path) -> None:
+    """A read that fails once must abort the run, not be retried into recovery.
+
+    Reviewer repro (PR #5 review / reviewer 2, issue 1): discovery swallowed
+    the storage failure, the main preflight loop re-read the study, the second
+    read succeeded, and stale-trial reaping then mutated a study whose
+    artifact-root binding had never been checked - a wrong-root invocation
+    silently failing the bound tree's RUNNING trial. Discovery is now the only
+    read, so the failure escalates and nothing in either tree is touched. The
+    unpatched second invocation pins the same refusal for the ordinary
+    wrong-root case: it conflicts before the registry scan can reap anything.
+    """
+    import phasesweep.engine.guards as guards
+
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment_a = make_experiment(
+        workdir=tmp_path / "runs_a",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment_a)
+    root_a = str(_experiment_dir(experiment_a))
+    study_name, stale_number, entry_path = _fabricate_interrupted_attempt(
+        experiment_a, storage, attempt_id="stale-attempt-1"
+    )
+    assert entry_path.is_file()
+
+    experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    real_loader = guards._load_existing_phase_study
+    calls = {"count": 0}
+
+    def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("transient storage failure")
+        return real_loader(exp, phase)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(guards, "_load_existing_phase_study", _fail_first_read)
+        with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+            run_experiment(experiment_b)
+
+    assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
+    chain = _exception_chain(excinfo.value)
+    assert any(isinstance(error, StudyStorageUnavailableError) for error in chain)
+    # The storage failure must stay the reported cause: a later, luckier read
+    # producing a root conflict would mean discovery ran twice.
+    assert not any(isinstance(error, ArtifactRootConflictError) for error in chain)
+
+    after_transient = optuna.load_study(study_name=study_name, storage=storage)
+    assert (
+        after_transient.get_trials(deepcopy=False)[stale_number].state
+        == optuna.trial.TrialState.RUNNING
+    )
+    assert entry_path.is_file()
+    assert after_transient.user_attrs[ARTIFACT_ROOT_ATTR] == root_a
+
+    # Same wrong-root invocation, no injected failure: the conflict is raised
+    # before the registry scan, so the stale attempt survives untouched here too.
+    with pytest.raises(ArtifactRootConflictError):
+        run_experiment(experiment_b)
+
+    after_conflict = optuna.load_study(study_name=study_name, storage=storage)
+    assert (
+        after_conflict.get_trials(deepcopy=False)[stale_number].state
+        == optuna.trial.TrialState.RUNNING
+    )
+    assert entry_path.is_file()
+    assert after_conflict.user_attrs[ARTIFACT_ROOT_ATTR] == root_a
+
+
+def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) -> None:
+    """An unreadable database is never reported as study absence.
+
+    A briefly locked file collapsing into "no such study" would skip the
+    artifact-root check for a study that becomes readable one call later
+    (PR #5 review / reviewer 2, issue 1).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    db_path = tmp_path / "studies.db"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db_path}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    phase = experiment.phases[0]
+    assert _sqlite_study_exists(experiment, phase) is True
+
+    # BEGIN EXCLUSIVE holds the write lock until this connection closes, and
+    # the probe connects with timeout=0.1, so the refusal is deterministic.
+    locker = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+    try:
+        locker.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(StudyStorageUnavailableError):
+            _sqlite_study_exists(experiment, phase)
+    finally:
+        locker.close()
+
+    assert _sqlite_study_exists(experiment, phase) is True
+
+
+def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: Path) -> None:
+    """Missing file and schema-less file are the only two absence verdicts."""
+    trainer = write_constant_trainer(tmp_path)
+    trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+
+    never_created = make_experiment(
+        workdir=tmp_path / "runs_missing",
+        storage=f"sqlite:///{tmp_path / 'never-created.db'}",
+        trial_command=trial_command,
+        n_trials=1,
+    )
+    assert not (tmp_path / "never-created.db").exists()
+    assert _sqlite_study_exists(never_created, never_created.phases[0]) is False
+
+    schemaless_path = tmp_path / "schemaless.db"
+    sqlite3.connect(schemaless_path).close()
+    assert schemaless_path.exists()
+    schemaless = make_experiment(
+        workdir=tmp_path / "runs_schemaless",
+        storage=f"sqlite:///{schemaless_path}",
+        trial_command=trial_command,
+        n_trials=1,
+    )
+    assert _sqlite_study_exists(schemaless, schemaless.phases[0]) is False
 
 
 def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
