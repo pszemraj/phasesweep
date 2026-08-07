@@ -6,6 +6,8 @@ _exp / _make_exp helpers scattered across test files. Tests that need specialize
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
 import textwrap
 from collections.abc import Iterator
@@ -31,6 +33,16 @@ from phasesweep.runtime.process import _read_proc_stat
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+
+
+@contextlib.contextmanager
+def temporary_umask(mask: int) -> Iterator[None]:
+    """Set the process umask for one test and restore it afterward."""
+    previous = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def is_pid_zombie(pid: int) -> bool:

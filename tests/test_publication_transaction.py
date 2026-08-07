@@ -14,7 +14,6 @@ failures must never replace the primary exception.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -22,7 +21,6 @@ import os
 import shutil
 import signal
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -58,7 +56,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
-from tests.conftest import make_experiment, write_trainer, write_yaml
+from tests.conftest import make_experiment, temporary_umask, write_trainer, write_yaml
 
 _TRAINER_BODY = """
 import argparse
@@ -96,16 +94,6 @@ def _stored_experiment(tmp_path: Path, *, n_trials: int = 1, env: dict[str, str]
             )
         ],
     )
-
-
-@contextlib.contextmanager
-def _umask(mask: int) -> Iterator[None]:
-    """Pin the process umask for one test so mode assertions are deterministic."""
-    previous = os.umask(mask)
-    try:
-        yield
-    finally:
-        os.umask(previous)
 
 
 def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:  # noqa: ANN001
@@ -1308,7 +1296,7 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
     or trial command behind a published winner.
     """
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
-    with _umask(0o022):
+    with temporary_umask(0o022):
         run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
@@ -1334,7 +1322,7 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
 def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: Path) -> None:
     """The readable provenance record carries identity and digests, never config values."""
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
-    with _umask(0o022):
+    with temporary_umask(0o022):
         run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None

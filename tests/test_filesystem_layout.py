@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
-import os
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -28,17 +25,7 @@ from phasesweep.runtime.files import (
     atomic_write_text,
     private_atomic_write_text,
 )
-from tests.conftest import make_experiment, write_constant_trainer
-
-
-@contextlib.contextmanager
-def _umask(mask: int) -> Iterator[None]:
-    """Set the process umask for the duration of a test and restore it after."""
-    previous = os.umask(mask)
-    try:
-        yield
-    finally:
-        os.umask(previous)
+from tests.conftest import make_experiment, temporary_umask, write_constant_trainer
 
 
 def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> None:
@@ -143,7 +130,7 @@ def test_atomic_write_text_applies_process_umask_to_new_artifacts(
     """
     path = tmp_path / "winner.yaml"
 
-    with _umask(mask):
+    with temporary_umask(mask):
         atomic_write_text(path, "value: 1\n")
 
     assert path.read_text(encoding="utf-8") == "value: 1\n"
@@ -158,7 +145,7 @@ def test_atomic_write_text_preserves_existing_artifact_mode(tmp_path: Path) -> N
     path.write_text("old\n", encoding="utf-8")
     path.chmod(0o640)
 
-    with _umask(0o077):
+    with temporary_umask(0o077):
         atomic_write_text(path, "new\n")
 
     assert path.read_text(encoding="utf-8") == "new\n"
@@ -175,7 +162,7 @@ def test_private_atomic_write_text_stays_owner_only_under_any_umask(
     """
     path = tmp_path / "state.json"
 
-    with _umask(mask):
+    with temporary_umask(mask):
         private_atomic_write_text(path, "{}\n")
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
