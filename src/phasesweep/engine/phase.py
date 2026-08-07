@@ -28,6 +28,7 @@ from phasesweep.engine.guards import (
     _validate_study_schema,
     _validate_trial_target,
     _verify_fingerprint,
+    _verify_winner_objective_evidence,
 )
 from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
@@ -301,6 +302,9 @@ def _run_phase(
         LegacyArtifactRootMigrationRequiredError: This phase's persistent study
             holds trials but predates artifact-root binding, so the workdir
             that owns its evidence cannot be inferred.
+        TrialEvidenceMissingError: The selected winner's evidence directory,
+            audit artifacts, or objective source are missing or no longer match
+            the provenance frozen at extraction.
         RuntimeError: Storage / fingerprint / stale-reaper inconsistency.
 
     """
@@ -1054,9 +1058,17 @@ def _select_phase_winner(
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
     :raises NoFeasibleTrialError: Every terminal trial was infeasible.
+    :raises TrialEvidenceMissingError: The selected trial's evidence directory,
+        audit artifacts, or objective source are missing or no longer match the
+        provenance frozen when its metric was extracted.
     :return Winner: The selected winner with composed overrides and source identity.
     """
     selected = select_winner(study, experiment, phase_name=phase.name)
+    # The evidence behind the number about to be published is re-proved here,
+    # digest and all (PR #5 review / reviewer 2, blocker 7). Selection itself
+    # reads only Optuna, so nothing before this point has looked at whether the
+    # winning trial's directory still holds the bytes its metric came from.
+    _verify_winner_objective_evidence(experiment, phase.name, selected)
     effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,

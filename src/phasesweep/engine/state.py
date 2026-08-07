@@ -332,6 +332,15 @@ def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
     return _generation_dir(experiment, generation_id) / "generation.yaml"
 
 
+# A generation's summary is written only as the last step of a successful run,
+# so its presence is what separates a published generation from a claim-time
+# namespace whose run never got that far. Named once because manifest
+# validation reasons about that distinction for *another* generation's
+# namespace, where the helper below cannot be used (PR #5 review / reviewer 2,
+# blocker 7).
+GENERATION_SUMMARY_FILENAME = "summary.yaml"
+
+
 def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's summary path.
 
@@ -339,7 +348,7 @@ def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path
     :param str generation_id: Immutable generation namespace identifier.
     :return Path: Path to the generation's summary YAML file.
     """
-    return _generation_dir(experiment, generation_id) / "summary.yaml"
+    return _generation_dir(experiment, generation_id) / GENERATION_SUMMARY_FILENAME
 
 
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
@@ -680,12 +689,21 @@ def _validate_generation_manifest(
     keeps a generation published before either existed valid without a schema
     bump.
 
+    A winner carried forward from an earlier generation additionally has that
+    generation resolved in this same tree
+    (:func:`_validate_winner_source_generation`, PR #5 review / reviewer 2,
+    blocker 7): the cited namespace holds the evidence behind the number, so a
+    publication whose source generation is absent - or which disagrees with the
+    winner that source published - is not a result this tree can stand behind.
+
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
-        only for error text; ownership is checked by the caller).
+        for error text and to tell a carried-forward winner from a local one;
+        ownership is checked by the caller).
     :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :raises RuntimeError: The manifest is missing, malformed, or any artifact
-        is absent, altered, unparsable, or inconsistent with the summary.
+    :raises RuntimeError: The manifest is missing, malformed, any artifact is
+        absent, altered, unparsable, or inconsistent with the summary, or a
+        winner cites a source generation this tree does not hold.
     """
 
     def _fail(reason: str) -> RuntimeError:
@@ -811,6 +829,13 @@ def _validate_generation_manifest(
                         f"winner for phase {name!r} has a winner_source "
                         f"that disagrees with its {id_field}"
                     )
+            _validate_winner_source_generation(
+                generation_dir,
+                generation_id,
+                name,
+                payload,
+                _fail,
+            )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
         elif name in decision_items:
@@ -830,6 +855,113 @@ def _validate_generation_manifest(
                         f"namespace contains an unlisted {kind} artifact "
                         f"for phase {phase_dir.name!r}"
                     )
+
+
+def _validate_winner_source_generation(
+    generation_dir: Path,
+    generation_id: str,
+    phase_name: str,
+    payload: Mapping[str, Any],
+    fail: Callable[[str], RuntimeError],
+) -> None:
+    """Require a carried-forward winner's source generation to exist in this tree.
+
+    A winner's own ``generation_id`` may legitimately name an earlier
+    generation - a top-up that reselects an existing trial, or a ``--from-phase``
+    resume that reuses a validated parent winner - and the manifest deliberately
+    checks that field for well-formedness only. That left the whole
+    cross-generation claim unverified: a published winner could cite a
+    generation that exists only in some *other* artifact tree, or no tree at
+    all, and the publication still validated as ``ok`` (PR #5 review /
+    reviewer 2, blocker 7). The cited namespace is where the evidence behind
+    that number lives, so it has to resolve here.
+
+    Deviating deliberately from a blanket "the source must also hold a winner
+    record for this phase": a crash between trial completion and publication
+    leaves a claim-time namespace - provenance files, no summary - whose trials
+    a later top-up legitimately publishes first, citing that crashed
+    generation. Requiring a winner record there would make ordinary crash
+    recovery permanently unpublishable. So the record is required exactly when
+    the source generation itself published (it has a summary); an unpublished
+    source needs only to exist. Directory existence alone already enforces the
+    same-tree invariant, and the summary carve-out still catches a published
+    source that lost its winner record.
+
+    :param Path generation_dir: The publishing generation's namespace directory.
+    :param str generation_id: The publishing generation's own id.
+    :param str phase_name: Phase whose winner payload is being validated.
+    :param Mapping[str, Any] payload: Parsed winner artifact, whose
+        ``generation_id``/``attempt_id``/``trial_number`` the caller has
+        already checked for well-formedness and internal agreement.
+    :param Callable[[str], RuntimeError] fail: Builder for the caller's
+        uniformly labeled manifest-validation error.
+    :raises RuntimeError: Whatever ``fail`` builds, when the cited source
+        generation is unsafely named, absent from this tree, or published a
+        winner record for this phase that disagrees with the carried winner.
+    """
+    source_generation = payload["generation_id"]
+    if source_generation == generation_id:
+        return
+    if not SAFE_NAME_PATTERN.fullmatch(source_generation):
+        # A corrupt or hostile winner could otherwise steer the lookups below
+        # out of the generations root with a traversal component.
+        raise fail(
+            f"winner for phase {phase_name!r} cites source generation "
+            f"{source_generation!r}, which is not a valid generation name"
+        )
+    source_dir = generation_dir.parent / source_generation
+    if not source_dir.is_dir():
+        raise fail(
+            f"winner for phase {phase_name!r} cites source generation "
+            f"{source_generation!r} which does not exist in this tree"
+        )
+    source_winner_path = source_dir / "phases" / phase_name / _ARTIFACT_FILENAMES["winner"]
+    if not source_winner_path.is_file():
+        if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
+            raise fail(
+                f"winner for phase {phase_name!r} cites source generation "
+                f"{source_generation!r}, which published but holds no winner record "
+                "for that phase"
+            )
+        # Unpublished source namespace: the crash-recovery case above.
+        return
+    try:
+        content = source_winner_path.read_bytes()
+    except PermissionError as exc:
+        raise fail(
+            _unreadable_artifact_permission_detail(
+                f"source generation {source_generation!r} winner artifact for phase {phase_name!r}"
+            )
+        ) from exc
+    except OSError as exc:
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{phase_name!r} is missing or unreadable"
+        ) from exc
+    try:
+        source_payload = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{phase_name!r} is not parseable"
+        ) from exc
+    if not isinstance(source_payload, Mapping):
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{phase_name!r} is not a mapping"
+        )
+    expected = {
+        "phase": phase_name,
+        "trial_number": payload.get("trial_number"),
+        "generation_id": source_generation,
+        "attempt_id": payload.get("attempt_id"),
+    }
+    for field_name, expected_value in expected.items():
+        if source_payload.get(field_name) != expected_value:
+            raise fail(
+                f"winner for phase {phase_name!r} disagrees with the winner recorded by its "
+                f"source generation {source_generation!r} on {field_name}"
+            )
 
 
 def _validate_generation_provenance_files(

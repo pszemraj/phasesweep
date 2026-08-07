@@ -28,6 +28,7 @@ from phasesweep.engine.guards import (
     _suite_fingerprint,
     _suite_lock,
     _validate_sampler_continuation,
+    _validate_selection_evidence,
     _verify_fingerprint,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
@@ -250,6 +251,9 @@ def run_experiment(
             with no feasible trial.
         UnsafeProcessCleanupError: A phase hard-aborted because a trial's
             process group could not be confirmed dead (review v0.5.11).
+        TrialEvidenceMissingError: A trial eligible to win no longer has the
+            on-disk evidence its study records, or the selected winner's
+            objective source no longer matches its frozen provenance.
         RuntimeError: Lock contention (another orchestrator running),
             fingerprint mismatch on ``--from-phase`` resume, or stale-reaper
             uncertainty (review v0.5.7 / blocker 2).
@@ -294,6 +298,10 @@ def _run_experiment_outcome(
         diagnostic callback; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
     :return ExperimentRunOutcome: Winners bound to the publishing generation id.
+    :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
+        to win whose recorded evidence is no longer in this tree, or selection
+        found the winner's objective source altered; raised before any trial
+        work in the first case, before publication in the second.
     :raises ProcessCleanupUncertainError: The run failed and post-failure
         reconciliation could not confirm process cleanup; the original failure
         is chained as the cause but is unsafe to handle on its own.
@@ -342,6 +350,17 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
+            # Selection reads Optuna alone, so a tree whose candidate evidence
+            # was deleted would silently reselect and republish those trials
+            # (PR #5 review / reviewer 2, blocker 7). Refuse here - after
+            # recovery has resolved every stale attempt, before the generation
+            # is marked running and before any trial launches - so nothing is
+            # added to a tree that cannot honestly be ranked. Deliberately not
+            # repeated on the post-failure reconciliation call below: an
+            # evidence gap found while cleaning up must never displace the
+            # primary error, and publication on that path is covered by the
+            # selection-time winner check.
+            _validate_selection_evidence(experiment, existing_studies)
             _reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,

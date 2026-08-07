@@ -77,6 +77,23 @@ class PublicationIntegrityError(PhaseSweepError):
     """
 
 
+class TrialEvidenceMissingError(PhaseSweepError):
+    """Raised when a selection-eligible trial's on-disk evidence is gone.
+
+    A completed trial that the study still records as eligible to win no
+    longer has the evidence directory and audit artifacts its own record
+    names. Winner selection reads Optuna alone, so without this check the
+    orchestrator would republish that trial's number, metric, and provenance
+    from a tree that no longer contains a single byte behind them.
+
+    Fails the run closed rather than either silently selecting such a trial
+    or silently skipping it: skipping is not the safe fallback here, because
+    dropping the trials whose evidence happens to be missing changes which
+    trial wins and therefore biases the published result (PR #5 review /
+    reviewer 2, blocker 7).
+    """
+
+
 class StudyStorageUnavailableError(PhaseSweepError):
     """Raised when persistent study storage cannot be inspected during preflight."""
 
