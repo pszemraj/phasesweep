@@ -19,6 +19,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Literal, TypeAlias
 
@@ -310,27 +311,99 @@ def _terminal_failure_payload(
     return _safe_failure_payload(error, stage=stage)
 
 
+# Backoff between terminal status write attempts. This runs on the exit path
+# of an already-finished sweep, so the whole retry budget stays well under a
+# second: it exists to ride out a momentary ENOSPC/EIO/EINTR, not to wait out
+# an operator repairing the filesystem.
+_STATUS_WRITE_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.25)
+
+
+def _write_status_file_with_retry(
+    status_path: Path,
+    payload: dict,
+    *,
+    attempts: int = 3,
+) -> None:
+    """Write one terminal status record, retrying only transient persistence errors.
+
+    Only :class:`OSError` is retried (PR #5 review / reviewer 2 pass 2, blocker
+    6). A serialization error is a defect of the payload, not of the
+    filesystem: retrying it cannot succeed, and the caller depends on seeing it
+    immediately so it can downgrade the record to a serializable one.
+
+    :param Path status_path: Destination ``status.json`` path for the run.
+    :param dict payload: JSON-serializable terminal status payload.
+    :param int attempts: Total attempts, including the first; must be at least one.
+    :raises OSError: The final attempt's persistence failure, once the retry
+        budget is exhausted.
+    :raises Exception: Any non-:class:`OSError` failure, from the first attempt
+        and without retrying.
+    """
+    log = logging.getLogger("phasesweep.mcp.runner")
+    for attempt in range(attempts):
+        try:
+            write_status_file(status_path, payload)
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            backoff = _STATUS_WRITE_BACKOFF_SECONDS[
+                min(attempt, len(_STATUS_WRITE_BACKOFF_SECONDS) - 1)
+            ]
+            log.warning(
+                "failed to persist terminal status (attempt %d of %d); retrying in %.2fs",
+                attempt + 1,
+                attempts,
+                backoff,
+                exc_info=True,
+            )
+            time.sleep(backoff)
+        else:
+            return
+
+
 def _write_status(
     status_path: Path,
     payload: dict,
     *,
     result_snapshot: dict | None,
     result_snapshot_error: str | None,
-) -> None:
+) -> bool:
     """Persist terminal evidence and its already-captured result snapshot.
+
+    Nothing raises out of the persistence work itself, by design: this runs
+    from ``main``'s ``finally`` with the run's own exception possibly in
+    flight, so raising a persistence error would mask the run's primary exit
+    (PR #5 review / reviewer 2 pass 2, blocker 6). The failure is reported
+    through the return value instead, which ``main`` turns into a nonzero exit
+    code on the otherwise-successful path. A shutdown signal deferred by the
+    window below is still delivered at its exit, after the terminal record is
+    durable; that is the run's own cancellation, not a persistence error.
+
+    Every write is monotonic: state only ever moves toward more evidence.
+    A ``complete`` transition that cannot be persisted leaves the durable
+    ``pending`` record and its embedded snapshot in place rather than
+    downgrading it to ``failed`` - a dead runner with a pending record is
+    finalized by ``phasesweep mcp recover-run``, whereas ``failed`` is
+    permanent.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
     :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
     :param str | None result_snapshot_error: Capture error class when no snapshot exists.
+    :return bool: Whether durable terminal evidence exists, i.e. some record
+        (``pending``, ``complete``, or ``failed``) reached disk. ``False`` only
+        when nothing could be persisted at all.
     :raises RuntimeError: Raised and handled in-process when no snapshot was
         captured; it never reaches the caller, because a missing snapshot is
         recorded as ``result_snapshot_state="failed"`` instead of failing the
         already-durable terminal evidence.
     """
+    log = logging.getLogger("phasesweep.mcp.runner")
     # A catchable shutdown may arrive after the durable pending write. Defer it
     # until the complete/failed replacement is durable so cancellation cannot
-    # strand an otherwise terminal run in the intermediate state.
+    # strand an otherwise terminal run in the intermediate state. This window
+    # is also the checkpoint that services a shutdown absorbed by the terminal
+    # snapshot capture (see ``capture_terminal``).
     with defer_shutdown_signals():
         terminal = {
             **payload,
@@ -340,10 +413,31 @@ def _write_status(
         if result_snapshot is not None:
             terminal["result_snapshot"] = result_snapshot
         try:
-            write_status_file(status_path, terminal)
-        except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
-            logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
-            return
+            _write_status_file_with_retry(status_path, terminal)
+        except OSError:
+            # The engine outcome is already committed; only the MCP-side
+            # terminal record is missing, so the run derives "running" until an
+            # operator recovers it. Report that upward instead of exiting zero.
+            log.exception(
+                "failed to persist terminal status.json after every retry; the sweep's own "
+                "outcome is unaffected but this run has no terminal MCP evidence"
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - terminal evidence must not mask the run's exit
+            # Not a persistence failure: the captured snapshot cannot be
+            # serialized at all. Record the minimal terminal evidence without
+            # it rather than returning with no status file, which would leave
+            # the run deriving "running" forever.
+            log.exception("failed to write status.json with the captured result snapshot")
+            terminal.pop("result_snapshot", None)
+            terminal["result_snapshot_state"] = "failed"
+            terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
+            try:
+                _write_status_file_with_retry(status_path, terminal)
+            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+                log.exception("failed to write status.json without the result snapshot")
+                return False
+            return True
 
         try:
             if result_snapshot is None:
@@ -355,27 +449,34 @@ def _write_status(
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to finalize terminal result snapshot"
-            )
+            log.exception("failed to finalize terminal result snapshot")
         else:
             terminal["result_snapshot_state"] = "complete"
 
         try:
-            write_status_file(status_path, terminal)
-        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to finalize result snapshot state in status.json"
+            _write_status_file_with_retry(status_path, terminal)
+        except OSError:
+            # Deliberately no downgrade write here: the durable pending record
+            # still holds the raw snapshot, and a dead runner with a pending
+            # record is exactly what `recover-run` finalizes. Replacing it with
+            # "failed" would trade a recoverable state for a permanent one -
+            # and the same OSError would most likely defeat that write too.
+            log.exception(
+                "failed to persist the finalized result snapshot state after every retry; "
+                "the durable pending record still holds the captured snapshot and remains "
+                "recoverable with `phasesweep mcp recover-run`"
             )
+            return True
+        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
+            log.exception("failed to finalize result snapshot state in status.json")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = type(exc).__name__
             try:
-                write_status_file(status_path, terminal)
+                _write_status_file_with_retry(status_path, terminal)
             except Exception:  # noqa: BLE001 - no further persistence fallback is available
-                logging.getLogger("phasesweep.mcp.runner").exception(
-                    "failed to persist result snapshot finalization failure"
-                )
+                log.exception("failed to persist result snapshot finalization failure")
+        return True
 
 
 def _persist_spawned_handle(
@@ -435,11 +536,18 @@ def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json.
 
     :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
-    :return int: Process exit code, zero on successful sweep completion.
+    :return int: Process exit code: zero when the sweep completed and its
+        terminal evidence is durable, and ``1`` when the sweep itself completed
+        but no status.json record could be persisted at all - the run has no
+        MCP-visible outcome, so exiting zero would claim one it cannot show.
     :raises RuntimeError: The per-run config snapshot could not be read or did
         not match its recorded hash.
     :raises PhaseSweepShutdown: The run was cancelled; re-raised after the
-        cancellation cause is recorded in status.json.
+        cancellation cause is recorded in status.json. Also raised on an
+        otherwise-successful run when a shutdown absorbed during the terminal
+        snapshot capture is serviced at the terminal status write: status.json
+        then records the engine's own successful outcome and this process exits
+        with the POSIX signalled code.
     :raises ProcessCleanupUncertainError: Child-process cleanup could not be
         confirmed; re-raised after status.json records the uncertainty.
     :raises BaseException: Whatever the handle write or engine run raised,
@@ -495,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
     result_snapshot_error: str | None = None
     terminal_report: TerminalReport | None = None
     config: Experiment | None = None
+    status_persisted = False
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -634,13 +743,17 @@ def main(argv: list[str] | None = None) -> int:
                 result_snapshot_error = type(exc).__name__
             else:
                 status["generation_unavailable_reason"] = "engine_generation_not_claimed"
-        _write_status(
+        status_persisted = _write_status(
             status_path,
             status,
             result_snapshot=result_snapshot,
             result_snapshot_error=result_snapshot_error,
         )
-    return 0
+    # Only reachable on the success path; every failure path re-raises above.
+    # A sweep whose terminal evidence never reached disk is not a clean exit:
+    # the server would see no status.json, derive "running" indefinitely, and
+    # keep this run's concurrency slot until an operator recovers it.
+    return 0 if status_persisted else 1
 
 
 if __name__ == "__main__":

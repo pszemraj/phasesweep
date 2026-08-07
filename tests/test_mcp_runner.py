@@ -1085,6 +1085,259 @@ def test_runner_records_snapshot_serialization_failure(
     assert "result_snapshot" not in final
 
 
+_TERMINAL_PAYLOAD: dict[str, object] = {
+    "run_id": "r0",
+    "returncode": 0,
+    "error_class": None,
+    "cleanup_confirmed": True,
+}
+
+
+def test_transient_terminal_status_write_failure_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A one-shot OS failure must not cost a finished run its terminal evidence.
+
+    Injected at ``os.replace`` (PR #5 review / reviewer 2 pass 2, blocker 6) so
+    the retry runs through the real private atomic writer - temp file, fsync,
+    replace - rather than a stubbed one.
+    """
+    status_path = tmp_path / "status.json"
+    monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
+    real_replace = os.replace
+    replacements: list[object] = []
+
+    def replace_failing_once(src: object, dst: object, **kwargs: object) -> None:
+        replacements.append(dst)
+        if len(replacements) == 1:
+            raise OSError("simulated transient atomic replace failure")
+        real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_failing_once)
+
+    assert (
+        mcp_runner._write_status(
+            status_path,
+            dict(_TERMINAL_PAYLOAD),
+            result_snapshot={"captured": True},
+            result_snapshot_error=None,
+        )
+        is True
+    )
+
+    # Failed pending write, its retry, then the complete write.
+    assert len(replacements) == 3
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "complete"
+    assert final["result_snapshot"] == {"captured": True}
+    assert "result_snapshot_error" not in final
+
+
+def test_transient_snapshot_state_write_failure_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The complete transition retries too; a blip must not downgrade the record."""
+    status_path = tmp_path / "status.json"
+    monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
+    real_write = mcp_runner.write_status_file
+    states: list[object] = []
+
+    def write_failing_on_the_complete_transition(path: Path, payload: dict) -> None:
+        states.append(payload["result_snapshot_state"])
+        if len(states) == 2:
+            raise OSError("simulated transient status write failure")
+        real_write(path, payload)
+
+    monkeypatch.setattr(mcp_runner, "write_status_file", write_failing_on_the_complete_transition)
+
+    assert (
+        mcp_runner._write_status(
+            status_path,
+            dict(_TERMINAL_PAYLOAD),
+            result_snapshot={"captured": True},
+            result_snapshot_error=None,
+        )
+        is True
+    )
+
+    assert states == ["pending", "complete", "complete"]
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "complete"
+    assert final["result_snapshot"] == {"captured": True}
+
+
+def test_exhausted_status_write_retries_report_missing_terminal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When nothing can be persisted, say so instead of returning as if it were."""
+    status_path = tmp_path / "status.json"
+    attempts: list[Path] = []
+
+    def refuse_every_write(path: Path, _payload: dict) -> None:
+        attempts.append(path)
+        raise OSError("simulated persistent status write failure")
+
+    monkeypatch.setattr(mcp_runner, "write_status_file", refuse_every_write)
+
+    with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
+        assert (
+            mcp_runner._write_status(
+                status_path,
+                dict(_TERMINAL_PAYLOAD),
+                result_snapshot={"captured": True},
+                result_snapshot_error=None,
+            )
+            is False
+        )
+
+    assert len(attempts) == 3
+    assert not status_path.exists()
+    assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
+
+
+def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable ``pending`` record with its snapshot outranks a degraded ``failed`` one.
+
+    ``pending`` plus a dead runner is exactly what ``recover-run`` finalizes,
+    so the runner must not trade it for the permanent ``failed`` state when the
+    complete transition cannot be persisted (PR #5 review / reviewer 2 pass 2,
+    blocker 6).
+    """
+    store = RunStore(tmp_path / "state")
+    run_id = "pending-run"
+    handle = make_run_handle(run_id=run_id, experiment_id="exp", pid=999999, starttime=111)
+    store.create(handle)
+    status_path = store.status_path(run_id)
+    monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
+    real_write = mcp_runner.write_status_file
+    states: list[object] = []
+
+    def write_only_the_pending_record(path: Path, payload: dict) -> None:
+        states.append(payload["result_snapshot_state"])
+        if len(states) > 1:
+            raise OSError("simulated persistent status write failure")
+        real_write(path, payload)
+
+    monkeypatch.setattr(mcp_runner, "write_status_file", write_only_the_pending_record)
+
+    assert (
+        mcp_runner._write_status(
+            status_path,
+            {**_TERMINAL_PAYLOAD, "run_id": run_id},
+            result_snapshot={"captured": True},
+            result_snapshot_error=None,
+        )
+        is True
+    )
+
+    # Three exhausted complete attempts, and no downgrade write after them.
+    assert states == ["pending", "complete", "complete", "complete"]
+    durable = json.loads(status_path.read_text())
+    assert durable["result_snapshot_state"] == "pending"
+    assert durable["result_snapshot"] == {"captured": True}
+    assert "result_snapshot_error" not in durable
+    assert store.state(handle) == "running"
+    assert store.snapshot_recovery_required(handle)
+
+
+def test_unserializable_captured_snapshot_still_records_terminal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot that cannot be serialized is a capture defect, not a write failure.
+
+    It is never retried, and it must not leave the run with no status file at
+    all - that would derive ``running`` forever and hold a concurrency slot.
+    """
+    status_path = tmp_path / "status.json"
+    real_write = mcp_runner.write_status_file
+    writes: list[object] = []
+
+    def counting_write(path: Path, payload: dict) -> None:
+        writes.append(payload["result_snapshot_state"])
+        real_write(path, payload)
+
+    monkeypatch.setattr(mcp_runner, "write_status_file", counting_write)
+
+    assert (
+        mcp_runner._write_status(
+            status_path,
+            dict(_TERMINAL_PAYLOAD),
+            result_snapshot={"not_json": object()},
+            result_snapshot_error=None,
+        )
+        is True
+    )
+
+    assert writes == ["pending", "failed"]
+    final = json.loads(status_path.read_text())
+    assert final["result_snapshot_state"] == "failed"
+    assert final["result_snapshot_error"] == "TypeError"
+    assert "result_snapshot" not in final
+
+
+def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sweep with no MCP-visible outcome is not a clean exit.
+
+    The engine's own result is untouched, but with no status.json the run
+    derives ``running`` forever and keeps its launch concurrency slot, so the
+    runner reports the missing evidence in its exit code instead of claiming an
+    outcome it cannot show (PR #5 review / reviewer 2 pass 2, blocker 6).
+    """
+    config_path, config_sha256 = _constant_trial_config(tmp_path, "no_status")
+
+    def refuse_every_write(_path: Path, _payload: dict) -> None:
+        raise OSError("simulated persistent status write failure")
+
+    monkeypatch.setattr(mcp_runner, "write_status_file", refuse_every_write)
+
+    store = RunStore(tmp_path / "state")
+    run_id = "no-status-run"
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id="no_status",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
+        assert (
+            runner_main(
+                [
+                    "--run-id",
+                    run_id,
+                    "--config",
+                    str(config_path),
+                    "--config-sha256",
+                    config_sha256,
+                    "--status-path",
+                    str(store.status_path(run_id)),
+                    "--state-dir",
+                    str(tmp_path / "state"),
+                    "--experiment-id",
+                    "no_status",
+                    "--started-at",
+                    started_at,
+                ],
+                cwd=tmp_path,
+            )
+            == 1
+        )
+
+    assert not store.status_path(run_id).exists()
+    assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
+    assert _last_successful_generation_id(load_config(config_path)) == run_id
+    # The consequence the exit code has to carry: this identity is exactly what
+    # the runner persisted for itself (spawned, this live process), and with no
+    # status.json the run stays ``running`` and holds its concurrency slot.
+    assert store.state(make_run_handle(run_id=run_id, experiment_id="no_status")) == "running"
+
+
 def test_runner_refuses_to_persist_handle_without_linux_process_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
