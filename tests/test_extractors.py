@@ -39,23 +39,27 @@ class _FakeApi:
 
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake ``wandb.apis.public.Api`` backed by a supplied run callable."""
+    """Install a fake ``wandb.apis.public.Api`` implementation."""
 
-    def install(run_for_path):
+    def install(run_for_path=None, *, api_class=None):  # noqa: ANN001, ANN202
         wandb_mod = types.ModuleType("wandb")
         apis_mod = types.ModuleType("wandb.apis")
         public_mod = types.ModuleType("wandb.apis.public")
         timeouts: list[int | None] = []
 
-        class Api:
-            def __init__(self, timeout=None):
-                timeouts.append(timeout)
-                self._inner = _FakeApi(run_for_path)
+        if api_class is None:
 
-            def run(self, path):
-                return self._inner.run(path)
+            class Api:
+                def __init__(self, timeout=None):
+                    timeouts.append(timeout)
+                    self._inner = _FakeApi(run_for_path)
 
-        public_mod.Api = Api
+                def run(self, path):
+                    return self._inner.run(path)
+
+            api_class = Api
+
+        public_mod.Api = api_class
         wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
         apis_mod.public = public_mod  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
@@ -600,29 +604,19 @@ def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wand
     assert seen == ["new-attempt"]
 
 
-def test_wandb_api_constructor_failure_is_typed_extractor_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-):
+def test_wandb_api_constructor_failure_is_typed_extractor_error(fake_wandb, tmp_path):
     """A credential/settings failure in ``Api(...)`` must not escape the error model.
 
     Construction used to happen outside the polling ``try`` block, so an
     exception there surfaced as an arbitrary exception instead of a typed
     extractor failure (review v0.5.17 / finding D).
     """
-    wandb_mod = types.ModuleType("wandb")
-    apis_mod = types.ModuleType("wandb.apis")
-    public_mod = types.ModuleType("wandb.apis.public")
 
     class Api:
         def __init__(self, timeout=None):
             raise RuntimeError("credential loader exploded during Api construction")
 
-    public_mod.Api = Api
-    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
-    apis_mod.public = public_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+    fake_wandb(api_class=Api)
 
     cfg = WandbExtractor(
         type="wandb",
@@ -638,7 +632,7 @@ def test_wandb_api_constructor_failure_is_typed_extractor_error(
 
 
 def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    fake_wandb, monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
     """A mid-poll ``Api(...)`` failure is transient, not a setup error.
 
@@ -647,9 +641,6 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
     constructor failure must be retried like any other poll error instead of
     aborting the wait with most of the budget unspent.
     """
-    wandb_mod = types.ModuleType("wandb")
-    apis_mod = types.ModuleType("wandb.apis")
-    public_mod = types.ModuleType("wandb.apis.public")
     constructions = {"count": 0}
 
     class Api:
@@ -663,12 +654,7 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
                 return _FakeRun(state="running", summary={})
             return _FakeRun(state="finished", summary={"eval/loss": 0.123})
 
-    public_mod.Api = Api
-    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
-    apis_mod.public = public_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+    fake_wandb(api_class=Api)
 
     clock = {"now": 0.0}
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
