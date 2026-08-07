@@ -942,6 +942,25 @@ def _first_json_unserializable(value: Any, _seen: set[int] | None = None) -> Any
     return value
 
 
+def _composed_fixed_override_values(
+    experiment: Experiment, phase: Phase
+) -> dict[str, tuple[str, Any]]:
+    """Compose fixed override values with their diagnostic origins.
+
+    :param Experiment experiment: Experiment supplying named contracts.
+    :param Phase phase: Phase supplying contract order and local overrides.
+    :return dict[str, tuple[str, Any]]: Values keyed by override name after
+        applying contracts in order and phase-local overrides last.
+    """
+    composed: dict[str, tuple[str, Any]] = {}
+    for contract_name in phase.contracts:
+        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
+            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
+    for key, value in phase.fixed_overrides.items():
+        composed[key] = ("fixed_overrides", value)
+    return composed
+
+
 def _validate_json_file_override_values(experiment: Experiment, phase: Phase) -> None:
     """Reject ``json_file`` override values the wire serializer cannot encode.
 
@@ -974,14 +993,7 @@ def _validate_json_file_override_values(experiment: Experiment, phase: Phase) ->
     # Lazy import to avoid a circular config <-> runtime cycle.
     from phasesweep.runtime.commands import dump_overrides_json
 
-    composed: dict[str, tuple[str, Any]] = {}
-    for contract_name in phase.contracts:
-        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
-            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
-    for key, value in phase.fixed_overrides.items():
-        composed[key] = ("fixed_overrides", value)
-
-    for key, (origin, value) in composed.items():
+    for key, (origin, value) in _composed_fixed_override_values(experiment, phase).items():
         try:
             dump_overrides_json(value)
         except (TypeError, ValueError) as exc:
@@ -1089,14 +1101,7 @@ def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> 
     if experiment.override_format != "argparse":
         return
 
-    composed: dict[str, tuple[str, Any]] = {}
-    for contract_name in phase.contracts:
-        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
-            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
-    for key, value in phase.fixed_overrides.items():
-        composed[key] = ("fixed_overrides", value)
-
-    for key, (origin, value) in composed.items():
+    for key, (origin, value) in _composed_fixed_override_values(experiment, phase).items():
         found = _first_argparse_unrenderable(value)
         if found is None:
             continue
