@@ -24,7 +24,7 @@ If you do not have an experiment yet, `phasesweep init` creates an installed-pac
 phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
-The command writes `catalog.yaml` with side effects disabled and winner values redacted. Before continuing, review:
+The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog). Before continuing, review:
 
 - every experiment description and config path;
 - `visible_params`, which controls sampled winner values visible to the agent;
@@ -59,7 +59,7 @@ A working connection returns only catalog-approved experiment IDs, descriptions,
 By default, `--type all` installs two independent integrations:
 
 - an MCP server entry whose command is the absolute `phasesweep-mcp` executable from the environment running the installer and whose arguments are `--catalog` plus the reviewed catalog path;
-- a marker-fenced copy of the packaged nine-rule agent instructions where the client supports project instructions.
+- a marker-fenced copy of the packaged agent instructions where the client supports project instructions.
 
 Project scope is used where the client reliably supports it. Claude Desktop and Codex MCP entries are user-scoped, and the plan labels them before confirmation. Shared instruction files contain one package-managed block with multiple client owners; if a later install updates that shared prompt, the plan names the existing owners affected.
 
@@ -107,7 +107,7 @@ After replacing or recreating the conda environment, rerun `phasesweep mcp insta
 
 ## Breaking development installs
 
-The package is not published and this MCP surface intentionally carries no deprecated tool aliases or launcher migration layer. If a client was configured by an earlier development build, rerun `phasesweep mcp install` and restart the client; cached old tool names disappear on restart. Entries written by an earlier development build's removed launcher modes are recognized as installer-managed and replaced or removed automatically. If the current installer reports the old entry as unmanaged, remove that one `phasesweep` client entry manually, rerun the installer, and restart. This is the complete migration policy.
+The package is not published, and the MCP runtime carries no deprecated tool aliases or legacy launcher execution path. The installer alone recognizes earlier installer-owned launcher shapes so it can replace or remove them. If a client was configured by an earlier development build, rerun `phasesweep mcp install` and restart the client; cached old tool names disappear on restart. If the current installer reports the old entry as unmanaged, remove that one `phasesweep` client entry manually, rerun the installer, and restart. This is the complete migration policy.
 
 ## Troubleshooting
 
@@ -123,7 +123,7 @@ The package is not published and this MCP surface intentionally carries no depre
 
 - [MCP operator reference](mcp.md): catalog schema, tool payloads, run lifecycle, recovery, authorization, auditing, security, and installer semantics.
 - [Runtime behavior](runtime.md): platform support, process supervision, storage, locks, GPU isolation, and output layout.
-- [Packaged agent instructions](../src/phasesweep/mcp/agent_prompt.md): the nine rules installed into supported project instruction files.
+- [Packaged agent instructions](../src/phasesweep/mcp/agent_prompt.md): the rules installed into supported project instruction files.
 
 For a manual stdio entry, use the absolute values printed by `which phasesweep-mcp` and your reviewed catalog:
 

@@ -10,7 +10,7 @@ The server starts from a catalog: a fixed allowlist mapping opaque ids to local 
 
 Catalog keys:
 
-- `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. Startup and a successful `mcp check` create missing directories with mode `0700`, validate existing directories without changing them, then probe each directory with a temporary file. An unsafe existing mode fails with its observed owner/mode and a concrete `chmod 700 ...` remediation when ownership is already correct.
+- `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. A catalog load that reaches state preparation creates missing directories with mode `0700`, validates existing directories without changing them, then probes each directory with a temporary file. Server startup, `mcp check`, `mcp init-catalog`, and MCP integration preflight for `mcp install` all load the catalog; even a dry run or a cancelled install can therefore create the private state layout. An unsafe existing mode fails with its observed owner/mode and a concrete `chmod 700 ...` remediation when ownership is already correct.
 - `max_concurrent_runs: int = 1` (minimum `1`): live-sweep cap across all catalog entries; see [concurrency and single-GPU hosts](#concurrency-and-single-gpu-hosts).
 - `experiments: list` (required; at least one item): allowlisted experiment entries. Entry ids must be unique.
 - `experiments[].id: str` (required): agent-visible id matching nonempty `[A-Za-z0-9_-]+`.

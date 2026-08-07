@@ -99,7 +99,7 @@ See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolatio
 
 ## Connect an agent
 
-The optional MCP server connects an AI agent to experiments you have approved without exposing trainer commands, paths, storage, environment, or raw logs. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result.
+The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result.
 
 ## Reference
 
