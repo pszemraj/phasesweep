@@ -21,6 +21,7 @@ import yaml
 
 from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
+    ActiveAttemptPersistenceError,
     ExperimentLockBusyError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -312,6 +313,21 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     assert failure["stage"] == "preflight"
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
+
+
+def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None:
+    """Restoring the workdir alone cannot clear the persisted phase abort."""
+    failure = mcp_runner._safe_failure_payload(
+        ActiveAttemptPersistenceError("attempt registry is unwritable"),
+        stage="execution",
+    )
+
+    assert failure["code"] == "storage_unavailable"
+    assert failure["retryable"] is False
+    assert failure["actor"] == "operator"
+    assert "restore write access" in failure["remediation"]
+    assert "increase the affected phase's n_trials" in failure["remediation"]
+    assert "new experiment name" in failure["remediation"]
 
 
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(

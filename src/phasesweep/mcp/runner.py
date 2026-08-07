@@ -174,21 +174,23 @@ def _base_failure_payload(
             ),
         }
     if isinstance(error, ActiveAttemptPersistenceError):
-        # Deliberately the same code as an unreachable study: a durable store
-        # PhaseSweep must write to before it may launch is unavailable, the
-        # condition is environmental and transient, and the operator restores
-        # it and retries. Only the store differs, so the remediation names it
-        # rather than minting a FailureCode whose policy would be identical
-        # (PR #5 review / reviewer 2 pass 2, blocker 5). Nothing was launched,
-        # so there is nothing to clean up.
+        # The unavailable workdir still fits the storage category, but this
+        # pre-launch refusal is recorded as a terminal fatal trial and durable
+        # phase abort at the accepted target. MCP experiments use persistent
+        # storage, so restoring write access does not make the unchanged config
+        # retryable: recovery must explicitly schedule a higher supported
+        # target or start a new experiment. Nothing was launched, so there is
+        # no process cleanup step (PR #5 re-review, P1).
         return {
             "code": "storage_unavailable",
             "stage": failure_stage,
-            "retryable": True,
+            "retryable": False,
             "actor": "operator",
             "remediation": (
-                "Ask the operator to restore write access to the experiment workdir "
-                "so trial attempts can be registered, then start a new run."
+                "Ask the operator to restore write access to the experiment workdir, then "
+                "increase the affected phase's n_trials above the failed run's accepted "
+                "target when sampler continuation is supported, or use a new experiment "
+                "name, before starting another run."
             ),
         }
     if isinstance(error, SamplerContinuationUnsupportedError):

@@ -26,7 +26,7 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
-from phasesweep.engine import ActiveAttemptPersistenceError, run_experiment
+from phasesweep.engine import ActiveAttemptPersistenceError, NoFeasibleTrialError, run_experiment
 from phasesweep.engine.guards import (
     _preflight_existing_studies,
     _PreflightCleanupReport,
@@ -1379,8 +1379,12 @@ def test_unregistrable_attempt_refuses_to_launch_its_trainer(
     assert str(attempts_dir) in trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_registration"
 
-    # The study stays usable once the workdir is writable again.
+    # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(guards_mod, "atomic_write_text", real_atomic_write_text)
+    with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
+        run_experiment(_exp(2))
+    assert not launched.exists()
+
     winners = run_experiment(_exp(3))
 
     assert winners["p"].metric == pytest.approx(0.5)
