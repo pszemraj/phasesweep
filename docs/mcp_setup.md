@@ -39,7 +39,7 @@ Add another `--from` for each experiment. Use `-o` to choose another catalog fil
 phasesweep mcp install
 ```
 
-The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config — including whether a recognized legacy launcher entry will be rewritten to the pinned executable, shown before the confirmation prompt. After confirmation it applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
+The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config - including whether a recognized legacy launcher entry will be rewritten to the pinned executable, shown before the confirmation prompt. After confirmation it applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
 
 The supported clients are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode. A missing catalog is never created implicitly; return to the review step instead.
 

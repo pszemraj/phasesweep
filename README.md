@@ -80,7 +80,7 @@ params:
 effective_overrides:
   n_layers: 8
   lr: 0.0003
-# … completion state, fingerprints, and objective provenance follow
+# ... completion state, fingerprints, and objective provenance follow
 ```
 
 ## Use your own trainer
