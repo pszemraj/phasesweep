@@ -27,7 +27,13 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
-from phasesweep.engine import TerminalReport, read_status, read_winner
+from phasesweep.engine import (
+    StudyStorageUnavailableError,
+    TerminalReport,
+    read_status,
+    read_winner,
+)
+from phasesweep.engine.guards import _load_phase_policy_state
 from phasesweep.engine.optuna import (
     _build_sampler,
     _create_phase_study,
@@ -968,6 +974,212 @@ def test_outcome_ledger_recovers_when_abort_marker_write_fails(
     monkeypatch.setattr(optuna.Study, "set_user_attr", real_set_user_attr)
     with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
         run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
+
+
+def _outcome_write_experiment(
+    tmp_path: Path,
+    *,
+    trainer_body: str,
+    storage: str,
+    constraints: list[Constraint] | None = None,
+    n_jobs: int = 1,
+) -> Experiment:
+    """Build the two-trial experiment the outcome-write-failure tests share."""
+    trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
+    extra: dict[str, Any] = {}
+    if n_jobs > 1:
+        extra = {"n_jobs": n_jobs, "gpu_policy": "none", "allow_no_gpu_isolation": True}
+    return make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=2,
+        constraints=constraints,
+        max_consecutive_failures=5,
+        sampler={"type": "random", "seed": 7},
+        **extra,
+    )
+
+
+def test_transient_trial_outcome_write_failure_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One flaky outcome write must not cost the phase a trial.
+
+    The bounded retry is what keeps the fail-closed reaction to an *unwritable*
+    ledger from firing on a momentarily busy one (PR #5 review / reviewer 2
+    pass 2, blocker 4).
+    """
+    db = tmp_path / "retry.db"
+    exp = _outcome_write_experiment(
+        tmp_path,
+        trainer_body='print("x=0.5")',
+        storage=f"sqlite:///{db}",
+    )
+
+    real_set_user_attr = optuna.Trial.set_user_attr
+    injected = {"n": 0}
+
+    def fail_first_outcome_write(trial: optuna.Trial, key: str, value: object) -> None:
+        if key == TRIAL_OUTCOME_ATTR and injected["n"] == 0:
+            injected["n"] += 1
+            raise RuntimeError("injected transient outcome write failure")
+        real_set_user_attr(trial, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_first_outcome_write)
+    winners = run_experiment(exp)
+
+    assert injected["n"] == 1
+    assert winners["p"].metric == pytest.approx(0.5)
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert [trial.state.name for trial in study.trials] == ["COMPLETE", "COMPLETE"]
+    assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [1, 2]
+    assert all(
+        trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success" for trial in study.trials
+    )
+
+
+@pytest.mark.parametrize(
+    ("trainer_body", "constraints"),
+    [
+        pytest.param('print("x=0.5")', None, id="successful_trial"),
+        pytest.param(
+            """
+            import os, sys
+            if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+                sys.exit(1)
+            print("x=0.5")
+            """,
+            None,
+            id="trainer_failure_trial",
+        ),
+        pytest.param(
+            """
+            import os
+            print("bytes=5000" if os.environ["PHASESWEEP_TRIAL_ID"] == "0" else "bytes=100")
+            print("x=0.5")
+            """,
+            [
+                Constraint(
+                    name="param_bytes",
+                    extractor=LogRegexExtractor(
+                        type="log_regex",
+                        pattern=r"bytes=(?P<value>[0-9.]+)",
+                    ),
+                    max=1000,
+                )
+            ],
+            id="infeasible_trial",
+        ),
+    ],
+)
+def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trainer_body: str,
+    constraints: list[Constraint] | None,
+) -> None:
+    """An unwritable outcome ledger must never produce a terminal row without one.
+
+    Optuna commits the trial for *any* ``Exception`` leaving the objective and
+    then refuses user-attr writes on the finished trial, so a FAIL recorded
+    without its outcome attr would wedge the study permanently: every later
+    invocation rejects it in ``_load_phase_policy_state``. The objective
+    therefore aborts outside Optuna's catch set, leaving the trial RUNNING with
+    its registry entry intact, and the phase reports a retryable storage
+    outage. The next run recovers it through the ordinary stale-attempt
+    protocol, which writes the outcome *before* the terminal transition
+    (PR #5 review / reviewer 2 pass 2, blocker 4).
+    """
+    db = tmp_path / "outcome.db"
+    exp = _outcome_write_experiment(
+        tmp_path,
+        trainer_body=trainer_body,
+        storage=f"sqlite:///{db}",
+        constraints=constraints,
+    )
+
+    real_set_user_attr = optuna.Trial.set_user_attr
+
+    def refuse_outcome_writes(trial: optuna.Trial, key: str, value: object) -> None:
+        if key == TRIAL_OUTCOME_ATTR:
+            raise RuntimeError("injected outcome write failure")
+        real_set_user_attr(trial, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", refuse_outcome_writes)
+    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [optuna.trial.TrialState.RUNNING]
+    assert not [
+        trial
+        for trial in trials
+        if trial.state.is_finished() and TRIAL_OUTCOME_ATTR not in trial.user_attrs
+    ]
+    # The durable attempt record is what the next run recovers through.
+    assert list((tmp_path / "runs" / "t" / "attempts").glob("*.json"))
+    assert not _last_successful_generation_path(exp).exists()
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", real_set_user_attr)
+    winners = run_experiment(exp)
+
+    assert winners["p"].metric == pytest.approx(0.5)
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
+        "schema_version": 1,
+        "sequence": 1,
+        "outcome": "failure",
+        "cause": "stale RUNNING trial recovered after its orchestrator stopped",
+    }
+    # The whole point: the ledger still validates, so the study is reusable.
+    assert _load_phase_policy_state(study).max_sequence == 2
+
+
+def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The n_jobs>1 path surfaces the same abort through the fatal-abort slot.
+
+    Optuna's threaded loop never calls ``result()`` on the last submitted
+    futures, so a worker's abort is silently dropped there; only the
+    orchestrator-owned fatal slot re-raised after ``study.optimize`` makes it
+    visible (PR #5 review / reviewer 2 pass 2, blocker 4).
+    """
+    journal = tmp_path / "outcome.journal"
+    exp = _outcome_write_experiment(
+        tmp_path,
+        trainer_body='print("x=0.5")',
+        storage=f"journal:///{journal}",
+        n_jobs=2,
+    )
+
+    real_set_user_attr = optuna.Trial.set_user_attr
+
+    def refuse_outcome_writes(trial: optuna.Trial, key: str, value: object) -> None:
+        if key == TRIAL_OUTCOME_ATTR:
+            raise RuntimeError("injected outcome write failure")
+        real_set_user_attr(trial, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", refuse_outcome_writes)
+    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{journal}"))
+    trials = study.get_trials(deepcopy=False)
+    assert not [
+        trial
+        for trial in trials
+        if trial.state.is_finished() and TRIAL_OUTCOME_ATTR not in trial.user_attrs
+    ]
+    assert any(trial.state == optuna.trial.TrialState.RUNNING for trial in trials)
     assert not _last_successful_generation_path(exp).exists()
 
 

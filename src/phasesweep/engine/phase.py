@@ -16,7 +16,10 @@ import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.search import _placeholder_values_for
-from phasesweep.engine.errors import StudySchemaMismatchError
+from phasesweep.engine.errors import (
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.guards import (
     _accepted_trial_target,
     _bind_study_artifact_root,
@@ -75,6 +78,37 @@ log = logging.getLogger("phasesweep.engine.phase")
 
 class _PolicyStateWriteError(RuntimeError):
     """Raised when durable failure-policy state cannot be persisted."""
+
+
+class _TrialOutcomeUnrecordedAbort(BaseException):
+    """Control-flow abort for a trial whose outcome record could not be written.
+
+    Derives directly from :class:`BaseException` on purpose, and must keep
+    doing so. Optuna's ``_run_trial`` catches ``optuna.TrialPruned`` and
+    ``(Exception, KeyboardInterrupt)`` around the objective and then calls
+    ``_tell_with_warning`` unconditionally, so *any* ``Exception`` leaving the
+    objective commits that trial's terminal state. A terminal row whose
+    ``TRIAL_OUTCOME_ATTR`` is missing cannot be repaired afterwards - Optuna
+    raises ``UpdateFinishedTrialError`` for user-attr writes on a finished
+    trial - and permanently wedges the study, because every later invocation
+    rejects it in ``_load_phase_policy_state``. Raising from outside Optuna's
+    catch set is what keeps the trial ``RUNNING`` instead, where the standard
+    stale-attempt recovery writes the outcome *before* the terminal
+    transition (PR #5 review / reviewer 2 pass 2, blocker 4).
+
+    Deliberately not a :class:`PhaseSweepError`: it never reaches an operator.
+    ``_run_phase`` converts it into :class:`StudyStorageUnavailableError` once
+    the optimize loop has drained.
+    """
+
+
+# Delays between the bounded retries of the per-trial outcome write. The write
+# is a single small user-attr row, so a transient backend fault (a locked
+# SQLite file, a momentary connection drop) usually clears within a few
+# hundred milliseconds; anything longer is an outage the phase must not
+# outrun. len() + 1 total attempts.
+_OUTCOME_WRITE_RETRY_DELAYS = (0.05, 0.25)
+_OUTCOME_WRITE_ATTEMPTS = len(_OUTCOME_WRITE_RETRY_DELAYS) + 1
 
 
 @dataclass
@@ -305,6 +339,10 @@ def _run_phase(
         TrialEvidenceMissingError: The selected winner's evidence directory,
             audit artifacts, or objective source are missing or no longer match
             the provenance frozen at extraction.
+        StudyStorageUnavailableError: A trial's terminal outcome could not be
+            persisted. That trial is left ``RUNNING`` with its attempt record
+            intact and recovers on the next run once storage is writable
+            (PR #5 review / reviewer 2 pass 2, blocker 4).
         RuntimeError: Storage / fingerprint / stale-reaper inconsistency.
 
     """
@@ -484,7 +522,11 @@ def _run_phase(
         not trial-number order. The per-trial outcome is written before the
         counter changes or the objective returns, so a restarted process can
         reconstruct the same streak. Any persistence failure aborts this
-        invocation; it is never downgraded to a warning.
+        invocation; it is never downgraded to a warning. The two writes fail
+        differently on purpose: the trial ledger row must exist before Optuna
+        can be allowed to commit any terminal state for the trial, while the
+        phase abort marker is written after that row is already durable and
+        can therefore be reconstructed from it on the next run.
 
         A no-op if ``trial.number`` is already in ``recorded_outcomes``.
         Mutates ``_run_phase``'s enclosing ``_consecutive_failures``,
@@ -504,8 +546,13 @@ def _run_phase(
                 record.
 
         Raises:
-            _PolicyStateWriteError: The trial outcome or the phase abort
-                marker could not be persisted to storage.
+            _TrialOutcomeUnrecordedAbort: The per-trial outcome row could not
+                be persisted, even after ``_OUTCOME_WRITE_ATTEMPTS`` tries.
+                The fatal-abort slot is set first, and the trial is left
+                ``RUNNING`` for stale-attempt recovery.
+            _PolicyStateWriteError: The phase abort marker could not be
+                persisted. This trial's outcome row is already durable, so the
+                next run reconstructs the abort from the ledger.
 
         """
         nonlocal _consecutive_failures, _completion_sequence
@@ -522,17 +569,42 @@ def _run_phase(
                 payload["cause"] = cause
             if fatal_policy is not None:
                 payload["policy"] = fatal_policy
-            try:
-                trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
-            except Exception as exc:
-                error = _PolicyStateWriteError(
+            # INVARIANT: no terminal Optuna row may exist without its outcome
+            # record. Optuna refuses user-attr writes on a finished trial
+            # (UpdateFinishedTrialError), so a FAIL committed after this write
+            # failed could never be repaired, and every later invocation would
+            # reject the whole study in ``_load_phase_policy_state``. The only
+            # correct reaction is therefore to prevent the terminal transition
+            # entirely and leave the trial RUNNING, where
+            # ``_record_stale_trial_failure``'s write-then-tell recovery can
+            # still give it a valid outcome (PR #5 review / reviewer 2 pass 2,
+            # blocker 4). Retry any Exception first — storage backends signal
+            # transient faults with assorted types — but never a BaseException,
+            # which is a shutdown or a control-flow abort of its own.
+            write_error: Exception | None = None
+            for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
+                if attempt_index:
+                    time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
+                try:
+                    trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
+                except Exception as exc:
+                    write_error = exc
+                else:
+                    write_error = None
+                    break
+            if write_error is not None:
+                unrecorded = _TrialOutcomeUnrecordedAbort(
                     f"Could not persist the terminal outcome for trial {trial.number} "
-                    f"in study {study.study_name!r}. Refusing to continue because a "
-                    "restart could otherwise omit this trial from "
-                    "max_consecutive_failures."
+                    f"in study {study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
+                    f"attempts ({type(write_error).__name__}: {write_error}). Trial "
+                    f"{trial.number} was deliberately left RUNNING, with its durable "
+                    "attempt record intact, so no terminal trial exists without its "
+                    "outcome record. Once storage accepts writes again, the next run "
+                    "recovers it through the standard stale-attempt protocol, which "
+                    "records the failure before marking the trial FAIL."
                 )
-                _record_fatal_abort(error)
-                raise error from exc
+                _record_fatal_abort(unrecorded)
+                raise unrecorded from write_error
 
             _completion_sequence = next_sequence
             recorded_outcomes[trial.number] = outcome
@@ -597,6 +669,9 @@ def _run_phase(
                 acquire the just-released GPU lease.
             TrialExecutionError: The subprocess returned non-zero / produced
                 no metric. Caught by ``study.optimize(catch=...)``.
+            _TrialOutcomeUnrecordedAbort: A successful trial's terminal
+                outcome could not be persisted, so the trial is deliberately
+                left ``RUNNING`` for stale-attempt recovery.
 
         """
         assert generation_id is not None
@@ -812,6 +887,16 @@ def _run_phase(
         """
         try:
             return _execute_objective(trial)
+        except _TrialOutcomeUnrecordedAbort:
+            # Must stay first. Every handler below answers by calling
+            # ``_record_outcome``, which is exactly what just failed, and the
+            # catch-all would additionally relabel this as an unexpected
+            # objective exception. Re-raising it untouched is what keeps the
+            # trial RUNNING for stale-attempt recovery (PR #5 review /
+            # reviewer 2 pass 2, blocker 4). Only the direct call path from
+            # ``_execute_objective`` needs the guard: the same abort raised
+            # from inside a sibling handler already bypasses the rest.
+            raise
         except _PolicyStateWriteError as exc:
             _record_fatal_abort(exc)
             raise
@@ -917,28 +1002,39 @@ def _run_phase(
         _completion_sequence = current_policy_state.max_sequence
         _consecutive_failures = current_policy_state.consecutive_failures
     try:
-        study.optimize(
-            objective,
-            n_trials=remaining,
-            n_jobs=phase.n_jobs,
-            timeout=optimize_timeout,
-            gc_after_trial=True,
-            callbacks=[abort_callback],
-            catch=(TrialExecutionError,),
-        )
-    finally:
-        # Always snapshot trials.csv, even if ``study.optimize`` raises
-        # (n_jobs=1 fatal-objective path) or some other transient backend
-        # error escapes. Forensic data must survive every exit path.
-        # Best-effort: a write failure here must not mask the actual
-        # exception from ``study.optimize``.
-        with contextlib.suppress(Exception):
-            _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+        try:
+            study.optimize(
+                objective,
+                n_trials=remaining,
+                n_jobs=phase.n_jobs,
+                timeout=optimize_timeout,
+                gc_after_trial=True,
+                callbacks=[abort_callback],
+                catch=(TrialExecutionError,),
+            )
+        finally:
+            # Always snapshot trials.csv, even if ``study.optimize`` raises
+            # (n_jobs=1 fatal-objective path) or some other transient backend
+            # error escapes. Forensic data must survive every exit path.
+            # Best-effort: a write failure here must not mask the actual
+            # exception from ``study.optimize``.
+            with contextlib.suppress(Exception):
+                _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
-    # Optuna's threaded path can absorb any uncaught objective exception after
-    # marking that trial FAIL. Re-raise the first one before timeout, soft
-    # abort, completeness, or winner-selection logic can relabel it.
-    _raise_if_fatal_aborted()
+        # Optuna's threaded path can absorb any uncaught objective exception
+        # after marking that trial FAIL. Re-raise the first one before timeout,
+        # soft abort, completeness, or winner-selection logic can relabel it.
+        _raise_if_fatal_aborted()
+    except _TrialOutcomeUnrecordedAbort as exc:
+        # The single conversion site for the outcome-write abort, covering
+        # both routes out of the optimize loop: n_jobs=1 propagates it
+        # straight through ``study.optimize``, while n_jobs>1 may swallow the
+        # worker's exception and leave ``_raise_if_fatal_aborted`` to re-raise
+        # it from the fatal-abort slot. Operators and the MCP runner see a
+        # retryable storage outage, which is what it is; the affected trial is
+        # still RUNNING and recovers on the next run (PR #5 review /
+        # reviewer 2 pass 2, blocker 4).
+        raise StudyStorageUnavailableError(str(exc)) from exc
 
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
