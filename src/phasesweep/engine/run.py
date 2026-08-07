@@ -59,6 +59,7 @@ from phasesweep.engine.state import (
     _promotion_decision_path,
     _published_promotion_decision_path,
     _read_pointer_target_summary,
+    _resolve_suite_publication_pointer,
     _run_log_path,
     _save_promotion_decision,
     _save_winner,
@@ -157,20 +158,37 @@ def config_status(config: Config) -> dict[str, Any]:
 
     For an :class:`~phasesweep.config.Experiment` this returns
     :func:`experiment_status` verbatim. For a :class:`~phasesweep.config.Suite`
-    it returns ``{kind: "suite", suite, workdir, studies}`` where each study is
-    ``{name, depends_on, status}`` and ``status`` is that study's compiled
-    experiment status — the same payload, generation identity included, that a
-    standalone experiment reports. The suite envelope itself carries no
-    generation identity: suite-level generations are not a status concept here.
+    it returns ``{kind: "suite", suite, workdir, published_suite_generation_id,
+    publication_integrity, studies}`` — plus ``publication_error`` as the one
+    conditional key, exactly as the experiment payload carries it — where each
+    study is ``{name, depends_on, status}`` and ``status`` is that study's
+    compiled experiment status: the same payload, generation identity included,
+    that a standalone experiment reports.
+
+    The suite envelope reports the *suite* last-success pointer's own tri-state
+    verdict (re-review v0.5.19 / observation N2). Reporting only the component
+    studies let a suite whose published summary no longer validated print
+    ``publication_integrity: "ok"`` for every component and exit 0, while
+    ``show-winners`` on the same tree correctly reported corruption — the
+    opposite of finding F4's contract that both surfaces escalate. As in the
+    experiment payload, ``published_suite_generation_id`` is populated only for
+    an ``"ok"`` verdict: a suite generation that failed validation is named in
+    the error, never presented as published.
 
     :param Config config: Parsed experiment or suite config to inspect.
     :return dict[str, Any]: Read-only status payload for the config.
     """
     if isinstance(config, Suite):
+        publication = _resolve_suite_publication_pointer(config)
         return {
             "kind": "suite",
             "suite": config.suite,
             "workdir": str(_suite_dir(config)),
+            "published_suite_generation_id": (
+                publication.generation_id if publication.state == "ok" else None
+            ),
+            "publication_integrity": publication.state,
+            **({"publication_error": publication.error} if publication.state == "failed" else {}),
             "studies": [
                 {
                     "name": study.name,

@@ -45,6 +45,7 @@ from phasesweep.engine.state import (
     _last_successful_generation_id,
     _last_successful_generation_path,
     _last_successful_suite_generation_id,
+    _suite_generation_summary_path,
     _winner_path,
 )
 from phasesweep.mcp.errors import CatalogError
@@ -706,15 +707,11 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     assert "only the publishing user" in captured.err
 
 
-def test_suite_status_fails_on_a_corrupt_component_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A suite status embeds every study, so one corrupt component fails the read.
+def _suite_config(tmp_path: Path) -> Path:
+    """Write a one-study suite config over persistent storage.
 
-    The suite envelope reports no generation identity of its own, so without
-    this the corruption would print inside a study payload and still exit 0.
+    :param Path tmp_path: Per-test temporary directory.
+    :return Path: Config path for a suite that has not run yet.
     """
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -722,12 +719,14 @@ def test_suite_status_fails_on_a_corrupt_component_publication(
         'parser.add_argument("--out")\nparser.add_argument("--x", type=int, default=0)\n'
         'args, _ = parser.parse_known_args()\nprint(f"x={args.x}")\n',
     )
-    config_path = write_yaml(
+    return write_yaml(
         tmp_path,
         f"""
         suite: integrity_suite
         defaults:
           workdir: {tmp_path}/runs
+          storage: sqlite:///{tmp_path}/suite.db
+          provenance: {{revision: test-fixture-v1}}
           trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
           metric:
             name: x
@@ -742,6 +741,21 @@ def test_suite_status_fails_on_a_corrupt_component_publication(
                 search_space: {{ x: {{ type: int, low: 0, high: 3 }} }}
         """,
     )
+
+
+def test_suite_status_fails_on_a_corrupt_component_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A suite status embeds every study, so one corrupt component fails the read.
+
+    A component-only run leaves the suite pointer ``absent`` -- a healthy state
+    for a suite that never published -- so the escalation here can only come
+    from the embedded study payload, which without this check would print the
+    corruption and still exit 0.
+    """
+    config_path = _suite_config(tmp_path)
     suite = load_config(config_path)
     assert isinstance(suite, Suite)
     # config_status compiles each study independently, so publishing the one
@@ -759,8 +773,89 @@ def test_suite_status_fails_on_a_corrupt_component_publication(
     assert exit_code == 1
     assert "Traceback" not in captured.err
     payload = yaml.safe_load(captured.out)
+    assert payload["publication_integrity"] == "absent"
+    assert payload["published_suite_generation_id"] is None
     assert payload["studies"][0]["status"]["publication_integrity"] == "failed"
     assert "Do not run anything over this tree" in captured.err
+
+
+def test_suite_status_reports_the_suite_publication_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A published suite reports its own generation identity and integrity.
+
+    Re-review v0.5.19 / observation N2: the suite envelope carried no
+    publication fields at all, so ``status`` could not report the one verdict
+    ``show-winners`` resolves for the same tree.
+    """
+    config_path = _suite_config(tmp_path)
+    suite = load_config(config_path)
+    assert isinstance(suite, Suite)
+
+    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    fresh = yaml.safe_load(capsys.readouterr().out)
+    assert fresh["publication_integrity"] == "absent"
+    assert fresh["published_suite_generation_id"] is None
+
+    run_suite(suite)
+    generation_id = _last_successful_suite_generation_id(suite)
+    assert generation_id is not None
+
+    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    published = yaml.safe_load(capsys.readouterr().out)
+    assert published["publication_integrity"] == "ok"
+    assert published["published_suite_generation_id"] == generation_id
+    assert "publication_error" not in published
+    assert published["studies"][0]["status"]["publication_integrity"] == "ok"
+
+
+def test_suite_status_escalates_a_corrupt_suite_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both reporting surfaces escalate a suite publication that stopped validating.
+
+    Re-review v0.5.19 / observation N2: the component studies still validate
+    here, so before the suite envelope carried its own verdict ``status``
+    printed ``publication_integrity: ok`` for every component and exited 0
+    while ``show-winners`` reported the same tree as corrupt.
+    """
+    config_path = _suite_config(tmp_path)
+    suite = load_config(config_path)
+    assert isinstance(suite, Suite)
+    run_suite(suite)
+    generation_id = _last_successful_suite_generation_id(suite)
+    assert generation_id is not None
+
+    # Spoof a published winner fact in the suite summary alone: the component
+    # generation it names stays intact, so only the suite verdict changes.
+    summary_path = _suite_generation_summary_path(suite, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    exposed = [item for item in summary["studies"][0]["phases"] if item.get("exposed")]
+    assert exposed, "test setup: the suite must expose at least one winner"
+    exposed[0]["metric"] = exposed[0]["metric"] + 1.0
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    payload = yaml.safe_load(captured.out)
+    assert payload["publication_integrity"] == "failed"
+    assert payload["published_suite_generation_id"] is None
+    assert payload["publication_error"]
+    # The component study is untouched, so the suite level is the only escalation.
+    assert payload["studies"][0]["status"]["publication_integrity"] == "ok"
+    assert "Suite 'integrity_suite'" in captured.err
+    assert "Do not run anything over this tree" in captured.err
+
+    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
+    winners_captured = capsys.readouterr()
+    assert "Suite 'integrity_suite'" in winners_captured.err
 
 
 def test_status_and_show_winners_stay_successful_without_corruption(

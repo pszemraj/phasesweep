@@ -51,6 +51,22 @@ FAILED_PUBLICATION_STATUS_KEYS = [
 error field (review v0.5.18 / finding F4).
 """
 
+SUITE_STATUS_KEYS = [
+    "kind",
+    "suite",
+    "workdir",
+    "published_suite_generation_id",
+    "publication_integrity",
+    "studies",
+]
+"""Exact ordered key set of a suite status envelope.
+
+The envelope reports the *suite* last-success pointer's own tri-state verdict
+beside the per-study payloads (re-review v0.5.19 / observation N2), with
+``publication_error`` as the same one conditional key the experiment payload
+carries.
+"""
+
 PHASE_STATUS_KEYS = {
     "trials",
     "running",
@@ -152,9 +168,14 @@ def test_suite_config_status_embeds_the_full_experiment_status(tmp_path: Path) -
 
     payload = config_status(config)
 
-    assert list(payload) == ["kind", "suite", "workdir", "studies"]
+    assert list(payload) == SUITE_STATUS_KEYS
     assert payload["kind"] == "suite"
     assert payload["suite"] == "shape_suite"
+    # Only a component study ran, so the suite itself has published nothing --
+    # reported as its own verdict rather than left unstated.
+    assert payload["publication_integrity"] == "absent"
+    assert payload["published_suite_generation_id"] is None
+    assert "publication_error" not in payload
 
     for study_payload in payload["studies"]:
         assert list(study_payload) == ["name", "depends_on", "status"]

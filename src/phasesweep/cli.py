@@ -426,13 +426,22 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
 
     Reads the status payload that was just rendered rather than re-resolving
     the pointer, so the exit status can never disagree with what the operator
-    was shown. A suite payload is checked one embedded study at a time: a
-    corrupt component publication is a corrupt suite result.
+    was shown. A suite payload is checked at both levels: its own suite
+    last-success pointer first — mirroring :func:`_show_suite_winners`, so the
+    two surfaces name the same subject for the same tree (re-review v0.5.19 /
+    observation N2) — and then one embedded study at a time, since a corrupt
+    component publication is a corrupt suite result too.
 
     :param dict[str, Any] payload: ``config_status`` payload already rendered.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
     if payload.get("kind") == "suite":
+        if payload.get("publication_integrity") == "failed":
+            raise _publication_integrity_error(
+                f"Suite {str(payload.get('suite'))!r}",
+                str(payload.get("publication_error")),
+                Path(str(payload.get("workdir"))),
+            )
         studies = payload.get("studies")
         for study in studies if isinstance(studies, list) else []:
             if isinstance(study, dict) and isinstance(study.get("status"), dict):
@@ -629,7 +638,8 @@ def status(config_path: Path) -> None:
 
     :param Path config_path: Experiment or suite YAML file to inspect.
     :raises PublicationIntegrityError: The reported publication - or, for a
-        suite, any component study's - no longer validates.
+        suite, its own suite-level publication or any component study's - no
+        longer validates.
     """
     config = load_config(config_path)
     payload = config_status(config)
