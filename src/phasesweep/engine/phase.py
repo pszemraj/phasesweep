@@ -298,6 +298,9 @@ def _run_phase(
             confirmed dead; phase hard-aborted (review v0.5.11).
         ArtifactRootConflictError: This phase's persistent study is bound to a
             different artifact root than the config's workdir offers.
+        LegacyArtifactRootMigrationRequiredError: This phase's persistent study
+            holds trials but predates artifact-root binding, so the workdir
+            that owns its evidence cannot be inferred.
         RuntimeError: Storage / fingerprint / stale-reaper inconsistency.
 
     """

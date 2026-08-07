@@ -645,8 +645,9 @@ def status(config_path: Path) -> None:
         "you have already moved the experiment's complete artifact tree there. Verifies at the "
         "destination that every trial in the study ledger still has its evidence directory, "
         "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
-        "publication validates; refuses relocating a published suite. Writes nothing unless "
-        "every check passes."
+        "publication validates; refuses relocating a published suite. Also the migration path "
+        "for a study that predates artifact-root binding: point the config at that study's "
+        "original tree. Writes nothing unless every check passes."
     ),
     short_help="Rebind studies to a moved artifact tree.",
 )
@@ -657,8 +658,9 @@ def rebind_workdir(config_path: Path) -> None:
     Each persistent phase study is bound to the one artifact root it publishes
     into, so an ordinary run against a different ``workdir`` is refused rather
     than allowed to produce a second, divergent publication tree. This command
-    is the operator's explicit statement that the tree itself was relocated. It
-    is a rebind, never a move: PhaseSweep does not copy, delete, or verify the
+    is the operator's explicit statement that the tree itself was relocated,
+    and the only way a study that predates the binding is adopted at all. It is
+    a rebind, never a move: PhaseSweep does not copy, delete, or verify the
     original tree.
 
     What it verifies at the destination, per experiment: the namespace exists;
@@ -677,9 +679,9 @@ def rebind_workdir(config_path: Path) -> None:
 
     :param Path config_path: Path to the experiment or suite YAML file whose
         ``workdir`` already names the artifact tree these studies own.
-    :raises ArtifactRootRebindError: Storage is in-memory, no phase study is
-        bound, a study cannot be read, or a destination fails any of the
-        checks above. Nothing is written.
+    :raises ArtifactRootRebindError: Storage is in-memory, every existing study
+        is unbound and empty, a study cannot be read, or a destination fails
+        any of the checks above. Nothing is written.
     :raises ExperimentLockBusyError: Another orchestrator owns one of the
         experiment (or suite) consistency locks.
     """

@@ -1166,3 +1166,23 @@ def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> 
     assert payload["retryable"] is False
     assert payload["actor"] == "operator"
     assert "rebind-workdir" in str(payload["remediation"])
+
+
+def test_legacy_artifact_root_migration_reports_the_conflict_category() -> None:
+    """The pre-binding migration refusal must classify as its parent conflict.
+
+    It is the same operator problem and the same remedy surface, so it must
+    not fall through to ``internal_error``; the remediation text also has to
+    fit a study that records no root at all (re-review v0.5.19 / blocker B1).
+    """
+    from phasesweep.engine.errors import LegacyArtifactRootMigrationRequiredError
+
+    payload = mcp_runner._base_failure_payload(
+        LegacyArtifactRootMigrationRequiredError("holds 2 trial(s) but records no artifact root"),
+        stage="preflight",
+    )
+
+    assert payload["code"] == "artifact_root_conflict"
+    assert payload["actor"] == "operator"
+    assert "rebind-workdir" in str(payload["remediation"])
+    assert "bound to" not in str(payload["remediation"])

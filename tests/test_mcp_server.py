@@ -34,11 +34,13 @@ from phasesweep.engine import (
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint, _reap_stale_trials
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
+    _experiment_dir,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
@@ -1845,6 +1847,10 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
             storage=experiment.storage,
             direction="minimize",
         )
+        # A study a prior run left behind carries this workdir's artifact-root
+        # binding; without it the pre-binding migration refusal preempts the
+        # schema aggregation this test is about (re-review v0.5.19 / blocker B1).
+        study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
         study.add_trial(
             optuna.trial.create_trial(
                 value=0.5,

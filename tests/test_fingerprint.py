@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import shutil
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,8 +28,10 @@ from phasesweep.config import (
 )
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     SamplerContinuationUnsupportedError,
+    StudyStorageUnavailableError,
     TrialTargetRegressionError,
     read_winners,
 )
@@ -54,8 +57,14 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
-from phasesweep.engine.trial import _environment_identity
-from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
+from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from tests.conftest import (
+    assert_published_winner_evidence_local,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+    write_yaml,
+)
 
 
 def _two_phase_experiment(
@@ -806,8 +815,8 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
 
 
-def test_preexisting_unbound_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
-    """A study created before the binding existed is claimed by the first run that sees it."""
+def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
+    """An empty study is claimed by the first run that sees it: no evidence can be stranded."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment = make_experiment(
@@ -825,6 +834,158 @@ def test_preexisting_unbound_study_is_adopted_on_first_contact(tmp_path: Path) -
 
     study = optuna.load_study(study_name="t::p", storage=storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+
+
+def _drop_artifact_root_binding(storage: str, study_name: str) -> None:
+    """Reconstruct a pre-binding study by deleting its artifact-root user attr.
+
+    Optuna's API can set a study user attr but never delete one, so the only
+    way to build the state a database written before the binding existed is
+    in is to remove the row from the SQLite file directly.
+
+    :param str storage: ``sqlite:///`` storage URL backing the study.
+    :param str study_name: Fully qualified Optuna study name to unbind.
+    """
+    with sqlite3.connect(storage.removeprefix("sqlite:///")) as connection:
+        connection.execute(
+            "DELETE FROM study_user_attributes WHERE key = ? AND study_id = "
+            "(SELECT study_id FROM studies WHERE study_name = ?)",
+            (ARTIFACT_ROOT_ATTR, study_name),
+        )
+
+
+def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path: Path) -> None:
+    """A pre-binding study with results is migrated explicitly, never adopted.
+
+    Adopting it would bind whichever workdir happened to run first, so a
+    second workdir could publish the same study's winner into a second tree
+    that both report as intact (re-review v0.5.19 / blocker B1).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    root = _experiment_dir(experiment)
+    assert_published_winner_evidence_local(root)
+    _drop_artifact_root_binding(storage, "t::p")
+
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError) as excinfo:
+        run_experiment(experiment)
+
+    message = str(excinfo.value)
+    assert "rebind-workdir" in message
+    assert "nothing was published" in message.lower()
+    assert (
+        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
+    )
+    # The refusal is not allowed to cost the tree its existing publication.
+    assert _last_successful_generation_id(experiment) is not None
+    assert_published_winner_evidence_local(root)
+
+
+def _unbound_two_phase_studies(
+    experiment: Experiment,
+    storage: str,
+    *,
+    bound_root: str,
+    arch_trials: int,
+) -> None:
+    """Create the ``arch``/``lr`` studies with a deliberate mixed binding state.
+
+    ``arch`` is left unbound (optionally populated) and ``lr`` is bound to
+    ``bound_root``, so an invocation offering a third root finds one claimable
+    study before the one that refuses it.
+
+    :param Experiment experiment: Two-phase experiment naming the studies.
+    :param str storage: Persistent storage URL both studies live in.
+    :param str bound_root: Artifact root recorded on the ``lr`` study.
+    :param int arch_trials: COMPLETE trials to seed into the ``arch`` study.
+    """
+    arch = optuna.create_study(
+        study_name=f"{experiment.experiment}::arch", storage=storage, direction="minimize"
+    )
+    for _ in range(arch_trials):
+        arch.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    lr = optuna.create_study(
+        study_name=f"{experiment.experiment}::lr", storage=storage, direction="minimize"
+    )
+    lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
+
+
+@pytest.mark.parametrize(
+    ("arch_trials", "expected"),
+    [
+        (0, ArtifactRootConflictError),
+        (1, LegacyArtifactRootMigrationRequiredError),
+    ],
+)
+def test_refused_multi_phase_binding_claims_nothing(
+    tmp_path: Path,
+    arch_trials: int,
+    expected: type[Exception],
+) -> None:
+    """A refused run must not leave an earlier phase bound to the rejected root.
+
+    Claiming inside the check loop bound every phase examined before the
+    conflicting one, so the tree the operator was told nothing happened to
+    already had a binding pointing at it (re-review v0.5.19 / blocker B3).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
+    offered = _two_phase_experiment(workdir=tmp_path / "runs_b", trainer=trainer, storage=storage)
+    _unbound_two_phase_studies(
+        bound, storage, bound_root=str(_experiment_dir(bound)), arch_trials=arch_trials
+    )
+
+    with pytest.raises(expected):
+        run_experiment(offered)
+
+    arch = optuna.load_study(study_name="t::arch", storage=storage)
+    lr = optuna.load_study(study_name="t::lr", storage=storage)
+    assert ARTIFACT_ROOT_ATTR not in arch.user_attrs
+    assert lr.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(bound))
+
+
+def test_unreadable_study_blocks_binding_for_its_siblings_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that aborts in preflight must not leave a binding behind.
+
+    The unreadable study aborts the run either way - as unconfirmed cleanup,
+    with the storage failure chained beneath it - so claiming the readable
+    studies would invent a binding for an invocation that never ran a trial
+    (re-review v0.5.19 / blocker B3).
+    """
+    import phasesweep.engine.guards as guards
+
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
+    for phase in experiment.phases:
+        optuna.create_study(study_name=f"t::{phase.name}", storage=storage, direction="minimize")
+    real_loader = guards._load_existing_phase_study
+
+    def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
+        if phase.name == "lr":
+            raise RuntimeError("storage went away")
+        return real_loader(exp, phase)
+
+    monkeypatch.setattr(guards, "_load_existing_phase_study", _fail_for_lr)
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
+
+    for phase in experiment.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
 def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:

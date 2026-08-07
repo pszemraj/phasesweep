@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sqlite3
 import sys
 import textwrap
 from pathlib import Path
@@ -46,7 +47,11 @@ from phasesweep.engine.state import (
 )
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
-from tests.conftest import write_trainer, write_yaml
+from tests.conftest import (
+    assert_published_winner_evidence_local,
+    write_trainer,
+    write_yaml,
+)
 
 
 def test_help_registers_commands_and_options() -> None:
@@ -1002,6 +1007,24 @@ def _movable_two_phase_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return config_a, config_b, workdir_a, workdir_b
 
 
+def _drop_artifact_root_binding(storage: str, study_name: str) -> None:
+    """Reconstruct a pre-binding study by deleting its artifact-root user attr.
+
+    Optuna's API can set a study user attr but never delete one, so the state
+    a database written before the binding existed is in has to be rebuilt by
+    removing the row from the SQLite file directly.
+
+    :param str storage: ``sqlite:///`` storage URL backing the study.
+    :param str study_name: Fully qualified Optuna study name to unbind.
+    """
+    with sqlite3.connect(storage.removeprefix("sqlite:///")) as connection:
+        connection.execute(
+            "DELETE FROM study_user_attributes WHERE key = ? AND study_id = "
+            "(SELECT study_id FROM studies WHERE study_name = ?)",
+            (ARTIFACT_ROOT_ATTR, study_name),
+        )
+
+
 def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1162,6 +1185,33 @@ def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
         _experiment_dir(suite_a.experiment_for_study(suite_a.studies[0]))
     )
+
+
+def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
+    tmp_path: Path,
+) -> None:
+    """The command is the migration path an ordinary run deliberately refuses.
+
+    The config names the study's original tree, so the destination checks are
+    what prove this workdir really owns the evidence (re-review v0.5.19 /
+    blocker B1).
+    """
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    assert experiment_a.storage is not None
+    _drop_artifact_root_binding(experiment_a.storage, "t::p")
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
+
+    assert result.exit_code == 0, result.output
+    assert "(unbound)" in result.output
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+    # The migrated study now runs and publishes like any other bound study.
+    run_experiment(load_experiment(config_a))
+    assert_published_winner_evidence_local(_experiment_dir(experiment_a))
 
 
 def test_rebind_workdir_converges_after_a_partially_applied_rebind(tmp_path: Path) -> None:

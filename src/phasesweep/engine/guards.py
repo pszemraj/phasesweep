@@ -19,6 +19,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ArtifactRootRebindError,
     ExperimentLockBusyError,
+    LegacyArtifactRootMigrationRequiredError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -1504,39 +1505,52 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.storage is not None and not storage_is_in_memory(experiment.storage)
 
 
-def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
-    """Claim, or re-confirm, the one artifact root a single phase study publishes into.
+def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
+    """Record the artifact root an already-checked study is allowed to claim.
 
-    ``workdir`` is deliberately excluded from every semantic fingerprint so an
-    artifact tree stays movable. Without a binding that mobility is unsound
-    (review v0.5.19 / finding F5): re-running the same config with a second
-    ``workdir`` matches the same fingerprints, tops up or re-selects against
-    trial directories living under the *first* root, and publishes a second,
-    divergent artifact tree — two roots each claiming to be the publication of
-    one study, with ``trial_dir`` attrs pointing into the other.
+    :param optuna.Study study: Phase study that :func:`_artifact_root_claim_needed`
+        just reported as claimable.
+    :param str offered: Resolved artifact root this config publishes into.
+    """
+    study.set_user_attr(ARTIFACT_ROOT_ATTR, offered)
+    log.info("Bound study %s to artifact root %s", study.study_name, offered)
 
-    First contact claims the root. That deliberately **adopts** studies created
-    before this attr existed: the first invocation to see such a study binds it
-    to *its own* root, which is the root of that invocation and not necessarily
-    the one that originally created the study. The alternative — refusing every
-    legacy study — would strand existing work, and any later invocation
-    offering a different root is still refused rather than silently rebound.
 
-    :param optuna.Study study: Phase study to bind.
+def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> bool:
+    """Decide, without writing anything, whether a study may claim the offered root.
+
+    The read-only half of the binding, split out so a multi-phase run can
+    check every declared phase before it claims any of them (re-review v0.5.19
+    / blocker B3).
+
+    :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
+    :return bool: ``True`` when the study records no binding and holds no
+        trials, so claiming the offered root is safe; ``False`` when it already
+        records exactly that root.
+    :raises LegacyArtifactRootMigrationRequiredError: The study holds trials but
+        records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: The study is already bound to a different
         artifact root, or carries a binding that is not a string.
     """
-    if not _artifact_root_binding_applies(experiment):
-        return
     offered = _artifact_root_identity(experiment)
     if ARTIFACT_ROOT_ATTR not in study.user_attrs:
-        study.set_user_attr(ARTIFACT_ROOT_ATTR, offered)
-        log.info("Bound study %s to artifact root %s", study.study_name, offered)
-        return
+        trial_count = len(study.get_trials(deepcopy=False))
+        if trial_count:
+            raise LegacyArtifactRootMigrationRequiredError(
+                f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
+                "artifact root: it predates artifact-root binding, and an ordinary run "
+                "cannot infer which workdir owns its trial directories and publication. "
+                f"Adopting the offered root {offered!r} here would let one study back two "
+                "artifact trees. Run 'phasesweep rebind-workdir <config>' with a config "
+                "whose workdir names the original, complete artifact tree; that validates "
+                "the evidence is present there and records the binding. No trial ran and "
+                "nothing was published."
+            )
+        return True
     bound = study.user_attrs[ARTIFACT_ROOT_ATTR]
     if bound == offered:
-        return
+        return False
     raise ArtifactRootConflictError(
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
         f"config offers {offered!r}. One persistent study backs exactly one publication "
@@ -1548,6 +1562,41 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     )
 
 
+def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
+    """Claim, or re-confirm, the one artifact root a single phase study publishes into.
+
+    ``workdir`` is deliberately excluded from every semantic fingerprint so an
+    artifact tree stays movable. Without a binding that mobility is unsound
+    (review v0.5.19 / finding F5): re-running the same config with a second
+    ``workdir`` matches the same fingerprints, tops up or re-selects against
+    trial directories living under the *first* root, and publishes a second,
+    divergent artifact tree — two roots each claiming to be the publication of
+    one study, with ``trial_dir`` attrs pointing into the other.
+
+    First contact claims the root only for a study that holds **no trials**,
+    mirroring the zero-trial fingerprint rebind in :func:`_verify_fingerprint`:
+    nothing was evaluated yet, so nothing can be stranded under another root.
+    A *populated* study with no binding predates the attr, and an ordinary run
+    cannot tell which workdir holds its trial directories; adopting whichever
+    workdir happened to run first would leave two trees each reporting an
+    intact publication of the same study (re-review v0.5.19 / blocker B1).
+    Migrating one is the operator's explicit statement, made against the
+    original tree with ``phasesweep rebind-workdir``.
+
+    :param optuna.Study study: Phase study to bind.
+    :param Experiment experiment: Parsed experiment supplying the artifact root.
+    :raises LegacyArtifactRootMigrationRequiredError: The study holds trials but
+        records no artifact root, so which workdir owns its evidence is unknown.
+    :raises ArtifactRootConflictError: The study is already bound to a different
+        artifact root, or carries a binding that is not a string.
+    """
+    if not _artifact_root_binding_applies(experiment):
+        return
+    if not _artifact_root_claim_needed(study, experiment):
+        return
+    _claim_study_artifact_root(study, _artifact_root_identity(experiment))
+
+
 def _bind_artifact_root(experiment: Experiment) -> None:
     """Bind every already-existing phase study to this config's artifact root.
 
@@ -1557,23 +1606,44 @@ def _bind_artifact_root(experiment: Experiment) -> None:
     as it found it. Phases whose study does not exist yet are bound by
     :func:`_bind_study_artifact_root` when the phase creates them.
 
+    Every declared phase is checked before any claim is written (re-review
+    v0.5.19 / blocker B3). Claiming as each phase was checked left the earlier
+    studies of a refused multi-phase run bound to the *rejected* root while
+    the error still said nothing was published. A study that cannot be read at
+    all suppresses the claims for its siblings too: the main preflight loop
+    turns that into :class:`StudyStorageUnavailableError` and aborts, and
+    binding the readable studies for a run that is about to abort would invent
+    a binding the operator never got a run out of. Preflight holds the
+    experiment lock across both passes, so nothing can bind in between.
+
     :param Experiment experiment: Parsed experiment whose declared phase
         studies are bound to its resolved artifact root.
+    :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
+        records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, or carries a binding that is not a string.
     """
     if not _artifact_root_binding_applies(experiment):
         return
+    claimable: list[optuna.Study] = []
+    unreadable = False
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)
         except Exception:  # noqa: BLE001 - reported as StudyStorageUnavailableError below
             # Leave the diagnosis to the main preflight loop, which turns this
             # into StudyStorageUnavailableError and aborts the run anyway; a
-            # study that cannot be read cannot be bound either way.
+            # study that cannot be read cannot be bound either way. Keep
+            # checking the remaining phases so a conflict is still reported.
+            unreadable = True
             continue
-        if study is not None:
-            _bind_study_artifact_root(study, experiment)
+        if study is not None and _artifact_root_claim_needed(study, experiment):
+            claimable.append(study)
+    if unreadable:
+        return
+    offered = _artifact_root_identity(experiment)
+    for study in claimable:
+        _claim_study_artifact_root(study, offered)
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1653,14 @@ class _ArtifactRootRebindEntry:
     phase_name: str
     study: optuna.Study
     previous: str | None
+
+    @property
+    def is_populated(self) -> bool:
+        """Return whether this study holds any trial at all.
+
+        :return bool: ``True`` when the study's ledger is non-empty.
+        """
+        return bool(self.study.get_trials(deepcopy=False))
 
 
 @dataclass(frozen=True)
@@ -1600,6 +1678,19 @@ class _ArtifactRootRebindPlan:
         :return bool: ``True`` when at least one existing phase study is bound.
         """
         return any(entry.previous is not None for entry in self.entries)
+
+    @property
+    def has_unbound_populated_study(self) -> bool:
+        """Return whether any existing study holds trials but records no binding.
+
+        Such a study predates artifact-root binding, so no ordinary run will
+        ever claim it (re-review v0.5.19 / blocker B1) and this command is its
+        only migration path.
+
+        :return bool: ``True`` when at least one existing phase study is
+            populated and unbound.
+        """
+        return any(entry.previous is None and entry.is_populated for entry in self.entries)
 
 
 def _artifact_root_rebind_entries(
@@ -1825,9 +1916,9 @@ def _plan_artifact_root_rebinds(
         one for a single experiment, one per study for a suite.
     :return list[_ArtifactRootRebindPlan]: One validated plan per experiment,
         ready to apply.
-    :raises ArtifactRootRebindError: Every experiment uses in-memory storage, no
-        phase study is bound anywhere, a study cannot be read, or a destination
-        fails validation.
+    :raises ArtifactRootRebindError: Every experiment uses in-memory storage,
+        every existing study is unbound *and* empty, a study cannot be read, or
+        a destination fails validation.
     """
     persistent = [
         experiment for experiment in experiments if _artifact_root_binding_applies(experiment)
@@ -1846,11 +1937,11 @@ def _plan_artifact_root_rebinds(
         )
         for experiment in persistent
     ]
-    if not any(plan.has_binding for plan in plans):
+    if not any(plan.has_binding or plan.has_unbound_populated_study for plan in plans):
         raise ArtifactRootRebindError(
-            "No phase study in this storage is bound to an artifact root, so there is nothing "
-            "to rebind; the next ordinary run binds these studies to the configured workdir. "
-            "Nothing was written."
+            "No phase study in this storage is bound to an artifact root, and none holds a "
+            "trial, so there is nothing to rebind or migrate; the next ordinary run binds "
+            "these empty studies to the configured workdir. Nothing was written."
         )
     for plan in plans:
         if plan.entries:
@@ -1942,6 +2033,9 @@ def _preflight_existing_studies(
     :raises ArtifactRootConflictError: A phase's persistent study is already
         bound to a different artifact root than this config's workdir offers;
         raised before any inspection, reaping, or trial work.
+    :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
+        predates artifact-root binding, so which workdir owns its evidence
+        cannot be inferred; raised on the same terms.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
         be inspected.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
@@ -1954,10 +2048,12 @@ def _preflight_existing_studies(
         not covered by a single common exception type.
     """
     _warn_unbounded_environment_inheritance(experiment)
-    # The artifact-root binding is checked FIRST and raises directly rather than
-    # joining the aggregate below: an invocation offering a second publication
-    # root must not reap, inspect, or claim anything in either tree (review
-    # v0.5.19 / finding F5).
+    # The artifact-root binding is checked FIRST, for every declared phase, and
+    # raises directly rather than joining the aggregate below: an invocation
+    # offering a second publication root must not reap, inspect, or claim
+    # anything in either tree (review v0.5.19 / finding F5). Claims are written
+    # only after every phase passed that check, so a refusal leaves no phase
+    # bound to the rejected root (re-review v0.5.19 / blocker B3).
     _bind_artifact_root(experiment)
     report = cleanup_report or _PreflightCleanupReport()
     studies: dict[str, optuna.Study] = {}

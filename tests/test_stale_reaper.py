@@ -35,12 +35,14 @@ from phasesweep.engine.guards import (
 )
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    _experiment_dir,
     _generation_path,
     _trial_dir_for,
 )
@@ -142,6 +144,21 @@ def test_is_same_live_process_fails_closed_when_proc_entry_is_unreadable(
     assert is_same_live_process(pid, saved_starttime) is False
 
 
+def _stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
+    """Bind a hand-built study to the artifact root a prior run would have claimed.
+
+    A fabricated populated study stands in for one an earlier invocation left
+    behind, and such a study always carries its artifact-root binding. Without
+    it, preflight refuses the run as a pre-binding study needing explicit
+    migration (re-review v0.5.19 / blocker B1), which preempts the recovery and
+    schema behavior these fixtures are about.
+
+    :param optuna.Study study: Fabricated study to bind.
+    :param Experiment experiment: Experiment whose resolved root it publishes into.
+    """
+    study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
+
+
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
@@ -225,6 +242,8 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         ],
     )
 
+    _stamp_artifact_root(study, exp)
+
     # Will raise on fingerprint mismatch, but reap must have run first.
     with pytest.raises(RuntimeError, match="different phase config"):
         _run_phase(
@@ -285,6 +304,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             study_name="cross_phase_orphan::b", storage=storage, direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        _stamp_artifact_root(study, experiment)
         trial = study.ask()
         trial_dir = _trial_dir_for(
             experiment,
@@ -337,6 +357,7 @@ def test_populated_legacy_study_fails_before_counting_or_launch(tmp_path: Path) 
         ],
     )
     study = optuna.create_study(study_name="legacy_trial::p", storage=storage, direction="minimize")
+    _stamp_artifact_root(study, experiment)
     study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
 
     with pytest.raises(
@@ -372,6 +393,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
         direction="minimize",
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _stamp_artifact_root(study, experiment)
     study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
 
     with pytest.raises(
@@ -491,6 +513,7 @@ def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path)
         storage=storage,
         direction="minimize",
     )
+    _stamp_artifact_root(study, experiment)
     trial = study.ask()
     stale = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -1071,6 +1094,7 @@ def _fabricate_stale_running_trial(
         direction="minimize",
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _stamp_artifact_root(study, experiment)
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,

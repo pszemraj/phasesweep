@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from phasesweep.config import (
     Constraint,
@@ -197,6 +198,38 @@ def write_constant_trainer(tmp_path: Path) -> Path:
         print("x=0.5")
         """,
     )
+
+
+def assert_published_winner_evidence_local(experiment_dir: Path) -> None:
+    """Assert every published winner's source generation exists in this same tree.
+
+    The invariant a second, divergent artifact tree breaks: a published
+    winner's ``winner_source.generation_id`` names the immutable generation
+    namespace holding the evidence behind that number, so it must resolve
+    *inside the tree the reader is reading*. When one study is allowed to back
+    two roots, both report ``publication_integrity: ok`` while the winner in
+    one of them cites a generation that only exists in the other (re-review
+    v0.5.19 / blocker B1).
+
+    :param Path experiment_dir: Experiment artifact namespace to check, i.e.
+        ``<workdir>/<experiment>``.
+    """
+    pointer = experiment_dir / "last_successful_generation.yaml"
+    assert pointer.is_file(), f"{experiment_dir} has never published"
+    published = yaml.safe_load(pointer.read_text())["generation_id"]
+    generations = experiment_dir / "generations"
+    assert (generations / published).is_dir(), (
+        f"published generation {published!r} is missing from {generations}"
+    )
+    winners = sorted((generations / published / "phases").glob("*/winner.yaml"))
+    assert winners, f"published generation {published!r} exposes no winner"
+    for winner_path in winners:
+        source = yaml.safe_load(winner_path.read_text())["winner_source"]
+        source_generation = source["generation_id"]
+        assert (generations / source_generation).is_dir(), (
+            f"{winner_path} cites generation {source_generation!r}, which does not exist "
+            f"under {generations}: its evidence lives in another artifact tree"
+        )
 
 
 def make_trial_context(

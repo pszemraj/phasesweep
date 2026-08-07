@@ -121,18 +121,21 @@ def _base_failure_payload(
             ),
         }
     if isinstance(error, ArtifactRootConflictError):
-        # Not a fingerprint problem: the study is healthy but bound to another
-        # publication root, and the fingerprint remediation (new experiment
-        # name / archive the study) would destroy that binding's value.
+        # Not a fingerprint problem: the study is healthy but is not provably
+        # this workdir's, and the fingerprint remediation (new experiment name
+        # / archive the study) would destroy the binding's value. The wording
+        # covers the subclass too: a study that predates the binding records no
+        # root at all, so "the workdir its studies are bound to" would name
+        # nothing (re-review v0.5.19 / blocker B1).
         return {
             "code": "artifact_root_conflict",
             "stage": failure_stage,
             "retryable": False,
             "actor": "operator",
             "remediation": (
-                "Ask the operator to run this experiment from the workdir its studies are "
-                "bound to, or to move the artifact tree and run `phasesweep rebind-workdir` "
-                "before retrying."
+                "Ask the operator to run this experiment from the workdir that owns its "
+                "artifact tree, or to relocate/restore that tree and run "
+                "`phasesweep rebind-workdir` against it before retrying."
             ),
         }
     if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
