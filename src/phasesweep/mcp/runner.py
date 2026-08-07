@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict
 from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
 from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
@@ -170,6 +171,24 @@ def _base_failure_payload(
             "actor": "operator",
             "remediation": (
                 "Ask the operator to restore the configured study storage, then start a new run."
+            ),
+        }
+    if isinstance(error, ActiveAttemptPersistenceError):
+        # Deliberately the same code as an unreachable study: a durable store
+        # PhaseSweep must write to before it may launch is unavailable, the
+        # condition is environmental and transient, and the operator restores
+        # it and retries. Only the store differs, so the remediation names it
+        # rather than minting a FailureCode whose policy would be identical
+        # (PR #5 review / reviewer 2 pass 2, blocker 5). Nothing was launched,
+        # so there is nothing to clean up.
+        return {
+            "code": "storage_unavailable",
+            "stage": failure_stage,
+            "retryable": True,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to restore write access to the experiment workdir "
+                "so trial attempts can be registered, then start a new run."
             ),
         }
     if isinstance(error, SamplerContinuationUnsupportedError):

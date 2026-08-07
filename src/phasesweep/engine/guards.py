@@ -17,6 +17,7 @@ import optuna
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
 from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ArtifactRootRebindError,
     ExperimentLockBusyError,
@@ -712,14 +713,22 @@ def _register_active_attempt(
     trial_dir: Path,
     generation_id: str,
 ) -> None:
-    """Best-effort durable registration of a newly allocated attempt.
+    """Durably register a newly allocated attempt before anything is launched.
 
     The entry binds the attempt to the *producing* phase name, study name,
     and storage URL, so preflight can find and resolve it even after the
     phase was renamed or removed, or the storage URL changed (review
-    v0.5.17 / blocker 3). A write failure only loses that cross-config
-    coverage for this attempt — the per-phase reaper still recovers it under
-    the same config — so it is logged, not raised.
+    v0.5.17 / blocker 3).
+
+    Creation is fail-closed. The write used to be swallowed on the theory
+    that "the per-phase reaper still recovers it under the same config", but
+    that is exactly wrong for the case this registry exists to cover: the
+    reaper walks only the phases the *current* config declares, so a rename,
+    a removal, or a changed storage URL is precisely when the lost entry was
+    the sole record of a trainer that may still be alive. Refusing to launch
+    an attempt PhaseSweep could not record keeps that unreachable state from
+    ever existing, and costs nothing to undo because this runs before the GPU
+    lease and the trainer (PR #5 review / reviewer 2 pass 2, blocker 5).
 
     Args:
         experiment: Parsed experiment config (supplies the registry root).
@@ -729,6 +738,10 @@ def _register_active_attempt(
         trial_number: Optuna trial number bound to this attempt.
         trial_dir: Resolved per-trial directory holding lifecycle/identity.
         generation_id: Engine invocation identity.
+
+    Raises:
+        ActiveAttemptPersistenceError: The registry entry could not be
+            written. No trainer was started and no GPU lease was consumed.
 
     """
     entry = {
@@ -742,23 +755,29 @@ def _register_active_attempt(
         "trial_dir": str(trial_dir),
         "generation_id": generation_id,
     }
+    entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
     try:
-        attempts_dir = _attempts_dir(experiment)
-        attempts_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            attempts_dir / f"{attempt_id}.json",
-            json.dumps(entry, sort_keys=True) + "\n",
-        )
-    except OSError:
-        log.warning(
-            "Could not register active attempt %s in the experiment attempt "
-            "registry; recovery after a phase rename/removal will not see it.",
-            attempt_id,
-        )
+        entry_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
+    except OSError as exc:
+        raise ActiveAttemptPersistenceError(
+            f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
+            f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
+            "consumed. This entry is the only durable record that would let a later "
+            "run discover this attempt after a phase rename/removal or a storage-URL "
+            "change, so PhaseSweep refuses to launch a trainer it could not account "
+            "for. Restore write access to the experiment workdir, then run again."
+        ) from exc
 
 
 def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     """Best-effort removal of a registry entry whose trial is durably terminal.
+
+    Deletion stays best-effort even though creation is fail-closed: a retained
+    entry is safe by construction. It names an already-terminal trial, so
+    preflight resolves it against a durable ``exited`` lifecycle, changes
+    nothing in the study, and garbage-collects the file. Only a *missing*
+    entry loses information (PR #5 review / reviewer 2 pass 2, blocker 5).
 
     Args:
         experiment: Parsed experiment config (supplies the registry root).

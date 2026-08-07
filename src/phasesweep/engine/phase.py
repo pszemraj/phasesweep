@@ -17,6 +17,7 @@ import optuna
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -339,6 +340,8 @@ def _run_phase(
         TrialEvidenceMissingError: The selected winner's evidence directory,
             audit artifacts, or objective source are missing or no longer match
             the provenance frozen at extraction.
+        ActiveAttemptPersistenceError: A trial's attempt could not be recorded
+            in the experiment attempt registry, so it was never launched.
         StudyStorageUnavailableError: A trial's terminal outcome could not be
             persisted. That trial is left ``RUNNING`` with its attempt record
             intact and recovers on the next run once storage is writable
@@ -669,6 +672,9 @@ def _run_phase(
                 acquire the just-released GPU lease.
             TrialExecutionError: The subprocess returned non-zero / produced
                 no metric. Caught by ``study.optimize(catch=...)``.
+            ActiveAttemptPersistenceError: The attempt could not be recorded
+                in the experiment attempt registry; nothing was launched and
+                no GPU lease was consumed.
             _TrialOutcomeUnrecordedAbort: A successful trial's terminal
                 outcome could not be persisted, so the trial is deliberately
                 left ``RUNNING`` for stale-attempt recovery.
@@ -716,7 +722,10 @@ def _run_phase(
         # recovery even if the phase is later renamed/removed or the storage
         # URL changes (review v0.5.17 / blocker 3). Retired by the post-trial
         # callback once Optuna's terminal state is durable; preflight GCs
-        # entries the callback never reached.
+        # entries the callback never reached. It raises rather than warns, and
+        # deliberately runs here — before the GPU lease and the launch — so a
+        # trainer PhaseSweep could not record is never started (PR #5 review /
+        # reviewer 2 pass 2, blocker 5).
         _register_active_attempt(
             experiment,
             attempt_id=attempt_id,
@@ -913,6 +922,20 @@ def _run_phase(
                 "fatal",
                 cause=str(exc),
                 fatal_policy="unsafe_process_cleanup",
+            )
+            raise
+        except ActiveAttemptPersistenceError as exc:
+            # Named rather than left to the catch-all below: the durable abort
+            # record is the operator's only account of why the phase stopped,
+            # and "unexpected_objective_exception" would point them at a
+            # PhaseSweep bug instead of at their unwritable workdir (PR #5
+            # review / reviewer 2 pass 2, blocker 5).
+            _record_fatal_abort(exc)
+            _record_outcome(
+                trial,
+                "fatal",
+                cause=str(exc),
+                fatal_policy="active_attempt_registration",
             )
             raise
         except BaseException as exc:

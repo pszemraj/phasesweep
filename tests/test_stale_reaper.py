@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import os
 import signal
@@ -25,7 +26,7 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
-from phasesweep.engine import run_experiment
+from phasesweep.engine import ActiveAttemptPersistenceError, run_experiment
 from phasesweep.engine.guards import (
     _preflight_existing_studies,
     _PreflightCleanupReport,
@@ -38,6 +39,7 @@ from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
@@ -1311,6 +1313,79 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     assert "p" in winners
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
+
+
+def test_unregistrable_attempt_refuses_to_launch_its_trainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attempt registration is a pre-launch durability requirement.
+
+    Swallowing the registry write published runs with zero registry coverage,
+    which is the one state the registry exists to prevent: after an
+    orchestrator hard-kill plus a phase rename, nothing can discover the
+    still-live trainer, because the per-phase reaper walks only the phases the
+    current config declares. So the write now fails closed, before the GPU
+    lease and before any subprocess (PR #5 review / reviewer 2 pass 2,
+    blocker 5). The registration-succeeds discovery path is covered by
+    ``test_renamed_phase_cannot_hide_stale_trainer_from_recovery``.
+    """
+    launched = tmp_path / "trainer_ran"
+    trainer = write_trainer(
+        tmp_path,
+        f"""
+        import pathlib
+        pathlib.Path({str(launched)!r}).touch()
+        print("x=0.5")
+        """,
+    )
+    storage = f"sqlite:///{tmp_path / 'registry.db'}"
+
+    def _exp(n_trials: int) -> Experiment:
+        return make_experiment(
+            experiment="unregistrable",
+            workdir=tmp_path / "runs",
+            storage=storage,
+            trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            n_trials=n_trials,
+        )
+
+    import phasesweep.engine.guards as guards_mod
+
+    real_atomic_write_text = guards_mod.atomic_write_text
+    attempts_dir = tmp_path / "runs" / "unregistrable" / "attempts"
+
+    def refuse_registry_writes(path: Path, text: str) -> None:
+        if path.parent == attempts_dir:
+            raise OSError(errno.EACCES, "injected registry write failure")
+        real_atomic_write_text(path, text)
+
+    monkeypatch.setattr(guards_mod, "atomic_write_text", refuse_registry_writes)
+    with pytest.raises(ActiveAttemptPersistenceError) as excinfo:
+        run_experiment(_exp(2))
+
+    message = str(excinfo.value)
+    assert str(attempts_dir) in message
+    assert "No trainer was started" in message
+    # Nothing was launched: no marker, and no durable process identity.
+    assert not launched.exists()
+    phase_dir = tmp_path / "runs" / "unregistrable" / "p"
+    assert not list(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
+
+    # The failure is a visible, valid terminal row - not an invisible RUNNING one.
+    study = optuna.load_study(study_name="unregistrable::p", storage=storage)
+    (trial,) = study.get_trials(deepcopy=False)
+    assert trial.state == optuna.trial.TrialState.FAIL
+    assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
+    assert str(attempts_dir) in trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_registration"
+
+    # The study stays usable once the workdir is writable again.
+    monkeypatch.setattr(guards_mod, "atomic_write_text", real_atomic_write_text)
+    winners = run_experiment(_exp(3))
+
+    assert winners["p"].metric == pytest.approx(0.5)
+    assert launched.exists()
+    assert not list(attempts_dir.glob("*.json"))
 
 
 @pytest.mark.parametrize(
