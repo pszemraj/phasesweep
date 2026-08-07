@@ -42,6 +42,7 @@ from phasesweep.engine.guards import (
     _recover_cleanup_uncertain_trials,
     _suite_fingerprint,
     _suite_lock,
+    _validate_suite_artifact_root_rebind,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
@@ -641,8 +642,11 @@ def status(config_path: Path) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Point this config's persistent phase studies at the workdir it now declares, after "
-        "you have already moved or copied the experiment's artifact tree there. Validates the "
-        "destination first and writes nothing if it does not hold the relocated tree."
+        "you have already moved the experiment's complete artifact tree there. Verifies at the "
+        "destination that every trial in the study ledger still has its evidence directory, "
+        "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
+        "publication validates; refuses relocating a published suite. Writes nothing unless "
+        "every check passes."
     ),
     short_help="Rebind studies to a moved artifact tree.",
 )
@@ -652,16 +656,30 @@ def rebind_workdir(config_path: Path) -> None:
 
     Each persistent phase study is bound to the one artifact root it publishes
     into, so an ordinary run against a different ``workdir`` is refused rather
-    than allowed to produce a second, divergent publication tree. This is the
-    operator's explicit statement that the tree itself has been relocated. It
+    than allowed to produce a second, divergent publication tree. This command
+    is the operator's explicit statement that the tree itself was relocated. It
     is a rebind, never a move: PhaseSweep does not copy, delete, or verify the
-    original tree, only that the destination holds a valid relocated one.
+    original tree.
+
+    What it verifies at the destination, per experiment: the namespace exists;
+    every trial the study ledger holds still has its evidence directory there,
+    which is what rejects a stale copy taken before the ledger advanced; no
+    trial is ``RUNNING`` and no attempt registry entry is unresolved, because
+    recovery follows the absolute paths those attempts persisted; and, when the
+    studies record completed trials, the recorded publication validates. A
+    suite that published a suite generation is refused outright - suite
+    summaries record absolute component paths that do not survive relocation.
+
+    Nothing else in the durable state graph is rewritten, so the refusals are
+    deliberately broader than the cases PhaseSweep can repair (re-review
+    v0.5.19 / blocker B2; see the tracked relocation TODO in
+    ``docs/development.md``).
 
     :param Path config_path: Path to the experiment or suite YAML file whose
-        ``workdir`` already names the relocated artifact tree.
+        ``workdir`` already names the artifact tree these studies own.
     :raises ArtifactRootRebindError: Storage is in-memory, no phase study is
-        bound, a study cannot be read, or a destination artifact root is
-        missing or does not hold the recorded publication. Nothing is written.
+        bound, a study cannot be read, or a destination fails any of the
+        checks above. Nothing is written.
     :raises ExperimentLockBusyError: Another orchestrator owns one of the
         experiment (or suite) consistency locks.
     """
@@ -681,6 +699,11 @@ def rebind_workdir(config_path: Path) -> None:
         for experiment in experiments:
             locks.enter_context(_experiment_lock(experiment))
         plans = _plan_artifact_root_rebinds(experiments)
+        if isinstance(config, Suite):
+            # Suite-level publication state is validated after the per-study
+            # plans and before any of them is applied, so a suite refusal still
+            # leaves every component binding exactly as it was.
+            _validate_suite_artifact_root_rebind(config, plans)
         for plan in plans:
             for study_name, previous, destination in _apply_artifact_root_rebind(plan):
                 origin = previous if previous is not None else "(unbound)"

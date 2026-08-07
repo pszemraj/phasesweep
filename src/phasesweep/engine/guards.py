@@ -45,6 +45,8 @@ from phasesweep.engine.state import (
     _attempts_dir,
     _experiment_dir,
     _last_successful_generation_id,
+    _last_successful_suite_generation_path,
+    _phase_dir,
     _suite_dir,
     _trial_dir_for,
 )
@@ -1575,12 +1577,21 @@ def _bind_artifact_root(experiment: Experiment) -> None:
 
 
 @dataclass(frozen=True)
+class _ArtifactRootRebindEntry:
+    """One existing phase study, its declared phase, and the root it records now."""
+
+    phase_name: str
+    study: optuna.Study
+    previous: str | None
+
+
+@dataclass(frozen=True)
 class _ArtifactRootRebindPlan:
     """One experiment's validated artifact-root rebind, before anything is written."""
 
     experiment: Experiment
     destination: str
-    entries: tuple[tuple[optuna.Study, str | None], ...]
+    entries: tuple[_ArtifactRootRebindEntry, ...]
 
     @property
     def has_binding(self) -> bool:
@@ -1588,21 +1599,21 @@ class _ArtifactRootRebindPlan:
 
         :return bool: ``True`` when at least one existing phase study is bound.
         """
-        return any(previous is not None for _study, previous in self.entries)
+        return any(entry.previous is not None for entry in self.entries)
 
 
 def _artifact_root_rebind_entries(
     experiment: Experiment,
-) -> tuple[tuple[optuna.Study, str | None], ...]:
+) -> tuple[_ArtifactRootRebindEntry, ...]:
     """Load every existing phase study with the artifact root it currently records.
 
     :param Experiment experiment: Parsed experiment whose phase studies are read.
-    :return tuple[tuple[optuna.Study, str | None], ...]: Each existing study
-        paired with its recorded binding, or ``None`` when it has none.
+    :return tuple[_ArtifactRootRebindEntry, ...]: Each existing study with its
+        declared phase name and its recorded binding (``None`` when unbound).
     :raises ArtifactRootRebindError: A phase study exists but cannot be read, so
         what it is bound to is unknown and a rebind cannot be safe.
     """
-    entries: list[tuple[optuna.Study, str | None]] = []
+    entries: list[_ArtifactRootRebindEntry] = []
     for phase in experiment.phases:
         try:
             study = _load_existing_phase_study(experiment, phase)
@@ -1615,11 +1626,17 @@ def _artifact_root_rebind_entries(
         if study is None:
             continue
         bound = study.user_attrs.get(ARTIFACT_ROOT_ATTR)
-        entries.append((study, bound if isinstance(bound, str) else None))
+        entries.append(
+            _ArtifactRootRebindEntry(
+                phase_name=phase.name,
+                study=study,
+                previous=bound if isinstance(bound, str) else None,
+            )
+        )
     return tuple(entries)
 
 
-def _studies_record_publication(entries: Sequence[tuple[optuna.Study, str | None]]) -> bool:
+def _studies_record_publication(entries: Sequence[_ArtifactRootRebindEntry]) -> bool:
     """Return whether storage records that this experiment produced a publishable result.
 
     A COMPLETE trial is the durable, root-independent evidence that the
@@ -1627,28 +1644,129 @@ def _studies_record_publication(entries: Sequence[tuple[optuna.Study, str | None
     source tree is gone by the time a rebind runs, so this is the only side of
     the move that can still be inspected.
 
-    :param Sequence[tuple[optuna.Study, str | None]] entries: Existing phase
-        studies paired with their recorded bindings.
+    :param Sequence[_ArtifactRootRebindEntry] entries: Existing phase studies
+        with their recorded bindings.
     :return bool: ``True`` when any phase study holds a COMPLETE trial.
     """
     return any(
         trial.state == optuna.trial.TrialState.COMPLETE
-        for study, _previous in entries
-        for trial in study.get_trials(deepcopy=False)
+        for entry in entries
+        for trial in entry.study.get_trials(deepcopy=False)
+    )
+
+
+def _validate_relocated_trial_evidence(
+    experiment: Experiment,
+    entries: Sequence[_ArtifactRootRebindEntry],
+) -> None:
+    """Require the destination tree to hold the evidence every ledger trial names.
+
+    The persisted ``phasesweep_trial_dir`` attr is an absolute path that
+    stale-trial recovery, cleanup recovery, and every later diagnosis read back
+    verbatim, so a rebind is only sound when the same evidence really is under
+    the destination (re-review v0.5.19 / blocker B2). Each stored path is
+    translated *structurally* - the destination's directory for the known phase
+    plus the stored directory's own name - rather than by re-rooting it against
+    a recorded previous root: that also covers a tree moved more than once, and
+    the adoption of a study that never recorded a root at all.
+
+    Two refusals fall out of the same walk. A ``RUNNING`` trial means an
+    attempt was interrupted and never resolved; recovery follows the paths that
+    attempt persisted, so it has to run against the original root before the
+    tree moves. A stale copy - taken before the ledger advanced - is rejected
+    by the missing directory of the trial that ran after the copy, which is
+    exactly the case that would otherwise publish a winner whose evidence
+    exists only in the source tree. A trial that never persisted the attr died
+    before launch and has no evidence to move, so it is skipped.
+
+    :param Experiment experiment: Parsed experiment naming the destination.
+    :param Sequence[_ArtifactRootRebindEntry] entries: Existing phase studies
+        with their recorded bindings.
+    :raises ArtifactRootRebindError: A study holds a RUNNING trial, records a
+        malformed trial directory, or names a trial directory that does not
+        exist under the destination tree.
+    """
+    for entry in entries:
+        phase_dir = _phase_dir(experiment, entry.phase_name)
+        for trial in entry.study.get_trials(deepcopy=False):
+            if trial.state == optuna.trial.TrialState.RUNNING:
+                raise ArtifactRootRebindError(
+                    f"Study {entry.study.study_name!r} holds RUNNING trial {trial.number}: an "
+                    "interrupted attempt must be resolved before its artifact tree moves, "
+                    "because stale-attempt recovery follows the absolute trial paths that "
+                    "attempt persisted. Run phasesweep against the original workdir to "
+                    "recover it, then move the tree and rebind. If this study predates "
+                    "artifact-root binding, so no ordinary run can reach it, mark that trial "
+                    "FAIL yourself once you have confirmed no process from it is alive. "
+                    "Nothing was written."
+                )
+            if TRIAL_DIR_ATTR not in trial.user_attrs:
+                continue
+            stored = trial.user_attrs[TRIAL_DIR_ATTR]
+            if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
+                raise ArtifactRootRebindError(
+                    f"Study {entry.study.study_name!r} trial {trial.number} records an invalid "
+                    f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}; a rebind cannot locate that "
+                    "trial's evidence under the destination tree. Nothing was written."
+                )
+            translated = phase_dir / Path(stored).name
+            if not translated.is_dir():
+                raise ArtifactRootRebindError(
+                    f"Destination artifact root {str(_experiment_dir(experiment))!r} is missing "
+                    f"the evidence for trial {trial.number} of study "
+                    f"{entry.study.study_name!r}: expected directory {str(translated)!r} "
+                    f"(recorded as {stored!r}). The moved or copied tree is incomplete, or it "
+                    "is a stale copy taken before that trial ran. Move the complete artifact "
+                    "tree, then rebind. Nothing was written."
+                )
+
+
+def _validate_no_live_attempts(experiment: Experiment) -> None:
+    """Refuse a rebind while the destination tree still holds unresolved attempts.
+
+    A registry entry is written when an attempt is allocated and unlinked once
+    its trial is durably terminal, so a surviving entry is an attempt nobody
+    resolved. Every entry stores the attempt's absolute trial directory and
+    recovery fails closed when that path is missing, so relocating the tree
+    under an unresolved attempt strands it permanently (re-review v0.5.19 /
+    blocker B2). The registry lives inside the experiment tree, so this reads
+    the copy that came along with the move.
+
+    :param Experiment experiment: Parsed experiment naming the destination.
+    :raises ArtifactRootRebindError: The destination registry holds at least one
+        unresolved attempt entry.
+    """
+    attempts_dir = _attempts_dir(experiment)
+    if not attempts_dir.is_dir():
+        return
+    pending = sorted(attempts_dir.glob("*.json"))
+    if not pending:
+        return
+    raise ArtifactRootRebindError(
+        f"Destination artifact root {str(_experiment_dir(experiment))!r} still holds "
+        f"unresolved attempt registry entries ({len(pending)} total, first "
+        f"{str(pending[0])!r}). Each entry references the absolute trial path its attempt "
+        "was launched with, and recovery cannot follow those paths after a relocation. "
+        "Run phasesweep against the original workdir until recovery clears these "
+        "attempts, then move the tree and rebind. Nothing was written."
     )
 
 
 def _validate_artifact_root_destination(
     experiment: Experiment,
-    entries: Sequence[tuple[optuna.Study, str | None]],
+    entries: Sequence[_ArtifactRootRebindEntry],
 ) -> None:
     """Confirm the config's workdir really holds this experiment's relocated tree.
 
-    Two checks, in order: the destination experiment namespace must exist, and
-    - when storage records that a publishable result was produced - the
-    destination's last-success pointer and its complete generation manifest
-    must validate there through :func:`_last_successful_generation_id`, the
-    same authoritative read every other publication consumer uses.
+    Four checks, in order: the destination experiment namespace must exist; the
+    destination must hold the trial evidence every ledger trial names, with no
+    RUNNING trial left to recover (:func:`_validate_relocated_trial_evidence`);
+    the relocated registry must hold no unresolved attempt
+    (:func:`_validate_no_live_attempts`); and - when storage records that a
+    publishable result was produced - the destination's last-success pointer
+    and its complete generation manifest must validate there through
+    :func:`_last_successful_generation_id`, the same authoritative read every
+    other publication consumer uses.
 
     Deliberately conservative in one case: an experiment whose trials completed
     but whose publication never succeeded is indistinguishable, from the
@@ -1657,10 +1775,11 @@ def _validate_artifact_root_destination(
     is the original workdir or a new experiment name.
 
     :param Experiment experiment: Parsed experiment naming the destination.
-    :param Sequence[tuple[optuna.Study, str | None]] entries: Existing phase
-        studies paired with their recorded bindings.
-    :raises ArtifactRootRebindError: The destination namespace is missing, or a
-        recorded publication does not validate there.
+    :param Sequence[_ArtifactRootRebindEntry] entries: Existing phase studies
+        with their recorded bindings.
+    :raises ArtifactRootRebindError: The destination namespace is missing, its
+        per-trial evidence is incomplete, a trial is still RUNNING, an attempt
+        is unresolved, or a recorded publication does not validate there.
     """
     destination = _experiment_dir(experiment)
     if not destination.is_dir():
@@ -1669,6 +1788,8 @@ def _validate_artifact_root_destination(
             "experiment's artifact tree to the workdir this config declares before rebinding. "
             "Nothing was written."
         )
+    _validate_relocated_trial_evidence(experiment, entries)
+    _validate_no_live_attempts(experiment)
     if not _studies_record_publication(entries):
         return
     try:
@@ -1692,6 +1813,13 @@ def _plan_artifact_root_rebinds(
     experiments: Sequence[Experiment],
 ) -> list[_ArtifactRootRebindPlan]:
     """Validate every experiment's rebind destination without writing anything.
+
+    Planning deliberately makes no claim about a *coherent* previous root: a
+    crash between two per-study attr writes leaves a mixture of source-bound
+    and destination-bound studies, and a second identical invocation has to
+    converge instead of refusing (re-review v0.5.19 / blocker B2). Every study
+    is validated against the destination and rewritten to it, so re-running the
+    command is idempotent.
 
     :param Sequence[Experiment] experiments: Experiments the config compiles to;
         one for a single experiment, one per study for a suite.
@@ -1739,10 +1867,61 @@ def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str
         root or None, new root)`` record per study written.
     """
     written: list[tuple[str, str | None, str]] = []
-    for study, previous in plan.entries:
-        study.set_user_attr(ARTIFACT_ROOT_ATTR, plan.destination)
-        written.append((study.study_name, previous, plan.destination))
+    for entry in plan.entries:
+        entry.study.set_user_attr(ARTIFACT_ROOT_ATTR, plan.destination)
+        written.append((entry.study.study_name, entry.previous, plan.destination))
     return written
+
+
+def _validate_suite_artifact_root_rebind(
+    suite: Suite,
+    plans: Sequence[_ArtifactRootRebindPlan],
+) -> None:
+    """Refuse a suite rebind whose published summaries cannot survive relocation.
+
+    A published suite summary anchors every study to the **absolute** path of
+    the component generation summary it derives from, and validation re-reads
+    that exact path, so a relocated suite publication is reported as corrupt by
+    the read surfaces the moment it is rebound (re-review v0.5.19 / blocker
+    B2). Component-level rebinds still proceed for a suite that never published
+    one: those studies carry only per-experiment state, which this command does
+    validate.
+
+    Conservative in the same way :func:`_validate_artifact_root_destination`
+    is: when every declared study records a completed trial, the suite may well
+    have published, and a destination with no suite pointer is
+    indistinguishable from one whose pointer was lost in the move.
+
+    :param Suite suite: Suite config naming the destination suite namespace.
+    :param Sequence[_ArtifactRootRebindPlan] plans: Validated per-study plans.
+    :raises ArtifactRootRebindError: The destination holds a suite publication,
+        or every declared study completed a trial while the destination holds
+        no suite publication at all.
+    """
+    pointer = _last_successful_suite_generation_path(suite)
+    if pointer.exists():
+        raise ArtifactRootRebindError(
+            f"Suite {suite.suite!r} records a published suite generation at {str(pointer)!r}. "
+            "A published suite summary pins each study to the absolute path of the component "
+            "summary it derives from, and those paths do not survive relocation: the rebound "
+            "tree would report a corrupt suite publication instead of a result. Keep the suite "
+            "at its original workdir, or use a new suite name for the relocated tree. Nothing "
+            "was written."
+        )
+    if (
+        plans
+        and len(plans) == len(suite.studies)
+        and all(plan.entries and _studies_record_publication(plan.entries) for plan in plans)
+    ):
+        raise ArtifactRootRebindError(
+            f"Every study of suite {suite.suite!r} records a completed trial, but the "
+            f"destination suite namespace {str(_suite_dir(suite))!r} holds no published suite "
+            "generation. A fully completed suite may have published one, and a missing pointer "
+            "is indistinguishable from a pointer lost in the move; a suite publication cannot "
+            "be relocated because its summaries record absolute component paths. Keep the "
+            "suite at its original workdir, or use a new suite name for the relocated tree. "
+            "Nothing was written."
+        )
 
 
 def _preflight_existing_studies(

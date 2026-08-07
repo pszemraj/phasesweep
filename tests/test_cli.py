@@ -30,6 +30,8 @@ from phasesweep.engine import (
     TrialTargetRegressionError,
     UnsafeProcessCleanupError,
 )
+from phasesweep.engine.guards import _register_active_attempt
+from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     _experiment_dir,
@@ -39,6 +41,7 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _last_successful_generation_path,
+    _last_successful_suite_generation_id,
     _winner_path,
 )
 from phasesweep.mcp.errors import CatalogError
@@ -942,6 +945,248 @@ def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> No
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
         _experiment_dir(suite_b.experiment_for_study(suite_b.studies[0]))
     )
+
+
+def _movable_two_phase_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Build one two-phase experiment as two configs differing only in workdir.
+
+    Two phases means two studies, which is what makes a partially applied
+    rebind observable at all.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return tuple[Path, Path, Path, Path]: ``(config_a, config_b, workdir_a, workdir_b)``.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"x": 0.5}))
+        print("x=0.5")
+        """,
+    )
+    workdir_a = tmp_path / "runs_a"
+    workdir_b = tmp_path / "runs_b"
+
+    def config_text(workdir: Path) -> str:
+        return textwrap.dedent(f"""
+            experiment: t
+            storage: sqlite:///{tmp_path}/studies.db
+            provenance: {{revision: test-fixture-v1}}
+            workdir: {workdir}
+            trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+            metric:
+              name: x
+              goal: minimize
+              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            phases:
+              - name: p
+                n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
+                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+              - name: q
+                n_trials: 1
+                sampler: {{ type: random, seed: 1 }}
+                search_space: {{ y: {{ type: int, low: 0, high: 10 }} }}
+            """).lstrip()
+
+    config_a = tmp_path / "exp_two_a.yaml"
+    config_a.write_text(config_text(workdir_a))
+    config_b = tmp_path / "exp_two_b.yaml"
+    config_b.write_text(config_text(workdir_b))
+    return config_a, config_b, workdir_a, workdir_b
+
+
+def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A copy taken before the ledger advanced is not the same artifact tree.
+
+    Its publication still validates, so only the per-trial evidence check sees
+    that the next run would select a trial whose artifacts exist solely in the
+    source tree (re-review v0.5.19 / blocker B2).
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    shutil.copytree(workdir_a, workdir_b)
+    topped_up = experiment_a.model_copy(
+        update={"phases": [experiment_a.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    run_experiment(topped_up)
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "trial 1" in captured.err
+    assert str(workdir_b) in captured.err
+    assert "stale copy" in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_refuses_while_a_trial_is_still_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An interrupted attempt has to be recovered before its tree moves.
+
+    Recovery reads the absolute trial path the attempt persisted, so it can
+    only run against the root that attempt started under.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    assert experiment_a.storage is not None
+    optuna.load_study(study_name="t::p", storage=experiment_a.storage).ask()
+    shutil.copytree(workdir_a, workdir_b)
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "RUNNING trial" in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_refuses_an_unresolved_attempt_at_the_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A surviving registry entry is an attempt nobody resolved.
+
+    Entries are unlinked when their attempt resolves, and each one references
+    the absolute trial directory recovery would have to inspect, which no
+    longer exists at that path once the tree moves.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    shutil.copytree(workdir_a, workdir_b)
+    experiment_b = load_experiment(config_b)
+    _register_active_attempt(
+        experiment_b,
+        attempt_id="unresolved-attempt",
+        phase_name="p",
+        study_name="t::p",
+        trial_number=0,
+        trial_dir=_experiment_dir(experiment_a) / "p" / "trial_00000",
+        generation_id="old-generation",
+    )
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "unresolved attempt registry entries" in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A published suite summary pins absolute component paths it cannot re-derive.
+
+    Rebinding it would produce a tree whose suite publication reports corrupt
+    on the next read, which is worse than refusing the move.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        open(args.out, "w").write(json.dumps({"x": 1.0}))
+        print("x=1.0")
+        """,
+    )
+
+    def suite_text(workdir: Path) -> str:
+        return textwrap.dedent(f"""
+            suite: s
+            defaults:
+              workdir: {workdir}
+              storage: sqlite:///{tmp_path}/suite.db
+              provenance: {{revision: test-fixture-v1}}
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            studies:
+              - name: only
+                phases:
+                  - name: p
+                    n_trials: 1
+                    sampler: {{ type: random, seed: 0 }}
+                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+            """).lstrip()
+
+    workdir_a = tmp_path / "runs_a"
+    workdir_b = tmp_path / "runs_b"
+    config_a = tmp_path / "suite_pub_a.yaml"
+    config_a.write_text(suite_text(workdir_a))
+    config_b = tmp_path / "suite_pub_b.yaml"
+    config_b.write_text(suite_text(workdir_b))
+    suite_a = load_config(config_a)
+    assert isinstance(suite_a, Suite)
+    run_suite(suite_a)
+    assert _last_successful_suite_generation_id(suite_a) is not None
+    shutil.copytree(workdir_a, workdir_b)
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "published suite generation" in captured.err
+    study = optuna.load_study(study_name="s__only::p", storage=f"sqlite:///{tmp_path}/suite.db")
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
+        _experiment_dir(suite_a.experiment_for_study(suite_a.studies[0]))
+    )
+
+
+def test_rebind_workdir_converges_after_a_partially_applied_rebind(tmp_path: Path) -> None:
+    """A crash between two per-study writes must be fixable by re-running the command.
+
+    Planning therefore validates every study against the destination instead
+    of requiring one coherent previous root.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_two_phase_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    shutil.copytree(workdir_a, workdir_b)
+    experiment_b = load_experiment(config_b)
+    assert experiment_b.storage is not None
+    destination = str(_experiment_dir(experiment_b))
+    optuna.load_study(study_name="t::p", storage=experiment_b.storage).set_user_attr(
+        ARTIFACT_ROOT_ATTR, destination
+    )
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
+
+    assert result.exit_code == 0, result.output
+    for phase_name in ("p", "q"):
+        study = optuna.load_study(study_name=f"t::{phase_name}", storage=experiment_b.storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == destination
 
 
 def test_rebind_workdir_reports_that_in_memory_storage_binds_nothing(
