@@ -210,6 +210,51 @@ def test_read_status_counts_sqlite_trials_with_uri_filename(tmp_path: Path) -> N
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_read_status_reports_running_attempts_from_the_counted_snapshot(
+    tmp_path: Path, backend: str
+) -> None:
+    """Every backend reports RUNNING identities beside the counts they explain.
+
+    The MCP terminal snapshot reconciles RUNNING rows against cleanup evidence
+    and must not reread a study to learn which rows those are (PR #5 review /
+    reviewer 2, blocker 6), so this comes from the same tolerant read.
+    """
+    path = tmp_path / f"phases.{backend}"
+    exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
+    study = optuna.create_study(
+        study_name="read_t::p",
+        storage=engine_optuna._resolve_storage(exp.storage) or exp.storage,
+    )
+    study.optimize(lambda trial: 1.0, n_trials=1)
+    running = study.ask()
+    running.set_user_attr("phasesweep_generation_id", "gen-1")
+    running.set_user_attr("phasesweep_attempt_id", "attempt-1")
+    study.ask()
+
+    phase = read_status(exp)["phases"][0]
+
+    assert phase["trial_data_available"] is True
+    assert phase["trials"] == {"COMPLETE": 1, "RUNNING": 2}
+    assert phase["running_attempts"] == [
+        {"trial_number": 1, "generation_id": "gen-1", "attempt_id": "attempt-1"},
+        {"trial_number": 2, "generation_id": None, "attempt_id": None},
+    ]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
+    tmp_path: Path, backend: str
+) -> None:
+    """Unread trial data reports no RUNNING identities, not an empty list."""
+    exp = _experiment(tmp_path, storage=f"{backend}:///{tmp_path}/missing.{backend}")
+
+    phase = read_status(exp)["phases"][0]
+
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
+
+
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
     """Publish an immutable generation (summary + record + phase winner) on disk.
 

@@ -76,6 +76,7 @@ def _phase_status_payloads(
     trial_counts: Mapping[str, dict[str, int]] | None = None,
     generation_trial_counts: Mapping[str, dict[str, int]] | None = None,
     trial_data_available: Mapping[str, bool] | None = None,
+    running_attempts: Mapping[str, list[dict[str, Any]] | None] | None = None,
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
@@ -95,6 +96,13 @@ def _phase_status_payloads(
     :param Mapping[str, bool] | None trial_data_available: Optional storage-read
         availability keyed by phase name. Included only in the path-free status
         view consumed by MCP.
+    :param Mapping[str, list[dict[str, Any]] | None] | None running_attempts:
+        Optional RUNNING trial identities keyed by phase name, from the same
+        storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
+        trial data was unreadable. Included only in the path-free status view
+        consumed by MCP, whose terminal snapshot must not reread studies to
+        learn which rows the RUNNING count refers to (PR #5 review /
+        reviewer 2, blocker 6).
     :param str | None winner_scope_generation_id: Already-resolved generation id
         whose winner files are represented. When ``pinned`` is ``False``
         (default), this is treated as an already-captured last-success id and
@@ -145,6 +153,9 @@ def _phase_status_payloads(
                         trial_data_available[phase.name]
                         if trial_data_available is not None
                         else True
+                    ),
+                    "running_attempts": (
+                        running_attempts[phase.name] if running_attempts is not None else []
                     ),
                 }
             )
@@ -374,6 +385,12 @@ def read_status(
     the runner writes) by reporting empty counts rather than raising.
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
+    The path-free phase payload also carries ``running_attempts``: the
+    identities of the RUNNING trials those same counts describe, from the same
+    snapshot, or ``None`` when ``trial_data_available`` is ``False``. It exists
+    so a caller that must reconcile RUNNING rows -- the MCP terminal snapshot
+    -- never needs a second, intolerant storage read after this one (PR #5
+    review / reviewer 2, blocker 6).
 
     This resolves the current pointer and the last-success pointer *exactly
     once each* and reuses those two captured ids for every downstream fact in
@@ -555,6 +572,21 @@ def read_status(
                 for name, stats in phase_stats.items()
             },
             trial_data_available={name: stats.available for name, stats in phase_stats.items()},
+            running_attempts={
+                name: (
+                    None
+                    if stats.running_attempts is None
+                    else [
+                        {
+                            "trial_number": attempt.trial_number,
+                            "generation_id": attempt.generation_id,
+                            "attempt_id": attempt.attempt_id,
+                        }
+                        for attempt in stats.running_attempts
+                    ]
+                )
+                for name, stats in phase_stats.items()
+            },
             winner_scope_generation_id=winner_scope_generation_id,
             pinned=pinned,
         ),

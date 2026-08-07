@@ -15,6 +15,7 @@ from pathlib import Path
 
 from phasesweep import config_status, load_config, run_experiment
 from phasesweep.config import Suite
+from phasesweep.engine import read_status
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import _generation_winner_path, _last_successful_generation_id
 from tests.conftest import write_trainer, write_yaml
@@ -87,6 +88,21 @@ READ_STATUS_ONLY_KEYS = {
     "summary_present",
 }
 
+READ_STATUS_ONLY_PHASE_KEYS = {
+    "phase",
+    "winner_present",
+    "trial_data_available",
+    "running_attempts",
+}
+"""Phase keys that exist only in the path-free read_status view.
+
+``running_attempts`` is the identity of each RUNNING row in the same storage
+snapshot the counts came from. The MCP terminal snapshot consumes it so it
+never has to reread a study to reconcile RUNNING trials (PR #5 review /
+reviewer 2, blocker 6); the CLI phase payload keeps exactly
+``PHASE_STATUS_KEYS`` and republishes none of it.
+"""
+
 
 def _write_suite(tmp_path: Path) -> Path:
     """Write a two-study suite whose trainer reports a constant objective."""
@@ -149,6 +165,7 @@ def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
 
     (phase,) = payload["phases"]
     assert set(phase) == PHASE_STATUS_KEYS
+    assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
     assert phase["name"] == "p"
     assert phase["winner"] is not None
     assert phase["completed"] == 1
@@ -184,6 +201,7 @@ def test_suite_config_status_embeds_the_full_experiment_status(tmp_path: Path) -
         assert not READ_STATUS_ONLY_KEYS & set(status)
         for phase in status["phases"]:
             assert set(phase) == PHASE_STATUS_KEYS
+            assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
 
     ran_status, untouched_status = (study["status"] for study in payload["studies"])
 
@@ -207,6 +225,28 @@ def test_suite_config_status_embeds_the_full_experiment_status(tmp_path: Path) -
     assert untouched_status["publication_integrity"] == "absent"
     assert untouched_status["phases"][0]["generation_trials"] == {}
     assert untouched_status["phases"][0]["winner"] is None
+
+
+def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path) -> None:
+    """The path-free phase view carries running attempts; the CLI view does not.
+
+    Both directions matter. The MCP terminal snapshot depends on
+    ``running_attempts`` arriving from the same tolerant read as the counts
+    (PR #5 review / reviewer 2, blocker 6), and ``experiment_status`` is a
+    pinned public contract that must not grow a key because of it.
+    """
+    config = load_config(_write_suite(tmp_path))
+    assert isinstance(config, Suite)
+    experiment = config.experiment_for_study(config.studies[0])
+    run_experiment(experiment)
+
+    (read_phase,) = read_status(experiment)["phases"]
+    (cli_phase,) = experiment_status(experiment)["phases"]
+
+    assert set(read_phase) >= READ_STATUS_ONLY_PHASE_KEYS
+    assert read_phase["trial_data_available"] is True
+    assert read_phase["running_attempts"] == []
+    assert set(cli_phase) == PHASE_STATUS_KEYS
 
 
 def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(

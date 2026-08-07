@@ -11,10 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
-from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
-    GENERATION_ID_ATTR,
     PublicationState,
     Winner,
     WinnerSource,
@@ -70,7 +67,16 @@ class PhaseStatusSnapshot(_SnapshotModel):
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
-    running_attempts: list[RunningAttemptSnapshot] = Field(default_factory=list)
+    running_attempts: list[RunningAttemptSnapshot] | None = None
+    """RUNNING rows the frozen counts describe, or ``None`` when unknown.
+
+    ``None`` means the capture read no trial data for this phase, i.e. it
+    pairs with ``trial_data_available: false`` -- an empty list would assert
+    there are no RUNNING rows. Snapshots frozen before this field existed also
+    parse as ``None``, which is the truthful reading: they recorded no
+    identities. A phase with readable trial data always carries a list, empty
+    when nothing is RUNNING.
+    """
 
 
 class StatusSnapshot(_SnapshotModel):
@@ -276,6 +282,8 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
                     generation_trials={},
                     winner_present=False,
                     trial_data_available=False,
+                    # Nothing was read, so nothing is known about RUNNING rows.
+                    running_attempts=None,
                 )
                 for phase in experiment.phases
             ],
@@ -311,6 +319,17 @@ def capture_result_snapshot(
     frozen winners come from that exact in-memory outcome instead of a
     second read of the winner files.
 
+    Exactly one storage read backs that agreement. Every trial fact frozen
+    here -- counts, generation counts, and the RUNNING identities later used
+    to reconcile cleanup evidence -- comes from the single tolerant
+    :func:`phasesweep.engine.read.read_status` call below. This function used
+    to reload each phase study afterwards to collect those identities, an
+    intolerant read with no retry: one transient "database is locked" in that
+    window failed the capture of an otherwise successful multi-hour run, and
+    a terminal snapshot that was never captured is unrecoverable by design
+    (see docs/mcp.md). Freezing a valid terminal result must not depend on a
+    second storage round trip (PR #5 review / reviewer 2, blocker 6).
+
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
     :param Mapping[str, Winner] | None engine_winners: The engine's own
@@ -334,27 +353,11 @@ def capture_result_snapshot(
                 "capturing the terminal snapshot from the authoritative artifacts anyway",
                 generation_id,
             )
+    # One tolerant read supplies every storage fact this snapshot freezes,
+    # including the RUNNING identities in each phase's ``running_attempts``
+    # (``None`` where ``trial_data_available`` is false). This capture must
+    # never reread a study afterwards (PR #5 review / reviewer 2, blocker 6).
     status = read_status(experiment, generation_id=generation_id)
-    phases_by_name = {phase.name: phase for phase in experiment.phases}
-    for phase_status in status["phases"]:
-        running_attempts: list[dict[str, Any]] = []
-        if phase_status["trial_data_available"]:
-            phase = phases_by_name[phase_status["phase"]]
-            study = _load_existing_phase_study(experiment, phase)
-            if study is not None:
-                for trial in study.get_trials(deepcopy=False):
-                    if trial.state.name != "RUNNING":
-                        continue
-                    generation = trial.user_attrs.get(GENERATION_ID_ATTR)
-                    attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-                    running_attempts.append(
-                        {
-                            "trial_number": trial.number,
-                            "generation_id": generation if isinstance(generation, str) else None,
-                            "attempt_id": attempt if isinstance(attempt, str) else None,
-                        }
-                    )
-        phase_status["running_attempts"] = running_attempts
     if engine_winners is not None:
         # The engine's terminal report is the authority on a successful
         # outcome (review v0.5.16 / blocker 2); freeze exactly what it
@@ -396,6 +399,12 @@ def finalize_result_snapshot(
 ) -> dict[str, Any]:
     """Finalize a previously captured snapshot without rereading shared state.
 
+    A phase whose capture recorded no RUNNING identities (``running_attempts``
+    is ``None``, which pairs with ``trial_data_available: false``, and is also
+    how a snapshot frozen before that field existed parses) is left exactly as
+    captured: there is nothing to reconcile the cleanup report against, and its
+    counts were never read either.
+
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
@@ -407,6 +416,12 @@ def finalize_result_snapshot(
     parsed = RunResultSnapshot.model_validate(snapshot)
     confirmed = set(confirmed_attempt_ids)
     for phase in parsed.status.phases:
+        if phase.running_attempts is None:
+            # The capture read no trial data for this phase, so it recorded no
+            # RUNNING identities to reconcile against. Its counts are equally
+            # unread, and inventing a reconciliation over them would fabricate
+            # states this snapshot never observed.
+            continue
         recovered = [
             attempt
             for attempt in phase.running_attempts

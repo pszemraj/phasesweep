@@ -24,6 +24,7 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     SamplerContinuationUnsupportedError,
+    StudyStorageUnavailableError,
     TerminalReport,
     TrialTargetRegressionError,
     read_status,
@@ -455,23 +456,143 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     monkeypatch: pytest.MonkeyPatch,
     storage_kind: str,
 ) -> None:
-    """Unavailable trial storage freezes explicit flags without a redundant study read."""
+    """Unavailable trial storage freezes explicit flags without a redundant study read.
+
+    ``running_attempts`` is ``None`` rather than ``[]`` here: nothing was read,
+    so an empty list would claim there are no RUNNING rows (PR #5 review /
+    reviewer 2, blocker 6).
+    """
     storage = None if storage_kind == "none" else f"sqlite:///{tmp_path / 'missing' / 'studies.db'}"
     experiment = make_experiment(workdir=tmp_path / "runs", storage=storage, n_trials=1)
 
     def fail_redundant_read(*args: object, **kwargs: object) -> None:
         raise OSError("storage remains unavailable")
 
-    monkeypatch.setattr(
-        "phasesweep.mcp.snapshots._load_existing_phase_study",
-        fail_redundant_read,
-    )
+    # Patched on Optuna itself, so the guard holds no matter how PhaseSweep
+    # imports its own study helpers: any study load at all fails the capture.
+    monkeypatch.setattr(optuna, "load_study", fail_redundant_read)
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
+
+
+def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful run's result is frozen even if studies became unloadable.
+
+    PR #5 review / reviewer 2, blocker 6: the capture used to reread every
+    phase study after ``read_status`` to collect RUNNING rows, with no
+    tolerance for failure. One transient lock in that millisecond-wide window
+    failed the capture, and a terminal snapshot that was never captured is
+    unrecoverable by design -- so a completed run's frozen result was lost to
+    storage flakiness that the tolerant status read itself shrugs off. The
+    fatal read simply no longer happens.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+        sampler=SEEDED_RANDOM,
+    )
+    reports: list[TerminalReport] = []
+
+    run_experiment(experiment, terminal_callback=reports.append)
+
+    (report,) = reports
+    assert report.primary_error is None
+    assert report.winners
+
+    loads = 0
+
+    def refuse_to_load(*args: object, **kwargs: object) -> None:
+        nonlocal loads
+        loads += 1
+        raise StudyStorageUnavailableError("database is locked")
+
+    # Patched on Optuna itself rather than on a PhaseSweep helper, so no
+    # import binding can hide a study reload from this test. Every remaining
+    # storage read must be the tolerant one read_status performs.
+    monkeypatch.setattr(optuna, "load_study", refuse_to_load)
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id=report.generation_id,
+        engine_winners=report.winners,
+    )
+
+    assert loads == 0
+    phase = snapshot["status"]["phases"][0]
+    assert phase["trial_data_available"] is True
     assert phase["running_attempts"] == []
+    assert phase["completed"] == 1
+    (frozen,) = snapshot["winners"]
+    assert frozen["phase"] == "p"
+    assert frozen["metric"] == report.winners["p"].metric
+    assert frozen["trial_number"] == report.winners["p"].trial_number
+
+    status_path = tmp_path / "status.json"
+    mcp_runner._write_status(
+        status_path,
+        {"run_id": "r0", "returncode": 0, "error_class": None, "cleanup_confirmed": True},
+        result_snapshot=snapshot,
+        result_snapshot_error=None,
+    )
+
+    assert json.loads(status_path.read_text())["result_snapshot_state"] == "complete"
+
+
+def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
+    tmp_path: Path,
+) -> None:
+    """RUNNING identities come from the one tolerant read, unchanged in shape."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
+    )
+    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    identified = study.ask()
+    identified.set_user_attr("phasesweep_generation_id", "current-generation")
+    identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
+    # A RUNNING row written before attempt identity existed: reported with
+    # null identity, never dropped, so the counts and the list agree.
+    study.ask()
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="current-generation",
+    )
+
+    phase = snapshot["status"]["phases"][0]
+    assert phase["trials"]["RUNNING"] == 2
+    assert phase["trial_data_available"] is True
+    assert phase["running_attempts"] == [
+        {
+            "trial_number": 0,
+            "generation_id": "current-generation",
+            "attempt_id": "current-attempt",
+        },
+        {"trial_number": 1, "generation_id": None, "attempt_id": None},
+    ]
+
+    finalized = mcp_runner.finalize_result_snapshot(
+        snapshot,
+        confirmed_attempt_ids={"current-attempt"},
+    )
+
+    finalized_phase = finalized["status"]["phases"][0]
+    assert finalized_phase["trials"] == {"RUNNING": 1, "FAIL": 1}
+    assert finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
+    assert finalized_phase["running_attempts"] == [
+        {"trial_number": 1, "generation_id": None, "attempt_id": None}
+    ]
 
 
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:

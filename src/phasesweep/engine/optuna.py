@@ -25,7 +25,7 @@ from phasesweep.config import (
     grid_search_space,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.state import GENERATION_ID_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR
 from phasesweep.runtime.files import (
     file_url_path,
     sqlite_database_path,
@@ -35,12 +35,34 @@ from phasesweep.runtime.files import (
 
 
 @dataclass(frozen=True)
+class _RunningTrialRef:
+    """Identity of one RUNNING trial observed in a storage snapshot.
+
+    Carries exactly the identity a caller needs to reconcile a RUNNING row
+    against external cleanup evidence: which trial it is, and which
+    generation/attempt claimed it. Values are ``None`` when the trial never
+    recorded that attribute (e.g. a row written by an older PhaseSweep).
+    """
+
+    trial_number: int
+    generation_id: str | None
+    attempt_id: str | None
+
+
+@dataclass(frozen=True)
 class _PhaseTrialStats:
-    """One read-only storage snapshot for phase counts."""
+    """One read-only storage snapshot for phase counts.
+
+    ``running_attempts`` is part of the *same* snapshot as ``counts``, not a
+    second read: it lists the RUNNING trials those counts describe, and is
+    ``None`` exactly when ``available`` is ``False`` (nothing was read, so
+    an empty list would claim knowledge this snapshot does not have).
+    """
 
     counts: dict[str, int]
     available: bool
     generation_counts: dict[str, dict[str, int]]
+    running_attempts: list[_RunningTrialRef] | None
 
 
 class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
@@ -327,8 +349,24 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
         return None
 
 
+def _decoded_string_attr(value_json: object) -> str | None:
+    """Decode one JSON-encoded trial user attribute as a string.
+
+    :param object value_json: Raw ``trial_user_attributes.value_json`` cell.
+    :return str | None: The decoded value when it is a string; ``None`` for a
+        missing, unparsable, or non-string attribute.
+    """
+    if not isinstance(value_json, str):
+        return None
+    try:
+        value = json.loads(value_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
 def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
-    """Return trial-state counts in one SQLite read.
+    """Return trial-state counts and RUNNING identities in one SQLite read.
 
     Status polling must be read-only. Passing a fresh SQLite URL through
     Optuna's storage constructor can create the database/schema and race the
@@ -336,76 +374,122 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     mode avoids both side effects: a missing, locked, or still-initializing DB
     simply reports no counts for now.
 
+    Counts and RUNNING identities come from a single ``SELECT`` -- one
+    statement, so one storage snapshot -- rather than an aggregate query plus
+    a follow-up read. Two statements can straddle a trial creation and report
+    a RUNNING attempt the counts do not include, and callers that reconcile
+    those two facts (see
+    :func:`phasesweep.mcp.snapshots.finalize_result_snapshot`) treat that
+    disagreement as corruption. Aggregation therefore happens here rather than
+    in SQL (PR #5 review / reviewer 2, blocker 6).
+
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
-    :return _PhaseTrialStats: Counts and an availability flag; counts are empty
-        and availability false when the DB cannot be read safely.
+    :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
+        flag; counts are empty, running attempts ``None``, and availability
+        false when the DB cannot be read safely.
     """
     assert experiment.storage is not None
     uri = sqlite_readonly_uri(experiment.storage)
     if uri is None:
-        return _PhaseTrialStats({}, False, {})
+        return _PhaseTrialStats({}, False, {}, None)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
                 """
-                SELECT trials.state, attrs.value_json, COUNT(*)
+                SELECT trials.number, trials.state, generation.value_json, attempt.value_json
                 FROM trials
                 JOIN studies ON trials.study_id = studies.study_id
-                LEFT JOIN trial_user_attributes AS attrs
-                  ON trials.trial_id = attrs.trial_id AND attrs.key = ?
+                LEFT JOIN trial_user_attributes AS generation
+                  ON trials.trial_id = generation.trial_id AND generation.key = ?
+                LEFT JOIN trial_user_attributes AS attempt
+                  ON trials.trial_id = attempt.trial_id AND attempt.key = ?
                 WHERE studies.study_name = ?
-                GROUP BY trials.state, attrs.value_json
                 """,
-                (GENERATION_ID_ATTR, _phase_study_name(experiment, phase)),
+                (
+                    GENERATION_ID_ATTR,
+                    ATTEMPT_ID_ATTR,
+                    _phase_study_name(experiment, phase),
+                ),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return _PhaseTrialStats({}, False, {})
+        return _PhaseTrialStats({}, False, {}, None)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
-    for state, value_json, count in rows:
+    running_attempts: list[_RunningTrialRef] = []
+    for number, state, generation_json, attempt_json in rows:
         state_name = str(state)
-        counts[state_name] = counts.get(state_name, 0) + int(count)
-        if value_json is None:
-            continue
-        try:
-            generation_id = json.loads(value_json)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(generation_id, str):
+        counts[state_name] = counts.get(state_name, 0) + 1
+        generation_id = _decoded_string_attr(generation_json)
+        if generation_id is not None:
             states = generation_counts.setdefault(generation_id, {})
-            states[state_name] = states.get(state_name, 0) + int(count)
-    return _PhaseTrialStats(counts, True, generation_counts)
+            states[state_name] = states.get(state_name, 0) + 1
+        if state_name != "RUNNING":
+            continue
+        if not isinstance(number, int):
+            # Optuna assigns ``number`` in the same INSERT that creates the
+            # row, so a missing one is a damaged row rather than a race with
+            # a live writer. It still counts as RUNNING; it just has no
+            # identity to report.
+            log.warning(
+                "study %s has a RUNNING trial with no trial number; "
+                "omitting it from the reported running attempts",
+                _phase_study_name(experiment, phase),
+            )
+            continue
+        running_attempts.append(
+            _RunningTrialRef(
+                trial_number=number,
+                generation_id=generation_id,
+                attempt_id=_decoded_string_attr(attempt_json),
+            )
+        )
+    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
 
 
 def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
-    """Read counts without creating a missing study.
+    """Read counts and RUNNING identities without creating a missing study.
+
+    Both facts come from the one trial list this function already loads, so a
+    caller never has to reread the study to learn which rows the RUNNING count
+    refers to (PR #5 review / reviewer 2, blocker 6).
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.storage is None:
-        return _PhaseTrialStats({}, False, {})
+        return _PhaseTrialStats({}, False, {}, None)
     backend = storage_backend(experiment.storage)
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase)
     if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return _PhaseTrialStats({}, False, {})
+        return _PhaseTrialStats({}, False, {}, None)
     try:
         study = _load_phase_study(experiment, phase)
         trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, False, {})
+        return _PhaseTrialStats({}, False, {}, None)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
+    running_attempts: list[_RunningTrialRef] = []
     for trial in trials:
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
             states = generation_counts.setdefault(generation_id, {})
             states[trial.state.name] = states.get(trial.state.name, 0) + 1
-    return _PhaseTrialStats(counts, True, generation_counts)
+        if trial.state.name != "RUNNING":
+            continue
+        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        running_attempts.append(
+            _RunningTrialRef(
+                trial_number=trial.number,
+                generation_id=generation_id if isinstance(generation_id, str) else None,
+                attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+            )
+        )
+    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
