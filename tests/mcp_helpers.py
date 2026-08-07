@@ -246,6 +246,43 @@ def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
         os.chdir(original)
 
 
+def runner_argv(
+    store: RunStore,
+    *,
+    run_id: str,
+    config: Path,
+    config_sha256: str,
+    experiment_id: str,
+    started_at: str,
+) -> list[str]:
+    """Build the detached-runner arguments shared by MCP tests.
+
+    :param RunStore store: Run store supplying status and state paths.
+    :param str run_id: Claimed run identifier.
+    :param Path config: Snapshotted experiment configuration.
+    :param str config_sha256: Expected configuration digest.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str started_at: Claimed launch timestamp.
+    :return list[str]: Runner arguments without the Python module prefix or cwd.
+    """
+    return [
+        "--run-id",
+        run_id,
+        "--config",
+        str(config),
+        "--config-sha256",
+        config_sha256,
+        "--status-path",
+        str(store.status_path(run_id)),
+        "--state-dir",
+        str(store.log_path(run_id).parent.parent),
+        "--experiment-id",
+        experiment_id,
+        "--started-at",
+        started_at,
+    ]
+
+
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, **payload}
     write_status_file(store.status_path(run_id), full_payload)

@@ -57,6 +57,7 @@ from tests.conftest import REPO, make_experiment, write_constant_trainer, write_
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_run_handle,
+    runner_argv,
     runner_main,
     slow_mcp_config_text,
 )
@@ -354,22 +355,14 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
         pytest.raises(ExperimentLockBusyError),
     ):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config_path),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(status_path),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "cancel_me",
-                "--started-at",
-                started_at,
-            ],
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="cancel_me",
+                started_at=started_at,
+            ),
             cwd=tmp_path,
         )
 
@@ -739,22 +732,14 @@ phases:
 
     assert (
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config_path),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(status_path),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "record_fail",
-                "--started-at",
-                started_at,
-            ],
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="record_fail",
+                started_at=started_at,
+            ),
             cwd=tmp_path,
         )
         == 0
@@ -819,22 +804,14 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config_path),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(store.status_path(run_id)),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "cancel_at_capture",
-                "--started-at",
-                started_at,
-            ],
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="cancel_at_capture",
+                started_at=started_at,
+            ),
             cwd=tmp_path,
         )
 
@@ -1324,22 +1301,14 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
     with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
         assert (
             runner_main(
-                [
-                    "--run-id",
-                    run_id,
-                    "--config",
-                    str(config_path),
-                    "--config-sha256",
-                    config_sha256,
-                    "--status-path",
-                    str(store.status_path(run_id)),
-                    "--state-dir",
-                    str(tmp_path / "state"),
-                    "--experiment-id",
-                    "no_status",
-                    "--started-at",
-                    started_at,
-                ],
+                runner_argv(
+                    store,
+                    run_id=run_id,
+                    config=config_path,
+                    config_sha256=config_sha256,
+                    experiment_id="no_status",
+                    started_at=started_at,
+                ),
                 cwd=tmp_path,
             )
             == 1
@@ -1401,26 +1370,6 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
     assert handle.visible_params_at_launch == ["lr"]
 
 
-def _runner_argv(store: RunStore, *, run_id: str, config: Path, started_at: str) -> list[str]:
-    """Build the runner argv the server constructs, minus ``--cwd``."""
-    return [
-        "--run-id",
-        run_id,
-        "--config",
-        str(config),
-        "--config-sha256",
-        "a" * 64,
-        "--status-path",
-        str(store.status_path(run_id)),
-        "--state-dir",
-        str(store.log_path(run_id).parent.parent),
-        "--experiment-id",
-        "cancel_me",
-        "--started-at",
-        started_at,
-    ]
-
-
 def test_runner_enters_the_project_directory_after_its_identity_is_durable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1453,10 +1402,12 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
 
     with pytest.raises(RuntimeError, match="stop once the project directory"):
         runner_main(
-            _runner_argv(
+            runner_argv(
                 store,
                 run_id="r-cwd",
                 config=tmp_path / "unread.yaml",
+                config_sha256="a" * 64,
+                experiment_id="cancel_me",
                 started_at=started_at,
             ),
             cwd=project,
@@ -1487,10 +1438,12 @@ def test_runner_persists_identity_even_when_the_project_directory_is_gone(
 
     with pytest.raises(FileNotFoundError):
         runner_main(
-            _runner_argv(
+            runner_argv(
                 store,
                 run_id="r-nocwd",
                 config=tmp_path / "unread.yaml",
+                config_sha256="a" * 64,
+                experiment_id="cancel_me",
                 started_at=started_at,
             ),
             cwd=tmp_path / "does-not-exist",
@@ -1523,20 +1476,14 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         sys.executable,
         "-m",
         "phasesweep.mcp.runner",
-        "--run-id",
-        run_id,
-        "--config",
-        str(config),
-        "--config-sha256",
-        config_sha256,
-        "--status-path",
-        str(status_path),
-        "--state-dir",
-        str(tmp_path / "state"),
-        "--experiment-id",
-        "cancel_me",
-        "--started-at",
-        started_at,
+        *runner_argv(
+            store,
+            run_id=run_id,
+            config=config,
+            config_sha256=config_sha256,
+            experiment_id="cancel_me",
+            started_at=started_at,
+        ),
         "--cwd",
         str(tmp_path),
     ]
@@ -1601,20 +1548,14 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
         sys.executable,
         "-m",
         "phasesweep.mcp.runner",
-        "--run-id",
-        run_id,
-        "--config",
-        str(config),
-        "--config-sha256",
-        config_sha256,
-        "--status-path",
-        str(status_path),
-        "--state-dir",
-        str(tmp_path / "state"),
-        "--experiment-id",
-        "cancel_me",
-        "--started-at",
-        started_at,
+        *runner_argv(
+            store,
+            run_id=run_id,
+            config=config,
+            config_sha256=config_sha256,
+            experiment_id="cancel_me",
+            started_at=started_at,
+        ),
         "--cwd",
         str(tmp_path),
     ]

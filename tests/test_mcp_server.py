@@ -95,6 +95,7 @@ from tests.mcp_helpers import (
     make_run_handle,
     mcp_experiment_config_text,
     patch_popen_capture,
+    runner_argv,
     runner_main,
     write_mcp_catalog,
     write_run_status,
@@ -642,22 +643,14 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
 
     assert (
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(store.status_path(run_id)),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
         == 0
     )
@@ -2058,22 +2051,14 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="hash mismatch"):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config),
-                "--config-sha256",
-                "0" * 64,
-                "--status-path",
-                str(status_path),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256="0" * 64,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
 
     status = json.loads(status_path.read_text())
@@ -2121,22 +2106,14 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
 
     with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(snapshot_path),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(store.status_path(run_id)),
-                "--state-dir",
-                str(registry.state_dir),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=snapshot_path,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
 
     handle = store.get(run_id)
@@ -2211,22 +2188,14 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
 
     with pytest.raises(StudySchemaMismatchError, match="multiple unsafe studies"):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(store.status_path(run_id)),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
 
     terminal = json.loads(store.status_path(run_id).read_text())
@@ -2260,22 +2229,14 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
 
     with pytest.raises(UnsafeProcessCleanupError, match="trial cleanup uncertain"):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(status_path),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
 
     status = json.loads(status_path.read_text())
@@ -2330,22 +2291,14 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
 
     with pytest.raises(ProcessCleanupUncertainError):
         runner_main(
-            [
-                "--run-id",
-                run_id,
-                "--config",
-                str(config),
-                "--config-sha256",
-                config_sha256,
-                "--status-path",
-                str(status_path),
-                "--state-dir",
-                str(tmp_path / "state"),
-                "--experiment-id",
-                "srv",
-                "--started-at",
-                started_at,
-            ]
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
         )
 
     status = json.loads(status_path.read_text())
