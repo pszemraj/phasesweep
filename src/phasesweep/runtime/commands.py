@@ -7,6 +7,7 @@ injection or misparse from shell metacharacters in paths or categorical values.
 from __future__ import annotations
 
 import json
+import math
 import shlex
 from pathlib import Path
 from typing import Any
@@ -15,20 +16,50 @@ from typing import Any
 def _stringify(value: Any) -> str:
     """Render a Python value into the canonical scalar form for trial commands.
 
+    The accepted set is exactly the argparse override contract enforced at
+    config load by
+    :func:`phasesweep.config.models._validate_argparse_override_values`: values
+    whose ``str()`` form is faithful to the JSON-mode dump the semantic
+    fingerprint hashes. This function is the defense in depth behind that
+    validator — it must fail loudly rather than ``str()`` a mapping or a
+    ``datetime.date`` into a command line, because that is how two different
+    commands end up sharing one study identity (PR #5 review / reviewer 2,
+    blocker 3).
+
     Args:
-        value: Any scalar, list, or tuple sampled by Optuna or read from
+        value: ``None``, a bool, an int, a finite float, a string, or a
+            list/tuple of those — sampled by Optuna or read from
             ``fixed_overrides``.
 
     Returns:
         A string representation: ``"true"``/``"false"`` for ``bool``;
-        ``"[a,b,c]"`` for list/tuple; ``str(value)`` otherwise.
+        ``"[a,b,c]"`` for list/tuple; ``str(value)`` for the remaining
+        scalars (``None`` renders as ``"None"``).
+
+    Raises:
+        TypeError: The value is outside the argparse contract — a mapping, a
+            non-finite float, or any other object (a YAML-native
+            ``date``/``datetime``, a set, ...).
 
     """
+    if value is None:
+        return "None"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_stringify(v) for v in value) + "]"
-    return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return str(value)
+    raise TypeError(
+        "override_format='argparse' supports null, booleans, integers, finite "
+        "floats, strings, and lists of those; got "
+        f"{type(value).__name__}: {value!r}. Use override_format='json_file' for "
+        "structured values."
+    )
 
 
 def _stringify_hydra(value: Any) -> str:
@@ -79,6 +110,11 @@ def format_argparse(overrides: dict[str, Any]) -> str:
     Returns:
         A single space-separated string of shell-quoted ``--key`` ``value``
         token pairs.
+
+    Raises:
+        TypeError: A value is outside the argparse override contract (see
+            :func:`_stringify`). Statically-known override values are already
+            rejected at config load; this covers anything else.
 
     """
     parts: list[str] = []

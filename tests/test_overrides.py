@@ -6,7 +6,7 @@ import shlex
 import pytest
 from pydantic import ValidationError
 
-from phasesweep import load_experiment, run_experiment
+from phasesweep import load_config, load_experiment, run_experiment
 from phasesweep.runtime.commands import (
     dump_overrides_json,
     format_argparse,
@@ -47,6 +47,52 @@ def test_hydra_rejects_structured_values():
 def test_argparse():
     s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
     assert s == "--lr 0.0003 --weight_decay 0.05"
+
+
+def test_argparse_renders_the_documented_wire_forms():
+    """The accepted value set renders exactly what config_reference.yaml promises."""
+    s = format_argparse(
+        {
+            "none": None,
+            "flag": True,
+            "n": 3,
+            "ratio": 2.5,
+            "tag": "s",
+            "items": [1, "a", False],
+        }
+    )
+
+    assert shlex.split(s) == [
+        "--none",
+        "None",
+        "--flag",
+        "true",
+        "--n",
+        "3",
+        "--ratio",
+        "2.5",
+        "--tag",
+        "s",
+        "--items",
+        "[1,a,false]",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param({"depth": 2}, id="mapping"),
+        pytest.param(datetime.date(2024, 1, 1), id="date"),
+        pytest.param([1, {"depth": 2}], id="nested-mapping"),
+        pytest.param(float("nan"), id="non-finite-float"),
+    ],
+)
+def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
+    """Defense in depth behind the config validator: str()-ing a mapping or a
+    date into a command line is how two different commands end up sharing one
+    fingerprint (PR #5 review / reviewer 2, blocker 3)."""
+    with pytest.raises(TypeError, match="json_file"):
+        format_argparse({"model": value})
 
 
 def test_render_command_hydra(tmp_path):
@@ -200,6 +246,153 @@ def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
 
     with pytest.raises(ValidationError, match="Phase 'p'.*'threshold'.*cannot encode.*non-finite"):
         load_experiment(p)
+
+
+def _argparse_yaml(tmp_path, body: str):
+    """Write a minimal argparse-format config with caller-supplied phase/contract body."""
+    return write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        trial_command: "python train.py {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+{body}
+        """,
+    )
+
+
+# ``knob`` holds a value with no faithful argparse wire form in every case:
+# a mapping renders through str() while the fingerprint dumps JSON-normalized
+# keys, and a YAML-native date/non-finite float has no canonical rendering at
+# all (PR #5 review / reviewer 2, blocker 3).
+_UNRENDERABLE_ARGPARSE_VALUES = [
+    pytest.param("{1: x}", r"Phase 't'.*'knob'.*type dict", id="int-keyed-mapping"),
+    pytest.param('{1: x, "1": y}', r"Phase 't'.*'knob'.*type dict", id="mixed-key-mapping"),
+    pytest.param("2024-01-01", r"Phase 't'.*'knob'.*type date", id="yaml-date"),
+    pytest.param(".nan", r"Phase 't'.*'knob'.*type float", id="non-finite-float"),
+    pytest.param(
+        "[2024-01-01]",
+        r"Phase 't'.*'knob'.*at position \[0\].*type date",
+        id="nested-date-in-list",
+    ),
+]
+
+
+@pytest.mark.parametrize(("value", "expected"), _UNRENDERABLE_ARGPARSE_VALUES)
+def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, expected):
+    p = _argparse_yaml(
+        tmp_path,
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        f"              knob: {value}\n",
+    )
+
+    with pytest.raises(ValidationError, match=expected):
+        load_experiment(p)
+
+
+def test_validate_rejects_unrenderable_argparse_contract_override(tmp_path):
+    """Contract-supplied values compose into the same command line and are checked too."""
+    p = _argparse_yaml(
+        tmp_path,
+        "        contracts:\n"
+        "          frozen:\n"
+        "            fixed_overrides:\n"
+        "              knob: {1: x}\n"
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 1\n"
+        "            contracts: [frozen]\n",
+    )
+
+    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
+        load_experiment(p)
+
+
+@pytest.mark.parametrize(
+    "value", [param.values[0] for param in _UNRENDERABLE_ARGPARSE_VALUES], ids=lambda v: str(v)
+)
+def test_json_file_keeps_its_own_verdict_on_argparse_rejected_values(tmp_path, value):
+    """The argparse contract is format-scoped: json_file's own validator decides
+    these values, and the argparse error must never fire for them."""
+    p = _json_file_yaml(
+        tmp_path,
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        f"              knob: {value}\n",
+    )
+
+    try:
+        load_experiment(p)
+    except ValidationError as exc:
+        assert "override_format='argparse'" not in str(exc)
+
+
+def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_path):
+    """With the value contract enforced, distinct Python values always produce
+    distinct JSON-mode dumps — so no two configs that render different commands
+    can share a study identity."""
+    # Import only: the fingerprint code itself is deliberately untouched.
+    from phasesweep.engine.guards import _phase_fingerprint
+
+    fingerprints: dict[str, str] = {}
+    for label, literal in {"int": "1", "str": '"1"', "bool": "true", "float": "1.0"}.items():
+        p = _argparse_yaml(
+            tmp_path,
+            "        phases:\n"
+            "          - name: t\n"
+            "            n_trials: 1\n"
+            "            fixed_overrides:\n"
+            f"              knob: {literal}\n",
+        )
+        exp = load_experiment(p)
+        fingerprints[label] = _phase_fingerprint(exp, exp.phases[0], {})
+
+    assert len(set(fingerprints.values())) == len(fingerprints)
+
+
+def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_path):
+    """A contract shared between a json_file study and an argparse study is only
+    legal for the json_file one; the argparse study fails when it is compiled."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: mixed_formats
+            defaults:
+              trial_command: "echo {overrides}"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
+              contracts:
+                frozen:
+                  fixed_overrides:
+                    model: {depth: 2}
+            studies:
+              - name: structured
+                override_format: json_file
+                trial_command: "echo {overrides_path}"
+                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
+              - name: flat
+                override_format: argparse
+                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
+            """,
+        )
+    )
+
+    structured, flat = config.studies
+    config.experiment_for_study(structured)
+    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
+        config.experiment_for_study(flat)
 
 
 def test_json_file_accepts_quoted_date_like_override(tmp_path):

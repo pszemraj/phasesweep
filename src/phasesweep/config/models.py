@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import math
 import string
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -745,6 +747,12 @@ class Experiment(_Frozen):
             # can actually be encoded. Check them explicitly here.
             _validate_json_file_override_values(self, phase)
 
+            # argparse wire contract (PR #5 review / reviewer 2, blocker 3):
+            # str()-rendering a structured value and hashing its JSON-mode dump
+            # disagree, so two different commands can share one fingerprint.
+            # Restrict argparse values to the set where the two agree.
+            _validate_argparse_override_values(self, phase)
+
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
             # unknown placeholders, and unbalanced braces at config-load instead
@@ -1001,6 +1009,129 @@ def _validate_json_file_override_values(experiment: Experiment, phase: Phase) ->
                 f"{key!r} holds a value the overrides.json serializer cannot encode "
                 f"({detail}): {value!r}. {hint}"
             ) from exc
+
+
+def _first_argparse_unrenderable(
+    value: Any, *, position: str = "", _seen: set[int] | None = None
+) -> tuple[str, Any] | None:
+    """Return the first value inside ``value`` that argparse cannot render faithfully.
+
+    ``bool`` is matched before ``int`` because ``isinstance(True, int)`` is
+    true and the two render differently (``true`` vs ``1``); both are allowed,
+    so the ordering documents intent rather than changing the verdict.
+    Containers are tracked by identity so a recursive YAML anchor cannot spin
+    this into a ``RecursionError`` (same guard as
+    :func:`_first_json_unserializable`).
+
+    :param Any value: Composed override value to inspect.
+    :param str position: Index path of ``value`` inside the original override
+        value (``""`` at the top level, ``"[0][2]"`` for nested list elements).
+    :param set[int] | None _seen: Internal recursion guard of container ids.
+    :return tuple[str, Any] | None: ``(position, offender)`` for the first
+        disallowed value, or ``None`` when every leaf is renderable.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return None
+    if isinstance(value, float):
+        # A non-finite float has no JSON representation, so the fingerprint dump
+        # would carry the non-standard NaN/Infinity token this repo's own strict
+        # reader refuses — the same reason json_file rejects it.
+        return None if math.isfinite(value) else (position, value)
+    if isinstance(value, (list, tuple)):
+        seen = set() if _seen is None else _seen
+        if id(value) in seen:
+            return None
+        seen.add(id(value))
+        for index, item in enumerate(value):
+            found = _first_argparse_unrenderable(item, position=f"{position}[{index}]", _seen=seen)
+            if found is not None:
+                return found
+        return None
+    return (position, value)
+
+
+def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> None:
+    """Reject ``argparse`` override values with no faithful wire form.
+
+    ``override_format: argparse`` renders each value through
+    :func:`phasesweep.runtime.commands._stringify`, which is ``str()`` for
+    anything that is not a bool or a list — while the semantic fingerprint
+    hashes ``model_dump(mode="json")``, which normalizes mapping keys to
+    strings. The two disagree on structured values, and the disagreement is
+    unsafe in both directions (PR #5 review / reviewer 2, blocker 3):
+
+    * ``{"a": {1: "x"}}`` and ``{"a": {"1": "x"}}`` render *different* commands
+      (``{1: 'x'}`` vs ``{'1': 'x'}``) but share a phase and experiment
+      fingerprint, so two different experiments reuse one study identity.
+    * A YAML mapping holding both ``1`` and ``"1"`` loads clean, silently loses
+      one entry in the fingerprint dump, and then kills the first trial in
+      ``json.dumps(..., sort_keys=True)`` over unorderable mixed keys — a
+      runtime crash the config layer never saw.
+
+    Restricting values to the set below removes both failure modes without
+    touching the fingerprint code: every remaining Python value maps to a
+    distinct JSON-mode dump, so distinct configs keep distinct fingerprints and
+    a shared fingerprint again implies an identical rendered command. Allowed,
+    recursively: ``None``, ``bool``, ``int``, finite ``float``, ``str``, and
+    lists/tuples of those. Structured values belong to
+    ``override_format: json_file``, which preserves JSON types on the wire.
+
+    Only the statically-known layers are checked, in composition order:
+    contract ``fixed_overrides`` then phase ``fixed_overrides`` — the same
+    scope, and for the same reasons, as
+    :func:`_validate_json_file_override_values`.
+
+    :param Experiment experiment: Experiment being validated; supplies
+        ``override_format`` and the contract definitions.
+    :param Phase phase: Phase whose composed fixed values are checked.
+    :raises ValueError: A composed value is outside the argparse value contract.
+    """
+    if experiment.override_format != "argparse":
+        return
+
+    composed: dict[str, tuple[str, Any]] = {}
+    for contract_name in phase.contracts:
+        for key, value in experiment.contracts[contract_name].fixed_overrides.items():
+            composed[key] = (f"contract {contract_name!r} fixed_overrides", value)
+    for key, value in phase.fixed_overrides.items():
+        composed[key] = ("fixed_overrides", value)
+
+    for key, (origin, value) in composed.items():
+        found = _first_argparse_unrenderable(value)
+        if found is None:
+            continue
+        position, offender = found
+        if isinstance(offender, Mapping):
+            hint = (
+                "A mapping has no argparse wire form: str() would render its "
+                "Python repr, while the fingerprint dump normalizes its keys to "
+                "strings — so {1: 'x'} and {'1': 'x'} would launch different "
+                "commands under one study identity, and a mapping holding both "
+                "keys would lose one entry from the fingerprint entirely. Use "
+                "override_format='json_file' for structured values."
+            )
+        elif isinstance(offender, float):
+            hint = (
+                "JSON has no representation for non-finite floats; use a finite "
+                'value, or quote it in YAML (e.g. "inf") if the trial command '
+                "should receive it as text."
+            )
+        else:
+            hint = (
+                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
+                "into Python date/datetime objects; quote the value in YAML "
+                '(e.g. "2024-01-01") to send it as text, or use '
+                "override_format='json_file' if the trainer needs a structured value."
+            )
+        where = f" at position {position}" if position else ""
+        raise ValueError(
+            f"Phase {phase.name!r}: override_format='argparse' but {origin} key "
+            f"{key!r} holds a value{where} that argparse cannot render faithfully "
+            f"(type {type(offender).__name__}): {offender!r}. argparse override "
+            "values must have one canonical wire form the JSON-mode fingerprint "
+            "preserves faithfully: null, booleans, integers, finite floats, "
+            f"strings, and lists of those. {hint}"
+        )
 
 
 def _format_field_names(template: str) -> set[str]:
