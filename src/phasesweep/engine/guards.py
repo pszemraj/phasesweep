@@ -1754,6 +1754,52 @@ def _studies_record_publication(entries: Sequence[_ArtifactRootRebindEntry]) -> 
     )
 
 
+def _running_trial_recoverable_in_place(
+    entry: _ArtifactRootRebindEntry,
+    trial: optuna.trial.FrozenTrial,
+    phase_dir: Path,
+    offered: str,
+) -> bool:
+    """Return whether a RUNNING trial's recovery can run at this destination as-is.
+
+    True only for adopting an unbound study **at its original tree** (PR #5
+    review / reviewer 2, issue 2): the study records no binding (or already
+    records exactly this destination, so a partially applied earlier rebind
+    still converges), and the trial's persisted directory resolves to exactly
+    the structurally expected path under the offered destination. Exact
+    equality is the proof that the destination *is* the original root rather
+    than a relocation: a copied or moved tree holds the evidence, but the
+    stored absolute path still names the source. For that proven case the
+    binding can be written with the trial left RUNNING -- the next ordinary
+    run recovers it through the standard stale-attempt protocol, which is the
+    one implementation that writes the durable failure outcome, retires the
+    registry entry, and keeps the failure-policy ledger valid. Telling the
+    operator to ``tell(FAIL)`` the trial by hand instead produced a terminal
+    trial with no ``phasesweep_trial_outcome`` and a permanently rejected
+    study schema.
+
+    :param _ArtifactRootRebindEntry entry: The study entry holding the trial.
+    :param optuna.trial.FrozenTrial trial: The RUNNING trial being judged.
+    :param Path phase_dir: Destination directory of the trial's declared phase.
+    :param str offered: The destination artifact-root identity.
+    :return bool: ``True`` when the binding may be written with this trial
+        left RUNNING for the next ordinary run to recover.
+    """
+    if entry.previous is not None and entry.previous != offered:
+        return False
+    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    if not isinstance(stored, str) or not stored:
+        return False
+    stored_path = Path(stored)
+    if not stored_path.is_absolute():
+        return False
+    expected = phase_dir / stored_path.name
+    try:
+        return stored_path.resolve(strict=True) == expected.resolve(strict=True)
+    except OSError:
+        return False
+
+
 def _validate_relocated_trial_evidence(
     experiment: Experiment,
     entries: Sequence[_ArtifactRootRebindEntry],
@@ -1771,33 +1817,43 @@ def _validate_relocated_trial_evidence(
 
     Two refusals fall out of the same walk. A ``RUNNING`` trial means an
     attempt was interrupted and never resolved; recovery follows the paths that
-    attempt persisted, so it has to run against the original root before the
-    tree moves. A stale copy - taken before the ledger advanced - is rejected
-    by the missing directory of the trial that ran after the copy, which is
-    exactly the case that would otherwise publish a winner whose evidence
-    exists only in the source tree. A trial that never persisted the attr died
-    before launch and has no evidence to move, so it is skipped.
+    attempt persisted, so a *relocation* must resolve it against the original
+    root before the tree moves. The one allowed exception is adoption at the
+    original root itself (:func:`_running_trial_recoverable_in_place`), where
+    those persisted paths already point exactly where they should and the next
+    ordinary run performs the recovery. A stale copy - taken before the ledger
+    advanced - is rejected by the missing directory of the trial that ran
+    after the copy, which is exactly the case that would otherwise publish a
+    winner whose evidence exists only in the source tree. A terminal trial
+    that never persisted the attr died before launch and has no evidence to
+    move, so it is skipped.
 
     :param Experiment experiment: Parsed experiment naming the destination.
     :param Sequence[_ArtifactRootRebindEntry] entries: Existing phase studies
         with their recorded bindings.
-    :raises ArtifactRootRebindError: A study holds a RUNNING trial, records a
-        malformed trial directory, or names a trial directory that does not
-        exist under the destination tree.
+    :raises ArtifactRootRebindError: A study holds a RUNNING trial that cannot
+        be recovered at this destination, records a malformed trial directory,
+        or names a trial directory that does not exist under the destination
+        tree.
     """
+    offered = _artifact_root_identity(experiment)
     for entry in entries:
         phase_dir = _phase_dir(experiment, entry.phase_name)
         for trial in entry.study.get_trials(deepcopy=False):
             if trial.state == optuna.trial.TrialState.RUNNING:
+                if _running_trial_recoverable_in_place(entry, trial, phase_dir, offered):
+                    continue
                 raise ArtifactRootRebindError(
                     f"Study {entry.study.study_name!r} holds RUNNING trial {trial.number}: an "
                     "interrupted attempt must be resolved before its artifact tree moves, "
                     "because stale-attempt recovery follows the absolute trial paths that "
                     "attempt persisted. Run phasesweep against the original workdir to "
-                    "recover it, then move the tree and rebind. If this study predates "
-                    "artifact-root binding, so no ordinary run can reach it, mark that trial "
-                    "FAIL yourself once you have confirmed no process from it is alive. "
-                    "Nothing was written."
+                    "recover it, then move the tree and rebind. A study that predates "
+                    "artifact-root binding is instead adopted in place: run "
+                    "'phasesweep rebind-workdir' with a config whose workdir IS the tree "
+                    "this trial ran under (its persisted trial path must already lie "
+                    "there), and the next ordinary run recovers the trial through the "
+                    "standard stale-attempt protocol. Nothing was written."
                 )
             if TRIAL_DIR_ATTR not in trial.user_attrs:
                 continue
@@ -1820,8 +1876,39 @@ def _validate_relocated_trial_evidence(
                 )
 
 
+def _attempt_entry_recoverable_in_place(entry_path: Path, destination: Path) -> bool:
+    """Return whether a registry entry's recorded trial path lies inside this tree.
+
+    An entry whose absolute trial directory resolves to an existing directory
+    under the destination experiment tree was written *by* this tree: the
+    attempt started under this exact root, so the next ordinary run here can
+    follow the recorded path and resolve it (PR #5 review / reviewer 2,
+    issue 2). An entry pointing anywhere else - or one that cannot be parsed -
+    would be stranded by the rebind and refuses it.
+
+    :param Path entry_path: Registry entry file to inspect.
+    :param Path destination: Resolved destination experiment directory.
+    :return bool: ``True`` when the entry's recorded trial directory exists
+        under ``destination``.
+    """
+    try:
+        payload = json.loads(entry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    recorded = payload.get("trial_dir")
+    if not isinstance(recorded, str) or not recorded or not Path(recorded).is_absolute():
+        return False
+    try:
+        resolved = Path(recorded).resolve(strict=True)
+    except OSError:
+        return False
+    return resolved.is_dir() and destination in resolved.parents
+
+
 def _validate_no_live_attempts(experiment: Experiment) -> None:
-    """Refuse a rebind while the destination tree still holds unresolved attempts.
+    """Refuse a rebind that would strand an unresolved attempt's recorded paths.
 
     A registry entry is written when an attempt is allocated and unlinked once
     its trial is durably terminal, so a surviving entry is an attempt nobody
@@ -1831,23 +1918,36 @@ def _validate_no_live_attempts(experiment: Experiment) -> None:
     blocker B2). The registry lives inside the experiment tree, so this reads
     the copy that came along with the move.
 
+    Entries whose recorded trial directory already exists *under this
+    destination* are allowed through: those attempts started under this exact
+    root (the adoption-in-place case), the recorded paths still resolve, and
+    the next ordinary run recovers them through the standard protocol (PR #5
+    review / reviewer 2, issue 2).
+
     :param Experiment experiment: Parsed experiment naming the destination.
-    :raises ArtifactRootRebindError: The destination registry holds at least one
-        unresolved attempt entry.
+    :raises ArtifactRootRebindError: The destination registry holds at least
+        one unresolved attempt entry whose recorded paths do not resolve
+        under this destination.
     """
     attempts_dir = _attempts_dir(experiment)
     if not attempts_dir.is_dir():
         return
-    pending = sorted(attempts_dir.glob("*.json"))
-    if not pending:
+    destination = _experiment_dir(experiment).resolve()
+    stranded = [
+        entry_path
+        for entry_path in sorted(attempts_dir.glob("*.json"))
+        if not _attempt_entry_recoverable_in_place(entry_path, destination)
+    ]
+    if not stranded:
         return
     raise ArtifactRootRebindError(
         f"Destination artifact root {str(_experiment_dir(experiment))!r} still holds "
-        f"unresolved attempt registry entries ({len(pending)} total, first "
-        f"{str(pending[0])!r}). Each entry references the absolute trial path its attempt "
-        "was launched with, and recovery cannot follow those paths after a relocation. "
-        "Run phasesweep against the original workdir until recovery clears these "
-        "attempts, then move the tree and rebind. Nothing was written."
+        f"unresolved attempt registry entries whose recorded trial paths do not resolve "
+        f"under it ({len(stranded)} total, first {str(stranded[0])!r}). Each entry "
+        "references the absolute trial path its attempt was launched with, and recovery "
+        "cannot follow those paths after a relocation. Run phasesweep against the "
+        "original workdir until recovery clears these attempts, then move the tree and "
+        "rebind. Nothing was written."
     )
 
 
@@ -1859,8 +1959,10 @@ def _validate_artifact_root_destination(
 
     Four checks, in order: the destination experiment namespace must exist; the
     destination must hold the trial evidence every ledger trial names, with no
-    RUNNING trial left to recover (:func:`_validate_relocated_trial_evidence`);
-    the relocated registry must hold no unresolved attempt
+    RUNNING trial left to recover except one that is recoverable in place at
+    its original root (:func:`_validate_relocated_trial_evidence`); the
+    relocated registry must hold no unresolved attempt whose recorded paths
+    do not resolve under this destination
     (:func:`_validate_no_live_attempts`); and - when storage records that a
     publishable result was produced - the destination's last-success pointer
     and its complete generation manifest must validate there through

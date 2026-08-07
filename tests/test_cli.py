@@ -23,6 +23,7 @@ from phasesweep.cli import main as cli_boundary
 from phasesweep.config import Suite, load_config
 from phasesweep.engine import (
     ExperimentLockBusyError,
+    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     PhaseSweepError,
     ProcessCleanupUncertainError,
@@ -39,6 +40,11 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    ATTEMPT_ID_ATTR,
+    TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_TARGET_ATTR,
+    _attempts_dir,
     _experiment_dir,
     _generation_dir,
     _generation_path,
@@ -52,6 +58,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
     write_trainer,
@@ -1421,6 +1428,138 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
     for phase_name in ("p", "q"):
         study = optuna.load_study(study_name=f"t::{phase_name}", storage=experiment_a.storage)
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_adopts_a_legacy_study_with_an_interrupted_attempt(
+    tmp_path: Path,
+) -> None:
+    """Adoption in place leaves the interrupted attempt for the ordinary protocol.
+
+    End-to-end shape of the migration a pre-binding database actually arrives
+    in: a study with no recorded root *and* an attempt its orchestrator never
+    resolved. The rebind proves ownership of the tree and writes the binding
+    with the RUNNING trial and its registry entry untouched; the next ordinary
+    run recovers both through the standard stale-attempt protocol, which is
+    the only path that persists a valid ``phasesweep_trial_outcome``. Telling
+    the operator to ``tell(FAIL)`` the trial by hand instead left a terminal
+    trial with no outcome, which every later run rejected as a schema
+    mismatch (PR #5 review / reviewer 2, issue 2).
+    """
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    assert experiment_a.storage is not None
+
+    # Exactly what a crashed orchestrator leaves behind: a second run raised the
+    # target to 2 (the engine persists that before launching any work), asked its
+    # trial, and died with the attempt allocated but no process ever launched.
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    study.set_user_attr(TRIAL_TARGET_ATTR, 2)
+    trial = study.ask()
+    trial_dir = _experiment_dir(experiment_a) / "p" / "trial_00001__interrupted"
+    trial_dir.mkdir(parents=True)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "legacy-attempt-1")
+    write_attempt_lifecycle(trial_dir, attempt_id="legacy-attempt-1", state="allocated")
+    _register_active_attempt(
+        experiment_a,
+        attempt_id="legacy-attempt-1",
+        phase_name="p",
+        study_name="t::p",
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="legacy-gen",
+    )
+    entry_path = _attempts_dir(experiment_a) / "legacy-attempt-1.json"
+    _drop_artifact_root_binding(experiment_a.storage, "t::p")
+
+    # An ordinary run cannot migrate the study, so it cannot recover the
+    # attempt either: the rebind is the only way forward.
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError):
+        run_experiment(load_experiment(config_a))
+    reloaded = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert reloaded.trials[trial.number].state == optuna.trial.TrialState.RUNNING
+    assert entry_path.is_file()
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
+
+    assert result.exit_code == 0, result.output
+    assert "(unbound) ->" in result.output
+    adopted = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert adopted.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+    # The rebind proves ownership; it deliberately recovers nothing.
+    assert adopted.trials[trial.number].state == optuna.trial.TrialState.RUNNING
+    assert entry_path.is_file()
+
+    # The next ordinary run recovers the attempt through the standard protocol
+    # and then runs the remaining budget. Two ledger trials are already
+    # terminal once recovery lands, so a third is what schedules new work.
+    topped_up = experiment_a.model_copy(
+        update={"phases": [experiment_a.phases[0].model_copy(update={"n_trials": 3})]}
+    )
+    run_experiment(topped_up)
+
+    final = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    trials = final.get_trials(deepcopy=False)
+    recovered = trials[trial.number]
+    assert recovered.state == optuna.trial.TrialState.FAIL
+    outcome = recovered.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert isinstance(outcome, dict)
+    assert outcome["outcome"] == "failure"
+    assert not entry_path.exists()
+    assert len(trials) >= 3
+    assert any(
+        candidate.state == optuna.trial.TrialState.COMPLETE and candidate.number > trial.number
+        for candidate in trials
+    )
+    assert_published_winner_evidence_local(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_still_refuses_an_unbound_running_trial_on_a_copied_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Adoption in place is not a licence to relocate an unresolved attempt.
+
+    The relaxation keys on the persisted trial path resolving to exactly its
+    structural position under the offered destination. A copy holds the same
+    evidence, but the stored absolute path still names the source tree, so
+    recovery there would follow paths this destination does not own and the
+    rebind must still refuse.
+    """
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    assert experiment_a.storage is not None
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    trial = study.ask()
+    trial_dir = _experiment_dir(experiment_a) / "p" / "trial_00001__interrupted"
+    trial_dir.mkdir(parents=True)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(ATTEMPT_ID_ATTR, "copied-attempt-1")
+    _register_active_attempt(
+        experiment_a,
+        attempt_id="copied-attempt-1",
+        phase_name="p",
+        study_name="t::p",
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="copied-gen",
+    )
+    shutil.copytree(workdir_a, workdir_b)
+    _drop_artifact_root_binding(experiment_a.storage, "t::p")
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    # Per-trial evidence is validated before the attempt registry, so the
+    # RUNNING trial is the refusal the operator sees.
+    assert "RUNNING trial" in captured.err
+    unchanged = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert ARTIFACT_ROOT_ATTR not in unchanged.user_attrs
 
 
 def test_rebind_workdir_reports_that_in_memory_storage_binds_nothing(

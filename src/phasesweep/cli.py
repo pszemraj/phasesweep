@@ -657,7 +657,9 @@ def status(config_path: Path) -> None:
         "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
         "publication validates; refuses relocating a published suite. Also the migration path "
         "for a study that predates artifact-root binding: point the config at that study's "
-        "original tree. Writes nothing unless every check passes. Note that a run refused for "
+        "original tree - there, an interrupted RUNNING trial whose persisted paths already "
+        "lie under that tree is allowed through, and the next ordinary run recovers it. "
+        "Writes nothing unless every check passes. Note that a run refused for "
         "a workdir conflict leaves a failed generation record under the new workdir - remove "
         "that experiment directory before moving the tree there, or the move nests it one "
         "level deep."
@@ -684,6 +686,15 @@ def rebind_workdir(config_path: Path) -> None:
     studies record completed trials, the recorded publication validates. A
     suite that published a suite generation is refused outright - suite
     summaries record absolute component paths that do not survive relocation.
+
+    The one ``RUNNING`` exception is adoption in place: when a pre-binding
+    study's interrupted trial persisted paths that already resolve exactly
+    under the offered workdir - proof the destination is the original root,
+    not a copy - the binding is written with the trial (and its registry
+    entry) left as-is, and the next ordinary run recovers it through the
+    standard stale-attempt protocol. That protocol, not a manual Optuna
+    ``tell(FAIL)``, is what records the durable failure outcome the study
+    schema requires.
 
     Nothing else in the durable state graph is rewritten, so the refusals are
     deliberately broader than the cases PhaseSweep can repair (re-review
