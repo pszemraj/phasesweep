@@ -24,7 +24,16 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, IntParam, Phase, Sampler, load_config
+from phasesweep.config import (
+    Experiment,
+    IntParam,
+    JsonEnvelopeExtractor,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+    load_config,
+)
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -50,6 +59,7 @@ from phasesweep.engine.state import (
     _winner_path,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
@@ -63,6 +73,7 @@ from phasesweep.mcp.server import (
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
     TOOL_LAUNCH_RUN,
+    GetRunResultsResult,
     GetRunStatusResult,
     PhaseSweepMCP,
     _safe_tool,
@@ -1332,6 +1343,219 @@ def test_status_and_winners_carry_the_publication_integrity_verdict(tmp_path: Pa
     # The verdict is a closed enum, so nothing path-shaped rides along with it.
     serialized = json.dumps([payload, winners], default=str)
     assert str(tmp_path) not in serialized
+
+
+# --------------------------------------------------------------------------
+# A published result is historical evidence. Editing the catalog config never
+# relabels it, and the agent is told when the two have diverged (review
+# v0.5.16 / blocker 4).
+# --------------------------------------------------------------------------
+
+
+def _drift_experiment(
+    tmp_path: Path,
+    trainer: Path,
+    *,
+    metric_name: str = "x",
+    goal: str = "minimize",
+    extractor: object | None = None,
+    phase_name: str = "p",
+) -> Experiment:
+    """Build the one-phase experiment the catalog-drift tests publish and edit."""
+    return make_experiment(
+        experiment="srv",
+        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        workdir=str(tmp_path / "runs"),
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(
+            name=metric_name,
+            goal=goal,
+            extractor=extractor
+            or LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=[
+            Phase(
+                name=phase_name,
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": IntParam(type="int", low=1, high=2)},
+            )
+        ],
+    )
+
+
+def _write_experiment_config(config: Path, experiment: Experiment) -> None:
+    """Rewrite a cataloged config file in place, as an operator edit would."""
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+
+
+def _publish_drift_experiment(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Publish one real generation and return its trainer, config, and catalog."""
+    trainer = write_constant_trainer(tmp_path)
+    config = tmp_path / "srv.yaml"
+    published = _drift_experiment(tmp_path, trainer)
+    _write_experiment_config(config, published)
+    catalog = _catalog(tmp_path, config)
+    run_experiment(published)
+    return trainer, config, catalog
+
+
+def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
+    tmp_path: Path,
+) -> None:
+    """A result published as x/minimize is never reported as y/maximize.
+
+    Both read surfaces must agree: status already resolved the historical
+    metric, while results built its label from the current catalog, so the
+    same number was reported under two different metrics by two tools of the
+    same server.
+    """
+    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+
+    app, _registry, _store = make_mcp_app(catalog)
+    baseline_status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+    baseline_results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+
+    # Unchanged config: the historical labels are also the current ones, and
+    # the drift flag says so rather than staying silent.
+    assert baseline_results.metric.name == "x"
+    assert baseline_results.metric.goal == "minimize"
+    assert baseline_results.result_context == "represented_generation"
+    assert baseline_results.published_config_matches_current is True
+    assert baseline_status.published_config_matches_current is True
+    assert baseline_status.result_phase_plan == ["p"]
+    assert baseline_results.winner_count == 1
+
+    _write_experiment_config(
+        config,
+        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
+    )
+    restarted, _restarted_registry, _restarted_store = make_mcp_app(catalog)
+
+    status = GetRunStatusResult.model_validate(restarted.status(experiment_id="srv"))
+    results = GetRunResultsResult.model_validate(restarted.winners(experiment_id="srv"))
+
+    assert (results.metric.name, results.metric.goal) == ("x", "minimize")
+    assert (status.metric.name, status.metric.goal) == (results.metric.name, results.metric.goal)
+    assert results.result_context == "represented_generation"
+    assert results.published_config_matches_current is False
+    assert status.published_config_matches_current is False
+    # The winner itself is unchanged: only its provenance disclosure improved.
+    assert results.winner_count == 1
+    assert results.phases[0].metric == baseline_results.phases[0].metric
+
+
+def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
+    tmp_path: Path,
+) -> None:
+    """A log-scraped number must not inherit a structured extractor's guarantees.
+
+    Reporting the current extractor's assurance beside a historical winner
+    claims evidence properties that run never had - the one field an agent is
+    told to use when deciding how far to trust a metric.
+    """
+    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+    published_assurance = objective_evidence_assurance(
+        _drift_experiment(tmp_path, trainer).metric.extractor
+    )
+
+    _write_experiment_config(
+        config,
+        _drift_experiment(
+            tmp_path,
+            trainer,
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="r.json",
+                objective_name="x",
+                split="test",
+                policy="test",
+            ),
+        ),
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+
+    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+    evidence = results.metric.objective_evidence.model_dump()
+
+    assert evidence == published_assurance
+    assert evidence["kind"] == "log_regex"
+    # The four guarantees the swapped-in extractor would have asserted.
+    assert evidence["objective_name_bound"] is False
+    assert evidence["split_bound"] is False
+    assert evidence["evaluation_policy_bound"] is False
+    assert evidence["source_identity_keyed"] is False
+    assert results.published_config_matches_current is False
+
+
+def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:
+    """Renaming a phase must not delete the published result from the payload.
+
+    Enumerating winners under the *current* phase names returned an "ok"
+    publication with zero winners and the new name listed as missing: an
+    agent's cue to launch a run over evidence that was there all along.
+    """
+    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="q"))
+    app, _registry, _store = make_mcp_app(catalog)
+
+    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+
+    assert results.publication_integrity == "ok"
+    assert [phase.phase for phase in results.phases] == ["p"]
+    assert results.winner_count == 1
+    assert results.declared_phase_count == 1
+    assert results.missing_phases == []
+    assert results.all_phases_have_winners is True
+    assert results.published_config_matches_current is False
+
+    status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+
+    # Status keeps reporting the *current* plan's progress - a run would have
+    # to produce a winner for "q" - but no longer implies the publication is
+    # empty: it names the plan that publication used and flags the drift.
+    assert status.is_published is True
+    assert [phase.phase for phase in status.phases] == ["q"]
+    assert status.phases[0].winner_present is False
+    assert status.result_phase_plan == ["p"]
+    assert status.published_config_matches_current is False
+    # ... and it still points at the result instead of answering "stop": the
+    # winner the results tool returns is right there.
+    assert _status_next_action(status) == TOOL_GET_RUN_RESULTS
+
+
+def test_current_visibility_policy_redacts_historical_values_without_relabeling_them(
+    tmp_path: Path,
+) -> None:
+    """Redaction is the current operator's call; labeling is the result's own.
+
+    The two must not be conflated in either direction: tightening the catalog
+    policy still hides a historical param value, and it never licenses
+    reporting that value under today's metric or phase name.
+    """
+    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+    _write_experiment_config(
+        config,
+        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize", phase_name="q"),
+    )
+
+    redacted_app, _registry, _store = make_mcp_app(catalog)
+    redacted = GetRunResultsResult.model_validate(redacted_app.winners(experiment_id="srv"))
+
+    assert redacted.phases[0].params == {"lr": "<redacted>"}
+    assert redacted.phases[0].params_redacted is True
+    assert redacted.phases[0].phase == "p"
+    assert (redacted.metric.name, redacted.metric.goal) == ("x", "minimize")
+
+    visible_app, _visible_registry, _visible_store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": ["lr"]})
+    )
+    visible = GetRunResultsResult.model_validate(visible_app.winners(experiment_id="srv"))
+
+    assert visible.phases[0].params["lr"] in (1, 2)
+    assert visible.phases[0].params_redacted is False
+    assert visible.phases[0].phase == "p"
+    assert (visible.metric.name, visible.metric.goal) == ("x", "minimize")
 
 
 def test_experiment_status_next_action_awaits_a_live_run(tmp_path: Path) -> None:

@@ -140,6 +140,17 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         winners = app.winners(run_id=run_id)
         assert winners["result_source"] == "frozen_run_snapshot"
         assert "objective_evidence" in winners["metric"]
+        # A frozen run reports its own recorded semantics, and they match the
+        # config it executed - the drift disclosure is silent here because
+        # there is nothing to disclose (review v0.5.16 / blocker 4).
+        assert winners["result_context"] == "represented_generation"
+        assert winners["published_config_matches_current"] is True
+        assert awaited["result_phase_plan"] == ["depth", "lr"]
+        assert awaited["published_config_matches_current"] is True
+        # The historical phase plan is read from the generation summary, whose
+        # per-phase records carry composed overrides; only names may cross into
+        # a tool payload.
+        assert "effective_overrides" not in json.dumps([winners, awaited], default=str)
         phases = winners["phases"]
         assert phases  # winners were actually produced
         assert [p["phase"] for p in phases] == ["depth", "lr"]
@@ -304,7 +315,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     numbered_rules = [
         line for line in initialization.instructions.splitlines() if line[:1].isdigit()
     ]
-    assert len(numbered_rules) == 10
+    assert len(numbered_rules) == 11
     assert "follow `next_cursor` until it is null" in numbered_rules[0]
     assert "call `inspect_experiment` before proposing a run" in numbered_rules[0]
     assert "Follow each result's `next_action`" in numbered_rules[1]
@@ -315,10 +326,13 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "`publication_integrity` is `failed`" in numbered_rules[5]
     assert "never propose a run" in numbered_rules[5]
     assert "convergence, trends, robustness, causality" in numbered_rules[7]
-    assert "Never edit an experiment config yourself" in numbered_rules[8]
-    assert "search space, samplers, gates" in numbered_rules[8]
-    assert "Never open raw datasets" in numbered_rules[9]
-    assert "trainer logs, raw result files, W&B dashboards" in numbered_rules[9]
+    # Historical labels stay historical (review v0.5.16 / blocker 4).
+    assert "`published_config_matches_current` is `false`" in numbered_rules[8]
+    assert "report them as historical" in numbered_rules[8]
+    assert "Never edit an experiment config yourself" in numbered_rules[9]
+    assert "search space, samplers, gates" in numbered_rules[9]
+    assert "Never open raw datasets" in numbered_rules[10]
+    assert "trainer logs, raw result files, W&B dashboards" in numbered_rules[10]
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -423,7 +437,16 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "found" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
     assert "run" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    # Both result surfaces disclose which config labeled the result they show.
+    results_properties = output_schemas[TOOL_GET_RUN_RESULTS]["properties"]
+    status_properties = output_schemas[TOOL_GET_RUN_STATUS]["properties"]
+    assert "result_context" in results_properties
+    assert "published_config_matches_current" in results_properties
+    assert "result_context" in status_properties
+    assert "published_config_matches_current" in status_properties
+    assert "result_phase_plan" in status_properties
 
     resources = asyncio.run(server.list_resources())
     assert {str(resource.uri) for resource in resources} == {CATALOG_RESOURCE_URI}

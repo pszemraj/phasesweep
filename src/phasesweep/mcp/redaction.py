@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import PublicationState, _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
 
@@ -74,6 +75,8 @@ def winners_payload(
     run_id: str | None = None,
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
+    result_context: ResultContext = "current_config",
+    published_config_matches_current: bool | None = None,
 ) -> dict[str, Any]:
     """Build the ``get_run_results`` payload from path-free phase-winner views.
 
@@ -82,10 +85,22 @@ def winners_payload(
     config-authored fixed or inherited values, so it is intentionally kept out
     of agent-visible tool results.
 
+    A published result is *historical evidence*: ``metric`` and
+    ``declared_phases`` must describe the generation the winners came from, not
+    whatever the config says today (review v0.5.16 / blocker 4). Callers are
+    responsible for sourcing both from the represented generation;
+    ``result_context`` and ``published_config_matches_current`` then tell the
+    agent which config those labels came from and whether it still matches the
+    one a further run would execute. Visibility policy is unaffected: the
+    *current* policy still decides which historical values are redacted, it
+    just never relabels them.
+
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
-    :param dict[str, Any] metric: Optimization metric and objective-evidence assurance.
-    :param list[str] declared_phases: All phase names in execution order.
+    :param dict[str, Any] metric: Optimization metric and objective-evidence
+        assurance the represented generation recorded.
+    :param list[str] declared_phases: Phase plan the represented generation
+        published under, in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
     :param PublicationState publication_integrity: Whether the experiment's
@@ -95,6 +110,13 @@ def winners_payload(
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
+    :param ResultContext result_context: Whether ``metric``/``declared_phases``
+        are the represented generation's own recorded semantics or the current
+        config's (the latter when nothing is published, or for a pre-manifest
+        legacy layout that recorded none).
+    :param bool | None published_config_matches_current: Whether the represented
+        generation's recorded config fingerprint matches the config this read
+        was interpreted through; ``None`` when undeterminable.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     winner_phases = {view.phase for view in views}
@@ -150,6 +172,8 @@ def winners_payload(
         "run_id": run_id,
         "result_source": result_source,
         "publication_integrity": publication_integrity,
+        "result_context": result_context,
+        "published_config_matches_current": published_config_matches_current,
         "metric": metric,
         "declared_phase_count": len(declared_phases),
         "winner_count": len(views),
@@ -191,6 +215,14 @@ def status_payload(
     deliberately *not* forwarded: the enum is what an agent must branch on,
     and the free-text detail belongs to the operator-facing CLI, which is the
     surface trusted with local specifics.
+
+    ``result_context``, ``published_config_matches_current`` and
+    ``result_phase_plan`` are forwarded rather than dropped (review v0.5.16 /
+    blocker 4). The ``phases`` list describes the *current* config's phases --
+    what a further run would execute -- so under a config edited since
+    publication it can legitimately show no winners beside ``is_published:
+    true``. Without these three the agent had no way to tell that apart from an
+    empty publication.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
@@ -243,6 +275,9 @@ def status_payload(
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
         "publication_integrity": status["publication_integrity"],
+        "result_context": status["result_context"],
+        "published_config_matches_current": status["published_config_matches_current"],
+        "result_phase_plan": status["result_phase_plan"],
         "metric": status["metric"],
         "phases": phases,
         "summary_present": status["summary_present"],

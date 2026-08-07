@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
+from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
     PublicationState,
     Winner,
@@ -110,6 +111,35 @@ class StatusSnapshot(_SnapshotModel):
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
 
+    result_context: ResultContext = "current_config"
+    """Whether ``metric`` and ``result_phase_plan`` are the represented
+    generation's own recorded semantics or the executing config's.
+
+    Defaults to ``"current_config"`` so snapshots frozen before this field
+    existed still parse. That is the conservative reading: such a snapshot
+    recorded no proof that its labels came from the generation's own summary.
+    """
+
+    published_config_matches_current: bool | None = None
+    """Whether the represented generation's recorded config fingerprint matched
+    the config this run executed, or ``None`` when it recorded none.
+
+    Frozen at capture time and never recomputed: this snapshot is read long
+    after the catalog config may have moved on, and re-answering it against a
+    later config would silently change what a frozen result claims. Snapshots
+    frozen before this field existed parse as ``None`` -- unknown, which is
+    exactly what they recorded.
+    """
+
+    result_phase_plan: list[str] | None = None
+    """Phase plan the represented generation published under, or ``None``.
+
+    ``None`` for snapshots frozen before this field existed; readers fall back
+    to this snapshot's own ``phases`` names, which for every runner-captured
+    snapshot is the same plan (the capture is pinned to the generation the
+    executing config just produced).
+    """
+
 
 class WinnerSourceSnapshot(_SnapshotModel):
     """Concrete source trial for an exposed phase winner."""
@@ -204,11 +234,19 @@ class RunResultSnapshot(_SnapshotModel):
     def status_payload(self) -> dict[str, Any]:
         """Return the stored status in the engine reader's path-free shape.
 
+        A snapshot frozen before ``result_phase_plan`` existed reports its own
+        frozen phase names instead: a runner capture is always pinned to the
+        generation its config just produced, so those names *are* that
+        generation's plan. The key is always present so payload builders can
+        read one shape for live and frozen reads alike.
+
         :return dict[str, Any]: Status mapping accepted by the MCP payload builder.
         """
         payload = self.status.model_dump(mode="json")
         for phase in payload["phases"]:
             phase.pop("running_attempts", None)
+        if payload["result_phase_plan"] is None:
+            payload["result_phase_plan"] = [phase.phase for phase in self.status.phases]
         return payload
 
     def winner_views(self) -> list[PhaseWinnerView]:
@@ -265,6 +303,11 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
             # report the same verdict a never-published tree does rather than
             # implying this placeholder inspected one.
             publication_integrity="absent",
+            # No summary was read either, so these labels are the config's own
+            # and no drift verdict was reached.
+            result_context="current_config",
+            published_config_matches_current=None,
+            result_phase_plan=[phase.name for phase in experiment.phases],
             metric=MetricSnapshot(
                 name=experiment.metric.name,
                 goal=experiment.metric.goal,
@@ -370,10 +413,17 @@ def capture_result_snapshot(
         # not the (possibly different) true current pointer: a pinned capture
         # wants exactly its own generation's winners even when a newer
         # generation has since become current (review v0.5.15 / blocker 3).
+        # They are enumerated under that generation's own recorded phase plan
+        # for the same reason: an unpinned capture can represent an older
+        # publication whose phase names this config no longer declares, and
+        # reading it through today's names would freeze a snapshot that omits
+        # winners which exist (review v0.5.16 / blocker 4).
         winner_snapshots = [
             _winner_snapshot(winner.phase, winner)
             for winner in read_winners(
-                experiment, generation_id=status["represented_generation_id"]
+                experiment,
+                generation_id=status["represented_generation_id"],
+                phase_names=status["result_phase_plan"],
             )
         ]
     snapshot = RunResultSnapshot(
@@ -386,6 +436,9 @@ def capture_result_snapshot(
             metric=status["metric"],
             phases=status["phases"],
             summary_present=status["summary_present"],
+            result_context=status["result_context"],
+            published_config_matches_current=status["published_config_matches_current"],
+            result_phase_plan=status["result_phase_plan"],
         ),
         winners=winner_snapshots,
     )

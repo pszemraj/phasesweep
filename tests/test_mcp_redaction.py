@@ -273,12 +273,31 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
         publication_integrity="ok",
         run_id="exp-run",
         represented_generation_id="generation-new",
+        result_context="represented_generation",
+        published_config_matches_current=False,
     )
 
     assert payload["run_id"] == "exp-run"
     assert payload["result_source"] == "frozen_run_snapshot"
+    # Completeness is measured against the plan the caller supplied, which for
+    # a published result is that generation's own (review v0.5.16 / blocker 4).
     assert payload["declared_phase_count"] == 2
     assert payload["winner_count"] == 1
     assert payload["missing_phases"] == ["p2"]
     assert payload["all_phases_have_winners"] is False
     assert payload["phases"][0]["winner_generation"] == "prior_generation"
+    assert payload["result_context"] == "represented_generation"
+    assert payload["published_config_matches_current"] is False
+
+
+def test_winners_payload_defaults_claim_no_historical_provenance() -> None:
+    """An undisclosed provenance reads as unknown, never as "no drift".
+
+    The defaults exist for callers that have no represented generation to
+    describe (nothing published), so they must not assert that the current
+    config produced the result or that it still matches.
+    """
+    payload = _winners_payload("exp", [])
+
+    assert payload["result_context"] == "current_config"
+    assert payload["published_config_matches_current"] is None

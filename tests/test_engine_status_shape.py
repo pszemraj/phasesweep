@@ -81,10 +81,14 @@ PHASE_STATUS_KEYS = {
 
 # read_status computes these for the MCP read view; experiment_status
 # deliberately does not republish them under the path-bearing CLI contract.
+# ``result_phase_plan`` is the represented generation's own phase plan, which
+# the CLI reads straight from the generation summary in ``show-winners``
+# instead (review v0.5.16 / blocker 4).
 READ_STATUS_ONLY_KEYS = {
     "metric",
     "result_context",
     "published_config_matches_current",
+    "result_phase_plan",
     "summary_present",
 }
 

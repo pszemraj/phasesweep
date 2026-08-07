@@ -688,4 +688,84 @@ def test_read_status_without_any_publication_uses_current_config(tmp_path: Path)
     status = read_status(experiment)
     assert status["result_context"] == "current_config"
     assert status["published_config_matches_current"] is None
+    assert status["result_phase_plan"] == ["p"]
     assert status["metric"]["name"] == "x"
+
+
+def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path) -> None:
+    """A phase renamed after publication must not hide the published winner.
+
+    ``phases`` stays the *current* config's progress view -- a run would have
+    to produce a winner for ``q`` -- while ``result_phase_plan`` reports the
+    plan the publication actually used, so a reader can enumerate it instead
+    of concluding the publication is empty (review v0.5.16 / blocker 4).
+    """
+    published = _drift_experiment(tmp_path)
+    run_experiment(published)
+
+    renamed = _drift_experiment(
+        tmp_path,
+        phases=[
+            Phase(
+                name="q",
+                n_trials=1,
+                comment="renamed phase",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+        ],
+    )
+
+    status = read_status(renamed)
+    assert status["is_published"] is True
+    assert status["result_phase_plan"] == ["p"]
+    assert status["published_config_matches_current"] is False
+    assert [phase["phase"] for phase in status["phases"]] == ["q"]
+    assert status["phases"][0]["winner_present"] is False
+
+    generation_id = status["represented_generation_id"]
+    # The declared-phase default is unchanged: the CLI resume/progress readers
+    # that depend on it keep asking about the phases configured today.
+    assert read_winners(renamed, generation_id=generation_id) == []
+
+    (winner,) = read_winners(
+        renamed,
+        generation_id=generation_id,
+        phase_names=status["result_phase_plan"],
+    )
+    assert winner.phase == "p"
+    assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
+
+
+def test_result_phase_plan_falls_back_to_the_current_config_for_a_planless_summary(
+    tmp_path: Path,
+) -> None:
+    """A summary that records no plan leaves the current config describing it.
+
+    Pre-manifest layouts published a summary with no ``phase_plan`` at all;
+    the only phase names such a tree can be read under are the configured
+    ones, and that fallback must survive.
+    """
+    exp = _experiment(tmp_path)
+    _mark_generation_published(exp, "generation-planless", "p")
+
+    status = read_status(exp)
+
+    assert status["is_published"] is True
+    assert status["result_context"] == "current_config"
+    assert status["result_phase_plan"] == ["p"]
+
+
+@pytest.mark.parametrize("unsafe_name", ["../escape", "", "phases/p"])
+def test_read_winners_refuses_phase_names_that_are_not_path_components(
+    tmp_path: Path, unsafe_name: str
+) -> None:
+    """Explicit plans become path segments, so they are validated like config names.
+
+    Plans parsed off disk are filtered before they reach here, so this guards
+    the remaining way an unsafe name could arrive: a caller passing one.
+    """
+    exp = _experiment(tmp_path)
+
+    with pytest.raises(ValueError, match="phase name"):
+        read_winners(exp, phase_names=[unsafe_name])

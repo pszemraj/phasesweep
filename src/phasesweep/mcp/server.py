@@ -30,8 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import generation_id_source, read_status, read_winners
+from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import PublicationState, Winner, WinnerSourceKind, _load_winner
-from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
+from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
@@ -190,6 +191,34 @@ PublicationIntegrity = Annotated[
             "if nothing published. On 'failed', report the corruption to the operator and do "
             "not launch a run against this experiment: a successful run advances the "
             "publication pointer past the corrupt result and nothing reports it afterwards."
+        )
+    ),
+]
+ResultContext = Annotated[
+    ResultContextLiteral,
+    Field(
+        description=(
+            "Which config's semantics label this result. 'represented_generation': the "
+            "metric name/goal and phase plan are the ones the represented generation "
+            "recorded when it ran, so they describe the numbers as produced even if the "
+            "config has since been edited. 'current_config': the represented result "
+            "recorded no semantics of its own - nothing has published yet, or the "
+            "publication predates result manifests - so the currently loaded config "
+            "describes it. Under 'represented_generation', objective_evidence still "
+            "falls back to the current extractor's assurance when the recorded summary "
+            "carries none: treat evidence flags as unproven for such a result."
+        )
+    ),
+]
+PublishedConfigMatchesCurrent = Annotated[
+    bool | None,
+    Field(
+        description=(
+            "Whether the config that produced this result still matches the one a further "
+            "run would execute. False means the config was edited after publication: the "
+            "labels here are historical, and the current phases may not correspond to the "
+            "published ones. Null when undeterminable - nothing published, or a "
+            "publication that recorded no config fingerprint. Never treat null as 'no drift'."
         )
     ),
 ]
@@ -454,6 +483,16 @@ class GetRunStatusResult(_ResultPayload):
         )
     )
     publication_integrity: PublicationIntegrity
+    result_context: ResultContext
+    published_config_matches_current: PublishedConfigMatchesCurrent
+    result_phase_plan: list[PhaseName] = Field(
+        description=(
+            "Phase plan the represented generation published under, in execution order. "
+            "Equals the phases list's names while the config is unchanged; after an edit "
+            "it is the historical plan, and the phases list is the current one a further "
+            "run would execute."
+        )
+    )
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
@@ -534,16 +573,30 @@ class WinnerPhasePayload(_ToolPayload):
 
 
 class GetRunResultsResult(_ResultPayload):
-    """Structured output for get_run_results."""
+    """Structured output for get_run_results.
+
+    Every result-scoped field describes the represented generation under the
+    config that produced it: ``metric``, ``declared_phase_count``,
+    ``missing_phases``, and ``all_phases_have_winners`` are measured against
+    the historical phase plan, not the current one (review v0.5.16 /
+    blocker 4). ``result_context`` and ``published_config_matches_current``
+    disclose which config that was.
+    """
 
     experiment_id: ExperimentId
     run_id: RunId | None
     result_source: ResultSource
     publication_integrity: PublicationIntegrity
+    result_context: ResultContext
+    published_config_matches_current: PublishedConfigMatchesCurrent
     metric: MetricPayload
-    declared_phase_count: int = Field(ge=0)
+    declared_phase_count: int = Field(
+        ge=0, description="Phases the represented generation's own plan declared."
+    )
     winner_count: int = Field(ge=0)
-    missing_phases: list[PhaseName]
+    missing_phases: list[PhaseName] = Field(
+        description="Phases of that same historical plan with no winner artifact."
+    )
     all_phases_have_winners: bool
     phases: list[WinnerPhasePayload]
     failure: FailurePayload | None = None
@@ -612,9 +665,15 @@ def _status_next_action(result: GetRunStatusResult) -> NextAction | None:
     the experiment either never ran under this server or every run of it is
     already terminal. Deferring to :func:`_run_next_action` there would answer
     "nothing left to do" even when finished work is on disk, so a published
-    winner steers the agent to the results tool instead. With no winner
-    anywhere there is genuinely nothing further to read, and null keeps its
-    documented meaning.
+    winner steers the agent to the results tool instead. With nothing published
+    and no winner anywhere there is genuinely nothing further to read, and null
+    keeps its documented meaning.
+
+    ``is_published`` is checked beside the per-phase winners because those
+    phases are the *current* config's: after a phase rename none of them has a
+    winner while the publication the results tool would return is intact, and
+    answering "stop" there sends the agent away from a result it can read
+    (review v0.5.16 / blocker 4).
 
     :param GetRunStatusResult result: Status payload whose transition is chosen.
     :return NextAction | None: Monitoring or result tool, or null when no
@@ -622,7 +681,7 @@ def _status_next_action(result: GetRunStatusResult) -> NextAction | None:
     """
     if result.run is not None:
         return _run_next_action(result.run)
-    if any(phase.winner_present for phase in result.phases):
+    if result.is_published or any(phase.winner_present for phase in result.phases):
         return cast(NextAction, TOOL_GET_RUN_RESULTS)
     return None
 
@@ -1137,6 +1196,19 @@ class PhaseSweepMCP:
         agent must stop rather than propose another run (review v0.5.18 /
         finding F4).
 
+        Every label describing the winners -- metric name and goal, objective
+        evidence, and the declared phase plan the completeness fields are
+        measured against -- comes from the represented generation's own
+        recorded semantics, never from the current catalog config (review
+        v0.5.16 / blocker 4). Reading them from the current config relabeled
+        historical numbers with a metric they were never optimized for,
+        asserted evidence guarantees the run never had, and, after a phase
+        rename, hid the published winner while reporting the new name as
+        missing. ``result_context`` and ``published_config_matches_current``
+        report which config supplied the labels and whether it still matches
+        the one a further run would execute. Visibility is unchanged: the
+        current policy still decides which historical *values* are redacted.
+
         :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
         :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
@@ -1147,11 +1219,13 @@ class PhaseSweepMCP:
             include_run=False,
         )
         snapshot, result_source = self._result_snapshot_view(experiment, handle)
-        publication_integrity: PublicationState
         if snapshot is not None:
+            # The frozen snapshot already carries the represented generation's
+            # own metric, phase plan, and drift verdict, captured under the
+            # config that run executed -- so this branch reads its labels from
+            # the same place the live branch does.
+            status = snapshot.status_payload()
             winner_views = snapshot.winner_views()
-            represented_generation_id = snapshot.status.represented_generation_id
-            publication_integrity = snapshot.status.publication_integrity
         else:
             # Resolve the represented generation once via read_status, then
             # reuse that exact id for read_winners: two independent pointer
@@ -1164,9 +1238,17 @@ class PhaseSweepMCP:
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
             )
-            represented_generation_id = status["represented_generation_id"]
-            publication_integrity = status["publication_integrity"]
-            winner_views = read_winners(experiment, generation_id=represented_generation_id)
+            # Enumerate the plan that generation published under, not the one
+            # the config declares now: a phase renamed since publication used
+            # to drop its winner from this payload entirely while reporting
+            # the new name as missing (review v0.5.16 / blocker 4).
+            winner_views = read_winners(
+                experiment,
+                generation_id=status["represented_generation_id"],
+                phase_names=status["result_phase_plan"],
+            )
+        represented_generation_id: str | None = status["represented_generation_id"]
+        publication_integrity: PublicationState = status["publication_integrity"]
         authority_handle = handle
         authority_unreadable = False
         if authority_handle is None and represented_generation_id is not None:
@@ -1191,17 +1273,15 @@ class PhaseSweepMCP:
         result = winners_payload(
             target_id,
             winner_views,
-            metric={
-                "name": experiment.metric.name,
-                "goal": experiment.metric.goal,
-                "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
-            },
-            declared_phases=[phase.name for phase in experiment.phases],
+            metric=status["metric"],
+            declared_phases=status["result_phase_plan"],
             result_source=result_source,
             publication_integrity=publication_integrity,
             run_id=run_id,
             represented_generation_id=represented_generation_id,
             visible_params=visible_params,
+            result_context=status["result_context"],
+            published_config_matches_current=status["published_config_matches_current"],
         )
         result["failure"] = self._run_failure_payload(handle) if handle is not None else None
         return result

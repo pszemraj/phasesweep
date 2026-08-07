@@ -147,6 +147,9 @@ def test_status_floors_inconsistent_historical_terminal_count() -> None:
         "represented_generation_id": "generation-current",
         "is_published": False,
         "publication_integrity": "absent",
+        "result_context": "current_config",
+        "published_config_matches_current": None,
+        "result_phase_plan": ["p"],
         "metric": {"name": "loss", "goal": "minimize"},
         "summary_present": False,
         "phases": [

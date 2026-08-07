@@ -14,10 +14,10 @@ re-verify phase fingerprints: that check belongs to the resume path in
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, TypeAlias, cast
 
 import yaml
 
@@ -38,6 +38,16 @@ from phasesweep.engine.state import (
     _resolve_publication_pointer,
 )
 from phasesweep.evidence.models import objective_evidence_assurance
+
+ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
+"""Which config's semantics a result payload's labels were read under.
+
+``"represented_generation"``: the labels come from the represented
+generation's own recorded summary, so they describe the result as it was
+produced. ``"current_config"``: the represented result recorded no semantics
+of its own (nothing published yet, or a pre-manifest legacy layout), so the
+currently loaded config describes it.
+"""
 
 
 @dataclass(frozen=True)
@@ -273,8 +283,9 @@ def read_winners(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    phase_names: Sequence[str] | None = None,
 ) -> list[PhaseWinnerView]:
-    """Read every persisted phase winner, in declared phase order.
+    """Read every persisted phase winner, in declared (or supplied) phase order.
 
     Phases without a winner yet are skipped, so the list length tells the
     caller how far the chain has progressed.
@@ -282,17 +293,32 @@ def read_winners(
     Args:
         experiment: Parsed experiment config whose phases are read in order.
         generation_id: Optional generation whose immutable winners should be read.
+        phase_names: Optional explicit phase plan to enumerate instead of the
+            currently configured phases, in the order given. A caller reading a
+            *historical* generation passes that generation's own recorded plan
+            (see :func:`_summary_phase_plan`), so a phase renamed in the config
+            since publication neither hides the published winner nor reports
+            the new name as missing (review v0.5.16 / blocker 4). Names are
+            path components, so each is validated; the default keeps the
+            declared-phase behavior every existing caller relies on.
 
     Returns:
-        One :class:`PhaseWinnerView` per phase that has a winner on disk.
+        One :class:`PhaseWinnerView` per named phase that has a winner on disk.
+
+    Raises:
+        ValueError: If ``phase_names`` contains a name that is not a safe path
+            component. Plans parsed off disk are filtered before they reach
+            here, so this only fires on a programming error.
 
     """
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
-    views = (
-        read_winner(experiment, phase.name, generation_id=generation_id)
-        for phase in experiment.phases
+    names = (
+        [phase.name for phase in experiment.phases]
+        if phase_names is None
+        else [_validate_safe_name("phase", name) for name in phase_names]
     )
+    views = (read_winner(experiment, name, generation_id=generation_id) for name in names)
     return [view for view in views if view is not None]
 
 
@@ -310,6 +336,41 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
     except (OSError, yaml.YAMLError):
         return None
     return payload if isinstance(payload, Mapping) else None
+
+
+def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] | None:
+    """Return the phase names a represented generation published under.
+
+    Only the ``name`` of each ``phase_plan`` entry is read. The summary's other
+    phase records (``phases``) carry composed hyperparameters that agent-facing
+    payloads must never see; the plan is the design-time list the engine froze
+    beside the metric semantics for exactly this purpose (engine/run.py's
+    generation summary).
+
+    An entry that is not a mapping with a safe name invalidates the whole plan:
+    these names become path components, and a partially parsed plan would
+    under-report the publication just as badly as the current config does.
+
+    :param Mapping[str, Any] | None summary_payload: Parsed generation summary, or ``None``.
+    :return list[str] | None: Recorded phase names in execution order, or
+        ``None`` when the summary is absent or records no usable plan (every
+        pre-manifest legacy summary, whose caller must fall back to the current
+        config).
+    """
+    if summary_payload is None:
+        return None
+    stored_plan = summary_payload.get("phase_plan")
+    if not isinstance(stored_plan, list) or not stored_plan:
+        return None
+    names: list[str] = []
+    for item in stored_plan:
+        if not isinstance(item, Mapping):
+            return None
+        name = item.get("name")
+        if not isinstance(name, str) or not SAFE_NAME_PATTERN.fullmatch(name):
+            return None
+        names.append(name)
+    return names
 
 
 def _current_pointer_generation_id(experiment: Experiment) -> str | None:
@@ -434,6 +495,17 @@ def read_status(
       is ``None``, ``is_published`` is ``False``, and no winner reads as
       present.
 
+    Two views coexist in this payload and must not be confused. The
+    *config-progress* view -- the ``phases`` list, with its trial counts,
+    targets, and per-phase winner presence -- describes the phases the current
+    config declares, because that is what a further run would execute. The
+    *result* view -- the metric descriptor, ``result_phase_plan``, and the
+    publication identity fields -- describes the represented generation on its
+    own terms. Under a config edited since publication the two legitimately
+    disagree, and ``result_context`` / ``published_config_matches_current``
+    say so explicitly rather than leaving a reader to conclude the publication
+    is empty (review v0.5.16 / blocker 4).
+
     Winner/summary facts (``winner_present``, top-level ``summary_present``)
     scope to ``represented_generation_id``. ``generation_trials`` scopes to
     ``current_generation_id`` in default mode (live progress of whatever is
@@ -470,10 +542,18 @@ def read_status(
         current config only when no summary semantics exist
         (``result_context: "current_config"``) — a published x/minimize
         result is never relabeled by a config edited to y/maximize (review
-        v0.5.16 / blocker 4). ``published_config_matches_current`` compares
-        the summary's recorded config fingerprint against the current
-        config's semantic fingerprint; ``None`` when the represented summary
-        records no fingerprint.
+        v0.5.16 / blocker 4). A pre-manifest legacy summary that records a
+        name and goal but no ``objective_evidence`` still reports
+        ``"represented_generation"``, with the evidence assurance falling back
+        to the current extractor's: that is the only historical semantics such
+        a layout preserved. ``result_phase_plan`` is likewise the represented
+        generation's own recorded phase plan, falling back to the current
+        config's phase names when the summary records none — it is the plan
+        the publication's winners must be enumerated under, and equals the
+        ``phases`` list's names whenever the config has not been edited since.
+        ``published_config_matches_current`` compares the summary's recorded
+        config fingerprint against the current config's semantic fingerprint;
+        ``None`` when the represented summary records no fingerprint.
     """
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
@@ -521,10 +601,14 @@ def read_status(
         "goal": experiment.metric.goal,
         "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
     }
-    result_context = "current_config"
+    result_phase_plan = [phase.name for phase in experiment.phases]
+    result_context: ResultContext = "current_config"
     published_config_matches_current: bool | None = None
     summary_payload = _read_summary_payload(summary_path)
     if summary_payload is not None:
+        stored_plan = _summary_phase_plan(summary_payload)
+        if stored_plan is not None:
+            result_phase_plan = stored_plan
         stored_metric = summary_payload.get("metric")
         if (
             isinstance(stored_metric, Mapping)
@@ -558,6 +642,7 @@ def read_status(
         **({"publication_error": publication.error} if publication.state == "failed" else {}),
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
+        "result_phase_plan": result_phase_plan,
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
