@@ -1773,8 +1773,7 @@ def _published_suite_summary_path_for(
 ) -> Path | None:
     """Resolve the authoritative suite summary from an already-captured published id.
 
-    Same legacy-fallback semantics as :func:`_published_suite_summary_path`,
-    but takes the caller's already-resolved suite last-success id instead of
+    Takes the caller's already-resolved suite last-success id instead of
     re-reading the pointer, so a caller that has already made a decision from
     one resolution (e.g. the CLI's publication-integrity check) cannot then
     render a summary belonging to a different one.
@@ -1792,18 +1791,6 @@ def _published_suite_summary_path_for(
     if _suite_generation_path(suite).is_file():
         return None
     return _suite_summary_path(suite)
-
-
-def _published_suite_summary_path(suite: Suite) -> Path | None:
-    """Return the authoritative last-success suite summary, with legacy fallback.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path | None: The generation-scoped suite summary path when a
-        validated last-success pointer exists; the legacy compatibility summary
-        path when no suite generation has ever been published; ``None`` when a
-        suite generation exists but none has completed successfully yet.
-    """
-    return _published_suite_summary_path_for(suite, _last_successful_suite_generation_id(suite))
 
 
 def _suite_log_path(suite: Suite) -> Path:

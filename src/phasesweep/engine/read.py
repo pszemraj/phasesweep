@@ -83,10 +83,10 @@ def _phase_status_payloads(
     experiment: Experiment,
     *,
     include_winner_path: bool,
-    trial_counts: Mapping[str, dict[str, int]] | None = None,
-    generation_trial_counts: Mapping[str, dict[str, int]] | None = None,
-    trial_data_available: Mapping[str, bool] | None = None,
-    running_attempts: Mapping[str, list[dict[str, Any]] | None] | None = None,
+    trial_counts: Mapping[str, dict[str, int]],
+    generation_trial_counts: Mapping[str, dict[str, int]],
+    trial_data_available: Mapping[str, bool],
+    running_attempts: Mapping[str, list[dict[str, Any]] | None],
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
@@ -101,13 +101,13 @@ def _phase_status_payloads(
 
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
     :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
-    :param Mapping[str, dict[str, int]] | None trial_counts: Optional pre-read counts keyed by phase name.
-    :param Mapping[str, dict[str, int]] | None generation_trial_counts: Optional counts for the represented generation, keyed by phase name.
-    :param Mapping[str, bool] | None trial_data_available: Optional storage-read
+    :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
+    :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
+    :param Mapping[str, bool] trial_data_available: Storage-read
         availability keyed by phase name. Included only in the path-free status
         view consumed by MCP.
-    :param Mapping[str, list[dict[str, Any]] | None] | None running_attempts:
-        Optional RUNNING trial identities keyed by phase name, from the same
+    :param Mapping[str, list[dict[str, Any]] | None] running_attempts:
+        RUNNING trial identities keyed by phase name, from the same
         storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
         trial data was unreadable. Included only in the path-free status view
         consumed by MCP, whose terminal snapshot must not reread studies to
@@ -136,19 +136,13 @@ def _phase_status_payloads(
                 experiment, winner_scope_generation_id, phase.name
             )
         winner_present = winner_path is not None and winner_path.is_file()
-        counts = (
-            _phase_trial_stats(experiment, phase).counts
-            if trial_counts is None
-            else trial_counts[phase.name]
-        )
+        counts = trial_counts[phase.name]
         payload: dict[str, Any] = {
             "trials": counts,
             "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
-            "generation_trials": (
-                generation_trial_counts[phase.name] if generation_trial_counts is not None else {}
-            ),
+            "generation_trials": generation_trial_counts[phase.name],
         }
         if include_winner_path:
             payload.update(
@@ -159,14 +153,8 @@ def _phase_status_payloads(
                 {
                     "phase": phase.name,
                     "winner_present": winner_present,
-                    "trial_data_available": (
-                        trial_data_available[phase.name]
-                        if trial_data_available is not None
-                        else True
-                    ),
-                    "running_attempts": (
-                        running_attempts[phase.name] if running_attempts is not None else []
-                    ),
+                    "trial_data_available": trial_data_available[phase.name],
+                    "running_attempts": running_attempts[phase.name],
                 }
             )
         phases.append(payload)
