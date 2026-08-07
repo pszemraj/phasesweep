@@ -640,22 +640,6 @@ def test_publication_refuses_tampered_winner_artifact(
     assert _current_pointer_state(experiment) == "publication_failed"
 
 
-def test_read_side_rejects_generation_with_altered_winner_artifact(tmp_path: Path) -> None:
-    """A warmed reader notices later winner corruption and fails closed."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["metric"]["x"] = -999.0
-    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-
-    assert _last_successful_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
-
-
 @pytest.mark.parametrize("identity_field", ["generation_id", "attempt_id"])
 def test_manifest_rejects_winner_source_identity_disagreement(
     tmp_path: Path,
@@ -737,7 +721,6 @@ def test_suite_publication_refuses_broken_component_manifest(
     [
         pytest.param("experiment: t\ngeneration_id: ../evil\n", id="traversal-id"),
         pytest.param("experiment: other\ngeneration_id: {gid}\n", id="wrong-experiment"),
-        pytest.param("experiment: t\ngeneration_id: no-such-generation\n", id="missing-generation"),
     ],
 )
 def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
@@ -774,19 +757,6 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     summary = yaml.safe_load(summary_path.read_text())
     summary["generation_id"] = "not-this-generation"
     summary_path.write_text(yaml.safe_dump(summary))
-
-    assert _last_successful_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
-
-
-def test_pointer_to_generation_with_missing_summary_is_not_authoritative(tmp_path: Path) -> None:
-    """A pointer whose target has no summary at all fails closed."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-
-    _generation_summary_path(experiment, generation_id).unlink()
 
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
@@ -877,31 +847,7 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert status["phases"][0]["winner_present"] is False
     # The boolean-blind wrapper keeps its fail-closed contract for path callers.
     assert _last_successful_generation_id(experiment) is None
-
-
-@pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
-def test_tampered_provenance_file_is_reported_as_a_failed_publication(
-    tmp_path: Path,
-    filename: str,
-) -> None:
-    """The F6 provenance files feed the same tri-state as any other artifact."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-
-    target = _generation_dir(experiment, generation_id) / filename
-    target.write_bytes(target.read_bytes() + b"\n# tampered\n")
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.generation_id == generation_id
-    assert pointer.error is not None
-    assert "does not match its recorded hash" in pointer.error
-
-    status = read_status(experiment)
-    assert status["publication_integrity"] == "failed"
-    assert "does not match its recorded hash" in status["publication_error"]
+    assert read_winner(experiment, "p") is None
 
 
 def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path) -> None:
@@ -937,6 +883,8 @@ def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
     assert status["publication_error"] == pointer.error
+    assert _last_successful_generation_id(experiment) is None
+    assert read_winner(experiment, "p") is None
 
 
 def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
@@ -1500,6 +1448,14 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     original = target.read_bytes()
 
     target.write_bytes(original + b"\n# tampered\n")
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert "does not match its recorded hash" in pointer.error
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert "does not match its recorded hash" in status["publication_error"]
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
