@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sqlite3
+import stat
 import sys
 import textwrap
 from pathlib import Path
@@ -661,6 +663,47 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     winners_captured = capsys.readouterr()
     assert "Do not run anything over this tree" in winners_captured.err
     assert "Traceback" not in winners_captured.err
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root reads any mode, so no PermissionError can be provoked",
+)
+def test_status_reports_an_unreadable_snapshot_as_permission_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A snapshot this user may not read reports permission, not corruption.
+
+    Re-review v0.5.19 / observation N1: ``config.snapshot.yaml`` is owner-only,
+    so a second operator inspecting a healthy tree was told the publication no
+    longer validates and to restore the generation namespace. The read still
+    fails closed -- nothing unvalidatable may read as published -- but the
+    reason names the permission denial and the user who can validate it.
+    """
+    config_path = _published_experiment_config(tmp_path)
+    run_experiment(load_experiment(config_path))
+    experiment = load_experiment(config_path)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
+    original_mode = stat.S_IMODE(snapshot.stat().st_mode)
+    snapshot.chmod(0o000)
+    try:
+        exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+        captured = capsys.readouterr()
+    finally:
+        snapshot.chmod(original_mode)
+
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    payload = yaml.safe_load(captured.out)
+    assert payload["publication_integrity"] == "failed"
+    assert "permission denied" in payload["publication_error"]
+    assert "missing or unreadable" not in payload["publication_error"]
+    assert "permission denied" in captured.err
+    assert "only the publishing user" in captured.err
 
 
 def test_suite_status_fails_on_a_corrupt_component_publication(

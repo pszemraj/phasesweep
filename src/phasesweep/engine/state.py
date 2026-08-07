@@ -576,6 +576,29 @@ def _generation_artifact_manifest(
     return items
 
 
+def _unreadable_artifact_permission_detail(subject: str) -> str:
+    """Build the manifest-failure detail for an artifact this user may not read.
+
+    A permission denial is not corruption, and reporting it as corruption sends
+    the operator to inspect or restore a namespace that is perfectly healthy
+    (re-review v0.5.19 / observation N1). Every generation's
+    ``config.snapshot.yaml`` is owner-only, so a second operator reading a
+    sound tree hits exactly this case; the verdict still fails closed -- an
+    unvalidatable publication may not be reported as published -- but the
+    remedy named is the publishing user, not the restore procedure.
+
+    :param str subject: Artifact that could not be read, named by role
+        (e.g. ``"config_snapshot artifact"``), never by path.
+    :return str: Bare reason clause for the caller's manifest-validation error.
+    """
+    return (
+        f"{subject} is not readable as this user (permission denied): validation cannot run "
+        "without it, and a generation's config.snapshot.yaml is deliberately owner-only, so "
+        "only the publishing user can fully validate this tree -- re-read it as that user "
+        "before treating this publication as corrupt"
+    )
+
+
 def _validate_generation_manifest(
     generation_dir: Path,
     generation_id: str,
@@ -687,6 +710,10 @@ def _validate_generation_manifest(
         artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
         try:
             content = artifact_path.read_bytes()
+        except PermissionError as exc:
+            raise _fail(
+                _unreadable_artifact_permission_detail(f"{kind} artifact for phase {name!r}")
+            ) from exc
         except OSError as exc:
             raise _fail(f"{kind} artifact for phase {name!r} is missing or unreadable") from exc
         if hashlib.sha256(content).hexdigest() != entry["sha256"]:
@@ -764,7 +791,11 @@ def _validate_generation_provenance_files(
 
     Note that the snapshot is owner-only, so a reader who cannot read it
     cannot validate the publication at all -- the same fail-closed outcome as
-    any other unreadable manifest-listed artifact.
+    any other unreadable manifest-listed artifact. A permission denial is
+    reported as its own reason rather than as "missing or unreadable"
+    (:func:`_unreadable_artifact_permission_detail`, re-review v0.5.19 /
+    observation N1): a second operator on a healthy tree hits it routinely,
+    and the remedy is the publishing user, not a namespace restore.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param Mapping[str, Any] summary: Parsed generation summary payload, whose
@@ -789,6 +820,8 @@ def _validate_generation_provenance_files(
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         try:
             content = (generation_dir / filename).read_bytes()
+        except PermissionError as exc:
+            raise fail(_unreadable_artifact_permission_detail(f"{kind} artifact")) from exc
         except OSError as exc:
             raise fail(f"{kind} artifact is missing or unreadable") from exc
         digest = hashlib.sha256(content).hexdigest()
@@ -799,6 +832,8 @@ def _validate_generation_provenance_files(
     snapshot_path = generation_dir / GENERATION_CONFIG_SNAPSHOT_FILENAME
     try:
         snapshot = yaml.safe_load(snapshot_path.read_text())
+    except PermissionError as exc:
+        raise fail(_unreadable_artifact_permission_detail("config_snapshot artifact")) from exc
     except (OSError, yaml.YAMLError) as exc:
         raise fail("config_snapshot artifact is not parseable") from exc
     if not isinstance(snapshot, Mapping):
@@ -809,6 +844,8 @@ def _validate_generation_provenance_files(
     record_path = generation_dir / GENERATION_REPRODUCIBILITY_FILENAME
     try:
         record = json.loads(record_path.read_text())
+    except PermissionError as exc:
+        raise fail(_unreadable_artifact_permission_detail("reproducibility artifact")) from exc
     except (OSError, ValueError) as exc:
         raise fail("reproducibility artifact is not parseable") from exc
     if not isinstance(record, Mapping):

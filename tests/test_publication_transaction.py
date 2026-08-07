@@ -1474,6 +1474,46 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root reads any mode, so no PermissionError can be provoked",
+)
+@pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
+def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """A provenance file this user may not read fails closed with its own reason.
+
+    Re-review v0.5.19 / observation N1: ``config.snapshot.yaml`` is owner-only,
+    so a second operator reading a perfectly healthy tree got the generic
+    "missing or unreadable" verdict and the "inspect or restore the generation
+    namespace" remedy -- for a permission bit. The verdict must stay ``failed``
+    (an unvalidatable tree is not a published one), but the reason must name
+    the permission denial and point at the publishing user.
+    """
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    target = _generation_dir(experiment, generation_id) / filename
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    target.chmod(0o000)
+    try:
+        status = read_status(experiment)
+        assert status["publication_integrity"] == "failed"
+        assert "permission denied" in status["publication_error"]
+        assert "only the publishing user" in status["publication_error"]
+        assert "missing or unreadable" not in status["publication_error"]
+        assert status["published_generation_id"] is None
+    finally:
+        target.chmod(original_mode)
+
+    # Restoring the mode restores the publication: nothing was ever corrupt.
+    assert _last_successful_generation_id(experiment) == generation_id
+
+
 def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) -> None:
     """A generation that fails mid-run still records what configuration ran.
 
