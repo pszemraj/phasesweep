@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import stat
 import subprocess
 import sys
 import time
@@ -17,12 +16,8 @@ import pytest
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import read_boot_id, read_proc_starttime
-from tests.conftest import is_pid_zombie
+from tests.conftest import file_mode, is_pid_zombie
 from tests.mcp_helpers import make_run_handle, write_run_status
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 def _earlier_boot_id() -> str:
@@ -153,12 +148,12 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     finally:
         os.umask(old_umask)
 
-    assert _mode(tmp_path / "state") == 0o700
-    assert _mode(tmp_path / "state" / "runs") == 0o700
-    assert _mode(tmp_path / "state" / "logs") == 0o700
-    assert _mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
-    assert _mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
-    assert _mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
+    assert file_mode(tmp_path / "state") == 0o700
+    assert file_mode(tmp_path / "state" / "runs") == 0o700
+    assert file_mode(tmp_path / "state" / "logs") == 0o700
+    assert file_mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
+    assert file_mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
+    assert file_mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
 
 
 def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: Path) -> None:
@@ -172,13 +167,13 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     state_dir = tmp_path / "state"
     RunStore(state_dir)
     before_modes = {
-        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+        path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     }
 
     RunStore.open_existing(state_dir)
 
     assert {
-        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+        path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     } == before_modes
 
 

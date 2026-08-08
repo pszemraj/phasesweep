@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import stat
 import subprocess
 import sys
 import threading
@@ -88,7 +87,7 @@ from phasesweep.runtime.process import (
     read_boot_id,
     read_proc_starttime,
 )
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import file_mode, make_experiment, write_constant_trainer
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_mcp_app,
@@ -232,10 +231,6 @@ def _load_first_phase_study(config: Path) -> optuna.Study:
 def _load_phase_trial(config: Path, trial_number: int) -> optuna.trial.FrozenTrial:
     study = _load_first_phase_study(config)
     return next(trial for trial in study.get_trials(deepcopy=False) if trial.number == trial_number)
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
@@ -2137,13 +2132,13 @@ def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
     run_id = result["run_id"]
     assert result["state"] == "running"
     assert captured["cmd"]
-    assert _mode(registry.state_dir) == 0o700
-    assert _mode(registry.state_dir / "runs") == 0o700
-    assert _mode(registry.state_dir / "logs") == 0o700
-    assert _mode(registry.state_dir / "runs" / f"{run_id}.json") == 0o600
-    assert _mode(store.log_path(run_id)) == 0o600
-    assert _mode(store.config_snapshot_path(run_id)) == 0o600
-    assert _mode(audit_path) == 0o600
+    assert file_mode(registry.state_dir) == 0o700
+    assert file_mode(registry.state_dir / "runs") == 0o700
+    assert file_mode(registry.state_dir / "logs") == 0o700
+    assert file_mode(registry.state_dir / "runs" / f"{run_id}.json") == 0o600
+    assert file_mode(store.log_path(run_id)) == 0o600
+    assert file_mode(store.config_snapshot_path(run_id)) == 0o600
+    assert file_mode(audit_path) == 0o600
 
 
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:

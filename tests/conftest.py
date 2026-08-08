@@ -9,6 +9,8 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sqlite3
+import stat
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,6 +29,7 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import _read_proc_stat
 
@@ -49,6 +52,21 @@ def is_pid_zombie(pid: int) -> bool:
     """Return whether a test subprocess has exited but awaits parent reaping."""
     stat = _read_proc_stat(Path("/proc") / str(pid))
     return stat is not None and stat.state == "Z"
+
+
+def file_mode(path: Path) -> int:
+    """Return the permission bits for a test path."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def drop_artifact_root_binding(storage: str, study_name: str) -> None:
+    """Reconstruct a pre-binding study by deleting its artifact-root user attr."""
+    with sqlite3.connect(storage.removeprefix("sqlite:///")) as connection:
+        connection.execute(
+            "DELETE FROM study_user_attributes WHERE key = ? AND study_id = "
+            "(SELECT study_id FROM studies WHERE study_name = ?)",
+            (ARTIFACT_ROOT_ATTR, study_name),
+        )
 
 
 @pytest.fixture(autouse=True)

@@ -149,14 +149,18 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
         load_experiment(p)
 
 
-def _json_file_yaml(tmp_path, body: str):
-    """Write a minimal json_file-format config with caller-supplied phase/contract body."""
+def _override_yaml(tmp_path, override_format: str, body: str):
+    """Write a minimal override config with caller-supplied phase/contract body."""
+    trial_command = {
+        "json_file": "python train.py --overrides {overrides_path}",
+        "argparse": "python train.py {overrides}",
+    }[override_format]
     return write_yaml(
         tmp_path,
         f"""
         experiment: t
-        trial_command: "python train.py --overrides {{overrides_path}}"
-        override_format: json_file
+        trial_command: "{trial_command}"
+        override_format: {override_format}
         metric:
           name: x
           goal: minimize
@@ -194,8 +198,9 @@ def test_dump_overrides_json_and_write_json_file_reject_non_finite_floats(tmp_pa
 
 def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
     """An unquoted YAML date becomes datetime.date, which overrides.json cannot encode."""
-    p = _json_file_yaml(
+    p = _override_yaml(
         tmp_path,
+        "json_file",
         """
         phases:
           - name: p
@@ -211,8 +216,9 @@ def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
 
 def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
     """Contract-supplied values are composed into the same artifact and checked too."""
-    p = _json_file_yaml(
+    p = _override_yaml(
         tmp_path,
+        "json_file",
         """
         contracts:
           frozen:
@@ -233,8 +239,9 @@ def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
     """YAML .inf resolves to a non-finite float, which the strict encoder
     (allow_nan=False) rejects; this must surface at load time, not at the
     first trial's json.dumps."""
-    p = _json_file_yaml(
+    p = _override_yaml(
         tmp_path,
+        "json_file",
         """
         phases:
           - name: p
@@ -246,23 +253,6 @@ def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
 
     with pytest.raises(ValidationError, match="Phase 'p'.*'threshold'.*cannot encode.*non-finite"):
         load_experiment(p)
-
-
-def _argparse_yaml(tmp_path, body: str):
-    """Write a minimal argparse-format config with caller-supplied phase/contract body."""
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        trial_command: "python train.py {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-{body}
-        """,
-    )
 
 
 # ``knob`` holds a value with no faithful argparse wire form in every case:
@@ -284,8 +274,9 @@ _UNRENDERABLE_ARGPARSE_VALUES = [
 
 @pytest.mark.parametrize(("value", "expected"), _UNRENDERABLE_ARGPARSE_VALUES)
 def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, expected):
-    p = _argparse_yaml(
+    p = _override_yaml(
         tmp_path,
+        "argparse",
         "        phases:\n"
         "          - name: t\n"
         "            n_trials: 1\n"
@@ -299,8 +290,9 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
 
 def test_validate_rejects_unrenderable_argparse_contract_override(tmp_path):
     """Contract-supplied values compose into the same command line and are checked too."""
-    p = _argparse_yaml(
+    p = _override_yaml(
         tmp_path,
+        "argparse",
         "        contracts:\n"
         "          frozen:\n"
         "            fixed_overrides:\n"
@@ -321,8 +313,9 @@ def test_validate_rejects_unrenderable_argparse_contract_override(tmp_path):
 def test_json_file_keeps_its_own_verdict_on_argparse_rejected_values(tmp_path, value):
     """The argparse contract is format-scoped: json_file's own validator decides
     these values, and the argparse error must never fire for them."""
-    p = _json_file_yaml(
+    p = _override_yaml(
         tmp_path,
+        "json_file",
         "        phases:\n"
         "          - name: t\n"
         "            n_trials: 1\n"
@@ -345,8 +338,9 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
 
     fingerprints: dict[str, str] = {}
     for label, literal in {"int": "1", "str": '"1"', "bool": "true", "float": "1.0"}.items():
-        p = _argparse_yaml(
+        p = _override_yaml(
             tmp_path,
+            "argparse",
             "        phases:\n"
             "          - name: t\n"
             "            n_trials: 1\n"
@@ -397,8 +391,9 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
 
 def test_json_file_accepts_quoted_date_like_override(tmp_path):
     """Quoting keeps the value a string, which is exactly the documented fix."""
-    p = _json_file_yaml(
+    p = _override_yaml(
         tmp_path,
+        "json_file",
         """
         phases:
           - name: p

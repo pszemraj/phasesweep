@@ -71,6 +71,7 @@ from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_i
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
+    drop_artifact_root_binding,
     make_experiment,
     write_constant_trainer,
     write_trainer,
@@ -1120,24 +1121,6 @@ def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> 
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
 
 
-def _drop_artifact_root_binding(storage: str, study_name: str) -> None:
-    """Reconstruct a pre-binding study by deleting its artifact-root user attr.
-
-    Optuna's API can set a study user attr but never delete one, so the only
-    way to build the state a database written before the binding existed is
-    in is to remove the row from the SQLite file directly.
-
-    :param str storage: ``sqlite:///`` storage URL backing the study.
-    :param str study_name: Fully qualified Optuna study name to unbind.
-    """
-    with sqlite3.connect(storage.removeprefix("sqlite:///")) as connection:
-        connection.execute(
-            "DELETE FROM study_user_attributes WHERE key = ? AND study_id = "
-            "(SELECT study_id FROM studies WHERE study_name = ?)",
-            (ARTIFACT_ROOT_ATTR, study_name),
-        )
-
-
 def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path: Path) -> None:
     """A pre-binding study with results is migrated explicitly, never adopted.
 
@@ -1156,7 +1139,7 @@ def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path
     run_experiment(experiment)
     root = _experiment_dir(experiment)
     assert_published_winner_evidence_local(root)
-    _drop_artifact_root_binding(storage, "t::p")
+    drop_artifact_root_binding(storage, "t::p")
 
     with pytest.raises(LegacyArtifactRootMigrationRequiredError) as excinfo:
         run_experiment(experiment)
