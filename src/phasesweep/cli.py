@@ -716,10 +716,11 @@ def rebind_workdir(config_path: Path) -> None:
     ``tell(FAIL)``, is what records the durable failure outcome the study
     schema requires.
 
-    Nothing else in the durable state graph is rewritten, so the refusals are
-    deliberately broader than the cases PhaseSweep can repair (re-review
-    v0.5.19 / blocker B2; see the tracked relocation TODO in
-    ``docs/development.md``).
+    The destination's reverse root-to-storage binding is updated before the
+    study attrs so an interrupted rebind converges on retry. No trial,
+    publication, or attempt metadata is rewritten, so the refusals remain
+    broader than the cases PhaseSweep can repair (re-review v0.5.19 / blocker
+    B2; see the tracked relocation TODO in ``docs/development.md``).
 
     Operational note: a run refused for a workdir conflict has already claimed
     a generation under the *destination* workdir, so that experiment directory

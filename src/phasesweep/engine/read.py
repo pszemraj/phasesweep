@@ -6,10 +6,12 @@ layer is the primary consumer; the CLI consumes a narrow slice of it (see
 ``_with_generation_identity`` in ``cli.py``) for its generation-identity
 split, so winner and status shapes have exactly one definition.
 
-Reads here are intentionally permissive. They report whatever is on disk -
-including partial runs - and never raise on a missing winner. They do NOT
-re-verify phase fingerprints: that check belongs to the resume path in
-``engine.state._load_winner``, not to a status read.
+Reads here are permissive about partial run state and never raise on a missing
+winner. They still fail closed when the artifact root belongs to another
+storage ledger: combining one database's trial counts with another database's
+publication is not a partial result. They do NOT re-verify phase fingerprints:
+that check belongs to the resume path in ``engine.state._load_winner``, not to
+a status read.
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
-from phasesweep.engine.guards import _experiment_semantic_fingerprint
+from phasesweep.engine.guards import (
+    _experiment_semantic_fingerprint,
+    _validate_artifact_root_binding,
+)
 from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import (
     PublicationState,
@@ -574,6 +579,7 @@ def read_status(
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = publication.generation_id if publication.state == "ok" else None

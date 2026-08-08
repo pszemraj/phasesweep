@@ -295,6 +295,15 @@ def _attempts_dir(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "attempts"
 
 
+def _artifact_root_binding_path(experiment: Experiment) -> Path:
+    """Return the reverse artifact-root-to-storage ownership record.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Root binding JSON path inside the experiment namespace.
+    """
+    return _experiment_dir(experiment) / "artifact_root_binding.json"
+
+
 def _generation_path(experiment: Experiment) -> Path:
     """Return the current engine generation metadata path.
 

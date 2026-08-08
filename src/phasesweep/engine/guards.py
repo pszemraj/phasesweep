@@ -48,6 +48,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
     Winner,
+    _artifact_root_binding_path,
     _attempts_dir,
     _experiment_dir,
     _last_successful_generation_id,
@@ -60,6 +61,7 @@ from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
+    atomic_write_text,
     canonical_storage_identity,
     exclusive_lock,
     file_sha256,
@@ -1730,7 +1732,7 @@ def _artifact_root_identity(experiment: Experiment) -> str:
     :param Experiment experiment: Parsed experiment supplying workdir and name.
     :return str: Resolved ``<workdir>/<experiment>`` namespace as a string.
     """
-    return str(_experiment_dir(experiment))
+    return str(_experiment_dir(experiment).resolve())
 
 
 def _artifact_root_binding_applies(experiment: Experiment) -> bool:
@@ -1742,6 +1744,93 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
         no second publication root can conflict with the first.
     """
     return experiment.storage is not None and not storage_is_in_memory(experiment.storage)
+
+
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 1
+
+
+def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
+    """Build the reverse ownership record for one persistent artifact root."""
+    storage_identity = canonical_storage_identity(experiment.storage)
+    assert storage_identity is not None
+    return {
+        "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
+        "experiment": experiment.experiment,
+        "artifact_root": _artifact_root_identity(experiment),
+        "storage_identity": storage_identity,
+    }
+
+
+def _root_contains_durable_state(experiment: Experiment) -> bool:
+    """Return whether an unbound root contains more than the opened run log."""
+    root = _experiment_dir(experiment)
+    if not root.is_dir():
+        return False
+    ignored = {"run.log", _artifact_root_binding_path(experiment).name}
+    try:
+        return any(path.name not in ignored for path in root.iterdir())
+    except OSError as exc:
+        raise ArtifactRootConflictError(
+            f"Cannot inspect artifact root {_artifact_root_identity(experiment)!r}: {exc}."
+        ) from exc
+
+
+def _validate_artifact_root_binding(
+    experiment: Experiment,
+    *,
+    claim_fresh: bool,
+) -> None:
+    """Validate or claim the storage ledger that owns an artifact tree.
+
+    Study attributes bind ledger to tree. This reverse record binds tree to
+    ledger, preventing a second database from combining its trial counts with
+    another database's publication. A non-empty legacy tree is adopted only by
+    the explicit ``rebind-workdir`` workflow.
+
+    :param Experiment experiment: Config whose root and storage must agree.
+    :param bool claim_fresh: Write the record when the root has no durable state.
+    :raises ArtifactRootConflictError: The record is malformed, unreadable, or
+        names another root, experiment, or storage ledger.
+    :raises LegacyArtifactRootMigrationRequiredError: A non-empty tree predates
+        the reverse binding and requires explicit adoption.
+    """
+    if not _artifact_root_binding_applies(experiment):
+        return
+    path = _artifact_root_binding_path(experiment)
+    expected = _artifact_root_binding_payload(experiment)
+    try:
+        raw = strict_json_loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if _root_contains_durable_state(experiment):
+            raise LegacyArtifactRootMigrationRequiredError(
+                f"Artifact root {expected['artifact_root']!r} contains durable state but "
+                "records no storage-ledger binding. An ordinary run or read cannot infer "
+                "which database owns this publication. Run 'phasesweep rebind-workdir "
+                "<config>' with a config naming this complete tree to adopt it explicitly. "
+                "No trial ran and nothing was published."
+            ) from None
+        if claim_fresh:
+            try:
+                atomic_write_text(path, json.dumps(expected, sort_keys=True) + "\n")
+            except OSError as exc:
+                raise ArtifactRootConflictError(
+                    f"Could not bind fresh artifact root {expected['artifact_root']!r} to "
+                    f"its storage ledger: {exc}. No trial ran and nothing was published."
+                ) from exc
+        return
+    except (OSError, ValueError) as exc:
+        raise ArtifactRootConflictError(
+            f"Artifact-root binding {path} is unreadable or malformed: {exc}. Refusing "
+            "to combine this tree with an unverified storage ledger."
+        ) from exc
+    if raw != expected:
+        raise ArtifactRootConflictError(
+            f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
+            f"ledger or experiment ({raw!r}); this config offers storage identity "
+            f"{expected['storage_identity']!r} for experiment {experiment.experiment!r}. "
+            "Use the config that owns this tree, or move the complete tree and run "
+            "'phasesweep rebind-workdir <config>'. No trial ran and nothing was published."
+        )
 
 
 def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
@@ -2294,8 +2383,38 @@ def _plan_artifact_root_rebinds(
         )
     for plan in plans:
         if plan.entries:
+            _validate_artifact_root_binding_for_rebind(plan)
             _validate_artifact_root_destination(plan.experiment, plan.entries)
     return plans
+
+
+def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) -> None:
+    """Require an existing reverse binding to agree with the ledger being rebound."""
+    path = _artifact_root_binding_path(plan.experiment)
+    try:
+        raw = strict_json_loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # Explicit rebind is the migration path for a legacy tree.
+        return
+    except (OSError, ValueError) as exc:
+        raise ArtifactRootRebindError(
+            f"Cannot read artifact-root binding {path}: {exc}. Nothing was written."
+        ) from exc
+    expected = _artifact_root_binding_payload(plan.experiment)
+    recorded_root = raw.get("artifact_root") if isinstance(raw, dict) else None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+        or raw.get("experiment") != expected["experiment"]
+        or raw.get("storage_identity") != expected["storage_identity"]
+        or not isinstance(recorded_root, str)
+        or not Path(recorded_root).is_absolute()
+    ):
+        raise ArtifactRootRebindError(
+            f"Artifact root {plan.destination!r} records ownership by another storage "
+            f"ledger, experiment, or source tree ({raw!r}). Refusing to rebind the "
+            "current studies onto it. Nothing was written."
+        )
 
 
 def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str, str | None, str]]:
@@ -2306,6 +2425,17 @@ def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str
     :return list[tuple[str, str | None, str]]: One ``(study name, previous
         root or None, new root)`` record per study written.
     """
+    binding_path = _artifact_root_binding_path(plan.experiment)
+    try:
+        atomic_write_text(
+            binding_path,
+            json.dumps(_artifact_root_binding_payload(plan.experiment), sort_keys=True) + "\n",
+        )
+    except OSError as exc:
+        raise ArtifactRootRebindError(
+            f"Could not write artifact-root binding {binding_path}: {exc}. No study "
+            "binding was changed."
+        ) from exc
     written: list[tuple[str, str | None, str]] = []
     for entry in plan.entries:
         entry.study.set_user_attr(ARTIFACT_ROOT_ATTR, plan.destination)

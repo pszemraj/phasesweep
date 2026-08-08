@@ -40,6 +40,7 @@ runs/
     summary.yaml
     attempts/
       <attempt-id>.json
+    artifact_root_binding.json
   phases.db
 ```
 

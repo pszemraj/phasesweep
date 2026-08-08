@@ -26,6 +26,7 @@ from phasesweep.engine.guards import (
     _PreflightCleanupReport,
     _suite_fingerprint,
     _suite_lock,
+    _validate_artifact_root_binding,
     _validate_sampler_continuation,
     _validate_selection_evidence,
     _verify_fingerprint,
@@ -326,6 +327,7 @@ def _run_experiment_outcome(
         _file_log_handler(_run_log_path(experiment)),
         _experiment_lock(experiment),
     ):
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
         generation_id = _claim_generation(experiment, requested_generation_id)
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None

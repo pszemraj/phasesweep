@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _artifact_root_binding_path,
     _attempts_dir,
     _experiment_dir,
     _generation_dir,
@@ -962,6 +963,8 @@ def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
     assert str(_experiment_dir(experiment_b)) in result.output
     study = optuna.load_study(study_name="t::p", storage=experiment_b.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_b))
+    root_binding = yaml.safe_load(_artifact_root_binding_path(experiment_b).read_text())
+    assert root_binding["artifact_root"] == str(_experiment_dir(experiment_b).resolve())
 
     # The relocated root is now the only one this study will publish into.
     run_experiment(load_experiment(config_b))
@@ -971,6 +974,33 @@ def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
     assert exit_code == 1
     assert "rebind-workdir" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(tmp_path: Path) -> None:
+    """Explicit rebind is not an escape hatch around reverse root ownership."""
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
+    owner = load_experiment(config_a)
+    run_experiment(owner)
+    owner_binding = _artifact_root_binding_path(owner).read_bytes()
+
+    foreign_config = tmp_path / "foreign.yaml"
+    foreign_config.write_text(config_a.read_text().replace("studies.db", "foreign.db"))
+    foreign = load_experiment(foreign_config)
+    assert foreign.storage is not None
+    foreign_study = optuna.create_study(
+        study_name="t::p",
+        storage=foreign.storage,
+        direction="minimize",
+    )
+    foreign_study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(foreign)))
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(foreign_config)])
+
+    assert result.exit_code != 0
+    assert result.exception is not None
+    assert "another storage ledger" in str(result.exception)
+    assert _artifact_root_binding_path(owner).read_bytes() == owner_binding
+    assert foreign_study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(foreign))
 
 
 @pytest.mark.parametrize(
@@ -1334,6 +1364,7 @@ def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
     run_experiment(experiment_a)
     assert experiment_a.storage is not None
     drop_artifact_root_binding(experiment_a.storage, "t::p")
+    _artifact_root_binding_path(experiment_a).unlink()
 
     result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
 
@@ -1341,6 +1372,7 @@ def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
     assert "(unbound)" in result.output
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+    assert _artifact_root_binding_path(experiment_a).is_file()
 
     # The migrated study now runs and publishes like any other bound study.
     run_experiment(load_experiment(config_a))

@@ -39,6 +39,7 @@ from phasesweep.engine import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
+    read_status,
     read_winners,
 )
 from phasesweep.engine.guards import (
@@ -56,6 +57,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
+    _artifact_root_binding_path,
     _attempts_dir,
     _experiment_dir,
     _generation_path,
@@ -1150,6 +1152,42 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     study = optuna.load_study(study_name="t::p", storage=storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
+
+
+def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
+    """One tree cannot mix publication files from one DB with counts from another."""
+    trainer = write_constant_trainer(tmp_path)
+    workdir = tmp_path / "runs"
+
+    def _experiment(database: str) -> Experiment:
+        return make_experiment(
+            workdir=workdir,
+            storage=f"sqlite:///{tmp_path / database}",
+            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            n_trials=1,
+        )
+
+    owner = _experiment("owner.db")
+    run_experiment(owner)
+    published = _last_successful_generation_id(owner)
+    assert published is not None
+    generation_dir = _experiment_dir(owner) / "generations"
+    generations_before = {path.name for path in generation_dir.iterdir()}
+    binding = json.loads(_artifact_root_binding_path(owner).read_text())
+    assert "owner.db" in binding["storage_identity"]
+
+    foreign = _experiment("foreign.db")
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        run_experiment(foreign)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_status(foreign)
+
+    assert not (tmp_path / "foreign.db").exists()
+    assert _last_successful_generation_id(owner) == published
+    assert {path.name for path in generation_dir.iterdir()} == generations_before
+    owner_status = read_status(owner)
+    assert owner_status["publication_integrity"] == "ok"
+    assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
 
 
 def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
