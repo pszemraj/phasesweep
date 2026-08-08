@@ -53,6 +53,8 @@ class GpuDevice:
     """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem.
 
     ``visible_token`` is what the trainer sees in ``CUDA_VISIBLE_DEVICES``.
+    GPU/MIG prefixes are replaced with the inventory's canonical spelling;
+    numeric indices keep the operator's ordinal.
     ``lock_token`` is the canonical physical-device identity the host lock keys
     on — normally the GPU UUID resolved from a numeric index at pool
     construction. It defaults to the visible token, while pool construction
@@ -295,10 +297,10 @@ def _bind_lock_identities(
 
     Binding is kept separate from deduplication so a caller that must fail
     closed on aliasing can see which tokens collapsed onto one card before they
-    are silently dropped (:func:`_require_distinct_whole_node_devices`). When
-    ``nvidia-smi`` cannot be read, numeric indices retain index-form lock
-    identities with a warning; GPU/MIG UUID tokens fail closed because their
-    existence and canonical spelling cannot be validated.
+    are silently dropped (:func:`_require_distinct_whole_node_devices`). Every
+    token fails closed when its required ``nvidia-smi`` inventory cannot be
+    read: accepting an unverified index or UUID could expose no CUDA device or
+    split the host lock namespace between index and UUID spellings.
 
     Args:
         devices: Devices built from configured, ambient, or detected tokens.
@@ -342,19 +344,13 @@ def _bind_lock_identities(
                 "reported no usable GPU UUID inventory. Fix nvidia-smi or the configured "
                 "gpu_devices/CUDA_VISIBLE_DEVICES value."
             )
-        # No map and one consistent spelling: indices remain their own identity,
-        # which still collides with itself across runs on this host — but NOT
-        # with a concurrent run whose nvidia-smi probe succeeded and locked the
-        # UUID form. Lock-identity resolution must succeed or fail the same way
-        # for every orchestrator on a host (watch systemd/cron units with a
-        # minimal PATH), so make the degradation loud instead of silent.
         if numeric:
-            log.warning(
-                "nvidia-smi index-to-UUID resolution is unavailable; GPU host locks for %s "
-                "fall back to index-form names. A concurrent run that CAN resolve UUIDs "
-                "would lock the same cards under different names and could double-book "
-                "them. Fix nvidia-smi (PATH, driver) for every orchestrator on this host.",
-                [device.visible_token for device in numeric],
+            raise RuntimeError(
+                "Cannot validate configured CUDA device index token(s) "
+                f"{[device.visible_token for device in numeric]} because nvidia-smi "
+                "reported no usable index-to-UUID inventory. Accepting index-form locks "
+                "would not exclude a concurrent UUID-form lock for the same card. Fix "
+                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value."
             )
 
     resolved: list[GpuDevice] = []
@@ -368,7 +364,7 @@ def _bind_lock_identities(
                     f"Configured CUDA GPU UUID token {token!r} {detail} in the nvidia-smi "
                     "inventory. Fix gpu_devices or CUDA_VISIBLE_DEVICES."
                 )
-            resolved.append(GpuDevice(visible_token=token, lock_token=matches[0]))
+            resolved.append(GpuDevice(visible_token=matches[0], lock_token=matches[0]))
             continue
         if token[:4].upper() == "MIG-":
             matches = [uuid for uuid in mig_uuids if uuid.lower().startswith(token.lower())]
@@ -378,13 +374,10 @@ def _bind_lock_identities(
                     f"Configured CUDA MIG token {token!r} {detail} in the nvidia-smi "
                     "inventory. Fix gpu_devices or CUDA_VISIBLE_DEVICES."
                 )
-            resolved.append(GpuDevice(visible_token=token, lock_token=matches[0]))
+            resolved.append(GpuDevice(visible_token=matches[0], lock_token=matches[0]))
             continue
         uuid = uuid_map.get(token)
         if uuid is None:
-            if not uuid_map:
-                resolved.append(device)
-                continue
             raise RuntimeError(
                 f"Configured CUDA device index {token} does not exist on this host, or "
                 f"nvidia-smi reported no usable GPU/MIG UUID for it (resolvable indices: "
@@ -431,10 +424,8 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
 
     Only *actual* collapses are reported. A collapse is visible either as a
     token that :func:`_normalize_devices` removed (an exact repeat, or an empty
-    token) or as two bound devices sharing one ``lock_identity``. Failed UUID
-    resolution raises before this check; numeric index fallback identities are
-    unique by construction, so an unavailable UUID map warns without producing
-    a false duplicate here.
+    token) or as two bound devices sharing one ``lock_identity``. Failed
+    inventory resolution raises before this check.
 
     :param list[str] requested: Stripped device tokens exactly as configured,
         before normalization dropped anything.
@@ -443,6 +434,16 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
     :raises RuntimeError: The configured tokens name fewer distinct physical
         GPUs than the declared world size.
     """
+    mig_devices = [device for device in bound if device.lock_identity[:4].upper() == "MIG-"]
+    if mig_devices and len(bound) > 1:
+        raise RuntimeError(
+            "gpu_policy='whole_node' cannot declare a multi-device world containing "
+            "MIG tokens. CUDA's enumerated device count depends on the driver version "
+            "and permits at most one compute instance per GPU instance, while the MIG "
+            "UUID inventory does not identify those parent GPU instances here. Configure "
+            "exactly one MIG token, or use full-GPU tokens for a multi-device world."
+        )
+
     aliases: list[str] = []
     first_by_identity: dict[str, str] = {}
     for device in bound:
