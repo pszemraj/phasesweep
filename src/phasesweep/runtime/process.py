@@ -1526,6 +1526,50 @@ class _ProcStat:
     starttime: int
 
 
+@dataclass(frozen=True)
+class _GroupMemberScan:
+    """One procfs group scan with the evidence needed for a safe death verdict."""
+
+    pids: tuple[int, ...]
+    complete: bool
+    all_members_terminal: bool
+
+    def __iter__(self) -> Iterator[int]:
+        """Iterate member PIDs for compatibility with cached-set callers."""
+        return iter(self.pids)
+
+
+def _read_proc_stat_result(proc_entry: Path) -> tuple[_ProcStat | None, bool]:
+    """Read one proc stat and distinguish disappearance from unreadability.
+
+    :param Path proc_entry: ``/proc/<pid>`` directory to inspect.
+    :return tuple: Parsed stat plus ``True`` when the read was conclusive.
+        A vanished PID is conclusively absent; permission, I/O, or parse
+        failures are incomplete evidence.
+    """
+    try:
+        data = (proc_entry / "stat").read_bytes()
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None, False
+    rest = data[rparen + 1 :].strip().split()
+    if len(rest) < 20:
+        return None, False
+    try:
+        stat = _ProcStat(
+            state=rest[0].decode("ascii"),
+            pgrp=int(rest[2]),
+            starttime=int(rest[19]),
+        )
+    except (UnicodeDecodeError, ValueError):
+        return None, False
+    return stat, True
+
+
 def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     """Parse the proc stat fields phasesweep uses for liveness checks.
 
@@ -1533,20 +1577,8 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     :return _ProcStat | None: Parsed state, process group, and starttime, or ``None`` when
         unreadable.
     """
-    try:
-        data = (proc_entry / "stat").read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
-    rparen = data.rfind(b")")
-    if rparen < 0:
-        return None
-    rest = data[rparen + 1 :].strip().split()
-    if len(rest) < 20:
-        return None
-    try:
-        return _ProcStat(state=rest[0].decode("ascii"), pgrp=int(rest[2]), starttime=int(rest[19]))
-    except (UnicodeDecodeError, ValueError):
-        return None
+    stat, _complete = _read_proc_stat_result(proc_entry)
+    return stat
 
 
 def read_proc_starttime(pid: int) -> int | None:
@@ -1948,41 +1980,82 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     if not proc_root.exists():
         return True
     if member_pids is None:
-        return _member_pids_alive(pgid, _group_member_pids(pgid))
+        scan = _coerce_group_member_scan(_group_member_pids(pgid))
+        if _member_pids_alive(pgid, scan.pids):
+            return True
+        if not scan.complete:
+            return True
+        if scan.all_members_terminal:
+            return False
+        # killpg proved the group existed, but a complete scan found no stable
+        # inspectable member. Re-check the kernel verdict; continued existence
+        # is uncertainty, not proof of death.
+        return _process_group_exists(pgid)
     if _member_pids_alive(pgid, member_pids):
         return True
-    refreshed = set(_group_member_pids(pgid))
+    scan = _coerce_group_member_scan(_group_member_pids(pgid))
+    refreshed = set(scan.pids)
     member_pids.clear()
     member_pids.update(refreshed)
-    return _member_pids_alive(pgid, member_pids)
+    if _member_pids_alive(pgid, member_pids):
+        return True
+    if not scan.complete:
+        return True
+    if scan.all_members_terminal:
+        return False
+    return _process_group_exists(pgid)
 
 
-def _group_member_pids(pgid: int) -> list[int]:
-    """Return current ``/proc`` PIDs that belong to process group ``pgid``.
+def _coerce_group_member_scan(value: _GroupMemberScan | list[int]) -> _GroupMemberScan:
+    """Normalize legacy/list test doubles to a complete nonterminal scan."""
+    if isinstance(value, _GroupMemberScan):
+        return value
+    return _GroupMemberScan(
+        pids=tuple(value),
+        complete=True,
+        all_members_terminal=False,
+    )
+
+
+def _group_member_pids(pgid: int) -> _GroupMemberScan:
+    """Return current ``/proc`` members plus scan completeness.
 
     :param int pgid: Process-group ID to find under ``/proc``.
-    :return list[int]: PIDs currently reporting membership in ``pgid``.
+    :return _GroupMemberScan: PIDs reporting membership, whether every proc
+        entry was inspectable, and whether all observed members were zombies
+        or exited.
     """
     proc_root = Path("/proc")
     if not proc_root.exists():
-        return []
+        return _GroupMemberScan(pids=(), complete=False, all_members_terminal=False)
     member_pids: list[int] = []
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        stat = _read_proc_stat(entry)
-        if stat is None:
-            continue
-        if stat.pgrp == pgid:
+    all_members_terminal = True
+    complete = True
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            stat, conclusive = _read_proc_stat_result(entry)
+            complete = complete and conclusive
+            if stat is None or stat.pgrp != pgid:
+                continue
             member_pids.append(int(entry.name))
-    return member_pids
+            if stat.state not in {"Z", "X"}:
+                all_members_terminal = False
+    except OSError:
+        complete = False
+    return _GroupMemberScan(
+        pids=tuple(member_pids),
+        complete=complete,
+        all_members_terminal=bool(member_pids) and all_members_terminal,
+    )
 
 
-def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
+def _member_pids_alive(pgid: int, member_pids: Collection[int]) -> bool:
     """Return whether any known member PID is still live and in ``pgid``.
 
     :param int pgid: Process-group ID each PID must still belong to.
-    :param set[int] | list[int] member_pids: Candidate member PIDs to inspect.
+    :param Collection[int] member_pids: Candidate member PIDs to inspect.
     :return bool: ``True`` when any candidate is a live, non-zombie member.
     """
     for pid in member_pids:

@@ -85,7 +85,7 @@ Shutdown-signal ownership follows an explicit contract, not handler-identity inf
 
 Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled; uncatchable parent death before identity commit cannot start the trainer because the supervisor still awaits the launch payload.
 
-If cleanup cannot prove the process group is gone, PhaseSweep fails closed with `UnsafeProcessCleanupError`. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
+If cleanup cannot prove the process group is gone, PhaseSweep fails closed with `UnsafeProcessCleanupError`. A `/proc` scan that is incomplete because of permissions or I/O failure is uncertainty, not evidence of death; only a complete scan showing zombie/exited members can override the kernel's still-existing process-group verdict. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
 
 ## Stale trial reaping
 

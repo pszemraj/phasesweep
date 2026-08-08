@@ -26,6 +26,7 @@ from phasesweep.runtime.process import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
     StaleProcessIdentity,
+    _GroupMemberScan,
     _kill_group,
     _process_group_alive_with_members,
     _shutdown_handler,
@@ -1139,6 +1140,50 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
     assert member_pids == {22}
     assert scans == [1234]
     assert member_sets == [{11}, {22}]
+
+
+def test_existing_group_with_no_inspectable_members_is_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kernel-visible group cannot be declared dead from an empty procfs view."""
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.process._group_member_pids", lambda pgid: [])
+
+    assert _process_group_alive_with_members(1234, None) is True
+
+
+def test_incomplete_procfs_scan_keeps_cleanup_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable entries outrank an otherwise terminal observed member."""
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._group_member_pids",
+        lambda pgid: _GroupMemberScan(
+            pids=(22,),
+            complete=False,
+            all_members_terminal=True,
+        ),
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: False)
+
+    assert _process_group_alive_with_members(1234, None) is True
+
+
+def test_complete_zombie_only_group_is_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Complete terminal evidence still lets cleanup finish without a false leak."""
+    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._group_member_pids",
+        lambda pgid: _GroupMemberScan(
+            pids=(22,),
+            complete=True,
+            all_members_terminal=True,
+        ),
+    )
+    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: False)
+
+    assert _process_group_alive_with_members(1234, None) is False
 
 
 @pytest.mark.parametrize(
