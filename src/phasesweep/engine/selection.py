@@ -353,6 +353,78 @@ def _evaluate_promotion_rule(
     return promoted, improvement, gates_passed, reason
 
 
+def _promotion_decision_payload(
+    *,
+    phase_name: str,
+    baseline_label: str,
+    candidate: Winner,
+    baseline: Winner,
+    promotion: Promotion,
+    improvement: float | None,
+    gates_passed: bool,
+    promoted: bool,
+    study_name: str | None = None,
+    reason: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Build the shared persisted promotion-decision fields.
+
+    :param str phase_name: Candidate phase exposed by the decision.
+    :param str baseline_label: Phase or study selector naming the baseline.
+    :param Winner candidate: Candidate winner evaluated for promotion.
+    :param Winner baseline: Baseline winner used for comparison.
+    :param Promotion promotion: Applied promotion rule.
+    :param float | None improvement: Computed metric improvement.
+    :param bool gates_passed: Whether the candidate's gates passed.
+    :param bool promoted: Whether the candidate met the rule.
+    :param str | None study_name: Optional suite study owning the decision.
+    :param str | None reason: Optional phase-level decision reason.
+    :param str | None message: Optional phase-level diagnostic.
+    :return dict[str, Any]: Persistable promotion decision.
+    """
+    action = "promote" if promoted else promotion.on_fail
+    payload: dict[str, Any] = {
+        "phase": phase_name,
+        "baseline": baseline_label,
+        "candidate_trial_number": candidate.trial_number,
+        "candidate_generation_id": candidate.generation_id,
+        "candidate_attempt_id": candidate.attempt_id,
+        "baseline_trial_number": baseline.trial_number,
+        "baseline_generation_id": baseline.generation_id,
+        "baseline_attempt_id": baseline.attempt_id,
+        "exposed_trial_number": (
+            candidate.trial_number
+            if action == "promote"
+            else baseline.trial_number
+            if action == "continue_baseline"
+            else None
+        ),
+        "exposed_source": (
+            "candidate"
+            if action == "promote"
+            else "baseline"
+            if action == "continue_baseline"
+            else None
+        ),
+        "candidate_metric": candidate.metric,
+        "baseline_metric": baseline.metric,
+        "min_delta": promotion.min_delta,
+        "improvement": improvement,
+        "requires_gates": promotion.requires_gates,
+        "gates_passed": gates_passed,
+        "promoted": promoted,
+        "on_fail": promotion.on_fail,
+        "action": action,
+    }
+    if study_name is not None:
+        payload["study"] = study_name
+    if reason is not None:
+        payload["reason"] = reason
+    if message:
+        payload["message"] = message
+    return payload
+
+
 def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     """Return the compact winner payload used in run summaries.
 
@@ -414,51 +486,18 @@ def _apply_promotion(
             f"vs {promotion.min_delta_vs!r} is below min_delta {promotion.min_delta:g}."
         )
 
-    action = (
-        "promote"
-        if promoted
-        else "continue_baseline"
-        if promotion.on_fail == "continue_baseline"
-        else promotion.on_fail
+    decision = _promotion_decision_payload(
+        phase_name=phase.name,
+        baseline_label=promotion.min_delta_vs,
+        candidate=candidate,
+        baseline=baseline,
+        promotion=promotion,
+        improvement=improvement,
+        gates_passed=gates_passed,
+        promoted=promoted,
+        reason=reason,
+        message=message,
     )
-    exposed_trial_number = (
-        candidate.trial_number
-        if action == "promote"
-        else baseline.trial_number
-        if action == "continue_baseline"
-        else None
-    )
-    exposed_source = (
-        "candidate"
-        if action == "promote"
-        else "baseline"
-        if action == "continue_baseline"
-        else None
-    )
-    decision: dict[str, Any] = {
-        "phase": phase.name,
-        "baseline": promotion.min_delta_vs,
-        "candidate_trial_number": candidate.trial_number,
-        "candidate_generation_id": candidate.generation_id,
-        "candidate_attempt_id": candidate.attempt_id,
-        "baseline_trial_number": baseline.trial_number,
-        "baseline_generation_id": baseline.generation_id,
-        "baseline_attempt_id": baseline.attempt_id,
-        "exposed_trial_number": exposed_trial_number,
-        "exposed_source": exposed_source,
-        "candidate_metric": candidate.metric,
-        "baseline_metric": baseline.metric,
-        "min_delta": promotion.min_delta,
-        "improvement": improvement,
-        "requires_gates": promotion.requires_gates,
-        "gates_passed": gates_passed,
-        "promoted": promoted,
-        "on_fail": promotion.on_fail,
-        "action": action,
-        "reason": reason,
-    }
-    if message:
-        decision["message"] = message
 
     if promoted:
         assert improvement is not None
@@ -575,40 +614,17 @@ def _apply_study_promotion(
         baseline=baseline,
     )
 
-    decision: dict[str, Any] = {
-        "study": study_name,
-        "phase": final_phase,
-        "baseline": baseline_label,
-        "candidate_trial_number": candidate.trial_number,
-        "candidate_generation_id": candidate.generation_id,
-        "candidate_attempt_id": candidate.attempt_id,
-        "baseline_trial_number": baseline.trial_number,
-        "baseline_generation_id": baseline.generation_id,
-        "baseline_attempt_id": baseline.attempt_id,
-        "candidate_metric": candidate.metric,
-        "baseline_metric": baseline.metric,
-        "min_delta": promotion.min_delta,
-        "improvement": improvement,
-        "requires_gates": promotion.requires_gates,
-        "gates_passed": gates_passed,
-        "promoted": promoted,
-        "on_fail": promotion.on_fail,
-        "action": "promote" if promoted else promotion.on_fail,
-        "exposed_source": (
-            "candidate"
-            if promoted
-            else "baseline"
-            if promotion.on_fail == "continue_baseline"
-            else None
-        ),
-        "exposed_trial_number": (
-            candidate.trial_number
-            if promoted
-            else baseline.trial_number
-            if promotion.on_fail == "continue_baseline"
-            else None
-        ),
-    }
+    decision = _promotion_decision_payload(
+        phase_name=final_phase,
+        baseline_label=baseline_label,
+        candidate=candidate,
+        baseline=baseline,
+        promotion=promotion,
+        improvement=improvement,
+        gates_passed=gates_passed,
+        promoted=promoted,
+        study_name=study_name,
+    )
     if promoted:
         log.info(
             "suite=%s study=%s PROMOTED improvement=%s baseline=%s min_delta=%g",
