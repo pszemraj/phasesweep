@@ -296,9 +296,9 @@ def _bind_lock_identities(
     Binding is kept separate from deduplication so a caller that must fail
     closed on aliasing can see which tokens collapsed onto one card before they
     are silently dropped (:func:`_require_distinct_whole_node_devices`). When
-    ``nvidia-smi`` cannot be read, every device keeps its visible token as its
-    own identity, so no alias is ever *detected* on that path — the degradation
-    is reported as a warning here and must not be mistaken for a collision.
+    ``nvidia-smi`` cannot be read, numeric indices retain index-form lock
+    identities with a warning; GPU/MIG UUID tokens fail closed because their
+    existence and canonical spelling cannot be validated.
 
     Args:
         devices: Devices built from configured, ambient, or detected tokens.
@@ -431,11 +431,10 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
 
     Only *actual* collapses are reported. A collapse is visible either as a
     token that :func:`_normalize_devices` removed (an exact repeat, or an empty
-    token) or as two bound devices sharing one ``lock_identity``. Failed
-    resolution never looks like a collapse: when ``nvidia-smi`` is unreadable,
-    :func:`_bind_lock_identities` leaves every device locking on its own visible
-    token, and those are unique by construction — so a host without a usable
-    UUID map warns and proceeds instead of false-positiving here.
+    token) or as two bound devices sharing one ``lock_identity``. Failed UUID
+    resolution raises before this check; numeric index fallback identities are
+    unique by construction, so an unavailable UUID map warns without producing
+    a false duplicate here.
 
     :param list[str] requested: Stripped device tokens exactly as configured,
         before normalization dropped anything.
@@ -534,11 +533,11 @@ class GpuPool:
             explicit_ids: GPU indices from YAML config. If ``None``, auto-detect
                 visible devices even for ``n_jobs == 1`` so independent
                 single-job phasesweep processes do not double-book cuda:0.
-            explicit_devices: Opaque CUDA_VISIBLE_DEVICES tokens from YAML config,
-                such as GPU UUIDs or MIG instance IDs. Mutually exclusive with
-                ``explicit_ids``.
+            explicit_devices: Numeric, GPU UUID, or MIG instance tokens from
+                YAML config. Mutually exclusive with ``explicit_ids``.
             allow_no_gpu: if ``True``, run without CUDA isolation when no numeric
-                GPU IDs can be resolved. Parallel CPU-only sweeps need this opt-in.
+                GPU IDs can be resolved. Parallel auto-detected CPU-only sweeps
+                need this opt-in; an explicit CUDA-disable value does not.
             policy: CUDA visibility policy. ``single_per_trial`` leases one
                 token per trial. ``whole_node`` leases all tokens for one trial
                 and exposes them comma-joined. ``none`` disables CUDA isolation

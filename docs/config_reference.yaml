@@ -110,7 +110,7 @@
 # Mutually exclusive with gpu_ids and forbidden by gpu_policy: "none".
 
 # allow_no_gpu_isolation: bool = false
-# Set true only for intentional CPU-only parallel trials or an external scheduler that already isolates devices. Required when n_jobs > 1 has no detectable GPU tokens, and when gpu_policy is "none" with n_jobs > 1.
+# Set true only for intentional CPU-only parallel trials or an external scheduler that already isolates devices. Required when n_jobs > 1 has no detectable GPU tokens and no explicit CUDA-disable value, and when gpu_policy is "none" with n_jobs > 1.
 
 # max_consecutive_failures: int = 5 (>= 1)
 # Stops scheduling after this many consecutive failed or infeasible results; a feasible result resets the count. Completion order and the current streak are durable across supported random/grid top-ups and process restarts, and a stale RUNNING trial reaped as FAIL counts as a failure. Already-running parallel peers may still finish after the threshold is reached.
@@ -175,7 +175,7 @@
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
 #   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds exactly those variables to that base set. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
 #   record_env: bool = false
-#   Write the composed trainer environment to `environment.json` in every trial directory (digest, inherit_env contract, and every name-value pair). Off by default because those values include secrets; the file is created owner-only (0600) inside the otherwise operator-readable trial directory. Independently of this flag, every trial records the environment's SHA-256 digest and its sorted variable NAMES as study attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
+#   Write the composed trainer environment to `environment.json` in every trial directory (digest, inherit_env contract, and every name-value pair). Off by default because those values include secrets; the file is created owner-only (0600) inside the otherwise operator-readable trial directory. Independently of this flag, every trial records the environment's SHA-256 digest and its sorted variable NAMES as trial attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.
