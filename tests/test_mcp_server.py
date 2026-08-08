@@ -40,6 +40,7 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint, _reap_stale_trials
+from phasesweep.engine.run import _write_generation_state
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -1501,6 +1502,39 @@ def test_run_scoped_snapshot_recomputes_publication_integrity(tmp_path: Path) ->
     assert status.phases[0].winner_present is False
     assert results.publication_integrity == "failed"
     assert results.winner_count == 0
+
+
+def test_run_scoped_snapshot_refreshes_live_generation_pointers(tmp_path: Path) -> None:
+    run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    later_failed_id = "srv-later-failed"
+    _write_generation_state(
+        experiment,
+        generation_id=later_failed_id,
+        state="failed",
+        from_phase=None,
+        publish_current=True,
+        error_class="RuntimeError",
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+
+    after_failure = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+
+    assert after_failure.current_generation_id == later_failed_id
+    assert after_failure.published_generation_id == run_id
+    assert after_failure.represented_generation_id == run_id
+    assert after_failure.is_published is True
+
+    later_published_id = "srv-later-published"
+    run_experiment(experiment, generation_id=later_published_id)
+
+    after_publication = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+
+    assert after_publication.current_generation_id == later_published_id
+    assert after_publication.published_generation_id == later_published_id
+    assert after_publication.represented_generation_id == run_id
+    assert after_publication.is_published is False
 
 
 def test_run_scoped_snapshot_fails_closed_when_publication_pointer_disappears(

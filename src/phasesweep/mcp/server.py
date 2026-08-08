@@ -1118,13 +1118,13 @@ class PhaseSweepMCP:
         *,
         result_source: ResultSource,
     ) -> dict[str, Any]:
-        """Combine frozen run facts with the two deliberately live result verdicts.
+        """Combine frozen run facts with deliberately live publication state.
 
         Trial counts, winners, labels, and represented-generation identity stay
-        frozen. Publication integrity is a property of the artifact tree now,
-        and config drift compares with the config a future catalog launch would
-        execute now, so serving either from capture time would make both fields
-        structurally stale.
+        frozen. The current/published pointers and their relationship to the
+        represented generation, publication integrity, and config drift are
+        properties of the artifact tree and catalog now. Serving those fields
+        from capture time would make a run-scoped status contradict a live read.
 
         :param str experiment_id: Catalog id associated with the run.
         :param Experiment run_experiment: Frozen config used to locate the run's tree.
@@ -1144,6 +1144,9 @@ class PhaseSweepMCP:
             ),
             comparison_experiment=comparison,
         )
+        status["current_generation_id"] = live["current_generation_id"]
+        status["published_generation_id"] = live["published_generation_id"]
+        status["is_published"] = live["is_published"]
         live_integrity = live["publication_integrity"]
         if frozen_was_published and live_integrity == "absent":
             # The frozen terminal evidence proves a publication existed. A

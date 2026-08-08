@@ -83,14 +83,13 @@ class PhaseStatusSnapshot(_SnapshotModel):
 class StatusSnapshot(_SnapshotModel):
     """Path-free terminal status view captured by the detached runner.
 
-    ``current_generation_id`` and ``published_generation_id`` are always the
-    actual mutable/last-success pointers and may differ from each other and
-    from ``represented_generation_id`` (e.g. a failed rerun, or a pinned
-    snapshot of a generation whose own publication failed).
+    ``current_generation_id`` and ``published_generation_id`` record the
+    mutable/last-success pointers at capture time. Run-scoped MCP reads refresh
+    them from the live tree before returning this snapshot because their public
+    contract is current pointer identity.
     ``represented_generation_id`` is the generation whose winner/summary facts
-    this snapshot shows, and ``is_published`` says whether that generation is
-    the actual published one -- a failed-publication generation's snapshot
-    correctly reports ``is_published: False`` while remaining fully readable.
+    this snapshot shows. ``is_published`` records the relationship at capture
+    time and is likewise refreshed by run-scoped MCP reads.
     See :func:`phasesweep.engine.read.read_status`.
     """
 
@@ -121,14 +120,10 @@ class StatusSnapshot(_SnapshotModel):
     """
 
     published_config_matches_current: bool | None = None
-    """Whether the represented generation's recorded config fingerprint matched
-    the config this run executed, or ``None`` when it recorded none.
+    """Whether the represented generation's config matched at capture time.
 
-    Frozen at capture time and never recomputed: this snapshot is read long
-    after the catalog config may have moved on, and re-answering it against a
-    later config would silently change what a frozen result claims. Snapshots
-    frozen before this field existed parse as ``None`` -- unknown, which is
-    exactly what they recorded.
+    Run-scoped MCP reads recompute this against the current catalog config;
+    snapshots frozen before this field existed parse as ``None``.
     """
 
     result_phase_plan: list[str] | None = None
