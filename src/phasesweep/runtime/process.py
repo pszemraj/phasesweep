@@ -947,8 +947,6 @@ class AttemptLifecycle:
     cleanup uncertainty.
     """
 
-    schema_version: int
-    attempt_id: str
     state: str
     return_code: int | None
     cleanup_confirmed: bool | None
@@ -1045,8 +1043,6 @@ def read_attempt_lifecycle(
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
     return AttemptLifecycle(
-        schema_version=schema_version,
-        attempt_id=expected_attempt_id,
         state=state,
         return_code=return_code,
         cleanup_confirmed=cleanup_confirmed,

@@ -131,15 +131,6 @@ def _validate_override_key(key: object, *, label: str) -> None:
             )
 
 
-def _key_parts(key: str) -> tuple[str, ...]:
-    """Split a validated dotted override key into path components.
-
-    :param str key: Validated dotted override key.
-    :return tuple[str, ...]: Dot-separated path components.
-    """
-    return tuple(key.split("."))
-
-
 def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
     """Return pairs ``(short, long)`` where ``short`` is a strict path-prefix of ``long``.
 
@@ -164,7 +155,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
         path-prefix of ``long``. Empty list when no collisions are present.
 
     """
-    parts_by_key = {key: _key_parts(key) for key in keys}
+    parts_by_key = {key: tuple(key.split(".")) for key in keys}
     seen: set[tuple[str, str]] = set()
 
     items = list(parts_by_key.items())

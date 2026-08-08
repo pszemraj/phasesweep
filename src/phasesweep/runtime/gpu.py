@@ -89,7 +89,6 @@ class GpuDevice:
 class _HostGpuLease:
     """Host-wide flock handle for one CUDA device token."""
 
-    device: GpuDevice
     handle: IO[str]
 
 
@@ -141,7 +140,7 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
         # locked handle that would exclude every other run from this GPU.
         unlock_file(handle)
         raise
-    return _HostGpuLease(device=device, handle=handle)
+    return _HostGpuLease(handle=handle)
 
 
 def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
