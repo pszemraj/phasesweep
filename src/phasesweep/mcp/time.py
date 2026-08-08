@@ -1,8 +1,8 @@
-"""Time helpers for MCP persistence and audit records."""
+"""Time parsing for MCP persistence and audit records."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 
 
 def parse_utc_iso(value: object) -> datetime | None:
@@ -19,13 +19,3 @@ def parse_utc_iso(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
-
-
-def utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string.
-
-    Returns:
-        Timezone-aware UTC timestamp.
-
-    """
-    return datetime.now(UTC).isoformat()

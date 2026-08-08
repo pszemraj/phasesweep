@@ -7,7 +7,6 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +32,7 @@ from phasesweep.evidence.wandb import (
 )
 from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.time import utc_now_iso
 
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
@@ -470,17 +470,9 @@ def _extract_wandb(
             # terminal state raises WandbRunTerminalError above.
             "run_state": "finished",
             "summary": {cfg.metric_key: summary[cfg.metric_key]},
-            "retrieved_at": _utc_now_iso(),
+            "retrieved_at": utc_now_iso(timespec="seconds"),
         }
     return value
-
-
-def _utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string.
-
-    :return str: Second-resolution UTC timestamp for provenance records.
-    """
-    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any, dict[str, Any] | None], float]] = {
@@ -589,7 +581,7 @@ def run_extractor(
             ) from exc
         raise
     if provenance is not None:
-        provenance["recorded_at"] = _utc_now_iso()
+        provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value
 
 

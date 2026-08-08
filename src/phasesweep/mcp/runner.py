@@ -46,7 +46,6 @@ from phasesweep.mcp.snapshots import (
     capture_result_snapshot,
     finalize_result_snapshot,
 )
-from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     absorb_shutdown_signals,
@@ -55,6 +54,7 @@ from phasesweep.runtime.process import (
     read_boot_id,
     read_proc_starttime,
 )
+from phasesweep.runtime.time import utc_now_iso
 
 FailureCode: TypeAlias = Literal[
     "fingerprint_mismatch",

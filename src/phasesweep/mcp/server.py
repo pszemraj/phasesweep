@@ -72,9 +72,10 @@ from phasesweep.mcp.snapshots import (
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
 )
-from phasesweep.mcp.time import parse_utc_iso, utc_now_iso
+from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import ensure_private_dir, fsync_directory, open_private_text
 from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc_starttime
+from phasesweep.runtime.time import utc_now_iso
 
 log = logging.getLogger("phasesweep.mcp.server")
 

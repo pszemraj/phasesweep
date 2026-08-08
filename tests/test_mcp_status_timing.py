@@ -24,7 +24,7 @@ from phasesweep.mcp.server import (
     _run_elapsed_seconds,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.time import utc_now_iso
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,

@@ -44,7 +44,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunHandle, RunStore
-from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
@@ -53,6 +52,7 @@ from phasesweep.runtime.process import (
     _process_group_alive,
     read_boot_id,
 )
+from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import (
     claim_runner_handle,

@@ -68,13 +68,13 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
-from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
     is_same_live_process,
     kill_stale_group,
 )
+from phasesweep.runtime.time import utc_now_iso
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)

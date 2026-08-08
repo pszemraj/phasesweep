@@ -15,8 +15,8 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP
-from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.time import utc_now_iso
 
 
 def write_mcp_catalog(

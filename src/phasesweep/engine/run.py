@@ -6,7 +6,6 @@ import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -88,6 +87,7 @@ from phasesweep.runtime.process import (
     service_pending_shutdown,
     signal_handler_scope,
 )
+from phasesweep.runtime.time import utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -1471,7 +1471,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         _file_log_handler(_suite_log_path(suite)),
     ):
         generation_id = _claim_suite_generation(suite)
-        started_at = datetime.now(UTC).isoformat()
+        started_at = utc_now_iso()
         _write_suite_generation_state(
             suite,
             generation_id=generation_id,
@@ -1528,7 +1528,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     results[study_spec.name] = exposed_winners
                 log.info("suite=%s study=%s COMPLETE", suite.suite, study_spec.name)
 
-            ended_at = datetime.now(UTC).isoformat()
+            ended_at = utc_now_iso()
             summary = _suite_summary_payload(
                 suite,
                 generation_id=generation_id,
@@ -1629,7 +1629,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     generation_id=generation_id,
                     state="failed",
                     started_at=started_at,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=utc_now_iso(),
                     error_class=failed_error_class,
                     publish_current=True,
                 ),

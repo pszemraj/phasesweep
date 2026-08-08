@@ -494,7 +494,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     from mcp import types
 
     from phasesweep.mcp.server import build_server
-    from phasesweep.mcp.time import utc_now_iso
+    from phasesweep.runtime.time import utc_now_iso
 
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
