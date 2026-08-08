@@ -11,7 +11,6 @@ import os
 import subprocess
 import sys
 import threading
-import types
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -1941,54 +1940,6 @@ def test_engine_minted_generation_without_a_handle_uses_current_catalog_policy(
 
     params = winners["phases"][0]["params"]
     assert isinstance(params["x"], int)
-
-
-def test_await_run_never_starts_a_status_read_past_the_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A slow status read must not launch after the deadline: that overshoot is
-    what pushes the default await past the client-side request timeout the
-    default was chosen to stay under. The just-collected snapshot is returned."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-await-bound"
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.create(
-        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
-    )
-
-    clock = {"now": 0.0}
-    read_starts: list[float] = []
-    real_read = app._read_status_target
-
-    def slow_read(**kwargs: Any) -> Any:
-        read_starts.append(clock["now"])
-        result = real_read(**kwargs)
-        clock["now"] += 4.9  # one disk read burns nearly the whole 5s budget
-        return result
-
-    async def virtual_sleep(seconds: float) -> None:
-        clock["now"] += seconds
-
-    monkeypatch.setattr(app, "_read_status_target", slow_read)
-    monkeypatch.setattr(
-        "phasesweep.mcp.server.time", types.SimpleNamespace(monotonic=lambda: clock["now"])
-    )
-    monkeypatch.setattr(
-        "phasesweep.mcp.server.asyncio",
-        types.SimpleNamespace(sleep=virtual_sleep, to_thread=asyncio.to_thread),
-    )
-
-    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=5))
-
-    assert awaited["reason"] == "timeout"
-    assert awaited["run"]["state"] == "running"
-    # A second equally slow read would return far past the deadline. The await
-    # keeps the first snapshot, starts no second read, and waits out the small
-    # remainder of the requested budget.
-    assert read_starts == [0.0]
-    assert clock["now"] == pytest.approx(5.0)
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:

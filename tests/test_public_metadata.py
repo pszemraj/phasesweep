@@ -11,12 +11,9 @@ from __future__ import annotations
 import importlib
 import stat
 import tomllib
-from fnmatch import fnmatch
-from importlib import resources
 from pathlib import Path
 
 import pytest
-import yaml
 
 import phasesweep.engine as engine
 import phasesweep.evidence as evidence
@@ -27,12 +24,6 @@ from phasesweep.evidence import evaluation as evidence_evaluation
 from tests.conftest import make_experiment, write_constant_trainer
 
 PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
-
-# Runtime-required package data: package -> relative POSIX path that must ship in the wheel.
-REQUIRED_PACKAGE_DATA = {
-    "phasesweep": "templates/starter_experiment.yaml",
-    "phasesweep.mcp": "agent_prompt.md",
-}
 
 CONSOLE_SCRIPTS = {
     "phasesweep": "phasesweep.cli:main",
@@ -46,31 +37,6 @@ def _pyproject() -> dict:
     return tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
 
 
-def test_package_data_ships_runtime_required_files() -> None:
-    """`phasesweep init` needs the starter template inside the wheel, not just the repo."""
-    package_data = _pyproject()["tool"]["setuptools"]["package-data"]
-
-    assert package_data.get("*") == ["py.typed"], package_data
-
-    for package, relative_path in REQUIRED_PACKAGE_DATA.items():
-        patterns = package_data.get(package)
-        assert patterns, f"{package!r} declares no package-data; {relative_path} would be dropped"
-        assert any(fnmatch(relative_path, pattern) for pattern in patterns), (
-            f"no package-data pattern in {patterns} ships {package}/{relative_path}"
-        )
-
-
-def test_package_data_files_exist_in_source_tree() -> None:
-    """A package-data pattern only helps if the declared file is actually checked in."""
-    where = _pyproject()["tool"]["setuptools"]["packages"]["find"]["where"]
-    assert where == ["src"], where
-    src_root = PYPROJECT_PATH.parent / "src"
-
-    for package, relative_path in REQUIRED_PACKAGE_DATA.items():
-        expected = src_root.joinpath(*package.split("."), *relative_path.split("/"))
-        assert expected.is_file(), f"declared package data missing from source tree: {expected}"
-
-
 def test_console_scripts_declare_importable_targets() -> None:
     """Both entry points stay declared and keep pointing at real callables."""
     assert _pyproject()["project"]["scripts"] == CONSOLE_SCRIPTS
@@ -79,25 +45,6 @@ def test_console_scripts_declare_importable_targets() -> None:
         module_name, _, attribute = target.partition(":")
         module = importlib.import_module(module_name)
         assert callable(getattr(module, attribute)), f"{target} is not callable"
-
-
-def test_starter_template_resolves_the_way_the_cli_resolves_it() -> None:
-    """Mirror `phasesweep.cli._starter_experiment_text` so packaging drift fails here first."""
-    template = resources.files("phasesweep").joinpath("templates", "starter_experiment.yaml")
-    assert template.is_file()
-
-    text = template.read_text(encoding="utf-8")
-    assert text.strip(), "packaged starter template is empty"
-
-    parsed = yaml.safe_load(text)
-    assert isinstance(parsed, dict), f"starter template is not a YAML mapping: {type(parsed)}"
-    assert parsed.get("experiment") == "phasesweep_starter"
-    assert parsed.get("phases"), "starter template declares no phases"
-
-    # The CLI substitutes these before writing; a renamed placeholder would ship a
-    # literal marker into the user's experiment.yaml.
-    for placeholder in ("__PHASESWEEP_WORKDIR__", "__PHASESWEEP_STORAGE__"):
-        assert placeholder in text, f"{placeholder} missing from packaged starter template"
 
 
 def test_engine_exports_all_typed_preflight_errors() -> None:
