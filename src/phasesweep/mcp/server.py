@@ -990,10 +990,12 @@ class PhaseSweepMCP:
         no new state, no side effects. Returns early when the run reaches a
         terminal state, operator recovery is required, or a phase gains a
         winner; otherwise returns the current status when the (clamped)
-        timeout elapses. Rechecks run every ``AWAIT_RECHECK_SECONDS`` (or at
-        the deadline, whichever comes first) and re-resolve the run from disk,
-        so state written while this request is active is observed. After a
-        server restart, a fresh call resumes from the same durable run.
+        timeout elapses. A blocking status read already in progress cannot be
+        preempted safely and may finish after that deadline. Rechecks run every
+        ``AWAIT_RECHECK_SECONDS`` (or as late as one estimated read duration
+        before the deadline) and re-resolve the run from disk, so state written
+        while this request is active is observed. After a server restart, a
+        fresh call resumes from the same durable run.
 
         :param str run_id: Detached run id to wait on.
         :param int timeout_seconds: Requested wait, clamped to
@@ -1030,14 +1032,17 @@ class PhaseSweepMCP:
                 reason = "terminal"
             elif _phase_gained_winner(baseline, snapshot):
                 reason = "phase_completed"
+            elif time.monotonic() >= deadline:
+                reason = "timeout"
             elif time.monotonic() + read_seconds >= deadline:
                 # Another read as slow as the one just finished would end past
-                # the deadline — that overshoot is what pushes the default
-                # await past the client-side request timeout the default was
-                # chosen to stay under. Return the fresh snapshot in hand:
-                # ordinary fast reads keep the final at-deadline recheck (the
-                # estimate is ~0), so state written during the last wait
-                # window is still observed.
+                # the deadline. Do not start it, but wait out the caller's
+                # remaining budget before returning the fresh snapshot in hand.
+                # The status read itself is blocking filesystem/storage work in
+                # a worker thread and cannot be preempted safely; if that read
+                # already crossed the deadline, the branch above returns as
+                # soon as it finishes.
+                await asyncio.sleep(max(0.0, deadline - time.monotonic()))
                 reason = "timeout"
             else:
                 remaining_before_next_read = max(
@@ -1128,6 +1133,7 @@ class PhaseSweepMCP:
         :return dict[str, Any]: Frozen status with current integrity/drift verdicts.
         """
         status = snapshot.status_payload()
+        frozen_was_published = status["is_published"] is True
         comparison = self._catalog_comparison_experiment(experiment_id)
         represented_generation_id = status["represented_generation_id"]
         live = read_status(
@@ -1137,13 +1143,20 @@ class PhaseSweepMCP:
             ),
             comparison_experiment=comparison,
         )
-        status["publication_integrity"] = live["publication_integrity"]
+        live_integrity = live["publication_integrity"]
+        if frozen_was_published and live_integrity == "absent":
+            # The frozen terminal evidence proves a publication existed. A
+            # missing last-success pointer is therefore lost publication
+            # authority, not the benign never-published state used by a fresh
+            # tree. Fail closed exactly like a corrupt pointer target.
+            live_integrity = "failed"
+        status["publication_integrity"] = live_integrity
         status["published_config_matches_current"] = (
             live["published_config_matches_current"]
             if comparison is not None and result_source != "terminal_snapshot_unavailable"
             else None
         )
-        if live["publication_integrity"] == "failed":
+        if live_integrity == "failed":
             # A failed pointer may not expose the unvalidated publication as a
             # current result. Keep the terminal run's frozen trial counts, but
             # clear result-presence claims and let callers omit winner values.

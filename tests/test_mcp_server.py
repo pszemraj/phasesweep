@@ -1509,6 +1509,24 @@ def test_run_scoped_snapshot_recomputes_publication_integrity(tmp_path: Path) ->
     assert results.winner_count == 0
 
 
+def test_run_scoped_snapshot_fails_closed_when_publication_pointer_disappears(
+    tmp_path: Path,
+) -> None:
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, _store = make_mcp_app(catalog)
+    experiment = app._registry.get("srv").experiment
+    _last_successful_generation_path(experiment).unlink()
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.publication_integrity == "failed"
+    assert status.is_published is False
+    assert status.phases[0].winner_present is False
+    assert results.publication_integrity == "failed"
+    assert results.winner_count == 0
+
+
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
@@ -1971,11 +1989,11 @@ def test_await_run_never_starts_a_status_read_past_the_deadline(
 
     assert awaited["reason"] == "timeout"
     assert awaited["run"]["state"] == "running"
-    # A second equally slow read would have returned at 9.8 virtual seconds,
-    # far past the 5s deadline; instead the await returns the first read's
-    # snapshot as soon as the cost estimate rules another read out.
+    # A second equally slow read would return far past the deadline. The await
+    # keeps the first snapshot, starts no second read, and waits out the small
+    # remainder of the requested budget.
     assert read_starts == [0.0]
-    assert clock["now"] == pytest.approx(4.9)
+    assert clock["now"] == pytest.approx(5.0)
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
