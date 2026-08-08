@@ -174,7 +174,7 @@ def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> Non
             "belongs to another attempt",
         ),
         (
-            '{"schema_version": 1, "attempt_id": "expected", "state": "launching"}',
+            '{"schema_version": 1, "attempt_id": "expected", "state": "unknown"}',
             "Unknown attempt lifecycle state",
         ),
         (
@@ -244,6 +244,48 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
             os.kill(result.pid, 0)
 
 
+def test_identity_write_failure_marks_launch_before_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing identity after Popen cannot retain the pre-launch marker."""
+    import phasesweep.runtime.process as process
+
+    real_atomic_write_text = process.atomic_write_text
+
+    def fail_pid_write(path: Path, text: str) -> None:
+        if path.name == PROCESS_IDENTITY_FILE:
+            raise OSError("identity disk full")
+        real_atomic_write_text(path, text)
+
+    real_abort_launch = process._abort_launch
+
+    def abort_but_report_uncertain(proc: object, pgid: int | None) -> bool:
+        real_abort_launch(proc, pgid)  # type: ignore[arg-type]
+        return False
+
+    monkeypatch.setattr(process, "atomic_write_text", fail_pid_write)
+    monkeypatch.setattr(process, "_abort_launch", abort_but_report_uncertain)
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    result = _run_supervised(
+        trial_dir,
+        "true",
+        timeout=None,
+        attempt_id="identity-uncertain-attempt",
+    )
+
+    assert result.cleanup_confirmed is False
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="identity-uncertain-attempt",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == "launching"
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+
+
 def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,7 +321,11 @@ import time
 from pathlib import Path
 import phasesweep.runtime.process as process
 
+real_atomic_write_text = process.atomic_write_text
 def stall_identity_write(path: Path, text: str) -> None:
+    if path.name != process.PROCESS_IDENTITY_FILE:
+        real_atomic_write_text(path, text)
+        return
     print(text, flush=True)
     while True:
         time.sleep(1)

@@ -49,6 +49,8 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     OVERRIDES_ATTR,
     PHASE_ABORT_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
     RETURN_CODE_ATTR,
@@ -77,6 +79,101 @@ from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
 
 log = logging.getLogger("phasesweep.engine.phase")
+
+
+@dataclass(frozen=True)
+class _AcceptedPartialDecision:
+    """Durable terminal decision to select from an incomplete timed-out phase."""
+
+    trial_target: int
+    outcome_sequence: int
+    finished_trials: int
+    completed_trials: int
+    timeout_scope: str
+    recovered_abort_sequence: int | None
+
+
+def _load_accepted_partial_decision(study: optuna.Study) -> _AcceptedPartialDecision | None:
+    """Load and validate a persisted accepted-partial timeout decision."""
+    raw = study.user_attrs.get(PHASE_DECISION_ATTR)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}. "
+            "Use a new experiment name, or archive/delete the inconsistent study."
+        )
+    trial_target = raw.get("trial_target")
+    outcome_sequence = raw.get("outcome_sequence")
+    finished_trials = raw.get("finished_trials")
+    completed_trials = raw.get("completed_trials")
+    timeout_scope = raw.get("timeout_scope")
+    recovered_abort_sequence = raw.get("recovered_abort_sequence")
+    if (
+        raw.get("schema_version") != PHASE_DECISION_SCHEMA_VERSION
+        or raw.get("decision") != "accepted_partial_timeout"
+        or type(trial_target) is not int
+        or trial_target < 1
+        or type(outcome_sequence) is not int
+        or outcome_sequence < 0
+        or type(finished_trials) is not int
+        or finished_trials < 0
+        or finished_trials >= trial_target
+        or type(completed_trials) is not int
+        or completed_trials < 0
+        or completed_trials > finished_trials
+        or timeout_scope not in {"phase", "run"}
+        or (
+            recovered_abort_sequence is not None
+            and (
+                type(recovered_abort_sequence) is not int
+                or recovered_abort_sequence < 1
+                or recovered_abort_sequence > outcome_sequence
+            )
+        )
+    ):
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: "
+            f"{raw!r}. Use a new experiment name, or archive/delete the inconsistent study."
+        )
+    return _AcceptedPartialDecision(
+        trial_target=trial_target,
+        outcome_sequence=outcome_sequence,
+        finished_trials=finished_trials,
+        completed_trials=completed_trials,
+        timeout_scope=timeout_scope,
+        recovered_abort_sequence=recovered_abort_sequence,
+    )
+
+
+def _partial_completion_for_replay(
+    study: optuna.Study,
+    decision: _AcceptedPartialDecision,
+    *,
+    outcome_sequence: int,
+) -> dict[str, Any]:
+    """Re-prove and return the frozen completion metadata for a decision replay."""
+    trials = study.get_trials(deepcopy=False)
+    finished_trials = _finished_trial_count(trials)
+    completed_trials = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+    if (
+        outcome_sequence != decision.outcome_sequence
+        or finished_trials != decision.finished_trials
+        or completed_trials != decision.completed_trials
+    ):
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} changed after its accepted partial-timeout "
+            "decision was committed. Use a new experiment name, or archive/delete "
+            "the inconsistent study."
+        )
+    return {
+        "requested_trials": decision.trial_target,
+        "finished_trials": decision.finished_trials,
+        "completed_trials": decision.completed_trials,
+        "incomplete": True,
+        "reason": "timeout",
+        "timeout_scope": decision.timeout_scope,
+    }
 
 
 class _PolicyStateWriteError(RuntimeError):
@@ -356,6 +453,7 @@ def _run_phase(
     phase_fingerprint: str
     policy_state = None
     recovery_abort: dict[str, Any] | None = None
+    partial_decision: _AcceptedPartialDecision | None = None
     # The trainer environment is a property of this process and its config, not
     # of any one trial, so it is composed once per phase execution and stamped
     # onto every trial (review v0.5.18 / finding F3).
@@ -372,6 +470,31 @@ def _run_phase(
         policy_state = _load_phase_policy_state(study)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
         _validate_trial_target(study, phase)
+        partial_decision = _load_accepted_partial_decision(study)
+        if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
+            # This terminal decision is the authority even if a crash landed
+            # before the separate historical abort marker was cleared. Replay
+            # deterministic selection; never reinterpret the timeout's unused
+            # slots as permission to launch more trainers.
+            completion = _partial_completion_for_replay(
+                study,
+                partial_decision,
+                outcome_sequence=policy_state.max_sequence,
+            )
+            try:
+                return _select_phase_winner(
+                    experiment,
+                    phase,
+                    inherited_winners,
+                    study,
+                    phase_fingerprint=phase_fingerprint,
+                    completion=completion,
+                )
+            except NoFeasibleTrialError as exc:
+                raise TimeoutError(
+                    f"Phase {phase.name!r} hit its {partial_decision.timeout_scope} deadline "
+                    "before any feasible trial could complete; no winner can be selected."
+                ) from exc
         accepted_target = _accepted_trial_target(study)
         active_abort = _active_phase_abort(
             study,
@@ -1020,6 +1143,11 @@ def _run_phase(
     # ever launched work toward, making the previously working config a
     # rejected regression (review v0.5.14 / blocker 4).
     _record_trial_target(study, phase)
+    if partial_decision is not None and phase.n_trials > partial_decision.trial_target:
+        # Raising n_trials is the explicit authorization to resume work after
+        # a terminal partial decision. The old record is no longer actionable
+        # once the larger target is durable.
+        study.set_user_attr(PHASE_DECISION_ATTR, None)
     if recovery_abort is not None:
         current_policy_state = _load_phase_policy_state(study)
         study.set_user_attr(
@@ -1120,6 +1248,28 @@ def _run_phase(
             "an incomplete winner."
         )
     persisted_abort = study.user_attrs.get(PHASE_ABORT_ATTR)
+    if accepted_partial_timeout:
+        current_policy_state = _load_phase_policy_state(study)
+        recovered_abort_sequence = (
+            persisted_abort["completion_sequence"] if persisted_abort is not None else None
+        )
+        # This is the terminal-decision transaction boundary. If the write
+        # fails, selection/publication never starts and a retry may spend a
+        # fresh timeout budget. Once it succeeds, identical retries replay
+        # selection from this frozen trial boundary without launching work.
+        study.set_user_attr(
+            PHASE_DECISION_ATTR,
+            {
+                "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+                "decision": "accepted_partial_timeout",
+                "trial_target": phase.n_trials,
+                "outcome_sequence": current_policy_state.max_sequence,
+                "finished_trials": finished_after,
+                "completed_trials": completed_after,
+                "timeout_scope": timeout_source,
+                "recovered_abort_sequence": recovered_abort_sequence,
+            },
+        )
     if persisted_abort is not None:
         # Only an explicitly accepted partial timeout can reach selection with
         # a newly tripped failure marker: the abort raise above is skipped
@@ -1133,12 +1283,10 @@ def _run_phase(
         # the abort.
         if accepted_partial_timeout:
             current_policy_state = _load_phase_policy_state(study)
-            # This single superseding record is the transaction boundary. If
-            # its write fails, no timeout-precedence decision was committed,
-            # selection/publication never runs, and the already-durable abort
-            # remains the valid pre-transition state. Once it succeeds, the
-            # loader consumes that exact abort sequence even if the separate
-            # historical-marker clear below fails or the process exits.
+            # The typed decision above already makes selection replayable.
+            # This separate recovery record resets the failure streak for a
+            # later explicitly increased target and consumes this exact abort
+            # even if the historical-marker clear below fails.
             study.set_user_attr(
                 PHASE_RECOVERY_ATTR,
                 {

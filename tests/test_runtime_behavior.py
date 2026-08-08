@@ -44,9 +44,12 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     PHASE_ABORT_ATTR,
+    PHASE_DECISION_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _attempts_dir,
@@ -1238,10 +1241,12 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
 
 
 @pytest.mark.parametrize("cleanup_attr_persists", [True, False])
+@pytest.mark.parametrize("identity_persists", [True, False])
 def test_unsafe_cleanup_blocks_topup_until_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cleanup_attr_persists: bool,
+    identity_persists: bool,
 ) -> None:
     """A larger target cannot acknowledge a possibly live trainer.
 
@@ -1276,11 +1281,14 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
             # fault injection. Restore the durable pre-exit shape a genuinely
             # unconfirmed cleanup leaves behind so preflight must consult the
             # process identity and our cleanup verdict.
+            trial_dir = Path(str(kwargs["trial_dir"]))
             write_attempt_lifecycle(
-                Path(str(kwargs["trial_dir"])),
+                trial_dir,
                 attempt_id=str(kwargs["attempt_id"]),
-                state="allocated",
+                state="allocated" if identity_persists else "launching",
             )
+            if not identity_persists:
+                (trial_dir / runtime_process.PROCESS_IDENTITY_FILE).unlink()
         return result
 
     def maybe_refuse_cleanup_attr(
@@ -1324,10 +1332,19 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     assert len(study.trials) == before
     assert list(_attempts_dir(_exp(3)).glob("*.json"))
+    assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
 
     # Positive cleanup is durably consumed before the registry is retired and
     # the ordinary fatal-abort top-up path becomes available.
     cleanup_safe["value"] = True
+    if not identity_persists:
+        write_attempt_lifecycle(
+            Path(str(unsafe_trial.user_attrs[TRIAL_DIR_ATTR])),
+            attempt_id=str(unsafe_trial.user_attrs[ATTEMPT_ID_ATTR]),
+            state="exited",
+            return_code=0,
+            cleanup_confirmed=True,
+        )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
@@ -1710,6 +1727,8 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     exp = Experiment(
         experiment="phase_scheduler_deadline_with_abort",
         workdir=str(tmp_path / "runs"),
+        storage=f"sqlite:///{tmp_path / 'decision.db'}",
+        provenance={"revision": "test-fixture-v1"},
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
@@ -1721,6 +1740,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
                 max_consecutive_failures=1,
                 timeout_seconds_per_phase=600.0,
                 allow_incomplete_on_timeout=True,
+                sampler=Sampler(type="random", seed=7),
                 search_space={},
             )
         ],
@@ -1737,8 +1757,10 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
         types.SimpleNamespace(monotonic=lambda: real_monotonic() + offset["seconds"]),
     )
     real_launch_trial = phase_mod.launch_trial
+    launched_trials: list[int] = []
 
     def launch_and_burn_the_budget(**kwargs: object) -> object:
+        launched_trials.append(int(kwargs["trial_id"]))
         executed = real_launch_trial(**kwargs)
         if clock_elapses and kwargs["trial_id"] == 1:
             offset["seconds"] = 10_000.0
@@ -1751,7 +1773,35 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
             run_experiment(exp)
         return
 
+    real_select = phase_mod._select_phase_winner
+    crashed = {"once": False}
+
+    def crash_first_selection(*args: object, **kwargs: object):
+        if not crashed["once"]:
+            crashed["once"] = True
+            raise RuntimeError("simulated crash after partial-timeout decision")
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(phase_mod, "_select_phase_winner", crash_first_selection)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_experiment(exp)
+
+    study = optuna.load_study(
+        study_name="phase_scheduler_deadline_with_abort::p",
+        storage=exp.storage,
+    )
+    assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
+    trial_count = len(study.trials)
+    launch_count = len(launched_trials)
+
     winners = run_experiment(exp)
+
+    study = optuna.load_study(
+        study_name="phase_scheduler_deadline_with_abort::p",
+        storage=exp.storage,
+    )
+    assert len(study.trials) == trial_count
+    assert len(launched_trials) == launch_count
 
     assert winners["p"].trial_number == 0
     completion = winners["p"].completion

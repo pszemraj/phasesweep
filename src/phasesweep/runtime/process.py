@@ -933,7 +933,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
 
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 1
-_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "exited"})
+_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
 
 
 @dataclass(frozen=True)
@@ -942,12 +942,12 @@ class AttemptLifecycle:
 
     Closes the two recovery windows the transient identity file could not
     represent (review v0.5.17 / blocker 2): ``allocated`` says a durable
-    Optuna ``RUNNING`` trial exists but no process was ever created (the
-    worker may still be queued for a GPU), and ``exited`` says the supervised
-    process group is confirmed gone even though evidence extraction and the
-    Optuna terminal commit may not have happened yet. Recovery can then fail
-    such trials safely instead of treating both states as unverifiable
-    cleanup uncertainty.
+    Optuna ``RUNNING`` trial exists but no process launch was attempted (the
+    worker may still be queued for a GPU), ``launching`` is committed before
+    ``Popen`` so a failed identity write cannot masquerade as that pre-launch
+    state, and ``exited`` says the supervised process group is confirmed gone
+    even though evidence extraction and the Optuna terminal commit may not
+    have happened yet.
     """
 
     state: str
@@ -969,7 +969,7 @@ def write_attempt_lifecycle(
         trial_dir: Per-trial directory (attempt-scoped, so states from
             different attempts can never collide).
         attempt_id: Immutable attempt identity binding the record.
-        state: One of ``"allocated"`` or ``"exited"``.
+        state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
         return_code: Root return code; only meaningful for ``"exited"``.
         cleanup_confirmed: Whether the whole process group was confirmed
             gone; only meaningful for ``"exited"``.
@@ -1397,6 +1397,16 @@ def run_supervised(
 
     try:
         with defer_shutdown_signals(), _launch_lock:
+            # Advance durably before Popen. Without this boundary, a spawned
+            # supervisor whose identity write and cleanup both fail is
+            # indistinguishable on recovery from a worker killed while still
+            # queued for a GPU (both otherwise leave ``allocated`` and no
+            # process_identity.json).
+            write_attempt_lifecycle(
+                trial_dir,
+                attempt_id=attempt_id,
+                state="launching",
+            )
             proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,

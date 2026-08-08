@@ -175,6 +175,11 @@ PHASE_ABORT_ATTR = "phasesweep_phase_abort"
 # later failures form the new recovery streak.
 PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
+# Terminal decision recorded before selecting/publishing a winner from an
+# intentionally incomplete timeout. It makes selection crash-replayable
+# without silently scheduling the trial slots the timeout deliberately left.
+PHASE_DECISION_ATTR = "phasesweep_phase_decision"
+PHASE_DECISION_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance (review v0.5.17 /
