@@ -747,11 +747,12 @@ class Experiment(_Frozen):
             # can actually be encoded. Check them explicitly here.
             _validate_json_file_override_values(self, phase)
 
-            # argparse wire contract (PR #5 review / reviewer 2, blocker 3):
-            # str()-rendering a structured value and hashing its JSON-mode dump
-            # disagree, so two different commands can share one fingerprint.
-            # Restrict argparse values to the set where the two agree.
-            _validate_argparse_override_values(self, phase)
+            # CLI override wire contract (PR #5 review / reviewer 2, blocker 3):
+            # rendering a structured or non-finite value and hashing its
+            # JSON-mode dump can disagree, so two different commands can share
+            # one fingerprint. Restrict argparse/Hydra values to the set where
+            # the wire form and semantic dump agree.
+            _validate_cli_override_values(self, phase)
 
             # Trial command template (v0.5.3 follow-up): render once with
             # placeholder overrides per phase. Catches typos like `{trail_dir}`,
@@ -1023,10 +1024,10 @@ def _validate_json_file_override_values(experiment: Experiment, phase: Phase) ->
             ) from exc
 
 
-def _first_argparse_unrenderable(
+def _first_cli_unrenderable(
     value: Any, *, position: str = "", _seen: set[int] | None = None
 ) -> tuple[str, Any] | None:
-    """Return the first value inside ``value`` that argparse cannot render faithfully.
+    """Return the first value a scalar/list CLI override cannot render faithfully.
 
     ``bool`` is matched before ``int`` because ``isinstance(True, int)`` is
     true and the two render differently (``true`` vs ``1``); both are allowed,
@@ -1055,15 +1056,15 @@ def _first_argparse_unrenderable(
             return None
         seen.add(id(value))
         for index, item in enumerate(value):
-            found = _first_argparse_unrenderable(item, position=f"{position}[{index}]", _seen=seen)
+            found = _first_cli_unrenderable(item, position=f"{position}[{index}]", _seen=seen)
             if found is not None:
                 return found
         return None
     return (position, value)
 
 
-def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> None:
-    """Reject ``argparse`` override values with no faithful wire form.
+def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
+    """Reject argparse/Hydra override values with no faithful wire form.
 
     ``override_format: argparse`` renders each value through
     :func:`phasesweep.runtime.commands._stringify`, which is ``str()`` for
@@ -1080,8 +1081,11 @@ def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> 
       ``json.dumps(..., sort_keys=True)`` over unorderable mixed keys — a
       runtime crash the config layer never saw.
 
-    Restricting values to the set below removes both failure modes without
-    touching the fingerprint code: every remaining Python value maps to a
+    Hydra has the same identity requirement: although its renderer rejects
+    mappings, it formerly accepted ``nan``/``inf``/``-inf`` as three distinct
+    command values while Pydantic's JSON-mode dump normalized all three to
+    ``None``. Restricting both scalar/list formats to the set below removes
+    these failure modes without touching the fingerprint code: every remaining Python value maps to a
     distinct JSON-mode dump, so distinct configs keep distinct fingerprints and
     a shared fingerprint again implies an identical rendered command. Allowed,
     recursively: ``None``, ``bool``, ``int``, finite ``float``, ``str``, and
@@ -1096,24 +1100,22 @@ def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> 
     :param Experiment experiment: Experiment being validated; supplies
         ``override_format`` and the contract definitions.
     :param Phase phase: Phase whose composed fixed values are checked.
-    :raises ValueError: A composed value is outside the argparse value contract.
+    :raises ValueError: A composed value is outside the selected CLI value contract.
     """
-    if experiment.override_format != "argparse":
+    if experiment.override_format not in {"argparse", "hydra"}:
         return
 
+    override_format = experiment.override_format
     for key, (origin, value) in _composed_fixed_override_values(experiment, phase).items():
-        found = _first_argparse_unrenderable(value)
+        found = _first_cli_unrenderable(value)
         if found is None:
             continue
         position, offender = found
         if isinstance(offender, Mapping):
             hint = (
-                "A mapping has no argparse wire form: str() would render its "
-                "Python repr, while the fingerprint dump normalizes its keys to "
-                "strings — so {1: 'x'} and {'1': 'x'} would launch different "
-                "commands under one study identity, and a mapping holding both "
-                "keys would lose one entry from the fingerprint entirely. Use "
-                "override_format='json_file' for structured values."
+                f"A mapping has no {override_format} wire form the fingerprint "
+                "preserves faithfully. Use override_format='json_file' for "
+                "structured values."
             )
         elif isinstance(offender, float):
             hint = (
@@ -1130,9 +1132,9 @@ def _validate_argparse_override_values(experiment: Experiment, phase: Phase) -> 
             )
         where = f" at position {position}" if position else ""
         raise ValueError(
-            f"Phase {phase.name!r}: override_format='argparse' but {origin} key "
-            f"{key!r} holds a value{where} that argparse cannot render faithfully "
-            f"(type {type(offender).__name__}): {offender!r}. argparse override "
+            f"Phase {phase.name!r}: override_format={override_format!r} but {origin} key "
+            f"{key!r} holds a value{where} that {override_format} cannot render faithfully "
+            f"(type {type(offender).__name__}): {offender!r}. {override_format} override "
             "values must have one canonical wire form the JSON-mode fingerprint "
             "preserves faithfully: null, booleans, integers, finite floats, "
             f"strings, and lists of those. {hint}"

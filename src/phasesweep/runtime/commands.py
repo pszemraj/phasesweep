@@ -73,14 +73,17 @@ def _stringify_hydra(value: Any) -> str:
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
         return str(value)
     if isinstance(value, str):
         return json.dumps(value)
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_stringify_hydra(v) for v in value) + "]"
     raise TypeError(
-        "override_format='hydra' supports scalar values and lists only; "
+        "override_format='hydra' supports null, booleans, integers, finite "
+        "floats, strings, and lists of those; "
         f"got {type(value).__name__}. Use override_format='json_file' for structured values."
     )
 

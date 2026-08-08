@@ -85,7 +85,7 @@ phase 'weight_decay': sampler=random seed=1 (resumable, reproducible)
 | `hydra` | Existing Hydra/OmegaConf applications. |
 | `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
 
-Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Config load checks every statically known composed value with the same strict serializer used for real trials; see [JSON file override validation](#json-file-override-validation) for YAML scalar pitfalls.
+Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. The scalar/list CLI formats reject non-finite floats because their rendered `nan`/`inf` values have no distinct semantic JSON identity. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Config load checks every statically known composed value with the same strict serializer used for real trials; see [JSON file override validation](#json-file-override-validation) for YAML scalar pitfalls.
 
 ## Trainer contract
 

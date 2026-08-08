@@ -44,6 +44,13 @@ def test_hydra_rejects_structured_values():
         format_hydra({"model": {"depth": 2}})
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_hydra_rejects_non_finite_values(value: float) -> None:
+    """The renderer must not admit values the semantic JSON dump collapses."""
+    with pytest.raises(TypeError, match="finite floats"):
+        format_hydra({"x": [value]})
+
+
 def test_argparse():
     s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
     assert s == "--lr 0.0003 --weight_decay 0.05"
@@ -154,6 +161,7 @@ def _override_yaml(tmp_path, override_format: str, body: str):
     trial_command = {
         "json_file": "python train.py --overrides {overrides_path}",
         "argparse": "python train.py {overrides}",
+        "hydra": "python train.py {overrides}",
     }[override_format]
     return write_yaml(
         tmp_path,
@@ -305,6 +313,56 @@ def test_validate_rejects_unrenderable_argparse_contract_override(tmp_path):
 
     with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
         load_experiment(p)
+
+
+@pytest.mark.parametrize("literal", [".nan", ".inf", "-.inf"])
+@pytest.mark.parametrize("origin", ["phase", "contract"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_validate_rejects_non_finite_hydra_fixed_override(
+    tmp_path, literal: str, origin: str, nested: bool
+) -> None:
+    """Hydra wire values must remain distinguishable in semantic fingerprints."""
+    value = f"[{literal}]" if nested else literal
+    if origin == "phase":
+        body = (
+            "        phases:\n"
+            "          - name: t\n"
+            "            n_trials: 1\n"
+            "            fixed_overrides:\n"
+            f"              knob: {value}\n"
+        )
+        expected = r"fixed_overrides.*'knob'"
+    else:
+        body = (
+            "        contracts:\n"
+            "          frozen:\n"
+            "            fixed_overrides:\n"
+            f"              knob: {value}\n"
+            "        phases:\n"
+            "          - name: t\n"
+            "            n_trials: 1\n"
+            "            contracts: [frozen]\n"
+        )
+        expected = r"contract 'frozen' fixed_overrides.*'knob'"
+
+    with pytest.raises(ValidationError, match=expected):
+        load_experiment(_override_yaml(tmp_path, "hydra", body))
+
+
+def test_validate_accepts_finite_hydra_fixed_override(tmp_path) -> None:
+    config = _override_yaml(
+        tmp_path,
+        "hydra",
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        "              knob: [1.5, -2.0]\n",
+    )
+
+    experiment = load_experiment(config)
+
+    assert experiment.phases[0].fixed_overrides["knob"] == [1.5, -2.0]
 
 
 @pytest.mark.parametrize(

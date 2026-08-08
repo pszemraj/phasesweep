@@ -34,7 +34,7 @@
 
 # override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
 # `argparse` requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load, because only that set has one canonical wire form the semantic fingerprint preserves faithfully. Use override_format `json_file` for structured values.
-# `hydra` requires `{overrides}` and emits `key=value`; it accepts scalars/lists and rejects mappings during config preflight.
+# `hydra` requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load. Non-finite floats are rejected because Hydra renders them distinctly while the semantic JSON fingerprint cannot preserve that distinction.
 # `json_file` requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
 
 # metric: Metric (required)
