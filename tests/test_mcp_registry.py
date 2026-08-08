@@ -155,7 +155,14 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
 def test_checked_in_catalog_loads(
     catalog_path: str,
     experiment_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        "phasesweep.mcp.registry._prepare_state_dir",
+        lambda _base, _configured: state_dir,
+    )
     registry = Registry.load(REPO / catalog_path)
 
     entry = registry.get(experiment_id)
