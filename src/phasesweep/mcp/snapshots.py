@@ -10,6 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
@@ -20,7 +21,7 @@ from phasesweep.engine.state import (
     _generation_record_path,
     _winner_source_or_default,
 )
-from phasesweep.evidence.models import _ObjectiveEvidenceFields, objective_evidence_assurance
+from phasesweep.evidence.models import _ObjectiveEvidenceFields
 
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
@@ -303,13 +304,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
             result_context="current_config",
             published_config_matches_current=None,
             result_phase_plan=[phase.name for phase in experiment.phases],
-            metric=MetricSnapshot(
-                name=experiment.metric.name,
-                goal=experiment.metric.goal,
-                objective_evidence=ObjectiveEvidenceSnapshot.model_validate(
-                    objective_evidence_assurance(experiment.metric.extractor)
-                ),
-            ),
+            metric=MetricSnapshot.model_validate(_metric_semantics_payload(experiment.metric)),
             phases=[
                 PhaseStatusSnapshot(
                     phase=phase.name,

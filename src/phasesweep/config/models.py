@@ -26,7 +26,12 @@ from phasesweep.config.search import (
     _placeholder_values_for,
     _validate_sampler_search_space,
 )
-from phasesweep.evidence.models import Extractor, Gate, ObjectiveExtractor
+from phasesweep.evidence.models import (
+    Extractor,
+    Gate,
+    ObjectiveExtractor,
+    objective_evidence_assurance,
+)
 from phasesweep.runtime.files import storage_backend, storage_is_in_memory
 
 
@@ -36,6 +41,19 @@ class Metric(_Frozen):
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
+
+
+def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
+    """Return the persisted and agent-visible semantics of one metric.
+
+    :param Metric metric: Configured optimization metric.
+    :return dict[str, Any]: Metric name, goal, and objective-evidence assurance.
+    """
+    return {
+        "name": metric.name,
+        "goal": metric.goal,
+        "objective_evidence": objective_evidence_assurance(metric.extractor),
+    }
 
 
 class Constraint(_Frozen):

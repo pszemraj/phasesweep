@@ -18,6 +18,7 @@ import yaml
 from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Phase, Suite
 from phasesweep.config.common import _validate_safe_name
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine.errors import StudyContextConflictError, StudyStorageUnavailableError
 from phasesweep.engine.guards import (
@@ -81,7 +82,6 @@ from phasesweep.engine.state import (
     _write_yaml_exclusive,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.runtime.files import file_sha256, require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -726,11 +726,7 @@ def _run_experiment_inner(
         "generation_id": generation_id,
         "phasesweep_version": __version__,
         "config_fingerprint": _experiment_semantic_fingerprint(experiment),
-        "metric": {
-            "name": experiment.metric.name,
-            "goal": experiment.metric.goal,
-            "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
-        },
+        "metric": _metric_semantics_payload(experiment.metric),
         "phase_plan": [
             {"name": phase.name, "comment": phase.comment} for phase in experiment.phases
         ],

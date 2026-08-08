@@ -25,6 +25,7 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.guards import (
     _experiment_semantic_fingerprint,
     _validate_artifact_root_binding,
@@ -44,7 +45,6 @@ from phasesweep.engine.state import (
     _published_winner_path_for,
     _resolve_publication_pointer,
 )
-from phasesweep.evidence.models import objective_evidence_assurance
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
 """Which config's semantics a result payload's labels were read under.
@@ -648,12 +648,8 @@ def read_status(
     # published yet, or a pre-manifest legacy summary without semantics) does
     # the current config describe the result.
     comparison = comparison_experiment or experiment
-    current_objective_evidence = objective_evidence_assurance(comparison.metric.extractor)
-    metric_payload = {
-        "name": comparison.metric.name,
-        "goal": comparison.metric.goal,
-        "objective_evidence": current_objective_evidence,
-    }
+    metric_payload = _metric_semantics_payload(comparison.metric)
+    current_objective_evidence = metric_payload["objective_evidence"]
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
     published_config_matches_current: bool | None = None

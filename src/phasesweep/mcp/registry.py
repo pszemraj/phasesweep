@@ -24,8 +24,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.state import _experiment_dir
-from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -175,11 +175,7 @@ class RegisteredExperiment:
     @property
     def metric_payload(self) -> dict[str, Any]:
         """Return the agent-visible optimization metric descriptor."""
-        return {
-            "name": self.experiment.metric.name,
-            "goal": self.experiment.metric.goal,
-            "objective_evidence": objective_evidence_assurance(self.experiment.metric.extractor),
-        }
+        return _metric_semantics_payload(self.experiment.metric)
 
     @property
     def capabilities(self) -> dict[str, bool]:
