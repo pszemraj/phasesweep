@@ -686,6 +686,10 @@ def main(argv: list[str] | None = None) -> int:
                 terminal_report = report
                 status["cleanup_confirmed"] = report.cleanup_confirmed
                 status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
+                status["recovered_attempt_generations"] = dict(
+                    sorted(report.recovered_attempt_generations.items())
+                )
+                status["uncertain_attempt_ids"] = sorted(report.uncertain_attempt_ids)
                 if report.primary_error is not None:
                     status["failure"] = _terminal_failure_payload(
                         report.primary_error,

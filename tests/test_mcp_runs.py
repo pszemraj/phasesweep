@@ -422,6 +422,14 @@ def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) 
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": "attempt-1"},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": [""]},
+        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_generations": []},
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "recovered_attempt_generations": {"attempt-1": ""},
+        },
+        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": "attempt-1"},
+        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": [""]},
     ],
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:

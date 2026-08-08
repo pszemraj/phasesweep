@@ -444,6 +444,7 @@ def finalize_result_snapshot(
     snapshot: Mapping[str, object],
     *,
     confirmed_attempt_ids: Collection[str] = (),
+    confirmed_attempt_locations: Mapping[str, tuple[str, int, str]] | None = None,
 ) -> dict[str, Any]:
     """Finalize a previously captured snapshot without rereading shared state.
 
@@ -455,6 +456,9 @@ def finalize_result_snapshot(
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
+    :param Mapping[str, tuple[str, int, str]] | None confirmed_attempt_locations:
+        Reconciled attempt ids mapped to phase, trial number, and generation;
+        used when the frozen row predates its Optuna identity attrs.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     :raises RuntimeError: If the cleanup report names more recovered attempts
         than the snapshot counts as RUNNING, for a phase or for the represented
@@ -463,6 +467,13 @@ def finalize_result_snapshot(
     """
     parsed = RunResultSnapshot.model_validate(snapshot)
     confirmed = set(confirmed_attempt_ids)
+    confirmed_by_location = {
+        (phase_name, trial_number): (attempt_id, generation_id)
+        for attempt_id, (phase_name, trial_number, generation_id) in (
+            (confirmed_attempt_locations or {}).items()
+        )
+        if attempt_id in confirmed
+    }
     for phase in parsed.status.phases:
         if phase.running_attempts is None:
             # The capture read no trial data for this phase, so it recorded no
@@ -470,11 +481,13 @@ def finalize_result_snapshot(
             # unread, and inventing a reconciliation over them would fabricate
             # states this snapshot never observed.
             continue
-        recovered = [
-            attempt
-            for attempt in phase.running_attempts
-            if attempt.attempt_id is not None and attempt.attempt_id in confirmed
-        ]
+        recovered: list[tuple[RunningAttemptSnapshot, str | None]] = []
+        for attempt in phase.running_attempts:
+            location = confirmed_by_location.get((phase.phase, attempt.trial_number))
+            if attempt.attempt_id is not None and attempt.attempt_id in confirmed:
+                recovered.append((attempt, None if location is None else location[1]))
+            elif attempt.attempt_id is None and location is not None:
+                recovered.append((attempt, location[1]))
         if not recovered:
             continue
         running = phase.trials.get("RUNNING", 0)
@@ -491,8 +504,12 @@ def finalize_result_snapshot(
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt
-            for attempt in recovered
-            if generation_id is not None and attempt.generation_id == generation_id
+            for attempt, recovered_generation_id in recovered
+            if generation_id is not None
+            and (
+                attempt.generation_id == generation_id
+                or (attempt.generation_id is None and recovered_generation_id == generation_id)
+            )
         ]
         if generation_recovered:
             generation_running = phase.generation_trials.get("RUNNING", 0)
@@ -504,9 +521,11 @@ def finalize_result_snapshot(
             phase.generation_trials["FAIL"] = phase.generation_trials.get("FAIL", 0) + len(
                 generation_recovered
             )
-        recovered_ids = {attempt.attempt_id for attempt in recovered}
+        recovered_trial_numbers = {attempt.trial_number for attempt, _generation_id in recovered}
         phase.running_attempts = [
-            attempt for attempt in phase.running_attempts if attempt.attempt_id not in recovered_ids
+            attempt
+            for attempt in phase.running_attempts
+            if attempt.trial_number not in recovered_trial_numbers
         ]
     return parsed.model_dump(mode="json")
 

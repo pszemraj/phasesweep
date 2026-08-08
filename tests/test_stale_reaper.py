@@ -38,6 +38,7 @@ from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
@@ -1090,6 +1091,7 @@ def _fabricate_stale_running_trial(
     attempt_id: str,
     generation_id: str = "old-generation",
     persist_attempt_id: bool = True,
+    persist_generation_id: bool = True,
 ) -> tuple[optuna.Study, Path, int]:
     """Create the phase study with one attribute-complete RUNNING trial."""
     study = optuna.create_study(
@@ -1108,7 +1110,8 @@ def _fabricate_stale_running_trial(
         attempt_id=attempt_id,
     )
     trial_dir.mkdir(parents=True)
-    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+    if persist_generation_id:
+        trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     if persist_attempt_id:
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
@@ -1214,6 +1217,7 @@ def _fabricate_registered_attempt(
     *,
     attempt_id: str,
     persist_trial_attempt_id: bool = True,
+    persist_trial_generation_id: bool = True,
 ) -> tuple[optuna.Study, Path, int]:
     """Fabricate a stale RUNNING trial plus its attempt registry entry."""
     study, trial_dir, number = _fabricate_stale_running_trial(
@@ -1221,6 +1225,7 @@ def _fabricate_registered_attempt(
         phase_name,
         attempt_id=attempt_id,
         persist_attempt_id=persist_trial_attempt_id,
+        persist_generation_id=persist_trial_generation_id,
     )
     _register_active_attempt(
         experiment,
@@ -1250,15 +1255,20 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         "p",
         attempt_id="partial-attempt",
         persist_trial_attempt_id=False,
+        persist_trial_generation_id=False,
     )
     write_attempt_lifecycle(trial_dir, attempt_id="partial-attempt", state="allocated")
 
     winners = run_experiment(experiment)
 
     assert "p" in winners
-    states = {trial.number: trial.state for trial in study.get_trials(deepcopy=False)}
+    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+    states = {number: trial.state for number, trial in trials.items()}
     assert states[stale_number] == optuna.trial.TrialState.FAIL
     assert optuna.trial.TrialState.COMPLETE in states.values()
+    assert trials[stale_number].user_attrs[ATTEMPT_ID_ATTR] == "partial-attempt"
+    assert trials[stale_number].user_attrs[GENERATION_ID_ATTR] == "old-generation"
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [stale_number]
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 

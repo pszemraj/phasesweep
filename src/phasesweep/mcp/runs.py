@@ -737,7 +737,13 @@ class RunStore:
         attempt_ids: set[str] = set()
         status = self._read_status(handle)
         if status is not None:
-            attempt_ids.update(status.get("recovered_attempt_ids", []))
+            generations = status.get("recovered_attempt_generations")
+            if isinstance(generations, dict):
+                attempt_ids.update(
+                    attempt_id
+                    for attempt_id in status.get("recovered_attempt_ids", [])
+                    if generations.get(attempt_id) == handle.run_id
+                )
         payload = self._read_cleanup_recovery(handle)
         if payload is None:
             return attempt_ids
@@ -745,6 +751,62 @@ class RunStore:
         if isinstance(values, list):
             attempt_ids.update(value for value in values if isinstance(value, str) and value)
         return attempt_ids
+
+    def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
+        """Return exact attempts the runner reported as cleanup-uncertain.
+
+        These identities bind recovery of an older-generation attempt to the
+        run whose terminal report actually named it, without letting arbitrary
+        later reconciliation serve as evidence for that run.
+
+        :param RunHandle handle: Run whose terminal cleanup cause is read.
+        :return set[str]: Persisted uncertain attempt identities.
+        """
+        status = self._read_status(handle)
+        if status is None:
+            return set()
+        return set(status.get("uncertain_attempt_ids", []))
+
+    def cleanup_recovered_attempt_locations(
+        self,
+        handle: RunHandle,
+    ) -> dict[str, tuple[str, int, str]]:
+        """Return study-local locators from matching operator recovery evidence.
+
+        A snapshot captured during the allocation window can contain a RUNNING
+        trial before its attempt and generation attrs were written. The
+        operator recovery record binds that anonymous frozen row by phase and
+        trial number after the registry restores its durable identity.
+
+        :param RunHandle handle: Run whose operator recovery evidence is read.
+        :return dict[str, tuple[str, int, str]]: Attempt ids mapped to phase,
+            trial number, and producing generation.
+        """
+        payload = self._read_cleanup_recovery(handle)
+        if payload is None:
+            return {}
+        recovered_ids = payload.get("reaped_attempt_ids")
+        locations = payload.get("reaped_attempt_locations")
+        if not isinstance(recovered_ids, list) or not isinstance(locations, dict):
+            return {}
+        authorized = {value for value in recovered_ids if isinstance(value, str) and value}
+        result: dict[str, tuple[str, int, str]] = {}
+        for attempt_id, raw in locations.items():
+            if attempt_id not in authorized or not isinstance(raw, dict):
+                continue
+            phase = raw.get("phase")
+            trial_number = raw.get("trial_number")
+            generation_id = raw.get("generation_id")
+            if (
+                isinstance(phase, str)
+                and phase
+                and type(trial_number) is int
+                and trial_number >= 0
+                and isinstance(generation_id, str)
+                and generation_id
+            ):
+                result[attempt_id] = (phase, trial_number, generation_id)
+        return result
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
@@ -826,6 +888,21 @@ class RunStore:
             or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
         ):
             return None
+        recovered_attempt_generations = payload.get("recovered_attempt_generations")
+        if recovered_attempt_generations is not None and (
+            not isinstance(recovered_attempt_generations, dict)
+            or any(
+                not isinstance(key, str) or not key or not isinstance(value, str) or not value
+                for key, value in recovered_attempt_generations.items()
+            )
+        ):
+            return None
+        uncertain_attempt_ids = payload.get("uncertain_attempt_ids")
+        if uncertain_attempt_ids is not None and (
+            not isinstance(uncertain_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in uncertain_attempt_ids)
+        ):
+            return None
         return payload
 
     def _terminal_cleanup_uncertain(self, handle: RunHandle, status: Mapping[str, object]) -> bool:
@@ -865,6 +942,23 @@ class RunStore:
             payload.get("run_id") == handle.run_id
             and payload.get("config_sha256") == handle.config_sha256
             and payload.get("cleanup_confirmed") is True
+        ):
+            return None
+        locations = payload.get("reaped_attempt_locations")
+        if locations is not None and (
+            not isinstance(locations, dict)
+            or any(
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or not isinstance(raw, dict)
+                or not isinstance(raw.get("phase"), str)
+                or not raw.get("phase")
+                or type(raw.get("trial_number")) is not int
+                or raw["trial_number"] < 0
+                or not isinstance(raw.get("generation_id"), str)
+                or not raw.get("generation_id")
+                for attempt_id, raw in locations.items()
+            )
         ):
             return None
         return payload

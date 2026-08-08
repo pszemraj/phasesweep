@@ -40,9 +40,10 @@ from phasesweep.engine.guards import (
     _plan_artifact_root_rebinds,
     _preflight_active_attempts,
     _PreflightCleanupReport,
-    _previously_recovered_uncertain_trial_count,
+    _previously_recovered_attempt_locations,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
+    _retire_active_attempt,
     _suite_fingerprint,
     _suite_lock,
     _validate_suite_artifact_root_rebind,
@@ -943,18 +944,34 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
             reaped = 0
             reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
+            reaped_attempt_locations = store.cleanup_recovered_attempt_locations(handle)
+            causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
+            inspected_attempt_ids: set[str] = set()
+            inspected_attempt_generations: dict[str, str] = {}
+            inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
+            registered_recovery_attempt_ids: set[str] = set()
             registered_attempts_reconciled = 0
             cleanup_recovered = 0
-            previously_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
                 if confirm:
                     active_report = _PreflightCleanupReport()
-                    registered_attempt_ids = _preflight_active_attempts(config, active_report)
-                    reaped_attempt_ids.update(active_report.recovered_attempt_ids)
+                    registered_attempts = _preflight_active_attempts(
+                        config,
+                        active_report,
+                        retain_recovery_evidence=True,
+                    )
+                    registered_evidence = active_report.recovered_attempt_generations
+                    registered_recovery_attempt_ids.update(active_report.recovered_attempt_ids)
                 else:
-                    registered_attempt_ids = _inspect_active_attempts(config)
-                registered_attempts_reconciled = len(registered_attempt_ids)
+                    registered_attempts = _inspect_active_attempts(config)
+                    registered_evidence = registered_attempts
+                registered_attempts_reconciled = len(registered_attempts)
+                reaped_attempt_ids.update(
+                    attempt_id
+                    for attempt_id, generation_id in registered_evidence.items()
+                    if generation_id == run_id or attempt_id in causal_attempt_ids
+                )
                 for phase in config.phases:
                     study = _load_existing_phase_study(config, phase)
                     if study is None:
@@ -966,27 +983,57 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     # trial-level evidence on retry (review v0.5.17 gap hunt).
                     # Read before the fresh pass below, which appends to the
                     # same ledger.
-                    previously_recovered += _previously_recovered_uncertain_trial_count(
-                        study, run_id
+                    previously_recovered = _previously_recovered_attempt_locations(
+                        study,
+                        phase.name,
+                        run_id,
+                        causal_attempt_ids=causal_attempt_ids,
                     )
+                    reaped_attempt_ids.update(previously_recovered)
+                    reaped_attempt_locations.update(previously_recovered)
                     if confirm:
                         cleanup_recovered += _recover_cleanup_uncertain_trials(
                             study,
                             config,
                             phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
                         )
                         reaped += _reap_stale_trials(
                             study,
                             config,
                             phase.name,
-                            recovered_attempt_ids=reaped_attempt_ids,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
                         )
                     else:
-                        cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
-                        reaped += _inspect_stale_running_trials(study, config, phase.name)
-            cleanup_evidence_count = (
-                len(reaped_attempt_ids) + reaped + cleanup_recovered + previously_recovered
-            )
+                        cleanup_recovered += _inspect_cleanup_uncertain_trials(
+                            study,
+                            phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
+                        )
+                        reaped += _inspect_stale_running_trials(
+                            study,
+                            config,
+                            phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
+                        )
+                for attempt_id in inspected_attempt_ids:
+                    if (
+                        inspected_attempt_generations.get(attempt_id) == run_id
+                        or attempt_id in causal_attempt_ids
+                    ):
+                        reaped_attempt_ids.add(attempt_id)
+                        location = inspected_attempt_locations.get(attempt_id)
+                        if location is not None:
+                            reaped_attempt_locations[attempt_id] = location
+            cleanup_evidence_count = len(reaped_attempt_ids)
             if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
                 if inspected_studies == 0:
                     detail = (
@@ -1044,12 +1091,26 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     "reaped_running_trials": reaped,
                     "registered_attempts_reconciled": registered_attempts_reconciled,
                     "reaped_attempt_ids": sorted(reaped_attempt_ids),
+                    "reaped_attempt_locations": {
+                        attempt_id: {
+                            "phase": phase_name,
+                            "trial_number": trial_number,
+                            "generation_id": generation_id,
+                        }
+                        for attempt_id, (
+                            phase_name,
+                            trial_number,
+                            generation_id,
+                        ) in sorted(reaped_attempt_locations.items())
+                    },
                     "cleanup_uncertain_terminal_trials": cleanup_recovered,
                 }
                 private_atomic_write_text(
                     store.cleanup_recovery_path(run_id),
                     json.dumps(payload, indent=2) + "\n",
                 )
+                for attempt_id in registered_recovery_attempt_ids:
+                    _retire_active_attempt(config, attempt_id)
                 store.clear_cleanup_uncertain(handle)
                 click.echo(
                     f"Cleared cleanup uncertainty for {run_id}; reconciled "
@@ -1070,6 +1131,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     run_id,
                     terminal_status,
                     confirmed_attempt_ids=reaped_attempt_ids,
+                    confirmed_attempt_locations=reaped_attempt_locations,
                 )
 
                 click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
@@ -1088,6 +1150,7 @@ def _finalize_stored_terminal_result_snapshot(
     terminal_status: dict,
     *,
     confirmed_attempt_ids: set[str],
+    confirmed_attempt_locations: dict[str, tuple[str, int, str]],
 ) -> None:
     """Finalize and persist a snapshot captured before the experiment lock was released.
 
@@ -1095,6 +1158,8 @@ def _finalize_stored_terminal_result_snapshot(
     :param str run_id: Run whose stored terminal snapshot should be finalized.
     :param dict terminal_status: Validated terminal process status to enrich.
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
+    :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Exact
+        phase, trial, and generation locators for reconciled attempts.
     :raises click.ClickException: If the stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -1111,6 +1176,7 @@ def _finalize_stored_terminal_result_snapshot(
         terminal_status["result_snapshot"] = finalize_result_snapshot(
             raw_snapshot,
             confirmed_attempt_ids=confirmed_attempt_ids,
+            confirmed_attempt_locations=confirmed_attempt_locations,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)

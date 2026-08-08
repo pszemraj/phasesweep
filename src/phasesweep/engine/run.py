@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -108,6 +108,7 @@ class TerminalReport:
     cleanup_confirmed: bool
     recovered_attempt_ids: frozenset[str]
     uncertain_attempt_ids: frozenset[str]
+    recovered_attempt_generations: Mapping[str, str] = field(default_factory=dict)
     cleanup_error: BaseException | None = None
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
@@ -402,6 +403,9 @@ def _run_experiment_outcome(
                 primary_error=None,
                 cleanup_confirmed=True,
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                recovered_attempt_generations=MappingProxyType(
+                    dict(cleanup.recovered_attempt_generations)
+                ),
                 uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 failure_stage=None,
                 winners=MappingProxyType(dict(result)),
@@ -432,6 +436,9 @@ def _run_experiment_outcome(
                         reconciliation.mark_uncertain(cleanup_exc)
                     log.exception("failed to reconcile all existing studies after run termination")
                 cleanup.recovered_attempt_ids.update(reconciliation.recovered_attempt_ids)
+                cleanup.recovered_attempt_generations.update(
+                    reconciliation.recovered_attempt_generations
+                )
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
@@ -468,6 +475,9 @@ def _run_experiment_outcome(
                 primary_error=primary_error,
                 cleanup_confirmed=cleanup.cleanup_confirmed,
                 recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                recovered_attempt_generations=MappingProxyType(
+                    dict(cleanup.recovered_attempt_generations)
+                ),
                 uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 cleanup_error=cleanup.error,
                 failure_stage="execution" if generation_prepared else "preflight",
@@ -494,6 +504,9 @@ def _run_experiment_outcome(
                             primary_error=terminal_error,
                             cleanup_confirmed=cleanup.cleanup_confirmed,
                             recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+                            recovered_attempt_generations=MappingProxyType(
+                                dict(cleanup.recovered_attempt_generations)
+                            ),
                             uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                             cleanup_error=cleanup.error,
                             failure_stage=("execution" if generation_prepared else "preflight"),

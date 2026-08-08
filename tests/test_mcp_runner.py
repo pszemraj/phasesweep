@@ -636,6 +636,19 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         {"trial_number": 1, "generation_id": None, "attempt_id": None}
     ]
 
+    fully_finalized = mcp_runner.finalize_result_snapshot(
+        snapshot,
+        confirmed_attempt_ids={"current-attempt", "allocated-attempt"},
+        confirmed_attempt_locations={
+            "allocated-attempt": ("p", 1, "prior-generation"),
+        },
+    )
+
+    fully_finalized_phase = fully_finalized["status"]["phases"][0]
+    assert fully_finalized_phase["trials"] == {"RUNNING": 0, "FAIL": 2}
+    assert fully_finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
+    assert fully_finalized_phase["running_attempts"] == []
+
 
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
     """Engine-supplied winners are frozen verbatim, with no second file read."""
