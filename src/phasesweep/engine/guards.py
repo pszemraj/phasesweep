@@ -708,7 +708,7 @@ def _read_trial_process_identity(
         ) from exc
 
 
-ATTEMPT_REGISTRY_SCHEMA_VERSION = 2
+ATTEMPT_REGISTRY_SCHEMA_VERSION = 3
 _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
     {
         "schema_version",
@@ -716,6 +716,7 @@ _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
         "experiment",
         "phase",
         "study_name",
+        "storage_identity",
         "storage_locator",
         "trial_number",
         "trial_dir",
@@ -773,6 +774,7 @@ def _register_active_attempt(
             "experiment": experiment.experiment,
             "phase": phase_name,
             "study_name": study_name,
+            "storage_identity": canonical_storage_identity(experiment.storage),
             "storage_locator": storage_recovery_locator(experiment.storage),
             "trial_number": trial_number,
             "trial_dir": str(trial_dir),
@@ -833,9 +835,15 @@ def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
         or not isinstance(payload.get("trial_dir"), str)
         or not isinstance(payload.get("study_name"), str)
         or (
+            payload.get("storage_identity") is not None
+            and not isinstance(payload.get("storage_identity"), str)
+        )
+        or (
             payload.get("storage_locator") is not None
             and not isinstance(payload.get("storage_locator"), str)
         )
+        or canonical_storage_identity(payload.get("storage_locator"))
+        != payload.get("storage_identity")
         or not isinstance(payload.get("generation_id"), str)
         or not payload.get("generation_id")
         or type(payload.get("trial_number")) is not int

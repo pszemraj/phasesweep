@@ -1267,6 +1267,8 @@ def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(tmp_path: 
     payload = json.loads(entry_path.read_text())
     assert payload["schema_version"] == ATTEMPT_REGISTRY_SCHEMA_VERSION
     assert payload["storage_locator"] == storage
+    assert payload["storage_identity"] == "rdb://postgresql://researcher@db.internal:5432/studies"
+    assert "secret" not in payload["storage_identity"]
     assert "storage" not in payload
     assert entry_path.parent.stat().st_mode & 0o777 == 0o700
     assert entry_path.stat().st_mode & 0o777 == 0o600
