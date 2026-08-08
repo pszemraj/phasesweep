@@ -390,7 +390,7 @@ class RunStore:
             return None
         try:
             handle = RunHandle(**payload)
-        except (TypeError, KeyError, ValueError):
+        except TypeError:
             return None
         if handle.run_id != expected_run_id:
             return None

@@ -1258,7 +1258,7 @@ class PhaseSweepMCP:
                 handle.config_sha256,
                 source=f"run snapshot {handle.run_id}",
             )
-        except (OSError, ValueError, yaml.YAMLError) as exc:
+        except (OSError, ValueError) as exc:
             log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)
             raise RunSnapshotUnavailableError(handle.run_id) from None
 

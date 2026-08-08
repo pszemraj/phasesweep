@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite
@@ -361,7 +360,7 @@ def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
     """
     try:
         raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError) as exc:
         raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
     try:
         catalog = _Catalog.model_validate(raw)
@@ -391,7 +390,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     try:
         config_bytes = cfg_path.read_bytes()
         config = load_config_bytes(config_bytes, source=cfg_path)
-    except (ValueError, OSError, yaml.YAMLError) as exc:
+    except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
     if isinstance(config, Suite):
         raise CatalogError(
