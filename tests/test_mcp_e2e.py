@@ -327,8 +327,9 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "never propose a run" in numbered_rules[5]
     assert "convergence, trends, robustness, causality" in numbered_rules[7]
     # Historical labels stay historical (review v0.5.16 / blocker 4).
-    assert "`published_config_matches_current` is `false`" in numbered_rules[8]
-    assert "report them as historical" in numbered_rules[8]
+    assert "`result_context` is `represented_generation`" in numbered_rules[8]
+    assert "`published_config_matches_current: false`" in numbered_rules[8]
+    assert "historical labels recorded by that generation" in numbered_rules[8]
     assert "Never edit an experiment config yourself" in numbered_rules[9]
     assert "search space, samplers, gates" in numbered_rules[9]
     assert "Never open raw datasets" in numbered_rules[10]
