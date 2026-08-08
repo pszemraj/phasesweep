@@ -20,6 +20,7 @@ from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
+    sqlite_database_path,
     storage_backend,
 )
 from tests.conftest import make_experiment, write_yaml
@@ -473,6 +474,14 @@ def test_sqlite_uri_file_storage_identity_resolves_actual_path(tmp_path: Path) -
     plain_storage = f"sqlite:///{db}"
 
     assert canonical_storage_identity(uri_storage) == canonical_storage_identity(plain_storage)
+
+
+def test_sqlite_database_path_rejects_remote_file_uri_authorities(tmp_path: Path) -> None:
+    remote = "sqlite:///file://db-host/tmp/phases.db?uri=true"
+    local = f"sqlite:///file://localhost{tmp_path}/phases.db?uri=true"
+
+    assert sqlite_database_path(remote) is None
+    assert sqlite_database_path(local) == tmp_path / "phases.db"
 
 
 def test_sqlite_uri_memory_storage_identity_is_in_memory() -> None:

@@ -168,6 +168,34 @@ def test_private_atomic_write_text_stays_owner_only_under_any_umask(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_private_file_in_shared_tree_creates_umask_governed_parents(tmp_path: Path) -> None:
+    path = tmp_path / "artifact-root" / "generation" / "config.snapshot.yaml"
+
+    with temporary_umask(0o022):
+        private_atomic_write_text(path, "secret\n", require_private_dir=False)
+
+    assert stat.S_IMODE((tmp_path / "artifact-root").stat().st_mode) == 0o755
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_atomic_writer_does_not_inherit_mode_through_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("target\n")
+    target.chmod(0o600)
+    destination = tmp_path / "summary.yaml"
+    destination.symlink_to(target)
+
+    with temporary_umask(0o022):
+        atomic_write_text(destination, "replacement\n")
+
+    assert destination.is_file() and not destination.is_symlink()
+    assert destination.read_text() == "replacement\n"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o644
+    assert target.read_text() == "target\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_atomic_text_writer_leaves_no_temporary_files(tmp_path: Path) -> None:
     """Staging files are cleaned up on both the commit path and the failure path."""
     artifacts = tmp_path / "artifacts"

@@ -827,7 +827,12 @@ def _private_atomic_writer(
     :return Iterator[IO[str]]: Writable text handle on the temporary file,
         open for the caller to populate before the atomic replace.
     """
-    parent_fd = open_directory_fd(path.parent, create=True, private_final=require_private_dir)
+    parent_fd = open_directory_fd(
+        path.parent,
+        create=True,
+        private_final=require_private_dir,
+        umask_created_dirs=not require_private_dir,
+    )
     leaf = leaf_name(path)
     fd = -1
     temporary: str | None = None
@@ -930,9 +935,13 @@ def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        target_mode: int | None = stat.S_IMODE(path.stat().st_mode)
+        target_info = path.lstat()
     except FileNotFoundError:
         target_mode = None
+    else:
+        target_mode = (
+            stat.S_IMODE(target_info.st_mode) if stat.S_ISREG(target_info.st_mode) else None
+        )
     fd = -1
     tmp_path: Path | None = None
     replaced = False
@@ -1158,7 +1167,8 @@ def sqlite_database_path(storage: str) -> Path | None:
         return None
     database = file_url_path(storage)
     if _sqlite_uri_filename_enabled(storage, database):
-        return Path(unquote(urlsplit(database).path)).expanduser()
+        uri_path = sqlite_uri_filename_path(storage)
+        return Path(uri_path).expanduser() if uri_path is not None else None
     return Path(database).expanduser()
 
 

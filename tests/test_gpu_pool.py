@@ -61,10 +61,12 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
         assert gid is None
 
 
-def test_gpu_pool_create_normalizes_explicit_device_tokens() -> None:
-    pool = GpuPool.create(n_jobs=1, explicit_devices=[" GPU-a "])
+def test_gpu_pool_create_normalizes_explicit_device_tokens(monkeypatch) -> None:
+    uuid = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    pool = GpuPool.create(n_jobs=1, explicit_devices=[f" {uuid} "])
 
-    assert [device.visible_token for device in pool._devices] == ["GPU-a"]
+    assert [device.visible_token for device in pool._devices] == [uuid]
 
 
 def test_explicit_gpu_ids_honored_for_single_job():
@@ -165,17 +167,20 @@ def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):
 
 
 def test_nonnumeric_cuda_visible_devices_is_leased_as_opaque_token(monkeypatch):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-deadbeef")
+    uuid = "GPU-deadbeef"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", uuid)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
 
     pool = GpuPool.create(n_jobs=1)
     with pool.acquire() as gid:
-        assert gid == "GPU-deadbeef"
+        assert gid == uuid
 
 
 def test_mig_cuda_visible_devices_get_safe_lock_names(monkeypatch, tmp_path):
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     token = "MIG-GPU-deadbeef/3/0"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", token)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: {token})
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -205,6 +210,9 @@ def test_cuda_visible_devices_minus_one_is_no_visible_gpu(monkeypatch, caplog):
 def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> None:
     """Pool locks follow the trainer's configured environment override."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": "GPU-configured"}
+    )
 
     pool = GpuPool.create(n_jobs=1, cuda_visible_devices="GPU-configured")
 
@@ -212,7 +220,9 @@ def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> N
         assert gid == "GPU-configured"
 
 
-def test_explicit_gpu_devices_preserve_tokens_and_dedupe():
+def test_explicit_gpu_devices_preserve_tokens_and_dedupe(monkeypatch):
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": "GPU-a"})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: {"MIG-GPU-b/1/0"})
     pool = GpuPool.create(
         n_jobs=2,
         explicit_devices=["GPU-a", "MIG-GPU-b/1/0", "GPU-a"],
@@ -326,6 +336,7 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
     uuid = "GPU-deadbeef"
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
     mig_token = "MIG-GPU-deadbeef/3/0"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: {mig_token})
 
     mig = GpuPool.create(n_jobs=1, explicit_devices=[mig_token])
     parent = GpuPool.create(n_jobs=1, explicit_ids=[0])
@@ -352,11 +363,10 @@ def test_unreadable_uuid_map_keeps_numeric_lock_names(tmp_path, monkeypatch) -> 
 
 def test_unreadable_uuid_map_rejects_mixed_token_forms(monkeypatch) -> None:
     """Mixed indices and opaque tokens without nvidia-smi fail closed, not silently."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,GPU-deadbeef")
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
 
-    with pytest.raises(RuntimeError, match="one convention"):
-        GpuPool.create(n_jobs=1)
+    with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
+        GpuPool.create(n_jobs=1, explicit_devices=["0", "GPU-deadbeef"])
 
 
 def test_unknown_numeric_index_fails_closed(monkeypatch) -> None:
@@ -425,16 +435,13 @@ def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch
     assert prefix_pool._devices[0].visible_token == "GPU-2b23"
 
 
-def test_abbreviated_uuid_prefix_without_map_degrades_loudly(tmp_path, monkeypatch, caplog) -> None:
-    """An unresolvable abbreviated prefix keeps its own lock identity and warns."""
+def test_abbreviated_uuid_prefix_without_map_fails_closed(tmp_path, monkeypatch) -> None:
+    """An unverified UUID prefix cannot reserve a lock for a physical device."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
-        pool = GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
-
-    assert pool._devices[0].lock_identity == "GPU-2b23"
-    assert any("abbreviated GPU UUID" in record.message for record in caplog.records)
+    with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
+        GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
 
 
 def test_lowercase_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
@@ -453,14 +460,52 @@ def test_lowercase_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, m
     assert prefix_pool._devices[0].visible_token == "gpu-2b23"
 
 
-def test_unresolvable_opaque_token_fails_closed(monkeypatch) -> None:
+def test_lowercase_full_uuid_shares_the_numeric_index_lock(tmp_path, monkeypatch) -> None:
+    """Full UUID spellings are case-insensitive for both validation and locking."""
+    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    lowercase = GpuPool.create(n_jobs=1, explicit_devices=[uuid.lower()])
+    by_index = GpuPool.create(n_jobs=1, explicit_ids=[0])
+
+    assert _gpu_lock_path(lowercase._devices[0]) == _gpu_lock_path(by_index._devices[0])
+    assert lowercase._devices[0].visible_token == uuid.lower()
+
+
+def test_whole_node_rejects_case_only_uuid_aliases(monkeypatch) -> None:
+    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+
+    with pytest.raises(RuntimeError, match="only 1 distinct physical GPU"):
+        GpuPool.create(
+            n_jobs=1,
+            explicit_devices=[uuid, uuid.lower()],
+            policy="whole_node",
+        )
+
+
+@pytest.mark.parametrize("prefix", ["GPU-", "MIG-"])
+def test_nonexistent_uuid_token_fails_closed(prefix: str, monkeypatch) -> None:
+    token = f"{prefix}00000000-0000-0000-0000-000000000000"
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: set())
+
+    with pytest.raises(RuntimeError, match="no usable (?:GPU UUID|MIG)|matches no device"):
+        GpuPool.create(n_jobs=1, explicit_devices=[token])
+
+
+def test_unresolvable_opaque_token_fails_closed_when_explicit(monkeypatch, caplog) -> None:
     """A token that is neither numeric nor GPU-/MIG- shaped gives CUDA nothing
     to expose while the real GPUs sit unlocked — the opaque equivalent of a
     nonexistent numeric index, which already fails closed."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,bogus")
 
-    with pytest.raises(RuntimeError, match="not a numeric index"):
-        GpuPool.create(n_jobs=1)
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        ambient = GpuPool.create(n_jobs=1)
+    with ambient.acquire() as visible:
+        assert visible == ""
+    assert any("Ambient CUDA_VISIBLE_DEVICES" in record.message for record in caplog.records)
 
     with pytest.raises(RuntimeError, match="not a numeric index"):
         GpuPool.create(n_jobs=1, explicit_devices=["bogus"])
@@ -485,6 +530,34 @@ def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(monkeypat
 
     with pool.acquire() as gid:
         assert gid == "-1"
+
+
+def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> None:
+    """A configured disable sentinel is already an explicit, isolated CPU request."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    pool = GpuPool.create(n_jobs=4, cuda_visible_devices="-1")
+
+    with pool.acquire() as gid:
+        assert gid == "-1"
+
+
+def test_ambient_scheduler_sentinel_warns_and_becomes_empty_visibility(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid == ""
+    assert any("treating it as empty visibility" in record.message for record in caplog.records)
+
+
+def test_configured_junk_visibility_is_not_a_disable_sentinel(monkeypatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    with pytest.raises(RuntimeError, match="not the empty string"):
+        GpuPool.create(n_jobs=1, cuda_visible_devices=",")
 
 
 def test_lock_layer_failure_does_not_shrink_the_pool(tmp_path, monkeypatch) -> None:

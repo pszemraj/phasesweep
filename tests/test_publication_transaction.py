@@ -53,6 +53,7 @@ from phasesweep.engine.state import (
     _suite_generation_record_path,
     _suite_generation_summary_path,
     _suite_summary_path,
+    _unresolvable_pointer,
 )
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
@@ -806,6 +807,25 @@ def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: 
     assert "publication_error" not in status
     assert status["published_generation_id"] is None
     assert status["is_published"] is False
+
+
+def test_unreadable_pointer_is_failed_not_an_internal_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pointer = tmp_path / "last_successful_generation.yaml"
+    real_stat = Path.stat
+
+    def deny_stat(path: Path, *args: object, **kwargs: object):
+        if path == pointer:
+            raise PermissionError("permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", deny_stat)
+
+    verdict = _unresolvable_pointer(pointer, "experiment 'x'")
+
+    assert verdict.state == "failed"
+    assert verdict.error is not None
 
 
 def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:

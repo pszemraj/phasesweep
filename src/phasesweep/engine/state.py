@@ -1170,8 +1170,12 @@ def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPo
     :return PublicationPointer: ``absent`` when no pointer file exists,
         ``failed`` when one exists but cannot be resolved.
     """
-    if not pointer_path.exists():
+    try:
+        pointer_path.stat()
+    except FileNotFoundError:
         return PublicationPointer(state="absent", generation_id=None, error=None)
+    except OSError:
+        pass
     return PublicationPointer(
         state="failed",
         generation_id=None,
