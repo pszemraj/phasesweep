@@ -25,8 +25,9 @@ def _capture_launch_env(
     experiment_env: dict[str, str] | None = None,
     execution: ExecutionContext | None = None,
     gpu_id: int | str | None = 2,
-) -> dict[str, str]:
-    captured: dict[str, str] = {}
+    gpu_lease_fds: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
 
     def fake_run_supervised(
         _cmd: str,
@@ -38,11 +39,13 @@ def _capture_launch_env(
         trial_dir: Path,
         attempt_id: str,
         cwd: str | None = None,
+        gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
         captured.update(env)
         captured["run_supervised_attempt_id"] = attempt_id
         if cwd is not None:
             captured["run_supervised_cwd"] = cwd
+        captured["gpu_lease_fds"] = gpu_lease_fds
         return ProcessResult(
             return_code=0,
             timed_out=False,
@@ -61,8 +64,19 @@ def _capture_launch_env(
         overrides={},
         timeout_seconds=None,
         gpu_id=gpu_id,
+        gpu_lease_fds=gpu_lease_fds,
     )
     return captured
+
+
+def test_launch_trial_forwards_gpu_lease_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trainer supervisor inherits the descriptors backing its GPU assignment."""
+    env = _capture_launch_env(tmp_path, monkeypatch, gpu_lease_fds=(17, 23))
+
+    assert env["gpu_lease_fds"] == (17, 23)
 
 
 @pytest.mark.parametrize(

@@ -752,7 +752,7 @@ def _run_phase(
 
         # GPU lease covers only subprocess lifetime, not extraction (#2).
         try:
-            with gpu_pool.acquire(deadline=optimize_deadline) as gpu_id:
+            with gpu_pool.acquire(deadline=optimize_deadline) as gpu_assignment:
                 # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
                 # extended to fatal objective errors). Without this, queued
                 # objective threads that passed the outer check before a peer
@@ -786,7 +786,8 @@ def _run_phase(
                     trial_dir=trial_dir,
                     overrides=overrides,
                     timeout_seconds=timeout_seconds,
-                    gpu_id=gpu_id,
+                    gpu_id=gpu_assignment.visible_devices,
+                    gpu_lease_fds=gpu_assignment.lease_fds,
                 )
 
                 # CRITICAL: this check must happen INSIDE the GPU lease (review

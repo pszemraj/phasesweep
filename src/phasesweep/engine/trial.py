@@ -350,6 +350,7 @@ def launch_trial(
     overrides: dict[str, Any],
     timeout_seconds: float | None,
     gpu_id: int | str | None = None,
+    gpu_lease_fds: tuple[int, ...] = (),
 ) -> ExecutedTrial:
     """Launch the trial subprocess. Call this while holding the GPU lease.
 
@@ -376,6 +377,9 @@ def launch_trial(
             trainer work (review v0.5.16 / blocker 6).
         gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
+        gpu_lease_fds: Host GPU-lock descriptors inherited by the trainer so
+            exclusion lasts for its process lifetime even if the orchestrator
+            exits abruptly.
 
     Returns:
         :class:`ExecutedTrial` bundling the trial context, the supervised
@@ -470,6 +474,7 @@ def launch_trial(
             trial_dir=workdir,
             attempt_id=attempt_id,
             cwd=None if trainer_cwd is None else str(trainer_cwd),
+            gpu_lease_fds=gpu_lease_fds,
         )
 
     ctx = TrialContext(

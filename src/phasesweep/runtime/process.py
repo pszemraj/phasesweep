@@ -1143,6 +1143,7 @@ def _spawn_blocked_supervisor(
     stdout: IO[str],
     stderr: IO[str],
     deadline: float | None = None,
+    gpu_lease_fds: Collection[int] = (),
 ) -> tuple[subprocess.Popen, int, int]:
     """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
@@ -1166,6 +1167,9 @@ def _spawn_blocked_supervisor(
             expires during the readiness wait, the spawn is aborted and
             :class:`_LaunchDeadlineExpired` is raised so the caller reports a
             timeout instead of a generic launch failure.
+        gpu_lease_fds: Open host GPU-lock descriptors deliberately inherited
+            by the supervisor and trainer so the kernel lease outlives an
+            orchestrator hard exit.
 
     Returns:
         A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
@@ -1203,7 +1207,7 @@ def _spawn_blocked_supervisor(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
-            pass_fds=(ready_write, ack_read),
+            pass_fds=(ready_write, ack_read, *gpu_lease_fds),
         )
         closed_fd = ready_write
         ready_write = -1
@@ -1260,6 +1264,7 @@ def run_supervised(
     trial_dir: Path,
     attempt_id: str,
     cwd: str | None = None,
+    gpu_lease_fds: Collection[int] = (),
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
@@ -1309,6 +1314,9 @@ def run_supervised(
             exec'ing the trainer, delivered over the ack pipe with the rest
             of the launch payload (review v0.5.17 / blocker 4). ``None``
             keeps the invocation cwd.
+        gpu_lease_fds: Open host GPU-lock descriptors inherited through the
+            supervisor's exec chain. The orchestrator closes only its copies;
+            the kernel retains each lock until the trainer exits.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
@@ -1353,6 +1361,7 @@ def run_supervised(
                 stdout=stdout,
                 stderr=stderr,
                 deadline=deadline,
+                gpu_lease_fds=gpu_lease_fds,
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,

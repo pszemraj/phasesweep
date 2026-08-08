@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import os
+import shlex
 import shutil
+import signal
+import sys
 import time
+from contextlib import suppress
 
 import pytest
 
@@ -23,6 +28,7 @@ from phasesweep.runtime.gpu import (
     _gpu_lock_path,
     _try_host_gpu_lease,
 )
+from phasesweep.runtime.process import run_supervised
 
 # Bound before any monkeypatching so hardware tests can restore the real probe.
 _real_detect_gpu_inventory = _detect_gpu_inventory
@@ -62,7 +68,8 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True)
     with pool.acquire() as gid:
-        assert gid is None
+        assert gid.visible_devices is None
+        assert gid.lease_fds == ()
 
 
 def test_gpu_pool_create_normalizes_explicit_device_tokens(monkeypatch) -> None:
@@ -77,14 +84,16 @@ def test_explicit_gpu_ids_honored_for_single_job():
     """A single-job phase with gpu_ids=[3] must isolate to GPU 3, not no-op."""
     pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
     with pool.acquire() as gid:
-        assert gid == "3"
+        assert gid.visible_devices == "3"
+        assert len(gid.lease_fds) == 1
 
 
 def test_whole_node_policy_assigns_all_configured_devices() -> None:
     pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1, 2], policy="whole_node")
 
     with pool.acquire() as gid:
-        assert gid == "0,1,2"
+        assert gid.visible_devices == "0,1,2"
+        assert len(gid.lease_fds) == 3
 
 
 def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> None:
@@ -107,7 +116,8 @@ def test_none_policy_disables_cuda_isolation(monkeypatch) -> None:
     pool = GpuPool.create(n_jobs=1, policy="none")
 
     with pool.acquire() as gid:
-        assert gid is None
+        assert gid.visible_devices is None
+        assert gid.lease_fds == ()
 
 
 def test_gpu_acquire_respects_deadline_when_local_slot_is_busy() -> None:
@@ -136,7 +146,7 @@ def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
     pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid == "3"
+        assert gid.visible_devices == "3"
 
 
 def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
@@ -147,7 +157,7 @@ def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
     pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid is None
+        assert gid.visible_devices is None
 
 
 def test_single_job_warns_when_nvidia_smi_is_broken_on_gpu_host(
@@ -170,7 +180,7 @@ def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):
     pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid == "2"
+        assert gid.visible_devices == "2"
 
 
 def test_nonnumeric_cuda_visible_devices_is_leased_as_opaque_token(monkeypatch):
@@ -180,7 +190,7 @@ def test_nonnumeric_cuda_visible_devices_is_leased_as_opaque_token(monkeypatch):
 
     pool = GpuPool.create(n_jobs=1)
     with pool.acquire() as gid:
-        assert gid == uuid
+        assert gid.visible_devices == uuid
 
 
 def test_mig_cuda_visible_devices_get_safe_lock_names(monkeypatch, tmp_path):
@@ -192,7 +202,7 @@ def test_mig_cuda_visible_devices_get_safe_lock_names(monkeypatch, tmp_path):
     pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid == token
+        assert gid.visible_devices == token
         locks = list(tmp_path.glob("gpu_*.lock"))
         assert len(locks) == 1
         assert "/" not in locks[0].name
@@ -209,7 +219,7 @@ def test_cuda_visible_devices_minus_one_is_no_visible_gpu(monkeypatch, caplog):
     with pool.acquire() as gid:
         # The sentinel is pinned, not dropped: a narrowed inherit_env contract
         # must not silently re-expose every host GPU to the trainer.
-        assert gid == "-1"
+        assert gid.visible_devices == "-1"
     assert any("exposes no devices" in record.message for record in caplog.records)
     assert not any("nvidia-smi detected no GPUs" in record.message for record in caplog.records)
 
@@ -224,7 +234,7 @@ def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> N
     pool = GpuPool.create(n_jobs=1, cuda_visible_devices="GPU-configured")
 
     with pool.acquire() as gid:
-        assert gid == "GPU-configured"
+        assert gid.visible_devices == "GPU-configured"
 
 
 def test_explicit_gpu_devices_preserve_tokens_and_dedupe(monkeypatch):
@@ -236,9 +246,9 @@ def test_explicit_gpu_devices_preserve_tokens_and_dedupe(monkeypatch):
     )
     acquired = []
     with pool.acquire() as gid:
-        acquired.append(gid)
+        acquired.append(gid.visible_devices)
     with pool.acquire() as gid:
-        acquired.append(gid)
+        acquired.append(gid.visible_devices)
     assert acquired == ["GPU-a", "MIG-GPU-b/1/0"]
 
 
@@ -248,7 +258,7 @@ def test_explicit_gpu_ids_dedupe_preserves_order():
     acquired = []
     for _ in range(3):
         with pool.acquire() as gpu_id:
-            acquired.append(gpu_id)
+            acquired.append(gpu_id.visible_devices)
     assert acquired == ["2", "0", "1"]
 
 
@@ -263,9 +273,81 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
         fcntl.flock(held, fcntl.LOCK_EX)
         pool = GpuPool.create(n_jobs=1, explicit_ids=[3, 4])
         with pool.acquire() as gid:
-            assert gid == "4"
+            assert gid.visible_devices == "4"
         assert lock_path.read_text() == holder_marker
         fcntl.flock(held, fcntl.LOCK_UN)
+
+
+def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> None:
+    """A live trainer retains its host lock after its orchestrator is SIGKILLed."""
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: locks)
+    started = tmp_path / "trainer_started"
+    trainer = (
+        f"import os, time; open({str(started)!r}, 'w').write(str(os.getpgrp())); time.sleep(1.5)"
+    )
+    command = shlex.join([sys.executable, "-c", trainer])
+    orchestrator_pid = os.fork()
+    reaped = False
+    trainer_pgid: int | None = None
+    if orchestrator_pid == 0:
+        try:
+            trial_dir = tmp_path / "trial"
+            trial_dir.mkdir()
+            pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
+            with (
+                pool.acquire() as assignment,
+                (trial_dir / "stdout.log").open("w") as stdout,
+                (trial_dir / "stderr.log").open("w") as stderr,
+            ):
+                run_supervised(
+                    command,
+                    env=os.environ.copy(),
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=10.0,
+                    trial_dir=trial_dir,
+                    attempt_id="hard-exit-attempt",
+                    gpu_lease_fds=assignment.lease_fds,
+                )
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+
+    try:
+        marker_deadline = time.monotonic() + 5.0
+        while not started.is_file() and time.monotonic() < marker_deadline:
+            exited, _ = os.waitpid(orchestrator_pid, os.WNOHANG)
+            if exited:
+                reaped = True
+                pytest.fail("orchestrator exited before the trainer started")
+            time.sleep(0.01)
+        assert started.is_file()
+        trainer_pgid = int(started.read_text())
+
+        os.kill(orchestrator_pid, signal.SIGKILL)
+        os.waitpid(orchestrator_pid, 0)
+        reaped = True
+
+        competitor = GpuPool.create(n_jobs=1, explicit_ids=[0])
+        with (
+            pytest.raises(GpuLeaseTimeoutError, match="Wallclock deadline"),
+            competitor.acquire(deadline=time.monotonic() + 0.1),
+        ):
+            pass
+
+        with competitor.acquire(deadline=time.monotonic() + 3.0) as assignment:
+            assert assignment.visible_devices == "0"
+    finally:
+        if not reaped:
+            with suppress(ProcessLookupError):
+                os.kill(orchestrator_pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(orchestrator_pid, 0)
+        if trainer_pgid is not None and trainer_pgid != os.getpgrp():
+            with suppress(ProcessLookupError):
+                os.killpg(trainer_pgid, signal.SIGKILL)
 
 
 def test_numeric_index_and_uuid_token_lock_the_same_physical_gpu(tmp_path, monkeypatch) -> None:
@@ -281,7 +363,7 @@ def test_numeric_index_and_uuid_token_lock_the_same_physical_gpu(tmp_path, monke
 
     with by_index.acquire() as gid:
         # The trainer still sees the token the operator configured.
-        assert gid == "0"
+        assert gid.visible_devices == "0"
         with (
             pytest.raises(TimeoutError, match="Wallclock deadline"),
             by_uuid.acquire(deadline=time.monotonic() + 0.02),
@@ -304,7 +386,7 @@ def test_autodetected_indices_resolve_to_the_same_lock_as_uuid_tokens(tmp_path, 
 
     assert _gpu_lock_path(detected._devices[0]) == _gpu_lock_path(GpuDevice(uuid))
     with detected.acquire() as gid:
-        assert gid == "0"
+        assert gid.visible_devices == "0"
 
 
 def test_ambient_uuid_and_configured_index_share_one_lock(tmp_path, monkeypatch) -> None:
@@ -318,7 +400,7 @@ def test_ambient_uuid_and_configured_index_share_one_lock(tmp_path, monkeypatch)
     configured = GpuPool.create(n_jobs=1, explicit_ids=[0])
 
     with ambient.acquire() as gid:
-        assert gid == uuid
+        assert gid.visible_devices == uuid
         with (
             pytest.raises(TimeoutError, match="Wallclock deadline"),
             configured.acquire(deadline=time.monotonic() + 0.02),
@@ -351,8 +433,8 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
     assert mig._devices[0].lock_identity == mig_token
     assert _gpu_lock_path(mig._devices[0]) != _gpu_lock_path(parent._devices[0])
     with mig.acquire() as mig_gid, parent.acquire() as parent_gid:
-        assert mig_gid == mig_token
-        assert parent_gid == "0"
+        assert mig_gid.visible_devices == mig_token
+        assert parent_gid.visible_devices == "0"
 
 
 def test_unreadable_uuid_map_rejects_numeric_tokens(monkeypatch) -> None:
@@ -519,7 +601,7 @@ def test_unresolvable_opaque_token_fails_closed_when_explicit(monkeypatch, caplo
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
         ambient = GpuPool.create(n_jobs=1)
     with ambient.acquire() as visible:
-        assert visible == ""
+        assert visible.visible_devices == ""
     assert any("Ambient CUDA_VISIBLE_DEVICES" in record.message for record in caplog.records)
 
     with pytest.raises(RuntimeError, match="not a numeric index"):
@@ -534,7 +616,7 @@ def test_empty_cuda_visible_devices_sentinel_is_pinned(monkeypatch) -> None:
     pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid == ""
+        assert gid.visible_devices == ""
 
 
 def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(monkeypatch) -> None:
@@ -544,7 +626,7 @@ def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(monkeypat
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True, cuda_visible_devices="-1")
 
     with pool.acquire() as gid:
-        assert gid == "-1"
+        assert gid.visible_devices == "-1"
 
 
 def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> None:
@@ -554,7 +636,7 @@ def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> N
     pool = GpuPool.create(n_jobs=4, cuda_visible_devices="-1")
 
     with pool.acquire() as gid:
-        assert gid == "-1"
+        assert gid.visible_devices == "-1"
 
 
 def test_ambient_scheduler_sentinel_warns_and_becomes_empty_visibility(monkeypatch, caplog) -> None:
@@ -564,7 +646,7 @@ def test_ambient_scheduler_sentinel_warns_and_becomes_empty_visibility(monkeypat
         pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
-        assert gid == ""
+        assert gid.visible_devices == ""
     assert any("treating it as empty visibility" in record.message for record in caplog.records)
 
 
@@ -595,7 +677,7 @@ def test_lock_layer_failure_does_not_shrink_the_pool(tmp_path, monkeypatch) -> N
 
     assert [device.visible_token for device in pool._available] == ["3"]
     with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
-        assert gid == "3"
+        assert gid.visible_devices == "3"
 
 
 def test_whole_node_lock_layer_failure_releases_partial_leases(tmp_path, monkeypatch) -> None:
@@ -619,7 +701,7 @@ def test_whole_node_lock_layer_failure_releases_partial_leases(tmp_path, monkeyp
     assert pool._whole_node_in_use is False
     monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", _try_host_gpu_lease)
     with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
-        assert gid == "0,1"
+        assert gid.visible_devices == "0,1"
 
 
 def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
@@ -846,7 +928,7 @@ def test_whole_node_accepts_distinct_physical_gpus(monkeypatch) -> None:
 
     assert [device.visible_token for device in pool._devices] == ["0", "1"]
     with pool.acquire() as gid:
-        assert gid == "0,1"
+        assert gid.visible_devices == "0,1"
 
 
 @pytest.mark.parametrize(

@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Generator, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -83,6 +83,14 @@ class GpuDevice:
         normalized = _SAFE_LOCK_TOKEN.sub("_", identity).strip("_") or "device"
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         return f"{normalized[:48]}_{digest}"
+
+
+@dataclass(frozen=True)
+class GpuAssignment:
+    """Trainer visibility plus the inherited file descriptors backing its lease."""
+
+    visible_devices: str | None
+    lease_fds: tuple[int, ...]
 
 
 @dataclass
@@ -144,10 +152,17 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
 
 
 def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
-    """Release a host-wide GPU lock."""
+    """Close this process's lease copy without unlocking inherited copies.
+
+    ``flock(LOCK_UN)`` operates on the shared open-file description and would
+    release the trainer's inherited lock too. Closing only our descriptor
+    keeps the lock alive after an orchestrator crash or uncertain cleanup,
+    until the last trainer-side copy closes.
+    """
     if lease is None:
         return
-    unlock_file(lease.handle)
+    with suppress(OSError):
+        lease.handle.close()
 
 
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
@@ -822,17 +837,17 @@ class GpuPool:
             self._condition.notify()
 
     @contextmanager
-    def acquire(self, *, deadline: float | None = None) -> Generator[str | None, None, None]:
-        """Block until a GPU is available, yield its CUDA-visible token, release on exit.
+    def acquire(self, *, deadline: float | None = None) -> Generator[GpuAssignment, None, None]:
+        """Block until a GPU is available and yield its visibility plus lease FDs.
 
         Args:
             deadline: Optional ``time.monotonic()`` deadline for the wait.
 
         Yields:
-            The CUDA_VISIBLE_DEVICES token for this critical section; the
-            pinned disable sentinel when the pool is inactive because CUDA
-            visibility is switched off; ``None`` when the pool is inactive
-            with nothing to pin.
+            A :class:`GpuAssignment` carrying the CUDA visibility token (the
+            pinned disable sentinel for explicit CPU isolation, or ``None``
+            for an inactive pool) and the host-lock descriptors the trainer
+            must inherit so exclusion survives an orchestrator hard exit.
 
         Raises:
             GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
@@ -840,10 +855,18 @@ class GpuPool:
         """
         acquired = self._acquire(deadline=deadline)
         try:
-            if acquired is not None:
-                yield acquired.visible_devices
-            else:
-                yield self._pinned_visible_devices
+            yield GpuAssignment(
+                visible_devices=(
+                    acquired.visible_devices
+                    if acquired is not None
+                    else self._pinned_visible_devices
+                ),
+                lease_fds=(
+                    tuple(lease.handle.fileno() for lease in acquired.leases)
+                    if acquired is not None
+                    else ()
+                ),
+            )
         finally:
             self._release(acquired)
 
