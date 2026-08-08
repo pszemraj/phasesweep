@@ -116,6 +116,42 @@ class TerminalReport:
     winners: Mapping[str, Winner] | None = None
 
 
+def _terminal_report_from_cleanup(
+    generation_id: str,
+    cleanup: _PreflightCleanupReport,
+    *,
+    primary_error: BaseException | None,
+    failure_stage: str | None,
+    winners: Mapping[str, Winner] | None = None,
+    cleanup_confirmed: bool | None = None,
+) -> TerminalReport:
+    """Freeze accumulated cleanup evidence into one terminal report.
+
+    :param str generation_id: Generation whose invocation ended.
+    :param _PreflightCleanupReport cleanup: Mutable cleanup evidence to freeze.
+    :param BaseException | None primary_error: Invocation's authoritative error.
+    :param str | None failure_stage: Stage where the invocation failed.
+    :param Mapping[str, Winner] | None winners: Successful published winners.
+    :param bool | None cleanup_confirmed: Optional explicit cleanup verdict.
+    :return TerminalReport: Immutable terminal outcome snapshot.
+    """
+    return TerminalReport(
+        generation_id=generation_id,
+        primary_error=primary_error,
+        cleanup_confirmed=(
+            cleanup.cleanup_confirmed if cleanup_confirmed is None else cleanup_confirmed
+        ),
+        recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
+        recovered_attempt_generations=MappingProxyType(
+            dict(cleanup.recovered_attempt_generations)
+        ),
+        uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
+        cleanup_error=cleanup.error,
+        failure_stage=failure_stage,
+        winners=MappingProxyType(dict(winners)) if winners is not None else None,
+    )
+
+
 @dataclass(frozen=True)
 class ExperimentRunOutcome:
     """One published experiment invocation bound to its generation identity.
@@ -415,17 +451,13 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
             )
-            terminal_report = TerminalReport(
-                generation_id=generation_id,
+            terminal_report = _terminal_report_from_cleanup(
+                generation_id,
+                cleanup,
                 primary_error=None,
-                cleanup_confirmed=True,
-                recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
-                recovered_attempt_generations=MappingProxyType(
-                    dict(cleanup.recovered_attempt_generations)
-                ),
-                uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
                 failure_stage=None,
-                winners=MappingProxyType(dict(result)),
+                winners=result,
+                cleanup_confirmed=True,
             )
             return ExperimentRunOutcome(
                 generation_id=generation_id,
@@ -487,16 +519,10 @@ def _run_experiment_outcome(
                     error_class=failed_error_class,
                 ),
             )
-            terminal_report = TerminalReport(
-                generation_id=generation_id,
+            terminal_report = _terminal_report_from_cleanup(
+                generation_id,
+                cleanup,
                 primary_error=primary_error,
-                cleanup_confirmed=cleanup.cleanup_confirmed,
-                recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
-                recovered_attempt_generations=MappingProxyType(
-                    dict(cleanup.recovered_attempt_generations)
-                ),
-                uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
-                cleanup_error=cleanup.error,
                 failure_stage="execution" if generation_prepared else "preflight",
             )
             if (
@@ -516,16 +542,10 @@ def _run_experiment_outcome(
             if terminal_callback is not None:
                 try:
                     if terminal_report is None:
-                        terminal_report = TerminalReport(
-                            generation_id=generation_id,
+                        terminal_report = _terminal_report_from_cleanup(
+                            generation_id,
+                            cleanup,
                             primary_error=terminal_error,
-                            cleanup_confirmed=cleanup.cleanup_confirmed,
-                            recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
-                            recovered_attempt_generations=MappingProxyType(
-                                dict(cleanup.recovered_attempt_generations)
-                            ),
-                            uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
-                            cleanup_error=cleanup.error,
                             failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
