@@ -184,6 +184,47 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     assert status["phases"][0]["trial_data_available"] is True
 
 
+def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "phases.db"
+    storage = f"sqlite:///{db}"
+    study = optuna.create_study(study_name="read_t::p", storage=storage)
+    study.optimize(lambda trial: 1.0, n_trials=50)
+    exp = _experiment(tmp_path, storage=storage)
+    real_connect = engine_optuna.sqlite3.connect
+    transferred_rows: list[int] = []
+
+    class CursorProxy:
+        def __init__(self, cursor) -> None:
+            self._cursor = cursor
+
+        def fetchall(self):
+            rows = self._cursor.fetchall()
+            transferred_rows.append(len(rows))
+            return rows
+
+    class ConnectionProxy:
+        def __init__(self, connection) -> None:
+            self._connection = connection
+
+        def execute(self, *args: object, **kwargs: object):
+            return CursorProxy(self._connection.execute(*args, **kwargs))
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def observed_connect(*args: object, **kwargs: object):
+        return ConnectionProxy(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(engine_optuna.sqlite3, "connect", observed_connect)
+
+    status = read_status(exp)
+
+    assert status["phases"][0]["trials"] == {"COMPLETE": 50}
+    assert transferred_rows == [1]
+
+
 def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:
     db = tmp_path / "phases.db"
     storage = f"sqlite:///{db}"
@@ -425,6 +466,7 @@ def test_read_status_legacy_workdir_without_generation_metadata_is_published(
     assert status["published_generation_id"] is None
     assert status["represented_generation_id"] is None
     assert status["is_published"] is True
+    assert status["publication_integrity"] == "ok"
     assert status["phases"][0]["winner_present"] is True
 
     # The path-bearing CLI/suite view derives from the same read and must not

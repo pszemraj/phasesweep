@@ -26,6 +26,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.engine.guards import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _phase_trial_stats
 from phasesweep.engine.state import (
+    PublicationState,
     WinnerSource,
     WinnerSourceKind,
     _generation_path,
@@ -361,6 +362,30 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return names
 
 
+def _recorded_objective_evidence(
+    candidate: object,
+    *,
+    fallback: dict[str, str | bool],
+) -> dict[str, str | bool]:
+    """Return a complete recorded assurance payload or the current fallback.
+
+    Result summaries are durable data and may predate or drift from the current
+    assurance schema. A partial/extra key set cannot safely be combined with
+    current guarantees, so treat the whole record as absent.
+
+    :param object candidate: Summary ``objective_evidence`` value.
+    :param dict[str, str | bool] fallback: Assurance derived from the current extractor.
+    :return dict[str, str | bool]: Complete recorded flags, or ``fallback``.
+    """
+    if not isinstance(candidate, Mapping) or set(candidate) != set(fallback):
+        return fallback
+    if candidate.get("kind") not in {"json_envelope", "log_regex", "wandb"}:
+        return fallback
+    if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
+        return fallback
+    return dict(candidate)
+
+
 def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
@@ -415,6 +440,7 @@ def read_status(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    comparison_experiment: Experiment | None = None,
     _include_winner_paths: bool = False,
 ) -> dict[str, Any]:
     """Per-phase trial counts and winner presence for one experiment.
@@ -514,6 +540,11 @@ def read_status(
         ``represented_generation_id`` is the captured
         ``published_generation_id`` and ``generation_trials`` scopes to the
         captured ``current_generation_id``.
+    :param Experiment | None comparison_experiment: Optional current config to
+        use only for drift comparison and current-extractor evidence fallback.
+        Artifact and trial reads still use ``experiment``. This lets a frozen
+        run config locate its own tree while a run-scoped MCP read compares the
+        represented result with the catalog config a future run would execute.
     :param bool _include_winner_paths: Internal CLI adapter flag selecting the
         path-bearing phase payload used by :func:`config_status`. Leave
         ``False`` for any agent-visible caller: ``True`` puts absolute winner
@@ -559,13 +590,15 @@ def read_status(
         winner_scope_generation_id = generation_id
         pinned = True
 
+    legacy_publication = False
     if represented_generation_id is None:
         # Only an unpinned read reaches here (a pinned read always represents
         # its own id), so this is either a workdir with nothing published --
         # ``False``, unchanged -- or a pre-generation legacy layout whose
         # compatibility ``winner.yaml`` is itself the publication and has no
         # pointer identity to compare against.
-        is_published = _legacy_publication_present(experiment)
+        legacy_publication = _legacy_publication_present(experiment)
+        is_published = legacy_publication
     else:
         is_published = represented_generation_id == published_generation_id
 
@@ -584,10 +617,11 @@ def read_status(
     # source of that interpretation; only when it records none (nothing
     # published yet, or a pre-manifest legacy summary without semantics) does
     # the current config describe the result.
+    comparison = comparison_experiment or experiment
     metric_payload = {
-        "name": experiment.metric.name,
-        "goal": experiment.metric.goal,
-        "objective_evidence": objective_evidence_assurance(experiment.metric.extractor),
+        "name": comparison.metric.name,
+        "goal": comparison.metric.goal,
+        "objective_evidence": objective_evidence_assurance(comparison.metric.extractor),
     }
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
@@ -608,17 +642,22 @@ def read_status(
                 "name": stored_metric["name"],
                 "goal": stored_metric["goal"],
                 "objective_evidence": (
-                    dict(stored_evidence)
-                    if isinstance(stored_evidence, Mapping)
-                    else metric_payload["objective_evidence"]
+                    _recorded_objective_evidence(
+                        stored_evidence,
+                        fallback=metric_payload["objective_evidence"],
+                    )
                 ),
             }
             result_context = "represented_generation"
         stored_fingerprint = summary_payload.get("config_fingerprint")
         if isinstance(stored_fingerprint, str) and stored_fingerprint:
             published_config_matches_current = (
-                stored_fingerprint == _experiment_semantic_fingerprint(experiment)
+                stored_fingerprint == _experiment_semantic_fingerprint(comparison)
             )
+
+    publication_state: PublicationState = publication.state
+    if publication_state == "absent" and legacy_publication:
+        publication_state = "ok"
 
     return {
         "experiment": experiment.experiment,
@@ -626,7 +665,7 @@ def read_status(
         "published_generation_id": published_generation_id,
         "represented_generation_id": represented_generation_id,
         "is_published": is_published,
-        "publication_integrity": publication.state,
+        "publication_integrity": publication_state,
         **({"publication_error": publication.error} if publication.state == "failed" else {}),
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,

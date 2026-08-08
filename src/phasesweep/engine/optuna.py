@@ -374,14 +374,12 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     mode avoids both side effects: a missing, locked, or still-initializing DB
     simply reports no counts for now.
 
-    Counts and RUNNING identities come from a single ``SELECT`` -- one
-    statement, so one storage snapshot -- rather than an aggregate query plus
-    a follow-up read. Two statements can straddle a trial creation and report
-    a RUNNING attempt the counts do not include, and callers that reconcile
-    those two facts (see
-    :func:`phasesweep.mcp.snapshots.finalize_result_snapshot`) treat that
-    disagreement as corruption. Aggregation therefore happens here rather than
-    in SQL (PR #5 review / reviewer 2, blocker 6).
+    Counts and RUNNING identities come from one CTE-backed statement, so one
+    storage snapshot. SQL aggregates terminal rows by state and generation,
+    while the ``UNION ALL`` arm returns identities only for RUNNING rows. This
+    avoids transferring every historical trial on every status poll without
+    splitting the read into two snapshots that could disagree during a live
+    write (PR #5 review / reviewer 2, blocker 6).
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
@@ -398,14 +396,26 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
         try:
             rows = conn.execute(
                 """
-                SELECT trials.number, trials.state, generation.value_json, attempt.value_json
-                FROM trials
-                JOIN studies ON trials.study_id = studies.study_id
-                LEFT JOIN trial_user_attributes AS generation
-                  ON trials.trial_id = generation.trial_id AND generation.key = ?
-                LEFT JOIN trial_user_attributes AS attempt
-                  ON trials.trial_id = attempt.trial_id AND attempt.key = ?
-                WHERE studies.study_name = ?
+                WITH phase_trials AS (
+                    SELECT trials.number,
+                           trials.state,
+                           generation.value_json AS generation_json,
+                           attempt.value_json AS attempt_json
+                    FROM trials
+                    JOIN studies ON trials.study_id = studies.study_id
+                    LEFT JOIN trial_user_attributes AS generation
+                      ON trials.trial_id = generation.trial_id AND generation.key = ?
+                    LEFT JOIN trial_user_attributes AS attempt
+                      ON trials.trial_id = attempt.trial_id AND attempt.key = ?
+                    WHERE studies.study_name = ?
+                )
+                SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
+                FROM phase_trials
+                GROUP BY state, generation_json
+                UNION ALL
+                SELECT 'running', number, state, generation_json, attempt_json, 1
+                FROM phase_trials
+                WHERE state = 'RUNNING'
                 """,
                 (
                     GENERATION_ID_ATTR,
@@ -420,14 +430,17 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_RunningTrialRef] = []
-    for number, state, generation_json, attempt_json in rows:
+    for row_kind, number, state, generation_json, attempt_json, tally in rows:
         state_name = str(state)
-        counts[state_name] = counts.get(state_name, 0) + 1
         generation_id = _decoded_string_attr(generation_json)
-        if generation_id is not None:
-            states = generation_counts.setdefault(generation_id, {})
-            states[state_name] = states.get(state_name, 0) + 1
-        if state_name != "RUNNING":
+        if row_kind == "count":
+            count = int(tally)
+            counts[state_name] = counts.get(state_name, 0) + count
+            if generation_id is not None:
+                states = generation_counts.setdefault(generation_id, {})
+                states[state_name] = states.get(state_name, 0) + count
+            continue
+        if row_kind != "running":
             continue
         if not isinstance(number, int):
             # Optuna assigns ``number`` in the same INSERT that creates the

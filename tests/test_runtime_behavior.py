@@ -1040,6 +1040,50 @@ def test_transient_trial_outcome_write_failure_is_retried(
     )
 
 
+def test_outcome_retry_backoff_does_not_hold_completion_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flaky worker's backoff must not block a peer's durable outcome write."""
+    journal = tmp_path / "retry-parallel.journal"
+    exp = _outcome_write_experiment(
+        tmp_path,
+        trainer_body="""
+        import os, time
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "1":
+            time.sleep(0.2)
+        print("x=0.5")
+        """,
+        storage=f"journal:///{journal}",
+        n_jobs=2,
+    )
+    real_set_user_attr = optuna.Trial.set_user_attr
+    first_failed = threading.Event()
+    successful_writes: list[int] = []
+
+    def fail_trial_zero_once(trial: optuna.Trial, key: str, value: object) -> None:
+        if key == TRIAL_OUTCOME_ATTR and trial.number == 0 and not first_failed.is_set():
+            first_failed.set()
+            raise RuntimeError("injected transient outcome write failure")
+        if key == TRIAL_OUTCOME_ATTR:
+            successful_writes.append(trial.number)
+        real_set_user_attr(trial, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_trial_zero_once)
+    monkeypatch.setattr("phasesweep.engine.phase._OUTCOME_WRITE_RETRY_DELAYS", (0.5, 0.5))
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].metric == pytest.approx(0.5)
+    study = optuna.load_study(
+        study_name="t::p",
+        storage=_resolve_storage(f"journal:///{journal}"),
+    )
+    sequences = sorted(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials)
+    assert first_failed.is_set()
+    assert successful_writes[:2] == [1, 0]
+    assert sequences == [1, 2]
+
+
 @pytest.mark.parametrize(
     ("trainer_body", "constraints"),
     [

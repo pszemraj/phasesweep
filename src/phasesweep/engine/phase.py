@@ -559,99 +559,102 @@ def _run_phase(
 
         """
         nonlocal _consecutive_failures, _completion_sequence
-        with _failure_lock:
-            if trial.number in recorded_outcomes:
-                return
-            next_sequence = _completion_sequence + 1
-            payload: dict[str, Any] = {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": next_sequence,
-                "outcome": outcome,
-            }
-            if cause is not None:
-                payload["cause"] = cause
-            if fatal_policy is not None:
-                payload["policy"] = fatal_policy
-            # INVARIANT: no terminal Optuna row may exist without its outcome
-            # record. Optuna refuses user-attr writes on a finished trial
-            # (UpdateFinishedTrialError), so a FAIL committed after this write
-            # failed could never be repaired, and every later invocation would
-            # reject the whole study in ``_load_phase_policy_state``. The only
-            # correct reaction is therefore to prevent the terminal transition
-            # entirely and leave the trial RUNNING, where
-            # ``_record_stale_trial_failure``'s write-then-tell recovery can
-            # still give it a valid outcome (PR #5 review / reviewer 2 pass 2,
-            # blocker 4). Retry any Exception first — storage backends signal
-            # transient faults with assorted types — but never a BaseException,
-            # which is a shutdown or a control-flow abort of its own.
-            write_error: Exception | None = None
-            for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
-                if attempt_index:
-                    time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
+        # INVARIANT: no terminal Optuna row may exist without its outcome
+        # record. Optuna refuses user-attr writes on a finished trial
+        # (UpdateFinishedTrialError), so a FAIL committed after this write
+        # failed could never be repaired. Retry any Exception first — storage
+        # backends signal transient faults with assorted types — but never a
+        # BaseException, which is a shutdown/control-flow abort of its own.
+        #
+        # The sequencing lock covers each write attempt and the state update it
+        # authorizes, but not retry backoff. A worker waiting for storage must
+        # not prevent a peer from durably recording an independent outcome.
+        # Because a peer may advance the completion sequence during that wait,
+        # every retry rebuilds its payload from the then-current sequence.
+        write_error: Exception | None = None
+        abort_record: dict[str, Any] | None = None
+        for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
+            if attempt_index:
+                time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
+            with _failure_lock:
+                if trial.number in recorded_outcomes:
+                    return
+                next_sequence = _completion_sequence + 1
+                payload: dict[str, Any] = {
+                    "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+                    "sequence": next_sequence,
+                    "outcome": outcome,
+                }
+                if cause is not None:
+                    payload["cause"] = cause
+                if fatal_policy is not None:
+                    payload["policy"] = fatal_policy
                 try:
                     trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
                 except Exception as exc:
                     write_error = exc
-                else:
-                    write_error = None
-                    break
-            if write_error is not None:
-                unrecorded = _TrialOutcomeUnrecordedAbort(
-                    f"Could not persist the terminal outcome for trial {trial.number} "
-                    f"in study {study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
-                    f"attempts ({type(write_error).__name__}: {write_error}). Trial "
-                    f"{trial.number} was deliberately left RUNNING, with its durable "
-                    "attempt record intact, so no terminal trial exists without its "
-                    "outcome record. Once storage accepts writes again, the next run "
-                    "recovers it through the standard stale-attempt protocol, which "
-                    "records the failure before marking the trial FAIL."
-                )
-                _record_fatal_abort(unrecorded)
-                raise unrecorded from write_error
+                    continue
 
-            _completion_sequence = next_sequence
-            recorded_outcomes[trial.number] = outcome
-            if outcome in {"failure", "fatal"}:
-                _consecutive_failures += 1
-            elif outcome == "success":
-                _consecutive_failures = 0
-            threshold_tripped = (not abort["flag"]) and (
-                _consecutive_failures >= phase.max_consecutive_failures
+                write_error = None
+                _completion_sequence = next_sequence
+                recorded_outcomes[trial.number] = outcome
+                if outcome in {"failure", "fatal"}:
+                    _consecutive_failures += 1
+                elif outcome == "success":
+                    _consecutive_failures = 0
+                threshold_tripped = (not abort["flag"]) and (
+                    _consecutive_failures >= phase.max_consecutive_failures
+                )
+                fatal_tripped = outcome == "fatal"
+                if not threshold_tripped and not fatal_tripped:
+                    return
+                abort["flag"] = True
+                if abort_recorded["flag"]:
+                    return
+                if fatal_tripped:
+                    abort_record = {
+                        "schema_version": 1,
+                        "policy": fatal_policy or "fatal_trial_exception",
+                        "completion_sequence": _completion_sequence,
+                        "trial_target": phase.n_trials,
+                        "cause": cause or f"trial {trial.number} hit a fatal objective error",
+                    }
+                else:
+                    abort_record = _failure_policy_abort_record(
+                        phase,
+                        consecutive_failures=_consecutive_failures,
+                        completion_sequence=_completion_sequence,
+                        trial_target=phase.n_trials,
+                    )
+                try:
+                    study.set_user_attr(PHASE_ABORT_ATTR, abort_record)
+                except Exception as exc:
+                    error = _PolicyStateWriteError(
+                        f"Trial {trial.number} durably recorded completion sequence "
+                        f"{_completion_sequence}, but the phase abort marker could not be "
+                        "persisted. Refusing to continue; the durable outcome ledger will "
+                        "reconstruct the abort on the next run."
+                    )
+                    _record_fatal_abort(error)
+                    raise error from exc
+                abort_recorded["flag"] = True
+                break
+        if write_error is not None:
+            unrecorded = _TrialOutcomeUnrecordedAbort(
+                f"Could not persist the terminal outcome for trial {trial.number} "
+                f"in study {study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
+                f"attempts ({type(write_error).__name__}: {write_error}). Trial "
+                f"{trial.number} was deliberately left RUNNING, with its durable "
+                "attempt record intact, so no terminal trial exists without its "
+                "outcome record. Once storage accepts writes again, the next run "
+                "recovers it through the standard stale-attempt protocol, which "
+                "records the failure before marking the trial FAIL."
             )
-            fatal_tripped = outcome == "fatal"
-            if not threshold_tripped and not fatal_tripped:
-                return
-            abort["flag"] = True
-            if abort_recorded["flag"]:
-                return
-            if fatal_tripped:
-                record = {
-                    "schema_version": 1,
-                    "policy": fatal_policy or "fatal_trial_exception",
-                    "completion_sequence": _completion_sequence,
-                    "trial_target": phase.n_trials,
-                    "cause": cause or f"trial {trial.number} hit a fatal objective error",
-                }
-            else:
-                record = _failure_policy_abort_record(
-                    phase,
-                    consecutive_failures=_consecutive_failures,
-                    completion_sequence=_completion_sequence,
-                    trial_target=phase.n_trials,
-                )
-            try:
-                study.set_user_attr(PHASE_ABORT_ATTR, record)
-            except Exception as exc:
-                error = _PolicyStateWriteError(
-                    f"Trial {trial.number} durably recorded completion sequence "
-                    f"{_completion_sequence}, but the phase abort marker could not be "
-                    "persisted. Refusing to continue; the durable outcome ledger will "
-                    "reconstruct the abort on the next run."
-                )
-                _record_fatal_abort(error)
-                raise error from exc
-            abort_recorded["flag"] = True
-        log.error("phase=%s ABORTED: %s", phase.name, record["cause"])
+            _record_fatal_abort(unrecorded)
+            raise unrecorded from write_error
+
+        assert abort_record is not None
+        log.error("phase=%s ABORTED: %s", phase.name, abort_record["cause"])
         with contextlib.suppress(Exception):
             study.stop()
 
