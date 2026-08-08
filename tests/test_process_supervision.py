@@ -1466,6 +1466,10 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
     import contextlib as _contextlib
 
     _report_uncertain_after_real_terminate(monkeypatch)
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
+        lambda: {"0": "GPU-test-0"},
+    )
 
     exp = make_experiment(
         workdir=tmp_path / "runs",

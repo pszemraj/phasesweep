@@ -629,7 +629,9 @@ def test_non_finite_extracted_value_returns_failed_result(
     assert result.failure_reason == failure_reason
 
 
-def test_abort_after_gpu_acquire_prevents_queued_trials(tmp_path: Path) -> None:
+def test_abort_after_gpu_acquire_prevents_queued_trials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With n_jobs > GPU pool, queued trials must re-check abort after acquiring.
 
     Setup: single GPU, 4 parallel jobs, all trials fail, max_consecutive_failures=1.
@@ -644,6 +646,10 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(tmp_path: Path) -> None:
         time.sleep(0.2)
         sys.exit(1)
         """,
+    )
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
+        lambda: {"0": "GPU-test-0"},
     )
     yaml_text = f"""
 experiment: abort_recheck
