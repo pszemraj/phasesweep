@@ -28,6 +28,7 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import (
+    ProcessCleanupUncertainError,
     StudyStorageUnavailableError,
     TerminalReport,
     read_status,
@@ -43,9 +44,12 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    CLEANUP_CONFIRMED_ATTR,
+    CLEANUP_RECOVERED_TRIALS_ATTR,
     PHASE_ABORT_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _attempts_dir,
     _last_successful_generation_path,
     _load_winner,
     _summary_path,
@@ -53,7 +57,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import (
     ExecutedTrial,
-    UnsafeProcessCleanupError,
     extract_trial_result,
 )
 from phasesweep.evidence import TrialContext
@@ -63,6 +66,7 @@ from phasesweep.runtime.process import (
     SignalOwnershipUnavailableError,
     install_signal_handlers,
     signal_handler_scope,
+    write_attempt_lifecycle,
 )
 from tests.conftest import (
     copy_fake_train,
@@ -1233,48 +1237,105 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
     assert not _last_successful_generation_path(exp).exists()
 
 
-def test_unsafe_cleanup_abort_is_durable_across_identical_reruns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("cleanup_attr_persists", [True, False])
+def test_unsafe_cleanup_blocks_topup_until_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_attr_persists: bool,
 ) -> None:
-    """An unsafe-cleanup hard abort survives restart like the failure-policy
-    abort: the identical no-op re-run must stay failed instead of publishing
-    the surviving COMPLETE trial (review v0.5.17 gap hunt; the blocker-1 fix
-    made only the max_consecutive_failures abort durable)."""
+    """A larger target cannot acknowledge a possibly live trainer.
+
+    The fatal outcome policy is the fallback authority when the redundant
+    cleanup attribute write fails. In both cases the active-attempt locator
+    remains until ordinary preflight positively confirms cleanup and commits
+    the study recovery ledger.
+    """
     import phasesweep.engine.trial as trial_mod
 
     db = tmp_path / "abort.db"
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db}",
-        n_trials=2,
-        sampler={"type": "random", "seed": 7},
-    )
+
+    def _exp(n_trials: int) -> Experiment:
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            n_trials=n_trials,
+            sampler={"type": "random", "seed": 7},
+        )
 
     real_run_supervised = trial_mod.run_supervised
+    real_set_user_attr = optuna.Trial.set_user_attr
     calls = {"n": 0}
+    cleanup_safe = {"value": False}
 
     def uncertain_on_second(*args: object, **kwargs: object) -> ProcessResult:
         calls["n"] += 1
         result = real_run_supervised(*args, **kwargs)
         if calls["n"] == 2:
             result.cleanup_confirmed = False
+            # ``real_run_supervised`` already observed a clean exit before this
+            # fault injection. Restore the durable pre-exit shape a genuinely
+            # unconfirmed cleanup leaves behind so preflight must consult the
+            # process identity and our cleanup verdict.
+            write_attempt_lifecycle(
+                Path(str(kwargs["trial_dir"])),
+                attempt_id=str(kwargs["attempt_id"]),
+                state="allocated",
+            )
         return result
 
+    def maybe_refuse_cleanup_attr(
+        trial: optuna.Trial,
+        key: str,
+        value: object,
+    ) -> None:
+        if not cleanup_attr_persists and key == CLEANUP_CONFIRMED_ATTR:
+            raise RuntimeError("injected cleanup attribute write failure")
+        real_set_user_attr(trial, key, value)
+
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", uncertain_on_second)
-    with pytest.raises(UnsafeProcessCleanupError):
-        run_experiment(exp)
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", maybe_refuse_cleanup_attr)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: cleanup_safe["value"],
+    )
+    with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
+        run_experiment(_exp(2))
 
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     record = study.user_attrs[PHASE_ABORT_ATTR]
     assert record["policy"] == "unsafe_process_cleanup"
     assert "cleanup could not be confirmed" in record["cause"]
+    unsafe_trial = next(
+        trial
+        for trial in study.get_trials(deepcopy=False)
+        if trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
+    )
+    assert unsafe_trial.user_attrs[TRIAL_OUTCOME_ATTR]["policy"] == "unsafe_process_cleanup"
+    if cleanup_attr_persists:
+        assert unsafe_trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    else:
+        assert CLEANUP_CONFIRMED_ATTR not in unsafe_trial.user_attrs
+    assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
-    # Identical retry with healthy cleanup: 2/2 terminal trials mean no new
-    # work; the durable record must keep the phase failed, not publish it.
+    # A larger target is not cleanup authority and launches no new trial.
+    before = len(study.trials)
+    with pytest.raises(ProcessCleanupUncertainError):
+        run_experiment(_exp(3))
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert len(study.trials) == before
+    assert list(_attempts_dir(_exp(3)).glob("*.json"))
+
+    # Positive cleanup is durably consumed before the registry is retired and
+    # the ordinary fatal-abort top-up path becomes available.
+    cleanup_safe["value"] = True
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
-        run_experiment(exp)
-    assert not _last_successful_generation_path(exp).exists()
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_exp(3))
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert len(study.trials) == before + 1
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
+    assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
 
 
 def test_stale_abort_record_cleared_before_selection_survives_selection_crash(

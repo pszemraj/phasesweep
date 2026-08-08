@@ -29,6 +29,7 @@ from phasesweep.engine.guards import (
     _record_trial_target,
     _register_active_attempt,
     _retire_active_attempt,
+    _trial_requires_cleanup_recovery,
     _validate_study_direction,
     _validate_study_schema,
     _validate_trial_target,
@@ -387,6 +388,7 @@ def _run_phase(
                     f"objective error: {policy_state.fatal_cause or 'no cause recorded'}"
                 ),
             }
+            active_abort["policy"] = policy_state.fatal_policy or "fatal_trial_exception"
             study.set_user_attr(PHASE_ABORT_ATTR, active_abort)
         if (
             active_abort is None
@@ -731,7 +733,9 @@ def _run_phase(
         # entries the callback never reached. It raises rather than warns, and
         # deliberately runs here — before the GPU lease and the launch — so a
         # trainer PhaseSweep could not record is never started (PR #5 review /
-        # reviewer 2 pass 2, blocker 5).
+        # reviewer 2 pass 2, blocker 5). Unsafe-cleanup entries deliberately
+        # survive the callback until preflight positively resolves the process
+        # and commits the cleanup-recovery ledger.
         _register_active_attempt(
             experiment,
             attempt_id=attempt_id,
@@ -973,11 +977,15 @@ def _run_phase(
         if abort["flag"]:
             with contextlib.suppress(Exception):
                 study.stop()
-        # The trial is durably terminal once callbacks run, so its registry
-        # entry can be retired (review v0.5.17 / blocker 3). Best-effort:
-        # preflight GCs entries this misses.
+        # Terminal state alone is insufficient for an unsafe-cleanup trial: its
+        # registry entry is the cross-phase/storage recovery locator and must
+        # survive until preflight durably consumes cleanup evidence.
         finished_attempt = _trial.user_attrs.get(ATTEMPT_ID_ATTR)
-        if isinstance(finished_attempt, str) and finished_attempt:
+        if (
+            isinstance(finished_attempt, str)
+            and finished_attempt
+            and not _trial_requires_cleanup_recovery(_trial)
+        ):
             _retire_active_attempt(experiment, finished_attempt)
         finished = _finished_trial_count(study.get_trials(deepcopy=False))
         now = time.monotonic()

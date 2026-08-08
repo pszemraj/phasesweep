@@ -95,6 +95,17 @@ class _PhasePolicyState:
     fatal_trial_number: int | None
     fatal_sequence: int | None
     fatal_cause: str | None
+    fatal_policy: str | None
+
+
+@dataclass(frozen=True)
+class _ParsedTrialOutcome:
+    """Validated durable terminal-outcome fields for one trial."""
+
+    sequence: int
+    outcome: str
+    cause: str | None
+    policy: str | None
 
 
 @dataclass
@@ -892,14 +903,13 @@ def _registry_attempt_process_is_resolved(
     )
 
 
-def _parsed_trial_outcome(value: Any) -> tuple[int, str, str | None] | None:
+def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
     """Return the ordered outcome fields when a trial attr is well formed.
 
     :param Any value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
-    :return tuple[int, str, str | None] | None: ``(sequence, outcome, cause)``
-        when ``value`` is a dict with the current schema version, a positive
-        int ``sequence``, an ``outcome`` in :data:`_TRIAL_OUTCOMES`, and a
-        ``cause`` that is ``None`` or ``str``; ``None`` otherwise.
+    :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
+        policy needed to distinguish cleanup uncertainty from ordinary errors;
+        ``None`` when the payload is malformed.
     """
     if not isinstance(value, dict):
         return None
@@ -907,15 +917,44 @@ def _parsed_trial_outcome(value: Any) -> tuple[int, str, str | None] | None:
     sequence = value.get("sequence")
     outcome = value.get("outcome")
     cause = value.get("cause")
+    policy = value.get("policy")
     if (
         schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
         or type(sequence) is not int
         or sequence < 1
         or outcome not in _TRIAL_OUTCOMES
         or (cause is not None and not isinstance(cause, str))
+        or (
+            policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
+        )
     ):
         return None
-    return sequence, outcome, cause
+    return _ParsedTrialOutcome(
+        sequence=sequence,
+        outcome=outcome,
+        cause=cause,
+        policy=policy,
+    )
+
+
+def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
+    """Return whether a terminal trial still lacks positive cleanup evidence.
+
+    The explicit cleanup attribute is forensic redundancy, not the sole
+    authority: its best-effort write can fail after the fatal outcome ledger
+    durably records ``unsafe_process_cleanup``. The study-level recovery ledger
+    is the only transition that consumes either form of uncertainty.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose durable cleanup state is inspected.
+    :return bool: Whether ordinary preflight must confirm cleanup before new work.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    unsafe_outcome = (
+        parsed is not None
+        and parsed.outcome == "fatal"
+        and parsed.policy == "unsafe_process_cleanup"
+    )
+    return trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False or unsafe_outcome
 
 
 def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -943,13 +982,18 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         if (parsed := _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR)))
         is not None
     }
-    used_sequences = [parsed[0] for parsed in parsed_by_trial.values()]
+    used_sequences = [parsed.sequence for parsed in parsed_by_trial.values()]
     existing = parsed_by_trial.get(trial.number)
-    if existing is not None and used_sequences.count(existing[0]) == 1:
-        sequence, outcome, cause = existing
+    policy: str | None = None
+    if existing is not None and used_sequences.count(existing.sequence) == 1:
+        sequence = existing.sequence
+        outcome = existing.outcome
+        cause = existing.cause
+        policy = existing.policy
         if outcome not in {"failure", "fatal"}:
             outcome = "failure"
             cause = "orchestrator stopped before Optuna committed the terminal trial state"
+            policy = None
     else:
         sequence = max(used_sequences, default=0) + 1
         outcome = "failure"
@@ -962,6 +1006,8 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     }
     if cause is not None:
         payload["cause"] = cause
+    if policy is not None:
+        payload["policy"] = policy
     try:
         active_trial = optuna.Trial(study, trial._trial_id)
         active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
@@ -1025,6 +1071,9 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
             and trial.user_attrs.get(ATTEMPT_ID_ATTR) == entry["attempt_id"]
             and trial.user_attrs.get(GENERATION_ID_ATTR) == entry["generation_id"]
         ):
+            return "recovered"
+        if trial.state.is_finished() and _trial_requires_cleanup_recovery(trial):
+            _record_cleanup_recovery(study, trial)
             return "recovered"
         return "terminal"
     stored_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
@@ -1411,7 +1460,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         recovery_boundary = raw_recovery_boundary
         recovered_abort_sequence = raw_recovered_abort_sequence
 
-    events: list[tuple[int, int, str, str | None]] = []
+    events: list[tuple[int, int, str, str | None, str | None]] = []
     seen_sequences: dict[int, int] = {}
     for trial in study.get_trials(deepcopy=False):
         raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
@@ -1424,7 +1473,10 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
             )
         if parsed is None:
             continue
-        sequence, outcome, cause = parsed
+        sequence = parsed.sequence
+        outcome = parsed.outcome
+        cause = parsed.cause
+        policy = parsed.policy
         other_trial = seen_sequences.get(sequence)
         if other_trial is not None:
             raise _phase_policy_schema_error(
@@ -1432,7 +1484,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
             )
         seen_sequences[sequence] = trial.number
-        events.append((sequence, trial.number, outcome, cause))
+        events.append((sequence, trial.number, outcome, cause, policy))
 
     events.sort()
     max_sequence = events[-1][0] if events else 0
@@ -1447,7 +1499,8 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     fatal_trial_number: int | None = None
     fatal_sequence: int | None = None
     fatal_cause: str | None = None
-    for sequence, trial_number, outcome, cause in events:
+    fatal_policy: str | None = None
+    for sequence, trial_number, outcome, cause, policy in events:
         if sequence <= recovery_boundary:
             continue
         if outcome == "success":
@@ -1458,6 +1511,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
             fatal_trial_number = trial_number
             fatal_sequence = sequence
             fatal_cause = cause
+            fatal_policy = policy
 
     return _PhasePolicyState(
         max_sequence=max_sequence,
@@ -1466,6 +1520,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         fatal_trial_number=fatal_trial_number,
         fatal_sequence=fatal_sequence,
         fatal_cause=fatal_cause,
+        fatal_policy=fatal_policy,
     )
 
 
@@ -2681,6 +2736,17 @@ def _preflight_existing_studies(
             continue
         studies[phase.name] = study
         try:
+            recovered_terminal_attempts: set[str] = set()
+            _recover_cleanup_uncertain_trials(
+                study,
+                experiment,
+                phase.name,
+                recovered_attempt_ids=recovered_terminal_attempts,
+                recovered_attempt_generations=report.recovered_attempt_generations,
+            )
+            report.recovered_attempt_ids.update(recovered_terminal_attempts)
+            for attempt_id in recovered_terminal_attempts:
+                _retire_active_attempt(experiment, attempt_id)
             _reap_stale_trials(
                 study,
                 experiment,
@@ -2886,7 +2952,7 @@ def _iter_cleanup_uncertain_trials(
         if (
             trial.state.is_finished()
             and trial.number not in recovered_trial_numbers
-            and trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False
+            and _trial_requires_cleanup_recovery(trial)
         ):
             trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
             identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
