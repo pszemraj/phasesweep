@@ -1393,6 +1393,40 @@ def _publish_drift_experiment(tmp_path: Path) -> tuple[Path, Path, Path]:
     return trainer, config, catalog
 
 
+def _record_published_run_snapshot(
+    tmp_path: Path,
+) -> tuple[str, Path, Path, Path]:
+    """Publish one generation whose id also has a completed MCP run snapshot."""
+    trainer = write_constant_trainer(tmp_path)
+    config = tmp_path / "srv.yaml"
+    experiment = _drift_experiment(tmp_path, trainer)
+    _write_experiment_config(config, experiment)
+    catalog = _catalog(tmp_path, config)
+    _app, registry, store = make_mcp_app(catalog)
+    reg = registry.get("srv")
+    run_id = "srv-frozen-result"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    run_experiment(experiment, generation_id=run_id)
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+    return run_id, trainer, config, catalog
+
+
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
@@ -1438,6 +1472,43 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     assert results.phases[0].metric == baseline_results.phases[0].metric
 
 
+def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
+    tmp_path: Path,
+) -> None:
+    run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
+    _write_experiment_config(
+        config,
+        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.result_source == "frozen_run_snapshot"
+    assert results.result_source == "frozen_run_snapshot"
+    assert status.published_config_matches_current is False
+    assert results.published_config_matches_current is False
+    assert (results.metric.name, results.metric.goal) == ("x", "minimize")
+
+
+def test_run_scoped_snapshot_recomputes_publication_integrity(tmp_path: Path) -> None:
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, _store = make_mcp_app(catalog)
+    experiment = app._registry.get("srv").experiment
+    winner_path = _generation_winner_path(experiment, run_id, "p")
+    winner_path.write_text("broken: true\n")
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.publication_integrity == "failed"
+    assert status.is_published is False
+    assert status.phases[0].winner_present is False
+    assert results.publication_integrity == "failed"
+    assert results.winner_count == 0
+
+
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
@@ -1479,6 +1550,27 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     assert evidence["evaluation_policy_bound"] is False
     assert evidence["source_identity_keyed"] is False
     assert results.published_config_matches_current is False
+
+
+def test_drifted_recorded_objective_evidence_falls_back_without_internal_error(
+    tmp_path: Path,
+) -> None:
+    trainer, _config, catalog = _publish_drift_experiment(tmp_path)
+    experiment = _drift_experiment(tmp_path, trainer)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    summary["metric"]["objective_evidence"]["future_flag"] = True
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    app, _registry, _store = make_mcp_app(catalog)
+
+    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+    status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+
+    expected = objective_evidence_assurance(experiment.metric.extractor)
+    assert results.metric.objective_evidence.model_dump() == expected
+    assert status.metric.objective_evidence.model_dump() == expected
 
 
 def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:

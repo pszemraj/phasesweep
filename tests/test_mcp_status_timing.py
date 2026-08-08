@@ -403,6 +403,34 @@ def test_await_run_clamps_timeout(
     assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
+def test_await_run_reserves_time_for_the_final_status_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = {"now": 0.0}
+    read_starts: list[float] = []
+    real_read = app._read_status_target
+
+    def timed_read(**kwargs):
+        read_starts.append(clock["now"])
+        result = real_read(**kwargs)
+        clock["now"] += 0.2
+        return result
+
+    async def advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr(app, "_read_status_target", timed_read)
+
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
+
+    assert result["reason"] == "timeout"
+    assert max(read_starts) < AWAIT_MIN_TIMEOUT_SECONDS
+    assert clock["now"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
+
+
 def test_await_run_returns_when_phase_gains_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

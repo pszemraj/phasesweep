@@ -295,6 +295,10 @@ def _cleanup_failure_payload(
     cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
     payload = _base_failure_payload(cleanup, stage="cleanup")
     if not isinstance(primary, ProcessCleanupUncertainError):
+        # ``cause`` is diagnostic history, not a second action contract. It
+        # intentionally retains the primary failure's own actor/retryability
+        # (for example, a user cancellation) while the authoritative outer
+        # cleanup_uncertain verdict blocks every relaunch pending recovery.
         payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 

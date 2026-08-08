@@ -970,6 +970,26 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
     assert report.cleanup_error is cleanup_error
 
 
+def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(
+            signum=signal.SIGTERM,
+            cleanup_confirmed=False,
+            child_pgids=(1234,),
+        ),
+    )
+
+    failure = mcp_runner._cleanup_failure_payload(shutdown, cause_stage="execution")
+
+    assert failure["code"] == "cleanup_uncertain"
+    assert failure["actor"] == "operator"
+    assert failure["retryable"] is False
+    assert failure["cause"]["code"] == "cancelled"
+    assert failure["cause"]["actor"] == "agent"
+    assert failure["cause"]["retryable"] is True
+
+
 def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

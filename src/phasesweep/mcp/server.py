@@ -1040,9 +1040,11 @@ class PhaseSweepMCP:
                 # window is still observed.
                 reason = "timeout"
             else:
-                await asyncio.sleep(
-                    min(AWAIT_RECHECK_SECONDS, max(0.0, deadline - time.monotonic()))
+                remaining_before_next_read = max(
+                    0.0,
+                    deadline - time.monotonic() - read_seconds,
                 )
+                await asyncio.sleep(min(AWAIT_RECHECK_SECONDS, remaining_before_next_read))
                 continue
             break
         result = self._status_result(target_id, status, run, handle, result_source)
@@ -1076,14 +1078,81 @@ class PhaseSweepMCP:
         )
         snapshot, result_source = self._result_snapshot_view(experiment, handle)
         status = (
-            snapshot.status_payload()
+            self._snapshot_status_payload(
+                target_id,
+                experiment,
+                snapshot,
+                result_source=result_source,
+            )
             if snapshot is not None
             else read_status(
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
+                comparison_experiment=self._catalog_comparison_experiment(target_id),
             )
         )
         return target_id, status, run, handle, result_source
+
+    def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
+        """Return the config a future catalog launch would execute, if available.
+
+        :param str experiment_id: Catalog id associated with a current or frozen read.
+        :return Experiment | None: Current catalog config, or ``None`` after removal.
+        """
+        try:
+            return self._registry.get(experiment_id).experiment
+        except UnknownExperimentError:
+            return None
+
+    def _snapshot_status_payload(
+        self,
+        experiment_id: str,
+        run_experiment: Experiment,
+        snapshot: RunResultSnapshot,
+        *,
+        result_source: ResultSource,
+    ) -> dict[str, Any]:
+        """Combine frozen run facts with the two deliberately live result verdicts.
+
+        Trial counts, winners, labels, and represented-generation identity stay
+        frozen. Publication integrity is a property of the artifact tree now,
+        and config drift compares with the config a future catalog launch would
+        execute now, so serving either from capture time would make both fields
+        structurally stale.
+
+        :param str experiment_id: Catalog id associated with the run.
+        :param Experiment run_experiment: Frozen config used to locate the run's tree.
+        :param RunResultSnapshot snapshot: Validated frozen result snapshot.
+        :param ResultSource result_source: Snapshot provenance, including the
+            unavailable placeholder case.
+        :return dict[str, Any]: Frozen status with current integrity/drift verdicts.
+        """
+        status = snapshot.status_payload()
+        comparison = self._catalog_comparison_experiment(experiment_id)
+        represented_generation_id = status["represented_generation_id"]
+        live = read_status(
+            run_experiment,
+            generation_id=(
+                represented_generation_id if isinstance(represented_generation_id, str) else None
+            ),
+            comparison_experiment=comparison,
+        )
+        status["publication_integrity"] = live["publication_integrity"]
+        status["published_config_matches_current"] = (
+            live["published_config_matches_current"]
+            if comparison is not None and result_source != "terminal_snapshot_unavailable"
+            else None
+        )
+        if live["publication_integrity"] == "failed":
+            # A failed pointer may not expose the unvalidated publication as a
+            # current result. Keep the terminal run's frozen trial counts, but
+            # clear result-presence claims and let callers omit winner values.
+            status["is_published"] = False
+            status["published_generation_id"] = None
+            status["summary_present"] = False
+            for phase in status["phases"]:
+                phase["winner_present"] = False
+        return status
 
     def _status_result(
         self,
@@ -1224,8 +1293,15 @@ class PhaseSweepMCP:
             # own metric, phase plan, and drift verdict, captured under the
             # config that run executed -- so this branch reads its labels from
             # the same place the live branch does.
-            status = snapshot.status_payload()
-            winner_views = snapshot.winner_views()
+            status = self._snapshot_status_payload(
+                target_id,
+                experiment,
+                snapshot,
+                result_source=result_source,
+            )
+            winner_views = (
+                [] if status["publication_integrity"] == "failed" else snapshot.winner_views()
+            )
         else:
             # Resolve the represented generation once via read_status, then
             # reuse that exact id for read_winners: two independent pointer
@@ -1237,6 +1313,7 @@ class PhaseSweepMCP:
             status = read_status(
                 experiment,
                 generation_id=handle.run_id if handle is not None else None,
+                comparison_experiment=self._catalog_comparison_experiment(target_id),
             )
             # Enumerate the plan that generation published under, not the one
             # the config declares now: a phase renamed since publication used
