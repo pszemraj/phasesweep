@@ -51,6 +51,7 @@ def deterministic_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
         "phasesweep.runtime.gpu._detect_gpu_uuid_map",
         lambda: dict(_TEST_UUID_MAP),
     )
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
 
 
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
@@ -160,18 +161,32 @@ def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
         assert gid.visible_devices is None
 
 
-def test_single_job_warns_when_nvidia_smi_is_broken_on_gpu_host(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
+
+    with pytest.raises(RuntimeError, match="could not enumerate GPUs.*double-book"):
+        GpuPool.create(n_jobs=1)
+
+
+def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
-        pool = GpuPool.create(n_jobs=1)
+        pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
 
+    with pool.acquire() as assignment:
+        assert assignment.visible_devices is None
     assert pool._devices == []
-    assert any("running WITHOUT CUDA isolation" in record.message for record in caplog.records)
+    assert any("allow_no_gpu_isolation: true" in record.message for record in caplog.records)
 
 
 def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):

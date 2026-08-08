@@ -568,8 +568,10 @@ class GpuPool:
 
         Raises:
             RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
-                ``allow_no_gpu``, the configured device tokens cannot be
-                resolved to canonical physical devices (see
+                ``allow_no_gpu``; the NVIDIA driver reports hardware that
+                ``nvidia-smi`` cannot enumerate without ``allow_no_gpu``; the
+                configured device tokens cannot be resolved to canonical
+                physical devices (see
                 :func:`_bind_lock_identities`), or ``policy='whole_node'`` and
                 the configured tokens collapse to fewer physical GPUs than the
                 declared world size (see
@@ -649,20 +651,27 @@ class GpuPool:
                     pinned,
                 )
                 return cls(devices=[], pinned_visible_devices=pinned)
-            if n_jobs <= 1:
-                if _nvidia_driver_reports_gpus():
-                    # The kernel driver knows about GPUs, so the empty probe is
-                    # a broken nvidia-smi, not a CPU-only host: this phase will
-                    # run with no CUDA_VISIBLE_DEVICES binding and hold zero
-                    # GPU host locks while real cards sit on the host
-                    # (review v0.5.17 gap hunt).
-                    log.warning(
-                        "nvidia-smi detected no GPUs but /proc/driver/nvidia/gpus lists "
-                        "hardware; running WITHOUT CUDA isolation or GPU host locks. Fix "
-                        "nvidia-smi or set gpu_ids/gpu_devices explicitly."
+            if _nvidia_driver_reports_gpus():
+                message = (
+                    "nvidia-smi could not enumerate GPUs, but "
+                    "/proc/driver/nvidia/gpus reports hardware. PhaseSweep cannot "
+                    "derive canonical device locks, so launching with unrestricted "
+                    "CUDA visibility could double-book the host. Fix nvidia-smi or "
+                    "set gpu_ids/gpu_devices explicitly"
+                )
+                if not allow_no_gpu:
+                    raise RuntimeError(
+                        f"{message}; set allow_no_gpu_isolation: true only to accept "
+                        "running without GPU host locks."
                     )
-                else:
-                    log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
+                log.warning(
+                    "%s; running without CUDA isolation because "
+                    "allow_no_gpu_isolation: true is set.",
+                    message,
+                )
+                return cls(devices=[], pinned_visible_devices=pinned)
+            if n_jobs <= 1:
+                log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
                 return cls(devices=[], pinned_visible_devices=pinned)
             if allow_no_gpu:
                 log.warning(
