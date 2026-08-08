@@ -1215,6 +1215,45 @@ def sqlite_readonly_uri(storage: str) -> str | None:
     return f"file:{quote(str(path), safe='/')}?mode=ro"
 
 
+def storage_recovery_locator(storage: str | None) -> str | None:
+    """Freeze a storage URL for later recovery from a different working directory.
+
+    Relative SQLite and journal paths are invocation-relative. Active-attempt
+    recovery can happen after the caller changes directories, so the durable
+    locator must resolve those paths while the attempt is registered. RDB URLs
+    are returned unchanged because their credentials and connection options are
+    operationally significant; callers persisting the result must use private
+    storage.
+
+    :param str | None storage: Configured Optuna storage URL.
+    :return str | None: Operationally equivalent locator with file paths made
+        absolute, or ``None`` for in-memory storage.
+    """
+    if storage_is_in_memory(storage):
+        return None
+    assert storage is not None
+    backend = storage_backend(storage)
+    if backend == "journal":
+        path = Path(file_url_path(storage)).expanduser().resolve()
+        return "journal:///" + str(path)
+    if backend != "sqlite":
+        return storage
+
+    from sqlalchemy.engine.url import make_url
+
+    url = make_url(storage)
+    database = url.database or ""
+    if _sqlite_uri_filename_enabled(storage, database):
+        uri_path = sqlite_uri_filename_path(storage)
+        if uri_path is None:
+            # A non-local ``file:`` authority is not cwd-relative.
+            return storage
+        frozen_database = "file:" + str(Path(uri_path).expanduser().resolve())
+    else:
+        frozen_database = str(Path(database).expanduser().resolve())
+    return url.set(database=frozen_database).render_as_string(hide_password=False)
+
+
 # Default TCP ports per RDB dialect family, so `host/db` and `host:5432/db`
 # share one lock identity. Families absent here keep no port segment when the
 # URL omits the port.

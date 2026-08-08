@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import json
 import logging
 import os
 import signal
@@ -28,6 +29,8 @@ from phasesweep.config import (
 )
 from phasesweep.engine import ActiveAttemptPersistenceError, NoFeasibleTrialError, run_experiment
 from phasesweep.engine.guards import (
+    ATTEMPT_REGISTRY_SCHEMA_VERSION,
+    _preflight_active_attempts,
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _reap_stale_trials,
@@ -1239,6 +1242,69 @@ def _fabricate_registered_attempt(
     return study, trial_dir, number
 
 
+def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(tmp_path: Path) -> None:
+    """Credential-bearing recovery locators never land in public artifacts."""
+    storage = "postgresql://researcher:secret@db.internal/studies?sslmode=require"
+    experiment = make_experiment(
+        experiment="private-registry",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'placeholder.db'}",
+    ).model_copy(update={"storage": storage})
+    trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__allocated"
+    trial_dir.mkdir(parents=True)
+
+    _register_active_attempt(
+        experiment,
+        attempt_id="private-attempt",
+        phase_name="p",
+        study_name="private-registry::p",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id="private-generation",
+    )
+
+    entry_path = _attempts_dir(experiment) / "private-attempt.json"
+    payload = json.loads(entry_path.read_text())
+    assert payload["schema_version"] == ATTEMPT_REGISTRY_SCHEMA_VERSION
+    assert payload["storage_locator"] == storage
+    assert "storage" not in payload
+    assert entry_path.parent.stat().st_mode & 0o777 == 0o700
+    assert entry_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_relative_registry_storage_recovers_from_the_registration_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing cwd cannot redirect stale-trial repair into a new database."""
+    registration_cwd = tmp_path / "registration"
+    recovery_cwd = tmp_path / "recovery"
+    registration_cwd.mkdir()
+    recovery_cwd.mkdir()
+    monkeypatch.chdir(registration_cwd)
+    experiment = make_experiment(
+        experiment="relative-registry",
+        workdir=tmp_path / "runs",
+        storage="sqlite:///studies.db",
+        n_trials=1,
+    )
+    study, trial_dir, stale_number = _fabricate_registered_attempt(
+        experiment,
+        "p",
+        attempt_id="relative-attempt",
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="relative-attempt", state="allocated")
+
+    monkeypatch.chdir(recovery_cwd)
+    report = _PreflightCleanupReport()
+    _preflight_active_attempts(experiment, report)
+
+    assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+    assert report.recovered_attempt_ids == {"relative-attempt"}
+    assert not (recovery_cwd / "studies.db").exists()
+    assert not list(_attempts_dir(experiment).glob("*.json"))
+
+
 def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path) -> None:
     """A registry entry survives an Optuna failure before the first trial attr."""
     trainer = write_trainer(tmp_path, "print('x=1.0')")
@@ -1398,7 +1464,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     import phasesweep.engine.guards as guards_mod
     import phasesweep.engine.phase as phase_mod
 
-    real_atomic_write_text = guards_mod.atomic_write_text
+    real_atomic_write_text = guards_mod.private_atomic_write_text
     real_write_attempt_lifecycle = phase_mod.write_attempt_lifecycle
     if failure_site == "registry":
 
@@ -1407,7 +1473,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
                 raise OSError(errno.EACCES, "injected registry write failure")
             real_atomic_write_text(path, text)
 
-        monkeypatch.setattr(guards_mod, "atomic_write_text", refuse_registry_writes)
+        monkeypatch.setattr(guards_mod, "private_atomic_write_text", refuse_registry_writes)
     else:
 
         def refuse_lifecycle_write(*_args: object, **_kwargs: object) -> None:
@@ -1437,7 +1503,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_persistence"
 
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
-    monkeypatch.setattr(guards_mod, "atomic_write_text", real_atomic_write_text)
+    monkeypatch.setattr(guards_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
         run_experiment(_exp(2))

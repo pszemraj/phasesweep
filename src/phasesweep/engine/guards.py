@@ -58,11 +58,14 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
-    atomic_write_text,
+    PlatformCapabilityError,
+    UnsafePrivatePathError,
     canonical_storage_identity,
     exclusive_lock,
     file_sha256,
+    private_atomic_write_text,
     storage_is_in_memory,
+    storage_recovery_locator,
     try_lock_file,
     unlock_file,
 )
@@ -703,7 +706,7 @@ def _read_trial_process_identity(
         ) from exc
 
 
-ATTEMPT_REGISTRY_SCHEMA_VERSION = 1
+ATTEMPT_REGISTRY_SCHEMA_VERSION = 2
 _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
     {
         "schema_version",
@@ -711,7 +714,7 @@ _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
         "experiment",
         "phase",
         "study_name",
-        "storage",
+        "storage_locator",
         "trial_number",
         "trial_dir",
         "generation_id",
@@ -732,7 +735,7 @@ def _register_active_attempt(
     """Durably register a newly allocated attempt before anything is launched.
 
     The entry binds the attempt to the *producing* phase name, study name,
-    and storage URL, so preflight can find and resolve it even after the
+    and a frozen storage locator, so preflight can find and resolve it even after the
     phase was renamed or removed, or the storage URL changed (review
     v0.5.17 / blocker 3).
 
@@ -760,22 +763,21 @@ def _register_active_attempt(
             written. No trainer was started and no GPU lease was consumed.
 
     """
-    entry = {
-        "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
-        "attempt_id": attempt_id,
-        "experiment": experiment.experiment,
-        "phase": phase_name,
-        "study_name": study_name,
-        "storage": experiment.storage,
-        "trial_number": trial_number,
-        "trial_dir": str(trial_dir),
-        "generation_id": generation_id,
-    }
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
     try:
-        entry_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
-    except OSError as exc:
+        entry = {
+            "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
+            "attempt_id": attempt_id,
+            "experiment": experiment.experiment,
+            "phase": phase_name,
+            "study_name": study_name,
+            "storage_locator": storage_recovery_locator(experiment.storage),
+            "trial_number": trial_number,
+            "trial_dir": str(trial_dir),
+            "generation_id": generation_id,
+        }
+        private_atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
+    except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
         raise ActiveAttemptPersistenceError(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
@@ -828,6 +830,10 @@ def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
         or not isinstance(payload.get("attempt_id"), str)
         or not isinstance(payload.get("trial_dir"), str)
         or not isinstance(payload.get("study_name"), str)
+        or (
+            payload.get("storage_locator") is not None
+            and not isinstance(payload.get("storage_locator"), str)
+        )
         or not isinstance(payload.get("generation_id"), str)
         or not payload.get("generation_id")
         or type(payload.get("trial_number")) is not int
@@ -1039,7 +1045,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         its durable failure outcome could not be recorded; the study is left
         inconsistent rather than silently dropping the failure.
     """
-    storage_url = entry["storage"]
+    storage_url = entry["storage_locator"]
     if storage_url is None:
         # In-memory storage died with its orchestrator; nothing to update.
         return "terminal"

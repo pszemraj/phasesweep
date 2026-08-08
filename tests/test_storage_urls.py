@@ -22,6 +22,7 @@ from phasesweep.runtime.files import (
     file_url_path,
     sqlite_database_path,
     storage_backend,
+    storage_recovery_locator,
 )
 from tests.conftest import make_experiment, write_yaml
 
@@ -250,6 +251,44 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
 
     # None → None (in-memory study).
     assert canonical_storage_identity(None) is None
+
+
+@pytest.mark.parametrize(
+    ("storage", "expected_backend", "expected_name"),
+    [
+        ("sqlite+pysqlite:///studies.db?timeout=30", "sqlite", "studies.db"),
+        (
+            "sqlite:///file:uri.db?mode=rwc&cache=shared&uri=true",
+            "sqlite",
+            "uri.db",
+        ),
+        ("journal:///studies.journal", "journal", "studies.journal"),
+    ],
+)
+def test_storage_recovery_locator_freezes_relative_file_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage: str,
+    expected_backend: str,
+    expected_name: str,
+) -> None:
+    """Recovery locators retain the registration cwd and URL semantics."""
+    registration_cwd = tmp_path / "registration"
+    recovery_cwd = tmp_path / "recovery"
+    registration_cwd.mkdir()
+    recovery_cwd.mkdir()
+    monkeypatch.chdir(registration_cwd)
+
+    locator = storage_recovery_locator(storage)
+
+    monkeypatch.chdir(recovery_cwd)
+    assert locator is not None
+    assert storage_backend(locator) == expected_backend
+    assert Path(file_url_path(locator)).is_absolute() or "file:/" in file_url_path(locator)
+    assert expected_name in locator
+    assert str(registration_cwd) in locator
+    if expected_backend == "sqlite" and "?" in storage:
+        assert "timeout=30" in locator or "cache=shared" in locator
 
 
 def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
