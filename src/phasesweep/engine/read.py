@@ -618,10 +618,11 @@ def read_status(
     # published yet, or a pre-manifest legacy summary without semantics) does
     # the current config describe the result.
     comparison = comparison_experiment or experiment
+    current_objective_evidence = objective_evidence_assurance(comparison.metric.extractor)
     metric_payload = {
         "name": comparison.metric.name,
         "goal": comparison.metric.goal,
-        "objective_evidence": objective_evidence_assurance(comparison.metric.extractor),
+        "objective_evidence": current_objective_evidence,
     }
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
@@ -644,7 +645,7 @@ def read_status(
                 "objective_evidence": (
                     _recorded_objective_evidence(
                         stored_evidence,
-                        fallback=metric_payload["objective_evidence"],
+                        fallback=current_objective_evidence,
                     )
                 ),
             }
