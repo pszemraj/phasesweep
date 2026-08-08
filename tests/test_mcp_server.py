@@ -45,6 +45,7 @@ from phasesweep.engine.guards import (
     _phase_fingerprint,
     _reap_stale_trials,
     _register_active_attempt,
+    _validate_artifact_root_binding,
 )
 from phasesweep.engine.run import _write_generation_state
 from phasesweep.engine.state import (
@@ -165,6 +166,7 @@ def _write_cleanup_uncertain_failed_trial(
         storage=exp.storage,
         direction="minimize",
     )
+    _validate_artifact_root_binding(exp, claim_fresh=True)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -204,6 +206,7 @@ def _write_stale_running_trial(
         storage=exp.storage,
         direction="minimize",
     )
+    _validate_artifact_root_binding(exp, claim_fresh=True)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -436,6 +439,7 @@ def _write_winner_yaml(
     incomplete: bool = False,
     generation_id: str | None = None,
 ) -> None:
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     path = (
         _winner_path(experiment, phase_name)
         if generation_id is None
@@ -637,6 +641,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     ) -> None:
         assert generation_id == run_id
         calls.append((config_obj.experiment, from_phase, dry_run))
+        _validate_artifact_root_binding(config_obj, claim_fresh=True)
         generation_path = _generation_record_path(config_obj, generation_id)
         generation_path.parent.mkdir(parents=True, exist_ok=True)
         generation_path.write_text(f"generation_id: {generation_id}\n")

@@ -955,9 +955,11 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
     calls = 0
     cleanup_error = ProcessCleanupUncertainError("cleanup could not be proven")
 
-    def preflight(_experiment: Experiment, *, cleanup_report, from_phase) -> dict:
+    def preflight(
+        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
+    ) -> dict:
         nonlocal calls
-        del from_phase
+        del from_phase, preloaded_studies
         calls += 1
         if calls == 2:
             cleanup_report.mark_uncertain(cleanup_error)
@@ -1019,9 +1021,11 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     )
     preflight_calls = 0
 
-    def preflight(_experiment: Experiment, *, cleanup_report, from_phase) -> dict:
+    def preflight(
+        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
+    ) -> dict:
         nonlocal preflight_calls
-        del cleanup_report, from_phase
+        del cleanup_report, from_phase, preloaded_studies
         preflight_calls += 1
         return {}
 
@@ -1059,9 +1063,11 @@ def test_shutdown_during_post_error_reconciliation_remains_cancellation(
     )
     preflight_calls = 0
 
-    def preflight(_experiment: Experiment, *, cleanup_report, from_phase) -> dict:
+    def preflight(
+        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
+    ) -> dict:
         nonlocal preflight_calls
-        del cleanup_report, from_phase
+        del cleanup_report, from_phase, preloaded_studies
         preflight_calls += 1
         if preflight_calls == 2:
             raise shutdown

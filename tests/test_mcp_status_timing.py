@@ -12,6 +12,7 @@ import optuna
 import pytest
 import yaml
 
+from phasesweep.engine.guards import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import _generation_winner_path, _winner_path
 from phasesweep.mcp.redaction import status_payload
@@ -184,6 +185,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         storage=experiment.storage,
     )
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     winner_path = _winner_path(experiment, "p")
     winner_path.parent.mkdir(parents=True, exist_ok=True)
     winner_path.write_text(
@@ -479,6 +481,7 @@ def test_await_run_returns_when_phase_gains_winner(
 
     async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
         winner = _generation_winner_path(experiment, "r1", experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")

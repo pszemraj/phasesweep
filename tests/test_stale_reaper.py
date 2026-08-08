@@ -319,6 +319,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         _stamp_artifact_root(study, experiment)
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
         trial = study.ask()
         trial_dir = _trial_dir_for(
             experiment,
@@ -441,6 +442,7 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
     elif stage == "get_trials":
         study = SimpleNamespace(
             study_name="shutdown::p",
+            user_attrs={},
             get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
         )
         monkeypatch.setattr(
@@ -528,6 +530,7 @@ def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path)
         direction="minimize",
     )
     _stamp_artifact_root(study, experiment)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     trial = study.ask()
     stale = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
