@@ -29,6 +29,7 @@ from phasesweep.engine.guards import (
     _record_trial_target,
     _register_active_attempt,
     _retire_active_attempt,
+    _validate_study_direction,
     _validate_study_schema,
     _validate_trial_target,
     _verify_fingerprint,
@@ -364,6 +365,7 @@ def _run_phase(
         # it claims its publication root here — before any inspection, reaping,
         # or trial work (review v0.5.19 / finding F5).
         _bind_study_artifact_root(study, experiment)
+        _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
         policy_state = _load_phase_policy_state(study)

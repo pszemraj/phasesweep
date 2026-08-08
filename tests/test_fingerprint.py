@@ -33,6 +33,7 @@ from phasesweep.engine import (
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     SamplerContinuationUnsupportedError,
+    StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
     read_winners,
@@ -1119,6 +1120,27 @@ def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> 
 
     study = optuna.load_study(study_name="t::p", storage=storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+
+
+def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path) -> None:
+    """An empty Optuna namespace cannot silently override the configured goal."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    experiment = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+    study = optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+
+    with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
+        run_experiment(experiment)
+
+    assert study.get_trials(deepcopy=False) == []
 
 
 def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path: Path) -> None:

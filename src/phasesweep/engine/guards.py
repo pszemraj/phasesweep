@@ -10,7 +10,7 @@ import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import optuna
 
@@ -1375,6 +1375,36 @@ def _validate_study_schema(study: optuna.Study) -> None:
     )
 
 
+def _validate_study_direction(
+    study: optuna.Study,
+    goal: Literal["minimize", "maximize"],
+) -> None:
+    """Reject a durable study whose objective direction differs from the config.
+
+    Optuna's ``load_if_exists=True`` keeps the stored direction and silently
+    ignores the direction supplied by a later caller. PhaseSweep therefore
+    validates the durable value explicitly before any trial can be launched.
+
+    :param optuna.Study study: Existing or newly created single-objective study.
+    :param Literal goal: Direction required by the experiment metric.
+    :raises StudySchemaMismatchError: The stored direction does not match ``goal``.
+    """
+    expected = (
+        optuna.study.StudyDirection.MINIMIZE
+        if goal == "minimize"
+        else optuna.study.StudyDirection.MAXIMIZE
+    )
+    if study.directions == [expected]:
+        return
+    stored = ", ".join(direction.name.lower() for direction in study.directions)
+    raise StudySchemaMismatchError(
+        f"Study {study.study_name!r} optimizes {stored or 'no direction'}, but the current "
+        f"config requires {goal}. Optuna does not change a persistent study's direction "
+        "when load_if_exists=True. Use a new experiment/phase name or remove the "
+        "incompatible study before running again."
+    )
+
+
 def _accepted_trial_target(study: optuna.Study) -> int:
     """Return the durable target, inferring old current-schema studies from history.
 
@@ -2543,6 +2573,7 @@ def _preflight_existing_studies(
             errors.append(exc)
             continue
         try:
+            _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
             if reached:
                 _validate_trial_target(study, phase)
