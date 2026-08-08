@@ -401,6 +401,16 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     }
 
 
+def _semantic_payload_digest(payload: object) -> str:
+    """Return the canonical digest used for persisted experiment semantics.
+
+    :param object payload: JSON-compatible semantic identity payload.
+    :return str: SHA-256 of the canonical compact JSON representation.
+    """
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
     """Hash the experiment semantics that give a published result its meaning.
 
@@ -436,8 +446,7 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
             {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
         ],
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return _semantic_payload_digest(payload)
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
@@ -567,8 +576,7 @@ def _phase_fingerprint(
 
     """
     payload = _phase_semantic_payload(experiment, phase, inherited_winners)
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return _semantic_payload_digest(payload)
 
 
 def _verify_fingerprint(

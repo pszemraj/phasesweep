@@ -467,15 +467,18 @@ def _phase_config_fingerprint(phase: Phase) -> str:
     """
     # Deferred: ``engine.guards`` imports this module, so a module-level import
     # here would be circular (same pattern as :func:`_load_winner`).
-    from phasesweep.engine.guards import EXPERIMENT_FINGERPRINT_SCHEMA_VERSION, _semantic_phase_dump
+    from phasesweep.engine.guards import (
+        EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        _semantic_payload_digest,
+        _semantic_phase_dump,
+    )
 
     payload = {
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "name": phase.name,
         **_semantic_phase_dump(phase),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return _semantic_payload_digest(payload)
 
 
 def _write_generation_provenance(
