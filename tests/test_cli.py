@@ -15,11 +15,12 @@ import optuna
 import pytest
 import yaml
 from click.testing import CliRunner
+from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import Suite, load_config
+from phasesweep.config import Experiment, Suite, load_config
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -1706,6 +1707,26 @@ def test_cli_boundary_reports_unexpected_failure_as_internal_error(
     assert "internal error" in captured.err
     assert "Traceback" in captured.err
     assert "injected-internal" in captured.err
+
+
+def test_cli_boundary_does_not_misclassify_unexpected_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only the config-loading layer may classify Pydantic errors as bad input."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    with pytest.raises(ValidationError) as exc_info:
+        Experiment.model_validate({})
+    _stub_run_command(monkeypatch, exc_info.value)
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 70
+    assert "internal error" in captured.err
+    assert "Traceback" in captured.err
 
 
 def test_cli_boundary_reports_environmental_io_failure_as_operational(

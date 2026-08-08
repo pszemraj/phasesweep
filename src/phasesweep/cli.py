@@ -12,7 +12,7 @@ import secrets
 import shlex
 import sys
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,6 @@ from urllib.parse import quote
 
 import click
 import yaml
-from pydantic import ValidationError
 
 from phasesweep.config import ConfigError, Experiment, Suite, load_config
 from phasesweep.config.search import sampler_capability_line
@@ -148,11 +147,6 @@ def main() -> None:
     except (click.Abort, KeyboardInterrupt):
         click.echo("Aborted.", err=True)
         sys.exit(_ABORT_EXIT)
-    except ValidationError as exc:
-        # Pydantic renders every failing field with its location; a traceback
-        # through the model machinery adds nothing to that.
-        click.echo(f"phasesweep: invalid config\n{exc}", err=True)
-        sys.exit(_USAGE_EXIT)
     except ConfigError as exc:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
@@ -179,6 +173,8 @@ def _load_cli_config(path: Path) -> Experiment | Suite:
     :return Experiment | Suite: Validated config.
     :raises ConfigError: The file cannot be parsed or fails model validation.
     """
+    from pydantic import ValidationError
+
     try:
         return load_config(path)
     except ValidationError as exc:
@@ -248,6 +244,30 @@ def _staged_text(destination: Path, text: str) -> Iterator[Path]:
                 staged.unlink()
 
 
+def _publish_staged_text(
+    destination: Path,
+    text: str,
+    *,
+    validate: Callable[[Path], object] | None = None,
+) -> bool:
+    """Stage, optionally validate, and exclusively publish a text file.
+
+    :param Path destination: Destination that must not already exist.
+    :param str text: Complete UTF-8 text to publish.
+    :param Callable[[Path], object] | None validate: Optional staged-file validator.
+    :return bool: True when published, or False if another writer won the destination race.
+    """
+    with _staged_text(destination, text) as staged:
+        if validate is not None:
+            validate(staged)
+        try:
+            os.link(staged, destination)
+        except FileExistsError:
+            return False
+        fsync_directory(destination.parent)
+    return True
+
+
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Write a runnable two-phase starter experiment without overwriting files.",
@@ -277,15 +297,9 @@ def init(output: Path) -> None:
         raise click.exceptions.Exit(2)
     text = _starter_experiment_text(target)
     try:
-        with _staged_text(target, text) as staged:
-            try:
-                os.link(staged, target)
-            except FileExistsError:
-                click.echo(
-                    f"phasesweep init: refusing to overwrite existing path {target}", err=True
-                )
-                raise click.exceptions.Exit(2) from None
-            fsync_directory(target.parent)
+        if not _publish_staged_text(target, text):
+            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+            raise click.exceptions.Exit(2)
     except OSError as exc:
         # `phasesweep init` is the first command a new user runs; an unwritable
         # directory or a filesystem without hard links must report one line, not
@@ -1341,18 +1355,13 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     try:
         text = scaffold_catalog_text(output, from_configs)
-        with _staged_text(output, text) as staged:
-            Registry.load(staged)
-            try:
-                os.link(staged, output)
-            except FileExistsError:
-                click.echo(
-                    f"phasesweep mcp init-catalog: {output} already exists; refusing to "
-                    "overwrite. Pass -o to choose another name.",
-                    err=True,
-                )
-                return False
-            fsync_directory(output.parent)
+        if not _publish_staged_text(output, text, validate=Registry.load):
+            click.echo(
+                f"phasesweep mcp init-catalog: {output} already exists; refusing to "
+                "overwrite. Pass -o to choose another name.",
+                err=True,
+            )
+            return False
     except CatalogError as exc:
         click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False
