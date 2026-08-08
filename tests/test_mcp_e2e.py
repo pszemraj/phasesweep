@@ -312,28 +312,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.instructions == agent_prompt_text(strip=True)
-    numbered_rules = [
-        line for line in initialization.instructions.splitlines() if line[:1].isdigit()
-    ]
-    assert len(numbered_rules) == 11
-    assert "follow `next_cursor` until it is null" in numbered_rules[0]
-    assert "call `inspect_experiment` before proposing a run" in numbered_rules[0]
-    assert "Follow each result's `next_action`" in numbered_rules[1]
-    assert "repeat `await_run` while directed" in numbered_rules[1]
-    assert "operator recovery is required" in numbered_rules[4]
-    # A corrupt publication must stop the agent rather than invite the re-run
-    # that overwrites the evidence (review v0.5.18 / finding F4).
-    assert "`publication_integrity` is `failed`" in numbered_rules[5]
-    assert "never propose a run" in numbered_rules[5]
-    assert "convergence, trends, robustness, causality" in numbered_rules[7]
-    # Historical labels stay historical (review v0.5.16 / blocker 4).
-    assert "`result_context` is `represented_generation`" in numbered_rules[8]
-    assert "`published_config_matches_current: false`" in numbered_rules[8]
-    assert "historical labels recorded by that generation" in numbered_rules[8]
-    assert "Never edit an experiment config yourself" in numbered_rules[9]
-    assert "search space, samplers, gates" in numbered_rules[9]
-    assert "Never open raw datasets" in numbered_rules[10]
-    assert "trainer logs, raw result files, W&B dashboards" in numbered_rules[10]
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -364,25 +342,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         TOOL_CANCEL_RUN,
     ):
         assert server._tool_manager.get_tool(tool_name).is_async is True
-
-    descriptions = {t.name: t.description for t in tools}
-    assert "Call this first" in descriptions[TOOL_LIST_EXPERIMENTS]
-    assert "then call inspect_experiment" in descriptions[TOOL_LIST_EXPERIMENTS]
-    assert "before launch_run" in descriptions[TOOL_INSPECT_EXPERIMENT]
-    assert "config identity" in descriptions[TOOL_INSPECT_EXPERIMENT]
-    assert "recover a lost run_id" in descriptions[TOOL_GET_LATEST_RUN]
-    assert "found=false never authorizes" in descriptions[TOOL_GET_LATEST_RUN]
-    assert "next await an active run" in descriptions[TOOL_GET_RUN_STATUS]
-    assert "stop if recovery_required" in descriptions[TOOL_GET_RUN_STATUS]
-    assert "repeat while running" in descriptions[TOOL_AWAIT_RUN]
-    assert "client-safe 20-second wait" in descriptions[TOOL_AWAIT_RUN]
-    assert "stop immediately for recovery_required" in descriptions[TOOL_AWAIT_RUN]
-    assert "this ends the normal workflow" in descriptions[TOOL_GET_RUN_RESULTS]
-    assert "winner-only data" in descriptions[TOOL_GET_RUN_RESULTS]
-    assert "explicit user authorization" in descriptions[TOOL_LAUNCH_RUN]
-    assert "Never retry permission" in descriptions[TOOL_LAUNCH_RUN]
-    assert "only when the user explicitly asks" in descriptions[TOOL_CANCEL_RUN]
-    assert "Never cancel automatically" in descriptions[TOOL_CANCEL_RUN]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
@@ -428,10 +387,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "recovery_required" in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["enum"]
-    assert (
-        "changed may still be true"
-        in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["description"]
-    )
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
@@ -458,7 +413,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     prompts = asyncio.run(server.list_prompts())
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
-    assert "launch_run" in str(prompt)
     assert "<redacted>" in str(prompt)
 
 

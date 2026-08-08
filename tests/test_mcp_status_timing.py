@@ -405,48 +405,13 @@ def test_await_run_clamps_timeout(
     assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
-def test_await_run_reserves_time_for_the_final_status_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app, _registry, _store = _app_with_run(tmp_path)
-    clock = {"now": 0.0}
-    read_starts: list[float] = []
-    real_read = app._read_status_target
-
-    def timed_read(**kwargs):
-        read_starts.append(clock["now"])
-        result = real_read(**kwargs)
-        clock["now"] += 0.2
-        return result
-
-    async def advance(seconds: float) -> None:
-        clock["now"] += seconds
-
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
-    monkeypatch.setattr(app, "_read_status_target", timed_read)
-
-    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
-
-    assert result["reason"] == "timeout"
-    assert max(read_starts) < AWAIT_MIN_TIMEOUT_SECONDS
-    assert clock["now"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
-
-
-@pytest.mark.parametrize(
-    ("read_seconds", "expected_elapsed"),
-    [
-        pytest.param(2.6, AWAIT_MIN_TIMEOUT_SECONDS, id="wait-remaining-budget"),
-        pytest.param(6.1, 6.1, id="in-progress-read-crosses-deadline"),
-    ],
-)
-def test_await_run_slow_read_timeout_policy(
+def _await_with_timed_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
     read_seconds: float,
-    expected_elapsed: float,
-) -> None:
-    """Do not return early, but do not claim a blocking read can be preempted."""
+) -> tuple[dict[str, object], list[float], float]:
+    """Run one minimum-timeout wait against a manually timed status reader."""
     app, _registry, _store = _app_with_run(tmp_path)
     clock = {"now": 0.0}
     read_starts: list[float] = []
@@ -466,10 +431,38 @@ def test_await_run_slow_read_timeout_policy(
     monkeypatch.setattr(app, "_read_status_target", timed_read)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
+    return result, read_starts, clock["now"]
+
+
+@pytest.mark.parametrize(
+    ("read_seconds", "expected_elapsed", "expect_single_read"),
+    [
+        pytest.param(0.2, AWAIT_MIN_TIMEOUT_SECONDS, False, id="reserve-final-status-read"),
+        pytest.param(2.6, AWAIT_MIN_TIMEOUT_SECONDS, True, id="wait-remaining-budget"),
+        pytest.param(6.1, 6.1, True, id="in-progress-read-crosses-deadline"),
+    ],
+)
+def test_await_run_read_timeout_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_seconds: float,
+    expected_elapsed: float,
+    expect_single_read: bool,
+) -> None:
+    """Do not return early, but do not claim a blocking read can be preempted."""
+    result, read_starts, elapsed = _await_with_timed_reads(
+        tmp_path,
+        monkeypatch,
+        read_seconds=read_seconds,
+    )
 
     assert result["reason"] == "timeout"
-    assert read_starts == [0.0]
-    assert clock["now"] == pytest.approx(expected_elapsed)
+    if expect_single_read:
+        assert read_starts == [0.0]
+    else:
+        assert len(read_starts) > 1
+        assert max(read_starts) < AWAIT_MIN_TIMEOUT_SECONDS
+    assert elapsed == pytest.approx(expected_elapsed)
 
 
 def test_await_run_returns_when_phase_gains_winner(

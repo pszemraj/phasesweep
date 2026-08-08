@@ -2582,154 +2582,66 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
         app.cancel(run_id)
 
 
-def test_cancel_uncertain_cleanup_keeps_run_live_for_launch_gate(
+@pytest.mark.parametrize(
+    ("runner_group_gone", "status_cleanup_confirmed", "preexisting_marker", "check_launch_gate"),
+    [
+        pytest.param(False, None, False, True, id="runner-group-still-live"),
+        pytest.param(True, None, False, True, id="forced-runner-kill-without-status"),
+        pytest.param(True, False, False, False, id="runner-status-cleanup-unconfirmed"),
+        pytest.param(True, True, True, False, id="runner-status-cleanup-confirmed"),
+    ],
+)
+def test_cancel_cleanup_confirmation_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runner_group_gone: bool,
+    status_cleanup_confirmed: bool | None,
+    preexisting_marker: bool,
+    check_launch_gate: bool,
 ) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    run_id = "srv-uncertain"
+    run_id = "srv-cancel-policy"
     handle = make_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
         allow_cancel=True,
-        pid=999999,
-        starttime=111,
     )
     store.create(handle)
+    if preexisting_marker:
+        store.mark_cleanup_uncertain(handle)
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
         assert store.cleanup_uncertain_path(run_id).is_file()
-        return False
+        if status_cleanup_confirmed is not None:
+            write_run_status(
+                store,
+                run_id,
+                returncode=143,
+                error_class="cancelled",
+                cleanup_confirmed=status_cleanup_confirmed,
+            )
+        return runner_group_gone
 
     monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
+    cleanup_confirmed = runner_group_gone and status_cleanup_confirmed is True
     assert result == {
         "run_id": run_id,
-        "state": "running",
-        "cleanup_confirmed": False,
-        "recovery_required": True,
+        "state": "cancelled" if cleanup_confirmed else "running",
+        "cleanup_confirmed": cleanup_confirmed,
+        "recovery_required": not cleanup_confirmed,
     }
-    assert store.cleanup_uncertain_path(run_id).is_file()
-
-    with pytest.raises(Exception, match="already has a running sweep"):
-        app.launch("srv")
-
-
-def test_cancel_forced_runner_kill_without_status_keeps_cleanup_uncertain(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-force-kill"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        allow_cancel=True,
-    )
-    store.create(handle)
-
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: True)
-
-    result = app.cancel(run_id)
-
-    assert result == {
-        "run_id": run_id,
-        "state": "running",
-        "cleanup_confirmed": False,
-        "recovery_required": True,
-    }
-    assert store.cleanup_uncertain_path(run_id).is_file()
-    assert not store.status_path(run_id).exists()
-
-    with pytest.raises(Exception, match="already has a running sweep"):
-        app.launch("srv")
-
-
-def test_cancel_requires_runner_status_cleanup_confirmation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-status-uncertain"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        allow_cancel=True,
-    )
-    store.create(handle)
-
-    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
-        write_run_status(
-            store,
-            run_id,
-            returncode=143,
-            error_class="cancelled",
-            cleanup_confirmed=False,
-        )
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
-
-    result = app.cancel(run_id)
-
-    assert result == {
-        "run_id": run_id,
-        "state": "running",
-        "cleanup_confirmed": False,
-        "recovery_required": True,
-    }
-    assert store.cleanup_uncertain_path(run_id).is_file()
-
-
-def test_cancel_clears_uncertainty_only_with_runner_cleanup_confirmation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-status-confirmed"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        allow_cancel=True,
-    )
-    store.create(handle)
-    store.mark_cleanup_uncertain(handle)
-
-    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
-        write_run_status(
-            store,
-            run_id,
-            returncode=143,
-            error_class="cancelled",
-            cleanup_confirmed=True,
-        )
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
-
-    result = app.cancel(run_id)
-
-    assert result == {
-        "run_id": run_id,
-        "state": "cancelled",
-        "cleanup_confirmed": True,
-        "recovery_required": False,
-    }
-    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert store.cleanup_uncertain_path(run_id).exists() is not cleanup_confirmed
+    if status_cleanup_confirmed is None:
+        assert not store.status_path(run_id).exists()
+    if check_launch_gate:
+        with pytest.raises(Exception, match="already has a running sweep"):
+            app.launch("srv")
 
 
 def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
