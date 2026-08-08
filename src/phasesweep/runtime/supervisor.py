@@ -15,7 +15,7 @@ site initialization (no ``sitecustomize``/``usercustomize``); ``-I``
 directory — which contains the sibling module ``phasesweep/runtime/json.py``
 — is never prepended to ``sys.path``, keeping ``import json`` resolved to the
 stdlib module every time. Keep imports here limited to the stdlib modules
-``os``, ``sys``, ``json``, and ``signal``.
+``os``, ``sys``, ``json``, ``signal``, and ``subprocess``.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 
 # Single source of truth for the wire frame's header width:
@@ -100,7 +101,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Signal readiness, await the framed launch payload, then exec the trainer.
+    """Signal readiness, await the launch payload, then guard the trainer.
 
     :param list[str] | None argv: Optional ``[ready_fd, ack_fd]`` argument
         vector; defaults to ``sys.argv[1:]`` when omitted.
@@ -108,10 +109,9 @@ def main(argv: list[str] | None = None) -> int:
         if the acknowledgement pipe does not deliver a well-formed
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
-        be entered; on success, ``os.execve`` replaces this process image with
-        ``/bin/sh -c cmd`` under the delivered environment and never returns
-        here — the trailing ``127`` only guards against ``execve`` returning
-        unexpectedly.
+        be entered. On success, the supervisor remains as the trusted process-
+        group leader and waits for a ``/bin/sh -c cmd`` child, returning the
+        child's exit status or reproducing its terminating signal.
     """
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 2:
@@ -155,8 +155,34 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             return 76
 
-    os.execve("/bin/sh", ["sh", "-c", cmd], env)
-    return 127
+    # Keep this trusted process alive for the trainer's entire lifetime. It
+    # owns inherited GPU-lease descriptors that arbitrary trainer code must
+    # never be able to close. Popen's default close_fds=True ensures the shell
+    # and trainer receive none of those descriptors while this guardian keeps
+    # its copies until the command exits.
+    #
+    # Group-directed shutdown signals must still reach the trainer. A caught
+    # signal disposition resets to default across exec, so the shell child gets
+    # normal SIGTERM/SIGINT/SIGHUP behavior while the guardian stays alive to
+    # retain the lease and wait for it. Once a signal terminates the child, the
+    # guardian reproduces that signal so the orchestrator observes the same
+    # subprocess return code it did when the supervisor exec-replaced itself.
+    guardian_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def retain_lease_while_child_exits(_signum: int, _frame: object) -> None:
+        """Keep the guardian alive while its process group shuts down."""
+
+    for shutdown_signal in guardian_signals:
+        signal.signal(shutdown_signal, retain_lease_while_child_exits)
+
+    child = subprocess.Popen(["/bin/sh", "-c", cmd], env=env, close_fds=True)
+    return_code = child.wait()
+    if return_code < 0:
+        terminating_signal = -return_code
+        signal.signal(terminating_signal, signal.SIG_DFL)
+        os.kill(os.getpid(), terminating_signal)
+        return 128 + terminating_signal
+    return return_code
 
 
 if __name__ == "__main__":

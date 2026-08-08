@@ -1168,8 +1168,9 @@ def _spawn_blocked_supervisor(
             :class:`_LaunchDeadlineExpired` is raised so the caller reports a
             timeout instead of a generic launch failure.
         gpu_lease_fds: Open host GPU-lock descriptors deliberately inherited
-            by the supervisor and trainer so the kernel lease outlives an
-            orchestrator hard exit.
+            by the trusted supervisor guardian so the kernel lease outlives an
+            orchestrator hard exit. The guardian does not pass them to the
+            trainer child.
 
     Returns:
         A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
@@ -1273,8 +1274,9 @@ def run_supervised(
     supervisor waits on an inherited acknowledgement pipe while the parent
     atomically persists ``process_identity.json``. Only after the identity is
     durable does the parent send the trainer command and full trainer
-    environment to the supervisor as a framed JSON payload, which the
-    supervisor then execs the trainer command under. If the parent dies
+    environment to the supervisor as a framed JSON payload. The supervisor
+    then stays alive as a lease guardian while a descriptor-scrubbed child
+    executes the trainer command. If the parent dies
     before delivering that payload, pipe EOF makes the supervisor exit
     without starting training.
 
@@ -1302,7 +1304,7 @@ def run_supervised(
     :class:`ProcessResult`.
 
     Args:
-        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
+        cmd: Shell command string the acknowledged supervisor runs with ``/bin/sh``.
         env: Full process environment for the subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
@@ -1314,9 +1316,10 @@ def run_supervised(
             exec'ing the trainer, delivered over the ack pipe with the rest
             of the launch payload (review v0.5.17 / blocker 4). ``None``
             keeps the invocation cwd.
-        gpu_lease_fds: Open host GPU-lock descriptors inherited through the
-            supervisor's exec chain. The orchestrator closes only its copies;
-            the kernel retains each lock until the trainer exits.
+        gpu_lease_fds: Open host GPU-lock descriptors inherited by the trusted
+            supervisor guardian, not its trainer child. The orchestrator
+            closes only its copies; the guardian retains each lock until the
+            trainer exits even if trainer code closes every unknown descriptor.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,

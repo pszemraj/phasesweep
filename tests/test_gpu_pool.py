@@ -294,13 +294,16 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
 
 
 def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> None:
-    """A live trainer retains its host lock after its orchestrator is SIGKILLed."""
+    """A trusted guardian retains the lock after trainer FD scrubbing and parent death."""
     locks = tmp_path / "locks"
     locks.mkdir()
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: locks)
     started = tmp_path / "trainer_started"
     trainer = (
-        f"import os, time; open({str(started)!r}, 'w').write(str(os.getpgrp())); time.sleep(1.5)"
+        "import os, time; "
+        "os.closerange(3, 1048576); "
+        f"open({str(started)!r}, 'w').write(str(os.getpgrp())); "
+        "time.sleep(1.5)"
     )
     command = shlex.join([sys.executable, "-c", trainer])
     orchestrator_pid = os.fork()

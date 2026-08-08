@@ -87,7 +87,7 @@ class GpuDevice:
 
 @dataclass(frozen=True)
 class GpuAssignment:
-    """Trainer visibility plus the inherited file descriptors backing its lease."""
+    """Trainer visibility plus descriptors transferred to its trusted guardian."""
 
     visible_devices: str | None
     lease_fds: tuple[int, ...]
@@ -152,12 +152,12 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
 
 
 def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
-    """Close this process's lease copy without unlocking inherited copies.
+    """Close this process's lease copy without unlocking guardian copies.
 
     ``flock(LOCK_UN)`` operates on the shared open-file description and would
-    release the trainer's inherited lock too. Closing only our descriptor
+    release the supervisor guardian's inherited lock too. Closing only our descriptor
     keeps the lock alive after an orchestrator crash or uncertain cleanup,
-    until the last trainer-side copy closes.
+    until the guardian exits with the trainer.
     """
     if lease is None:
         return
