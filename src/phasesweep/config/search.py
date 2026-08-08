@@ -183,7 +183,7 @@ class Sampler(_Frozen):
     """Optuna sampler configuration."""
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
-    seed: int | None = None
+    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     n_startup_trials: int = Field(default=10, ge=0)  # tpe only
     acknowledge_nonresumable: bool = Field(
         default=False,
