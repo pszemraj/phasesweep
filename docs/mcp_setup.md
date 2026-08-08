@@ -89,7 +89,7 @@ phasesweep mcp install --agent codex --yes --allow-user-scope
 phasesweep mcp install --agent claude --agent cursor --type mcp --yes
 ```
 
-`--agent` may be repeated. `--type mcp|instructions|all` selects the integration, `--project DIR` anchors project-scoped files, and `--catalog PATH` overrides `<project>/catalog.yaml`. Unattended user-scoped writes require `--allow-user-scope`; `--yes` alone is not sufficient. A dry run performs catalog preflight and may provision its private state layout, but it does not edit client files.
+`--agent` may be repeated. `--type mcp|instructions|all` selects the integration, `--project DIR` anchors project-scoped files, and `--catalog PATH` overrides `<project>/catalog.yaml`. Unattended user-scoped writes require `--allow-user-scope`; `--yes` alone is not sufficient. A dry run still performs the catalog preflight from step 2, but it does not edit client files.
 
 An instructions-only install needs no catalog or MCP SDK:
 
@@ -106,7 +106,7 @@ phasesweep mcp check-install
 phasesweep mcp check-install --agent claude
 ```
 
-The report distinguishes a healthy entry (`ok`), missing or non-executable launchers, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
+The report distinguishes a resolvable managed launcher (`ok`), missing or non-executable launchers, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. It does not parse the catalog or test server startup; use `phasesweep mcp check` for those validations. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
 
 For CI, explicit catalog review, or troubleshooting, run:
 
@@ -114,7 +114,7 @@ For CI, explicit catalog review, or troubleshooting, run:
 phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 ```
 
-This uses the server's startup validation, provisions and probes the private state layout, and launches no sweep.
+This uses the server's startup validation and, only after every catalog entry passes, provisions and probes the private state layout. It launches no sweep.
 
 After replacing or recreating the conda environment, rerun `phasesweep mcp install` from the intended environment and restart each selected client so its absolute executable path and instructions are refreshed.
 

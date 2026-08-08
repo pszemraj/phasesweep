@@ -38,7 +38,7 @@ phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-The real run launches 9 trials (3 phases x 3 trials, 1000 batches each). Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
+A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
 
 The phase order is deliberate: `optimizer_scale` selects `learning_rate` first because it is the highest-leverage scale decision; `weight_decay` tunes that parameter after the update scale is fixed; then `clip_norm` selects `grad_clip_norm` as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
 
@@ -48,7 +48,7 @@ The example sweeps only supported trainer controls. The upstream template does n
 
 ## MCP full sweep
 
-The MCP catalog exposes the same nine-trial, 1000-batch-per-trial experiment as the full CLI config above; it is not the two-trial quick smoke. It pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
+The MCP catalog exposes the same nine-attempt target with 1000 batches per attempt as the full CLI config above; it is not the two-attempt quick smoke. It pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
 
 ```bash
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml

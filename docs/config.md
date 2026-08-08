@@ -234,7 +234,7 @@ metric:
 
 [examples/tiny_decoder_enwik8/run_trial.py](../examples/tiny_decoder_enwik8/run_trial.py) is a worked trainer-side implementation. If you cannot change the trainer, `log_regex` remains available for an objective at the weakest [objective-evidence assurance tier](mcp.md#objective-evidence-assurance).
 
-### `provenance` is required whenever `storage` is set
+### `provenance` is required for persistent storage
 
 ```text
 Value error, Persistent storage requires a nonempty provenance mapping that identifies
