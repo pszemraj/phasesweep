@@ -14,7 +14,7 @@ from typing import Any
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.server import PhaseSweepMCP
+from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
 from phasesweep.runtime.process import read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
@@ -265,22 +265,15 @@ def runner_argv(
     :param str started_at: Claimed launch timestamp.
     :return list[str]: Runner arguments without the Python module prefix or cwd.
     """
-    return [
-        "--run-id",
-        run_id,
-        "--config",
-        str(config),
-        "--config-sha256",
-        config_sha256,
-        "--status-path",
-        str(store.status_path(run_id)),
-        "--state-dir",
-        str(store.log_path(run_id).parent.parent),
-        "--experiment-id",
-        experiment_id,
-        "--started-at",
-        started_at,
-    ]
+    return _runner_protocol_argv(
+        run_id=run_id,
+        config_snapshot_path=config,
+        config_sha256=config_sha256,
+        status_path=store.status_path(run_id),
+        state_dir=store.log_path(run_id).parent.parent,
+        experiment_id=experiment_id,
+        started_at=started_at,
+    )
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:

@@ -491,6 +491,58 @@ class CatalogCheckReport:
         return all(entry.ok for entry in self.entries)
 
 
+def _load_catalog_entries(
+    catalog: _Catalog,
+    base: Path,
+    *,
+    collect_errors: bool,
+) -> tuple[dict[str, RegisteredExperiment], tuple[CatalogCheckEntry, ...]]:
+    """Validate catalog entries under the check or startup error policy.
+
+    :param _Catalog catalog: Parsed catalog whose entries should be loaded.
+    :param Path base: Catalog directory used to resolve relative paths.
+    :param bool collect_errors: Collect one verdict per entry when true; raise
+        the first :class:`CatalogError` when false.
+    :return tuple: Successfully loaded entries keyed by id and any collected
+        check verdicts, in catalog order.
+    :raises CatalogError: The first entry error when ``collect_errors`` is false.
+    """
+    items: dict[str, RegisteredExperiment] = {}
+    verdicts: list[CatalogCheckEntry] = []
+    seen: set[str] = set()
+    # Two catalog ids must never govern one engine experiment: the MCP busy
+    # guard keys on the id string while the engine's locks key on the output
+    # namespace and storage identity.
+    namespace_owners: dict[str, str] = {}
+    storage_owners: dict[str, str] = {}
+    for entry in catalog.experiments:
+        try:
+            if entry.id in seen:
+                raise CatalogError(f"duplicate catalog id {entry.id!r}")
+            seen.add(entry.id)
+            registered = _load_entry(base, entry)
+            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+        except CatalogError as exc:
+            if not collect_errors:
+                raise
+            verdicts.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
+            continue
+
+        items[entry.id] = registered
+        if collect_errors:
+            actions = tuple(
+                action
+                for action, allowed in (
+                    ("launch", registered.allow_launch),
+                    ("cancel", registered.allow_cancel),
+                    ("from_phase", registered.allow_from_phase),
+                )
+                if allowed
+            )
+            verdicts.append(CatalogCheckEntry(entry.id, actions=actions))
+    return items, tuple(verdicts)
+
+
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate every catalog entry, collecting per-entry verdicts.
 
@@ -506,32 +558,8 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """
     require_linux_mcp_host()
     catalog, base = _parse_catalog(catalog_path)
-    seen: set[str] = set()
-    namespace_owners: dict[str, str] = {}
-    storage_owners: dict[str, str] = {}
-    entries: list[CatalogCheckEntry] = []
-    for entry in catalog.experiments:
-        if entry.id in seen:
-            entries.append(CatalogCheckEntry(entry.id, error=f"duplicate catalog id {entry.id!r}"))
-            continue
-        seen.add(entry.id)
-        try:
-            registered = _load_entry(base, entry)
-            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
-        except CatalogError as exc:
-            entries.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
-            continue
-        actions = tuple(
-            action
-            for action, allowed in (
-                ("launch", registered.allow_launch),
-                ("cancel", registered.allow_cancel),
-                ("from_phase", registered.allow_from_phase),
-            )
-            if allowed
-        )
-        entries.append(CatalogCheckEntry(entry.id, actions=actions))
-    report = CatalogCheckReport(entries=tuple(entries))
+    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
+    report = CatalogCheckReport(entries=verdicts)
     if report.ok:
         _prepare_state_dir(base, catalog.state_dir)
     return report
@@ -575,20 +603,7 @@ class Registry:
         """
         require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
-        items: dict[str, RegisteredExperiment] = {}
-        # Two catalog ids must never govern one engine experiment: the MCP
-        # busy guard keys on the id string while the engine's locks key on
-        # the output namespace and storage identity, so two entries sharing
-        # a resource would race each other's launches and split the run
-        # history across ids (review v0.5.17 gap hunt).
-        namespace_owners: dict[str, str] = {}
-        storage_owners: dict[str, str] = {}
-        for entry in catalog.experiments:
-            if entry.id in items:
-                raise CatalogError(f"duplicate catalog id {entry.id!r}")
-            loaded = _load_entry(base, entry)
-            _claim_catalog_entry_identity(loaded, namespace_owners, storage_owners)
-            items[entry.id] = loaded
+        items, _ = _load_catalog_entries(catalog, base, collect_errors=False)
         return cls(
             state_dir=_prepare_state_dir(base, catalog.state_dir),
             items=items,

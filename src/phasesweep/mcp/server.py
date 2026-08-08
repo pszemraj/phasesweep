@@ -296,6 +296,49 @@ def _runner_env() -> dict[str, str]:
     return env
 
 
+def _runner_protocol_argv(
+    *,
+    run_id: str,
+    config_snapshot_path: Path,
+    config_sha256: str,
+    status_path: Path,
+    state_dir: Path,
+    experiment_id: str,
+    started_at: str,
+) -> list[str]:
+    """Build the required detached-runner protocol arguments.
+
+    Interpreter hardening flags and the project cwd stay at the spawn boundary:
+    they govern how the child starts, while this list is the stable identity and
+    persistence contract consumed by :mod:`phasesweep.mcp.runner`.
+
+    :param str run_id: Claimed run identifier.
+    :param Path config_snapshot_path: Immutable config snapshot for the run.
+    :param str config_sha256: Expected digest of the config snapshot.
+    :param Path status_path: Terminal-status destination.
+    :param Path state_dir: MCP state directory containing the run store.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str started_at: Claimed launch timestamp.
+    :return list[str]: Runner arguments without interpreter prefix, cwd, or optional grants.
+    """
+    return [
+        "--run-id",
+        run_id,
+        "--config",
+        str(config_snapshot_path),
+        "--config-sha256",
+        config_sha256,
+        "--status-path",
+        str(status_path),
+        "--state-dir",
+        str(state_dir),
+        "--experiment-id",
+        experiment_id,
+        "--started-at",
+        started_at,
+    ]
+
+
 class _ToolPayload(BaseModel):
     """Strict base for structured MCP tool results."""
 
@@ -1944,20 +1987,15 @@ class PhaseSweepMCP:
             "-s",
             "-m",
             "phasesweep.mcp.runner",
-            "--run-id",
-            run_id,
-            "--config",
-            str(config_snapshot_path),  # per-run snapshot, not agent input
-            "--config-sha256",
-            reg.config_sha256,
-            "--status-path",
-            str(status_path),
-            "--state-dir",
-            str(self._registry.state_dir),
-            "--experiment-id",
-            reg.id,
-            "--started-at",
-            pending.started_at,
+            *_runner_protocol_argv(
+                run_id=run_id,
+                config_snapshot_path=config_snapshot_path,
+                config_sha256=reg.config_sha256,
+                status_path=status_path,
+                state_dir=self._registry.state_dir,
+                experiment_id=reg.id,
+                started_at=pending.started_at,
+            ),
             # The runner chdirs here itself once its identity is durable; see
             # the trust-boundary note below for why Popen must not do it.
             "--cwd",

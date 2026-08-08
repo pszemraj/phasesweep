@@ -783,6 +783,67 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
     assert store.state(handle) == "running"
 
 
+def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        recovered_attempt_ids=["runner-match", "runner-other"],
+        recovered_attempt_generations={
+            "runner-match": handle.run_id,
+            "runner-other": "other-run",
+        },
+    )
+    store.cleanup_recovery_path(handle.run_id).write_text(
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": ["operator-match"],
+                "reaped_attempt_locations": {
+                    "operator-match": {
+                        "phase": "p",
+                        "trial_number": 3,
+                        "generation_id": handle.run_id,
+                    },
+                    "not-authorized": {
+                        "phase": "p",
+                        "trial_number": 4,
+                        "generation_id": handle.run_id,
+                    },
+                },
+            }
+        )
+    )
+
+    attempt_ids, locations = store.cleanup_recovered_attempt_evidence(handle)
+
+    assert attempt_ids == {"runner-match", "operator-match"}
+    assert locations == {"operator-match": ("p", 3, handle.run_id)}
+
+    # Optional runner evidence may be persisted as null by an older or partial
+    # writer; the operator record remains independently usable.
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        recovered_attempt_ids=None,
+        recovered_attempt_generations={"runner-match": handle.run_id},
+    )
+    attempt_ids, locations = store.cleanup_recovered_attempt_evidence(handle)
+    assert attempt_ids == {"operator-match"}
+    assert locations == {"operator-match": ("p", 3, handle.run_id)}
+
+
 def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())

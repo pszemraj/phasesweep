@@ -371,16 +371,33 @@ class RunStore:
             )
         )
 
+    def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
+        """Load persisted handles and identify malformed handle records.
+
+        :return tuple: Readable handles and stable identities for malformed
+            handle files. Orphaned sibling evidence is intentionally outside
+            this scan and is added only by :meth:`launch_inventory`.
+        """
+        handles: list[RunHandle] = []
+        unreadable: set[str] = set()
+        for path in self._runs_dir.glob("*.json"):
+            handle = self._load_handle(path, expected_run_id=path.stem)
+            if handle is None:
+                unreadable.add(
+                    f"run:{path.stem}"
+                    if SAFE_NAME_PATTERN.fullmatch(path.stem)
+                    else f"handle:{path.name}"
+                )
+                continue
+            handles.append(handle)
+        return handles, unreadable
+
     def list_handles(self) -> list[RunHandle]:
         """Load every persisted handle, skipping any that are malformed or partial.
 
         :return list[RunHandle]: Successfully decoded run handles.
         """
-        handles = []
-        for path in self._runs_dir.glob("*.json"):
-            handle = self._load_handle(path, expected_run_id=path.stem)
-            if handle is not None:
-                handles.append(handle)
+        handles, _unreadable = self._scan_handles()
         return handles
 
     def launch_inventory(self) -> tuple[list[RunHandle], int]:
@@ -396,20 +413,8 @@ class RunStore:
         :return tuple[list[RunHandle], int]: Readable handles and the number of
             distinct malformed-handle or orphan-evidence identities.
         """
-        handles: list[RunHandle] = []
-        readable_ids: set[str] = set()
-        unreadable: set[str] = set()
-        for path in self._runs_dir.glob("*.json"):
-            handle = self._load_handle(path, expected_run_id=path.stem)
-            if handle is None:
-                unreadable.add(
-                    f"run:{path.stem}"
-                    if SAFE_NAME_PATTERN.fullmatch(path.stem)
-                    else f"handle:{path.name}"
-                )
-                continue
-            handles.append(handle)
-            readable_ids.add(handle.run_id)
+        handles, unreadable = self._scan_handles()
+        readable_ids = {handle.run_id for handle in handles}
 
         for path in self._logs_dir.iterdir():
             if not path.is_file():
@@ -728,68 +733,41 @@ class RunStore:
         status = self._read_status(handle)
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
 
-    def cleanup_recovered_attempt_ids(self, handle: RunHandle) -> set[str]:
-        """Return exact reaped attempt IDs from valid runner and operator evidence.
+    def cleanup_recovered_attempt_evidence(
+        self,
+        handle: RunHandle,
+    ) -> tuple[set[str], dict[str, tuple[str, int, str]]]:
+        """Return recovered attempt IDs and locations from one evidence snapshot.
+
+        Runner status contributes attempt IDs only when its generation map binds
+        them to this run. Operator evidence contributes IDs and authorizes only
+        the locations whose IDs appear in that same recovery record.
 
         :param RunHandle handle: Run whose cleanup recovery evidence should be read.
-        :return set[str]: Reaped attempt identities persisted for snapshot finalization.
+        :return tuple: Reaped attempt identities and operator-authorized locations.
         """
         attempt_ids: set[str] = set()
         status = self._read_status(handle)
         if status is not None:
             generations = status.get("recovered_attempt_generations")
-            if isinstance(generations, dict):
+            recovered_ids = status.get("recovered_attempt_ids")
+            if isinstance(generations, dict) and isinstance(recovered_ids, list):
                 attempt_ids.update(
                     attempt_id
-                    for attempt_id in status.get("recovered_attempt_ids", [])
+                    for attempt_id in recovered_ids
                     if generations.get(attempt_id) == handle.run_id
                 )
         payload = self._read_cleanup_recovery(handle)
         if payload is None:
-            return attempt_ids
-        values = payload.get("reaped_attempt_ids")
-        if isinstance(values, list):
-            attempt_ids.update(value for value in values if isinstance(value, str) and value)
-        return attempt_ids
-
-    def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
-        """Return exact attempts the runner reported as cleanup-uncertain.
-
-        These identities bind recovery of an older-generation attempt to the
-        run whose terminal report actually named it, without letting arbitrary
-        later reconciliation serve as evidence for that run.
-
-        :param RunHandle handle: Run whose terminal cleanup cause is read.
-        :return set[str]: Persisted uncertain attempt identities.
-        """
-        status = self._read_status(handle)
-        if status is None:
-            return set()
-        return set(status.get("uncertain_attempt_ids", []))
-
-    def cleanup_recovered_attempt_locations(
-        self,
-        handle: RunHandle,
-    ) -> dict[str, tuple[str, int, str]]:
-        """Return study-local locators from matching operator recovery evidence.
-
-        A snapshot captured during the allocation window can contain a RUNNING
-        trial before its attempt and generation attrs were written. The
-        operator recovery record binds that anonymous frozen row by phase and
-        trial number after the registry restores its durable identity.
-
-        :param RunHandle handle: Run whose operator recovery evidence is read.
-        :return dict[str, tuple[str, int, str]]: Attempt ids mapped to phase,
-            trial number, and producing generation.
-        """
-        payload = self._read_cleanup_recovery(handle)
-        if payload is None:
-            return {}
+            return attempt_ids, {}
         recovered_ids = payload.get("reaped_attempt_ids")
         locations = payload.get("reaped_attempt_locations")
-        if not isinstance(recovered_ids, list) or not isinstance(locations, dict):
-            return {}
+        if not isinstance(recovered_ids, list):
+            return attempt_ids, {}
         authorized = {value for value in recovered_ids if isinstance(value, str) and value}
+        attempt_ids.update(authorized)
+        if not isinstance(locations, dict):
+            return attempt_ids, {}
         result: dict[str, tuple[str, int, str]] = {}
         for attempt_id, raw in locations.items():
             if attempt_id not in authorized or not isinstance(raw, dict):
@@ -806,7 +784,22 @@ class RunStore:
                 and generation_id
             ):
                 result[attempt_id] = (phase, trial_number, generation_id)
-        return result
+        return attempt_ids, result
+
+    def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
+        """Return exact attempts the runner reported as cleanup-uncertain.
+
+        These identities bind recovery of an older-generation attempt to the
+        run whose terminal report actually named it, without letting arbitrary
+        later reconciliation serve as evidence for that run.
+
+        :param RunHandle handle: Run whose terminal cleanup cause is read.
+        :return set[str]: Persisted uncertain attempt identities.
+        """
+        status = self._read_status(handle)
+        if status is None:
+            return set()
+        return set(status.get("uncertain_attempt_ids", []))
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.

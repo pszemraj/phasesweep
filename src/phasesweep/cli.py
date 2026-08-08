@@ -939,8 +939,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 raise click.ClickException("runner process-group cleanup is still uncertain")
 
             reaped = 0
-            reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
-            reaped_attempt_locations = store.cleanup_recovered_attempt_locations(handle)
+            (
+                reaped_attempt_ids,
+                reaped_attempt_locations,
+            ) = store.cleanup_recovered_attempt_evidence(handle)
             causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
             inspected_attempt_ids: set[str] = set()
             inspected_attempt_generations: dict[str, str] = {}
