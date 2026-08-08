@@ -103,6 +103,8 @@ def _which_on_absolute_path(command: str) -> str | None:
     :return str | None: Absolute path to the resolved executable, or ``None``
         when no absolute ``PATH`` entry provides one.
     """
+    if PurePath(command).name != command:
+        return None
     entries = [
         entry
         for entry in os.environ.get("PATH", "").split(os.pathsep)

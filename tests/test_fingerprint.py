@@ -232,6 +232,16 @@ def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None
         Experiment.model_validate(payload)
 
 
+@pytest.mark.parametrize("storage", [":memory:", "sqlite://", "sqlite:///:memory:"])
+def test_in_memory_storage_does_not_require_provenance(storage: str) -> None:
+    payload = make_experiment().model_dump()
+    payload["storage"] = storage
+
+    experiment = Experiment.model_validate(payload)
+
+    assert experiment.provenance == {}
+
+
 def test_late_child_fingerprint_failure_preserves_last_successful_results(
     tmp_path: Path,
 ) -> None:

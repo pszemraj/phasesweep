@@ -299,6 +299,23 @@ def test_categorical_rejects_equal_but_distinct_choices(
         CategoricalParam(type="categorical", choices=choices)
 
 
+def test_categorical_config_error_uses_only_the_selected_union_branch(tmp_path: Path) -> None:
+    """The ``type`` discriminator keeps upgrade errors focused on categorical choices."""
+    with pytest.raises(ValidationError) as exc_info:
+        load_experiment(
+            _grid_yaml(
+                tmp_path,
+                "x: { type: categorical, choices: [1, 1.0] }",
+                n_trials=2,
+            )
+        )
+
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["loc"][-2:] == ("categorical", "choices")
+    assert "must remain distinguishable" in errors[0]["msg"]
+
+
 def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
     """Sub-1e-12 steps collapse onto the same rounded value, so cardinality would lie."""
     with pytest.raises(ValidationError, match="collapses to 2 unique value"):

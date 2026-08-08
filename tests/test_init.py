@@ -183,7 +183,7 @@ def test_init_write_failure_does_not_claim_destination(
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
-    assert result.exit_code == 2
+    assert result.exit_code == 1
     assert f"phasesweep init: cannot write {output}: fsync failed" in result.output
     assert not output.exists()
     assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
@@ -208,7 +208,7 @@ def test_init_reports_publish_errors_without_a_traceback(
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
-    assert result.exit_code == 2
+    assert result.exit_code == 1
     assert isinstance(result.exception, SystemExit)
     assert f"phasesweep init: cannot write {output}: hard links are not supported" in result.output
     assert "Traceback" not in result.output

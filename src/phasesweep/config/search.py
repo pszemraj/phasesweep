@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -163,7 +163,10 @@ class CategoricalParam(_Frozen):
         return choices
 
 
-SearchParam = FloatParam | IntParam | CategoricalParam
+SearchParam = Annotated[
+    FloatParam | IntParam | CategoricalParam,
+    Field(discriminator="type"),
+]
 
 
 # Samplers whose suggestions depend on process-local RNG/optimizer state that

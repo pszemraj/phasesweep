@@ -1659,6 +1659,22 @@ def test_cli_boundary_reports_config_syntax_error_without_traceback(
     assert "Traceback" not in captured.out
 
 
+def test_cli_boundary_names_config_for_schema_validation_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "invalid-schema.yaml"
+    config_path.write_text("experiment: t\nphases: []\n")
+
+    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert str(config_path) in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_boundary_reports_expected_run_failure_without_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1713,6 +1729,24 @@ def test_cli_boundary_reports_unexpected_failure_as_internal_error(
     assert "internal error" in captured.err
     assert "Traceback" in captured.err
     assert "injected-internal" in captured.err
+
+
+def test_cli_boundary_reports_environmental_io_failure_as_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    _stub_run_command(monkeypatch, PermissionError("workdir is not writable"))
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "workdir is not writable" in captured.err
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.err
 
 
 def test_cli_boundary_leaves_help_exit_status_unchanged(

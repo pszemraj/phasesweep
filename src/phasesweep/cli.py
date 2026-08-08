@@ -157,11 +157,27 @@ def main() -> None:
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
         sys.exit(_FAILURE_EXIT)
+    except OSError as exc:
+        click.echo(f"phasesweep: operational error: {exc}", err=True)
+        sys.exit(_FAILURE_EXIT)
     except Exception:  # noqa: BLE001 - the boundary's purpose is to report bugs
         click.echo("phasesweep: internal error — please report this traceback.", err=True)
         traceback.print_exc()
         sys.exit(_INTERNAL_EXIT)
     sys.exit(status if isinstance(status, int) else 0)
+
+
+def _load_cli_config(path: Path) -> Experiment | Suite:
+    """Load a CLI config while retaining its source path in schema diagnostics.
+
+    :param Path path: Config file supplied to a CLI command.
+    :return Experiment | Suite: Validated config.
+    :raises ConfigError: The file cannot be parsed or fails model validation.
+    """
+    try:
+        return load_config(path)
+    except ValidationError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def _starter_experiment_text(target: Path) -> str:
@@ -246,8 +262,8 @@ def init(output: Path) -> None:
     :param Path output: Destination YAML path; existing paths are never replaced.
     :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
         file or symlink, including when it appears between the check and the
-        atomic publication, and when staging or publishing fails with an
-        ``OSError`` such as a permission, disk-space, or hard-link error.
+        atomic publication; with code 1 when staging or publishing fails with
+        an ``OSError`` such as a permission, disk-space, or hard-link error.
     """
     expanded = output.expanduser()
     target = expanded.absolute()
@@ -270,7 +286,7 @@ def init(output: Path) -> None:
         # directory or a filesystem without hard links must report one line, not
         # a traceback.
         click.echo(f"phasesweep init: cannot write {target}: {exc}", err=True)
-        raise click.exceptions.Exit(2) from None
+        raise click.exceptions.Exit(1) from None
 
     # Quote the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
@@ -326,7 +342,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     # codes remain structured throughout startup, including dry-run previews.
     # run_experiment() repeats this idempotently for direct library callers.
     install_signal_handlers()
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if from_phase is not None:
         if isinstance(config, Suite):
             click.echo("--from-phase is only supported for single experiment configs.", err=True)
@@ -346,7 +362,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
     """Validate ``config_path`` without running anything."""
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if isinstance(config, Experiment):
         click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
         _render_experiment_phases(config)
@@ -468,7 +484,7 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
     """Print winner files referenced by ``config_path``."""
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if isinstance(config, Suite):
         _show_suite_winners(config)
         return
@@ -641,7 +657,7 @@ def status(config_path: Path) -> None:
         suite, its own suite-level publication or any component study's - no
         longer validates.
     """
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     payload = config_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     _raise_on_failed_publication(payload)
@@ -714,7 +730,7 @@ def rebind_workdir(config_path: Path) -> None:
     :raises ExperimentLockBusyError: Another orchestrator owns one of the
         experiment (or suite) consistency locks.
     """
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     experiments = (
         [config.experiment_for_study(study) for study in config.studies]
         if isinstance(config, Suite)

@@ -2144,6 +2144,17 @@ def test_server_command_refuses_relative_only_path(tmp_path, monkeypatch):
         install_mod.resolve_server_command()
 
 
+def test_absolute_path_lookup_rejects_commands_with_a_separator(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    workdir = tmp_path / "workdir"
+    launcher = _executable(workdir / "relative")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(launcher.parent))
+
+    assert install_mod._which_on_absolute_path(f"./{launcher.name}") is None
+
+
 def test_probe_launcher_ignores_relative_path_entries(tmp_path, monkeypatch):
     from phasesweep.mcp.install import installer as install_mod
 

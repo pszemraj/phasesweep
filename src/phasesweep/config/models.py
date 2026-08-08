@@ -543,7 +543,7 @@ class Experiment(_Frozen):
         """Require meaningful external-input identity for persistent study reuse.
 
         :raises ValueError: If any provenance key or value is blank, or if
-            ``storage`` is set while ``provenance`` is empty.
+            persistent ``storage`` is set while ``provenance`` is empty.
         :return Experiment: Self, unchanged.
         """
         invalid = [
@@ -551,7 +551,7 @@ class Experiment(_Frozen):
         ]
         if invalid:
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
-        if self.storage is not None and not self.provenance:
+        if not storage_is_in_memory(self.storage) and not self.provenance:
             raise ValueError(
                 "Persistent storage requires a nonempty provenance mapping that identifies "
                 "the trainer, data, and dependency revision used by this experiment."
