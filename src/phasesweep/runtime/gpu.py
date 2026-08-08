@@ -109,24 +109,13 @@ class _GpuAcquisition:
     visible_devices: str
 
 
-def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
-    """Normalize a CUDA device token into :class:`GpuDevice`.
-
-    :param GpuDevice | int | str device: CUDA device token to normalize.
-    :return GpuDevice: Existing device instance or a device wrapping the stringified token.
-    """
-    if isinstance(device, GpuDevice):
-        return device
-    return GpuDevice(str(device))
-
-
-def _gpu_lock_path(device: GpuDevice | int | str) -> Path:
+def _gpu_lock_path(device: GpuDevice) -> Path:
     """Return the host-wide lock file for a CUDA device token.
 
-    :param GpuDevice | int | str device: CUDA device token.
+    :param GpuDevice device: Canonical CUDA device identity.
     :return Path: Host-wide lock file path for ``device``.
     """
-    return lock_dir() / f"gpu_{_coerce_device(device).lock_name}.lock"
+    return lock_dir() / f"gpu_{device.lock_name}.lock"
 
 
 def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:

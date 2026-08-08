@@ -1178,9 +1178,9 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
 
     monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
 
-    def fake_group_member_pids(pgid: int) -> list[int]:
+    def fake_group_member_pids(pgid: int) -> _GroupMemberScan:
         scans.append(pgid)
-        return [22]
+        return _GroupMemberScan(pids=(22,), complete=True, all_members_terminal=False)
 
     def fake_member_pids_alive(pgid: int, pids: set[int] | list[int]) -> bool:
         member_sets.append(set(pids))
@@ -1202,7 +1202,10 @@ def test_existing_group_with_no_inspectable_members_is_uncertain(
 ) -> None:
     """A kernel-visible group cannot be declared dead from an empty procfs view."""
     monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._group_member_pids", lambda pgid: [])
+    monkeypatch.setattr(
+        "phasesweep.runtime.process._group_member_pids",
+        lambda pgid: _GroupMemberScan(pids=(), complete=True, all_members_terminal=False),
+    )
 
     assert _process_group_alive_with_members(1234, None) is True
 

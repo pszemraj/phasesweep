@@ -1608,10 +1608,6 @@ class _GroupMemberScan:
     complete: bool
     all_members_terminal: bool
 
-    def __iter__(self) -> Iterator[int]:
-        """Iterate member PIDs for compatibility with cached-set callers."""
-        return iter(self.pids)
-
 
 def _read_proc_stat_result(proc_entry: Path) -> tuple[_ProcStat | None, bool]:
     """Read one proc stat and distinguish disappearance from unreadability.
@@ -1931,7 +1927,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
             log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
-        members[pgid] = set(_group_member_pids(pgid))
+        members[pgid] = set(_group_member_pids(pgid).pids)
         pending.append(pgid)
 
     deadline = time.monotonic() + grace_seconds
@@ -2054,7 +2050,7 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     if not proc_root.exists():
         return True
     if member_pids is None:
-        scan = _coerce_group_member_scan(_group_member_pids(pgid))
+        scan = _group_member_pids(pgid)
         if _member_pids_alive(pgid, scan.pids):
             return True
         if not scan.complete:
@@ -2067,7 +2063,7 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
         return _process_group_exists(pgid)
     if _member_pids_alive(pgid, member_pids):
         return True
-    scan = _coerce_group_member_scan(_group_member_pids(pgid))
+    scan = _group_member_pids(pgid)
     refreshed = set(scan.pids)
     member_pids.clear()
     member_pids.update(refreshed)
@@ -2078,17 +2074,6 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     if scan.all_members_terminal:
         return False
     return _process_group_exists(pgid)
-
-
-def _coerce_group_member_scan(value: _GroupMemberScan | list[int]) -> _GroupMemberScan:
-    """Normalize legacy/list test doubles to a complete nonterminal scan."""
-    if isinstance(value, _GroupMemberScan):
-        return value
-    return _GroupMemberScan(
-        pids=tuple(value),
-        complete=True,
-        all_members_terminal=False,
-    )
 
 
 def _group_member_pids(pgid: int) -> _GroupMemberScan:
