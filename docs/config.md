@@ -97,7 +97,7 @@ The command in `trial_command` is the training or evaluation program for one tri
 - When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
 - For a `json_envelope` extractor, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into the result envelope. PhaseSweep verifies all three before accepting its objective.
 
-The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is also set to the attempt ID so W&B evidence lookup uses an immutable identity instead of a reusable label. GPU assignment can override `CUDA_VISIBLE_DEVICES` and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` only when the environment did not already define an order. A top-level `env.CUDA_VISIBLE_DEVICES` override is also used for pool discovery, so the lock set and trainer visibility cannot diverge. A narrowed `inherit_env` contract drops the ambient `CUDA_VISIBLE_DEVICES` value from direct inheritance, but the value still drives GPU pool discovery: device tokens it names are leased and re-bound per trial, and a disable sentinel (`""` or `-1`) is pinned into every trial environment so the disable survives the narrowed contract. An unsupported ambient sentinel is warned about and pinned as an empty visibility set; the same malformed value in configured `env` fails. PhaseSweep warns once per phase only when a phase assigns no visibility at all (`gpu_policy: none` under a narrowed contract with an ambient value present); the fingerprinted ways to pass GPU visibility through remain naming it in the `inherit_env` list or setting it under top-level `env`.
+The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is set to the attempt ID so W&B lookup uses an immutable identity. GPU leasing may override CUDA visibility; the [GPU runtime contract](runtime.md#concurrency-model) defines discovery, disable sentinels, locking, and narrowed-environment behavior.
 
 Metric extractor failures, non-finite metrics, nonzero exits, and missing objective or constraint evidence fail the trial. Gate failures follow the separate [evidence gate](#evidence-gates) policy. Constraint bound violations are different: they produce completed but infeasible trials. PhaseSweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution - an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
 
@@ -232,7 +232,7 @@ metric:
     policy: final_checkpoint
 ```
 
-[examples/tiny_decoder_enwik8/run_trial.py](../examples/tiny_decoder_enwik8/run_trial.py) is a worked trainer-side implementation. If you cannot change the trainer, `log_regex` remains available for an objective, at the weakest assurance tier - see the assurance flags under [experiment keys](#experiment-keys).
+[examples/tiny_decoder_enwik8/run_trial.py](../examples/tiny_decoder_enwik8/run_trial.py) is a worked trainer-side implementation. If you cannot change the trainer, `log_regex` remains available for an objective at the weakest [objective-evidence assurance tier](mcp.md#objective-evidence-assurance).
 
 ### `provenance` is required whenever `storage` is set
 
@@ -241,14 +241,7 @@ Value error, Persistent storage requires a nonempty provenance mapping that iden
 the trainer, data, and dependency revision used by this experiment.
 ```
 
-Persistent storage means results outlive the process that produced them, so PhaseSweep now requires the inputs the command string cannot describe to be declared. Add at least one nonempty key/value pair; every entry participates in the phase fingerprint, so declaring a value you will change frequently will invalidate resume.
-
-```yaml
-storage: sqlite:///runs.db
-provenance:
-  trainer_rev: a1b2c3d
-  dataset: enwik8-2011-09-01
-```
+Add at least one nonempty [provenance](#experiment-keys) entry identifying inputs outside the YAML. Every entry participates in the phase fingerprint.
 
 ### RDB storage requires an explicit single-host acknowledgement
 
@@ -257,7 +250,7 @@ Value error, storage 'postgresql://...' resolves to backend 'postgresql', a shar
 relational store. ... Set allow_external_rdb_single_host: true ...
 ```
 
-PhaseSweep's coordination (locks, generation pointers) is host-local, so a shared RDB does not make a sweep multi-host safe. Add `allow_external_rdb_single_host: true` if every process touching that storage and workdir runs on one host; otherwise switch to `journal:///path.journal` for single-host parallel work or `sqlite:///path.db` for sequential `n_jobs: 1`.
+Add `allow_external_rdb_single_host: true` only for the [single-host RDB contract](runtime.md#concurrency-model). Otherwise use Journal storage for same-host parallel work or SQLite for sequential work.
 
 ### Persistent storage now requires a seeded, acknowledged sampler
 
@@ -268,17 +261,17 @@ Value error, Phase 'lr': sampler.type='tpe' with persistent storage (...) requir
 sampler.acknowledge_nonresumable: true. ...
 ```
 
-The default `sampler` block (`type: tpe`, no seed) is no longer accepted on persistent storage. Add a `seed` to every `tpe`, `random`, or `cmaes` phase, and `acknowledge_nonresumable: true` to every `tpe` or `cmaes` phase; `grid` phases and in-memory runs are unaffected. See [sampler capability on persistent storage](#sampler-capability-on-persistent-storage) for the reasoning and a worked example. The acknowledgement is run-control, not semantics: it is excluded from phase fingerprints, so adding it does not invalidate an existing study.
+Apply the [persistent-storage sampler contract](#sampler-capability-on-persistent-storage): seed stochastic samplers and acknowledge TPE/CMA-ES restart limits. The acknowledgement is run-control, so adding it does not invalidate an existing study.
 
 ### Fingerprints now include the execution contract
 
-Every semantic fingerprint (phase schema v4, experiment schema v3, suite schema v3) includes the trainer execution context: the resolved effective trainer cwd (the invocation directory when `execution.cwd` is omitted) and the `execution.inherit_env` contract. Populated studies created under earlier schemas fail the fingerprint check on their next resume or top-up:
+Current fingerprints include the [trainer execution context](#experiment-keys). Populated studies created under earlier schemas fail their next resume or top-up:
 
 ```text
 StudyFingerprintMismatchError: Study 'exp::phase' was created with a different phase config ...
 ```
 
-An omitted `execution.cwd` is no longer an unbound identity: invoking the same relative trainer command from another directory now correctly counts as a semantic change. Finish or archive in-flight studies under the old release, or use a new experiment name for work started under this one. Published generation summaries from earlier releases are likewise reported as historical (`published_config_matches_current: false`) rather than reinterpreted.
+Finish or archive in-flight studies under the old release, or use a new experiment name. Earlier published generations remain readable but report config drift rather than adopting the new execution identity.
 
 ### Categorical `choices` must be pairwise unequal
 
@@ -288,11 +281,7 @@ phases.0.search_space.x.CategoricalParam.choices
   1.0 at index 1 compares equal to 1 at index 0.
 ```
 
-A repeated choice was previously kept verbatim. For a grid phase that inflated the cardinality, so `choices: [1, 1, 2]` with `n_trials: 3` ran three trials over two distinct assignments and still reported the matrix complete; under TPE or random sampling it doubled that value's weight. Before initializing a study, delete the repeat and lower `n_trials` to the new cardinality. For a populated persistent study, changing the choices changes its fingerprint and lowering the accepted trial target is rejected; use a new experiment name or separate storage instead.
-
-Uniqueness is judged by plain Python comparison rather than by type, so `[1, 1.0, true]`, `[0, false]`, and `[0.0, -0.0]` are rejected too. Optuna records a sampled categorical as its `==` index into `choices`, which means equal-but-differently-typed choices all persist as the first of them: the trainer ran `--x true` while the recorded trial, the published winner, the overrides every child phase inherits, and the TPE history all said `1`. If you meant to compare a number against a flag, use choices that differ as values - `["1", "1.0", "true"]` as strings, or separate keys.
-
-The same completeness rule now covers generated float grids: a `step` small enough that adjacent points collapse under the 12-decimal canonical rounding (`low: 0.0, high: 1.0e-12, step: 1.0e-13`) is rejected rather than silently enumerating repeats. Sweep an exponent or a multiplier rather than values that fine.
+Remove values that compare equal under the [categorical-choice rule](#search-parameters), including equal values of different types. Adjust a fresh grid's `n_trials` to the new cardinality; use a new experiment name or storage for a populated study whose choices must change. Float grids that collapse after canonical rounding likewise need a coarser step or a different parameterization.
 
 ### JSON file override validation
 
@@ -301,9 +290,7 @@ Value error, Phase 'p': override_format='json_file' but fixed_overrides key 'cut
 holds a value the overrides.json serializer cannot encode (type date) ...
 ```
 
-`override_format: json_file` writes overrides through a strict `json.dumps`. Config validation and dry-run do not write `overrides.json`, so a value YAML resolved into a non-JSON Python object used to load clean, pass `phasesweep validate`, and then kill the first real trial. Contract and phase `fixed_overrides` are now encoded through that same serializer at load, and the error names the phase, the origin layer, the key, and the offending type. The same gate rejects non-finite floats: YAML `.inf`/`.nan` would serialize as the non-standard `Infinity`/`NaN` tokens the trial-side reader refuses to parse, so they fail at load with the same shaped error - use a finite value, or quote it if the trainer should receive it as text.
-
-The usual cause is an unquoted YAML scalar that PyYAML resolves to `date`, `datetime`, or `time`. Quote it:
+The strict [JSON override validation](#override-formats) now runs while loading the config. Quote YAML-native dates, datetimes, or times that the trainer should receive as text; replace non-finite numbers with finite values.
 
 ```yaml
 # before - datetime.date, not a string
@@ -315,21 +302,13 @@ fixed_overrides:
   cutoff: "2024-01-01"
 ```
 
-### Generation summaries are now versioned result manifests
-
-This is a workdir-artifact change, not a config-load failure. New publications use the [versioned generation manifest and authoritative pointer](runtime.md#output-layout).
-
-Results published by older builds (summaries without `schema_version`) remain readable through the previous identity-only check - nothing to migrate. But note the interpretation change: status and winner reads now report a published result under the metric name, goal, and phase comments *it* recorded, and add `published_config_matches_current` so an edited config is flagged instead of silently relabeling historical evidence. For a single experiment, run-control edits (`n_trials` top-ups, comments, throughput knobs) do not flag drift, while edits to the metric, extractor, search spaces, phase names/order, or inheritance do. Suite results use the stricter [suite fingerprint behavior](runtime.md#fingerprints-and-resume).
-
-Suite summaries added hash-verified component anchors in schema 3; the [runtime output contract](runtime.md#output-layout) defines current validation. Suite results published at schema 1/2 stay readable through the identity-only check; the next successful `run_suite` republishes at schema 3 with the anchors in place.
-
 ### `whole_node` phases require an explicit device set
 
 ```text
 gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices list
 ```
 
-Under `whole_node` the device set is the trainer's world size - it changes the global batch size and therefore the loss - so it can no longer be left to ambient `CUDA_VISIBLE_DEVICES` or `nvidia-smi` detection. Add the explicit list. The set's *size* now also joins the phase fingerprint (its spelling does not), so an existing `whole_node` study resumes only with the same device count.
+Add an explicit `gpu_ids` or `gpu_devices` list. Its size is the trainer's world size and joins the fingerprint; see the [`whole_node` runtime contract](runtime.md#concurrency-model).
 
 ### W&B `run_name_template` is removed, and `timeout_seconds` has a floor of 1
 
@@ -342,7 +321,7 @@ metric.extractor.wandb.timeout_seconds
   Input should be a finite number
 ```
 
-Both apply to the `wandb` extractor and the `wandb_summary_required` gate. W&B evidence is addressed by the immutable `WANDB_RUN_ID` (set to the attempt ID), so a name template can no longer affect which run is read - delete the key. `PHASESWEEP_RUN_NAME` is still injected if you want a human-readable display name, which the trainer sets itself. A `timeout_seconds` under 1 could expire before a single poll, reporting missing evidence for a run that was merely still uploading; raise it to at least `1`. `poll_seconds` and `timeout_seconds` must also be finite: `.inf` used to pass the floor check and then crash the first poll with a misleading credentials diagnosis. There is no "wait forever" - pick a large finite budget.
+Both changes apply to the `wandb` extractor and `wandb_summary_required` gate. Delete `run_name_template`; evidence uses the injected immutable `WANDB_RUN_ID`, while trainers may still use `PHASESWEEP_RUN_NAME` for display. Set finite polling values and raise `timeout_seconds` to at least `1`.
 
 ### Suite and study names may no longer contain `__`
 
@@ -354,21 +333,7 @@ suite
   study identity, and fingerprint.
 ```
 
-`Suite.suite` and every `StudySpec.name` are still restricted to nonempty ASCII `[A-Za-z0-9_-]+`, but a literal `__` anywhere in the name is now also rejected, because the compiled component experiment is named `<suite>__<study>` - a `__` inside either part would let two different suite/study pairs collide on one artifact namespace, study identity, and fingerprint. A study name with `__` fails the identical check under `studies.<n>.name`, with `Study` in place of `Suite` in the message. Rename any suite or study name that used `__` as a separator to `-` or a single `_`.
-
-```yaml
-# before
-suite: nightly__sweep
-studies:
-  - name: lr
-    phases: [{name: eval, n_trials: 1}]
-
-# after
-suite: nightly-sweep
-studies:
-  - name: lr
-    phases: [{name: eval, n_trials: 1}]
-```
+Rename `__` inside suite or study names to `-` or a single `_`. The double underscore separates the two parts of the compiled `<suite>__<study>` experiment identity.
 
 ### Suite promotion requires the candidate and baseline to resolve to the same metric contract
 
@@ -379,29 +344,4 @@ and the baseline resolves to {'name': 'loss', ...}. Put the shared metric in
 suite.defaults or make both study metrics identical.
 ```
 
-A suite study's `promotion.min_delta_vs` compares `baseline.metric` and `candidate.metric` directly, so if the two studies resolve to different `Metric` objects - a different `name`, `goal`, or `extractor` configuration - the subtraction would compare unrelated scalars. Config validation now rejects that mismatch instead of silently computing a meaningless delta. The elided `{...}` portions of the error are each study's fully resolved metric (`Metric.model_dump(mode="json")`), so you can see exactly which field diverged. Give the candidate and baseline the same metric, normally by declaring it once in `suite.defaults.metric` and letting both studies inherit it instead of restating it per study.
-
-```yaml
-# before - candidate's extractor pattern differs from the baseline's
-suite: incompatible_metrics
-defaults:
-  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
-studies:
-  - name: baseline
-    phases: [{name: baseline_eval, n_trials: 1}]
-  - name: candidate
-    metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.]+)'}}
-    promotion: {min_delta_vs: baseline}
-    phases: [{name: candidate_eval, n_trials: 1}]
-
-# after - candidate inherits the shared metric instead of restating it
-suite: incompatible_metrics
-defaults:
-  metric: {name: loss, goal: minimize, extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
-studies:
-  - name: baseline
-    phases: [{name: baseline_eval, n_trials: 1}]
-  - name: candidate
-    promotion: {min_delta_vs: baseline}
-    phases: [{name: candidate_eval, n_trials: 1}]
-```
+Move the shared metric to `suite.defaults.metric` or make both study metrics identical. The error prints each fully resolved metric so the differing name, goal, or extractor field is visible; the [suite promotion contract](#suites) explains why they must match.

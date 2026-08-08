@@ -120,23 +120,6 @@ Between `exec` and the runner's first durable handle write, the server cannot ye
 
 This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
 
-## Installer file preservation contract
-
-Launcher setup, re-pinning, and checks are covered under [verification and maintenance](mcp_setup.md#verification-and-maintenance).
-
-Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed. Project-scoped symlinks are followed only when the resolved target remains inside the selected project. Each operation pins that physical target, serializes against other PhaseSweep installers, and refuses replacement if the file changes during the transaction. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
-
-Ownership of a JSON entry is inferred from the exact generated shape; no receipt records which entry the installer created. A hand-authored entry with that exact shape is therefore treated as managed and may be replaced or removed. Any differing key or argument makes the entry unmanaged. Codex TOML additionally requires the installer's marker lines around the recognizable table. Shared project instructions use one marker-fenced block plus an owner set; removing one client retains the block for the other owners, and removing the final owner removes it.
-
-Preservation depends on the file format:
-
-- Marker-fenced instruction text and the managed Codex TOML block preserve unrelated bytes according to their marker contract.
-- Strict JSON client files may be reserialized during install or uninstall. The editor preserves key order, every number's source spelling (`1e2` stays `1e2`, `1.50` stays `1.50`), detected indentation and newline style, final-newline state, and file permissions, but compact formatting may normalize. For example, `{"a":1}` may become `{"a": 1}`.
-- Duplicate keys, comments, JSON5, non-finite values, and overflowing numbers are refused rather than guessed at.
-- Empty files and empty JSON containers remain after uninstall because whole-file creation ownership is not persisted.
-
-Accordingly, uninstall is not a blanket byte-identical JSON round trip. It removes the managed member while preserving the documented structural and formatting properties above.
-
 ## Inspecting runs
 
 Run handles and per-run logs live under `state_dir`:

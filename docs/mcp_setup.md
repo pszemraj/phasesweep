@@ -63,7 +63,20 @@ By default, `--type all` installs two independent integrations:
 
 Project scope is used where the client reliably supports it. Claude Desktop and Codex MCP entries are user-scoped, and the plan labels them before confirmation. Shared instruction files contain one package-managed block with multiple client owners; if a later install updates that shared prompt, the plan names the existing owners affected.
 
-`phasesweep mcp uninstall` removes only recognizable installer-managed entries and ownership blocks. Unmanaged same-name entries are reported and left untouched. The [installer preservation contract](mcp.md#installer-file-preservation-contract) documents symlinks, locking, JSON reserialization, markers, ownership, and manual-merge behavior.
+`phasesweep mcp uninstall` removes only recognizable installer-managed entries and ownership blocks. Unmanaged same-name entries are reported and left untouched.
+
+### File preservation
+
+Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed. Project-scoped symlinks are followed only when the resolved target remains inside the selected project. Each operation pins that physical target, serializes against other PhaseSweep installers, and refuses replacement if the file changes during the transaction. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+
+JSON ownership is inferred from the exact generated shape; no receipt records which entry the installer created. A hand-authored entry with that shape is therefore managed and may be replaced or removed. Any differing key or argument makes it unmanaged. Codex TOML additionally requires the installer's marker lines. Shared project instructions use one marker-fenced block plus an owner set; removing one client retains the other owners' block, and removing the final owner removes it.
+
+- Marker-fenced instructions and managed Codex TOML preserve unrelated bytes according to their marker contract.
+- Strict JSON may be reserialized. Key order, number spelling (`1e2`, `1.50`), indentation, newline style, final-newline state, and permissions are preserved, but compact spacing may normalize (`{"a":1}` may become `{"a": 1}`).
+- Duplicate keys, comments, JSON5, non-finite values, and overflowing numbers are refused.
+- Empty files and empty JSON containers remain after uninstall because whole-file creation ownership is not persisted.
+
+Uninstall removes the managed member; it does not promise a byte-identical JSON round trip.
 
 ## Unattended installation
 
@@ -117,7 +130,7 @@ The package is not published, and the MCP runtime carries no deprecated tool ali
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
 - Catalog path, storage, or working-directory rejection: follow [paths and the working directory](mcp.md#paths-and-the-working-directory).
-- A client config is skipped: use the manual snippet printed by the installer and review the [file preservation contract](mcp.md#installer-file-preservation-contract). The installer does not overwrite malformed or unmanaged data.
+- A client config is skipped: use the manual snippet printed by the installer and review [file preservation](#file-preservation). The installer does not overwrite malformed or unmanaged data.
 
 ## Advanced and manual details
 
