@@ -142,9 +142,7 @@ def _terminal_report_from_cleanup(
             cleanup.cleanup_confirmed if cleanup_confirmed is None else cleanup_confirmed
         ),
         recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
-        recovered_attempt_generations=MappingProxyType(
-            dict(cleanup.recovered_attempt_generations)
-        ),
+        recovered_attempt_generations=MappingProxyType(dict(cleanup.recovered_attempt_generations)),
         uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),
         cleanup_error=cleanup.error,
         failure_stage=failure_stage,
