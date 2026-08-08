@@ -181,6 +181,22 @@ class ConcurrencyLimitError(McpToolError):
         )
 
 
+class RunCapacityUnknownError(McpToolError):
+    """Raised when persisted run records cannot prove launch capacity."""
+
+    def __init__(self, unreadable_records: int) -> None:
+        """Create a fail-closed capacity error without exposing state paths.
+
+        :param int unreadable_records: Distinct malformed or orphaned run identities.
+        """
+        super().__init__(
+            f"cannot prove available launch capacity because the MCP state contains "
+            f"{unreadable_records} unreadable or orphaned run record(s). Do not retry or "
+            "launch a replacement. Ask the operator to inspect and repair the MCP state "
+            "directory first."
+        )
+
+
 class LaunchInProgressError(McpToolError):
     """Raised when another launch holds the launch lock. Transient; retry.
 

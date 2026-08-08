@@ -46,6 +46,7 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    RunCapacityUnknownError,
     RunLaunchUnsettledError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
@@ -1507,7 +1508,10 @@ class PhaseSweepMCP:
             with self._runs.launch_lock() as acquired:
                 if not acquired:
                     raise LaunchInProgressError()
-                live = self._runs.live_runs()
+                handles, unreadable_records = self._runs.launch_inventory()
+                if unreadable_records:
+                    raise RunCapacityUnknownError(unreadable_records)
+                live = [handle for handle in handles if self._runs.state(handle) == "running"]
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)
                 if busy is not None:

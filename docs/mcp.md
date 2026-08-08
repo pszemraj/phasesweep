@@ -34,6 +34,8 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 `max_concurrent_runs` (catalog top level, default `1`) caps how many sweeps run at once across **all** experiments. The default of `1` suits a single-GPU host: each sweep's trials use the GPU, so a second concurrent sweep would contend for the device and slow both down. A `launch_run` that would exceed the cap returns up to five blocking run IDs; await one directly and retry the refused launch after it becomes terminal, or ask the user before cancelling it. Raise the cap on multi-GPU hosts where independent sweeps can run side by side.
 
+Launch also refuses when a handle is malformed or per-run evidence survives without a readable handle. In that state the server cannot prove whether the missing run still consumes capacity; an operator must inspect and repair the state directory before another launch. Historical read tools remain available for every healthy handle instead of failing the whole catalog.
+
 The cap counts MCP-launched runs recorded in `state_dir`; it does not count a concurrent CLI `phasesweep run` on the same host. CLI and MCP runs are still coordinated by the runtime locks described in [runtime behavior](runtime.md#concurrency-model).
 
 ## Tools

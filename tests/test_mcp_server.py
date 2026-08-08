@@ -62,6 +62,7 @@ from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
+    RunCapacityUnknownError,
     RunLaunchUnsettledError,
     UnknownExperimentError,
 )
@@ -492,6 +493,27 @@ def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> No
     with pytest.raises(Exception, match="changed since server startup"):
         app.launch("srv")
 
+    assert store.list_handles() == []
+
+
+@pytest.mark.parametrize("record_kind", ["malformed_handle", "orphan_config"])
+def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_kind: str,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    captured = patch_popen_capture(monkeypatch)
+    if record_kind == "malformed_handle":
+        (tmp_path / "state" / "runs" / "srv-broken.json").write_text("{not valid json")
+    else:
+        store.config_snapshot_path("srv-orphan").write_text("experiment: srv\n")
+
+    with pytest.raises(RunCapacityUnknownError, match="cannot prove available launch capacity"):
+        app.launch("srv")
+
+    assert "cmd" not in captured
     assert store.list_handles() == []
 
 

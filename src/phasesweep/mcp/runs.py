@@ -55,6 +55,13 @@ __all__ = [
 # 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
+_RUN_EVIDENCE_SUFFIXES = (
+    ".cleanup_uncertain.json",
+    ".cleanup_recovery.json",
+    ".status.json",
+    ".config.yaml",
+    ".log",
+)
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -375,6 +382,46 @@ class RunStore:
             if handle is not None:
                 handles.append(handle)
         return handles
+
+    def launch_inventory(self) -> tuple[list[RunHandle], int]:
+        """Load handles and count records whose launch authority is unreadable.
+
+        Ordinary read tools intentionally skip malformed handles so one bad
+        historical record does not hide every healthy run. Launch is different:
+        capacity is a safety decision, and neither a malformed handle nor
+        per-run evidence with no readable handle can be assumed terminal.
+
+        The caller must hold :meth:`launch_lock` across this scan and the spawn.
+
+        :return tuple[list[RunHandle], int]: Readable handles and the number of
+            distinct malformed-handle or orphan-evidence identities.
+        """
+        handles: list[RunHandle] = []
+        readable_ids: set[str] = set()
+        unreadable: set[str] = set()
+        for path in self._runs_dir.glob("*.json"):
+            handle = self._load_handle(path, expected_run_id=path.stem)
+            if handle is None:
+                unreadable.add(
+                    f"run:{path.stem}"
+                    if SAFE_NAME_PATTERN.fullmatch(path.stem)
+                    else f"handle:{path.name}"
+                )
+                continue
+            handles.append(handle)
+            readable_ids.add(handle.run_id)
+
+        for path in self._logs_dir.iterdir():
+            if not path.is_file():
+                continue
+            for suffix in _RUN_EVIDENCE_SUFFIXES:
+                if not path.name.endswith(suffix):
+                    continue
+                run_id = path.name[: -len(suffix)]
+                if SAFE_NAME_PATTERN.fullmatch(run_id) and run_id not in readable_ids:
+                    unreadable.add(f"run:{run_id}")
+                break
+        return handles, len(unreadable)
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.

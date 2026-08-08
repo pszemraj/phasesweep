@@ -207,6 +207,20 @@ def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     assert {h.run_id for h in store.list_handles()} == {"exp-1", "exp-2"}
 
 
+def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    store.create(make_run_handle(run_id="exp-valid"))
+    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    store.log_path("broken").write_text("runner may still exist\n")
+    store.config_snapshot_path("exp-orphan").write_text("experiment: orphan\n")
+    store.status_path("exp-orphan").write_text("{}\n")
+
+    handles, unreadable_records = store.launch_inventory()
+
+    assert [handle.run_id for handle in handles] == ["exp-valid"]
+    assert unreadable_records == 2
+
+
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
