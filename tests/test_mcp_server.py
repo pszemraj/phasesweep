@@ -39,7 +39,12 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.guards import _experiment_lock, _phase_fingerprint, _reap_stale_trials
+from phasesweep.engine.guards import (
+    _experiment_lock,
+    _phase_fingerprint,
+    _reap_stale_trials,
+    _register_active_attempt,
+)
 from phasesweep.engine.run import _write_generation_state
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -48,6 +53,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
+    _attempts_dir,
     _experiment_dir,
     _generation_record_path,
     _generation_summary_path,
@@ -87,6 +93,7 @@ from phasesweep.runtime.process import (
     _write_process_identity,
     read_boot_id,
     read_proc_starttime,
+    write_attempt_lifecycle,
 )
 from tests.conftest import file_mode, make_experiment, write_constant_trainer
 from tests.mcp_helpers import (
@@ -3097,6 +3104,107 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     assert store.recovery_required(handle)
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
+
+
+def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trial supervisor can outlive its runner in a separate process group.
+
+    With no loadable Optuna study, the experiment-level attempt registry is
+    the only remaining authority. Recovery must inspect it in dry-run mode,
+    refuse to clear the run while its process cleanup is uncertain, and only
+    finalize after the registered supervisor is confirmed gone.
+    """
+    config = _config(tmp_path)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-registry-only-recovery"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+
+    attempt_id = "registry-only-attempt"
+    trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
+    trial_dir.mkdir(parents=True)
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    _write_trial_process_identity(
+        trial_dir,
+        attempt_id=attempt_id,
+        pid=4242,
+        starttime=222,
+    )
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name="removed-phase",
+        study_name="srv::removed-phase",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id=run_id,
+    )
+    entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
+
+    runner_cleanup_calls = 0
+    trial_cleanup_allowed = False
+    trial_cleanup_calls = 0
+
+    def runner_cleanup(*args: object, **kwargs: object) -> bool:
+        nonlocal runner_cleanup_calls
+        runner_cleanup_calls += 1
+        return True
+
+    def trial_cleanup(_identity: StaleProcessIdentity) -> bool:
+        nonlocal trial_cleanup_calls
+        trial_cleanup_calls += 1
+        return trial_cleanup_allowed
+
+    monkeypatch.setattr("phasesweep.cli.kill_stale_group", runner_cleanup)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        trial_cleanup,
+    )
+    runner = CliRunner()
+    command = ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id]
+
+    dry = runner.invoke(cli_main, command)
+
+    assert dry.exit_code == 0, dry.output
+    assert "reconcile 1 registered attempt" in dry.output
+    assert runner_cleanup_calls == 0
+    assert trial_cleanup_calls == 0
+
+    refused = runner.invoke(cli_main, [*command, "--confirm"])
+
+    assert refused.exit_code != 0
+    assert "may still have a live process group" in refused.output
+    assert runner_cleanup_calls == 1
+    assert trial_cleanup_calls == 1
+    assert entry_path.is_file()
+    assert not store.status_path(run_id).exists()
+    assert not store.cleanup_recovery_path(run_id).exists()
+    assert store.state(handle) == "running"
+    with pytest.raises(Exception, match="already has a running sweep"):
+        app.launch("srv")
+
+    trial_cleanup_allowed = True
+    confirmed = runner.invoke(cli_main, [*command, "--confirm"])
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "reconciled 1 registered attempt" in confirmed.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["registered_attempts_reconciled"] == 1
+    assert not entry_path.exists()
+    assert store.state(handle) == "failed"
 
 
 def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_path: Path) -> None:

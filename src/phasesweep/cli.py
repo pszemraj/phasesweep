@@ -34,9 +34,12 @@ from phasesweep.engine.guards import (
     _apply_artifact_root_rebind,
     _experiment_lock,
     _experiment_semantic_fingerprint,
+    _inspect_active_attempts,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
     _plan_artifact_root_rebinds,
+    _preflight_active_attempts,
+    _PreflightCleanupReport,
     _previously_recovered_uncertain_trial_count,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
@@ -940,11 +943,18 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 
             reaped = 0
             reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
-            persisted_reaped_attempts = len(reaped_attempt_ids)
+            registered_attempts_reconciled = 0
             cleanup_recovered = 0
             previously_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
+                if confirm:
+                    active_report = _PreflightCleanupReport()
+                    registered_attempt_ids = _preflight_active_attempts(config, active_report)
+                    reaped_attempt_ids.update(active_report.recovered_attempt_ids)
+                else:
+                    registered_attempt_ids = _inspect_active_attempts(config)
+                registered_attempts_reconciled = len(registered_attempt_ids)
                 for phase in config.phases:
                     study = _load_existing_phase_study(config, phase)
                     if study is None:
@@ -975,7 +985,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                         cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
                         reaped += _inspect_stale_running_trials(study, config, phase.name)
             cleanup_evidence_count = (
-                persisted_reaped_attempts + reaped + cleanup_recovered + previously_recovered
+                len(reaped_attempt_ids) + reaped + cleanup_recovered + previously_recovered
             )
             if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
                 if inspected_studies == 0:
@@ -999,6 +1009,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 if cleanup_recovery_needed:
                     actions.append(
                         "attempt runner process-group cleanup, "
+                        f"reconcile {registered_attempts_reconciled} registered attempt(s), "
                         f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
                         "cleanup-uncertain terminal trial(s)"
                     )
@@ -1031,6 +1042,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     "recovered_at": utc_now_iso(),
                     "cleanup_confirmed": True,
                     "reaped_running_trials": reaped,
+                    "registered_attempts_reconciled": registered_attempts_reconciled,
                     "reaped_attempt_ids": sorted(reaped_attempt_ids),
                     "cleanup_uncertain_terminal_trials": cleanup_recovered,
                 }
@@ -1040,8 +1052,10 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 )
                 store.clear_cleanup_uncertain(handle)
                 click.echo(
-                    f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
-                    f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
+                    f"Cleared cleanup uncertainty for {run_id}; reconciled "
+                    f"{registered_attempts_reconciled} registered attempt(s), reaped {reaped} "
+                    f"stale trial(s), and confirmed {cleanup_recovered} cleanup-uncertain "
+                    "trial(s)."
                 )
 
             if snapshot_recovery_required and stored_snapshot is None:

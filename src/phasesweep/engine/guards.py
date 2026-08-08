@@ -826,7 +826,12 @@ def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
     return payload
 
 
-def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Path) -> None:
+def _registry_attempt_process_is_resolved(
+    entry: dict[str, Any],
+    entry_path: Path,
+    *,
+    inspect_only: bool = False,
+) -> None:
     """Prove no live process can remain from one registered attempt.
 
     Mirrors :func:`_resolve_attempt_for_reaping` but works from the registry
@@ -836,6 +841,8 @@ def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Pat
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
+    :param bool inspect_only: Validate durable recovery evidence without
+        signalling a process.
     :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
     """
     attempt_id = entry["attempt_id"]
@@ -864,6 +871,8 @@ def _registry_attempt_process_is_resolved(entry: dict[str, Any], entry_path: Pat
             f"Attempt registry entry {entry_path} has a missing or malformed "
             f"process identity in {trial_dir}."
         ) from exc
+    if inspect_only:
+        return
     if not cleanup_stale_trial_process(identity):
         raise ProcessCleanupUncertainError(
             f"Registered attempt {attempt_id} (phase {entry['phase']!r}, from "
@@ -1034,7 +1043,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
 def _preflight_active_attempts(
     experiment: Experiment,
     report: _PreflightCleanupReport,
-) -> None:
+) -> set[str]:
     """Resolve every registered nonterminal attempt before any launch.
 
     Runs before the per-phase study loop and is deliberately independent of
@@ -1045,15 +1054,18 @@ def _preflight_active_attempts(
 
     :param Experiment experiment: Parsed experiment whose registry is scanned.
     :param _PreflightCleanupReport report: Shared cleanup-evidence collector.
+    :return set[str]: Attempt ids inspected during this pass.
     :raises ProcessCleanupUncertainError: A registered attempt could not be
         proven safe.
     """
     attempts_dir = _attempts_dir(experiment)
     if not attempts_dir.is_dir():
-        return
+        return set()
+    inspected: set[str] = set()
     for entry_path in sorted(attempts_dir.glob("*.json")):
         entry = _load_attempt_entry(entry_path)
         attempt_id = entry["attempt_id"]
+        inspected.add(attempt_id)
         try:
             _registry_attempt_process_is_resolved(entry, entry_path)
         except ProcessCleanupUncertainError as exc:
@@ -1066,6 +1078,30 @@ def _preflight_active_attempts(
         if outcome != "unreachable":
             with contextlib.suppress(OSError):
                 entry_path.unlink(missing_ok=True)
+    return inspected
+
+
+def _inspect_active_attempts(experiment: Experiment) -> set[str]:
+    """Validate registered attempts without signalling or changing state.
+
+    This is the observational half of ``mcp recover-run``. It scans the same
+    phase-independent registry as normal preflight, so renamed phases and
+    unavailable current storage cannot hide a trainer from the dry run.
+
+    :param Experiment experiment: Parsed experiment whose registry is scanned.
+    :return set[str]: Attempt ids a confirmed recovery would reconcile.
+    :raises ProcessCleanupUncertainError: An entry lacks safe recovery evidence.
+    """
+    attempts_dir = _attempts_dir(experiment)
+    if not attempts_dir.is_dir():
+        return set()
+    inspected: set[str] = set()
+    for entry_path in sorted(attempts_dir.glob("*.json")):
+        entry = _load_attempt_entry(entry_path)
+        attempt_id = entry["attempt_id"]
+        _registry_attempt_process_is_resolved(entry, entry_path, inspect_only=True)
+        inspected.add(attempt_id)
+    return inspected
 
 
 def _attempt_lifecycle_for_reaping(
