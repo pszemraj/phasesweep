@@ -15,6 +15,7 @@ from uuid import uuid4
 import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
+from phasesweep.config.models import _iter_fixed_override_layers
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
@@ -274,9 +275,8 @@ def _composed_overrides(
     out: dict[str, Any] = {}
     for parent in phase.inherits:
         out.update(inherited_winners[parent].effective_overrides)
-    for contract_name in phase.contracts:
-        out.update(experiment.contracts[contract_name].fixed_overrides)
-    out.update(phase.fixed_overrides)
+    for _origin, fixed_overrides in _iter_fixed_override_layers(experiment, phase):
+        out.update(fixed_overrides)
     out.update(sampled)
     return out
 

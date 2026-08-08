@@ -204,21 +204,28 @@ def test_dump_overrides_json_and_write_json_file_reject_non_finite_floats(tmp_pa
         write_json_file({"x": value}, tmp_path)
 
 
-def test_validate_rejects_unserializable_json_file_fixed_override(tmp_path):
-    """An unquoted YAML date becomes datetime.date, which overrides.json cannot encode."""
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        pytest.param("2024-01-01", r"'knob'.*cannot encode.*type date", id="yaml-date"),
+        pytest.param(".inf", r"'knob'.*cannot encode.*non-finite", id="non-finite-float"),
+    ],
+)
+def test_validate_rejects_invalid_json_file_fixed_override(
+    tmp_path, literal: str, expected: str
+) -> None:
+    """The canonical strict JSON serializer rejects unsupported fixed values at load time."""
     p = _override_yaml(
         tmp_path,
         "json_file",
-        """
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              cutoff: 2024-01-01
-        """,
+        "        phases:\n"
+        "          - name: p\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        f"              knob: {literal}\n",
     )
 
-    with pytest.raises(ValidationError, match="Phase 'p'.*'cutoff'.*cannot encode.*type date"):
+    with pytest.raises(ValidationError, match=expected):
         load_experiment(p)
 
 
@@ -240,26 +247,6 @@ def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
     )
 
     with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
-        load_experiment(p)
-
-
-def test_validate_rejects_non_finite_json_file_fixed_override(tmp_path):
-    """YAML .inf resolves to a non-finite float, which the strict encoder
-    (allow_nan=False) rejects; this must surface at load time, not at the
-    first trial's json.dumps."""
-    p = _override_yaml(
-        tmp_path,
-        "json_file",
-        """
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              threshold: .inf
-        """,
-    )
-
-    with pytest.raises(ValidationError, match="Phase 'p'.*'threshold'.*cannot encode.*non-finite"):
         load_experiment(p)
 
 
@@ -365,28 +352,6 @@ def test_validate_accepts_finite_hydra_fixed_override(tmp_path) -> None:
     assert experiment.phases[0].fixed_overrides["knob"] == [1.5, -2.0]
 
 
-@pytest.mark.parametrize(
-    "value", [param.values[0] for param in _UNRENDERABLE_ARGPARSE_VALUES], ids=lambda v: str(v)
-)
-def test_json_file_keeps_its_own_verdict_on_argparse_rejected_values(tmp_path, value):
-    """The argparse contract is format-scoped: json_file's own validator decides
-    these values, and the argparse error must never fire for them."""
-    p = _override_yaml(
-        tmp_path,
-        "json_file",
-        "        phases:\n"
-        "          - name: t\n"
-        "            n_trials: 1\n"
-        "            fixed_overrides:\n"
-        f"              knob: {value}\n",
-    )
-
-    try:
-        load_experiment(p)
-    except ValidationError as exc:
-        assert "override_format='argparse'" not in str(exc)
-
-
 def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_path):
     """With the value contract enforced, distinct Python values always produce
     distinct JSON-mode dumps — so no two configs that render different commands
@@ -447,23 +412,30 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
         config.experiment_for_study(flat)
 
 
-def test_json_file_accepts_quoted_date_like_override(tmp_path):
-    """Quoting keeps the value a string, which is exactly the documented fix."""
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        pytest.param('"2024-01-01"', "2024-01-01", id="quoted-date"),
+        pytest.param("{depth: 2}", {"depth": 2}, id="mapping"),
+    ],
+)
+def test_validate_accepts_json_file_fixed_override(
+    tmp_path, literal: str, expected: object
+) -> None:
+    """Values supported by strict JSON remain available only on the json_file wire."""
     p = _override_yaml(
         tmp_path,
         "json_file",
-        """
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              cutoff: "2024-01-01"
-        """,
+        "        phases:\n"
+        "          - name: p\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        f"              knob: {literal}\n",
     )
 
     exp = load_experiment(p)
 
-    assert exp.phases[0].fixed_overrides["cutoff"] == "2024-01-01"
+    assert exp.phases[0].fixed_overrides["knob"] == expected
 
 
 # ---- migrated from version-named files ----
@@ -587,4 +559,25 @@ def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: st
             load_experiment(p)
         return
     exp = load_experiment(p)
-    assert exp.phases[-1].fixed_overrides["lr"] == 5.0e-4
+    child = exp.phases[-1]
+    assert child.fixed_overrides["lr"] == 5.0e-4
+
+    # Exercise the runtime merge too: inherited winners are the lowest layer,
+    # the explicit fixed resolution replaces both, and sampled keys remain the
+    # final layer.
+    from phasesweep.engine.phase import _composed_overrides
+    from phasesweep.engine.state import Winner
+
+    inherited = {
+        name: Winner(
+            trial_number=index,
+            params={"lr": value},
+            effective_overrides={"lr": value},
+            metric=value,
+        )
+        for index, (name, value) in enumerate((("a", 1.0e-4), ("b", 2.0e-4)))
+    }
+    assert _composed_overrides(exp, child, {"dropout": 0.25}, inherited) == {
+        "lr": 5.0e-4,
+        "dropout": 0.25,
+    }

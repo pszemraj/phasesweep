@@ -10,82 +10,74 @@ import json
 import math
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+_CliOverrideFormat = Literal["argparse", "hydra"]
 
 
-def _stringify(value: Any) -> str:
-    """Render a Python value into the canonical scalar form for trial commands.
+class _OverrideValueError(TypeError):
+    """A value outside the shared argparse/Hydra override contract."""
 
-    The accepted set is exactly the argparse override contract enforced at
-    config load by
-    :func:`phasesweep.config.models._validate_argparse_override_values`: values
-    whose ``str()`` form is faithful to the JSON-mode dump the semantic
-    fingerprint hashes. This function is the defense in depth behind that
-    validator — it must fail loudly rather than ``str()`` a mapping or a
-    ``datetime.date`` into a command line, because that is how two different
-    commands end up sharing one study identity (PR #5 review / reviewer 2,
-    blocker 3).
+    def __init__(self, fmt: _CliOverrideFormat, value: Any, position: str) -> None:
+        """Describe the exact nested value the selected CLI wire cannot render."""
+        self.value = value
+        self.position = position
+        where = f" at position {position}" if position else ""
+        super().__init__(
+            f"override_format={fmt!r} supports null, booleans, integers, finite "
+            f"floats, strings, and lists of those; got{where} "
+            f"{type(value).__name__}: {value!r}. Use override_format='json_file' "
+            "for structured values."
+        )
 
-    Args:
-        value: ``None``, a bool, an int, a finite float, a string, or a
-            list/tuple of those — sampled by Optuna or read from
-            ``fixed_overrides``.
 
-    Returns:
-        A string representation: ``"true"``/``"false"`` for ``bool``;
-        ``"[a,b,c]"`` for list/tuple; ``str(value)`` for the remaining
-        scalars (``None`` renders as ``"None"``).
+def _render_override_value(
+    value: Any,
+    fmt: _CliOverrideFormat,
+    *,
+    position: str = "",
+    _ancestors: set[int] | None = None,
+) -> str:
+    """Render one value using the shared argparse/Hydra value contract.
 
-    Raises:
-        TypeError: The value is outside the argparse contract — a mapping, a
-            non-finite float, or any other object (a YAML-native
-            ``date``/``datetime``, a set, ...).
-
+    :param Any value: Scalar or recursively list-like override value.
+    :param _CliOverrideFormat fmt: Target CLI override grammar.
+    :param str position: Nested list position used in diagnostics.
+    :param set[int] | None _ancestors: Internal recursive-container guard.
+    :raises _OverrideValueError: If a value has no faithful CLI wire form.
+    :return str: Canonical value text for ``fmt``.
     """
     if value is None:
-        return "None"
+        return "None" if fmt == "argparse" else "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_stringify(v) for v in value) + "]"
     if isinstance(value, str):
-        return value
+        return value if fmt == "argparse" else json.dumps(value)
     if isinstance(value, int):
         return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return str(value)
-    raise TypeError(
-        "override_format='argparse' supports null, booleans, integers, finite "
-        "floats, strings, and lists of those; got "
-        f"{type(value).__name__}: {value!r}. Use override_format='json_file' for "
-        "structured values."
-    )
-
-
-def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar.
-
-    :param Any value: Scalar or list-like value to render.
-    :raises TypeError: If the value cannot be represented by the supported grammar.
-    :return str: Hydra-compatible representation of the value.
-    """
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return str(value)
-    if isinstance(value, str):
-        return json.dumps(value)
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return str(value)
+        raise _OverrideValueError(fmt, value, position)
     if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_stringify_hydra(v) for v in value) + "]"
-    raise TypeError(
-        "override_format='hydra' supports null, booleans, integers, finite "
-        "floats, strings, and lists of those; "
-        f"got {type(value).__name__}. Use override_format='json_file' for structured values."
-    )
+        ancestors = set() if _ancestors is None else _ancestors
+        if id(value) in ancestors:
+            raise _OverrideValueError(fmt, value, position)
+        ancestors.add(id(value))
+        try:
+            rendered = (
+                _render_override_value(
+                    item,
+                    fmt,
+                    position=f"{position}[{index}]",
+                    _ancestors=ancestors,
+                )
+                for index, item in enumerate(value)
+            )
+            return "[" + ",".join(rendered) + "]"
+        finally:
+            ancestors.remove(id(value))
+    raise _OverrideValueError(fmt, value, position)
 
 
 def format_hydra(overrides: dict[str, Any]) -> str:
@@ -100,7 +92,7 @@ def format_hydra(overrides: dict[str, Any]) -> str:
     """
     parts: list[str] = []
     for k, v in overrides.items():
-        parts.append(shlex.quote(f"{k}={_stringify_hydra(v)}"))
+        parts.append(shlex.quote(f"{k}={_render_override_value(v, 'hydra')}"))
     return " ".join(parts)
 
 
@@ -115,15 +107,15 @@ def format_argparse(overrides: dict[str, Any]) -> str:
         token pairs.
 
     Raises:
-        TypeError: A value is outside the argparse override contract (see
-            :func:`_stringify`). Statically-known override values are already
-            rejected at config load; this covers anything else.
+        TypeError: A value is outside the shared CLI override contract (see
+            :func:`_render_override_value`). Statically-known override values
+            are already rejected at config load; this covers anything else.
 
     """
     parts: list[str] = []
     for k, v in overrides.items():
         parts.append(shlex.quote(f"--{k}"))
-        parts.append(shlex.quote(_stringify(v)))
+        parts.append(shlex.quote(_render_override_value(v, "argparse")))
     return " ".join(parts)
 
 
