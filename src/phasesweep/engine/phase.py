@@ -1133,6 +1133,12 @@ def _run_phase(
         # the abort.
         if accepted_partial_timeout:
             current_policy_state = _load_phase_policy_state(study)
+            # This single superseding record is the transaction boundary. If
+            # its write fails, no timeout-precedence decision was committed,
+            # selection/publication never runs, and the already-durable abort
+            # remains the valid pre-transition state. Once it succeeds, the
+            # loader consumes that exact abort sequence even if the separate
+            # historical-marker clear below fails or the process exits.
             study.set_user_attr(
                 PHASE_RECOVERY_ATTR,
                 {
