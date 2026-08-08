@@ -63,6 +63,7 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
     drop_artifact_root_binding,
+    write_constant_trainer,
     write_trainer,
     write_yaml,
 )
@@ -931,28 +932,30 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert "trial_number" in capsys.readouterr().out
 
 
-def _movable_experiment_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _movable_experiment_configs(
+    tmp_path: Path,
+    *,
+    include_second_phase: bool = False,
+) -> tuple[Path, Path, Path, Path]:
     """Write two configs that differ only in ``workdir`` and share one SQLite storage.
 
     :param Path tmp_path: Per-test temporary directory.
+    :param bool include_second_phase: Add a second study to exercise partial rebinds.
     :return tuple[Path, Path, Path, Path]: ``(config_a, config_b, workdir_a, workdir_b)``.
     """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        """
-        import argparse, json
-        from pathlib import Path
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"x": 0.5}))
-        print("x=0.5")
-        """,
-    )
+    trainer = write_constant_trainer(tmp_path)
     workdir_a = tmp_path / "runs_a"
     workdir_b = tmp_path / "runs_b"
+    second_phase = (
+        """
+              - name: q
+                n_trials: 1
+                sampler: { type: random, seed: 1 }
+                search_space: { y: { type: int, low: 0, high: 10 } }
+    """
+        if include_second_phase
+        else ""
+    )
 
     def config_text(workdir: Path) -> str:
         return textwrap.dedent(f"""
@@ -970,11 +973,56 @@ def _movable_experiment_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]
                 n_trials: 1
                 sampler: {{ type: random, seed: 0 }}
                 search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
+            {second_phase}
             """).lstrip()
 
-    config_a = tmp_path / "exp_a.yaml"
+    stem = "exp_two" if include_second_phase else "exp"
+    config_a = tmp_path / f"{stem}_a.yaml"
     config_a.write_text(config_text(workdir_a))
-    config_b = tmp_path / "exp_b.yaml"
+    config_b = tmp_path / f"{stem}_b.yaml"
+    config_b.write_text(config_text(workdir_b))
+    return config_a, config_b, workdir_a, workdir_b
+
+
+def _movable_suite_configs(
+    tmp_path: Path,
+    *,
+    study_names: tuple[str, ...],
+) -> tuple[Path, Path, Path, Path]:
+    """Write equivalent suite configs rooted at two different workdirs."""
+    trainer = write_constant_trainer(tmp_path)
+    workdir_a = tmp_path / "runs_a"
+    workdir_b = tmp_path / "runs_b"
+    study_entries = "".join(
+        f"""\
+  - name: {study_name}
+    phases:
+      - name: p
+        n_trials: 1
+        sampler: {{ type: random, seed: 0 }}
+        search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+"""
+        for study_name in study_names
+    )
+
+    def config_text(workdir: Path) -> str:
+        return f"""\
+suite: s
+defaults:
+  workdir: {workdir}
+  storage: sqlite:///{tmp_path}/suite.db
+  provenance: {{revision: test-fixture-v1}}
+  trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+  metric:
+    name: x
+    goal: minimize
+    extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+studies:
+{study_entries}"""
+
+    config_a = tmp_path / "suite_a.yaml"
+    config_a.write_text(config_text(workdir_a))
+    config_b = tmp_path / "suite_b.yaml"
     config_b.write_text(config_text(workdir_b))
     return config_a, config_b, workdir_a, workdir_b
 
@@ -1105,51 +1153,10 @@ def test_rebind_workdir_refuses_when_no_study_is_bound(
 
 def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> None:
     """A suite compiles to one experiment per study, each with its own artifact root."""
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        open(args.out, "w").write(json.dumps({"x": 1.0}))
-        print("x=1.0")
-        """,
+    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
+        tmp_path,
+        study_names=("ran", "untouched"),
     )
-
-    def suite_text(workdir: Path) -> str:
-        return textwrap.dedent(f"""
-            suite: s
-            defaults:
-              workdir: {workdir}
-              storage: sqlite:///{tmp_path}/suite.db
-              provenance: {{revision: test-fixture-v1}}
-              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: ran
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-              - name: untouched
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-            """).lstrip()
-
-    workdir_a = tmp_path / "runs_a"
-    workdir_b = tmp_path / "runs_b"
-    config_a = tmp_path / "suite_a.yaml"
-    config_a.write_text(suite_text(workdir_a))
-    config_b = tmp_path / "suite_b.yaml"
-    config_b.write_text(suite_text(workdir_b))
     suite_a = load_config(config_a)
     assert isinstance(suite_a, Suite)
     # Only the first study has ever run, so the second contributes no study to
@@ -1167,61 +1174,6 @@ def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> No
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
         _experiment_dir(suite_b.experiment_for_study(suite_b.studies[0]))
     )
-
-
-def _movable_two_phase_configs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    """Build one two-phase experiment as two configs differing only in workdir.
-
-    Two phases means two studies, which is what makes a partially applied
-    rebind observable at all.
-
-    :param Path tmp_path: Per-test temporary directory.
-    :return tuple[Path, Path, Path, Path]: ``(config_a, config_b, workdir_a, workdir_b)``.
-    """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        """
-        import argparse, json
-        from pathlib import Path
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"x": 0.5}))
-        print("x=0.5")
-        """,
-    )
-    workdir_a = tmp_path / "runs_a"
-    workdir_b = tmp_path / "runs_b"
-
-    def config_text(workdir: Path) -> str:
-        return textwrap.dedent(f"""
-            experiment: t
-            storage: sqlite:///{tmp_path}/studies.db
-            provenance: {{revision: test-fixture-v1}}
-            workdir: {workdir}
-            trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-            metric:
-              name: x
-              goal: minimize
-              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            phases:
-              - name: p
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-              - name: q
-                n_trials: 1
-                sampler: {{ type: random, seed: 1 }}
-                search_space: {{ y: {{ type: int, low: 0, high: 10 }} }}
-            """).lstrip()
-
-    config_a = tmp_path / "exp_two_a.yaml"
-    config_a.write_text(config_text(workdir_a))
-    config_b = tmp_path / "exp_two_b.yaml"
-    config_b.write_text(config_text(workdir_b))
-    return config_a, config_b, workdir_a, workdir_b
 
 
 def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
@@ -1329,45 +1281,10 @@ def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
     Rebinding it would produce a tree whose suite publication reports corrupt
     on the next read, which is worse than refusing the move.
     """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        open(args.out, "w").write(json.dumps({"x": 1.0}))
-        print("x=1.0")
-        """,
+    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
+        tmp_path,
+        study_names=("only",),
     )
-
-    def suite_text(workdir: Path) -> str:
-        return textwrap.dedent(f"""
-            suite: s
-            defaults:
-              workdir: {workdir}
-              storage: sqlite:///{tmp_path}/suite.db
-              provenance: {{revision: test-fixture-v1}}
-              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: only
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-            """).lstrip()
-
-    workdir_a = tmp_path / "runs_a"
-    workdir_b = tmp_path / "runs_b"
-    config_a = tmp_path / "suite_pub_a.yaml"
-    config_a.write_text(suite_text(workdir_a))
-    config_b = tmp_path / "suite_pub_b.yaml"
-    config_b.write_text(suite_text(workdir_b))
     suite_a = load_config(config_a)
     assert isinstance(suite_a, Suite)
     run_suite(suite_a)
@@ -1421,7 +1338,10 @@ def test_rebind_workdir_converges_after_a_partially_applied_rebind(tmp_path: Pat
     Planning therefore validates every study against the destination instead
     of requiring one coherent previous root.
     """
-    config_a, config_b, workdir_a, workdir_b = _movable_two_phase_configs(tmp_path)
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(
+        tmp_path,
+        include_second_phase=True,
+    )
     experiment_a = load_experiment(config_a)
     run_experiment(experiment_a)
     shutil.copytree(workdir_a, workdir_b)
@@ -1454,7 +1374,10 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
     relocated here, so this exact rebind succeeds without the injected
     failure: the refusal is caused by the unknown binding alone.
     """
-    config_a, config_b, workdir_a, workdir_b = _movable_two_phase_configs(tmp_path)
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(
+        tmp_path,
+        include_second_phase=True,
+    )
     experiment_a = load_experiment(config_a)
     run_experiment(experiment_a)
     assert experiment_a.storage is not None
