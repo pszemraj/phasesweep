@@ -802,35 +802,38 @@ def _open_private_text(path: Path, mode: str) -> IO[str]:
         os.close(parent_fd)
 
 
-def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
-    """Create a uniquely-named, owner-only temporary file next to a destination leaf.
+def _new_exclusive_temp_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
+    """Create a uniquely named temporary file relative to an open directory.
 
     Uses ``O_CREAT | O_EXCL`` with ``O_NOFOLLOW`` relative to ``parent_fd``
-    so the temporary file can never collide with an existing path or be a
-    followed symlink, then ``fchmod``s it to the private file mode
-    (belt-and-suspenders against umask). Retries with a fresh random suffix
-    on a name collision.
+    and retries with a fresh random suffix on a name collision.
 
-    :param int parent_fd: Open descriptor on the destination directory the
-        temporary file is created inside; not closed or otherwise consumed
-        by this function.
-    :param str leaf: Final path component of the eventual destination, used
-        only to build a recognizable temporary filename.
-    :return tuple[int, str]: The open file descriptor (ownership transfers
-        to the caller, who must close it) and the temporary file's name,
-        relative to ``parent_fd``.
+    :param int parent_fd: Open destination-directory descriptor.
+    :param str leaf: Destination leaf used in the temporary name.
+    :param int mode: Requested creation mode, subject to the process umask.
+    :return tuple[int, str]: Open descriptor and parent-relative temporary name.
     :raises FileExistsError: If 10 consecutive random names all collide.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
     for _ in range(10):
         temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
         try:
-            fd = os.open(temporary, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+            return os.open(temporary, flags, mode, dir_fd=parent_fd), temporary
         except FileExistsError:
             continue
-        os.fchmod(fd, PRIVATE_FILE_MODE)
-        return fd, temporary
     raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
+
+
+def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
+    """Create an owner-only temporary file next to a destination leaf.
+
+    :param int parent_fd: Open destination-directory descriptor.
+    :param str leaf: Destination leaf used in the temporary name.
+    :return tuple[int, str]: Open descriptor and parent-relative temporary name.
+    """
+    fd, temporary = _new_exclusive_temp_fd(parent_fd, leaf, PRIVATE_FILE_MODE)
+    os.fchmod(fd, PRIVATE_FILE_MODE)
+    return fd, temporary
 
 
 @contextlib.contextmanager

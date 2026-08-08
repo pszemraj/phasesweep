@@ -25,7 +25,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import stat
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from typing import IO, Literal, TypeAlias
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
     UnsafePrivatePathError,
+    _new_exclusive_temp_fd,
     absolute_path,
     leaf_name,
     lock_dir,
@@ -248,25 +248,6 @@ def _snapshot_matches(parent_fd: int, leaf: str, expected: _TextSnapshot) -> boo
     return current.stat_token == expected.stat_token and current.raw == expected.raw
 
 
-def _new_temporary_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
-    """Create an umask-governed temporary file relative to ``parent_fd``.
-
-    :param int parent_fd: Open descriptor for the target's parent directory.
-    :param str leaf: Destination filename used to make the temporary name recognizable.
-    :param int mode: Requested creation mode, subject to the process umask.
-    :return tuple[int, str]: Open descriptor and temporary filename.
-    :raises FileExistsError: If ten random temporary names all collide.
-    """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
-    for _ in range(10):
-        temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
-        try:
-            return os.open(temporary, flags, mode, dir_fd=parent_fd), temporary
-        except FileExistsError:
-            continue
-    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
-
-
 def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> AtomicWriteResult:
     """Atomically replace ``path`` with UTF-8 ``text`` in the same directory.
 
@@ -292,7 +273,7 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
         )
         leaf = leaf_name(path)
         create_mode = expected.mode if expected.mode is not None else 0o666
-        fd, temporary = _new_temporary_fd(parent_fd, leaf, create_mode)
+        fd, temporary = _new_exclusive_temp_fd(parent_fd, leaf, create_mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             if expected.mode is not None:
                 os.fchmod(handle.fileno(), expected.mode)

@@ -330,14 +330,14 @@ def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatc
     path = tmp_path / "mcp.json"
     path.write_text('{"mcpServers": {"other": {"command": "x"}}}\n')
     external = '{"changed_by": "another process"}\n'
-    real_new_temporary_fd = install_edits._new_temporary_fd
+    real_new_temporary_fd = install_edits._new_exclusive_temp_fd
 
     def change_after_temp_creation(parent_fd, leaf, mode):
         fd, name = real_new_temporary_fd(parent_fd, leaf, mode)
         path.write_text(external)
         return fd, name
 
-    monkeypatch.setattr(install_edits, "_new_temporary_fd", change_after_temp_creation)
+    monkeypatch.setattr(install_edits, "_new_exclusive_temp_fd", change_after_temp_creation)
 
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "stale"
     assert path.read_text() == external
