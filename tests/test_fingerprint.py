@@ -1190,6 +1190,72 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
 
 
+def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same relative URL from another cwd cannot reinterpret one tree."""
+    trainer = write_constant_trainer(tmp_path)
+    registration_cwd = tmp_path / "registration"
+    foreign_cwd = tmp_path / "foreign"
+    registration_cwd.mkdir()
+    foreign_cwd.mkdir()
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="sqlite:///ledger.db",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    monkeypatch.chdir(registration_cwd)
+    run_experiment(experiment)
+    binding_path = _artifact_root_binding_path(experiment)
+    binding_before = binding_path.read_bytes()
+    generation_before = _last_successful_generation_id(experiment)
+
+    monkeypatch.chdir(foreign_cwd)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        run_experiment(experiment)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_status(experiment)
+
+    assert not (foreign_cwd / "ledger.db").exists()
+    assert binding_path.read_bytes() == binding_before
+    assert _last_successful_generation_id(experiment) == generation_before
+
+
+def test_retargeted_experiment_symlink_is_rejected_before_claim(
+    tmp_path: Path,
+) -> None:
+    """A stable configured spelling does not hide a different physical root."""
+    trainer = write_constant_trainer(tmp_path)
+    original_parent = tmp_path / "original"
+    workdir = tmp_path / "runs"
+    original_root = original_parent / "t"
+    retargeted_root = tmp_path / "physical-b"
+    original_parent.mkdir()
+    workdir.mkdir()
+    retargeted_root.mkdir()
+    owner = make_experiment(
+        workdir=original_parent,
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(owner)
+    original_binding = _artifact_root_binding_path(owner).read_bytes()
+
+    experiment_link = workdir / "t"
+    experiment_link.symlink_to(original_root, target_is_directory=True)
+    experiment_link.unlink()
+    experiment_link.symlink_to(retargeted_root, target_is_directory=True)
+    retargeted = owner.model_copy(update={"workdir": str(workdir)})
+    with pytest.raises(ArtifactRootConflictError, match="publishes into artifact root"):
+        run_experiment(retargeted)
+
+    assert list(retargeted_root.iterdir()) == []
+    assert (original_root / "artifact_root_binding.json").read_bytes() == original_binding
+
+
 def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
     """An empty study is claimed by the first run that sees it: no evidence can be stranded."""
     trainer = write_constant_trainer(tmp_path)
@@ -1762,8 +1828,9 @@ def test_fresh_run_preflight_consumes_run_deadline(
         *,
         cleanup_report: object,
         from_phase: str | None,
+        preloaded_studies: object,
     ) -> dict[str, optuna.Study]:
-        del cleanup_report, from_phase
+        del cleanup_report, from_phase, preloaded_studies
         clock["now"] += 2.0
         return {}
 

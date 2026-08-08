@@ -1968,6 +1968,11 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, or carries a binding that is not a string.
     """
+    if _artifact_root_binding_applies(experiment):
+        # Reject an existing foreign/legacy root before touching storage. A
+        # genuinely fresh root remains unclaimed until every study-side
+        # binding has also passed its read-only check below.
+        _validate_artifact_root_binding(experiment, claim_fresh=False)
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:
@@ -1984,6 +1989,11 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
     claimable = [
         study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
     ]
+    # Both directions are now known-compatible. Claim the tree first, then
+    # empty studies: a crash cannot leave a study pointing at a tree that does
+    # not itself name the same ledger. Crucially, neither claim occurs when a
+    # symlink-retargeted leaf exposed a study still bound to the old target.
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     offered = _artifact_root_identity(experiment)
     for study in claimable:
         _claim_study_artifact_root(study, offered)
@@ -2819,6 +2829,7 @@ def _preflight_existing_studies(
     *,
     cleanup_report: _PreflightCleanupReport | None = None,
     from_phase: str | None = None,
+    preloaded_studies: Mapping[str, optuna.Study] | None = None,
 ) -> dict[str, optuna.Study]:
     """Validate and reap every existing declared phase study before launch.
 
@@ -2827,6 +2838,10 @@ def _preflight_existing_studies(
         accumulate cleanup evidence into; a fresh one is created if omitted.
     :param str | None from_phase: Optional resume point. Recovery and schema checks
         still cover every phase; trial-target validation starts at this reached phase.
+    :param Mapping[str, optuna.Study] | None preloaded_studies: Studies already
+        discovered and ownership-checked under the experiment lock before the
+        generation claim. Direct callers omit this and perform the same strict
+        discovery here.
     :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
         with no durable study yet are omitted).
     :raises ArtifactRootConflictError: A phase's persistent study is already
@@ -2856,11 +2871,14 @@ def _preflight_existing_studies(
     # recovery a study whose root was never checked (PR #5 review /
     # reviewer 2, issue 1). The storage error still marks cleanup uncertain:
     # an unreadable ledger cannot prove its attempts are resolved.
-    try:
-        loaded = _load_and_check_artifact_roots(experiment)
-    except StudyStorageUnavailableError as exc:
-        report.mark_uncertain(exc)
-        raise
+    if preloaded_studies is None:
+        try:
+            loaded = _load_and_check_artifact_roots(experiment)
+        except StudyStorageUnavailableError as exc:
+            report.mark_uncertain(exc)
+            raise
+    else:
+        loaded = dict(preloaded_studies)
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase

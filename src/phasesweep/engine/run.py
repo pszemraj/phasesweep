@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -18,15 +19,15 @@ from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment, Phase, Suite
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import StudyContextConflictError
+from phasesweep.engine.errors import StudyContextConflictError, StudyStorageUnavailableError
 from phasesweep.engine.guards import (
     _experiment_lock,
     _experiment_semantic_fingerprint,
+    _load_and_check_artifact_roots,
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _suite_fingerprint,
     _suite_lock,
-    _validate_artifact_root_binding,
     _validate_sampler_continuation,
     _validate_selection_evidence,
     _verify_fingerprint,
@@ -324,15 +325,28 @@ def _run_experiment_outcome(
     # this one is a reentrant no-op that installs and restores nothing.
     with (
         signal_handler_scope(),
-        _file_log_handler(_run_log_path(experiment)),
         _experiment_lock(experiment),
+        contextlib.ExitStack() as run_stack,
     ):
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        # Resolve both ownership directions before the generation claim. The
+        # returned objects are passed into preflight so storage is not reread
+        # after this strict discovery-and-claim boundary.
+        try:
+            existing_studies = _load_and_check_artifact_roots(experiment)
+        except StudyStorageUnavailableError as exc:
+            # The ledger may contain attempts from an earlier orchestrator. A
+            # failed ownership read cannot prove those processes are resolved,
+            # even though this invocation has not claimed a generation or
+            # launched anything of its own.
+            raise ProcessCleanupUncertainError(
+                "Artifact ownership could not be checked because persistent study "
+                "storage is unavailable; cleanup state is therefore unknown."
+            ) from exc
+        run_stack.enter_context(_file_log_handler(_run_log_path(experiment)))
         generation_id = _claim_generation(experiment, requested_generation_id)
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = _PreflightCleanupReport()
-        existing_studies: dict[str, optuna.Study] = {}
         generation_prepared = False
         try:
             run_deadline = (
@@ -351,6 +365,7 @@ def _run_experiment_outcome(
                 experiment,
                 cleanup_report=cleanup,
                 from_phase=from_phase,
+                preloaded_studies=existing_studies,
             )
             # Selection reads Optuna alone, so a tree whose candidate evidence
             # was deleted would silently reselect and republish those trials
