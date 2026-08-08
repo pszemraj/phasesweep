@@ -111,8 +111,13 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
-    result = _run_supervised(trial_dir, "false", timeout=None, attempt_id="failure-attempt")
-    assert result.return_code != 0
+    result = _run_supervised(
+        trial_dir,
+        "kill -9 $$",
+        timeout=None,
+        attempt_id="failure-attempt",
+    )
+    assert result.return_code == -signal.SIGKILL
     identity = read_stale_process_identity(
         trial_dir,
         expected_attempt_id="failure-attempt",
@@ -549,7 +554,10 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
-        proc, pgid, ack_write = _spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+        proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
+            stdout=fout,
+            stderr=ferr,
+        )
     try:
         argv = captured["argv"]
         assert isinstance(argv, list)
@@ -566,6 +574,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
         assert set(captured["env"]) == {"PATH"}
     finally:
         os.close(ack_write)
+        os.close(status_read)
         _kill_group(pgid, proc)
         process._unregister(pgid)
 

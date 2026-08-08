@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import shlex
@@ -294,21 +295,26 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
 
 
 def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> None:
-    """A trusted guardian retains the lock after trainer FD scrubbing and parent death."""
+    """A guardian retains the lock through FD scrubbing, parent death, and descendants."""
     locks = tmp_path / "locks"
     locks.mkdir()
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: locks)
     started = tmp_path / "trainer_started"
+    worker = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
     trainer = (
-        "import os, time; "
+        "import json, os, subprocess, sys, time; "
         "os.closerange(3, 1048576); "
-        f"open({str(started)!r}, 'w').write(str(os.getpgrp())); "
-        "time.sleep(1.5)"
+        f"worker = subprocess.Popen([sys.executable, '-c', {worker!r}]); "
+        "state = {'root_pid': os.getpid(), 'pgid': os.getpgrp(), "
+        "'worker_pid': worker.pid}; "
+        f"open({str(started)!r}, 'w').write(json.dumps(state)); "
+        "time.sleep(0.3)"
     )
     command = shlex.join([sys.executable, "-c", trainer])
     orchestrator_pid = os.fork()
     reaped = False
     trainer_pgid: int | None = None
+    worker_pid: int | None = None
     if orchestrator_pid == 0:
         try:
             trial_dir = tmp_path / "trial"
@@ -342,11 +348,27 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
                 pytest.fail("orchestrator exited before the trainer started")
             time.sleep(0.01)
         assert started.is_file()
-        trainer_pgid = int(started.read_text())
+        state = json.loads(started.read_text())
+        root_pid = int(state["root_pid"])
+        trainer_pgid = int(state["pgid"])
+        worker_pid = int(state["worker_pid"])
 
         os.kill(orchestrator_pid, signal.SIGKILL)
         os.waitpid(orchestrator_pid, 0)
         reaped = True
+
+        # The direct trainer exits, but its SIGTERM-ignoring worker remains.
+        # The old guardian released the lease at this exact boundary.
+        root_exit_deadline = time.monotonic() + 2.0
+        while time.monotonic() < root_exit_deadline:
+            try:
+                os.kill(root_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("trainer root did not exit before descendant lease check")
+        os.kill(worker_pid, 0)
 
         competitor = GpuPool.create(n_jobs=1, explicit_ids=[0])
         with (
@@ -355,7 +377,9 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
         ):
             pass
 
-        with competitor.acquire(deadline=time.monotonic() + 3.0) as assignment:
+        os.kill(worker_pid, signal.SIGKILL)
+        worker_pid = None
+        with competitor.acquire(deadline=time.monotonic() + 5.0) as assignment:
             assert assignment.visible_devices == "0"
     finally:
         if not reaped:
@@ -366,6 +390,9 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
         if trainer_pgid is not None and trainer_pgid != os.getpgrp():
             with suppress(ProcessLookupError):
                 os.killpg(trainer_pgid, signal.SIGKILL)
+        if worker_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(worker_pid, signal.SIGKILL)
 
 
 def test_numeric_index_and_uuid_token_lock_the_same_physical_gpu(tmp_path, monkeypatch) -> None:

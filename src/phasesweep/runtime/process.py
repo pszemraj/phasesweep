@@ -19,9 +19,10 @@ package from the trainer's ``PYTHONPATH``, or a trainer-composed
 ``sitecustomize``, and it starts in ~30ms instead of paying phasesweep's
 package-import cost. Only after this process durably persists
 ``process_identity.json`` does it send the trainer's shell command and full
-environment to the supervisor as a framed JSON payload; the supervisor then
-``execve``s ``/bin/sh -c cmd`` under that environment, replacing itself as
-the same PID/process group already registered here.
+environment to the supervisor as a framed JSON payload. The supervisor stays
+outside the trainer's process group as a trusted GPU-lease guardian; its
+blocked child becomes the recorded process-group leader before executing
+``/bin/sh -c cmd``.
 """
 
 from __future__ import annotations
@@ -682,21 +683,23 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
             absorbed.signum = drained
 
 
-def _register(proc: subprocess.Popen) -> int:
+def _register(proc: subprocess.Popen, *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
     Args:
         proc: The ``Popen`` object returned by a just-completed ``Popen()`` call.
+        pgid: Explicit child process group guarded by ``proc``. When omitted,
+            register ``proc``'s own process group.
 
     Returns:
         The process-group ID (``pgid``) the subprocess was registered under.
         Callers store this for later ``_unregister`` and signal targeting.
 
     """
-    pgid = os.getpgid(proc.pid)
+    resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
-        _active_children[pgid] = proc
-    return pgid
+        _active_children[resolved_pgid] = proc
+    return resolved_pgid
 
 
 def _unregister(pgid: int) -> None:
@@ -1138,13 +1141,37 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
+    """Read one fixed-size pipe frame without exceeding ``deadline``.
+
+    :param int fd: Pipe descriptor to read.
+    :param int size: Required frame size in bytes.
+    :param float deadline: Absolute ``time.monotonic`` deadline.
+    :return bytes | None: Complete frame, or ``None`` on timeout or early EOF.
+    """
+    import time
+
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+        if not readable:
+            return None
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _spawn_blocked_supervisor(
     *,
     stdout: IO[str],
     stderr: IO[str],
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
-) -> tuple[subprocess.Popen, int, int]:
+) -> tuple[subprocess.Popen, int, int, int]:
     """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
     Launches the stdlib-only ``phasesweep.runtime.supervisor`` script
@@ -1152,7 +1179,8 @@ def _spawn_blocked_supervisor(
     ``python -I -S`` with a minimal sanitized environment — see
     :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
     acknowledgement pipe. Blocks (via ``select``) until the supervisor
-    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
+    forks a blocked trainer session and reports that child's PID, or
+    ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
     capped by the remaining launch ``deadline`` when one is given (review
     v0.5.16 / blocker 6), so a slow supervisor startup can never outlive the
     trial's own wallclock budget. Then registers the new process group. On
@@ -1173,11 +1201,14 @@ def _spawn_blocked_supervisor(
             trainer child.
 
     Returns:
-        A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
-        its registered process-group id, and the write end of the
-        acknowledgement pipe. The caller owns ``ack_write`` and must send the
-        framed launch payload (see :func:`_encode_launch_payload`) and close
-        it once the trial's process identity is durably persisted.
+        A ``(proc, pgid, ack_write, status_read)`` tuple: the guardian's
+        ``Popen`` handle, the trainer's registered process-group id, the write
+        end of the acknowledgement pipe, and the read end of the guardian
+        status pipe. The caller owns both descriptors. It must send the framed
+        launch payload (see :func:`_encode_launch_payload`) and close
+        ``ack_write`` once the trainer identity is durably persisted; after
+        the guardian exits, ``status_read`` yields ``b"D"`` when it had to reap
+        descendants left behind by the trainer root, otherwise EOF.
 
     Raises:
         _LaunchDeadlineExpired: The launch deadline expired before the
@@ -1217,28 +1248,32 @@ def _spawn_blocked_supervisor(
         ack_read = -1
         os.close(closed_fd)
 
-        pgid = _register(proc)
-        ready_timeout = _SUPERVISOR_READY_TIMEOUT_SECONDS
+        ready_deadline = time.monotonic() + _SUPERVISOR_READY_TIMEOUT_SECONDS
         if deadline is not None:
-            ready_timeout = min(ready_timeout, max(0.0, deadline - time.monotonic()))
-        readable, _, _ = select.select(
-            [ready_read],
-            [],
-            [],
-            ready_timeout,
+            ready_deadline = min(ready_deadline, deadline)
+        ready_frame = _read_pipe_frame(
+            ready_read,
+            1 + _supervisor._READY_PID_WIDTH,
+            deadline=ready_deadline,
         )
-        if not readable and deadline is not None and time.monotonic() >= deadline:
+        if ready_frame is None and deadline is not None and time.monotonic() >= deadline:
             raise _LaunchDeadlineExpired(
                 "trial launch deadline expired while waiting for the supervisor",
                 pid=proc.pid,
             )
-        # Written by phasesweep.runtime.supervisor.main's os.write(ready_fd, b"R").
-        if not readable or os.read(ready_read, 1) != b"R":
+        if ready_frame is None or not ready_frame.startswith(b"R"):
             raise RuntimeError("trial supervisor did not become ready before launch")
-        closed_fd = ready_read
+        try:
+            trainer_pid = int(ready_frame[1:].decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("trial supervisor reported an invalid trainer PID") from exc
+        if trainer_pid <= 0:
+            raise RuntimeError("trial supervisor reported an invalid trainer PID")
+        pgid = trainer_pid
+        _register(proc, pgid=pgid)
+        status_read = ready_read
         ready_read = -1
-        os.close(closed_fd)
-        return proc, pgid, ack_write
+        return proc, pgid, ack_write, status_read
     except Exception as exc:
         if ack_write >= 0:
             closed_fd = ack_write
@@ -1275,8 +1310,8 @@ def run_supervised(
     atomically persists ``process_identity.json``. Only after the identity is
     durable does the parent send the trainer command and full trainer
     environment to the supervisor as a framed JSON payload. The supervisor
-    then stays alive as a lease guardian while a descriptor-scrubbed child
-    executes the trainer command. If the parent dies
+    then stays alive outside the trainer's process group as a lease guardian
+    while a descriptor-scrubbed child executes the trainer command. If the parent dies
     before delivering that payload, pipe EOF makes the supervisor exit
     without starting training.
 
@@ -1319,7 +1354,8 @@ def run_supervised(
         gpu_lease_fds: Open host GPU-lock descriptors inherited by the trusted
             supervisor guardian, not its trainer child. The orchestrator
             closes only its copies; the guardian retains each lock until the
-            trainer exits even if trainer code closes every unknown descriptor.
+            entire trainer process group is gone even if trainer code closes
+            every unknown descriptor or its root shell exits before a worker.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
@@ -1356,11 +1392,12 @@ def run_supervised(
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     ack_write: int | None = None
+    status_read: int | None = None
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
 
     try:
         with defer_shutdown_signals(), _launch_lock:
-            proc, pgid, ack_write = _spawn_blocked_supervisor(
+            proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,
                 deadline=deadline,
@@ -1368,7 +1405,7 @@ def run_supervised(
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,
-                pid=proc.pid,
+                pid=pgid,
                 pgid=pgid,
             )
             _write_process_identity(identity_path, identity)
@@ -1379,7 +1416,7 @@ def run_supervised(
                 # v0.5.16 / blocker 6).
                 raise _LaunchDeadlineExpired(
                     "trial launch deadline expired before the trainer payload was delivered",
-                    pid=proc.pid,
+                    pid=pgid,
                 )
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
@@ -1390,6 +1427,9 @@ def run_supervised(
     except _LaunchDeadlineExpired as exc:
         if ack_write is not None:
             os.close(ack_write)
+        if status_read is not None:
+            os.close(status_read)
+            status_read = None
         cleanup_confirmed = exc.cleanup_confirmed
         pid = exc.pid
         return_code = -9
@@ -1397,7 +1437,7 @@ def run_supervised(
             # Raised at the pre-payload recheck: the supervisor is still
             # blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
-            pid = proc.pid
+            pid = pgid if pgid is not None else proc.pid
             if proc.returncode is not None:
                 return_code = proc.returncode
         if cleanup_confirmed:
@@ -1418,6 +1458,9 @@ def run_supervised(
     except Exception as exc:
         if ack_write is not None:
             os.close(ack_write)
+        if status_read is not None:
+            os.close(status_read)
+            status_read = None
         if proc is None:
             raise
         target_pgid = pgid if pgid is not None else proc.pid
@@ -1444,7 +1487,7 @@ def run_supervised(
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
             timed_out=False,
-            pid=proc.pid,
+            pid=pgid if pgid is not None else proc.pid,
             duration_seconds=duration,
             failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
@@ -1452,6 +1495,7 @@ def run_supervised(
 
     assert proc is not None
     assert pgid is not None
+    assert status_read is not None
 
     timed_out = False
     failure_reason: str | None = None
@@ -1466,14 +1510,29 @@ def run_supervised(
         except subprocess.TimeoutExpired:
             timed_out = True
             failure_reason = f"timeout after {timeout}s"
-            log.warning("Trial PID %d (pgid %d) timed out — terminating group", proc.pid, pgid)
+            log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
+            guardian_status = os.read(status_read, 1)
+            os.close(status_read)
+            status_read = None
+            if guardian_status == _supervisor._DESCENDANTS_REAPED:
+                failure_reason = (
+                    f"root process exited with code {proc.returncode}, "
+                    f"but process group {pgid} still had live descendants"
+                )
+                log.warning(
+                    "Trial PID %d exited with code %s but process group %d "
+                    "still had live descendants; the lease guardian terminated them",
+                    pgid,
+                    proc.returncode,
+                    pgid,
+                )
             # Root process exited normally. That is not sufficient — the trial
             # is only clean once the entire process group is gone. A common
             # pathological case: `python launcher.py &` exits immediately while
             # the training worker stays alive holding GPU memory.
-            if _process_group_alive(pgid):
+            if failure_reason is None and _process_group_alive(pgid):
                 failure_reason = (
                     f"root process exited with code {proc.returncode}, "
                     f"but process group {pgid} still had live descendants"
@@ -1481,13 +1540,15 @@ def run_supervised(
                 log.warning(
                     "Trial PID %d exited with code %s but process group %d "
                     "still has live descendants — terminating group",
-                    proc.pid,
+                    pgid,
                     proc.returncode,
                     pgid,
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
 
     finally:
+        if status_read is not None:
+            os.close(status_read)
         _unregister(pgid)
 
     # The identity record is deliberately RETAINED on clean exit (review
@@ -1508,7 +1569,7 @@ def run_supervised(
     return ProcessResult(
         return_code=proc.returncode if proc.returncode is not None else -9,
         timed_out=timed_out,
-        pid=proc.pid,
+        pid=pgid,
         duration_seconds=duration,
         failure_reason=failure_reason,
         cleanup_confirmed=cleanup_confirmed,

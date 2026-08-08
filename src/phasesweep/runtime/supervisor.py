@@ -15,21 +15,26 @@ site initialization (no ``sitecustomize``/``usercustomize``); ``-I``
 directory — which contains the sibling module ``phasesweep/runtime/json.py``
 — is never prepended to ``sys.path``, keeping ``import json`` resolved to the
 stdlib module every time. Keep imports here limited to the stdlib modules
-``os``, ``sys``, ``json``, ``signal``, and ``subprocess``.
+``contextlib``, ``os``, ``sys``, ``json``, ``signal``, and ``time``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
-import subprocess
 import sys
+import time
 
 # Single source of truth for the wire frame's header width:
 # phasesweep.runtime.process._encode_launch_payload reads this constant
 # directly (the parent already imports this module).
 _HEADER_LEN = 10
+_READY_PID_WIDTH = 10
+_DESCENDANTS_REAPED = b"D"
+_GROUP_POLL_SECONDS = 0.05
+_GROUP_TERM_GRACE_SECONDS = 10.0
 
 
 def _read_exact(fd: int, size: int) -> bytes | None:
@@ -100,8 +105,163 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
     return cmd, env, cwd
 
 
+def _trainer_group_alive(pgid: int) -> bool:
+    """Return whether ``pgid`` still has a non-zombie member.
+
+    ``killpg(..., 0)`` is the primary existence probe. Linux keeps a process
+    group visible while its last member is a zombie, though, so a complete
+    procfs scan may prove that no process capable of holding GPU state remains.
+    Any unreadable evidence fails closed: the guardian keeps the lease.
+
+    :param int pgid: Trainer process-group identifier.
+    :return bool: ``True`` while a live member exists or absence is uncertain.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return True
+
+    complete = True
+    found_member = False
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/stat", "rb") as stat_file:
+                    data = stat_file.read()
+                right_paren = data.rfind(b")")
+                fields = data[right_paren + 2 :].split()
+                state = fields[0]
+                member_pgid = int(fields[2])
+            except FileNotFoundError:
+                continue
+            except (IndexError, OSError, ValueError):
+                complete = False
+                continue
+            if member_pgid != pgid:
+                continue
+            found_member = True
+            if state != b"Z":
+                return True
+
+    # A group that exists but had no readable member, or a scan with missing
+    # evidence, is not enough proof to release a host-wide GPU lock.
+    return not (found_member and complete)
+
+
+def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
+    """Wait until ``pgid`` is gone, bounded only when ``timeout`` is set."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while _trainer_group_alive(pgid):
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(_GROUP_POLL_SECONDS)
+    return True
+
+
+def _reap_remaining_group(pgid: int) -> bool:
+    """Terminate post-root descendants while retaining inherited leases.
+
+    :param int pgid: Trainer process group whose root was already reaped.
+    :return bool: Whether at least one descendant remained after root exit.
+    """
+    if not _trainer_group_alive(pgid):
+        return False
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+
+    if _wait_for_group_exit(pgid, _GROUP_TERM_GRACE_SECONDS):
+        return True
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+
+    # There is nobody left upstream to protect this lease after an
+    # orchestrator hard exit. If SIGKILL cannot be confirmed, deliberately
+    # wait without a deadline rather than reopening the GPU to another run.
+    _wait_for_group_exit(pgid, None)
+    return True
+
+
+def _close_trainer_fds() -> None:
+    """Close every non-stdio descriptor before executing trainer code."""
+    try:
+        max_fd = int(os.sysconf("SC_OPEN_MAX"))
+    except (OSError, TypeError, ValueError):
+        max_fd = 1_048_576
+    os.closerange(3, max_fd)
+
+
+def _run_trainer(ready_fd: int, ack_fd: int) -> int:
+    """Create the trainer session, cross the launch barrier, and exec it."""
+    try:
+        os.setsid()
+    except OSError:
+        return 74
+
+    ready_frame = b"R" + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")
+    try:
+        os.write(ready_fd, ready_frame)
+    finally:
+        os.close(ready_fd)
+
+    try:
+        payload = _read_launch_payload(ack_fd)
+    finally:
+        os.close(ack_fd)
+    if payload is None:
+        return 75
+    cmd, env, cwd = payload
+
+    if cwd is not None:
+        try:
+            os.chdir(cwd)
+        except OSError:
+            return 76
+
+    _close_trainer_fds()
+    try:
+        os.execve("/bin/sh", ["/bin/sh", "-c", cmd], env)
+    except OSError:
+        return 77
+    return 77
+
+
+def _return_child_status(status: int) -> int:
+    """Return an exit status or reproduce the trainer root's signal."""
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        terminating_signal = os.WTERMSIG(status)
+        # SIGKILL and SIGSTOP already have immutable default dispositions;
+        # asking signal.signal() to change either one raises EINVAL and would
+        # corrupt the trainer's ``-signal`` return code into guardian exit 1.
+        if terminating_signal not in {signal.SIGKILL, signal.SIGSTOP}:
+            signal.signal(terminating_signal, signal.SIG_DFL)
+        os.kill(os.getpid(), terminating_signal)
+        return 128 + terminating_signal
+    return 70
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Signal readiness, await the launch payload, then guard the trainer.
+    """Fork a blocked trainer and guard its whole process group.
 
     :param list[str] | None argv: Optional ``[ready_fd, ack_fd]`` argument
         vector; defaults to ``sys.argv[1:]`` when omitted.
@@ -109,9 +269,9 @@ def main(argv: list[str] | None = None) -> int:
         if the acknowledgement pipe does not deliver a well-formed
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
-        be entered. On success, the supervisor remains as the trusted process-
-        group leader and waits for a ``/bin/sh -c cmd`` child, returning the
-        child's exit status or reproducing its terminating signal.
+        be entered. On success, the supervisor remains outside the trainer's
+        process group, holds inherited GPU leases until every group member is
+        gone, and returns the trainer root's exit status or terminating signal.
     """
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 2:
@@ -130,59 +290,24 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(signal, "pthread_sigmask"):
         signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(_run_trainer(ready_fd, ack_fd))
+
+    # The guardian is deliberately outside the trainer's new session and
+    # process group. Group-directed SIGKILL can therefore never release its
+    # inherited GPU leases before every trainer descendant is confirmed gone.
+    os.close(ack_fd)
     try:
-        # Checked by phasesweep.runtime.process._spawn_blocked_supervisor's
-        # `os.read(ready_read, 1) != b"R"` readiness gate.
-        os.write(ready_fd, b"R")
+        _, status = os.waitpid(child_pid, 0)
+        if _reap_remaining_group(child_pid):
+            with contextlib.suppress(OSError):
+                os.write(ready_fd, _DESCENDANTS_REAPED)
+            # A closed pipe is expected after an orchestrator hard exit: there
+            # is no parent left to consume the diagnostic, but cleanup continues.
+        return _return_child_status(status)
     finally:
         os.close(ready_fd)
-
-    try:
-        payload = _read_launch_payload(ack_fd)
-    finally:
-        os.close(ack_fd)
-    if payload is None:
-        return 75
-    cmd, env, cwd = payload
-
-    if cwd is not None:
-        # The execution contract's trainer working directory (review v0.5.17 /
-        # blocker 4). A failed chdir must fail loudly BEFORE exec — running
-        # the trainer from the wrong directory would silently change what a
-        # relative-path command means.
-        try:
-            os.chdir(cwd)
-        except OSError:
-            return 76
-
-    # Keep this trusted process alive for the trainer's entire lifetime. It
-    # owns inherited GPU-lease descriptors that arbitrary trainer code must
-    # never be able to close. Popen's default close_fds=True ensures the shell
-    # and trainer receive none of those descriptors while this guardian keeps
-    # its copies until the command exits.
-    #
-    # Group-directed shutdown signals must still reach the trainer. A caught
-    # signal disposition resets to default across exec, so the shell child gets
-    # normal SIGTERM/SIGINT/SIGHUP behavior while the guardian stays alive to
-    # retain the lease and wait for it. Once a signal terminates the child, the
-    # guardian reproduces that signal so the orchestrator observes the same
-    # subprocess return code it did when the supervisor exec-replaced itself.
-    guardian_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-
-    def retain_lease_while_child_exits(_signum: int, _frame: object) -> None:
-        """Keep the guardian alive while its process group shuts down."""
-
-    for shutdown_signal in guardian_signals:
-        signal.signal(shutdown_signal, retain_lease_while_child_exits)
-
-    child = subprocess.Popen(["/bin/sh", "-c", cmd], env=env, close_fds=True)
-    return_code = child.wait()
-    if return_code < 0:
-        terminating_signal = -return_code
-        signal.signal(terminating_signal, signal.SIG_DFL)
-        os.kill(os.getpid(), terminating_signal)
-        return 128 + terminating_signal
-    return return_code
 
 
 if __name__ == "__main__":
