@@ -27,6 +27,9 @@ from phasesweep.config import (
     Phase,
     Promotion,
     Sampler,
+    StudySpec,
+    Suite,
+    SuiteDefaults,
 )
 from phasesweep.engine import (
     ArtifactRootConflictError,
@@ -525,6 +528,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
 
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The trainer's cwd and env-inheritance contract are semantic inputs.
 
@@ -535,6 +539,12 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     default block.
     """
     from phasesweep.engine.guards import _experiment_semantic_fingerprint, _phase_semantic_payload
+
+    invocation_a = tmp_path / "invocation-a"
+    invocation_b = tmp_path / "invocation-b"
+    invocation_a.mkdir()
+    invocation_b.mkdir()
+    monkeypatch.chdir(invocation_a)
 
     variants = {
         "unbound": make_experiment(),
@@ -549,6 +559,18 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     # Writing the default block out longhand is not a semantic edit.
     assert experiment_fps["unbound"] == experiment_fps["explicit_default"]
     assert phase_fps["unbound"] == phase_fps["explicit_default"]
+
+    monkeypatch.chdir(invocation_b)
+    second_invocation = make_experiment()
+    assert _experiment_semantic_fingerprint(second_invocation) != experiment_fps["unbound"]
+    assert (
+        _phase_fingerprint(second_invocation, second_invocation.phases[0], {})
+        != phase_fps["unbound"]
+    )
+
+    explicit_first = make_experiment(execution=ExecutionContext(cwd=str(invocation_a)))
+    assert _experiment_semantic_fingerprint(explicit_first) == experiment_fps["unbound"]
+    assert _phase_fingerprint(explicit_first, explicit_first.phases[0], {}) == phase_fps["unbound"]
 
     distinct = ["unbound", "cwd", "inherit_none", "inherit_names"]
     assert len({experiment_fps[name] for name in distinct}) == len(distinct)
@@ -568,6 +590,35 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _phase_fingerprint(reordered, reordered.phases[0], {}) == _phase_fingerprint(
         ordered, ordered.phases[0], {}
     )
+
+
+def test_suite_fingerprint_includes_effective_invocation_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suite cannot compile the same relative trainer command from two code trees."""
+    base = make_experiment()
+    suite = Suite(
+        suite="identity",
+        defaults=SuiteDefaults(
+            workdir=base.workdir,
+            trial_command=base.trial_command,
+            metric=base.metric,
+        ),
+        studies=[StudySpec(name="study", phases=base.phases)],
+    )
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    from phasesweep.engine.guards import _suite_fingerprint
+
+    monkeypatch.chdir(first)
+    first_fingerprint = _suite_fingerprint(suite)
+    monkeypatch.chdir(second)
+
+    assert _suite_fingerprint(suite) != first_fingerprint
 
 
 def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:

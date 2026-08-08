@@ -1343,7 +1343,9 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
     assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o600
 
     snapshot = yaml.safe_load(snapshot_path.read_text())
-    assert snapshot == experiment.model_dump(mode="json")
+    expected_snapshot = experiment.model_dump(mode="json")
+    expected_snapshot["execution"]["cwd"] = str(Path.cwd().resolve())
+    assert snapshot == expected_snapshot
 
     # Spot-check the values an operator actually needs to reproduce the run.
     assert snapshot["trial_command"] == experiment.trial_command
@@ -1554,7 +1556,9 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     assert snapshot_path.is_file()
     assert repro_path.is_file()
     snapshot = yaml.safe_load(snapshot_path.read_text())
-    assert snapshot == experiment.model_dump(mode="json")
+    expected_snapshot = experiment.model_dump(mode="json")
+    expected_snapshot["execution"]["cwd"] = str(Path.cwd().resolve())
+    assert snapshot == expected_snapshot
     assert json.loads(repro_path.read_text())["generation_id"] == failed_generation
 
 

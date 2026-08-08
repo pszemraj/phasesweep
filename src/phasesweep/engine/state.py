@@ -477,14 +477,14 @@ def _write_generation_provenance(
     records what configuration ran (review v0.5.18 / finding F6). Two files
     land side by side:
 
-    * ``config.snapshot.yaml`` -- the canonicalized full config, the
-      experiment's ``model_dump(mode="json")`` rendered as YAML. It is the
-      engine's canonical view, *not* a copy of the operator's file: key order
-      is normalized, defaults are materialized, and comments are not
-      preserved. Because ``env:`` may hold secrets it is written owner-only
-      (0600) through the private atomic writer, even though its directory is
-      deliberately operator-readable (see the trust-boundary note in
-      ``docs/runtime.md``).
+    * ``config.snapshot.yaml`` -- the canonicalized effective config rendered
+      as YAML. It is the engine's execution view, *not* a copy of the
+      operator's file: key order is normalized, defaults are materialized,
+      comments are not preserved, and an omitted ``execution.cwd`` is frozen
+      as the resolved invocation directory the trainer inherited. Because
+      ``env:`` may hold secrets it is written owner-only (0600) through the
+      private atomic writer, even though its directory is deliberately
+      operator-readable (see the trust-boundary note in ``docs/runtime.md``).
     * ``reproducibility.json`` -- an ordinary umask-governed artifact that is
       safe to read and share: versions, the semantic fingerprints, the
       operator-declared ``provenance`` mapping (public by design), and the
@@ -518,13 +518,16 @@ def _write_generation_provenance(
     from phasesweep.engine.guards import (
         EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         FINGERPRINT_SCHEMA_VERSION,
+        _execution_identity,
         _experiment_semantic_fingerprint,
     )
 
     snapshot_path = _generation_config_snapshot_path(experiment, generation_id)
+    snapshot = experiment.model_dump(mode="json")
+    snapshot["execution"]["cwd"] = _execution_identity(experiment)["cwd"]
     private_atomic_write_text(
         snapshot_path,
-        yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False),
+        yaml.safe_dump(snapshot, sort_keys=False),
         require_private_dir=False,
     )
     _write_json_atomic(

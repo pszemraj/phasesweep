@@ -135,6 +135,7 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     reg = registry.get("reg_ok")
     assert reg.config_path == config.resolve()
     assert reg.cwd == config.resolve().parent
+    assert reg.experiment.execution.cwd == str(config.resolve().parent)
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
     assert not reg.allow_launch
@@ -208,6 +209,7 @@ def test_catalog_cwd_resolves_against_catalog_file(tmp_path: Path) -> None:
     reg = Registry.load(catalog).get("reg_ok")
 
     assert reg.cwd == run_cwd.resolve()
+    assert reg.experiment.execution.cwd == str(run_cwd.resolve())
 
 
 def test_catalog_cwd_must_exist(tmp_path: Path) -> None:

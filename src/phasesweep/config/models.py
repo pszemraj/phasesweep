@@ -432,8 +432,8 @@ class ExecutionContext(_Frozen):
             "agree. When set, the RESOLVED path joins the semantic "
             "fingerprint, so the same study can never mix trainers reached "
             "through different working directories. When unset, trainers run "
-            "in the invocation cwd and the fingerprint records the context as "
-            "unbound (null)."
+            "in the invocation cwd and that effective resolved directory joins "
+            "the fingerprint."
         ),
     )
     inherit_env: Literal["all", "none"] | list[str] = Field(

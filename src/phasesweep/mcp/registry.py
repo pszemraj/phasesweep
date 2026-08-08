@@ -398,6 +398,14 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
             "in this version; register single-experiment configs"
         )
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
+    if config.execution.cwd is None:
+        # The detached runner enters the catalog entry's cwd before invoking
+        # the engine. Materialize that effective trainer cwd in the in-memory
+        # registry config so server-side fingerprints and drift comparisons
+        # describe the same execution context as the runner.
+        config = config.model_copy(
+            update={"execution": config.execution.model_copy(update={"cwd": str(cwd)})}
+        )
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     return RegisteredExperiment(
         id=entry.id,

@@ -341,15 +341,17 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
-# v3 / v2 / v2: the execution contract (resolved trainer cwd + declared
-# env-inheritance) joined every semantic fingerprint (review v0.5.17 /
-# blocker 4), and whole_node phases additionally fingerprint their configured
-# device-set size — the trainer's world size (review v0.5.17 gap hunt).
+# v4 / v3 / v3: an omitted execution.cwd now contributes its effective
+# invocation directory instead of an unbound null. The earlier execution
+# contract work covered only configured cwd values, which still let identical
+# persistent-study identities launch different relative commands from two
+# invocation directories. whole_node phases additionally fingerprint their
+# configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
 # on resume; see docs/config.md's upgrade section.
-FINGERPRINT_SCHEMA_VERSION = 3
-SUITE_FINGERPRINT_SCHEMA_VERSION = 2
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 2
+FINGERPRINT_SCHEMA_VERSION = 4
+SUITE_FINGERPRINT_SCHEMA_VERSION = 3
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 3
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
@@ -360,20 +362,20 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     different code or data under one study (review v0.5.17 / blocker 4). A
     configured cwd contributes its RESOLVED path — a relative cwd invoked
     from two directories is two different execution contexts and must not
-    share a study. An unconfigured cwd is recorded as ``None`` (explicitly
-    unbound, the documented historical behavior). Ambient variable *values*
-    are never hashed — they may hold secrets and are not declared semantic;
-    put semantic values in ``env``, which is fingerprinted.
+    share a study. An unconfigured cwd contributes the resolved invocation
+    directory because that is where the trainer actually runs. Ambient
+    variable *values* are never hashed — they may hold secrets and are not
+    declared semantic; put semantic values in ``env``, which is fingerprinted.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
     contract = experiment.execution.inherit_env
     return {
-        "cwd": (
-            None
-            if experiment.execution.cwd is None
-            else str(Path(experiment.execution.cwd).expanduser().resolve())
+        "cwd": str(
+            Path(experiment.execution.cwd).expanduser().resolve()
+            if experiment.execution.cwd is not None
+            else Path.cwd().resolve()
         ),
         "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
     }
@@ -467,6 +469,7 @@ def _suite_fingerprint(suite: Suite) -> str:
                     None if study.promotion is None else study.promotion.model_dump(mode="json")
                 ),
                 "experiment": suite.experiment_for_study(study).model_dump(mode="json"),
+                "execution_identity": _execution_identity(suite.experiment_for_study(study)),
             }
             for study in suite.studies
         ],

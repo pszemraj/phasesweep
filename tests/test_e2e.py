@@ -79,7 +79,9 @@ def test_full_sweep_and_replay(tmp_path):
     snapshot_path = generation_dir / "config.snapshot.yaml"
     repro_path = generation_dir / "reproducibility.json"
     assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o600
-    assert yaml.safe_load(snapshot_path.read_text()) == exp.model_dump(mode="json")
+    expected_snapshot = exp.model_dump(mode="json")
+    expected_snapshot["execution"]["cwd"] = str(Path.cwd().resolve())
+    assert yaml.safe_load(snapshot_path.read_text()) == expected_snapshot
 
     record = json.loads(repro_path.read_text())
     assert [item["name"] for item in record["phase_config_fingerprints"]] == [
