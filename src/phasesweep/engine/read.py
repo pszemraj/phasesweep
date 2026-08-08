@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_id,
     _parse_winner_source,
     _published_summary_path_for,
     _published_winner_path,
@@ -167,42 +168,13 @@ def _phase_status_payloads(
     return phases
 
 
-def read_winner(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    generation_id: str | None = None,
-) -> PhaseWinnerView | None:
-    """Read a single phase's persisted winner, or ``None`` if not yet written.
+def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | None:
+    """Parse one already-resolved winner path using the permissive read contract.
 
-    Args:
-        experiment: Parsed experiment config; supplies the artifact roots.
-            The metric value is extracted under the name the winner file
-            itself recorded, so a historical winner is never reinterpreted
-            through the currently configured metric (review v0.5.16 /
-            blocker 4).
-        phase_name: Phase whose ``winner.yaml`` to read.
-        generation_id: Optional generation whose immutable winner should be read.
-
-    Returns:
-        A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
-        winner on disk: never run, still running, selection failed, or the file
-        is malformed. A malformed read is treated as "not yet written" -
-            consistent with this module's permissive contract and with
-            ``_phase_trial_stats`` swallowing transient backend errors. The
-        strict, fingerprint-verifying read used for ``--from-phase`` resume
-        lives in ``engine.state._load_winner`` and is intentionally not
-        relaxed here.
-
+    :param Path | None path: Winner path selected by the caller, or ``None``.
+    :param str phase_name: Phase name exposed by the selected winner.
+    :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
-    if generation_id is not None:
-        _validate_safe_name("generation", generation_id)
-    path = (
-        _published_winner_path(experiment, phase_name)
-        if generation_id is None
-        else _generation_winner_path(experiment, generation_id, phase_name)
-    )
     if path is None or not path.is_file():
         return None
     try:
@@ -274,6 +246,45 @@ def read_winner(
         return None
 
 
+def read_winner(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    generation_id: str | None = None,
+) -> PhaseWinnerView | None:
+    """Read a single phase's persisted winner, or ``None`` if not yet written.
+
+    Args:
+        experiment: Parsed experiment config; supplies the artifact roots.
+            The metric value is extracted under the name the winner file
+            itself recorded, so a historical winner is never reinterpreted
+            through the currently configured metric (review v0.5.16 /
+            blocker 4).
+        phase_name: Phase whose ``winner.yaml`` to read.
+        generation_id: Optional generation whose immutable winner should be read.
+
+    Returns:
+        A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
+        winner on disk: never run, still running, selection failed, or the file
+        is malformed. A malformed read is treated as "not yet written" -
+            consistent with this module's permissive contract and with
+            ``_phase_trial_stats`` swallowing transient backend errors. The
+        strict, fingerprint-verifying read used for ``--from-phase`` resume
+        lives in ``engine.state._load_winner`` and is intentionally not
+        relaxed here.
+
+    """
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
+    path = (
+        _published_winner_path(experiment, phase_name)
+        if generation_id is None
+        else _generation_winner_path(experiment, generation_id, phase_name)
+    )
+    return _read_winner_path(path, phase_name)
+
+
 def read_winners(
     experiment: Experiment,
     *,
@@ -306,14 +317,26 @@ def read_winners(
             here, so this only fires on a programming error.
 
     """
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    published_generation_id: str | None = None
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
+    else:
+        published_generation_id = _last_successful_generation_id(experiment)
     names = (
         [phase.name for phase in experiment.phases]
         if phase_names is None
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
-    views = (read_winner(experiment, name, generation_id=generation_id) for name in names)
+    paths = (
+        (
+            _generation_winner_path(experiment, generation_id, name)
+            if generation_id is not None
+            else _published_winner_path_for(experiment, published_generation_id, name)
+        )
+        for name in names
+    )
+    views = (_read_winner_path(path, name) for name, path in zip(names, paths, strict=True))
     return [view for view in views if view is not None]
 
 
