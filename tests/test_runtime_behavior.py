@@ -1719,7 +1719,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     import contextlib
 
     import phasesweep.engine.phase as phase_mod
-    from phasesweep.runtime.gpu import GpuLeaseTimeoutError
+    from phasesweep.runtime.gpu import GpuAssignment, GpuLeaseTimeoutError
 
     trainer = write_trainer(
         tmp_path,
@@ -1763,7 +1763,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
             self.calls += 1
             if self.calls > 1:
                 raise exc_type("GPU lease wait exhausted")
-            yield None
+            yield GpuAssignment(visible_devices=None, lease_fds=())
 
     monkeypatch.setattr(
         phase_mod.GpuPool, "create", classmethod(lambda cls, **kwargs: _FailingSecondLeasePool())

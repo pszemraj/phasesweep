@@ -23,6 +23,7 @@ from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
+    ExecutionContext,
     Experiment,
     IntParam,
     JsonEnvelopeExtractor,
@@ -1383,6 +1384,7 @@ def _drift_experiment(
         experiment="srv",
         storage=f"sqlite:///{tmp_path / 'drift.db'}",
         workdir=str(tmp_path / "runs"),
+        execution=ExecutionContext(cwd=str(tmp_path)),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         metric=Metric(
             name=metric_name,
