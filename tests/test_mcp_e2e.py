@@ -312,6 +312,14 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.instructions == agent_prompt_text(strip=True)
+    for safety_contract in (
+        "When `recovery_required` is true, stop",
+        "When `publication_integrity` is `failed`, stop",
+        "`result_context` is `represented_generation`",
+        "Never edit an experiment config yourself",
+        "Never open raw datasets",
+    ):
+        assert safety_contract in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -326,6 +334,15 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
+    descriptions = {t.name: t.description for t in tools}
+    for tool_name, safety_contracts in {
+        TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
+        TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
+        TOOL_GET_RUN_STATUS: ("stop if recovery_required",),
+        TOOL_AWAIT_RUN: ("stop immediately for recovery_required",),
+    }.items():
+        for safety_contract in safety_contracts:
+            assert safety_contract in descriptions[tool_name]
     listed = server._tool_manager.get_tool(TOOL_LIST_EXPERIMENTS).fn()
     assert listed.next_action == TOOL_INSPECT_EXPERIMENT
     latest = asyncio.run(
