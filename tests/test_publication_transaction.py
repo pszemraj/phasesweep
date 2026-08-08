@@ -1360,6 +1360,19 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
 def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: Path) -> None:
     """The readable provenance record carries identity and digests, never config values."""
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
+    experiment = experiment.model_copy(
+        update={
+            "phases": [
+                *experiment.phases,
+                Phase(
+                    name="q",
+                    n_trials=1,
+                    sampler=Sampler(type="random", seed=1),
+                    search_space={"y": IntParam(type="int", low=0, high=10)},
+                ),
+            ]
+        }
+    )
     with temporary_umask(0o022):
         run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
@@ -1383,12 +1396,12 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
     assert record["config_fingerprint"] == summary["config_fingerprint"]
     assert record["provenance"] == experiment.provenance
     assert record["schema_versions"]["generation_summary"] == summary["schema_version"]
-    assert [item["name"] for item in record["phase_config_fingerprints"]] == [
+    phase_fingerprints = record["phase_config_fingerprints"]
+    assert [item["name"] for item in phase_fingerprints] == [
         phase.name for phase in experiment.phases
     ]
-    assert all(len(item["sha256"]) == 64 for item in record["phase_config_fingerprints"]), record[
-        "phase_config_fingerprints"
-    ]
+    assert all(len(item["sha256"]) == 64 for item in phase_fingerprints), phase_fingerprints
+    assert len({item["sha256"] for item in phase_fingerprints}) == len(experiment.phases)
     assert record["config_snapshot"] == {
         "path": _CONFIG_SNAPSHOT_NAME,
         "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
