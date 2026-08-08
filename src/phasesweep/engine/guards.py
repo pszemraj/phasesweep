@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,7 +66,9 @@ from phasesweep.runtime.files import (
     canonical_storage_identity,
     exclusive_lock,
     file_sha256,
+    open_directory_fd,
     private_atomic_write_text,
+    read_private_text_at,
     storage_is_in_memory,
     storage_recovery_locator,
     try_lock_file,
@@ -806,11 +809,54 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
         attempt_id: Attempt whose Optuna trial reached a terminal state.
 
     """
-    with contextlib.suppress(OSError):
-        (_attempts_dir(experiment) / f"{attempt_id}.json").unlink(missing_ok=True)
+    with (
+        contextlib.suppress(OSError, ProcessCleanupUncertainError),
+        _open_attempt_registry(experiment) as (directory_fd, _entry_paths),
+    ):
+        if directory_fd is not None:
+            os.unlink(f"{attempt_id}.json", dir_fd=directory_fd)
 
 
-def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
+@contextlib.contextmanager
+def _open_attempt_registry(
+    experiment: Experiment,
+) -> Iterator[tuple[int | None, list[Path]]]:
+    """Open and enumerate the private attempt registry without following links.
+
+    :param Experiment experiment: Experiment whose registry is inspected.
+    :return Iterator[tuple[int | None, list[Path]]]: Stable directory descriptor
+        and sorted JSON display paths; ``(None, [])`` when no registry exists.
+    :raises ProcessCleanupUncertainError: The registry path or permissions are unsafe.
+    """
+    attempts_dir = _attempts_dir(experiment)
+    try:
+        directory_fd = open_directory_fd(
+            attempts_dir,
+            create=False,
+            private_final=True,
+        )
+    except FileNotFoundError:
+        yield None, []
+        return
+    except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry {attempts_dir} is not a real owner-only directory. "
+            "Recovery cannot trust process authority reached through a symlink or "
+            "shared path. Restore the original registry with mode 0700 before retrying."
+        ) from exc
+    try:
+        try:
+            names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".json"))
+        except OSError as exc:
+            raise ProcessCleanupUncertainError(
+                f"Attempt registry {attempts_dir} cannot be enumerated safely."
+            ) from exc
+        yield directory_fd, [attempts_dir / name for name in names]
+    finally:
+        os.close(directory_fd)
+
+
+def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any]:
     """Load and validate one attempt registry entry.
 
     :param Path entry_path: Registry entry file to parse.
@@ -819,8 +865,8 @@ def _load_attempt_entry(entry_path: Path) -> dict[str, Any]:
         — recovery cannot know whether a process from it is still alive.
     """
     try:
-        payload = strict_json_loads(entry_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
+    except (OSError, PlatformCapabilityError, UnsafePrivatePathError, ValueError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
             "Recovery cannot prove whether a process from this attempt is still "
@@ -1165,29 +1211,29 @@ def _preflight_active_attempts(
     :raises ProcessCleanupUncertainError: A registered attempt could not be
         proven safe.
     """
-    attempts_dir = _attempts_dir(experiment)
-    if not attempts_dir.is_dir():
-        return {}
     inspected: dict[str, str] = {}
-    for entry_path in sorted(attempts_dir.glob("*.json")):
-        entry = _load_attempt_entry(entry_path)
-        attempt_id = entry["attempt_id"]
-        inspected[attempt_id] = entry["generation_id"]
-        try:
-            _registry_attempt_process_is_resolved(entry, entry_path)
-        except ProcessCleanupUncertainError as exc:
-            report.uncertain_attempt_ids.add(attempt_id)
-            report.mark_uncertain(exc)
-            raise
-        outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
-        if outcome in {"reaped", "recovered"}:
-            report.recovered_attempt_ids.add(attempt_id)
-            report.recovered_attempt_generations[attempt_id] = entry["generation_id"]
-        if outcome != "unreachable" and not (
-            retain_recovery_evidence and outcome in {"reaped", "recovered"}
-        ):
-            with contextlib.suppress(OSError):
-                entry_path.unlink(missing_ok=True)
+    with _open_attempt_registry(experiment) as (directory_fd, entry_paths):
+        if directory_fd is None:
+            return inspected
+        for entry_path in entry_paths:
+            entry = _load_attempt_entry(entry_path, directory_fd=directory_fd)
+            attempt_id = entry["attempt_id"]
+            inspected[attempt_id] = entry["generation_id"]
+            try:
+                _registry_attempt_process_is_resolved(entry, entry_path)
+            except ProcessCleanupUncertainError as exc:
+                report.uncertain_attempt_ids.add(attempt_id)
+                report.mark_uncertain(exc)
+                raise
+            outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+            if outcome in {"reaped", "recovered"}:
+                report.recovered_attempt_ids.add(attempt_id)
+                report.recovered_attempt_generations[attempt_id] = entry["generation_id"]
+            if outcome != "unreachable" and not (
+                retain_recovery_evidence and outcome in {"reaped", "recovered"}
+            ):
+                with contextlib.suppress(OSError):
+                    os.unlink(entry_path.name, dir_fd=directory_fd)
     return inspected
 
 
@@ -1203,15 +1249,15 @@ def _inspect_active_attempts(experiment: Experiment) -> dict[str, str]:
         mapped to their producing generation ids.
     :raises ProcessCleanupUncertainError: An entry lacks safe recovery evidence.
     """
-    attempts_dir = _attempts_dir(experiment)
-    if not attempts_dir.is_dir():
-        return {}
     inspected: dict[str, str] = {}
-    for entry_path in sorted(attempts_dir.glob("*.json")):
-        entry = _load_attempt_entry(entry_path)
-        attempt_id = entry["attempt_id"]
-        _registry_attempt_process_is_resolved(entry, entry_path, inspect_only=True)
-        inspected[attempt_id] = entry["generation_id"]
+    with _open_attempt_registry(experiment) as (directory_fd, entry_paths):
+        if directory_fd is None:
+            return inspected
+        for entry_path in entry_paths:
+            entry = _load_attempt_entry(entry_path, directory_fd=directory_fd)
+            attempt_id = entry["attempt_id"]
+            _registry_attempt_process_is_resolved(entry, entry_path, inspect_only=True)
+            inspected[attempt_id] = entry["generation_id"]
     return inspected
 
 
@@ -1264,7 +1310,8 @@ def _resolve_attempt_for_reaping(
     2. A retained process identity means a process was launched — verify and
        clean it the fail-closed way.
     3. A durable ``allocated`` lifecycle with no identity means no process
-       was ever created (the worker died queued for a GPU). Safe to fail.
+       launch was ever attempted (the worker died queued for a GPU). The
+       launcher advances to ``launching`` before Popen. Safe to fail.
     4. Anything else keeps today's fail-closed behavior.
 
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial being resolved.
@@ -1288,9 +1335,10 @@ def _resolve_attempt_for_reaping(
     identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
     if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
         # A missing identity is exactly what 'allocated' predicts: the worker
-        # died queued (e.g. waiting for a GPU) before any process existed. A
-        # present-but-unreadable identity instead falls through to the strict
-        # reader below and fails closed — a launch had begun.
+        # died queued (e.g. waiting for a GPU) before launch began. The
+        # launcher durably advances to 'launching' before Popen; that state and
+        # a present-but-unreadable identity both fall through to the strict
+        # reader below and fail closed.
         log.warning(
             "Trial %d in study %s was allocated but no process was ever launched "
             "(orchestrator died while queued); failing it without signalling.",
@@ -2222,7 +2270,12 @@ def _validate_relocated_trial_evidence(
                 )
 
 
-def _attempt_entry_recoverable_in_place(entry_path: Path, destination: Path) -> bool:
+def _attempt_entry_recoverable_in_place(
+    entry_path: Path,
+    destination: Path,
+    *,
+    directory_fd: int,
+) -> bool:
     """Return whether a registry entry's recorded trial path lies inside this tree.
 
     An entry whose absolute trial directory resolves to an existing directory
@@ -2238,8 +2291,8 @@ def _attempt_entry_recoverable_in_place(entry_path: Path, destination: Path) -> 
         under ``destination``.
     """
     try:
-        payload = json.loads(entry_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        payload = json.loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
+    except (OSError, PlatformCapabilityError, UnsafePrivatePathError, ValueError):
         return False
     if not isinstance(payload, dict):
         return False
@@ -2275,15 +2328,26 @@ def _validate_no_live_attempts(experiment: Experiment) -> None:
         one unresolved attempt entry whose recorded paths do not resolve
         under this destination.
     """
-    attempts_dir = _attempts_dir(experiment)
-    if not attempts_dir.is_dir():
-        return
     destination = _experiment_dir(experiment).resolve()
-    stranded = [
-        entry_path
-        for entry_path in sorted(attempts_dir.glob("*.json"))
-        if not _attempt_entry_recoverable_in_place(entry_path, destination)
-    ]
+    try:
+        with _open_attempt_registry(experiment) as (directory_fd, entry_paths):
+            if directory_fd is None:
+                return
+            stranded = [
+                entry_path
+                for entry_path in entry_paths
+                if not _attempt_entry_recoverable_in_place(
+                    entry_path,
+                    destination,
+                    directory_fd=directory_fd,
+                )
+            ]
+    except ProcessCleanupUncertainError as exc:
+        raise ArtifactRootRebindError(
+            f"Destination artifact root {str(_experiment_dir(experiment))!r} has an "
+            "unsafe attempt registry. Restore its owner-only 0700 directory and 0600 "
+            "entry files before rebinding."
+        ) from exc
     if not stranded:
         return
     raise ArtifactRootRebindError(

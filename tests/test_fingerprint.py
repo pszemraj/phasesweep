@@ -40,6 +40,7 @@ from phasesweep.engine import (
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
     read_status,
+    read_winner,
     read_winners,
 )
 from phasesweep.engine.guards import (
@@ -1181,6 +1182,12 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
         run_experiment(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(foreign)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winner(foreign, "p")
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winner(foreign, "p", generation_id=published)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winners(foreign)
 
     assert not (tmp_path / "foreign.db").exists()
     assert _last_successful_generation_id(owner) == published

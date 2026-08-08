@@ -27,15 +27,22 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
-from phasesweep.engine import ActiveAttemptPersistenceError, NoFeasibleTrialError, run_experiment
+from phasesweep.engine import (
+    ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
+    NoFeasibleTrialError,
+    run_experiment,
+)
 from phasesweep.engine.guards import (
     ATTEMPT_REGISTRY_SCHEMA_VERSION,
+    _inspect_active_attempts,
     _preflight_active_attempts,
     _preflight_existing_studies,
     _PreflightCleanupReport,
     _reap_stale_trials,
     _record_stale_trial_failure,
     _register_active_attempt,
+    _validate_artifact_root_binding,
 )
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
@@ -1104,6 +1111,7 @@ def _fabricate_stale_running_trial(
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     _stamp_artifact_root(study, experiment)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
@@ -1274,6 +1282,51 @@ def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(tmp_path: 
     assert entry_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["directory_mode", "file_mode", "directory_symlink", "entry_symlink"],
+)
+def test_attempt_registry_refuses_unsafe_private_authority(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Recovery never follows or trusts a registry outside its private namespace."""
+    experiment = make_experiment(
+        experiment="unsafe-registry",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+    )
+    trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__unsafe"
+    trial_dir.mkdir(parents=True)
+    _register_active_attempt(
+        experiment,
+        attempt_id="unsafe-attempt",
+        phase_name="p",
+        study_name="unsafe-registry::p",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id="unsafe-generation",
+    )
+    attempts_dir = _attempts_dir(experiment)
+    entry_path = attempts_dir / "unsafe-attempt.json"
+
+    if mutation == "directory_mode":
+        attempts_dir.chmod(0o755)
+    elif mutation == "file_mode":
+        entry_path.chmod(0o644)
+    elif mutation == "directory_symlink":
+        redirected = attempts_dir.with_name("redirected-attempts")
+        attempts_dir.rename(redirected)
+        attempts_dir.symlink_to(redirected, target_is_directory=True)
+    else:
+        target = attempts_dir.parent / "redirected-attempt.json"
+        entry_path.rename(target)
+        entry_path.symlink_to(target)
+
+    with pytest.raises(ProcessCleanupUncertainError, match="registry|entry"):
+        _inspect_active_attempts(experiment)
+
+
 def test_relative_registry_storage_recovers_from_the_registration_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1421,11 +1474,13 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     )
     write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
 
-    winners = run_experiment(_exp("new.db"))
+    report = _PreflightCleanupReport()
+    _preflight_active_attempts(old_exp, report)
 
-    assert "p" in winners
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        run_experiment(_exp("new.db"))
 
 
 @pytest.mark.parametrize("failure_site", ["lifecycle", "registry"])

@@ -46,6 +46,7 @@ from phasesweep.engine.guards import (
     _retire_active_attempt,
     _suite_fingerprint,
     _suite_lock,
+    _validate_artifact_root_binding,
     _validate_suite_artifact_root_rebind,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
@@ -591,6 +592,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         printing "(no winner yet)" beside a corrupt publication reads as a
         phase that simply has not run (review v0.5.18 / finding F4).
     """
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
     publication = _resolve_publication_pointer(experiment)
     if publication.state == "failed":
         raise _publication_integrity_error(

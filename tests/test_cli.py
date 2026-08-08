@@ -21,6 +21,7 @@ from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
 from phasesweep.config import Suite, load_config
 from phasesweep.engine import (
+    ArtifactRootConflictError,
     ExperimentLockBusyError,
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
@@ -408,6 +409,41 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
     assert unpublished.exit_code == 0
     assert "(no winner yet)" in unpublished.output
     assert "trial_number: 99" not in unpublished.output
+
+
+def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
+    """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=1.0")')
+    owner_config = write_yaml(
+        tmp_path,
+        f"""
+        experiment: winner_owner
+        workdir: {tmp_path}/runs
+        storage: sqlite:///{tmp_path}/owner.db
+        provenance: {{revision: test-fixture-v1}}
+        trial_command: "python {trainer} {{overrides}}"
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)'}}
+        phases:
+          - name: p
+            n_trials: 1
+            sampler: {{type: random, seed: 0}}
+            search_space: {{}}
+        """,
+    )
+    owner = load_experiment(owner_config)
+    run_experiment(owner)
+
+    foreign_config = tmp_path / "foreign.yaml"
+    foreign_config.write_text(owner_config.read_text().replace("owner.db", "foreign.db"))
+    result = CliRunner().invoke(cli_main, ["show-winners", str(foreign_config)])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ArtifactRootConflictError)
+    assert "different storage ledger" in str(result.exception)
+    assert "trial_number" not in result.output
 
 
 def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):

@@ -195,6 +195,7 @@ def read_winner(
         relaxed here.
 
     """
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
     path = (

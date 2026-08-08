@@ -698,6 +698,32 @@ def _validate_private_destination(parent_fd: int, leaf: str, path: Path) -> None
     _validate_private_file_info(path, info)
 
 
+def read_private_text_at(parent_fd: int, leaf: str, path: Path) -> str:
+    """Read one private UTF-8 file relative to an already-open directory.
+
+    :param int parent_fd: Validated directory descriptor that anchors the read.
+    :param str leaf: Single filename to open relative to ``parent_fd``.
+    :param Path path: Display path used in validation errors.
+    :return str: Complete UTF-8 contents of the validated owner-only file.
+    :raises UnsafePrivatePathError: The name is unsafe or the entry is not a
+        private, unshared regular file.
+    """
+    if leaf != leaf_name(Path(leaf)):
+        raise UnsafePrivatePathError(f"Private file {path} has an unsafe filename.")
+    try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_CLOEXEC | nofollow_flag(), dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafePrivatePathError(f"Private file {path} must not be a symlink.") from exc
+        raise
+    try:
+        _validate_private_file_info(path, os.fstat(fd))
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
 def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     """Open a UTF-8 text file with owner-only permissions.
 
@@ -1274,7 +1300,6 @@ _RDB_CONNECTION_ONLY_OPTIONS = frozenset(
         "application_name",
         "charset",
         "connect_timeout",
-        "options",
         "read_timeout",
         "sslcert",
         "sslkey",

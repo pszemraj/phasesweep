@@ -408,6 +408,11 @@ def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: st
             "postgresql://u@/db?host=/var/run/postgresql",
             "postgresql://u@/db?host=/tmp",
         ),
+        (
+            "different PostgreSQL search_path",
+            "postgresql://u@h/db?options=-csearch_path%3Dresearch_a",
+            "postgresql://u@h/db?options=-csearch_path%3Dresearch_b",
+        ),
     ],
 )
 def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right: str) -> None:
