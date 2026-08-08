@@ -341,8 +341,8 @@ def _run_phase(
         TrialEvidenceMissingError: The selected winner's evidence directory,
             audit artifacts, or objective source are missing or no longer match
             the provenance frozen at extraction.
-        ActiveAttemptPersistenceError: A trial's attempt could not be recorded
-            in the experiment attempt registry, so it was never launched.
+        ActiveAttemptPersistenceError: A trial's required recovery metadata
+            could not be persisted, so it was never launched.
         StudyStorageUnavailableError: A trial's terminal outcome could not be
             persisted. That trial is left ``RUNNING`` with its attempt record
             intact and recovers on the next run once storage is writable
@@ -677,9 +677,9 @@ def _run_phase(
                 acquire the just-released GPU lease.
             TrialExecutionError: The subprocess returned non-zero / produced
                 no metric. Caught by ``study.optimize(catch=...)``.
-            ActiveAttemptPersistenceError: The attempt could not be recorded
-                in the experiment attempt registry; nothing was launched and
-                no GPU lease was consumed.
+            ActiveAttemptPersistenceError: Required attempt recovery metadata
+                could not be persisted; nothing was launched and no GPU lease
+                was consumed.
             _TrialOutcomeUnrecordedAbort: A successful trial's terminal
                 outcome could not be persisted, so the trial is deliberately
                 left ``RUNNING`` for stale-attempt recovery.
@@ -711,18 +711,19 @@ def _run_phase(
         # killed while queued leaves a RUNNING trial with this marker and no
         # process identity; recovery can then prove no process was ever
         # created instead of failing closed forever (review v0.5.17 /
-        # blocker 2 gap A). Best-effort: a write failure only degrades that
-        # trial back to the old fail-closed recovery semantics.
+        # blocker 2 gap A). This is a pre-launch durability requirement: a
+        # write failure would otherwise create an attempt that recovery can
+        # never distinguish from a process whose identity write was torn.
         try:
             trial_dir.mkdir(parents=True, exist_ok=True)
             write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
-        except OSError:
-            log.warning(
-                "Could not persist the 'allocated' lifecycle marker for trial %d "
-                "(attempt %s); recovery of a pre-launch crash will fail closed.",
-                trial.number,
-                attempt_id,
-            )
+        except OSError as exc:
+            raise ActiveAttemptPersistenceError(
+                f"Could not persist the allocated lifecycle marker for trial "
+                f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
+                "No trainer was started and no GPU lease was consumed. Restore "
+                "write access to the experiment workdir, then run again."
+            ) from exc
         # Experiment-level registration is what keeps this attempt visible to
         # recovery even if the phase is later renamed/removed or the storage
         # URL changes (review v0.5.17 / blocker 3). Retired by the post-trial
@@ -940,7 +941,7 @@ def _run_phase(
                 trial,
                 "fatal",
                 cause=str(exc),
-                fatal_policy="active_attempt_registration",
+                fatal_policy="active_attempt_persistence",
             )
             raise
         except BaseException as exc:

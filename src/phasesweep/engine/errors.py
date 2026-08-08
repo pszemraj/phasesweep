@@ -99,21 +99,18 @@ class StudyStorageUnavailableError(PhaseSweepError):
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):
-    """Raised when a trial attempt could not be registered before its launch.
+    """Raised when required attempt recovery state cannot persist before launch.
 
-    The experiment-level ``attempts/`` registry is the only durable discovery
-    path for an attempt whose phase is later renamed or removed, or whose
-    storage URL changes: the per-phase reaper visits only the phases the
-    *current* config declares. An unregistered attempt whose orchestrator is
-    then hard-killed therefore leaves a trainer no later run can find, while
-    the renamed phase happily publishes alongside it.
+    The allocated lifecycle marker proves a process was never created, and the
+    experiment-level ``attempts/`` registry discovers work after a phase rename,
+    removal, or storage change. Losing either record before launch creates an
+    attempt a later run cannot safely account for.
 
-    Registration is consequently a pre-launch durability requirement rather
-    than a best-effort convenience, and this failure is raised before any
-    trainer starts or any GPU lease is consumed - nothing needs undoing. The
-    condition is environmental (the experiment workdir is not writable), so
-    the remedy is restoring that tree, not a config change (PR #5 review /
-    reviewer 2 pass 2, blocker 5).
+    Both writes are consequently pre-launch durability requirements. This
+    failure is raised before any trainer starts or any GPU lease is consumed,
+    so nothing needs undoing. The condition is environmental (the experiment
+    workdir is not writable), so the remedy is restoring that tree, not a
+    config change.
     """
 
 

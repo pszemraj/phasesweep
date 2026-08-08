@@ -44,6 +44,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    _attempts_dir,
     _experiment_dir,
     _generation_path,
     _trial_dir_for,
@@ -1088,6 +1089,7 @@ def _fabricate_stale_running_trial(
     *,
     attempt_id: str,
     generation_id: str = "old-generation",
+    persist_attempt_id: bool = True,
 ) -> tuple[optuna.Study, Path, int]:
     """Create the phase study with one attribute-complete RUNNING trial."""
     study = optuna.create_study(
@@ -1107,7 +1109,8 @@ def _fabricate_stale_running_trial(
     )
     trial_dir.mkdir(parents=True)
     trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
-    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
+    if persist_attempt_id:
+        trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     return study, trial_dir, trial.number
 
@@ -1210,10 +1213,14 @@ def _fabricate_registered_attempt(
     phase_name: str,
     *,
     attempt_id: str,
+    persist_trial_attempt_id: bool = True,
 ) -> tuple[optuna.Study, Path, int]:
     """Fabricate a stale RUNNING trial plus its attempt registry entry."""
     study, trial_dir, number = _fabricate_stale_running_trial(
-        experiment, phase_name, attempt_id=attempt_id
+        experiment,
+        phase_name,
+        attempt_id=attempt_id,
+        persist_attempt_id=persist_trial_attempt_id,
     )
     _register_active_attempt(
         experiment,
@@ -1225,6 +1232,34 @@ def _fabricate_registered_attempt(
         generation_id="old-generation",
     )
     return study, trial_dir, number
+
+
+def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path) -> None:
+    """A registry entry survives an Optuna failure before the first trial attr."""
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    experiment = make_experiment(
+        experiment="partial-registration",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'partial.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        n_trials=2,
+        sampler=Sampler(type="random", seed=1),
+    )
+    study, trial_dir, stale_number = _fabricate_registered_attempt(
+        experiment,
+        "p",
+        attempt_id="partial-attempt",
+        persist_trial_attempt_id=False,
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="partial-attempt", state="allocated")
+
+    winners = run_experiment(experiment)
+
+    assert "p" in winners
+    states = {trial.number: trial.state for trial in study.get_trials(deepcopy=False)}
+    assert states[stale_number] == optuna.trial.TrialState.FAIL
+    assert optuna.trial.TrialState.COMPLETE in states.values()
+    assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
@@ -1315,19 +1350,19 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
 
 
-def test_unregistrable_attempt_refuses_to_launch_its_trainer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure_site", ["lifecycle", "registry"])
+def test_unpersistable_attempt_refuses_to_launch_its_trainer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
 ) -> None:
-    """Attempt registration is a pre-launch durability requirement.
+    """Lifecycle and registry writes are pre-launch durability requirements.
 
-    Swallowing the registry write published runs with zero registry coverage,
-    which is the one state the registry exists to prevent: after an
-    orchestrator hard-kill plus a phase rename, nothing can discover the
-    still-live trainer, because the per-phase reaper walks only the phases the
-    current config declares. So the write now fails closed, before the GPU
-    lease and before any subprocess (PR #5 review / reviewer 2 pass 2,
-    blocker 5). The registration-succeeds discovery path is covered by
-    ``test_renamed_phase_cannot_hide_stale_trainer_from_recovery``.
+    Losing the registry makes a trainer undiscoverable after a phase rename;
+    losing the allocated lifecycle marker makes a queued pre-launch crash
+    indistinguishable from a torn process-identity write. Both failures must
+    stop before the GPU lease and subprocess. The successful discovery path is
+    covered by ``test_renamed_phase_cannot_hide_stale_trainer_from_recovery``.
     """
     launched = tmp_path / "trainer_ran"
     trainer = write_trainer(
@@ -1349,22 +1384,34 @@ def test_unregistrable_attempt_refuses_to_launch_its_trainer(
             n_trials=n_trials,
         )
 
+    attempts_dir = tmp_path / "runs" / "unregistrable" / "attempts"
     import phasesweep.engine.guards as guards_mod
+    import phasesweep.engine.phase as phase_mod
 
     real_atomic_write_text = guards_mod.atomic_write_text
-    attempts_dir = tmp_path / "runs" / "unregistrable" / "attempts"
+    real_write_attempt_lifecycle = phase_mod.write_attempt_lifecycle
+    if failure_site == "registry":
 
-    def refuse_registry_writes(path: Path, text: str) -> None:
-        if path.parent == attempts_dir:
-            raise OSError(errno.EACCES, "injected registry write failure")
-        real_atomic_write_text(path, text)
+        def refuse_registry_writes(path: Path, text: str) -> None:
+            if path.parent == attempts_dir:
+                raise OSError(errno.EACCES, "injected registry write failure")
+            real_atomic_write_text(path, text)
 
-    monkeypatch.setattr(guards_mod, "atomic_write_text", refuse_registry_writes)
+        monkeypatch.setattr(guards_mod, "atomic_write_text", refuse_registry_writes)
+    else:
+
+        def refuse_lifecycle_write(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.EACCES, "injected lifecycle write failure")
+
+        monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", refuse_lifecycle_write)
     with pytest.raises(ActiveAttemptPersistenceError) as excinfo:
         run_experiment(_exp(2))
 
     message = str(excinfo.value)
-    assert str(attempts_dir) in message
+    if failure_site == "registry":
+        assert str(attempts_dir) in message
+    else:
+        assert "allocated lifecycle marker" in message
     assert "No trainer was started" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
@@ -1376,11 +1423,12 @@ def test_unregistrable_attempt_refuses_to_launch_its_trainer(
     (trial,) = study.get_trials(deepcopy=False)
     assert trial.state == optuna.trial.TrialState.FAIL
     assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
-    assert str(attempts_dir) in trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_registration"
+    assert message in trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_persistence"
 
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(guards_mod, "atomic_write_text", real_atomic_write_text)
+    monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
         run_experiment(_exp(2))
     assert not launched.exists()

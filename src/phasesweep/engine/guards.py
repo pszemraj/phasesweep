@@ -1005,9 +1005,13 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
     trial = next((t for t in trials if t.number == entry["trial_number"]), None)
     if trial is None or trial.state != optuna.trial.TrialState.RUNNING:
         return "terminal"
-    if trial.user_attrs.get(ATTEMPT_ID_ATTR) != entry["attempt_id"]:
-        # The RUNNING trial belongs to a different attempt than this entry;
-        # leave it for that attempt's own recovery evidence.
+    stored_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if stored_attempt_id is not None and stored_attempt_id != entry["attempt_id"]:
+        # A conflicting durable id proves the RUNNING row belongs to another
+        # attempt. A missing id is different: registration is written before
+        # the first Optuna attr, so it is the expected crash/storage-failure
+        # window. The registry entry plus the already-validated lifecycle or
+        # process identity still binds this exact study and trial safely.
         return "terminal"
     _record_stale_trial_failure(study, trial)
     try:
