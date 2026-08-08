@@ -27,7 +27,7 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.runtime.commands import render_command
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.files import file_sha256, private_atomic_write_text
 from phasesweep.runtime.process import ProcessResult, run_supervised
 
 log = logging.getLogger("phasesweep.engine.trial")
@@ -423,7 +423,7 @@ def launch_trial(
         if experiment.override_format == "json_file"
         else resolved_overrides_path
     )
-    overrides_sha256 = hashlib.sha256(evidence_overrides_path.read_bytes()).hexdigest()
+    overrides_sha256 = file_sha256(evidence_overrides_path)
     # Orchestrator-created trial artifact, not symlink-hardened by design (see
     # the trust-boundary comment above).
     (workdir / "command.txt").write_text(cmd + "\n")

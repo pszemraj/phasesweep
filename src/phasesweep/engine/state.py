@@ -22,6 +22,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.runtime.files import (
     atomic_text_writer,
+    file_sha256,
     fsync_directory,
     private_atomic_write_text,
 )
@@ -436,16 +437,6 @@ def _generation_reproducibility_path(experiment: Experiment, generation_id: str)
     return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
 
 
-def _file_sha256(path: Path) -> str:
-    """Return the SHA-256 hex digest of one file's bytes.
-
-    :param Path path: File to hash.
-    :return str: 64-character hex digest.
-    :raises OSError: The file cannot be read.
-    """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _phase_config_fingerprint(phase: Phase) -> str:
     """Hash one phase's configured semantics, independent of any winner.
 
@@ -559,7 +550,7 @@ def _write_generation_provenance(
             "provenance": dict(sorted(experiment.provenance.items())),
             "config_snapshot": {
                 "path": GENERATION_CONFIG_SNAPSHOT_FILENAME,
-                "sha256": _file_sha256(snapshot_path),
+                "sha256": file_sha256(snapshot_path),
             },
         },
     )
@@ -628,7 +619,7 @@ def _generation_artifact_manifest(
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         artifact = generation_dir / filename
         if artifact.is_file():
-            items.append({"kind": kind, "path": filename, "sha256": _file_sha256(artifact)})
+            items.append({"kind": kind, "path": filename, "sha256": file_sha256(artifact)})
     phases_dir = generation_dir / "phases"
     if not phases_dir.is_dir():
         return items
@@ -639,7 +630,7 @@ def _generation_artifact_manifest(
             artifact = phase_dir / _ARTIFACT_FILENAMES[kind]
             if artifact.is_file():
                 items.append(
-                    {"kind": kind, "phase": phase_dir.name, "sha256": _file_sha256(artifact)}
+                    {"kind": kind, "phase": phase_dir.name, "sha256": file_sha256(artifact)}
                 )
     return items
 

@@ -61,6 +61,7 @@ from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
     exclusive_lock,
+    file_sha256,
     storage_is_in_memory,
     try_lock_file,
     unlock_file,
@@ -2215,25 +2216,6 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> Mapping[str,
     return parsed if isinstance(parsed, Mapping) else None
 
 
-def _streamed_file_sha256(path: Path) -> str:
-    """Hash one file's bytes without holding them all in memory.
-
-    The default objective source is the trainer's unbounded ``stdout.log``, so
-    this is read in chunks rather than through
-    :func:`phasesweep.engine.state._file_sha256`, which materializes the whole
-    file.
-
-    :param Path path: File to digest.
-    :return str: 64-character hex digest.
-    :raises OSError: The file cannot be read.
-    """
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 def _verify_objective_source_evidence(
     trial_dir: Path,
     provenance: Mapping[str, Any] | None,
@@ -2290,7 +2272,7 @@ def _verify_objective_source_evidence(
     if not isinstance(recorded_digest, str) or not recorded_digest:
         return
     try:
-        actual_digest = _streamed_file_sha256(source_path)
+        actual_digest = file_sha256(source_path)
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, which could not be "

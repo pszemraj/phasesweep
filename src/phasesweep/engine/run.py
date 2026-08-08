@@ -45,7 +45,6 @@ from phasesweep.engine.state import (
     Winner,
     _experiment_dir,
     _file_log_handler,
-    _file_sha256,
     _generation_artifact_manifest,
     _generation_dir,
     _generation_path,
@@ -82,7 +81,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.evidence.models import objective_evidence_assurance
-from phasesweep.runtime.files import require_posix_runtime
+from phasesweep.runtime.files import file_sha256, require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     absorb_shutdown_signals,
@@ -1514,7 +1513,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     "experiment_generation_id": component.generation_id,
                     "experiment_phase_fingerprints": dict(component.phase_fingerprints),
                     "component_summary_path": str(component_summary_path),
-                    "component_summary_sha256": _file_sha256(component_summary_path),
+                    "component_summary_sha256": file_sha256(component_summary_path),
                 }
                 exposed_winners, decision = _apply_study_promotion(
                     suite=suite,

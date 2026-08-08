@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import logging
 import os
 import secrets
@@ -26,6 +27,20 @@ PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SHARED_DIR_MODE = 0o3770
 SHARED_FILE_MODE = 0o660
+
+
+def file_sha256(path: Path) -> str:
+    """Return a file's SHA-256 digest without holding all bytes in memory.
+
+    :param Path path: File to hash.
+    :return str: 64-character hexadecimal digest.
+    :raises OSError: The file cannot be read.
+    """
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 class UnsafeLockPathError(RuntimeError):

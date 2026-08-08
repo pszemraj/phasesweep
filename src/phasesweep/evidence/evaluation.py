@@ -31,6 +31,7 @@ from phasesweep.evidence.wandb import (
     WandbSetupError,
     poll_wandb_summary,
 )
+from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import strict_json_loads
 
 # Version of the objective evidence provenance payload frozen alongside a
@@ -711,13 +712,9 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     try:
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
-        hasher = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                hasher.update(chunk)
+        digest = file_sha256(path)
     except OSError as exc:
         return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
-    digest = hasher.hexdigest()
     if digest == gate.sha256:
         return GateResult(gate.type, True, f"{gate.path} sha256 matched")
     return GateResult(gate.type, False, f"{gate.path} sha256 {digest} != {gate.sha256}")
