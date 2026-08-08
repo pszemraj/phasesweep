@@ -46,7 +46,6 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _last_successful_generation_path,
-    _last_successful_suite_generation_id,
     _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
     _suite_generation_path,
@@ -697,7 +696,7 @@ def test_suite_publication_refuses_broken_component_manifest(
     with pytest.raises(RuntimeError, match="component manifest is invalid"):
         run_suite(suite)
 
-    assert _last_successful_suite_generation_id(suite) is None
+    assert _resolve_suite_publication_pointer(suite).state == "absent"
 
 
 # --------------------------------------------------------------------------
@@ -915,7 +914,9 @@ def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     """The suite pointer gets the same tri-state as the experiment pointer."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
-    generation_id = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
     assert generation_id is not None
 
     assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
@@ -930,7 +931,6 @@ def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     assert pointer.state == "failed"
     assert pointer.generation_id == generation_id
     assert pointer.error is not None
-    assert _last_successful_suite_generation_id(suite) is None
 
 
 def test_suite_publication_pointer_reports_absent_before_anything_publishes(
@@ -1068,7 +1068,9 @@ def test_suite_precommit_validation_failure_keeps_prior_publication(
     """Suite mirror: a pre-commit validation failure keeps the prior suite publication."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
-    first_generation = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    first_generation = pointer.generation_id
     assert first_generation is not None
 
     def fail_validation(*_args: object, **_kwargs: object) -> None:
@@ -1084,7 +1086,9 @@ def test_suite_precommit_validation_failure_keeps_prior_publication(
     ]
     assert second_generation != first_generation
     assert _suite_record_state(suite, second_generation) == "publication_failed"
-    assert _last_successful_suite_generation_id(suite) == first_generation
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    assert pointer.generation_id == first_generation
 
 
 def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
@@ -1095,7 +1099,9 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
     """Suite mirror: a post-commit projection failure must not fail the suite run."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
-    first_generation = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    first_generation = pointer.generation_id
     assert first_generation is not None
 
     def fail_projection(*_args: object, **_kwargs: object) -> None:
@@ -1107,7 +1113,9 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
         results = run_suite(suite)
 
     assert set(results) == {"one"}
-    second_generation = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    second_generation = pointer.generation_id
     assert second_generation is not None
     assert second_generation != first_generation
     assert _suite_record_state(suite, second_generation) == "published"
@@ -1128,7 +1136,9 @@ def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
     suite path previously trusted the summary text on identity alone."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
-    generation_id = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
     assert generation_id is not None
 
     summary_path = _suite_generation_summary_path(suite, generation_id)
@@ -1141,7 +1151,7 @@ def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
     # Spoof the published metric value in the suite summary itself.
     exposed[0]["metric"] = exposed[0]["metric"] + 1.0
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    assert _last_successful_suite_generation_id(suite) is None
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
 
     # Parameters and effective overrides are published winner facts too.
     summary = yaml.safe_load(original)
@@ -1149,26 +1159,30 @@ def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
     exposed = [item for item in study["phases"] if item.get("exposed")]
     exposed[0]["params"]["x"] = exposed[0]["params"]["x"] + 1
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    assert _last_successful_suite_generation_id(suite) is None
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
 
     # Restore, then tamper the hash-anchored component summary instead.
     summary_path.write_text(original)
-    assert _last_successful_suite_generation_id(suite) == generation_id
+    assert _resolve_suite_publication_pointer(suite).generation_id == generation_id
     component_path = Path(study["component_summary_path"])
     component_original = component_path.read_text()
     component_path.write_text(component_original + "\n# tampered\n")
-    assert _last_successful_suite_generation_id(suite) is None
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
 
     # Restoring both artifacts restores the published result.
     component_path.write_text(component_original)
-    assert _last_successful_suite_generation_id(suite) == generation_id
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    assert pointer.generation_id == generation_id
 
 
 def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:
     """Suite mirror: a published suite generation's record can never be rewritten."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
-    generation_id = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
     assert generation_id is not None
     record_path = _suite_generation_record_path(suite, generation_id)
     first_content = record_path.read_bytes()
@@ -1183,7 +1197,9 @@ def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:
     )
 
     assert record_path.read_bytes() == first_content
-    assert _last_successful_suite_generation_id(suite) == generation_id
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    assert pointer.generation_id == generation_id
 
 
 def test_suite_manifest_names_the_generation_that_produced_its_winners(

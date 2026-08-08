@@ -1562,21 +1562,6 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
     return PublicationPointer(state="ok", generation_id=generation_id, error=None)
 
 
-def _last_successful_suite_generation_id(suite: Suite) -> str | None:
-    """Return the last-success suite generation id, failing closed on any invalidity.
-
-    The boolean-blind view of :func:`_resolve_suite_publication_pointer`, kept
-    for path-construction callers; surfaces that *report* suite publication
-    state use the tri-state resolver (review v0.5.18 / finding F4).
-
-    :param Suite suite: Suite config with artifact root details.
-    :return str | None: The last-successful suite generation id, or ``None``
-        when the pointer or its target summary fails validation.
-    """
-    pointer = _resolve_suite_publication_pointer(suite)
-    return pointer.generation_id if pointer.state == "ok" else None
-
-
 def _validate_suite_summary_integrity(
     generation_id: str,
     summary: Mapping[str, Any],

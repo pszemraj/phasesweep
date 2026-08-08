@@ -52,7 +52,7 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _last_successful_generation_path,
-    _last_successful_suite_generation_id,
+    _resolve_suite_publication_pointer,
     _suite_generation_summary_path,
     _winner_path,
 )
@@ -809,7 +809,9 @@ def test_suite_status_reports_the_suite_publication_verdict(
     assert fresh["published_suite_generation_id"] is None
 
     run_suite(suite)
-    generation_id = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
     assert generation_id is not None
 
     assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
@@ -836,7 +838,9 @@ def test_suite_status_escalates_a_corrupt_suite_publication(
     suite = load_config(config_path)
     assert isinstance(suite, Suite)
     run_suite(suite)
-    generation_id = _last_successful_suite_generation_id(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
     assert generation_id is not None
 
     # Spoof a published winner fact in the suite summary alone: the component
@@ -1319,7 +1323,7 @@ def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
     suite_a = load_config(config_a)
     assert isinstance(suite_a, Suite)
     run_suite(suite_a)
-    assert _last_successful_suite_generation_id(suite_a) is not None
+    assert _resolve_suite_publication_pointer(suite_a).state == "ok"
     shutil.copytree(workdir_a, workdir_b)
 
     exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
