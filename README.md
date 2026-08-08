@@ -87,7 +87,7 @@ effective_overrides:
 
 Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory. Argparse and Hydra templates use `{overrides}` for the rendered parameters; `json_file` templates use `{overrides_path}`. The trainer must accept that boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
 
-Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints every rendered command without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
+Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
 
 ```bash
 phasesweep status experiment.yaml                           # durable progress, nothing launched
