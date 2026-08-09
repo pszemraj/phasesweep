@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
@@ -103,6 +104,21 @@ AWAIT_MAX_TIMEOUT_SECONDS = 600
 # default-length wait rechecks run state several times mid-wait instead of only
 # at entry and at the deadline.
 AWAIT_RECHECK_SECONDS = 5
+
+
+class _SpawnBookkeepingError(Exception):
+    """Carry cleanup evidence for a failure after a runner process was created."""
+
+    def __init__(self, original_error: BaseException, *, cleanup_confirmed: bool) -> None:
+        """Create an internal post-spawn ownership failure.
+
+        :param BaseException original_error: Failure raised after ``Popen`` succeeded.
+        :param bool cleanup_confirmed: Whether the spawned process group is confirmed gone.
+        """
+        super().__init__("runner bookkeeping failed after process creation")
+        self.original_error = original_error
+        self.cleanup_confirmed = cleanup_confirmed
+
 
 # Agent-facing tool descriptions. Descriptions are the one instruction channel
 # present on every call even when the user loads no prompt, so each one chains
@@ -1591,37 +1607,33 @@ class PhaseSweepMCP:
                 else:
                     raise RuntimeError("failed to mint an unused MCP run id")
                 resolved["run_id"] = run_id
+                handle: RunHandle | None = None
                 try:
                     handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
-                except Exception as spawn_exc:
+                    if handle.pid_starttime is None:
+                        raise RuntimeError(
+                            "spawned runner has no Linux /proc start time; refused launch because "
+                            "later cancellation could not distinguish PID reuse"
+                        )
+                    self._runs.update(handle)
+                except _SpawnBookkeepingError as spawn_exc:
                     self._record_launch_failure(
                         pending,
-                        cleanup_confirmed=True,
-                        error_class=type(spawn_exc).__name__,
+                        cleanup_confirmed=spawn_exc.cleanup_confirmed,
+                        error_class=type(spawn_exc.original_error).__name__,
                     )
-                    raise
-                if handle.pid_starttime is None:
-                    launch_exc = RuntimeError(
-                        "spawned runner has no Linux /proc start time; refused launch because "
-                        "later cancellation could not distinguish PID reuse"
+                    raise spawn_exc.original_error from None
+                except BaseException as launch_exc:
+                    cleanup_confirmed = (
+                        True if handle is None else self._terminate_failed_spawn(handle, launch_exc)
                     )
-                    cleanup_confirmed = self._terminate_failed_spawn(handle, launch_exc)
                     self._record_launch_failure(
                         pending,
                         cleanup_confirmed=cleanup_confirmed,
                         error_class=type(launch_exc).__name__,
                     )
-                    raise launch_exc
-                try:
-                    self._runs.update(handle)
-                except Exception as save_exc:
-                    cleanup_confirmed = self._terminate_failed_spawn(handle, save_exc)
-                    self._record_launch_failure(
-                        pending,
-                        cleanup_confirmed=cleanup_confirmed,
-                        error_class=type(save_exc).__name__,
-                    )
                     raise
+                assert handle is not None
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
             self._audit_error(
@@ -1924,7 +1936,7 @@ class PhaseSweepMCP:
         try:
             self._runs.mark_cleanup_uncertain(handle)
             marker_written = True
-        except Exception as marker_exc:
+        except BaseException as marker_exc:
             log.error(
                 "cleanup uncertain after failed runner launch bookkeeping for "
                 "run_id=%s pgid=%s, but failed to persist cleanup uncertainty marker; "
@@ -1941,7 +1953,7 @@ class PhaseSweepMCP:
                 handle.pid_starttime,
                 pgid=handle.pgid,
             )
-        except Exception:
+        except BaseException:
             log.exception(
                 "failed to terminate untracked runner run_id=%s pgid=%s",
                 handle.run_id,
@@ -1950,8 +1962,15 @@ class PhaseSweepMCP:
             return False
         if cleanup_confirmed:
             if marker_written:
-                with contextlib.suppress(Exception):
+                try:
                     self._runs.clear_cleanup_uncertain(handle)
+                except BaseException:
+                    log.exception(
+                        "runner cleanup succeeded but its uncertainty marker could not be "
+                        "cleared for run_id=%s; retaining the recovery reservation",
+                        handle.run_id,
+                    )
+                    return False
         else:
             log.error(
                 "cleanup uncertain after failed runner launch bookkeeping for run_id=%s pgid=%s",
@@ -2021,31 +2040,68 @@ class PhaseSweepMCP:
         spawn_cwd = self._neutral_spawn_cwd()
         # Open the log here, hand the fd to the child, then close our copy. The
         # child keeps it. stdin is /dev/null so the runner never blocks on input.
-        with open_private_text(log_path, "w") as log_file:
-            proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,  # own session/pgid; survives restart; signal as a group
-                cwd=str(spawn_cwd),
-                env=_runner_env(),
+        # Once Popen returns, every later operation is inside the BaseException
+        # boundary: shutdown interrupts are ownership failures too, not proof
+        # that no child was created.
+        proc: subprocess.Popen | None = None
+        handle: RunHandle | None = None
+        pid_starttime: int | None = None
+        boot_id: str | None = None
+        try:
+            with open_private_text(log_path, "w") as log_file:
+                proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,  # own session/pgid; survives restart; signal as a group
+                    cwd=str(spawn_cwd),
+                    env=_runner_env(),
+                )
+                # Build the minimum usable identity before log close, /proc,
+                # boot-id, or handle enrichment can fail. start_new_session=True
+                # makes the child the group leader, so pgid == pid without a
+                # getpgid() race if it exits quickly.
+                handle = RunHandle(
+                    run_id=run_id,
+                    experiment_id=reg.id,
+                    config_sha256=reg.config_sha256,
+                    pid=proc.pid,
+                    pgid=proc.pid,
+                    pid_starttime=None,
+                    started_at=pending.started_at,
+                    launch_state="spawned",
+                    allow_cancel=pending.allow_cancel,
+                    visible_params_at_launch=pending.visible_params_at_launch,
+                    boot_id=None,
+                )
+                pid_starttime = read_proc_starttime(proc.pid)
+                handle = replace(handle, pid_starttime=pid_starttime)
+                boot_id = read_boot_id()
+                handle = replace(handle, boot_id=boot_id)
+        except BaseException as exc:
+            if proc is None:
+                # Opening the log or Popen itself failed: no child exists.
+                raise
+            cleanup_handle = RunHandle(
+                run_id=run_id,
+                experiment_id=reg.id,
+                config_sha256=reg.config_sha256,
+                pid=proc.pid,
+                pgid=proc.pid,
+                pid_starttime=pid_starttime,
+                started_at=pending.started_at,
+                launch_state="spawned",
+                allow_cancel=pending.allow_cancel,
+                visible_params_at_launch=pending.visible_params_at_launch,
+                boot_id=boot_id,
             )
-        handle = RunHandle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            pid=proc.pid,
-            # start_new_session=True makes the child a session+group leader, so
-            # pgid == pid by POSIX. Avoids a getpgid() race if the child exits fast.
-            pgid=proc.pid,
-            pid_starttime=read_proc_starttime(proc.pid),
-            started_at=pending.started_at,
-            launch_state="spawned",
-            allow_cancel=pending.allow_cancel,
-            visible_params_at_launch=pending.visible_params_at_launch,
-            boot_id=read_boot_id(),
-        )
+            cleanup_confirmed = self._terminate_failed_spawn(cleanup_handle, exc)
+            raise _SpawnBookkeepingError(
+                exc,
+                cleanup_confirmed=cleanup_confirmed,
+            ) from exc
+        assert handle is not None
         return handle
 
     def _neutral_spawn_cwd(self) -> Path:

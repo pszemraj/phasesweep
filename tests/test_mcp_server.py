@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import logging
@@ -11,7 +12,7 @@ import os
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.mcp.server as mcp_server
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     ExecutionContext,
@@ -766,6 +768,147 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert app.status(run_id=handle.run_id)["run"]["failure"] == failure
 
 
+def test_launch_terminates_real_runner_when_log_context_exit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child created before log close fails is owned and terminated."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    real_popen = subprocess.Popen
+    real_open_private_text = mcp_server.open_private_text
+    spawned: list[subprocess.Popen[Any]] = []
+
+    @contextlib.contextmanager
+    def fail_log_close(path: Path, mode: str) -> Iterator[Any]:
+        with real_open_private_text(path, mode) as handle:
+            yield handle
+        if path.suffix == ".log":
+            raise OSError("injected log context exit failure")
+
+    def sleeping_popen(_cmd: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            **kwargs,
+        )
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(mcp_server, "open_private_text", fail_log_close)
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", sleeping_popen)
+    try:
+        with pytest.raises(OSError, match="log context exit"):
+            app.launch("srv")
+        assert len(spawned) == 1
+        spawned[0].wait(timeout=5)
+
+        (pending,) = store.list_handles()
+        terminal = store.recorded_terminal_status(pending)
+        assert terminal is not None
+        assert terminal["cleanup_confirmed"] is True
+        assert terminal["error_class"] == "OSError"
+        assert store.state(pending) == "failed"
+        assert not store.recovery_required(pending)
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("failing_reader", "cleanup_confirmed", "expected_state"),
+    [
+        ("starttime", True, "failed"),
+        ("boot_id", True, "failed"),
+        ("starttime", False, "running"),
+    ],
+)
+def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_reader: str,
+    cleanup_confirmed: bool,
+    expected_state: str,
+) -> None:
+    """A fallible identity read cannot turn a created child into a pre-spawn failure."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fail_identity_read(*_args: object) -> None:
+        raise OSError(f"injected {failing_reader} read failure")
+
+    def fake_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, saved_starttime, pgid))
+        return cleanup_confirmed
+
+    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+    monkeypatch.setattr(
+        mcp_server,
+        "read_proc_starttime" if failing_reader == "starttime" else "read_boot_id",
+        fail_identity_read,
+    )
+
+    with pytest.raises(OSError, match=failing_reader):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["cleanup_confirmed"] is cleanup_confirmed
+    assert store.state(pending) == expected_state
+    assert store.recovery_required(pending) is (not cleanup_confirmed)
+    assert cleanup_calls
+    if failing_reader == "starttime":
+        assert cleanup_calls[0][1] is None
+    else:
+        assert cleanup_calls[0][1] is not None
+
+
+def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KeyboardInterrupt after Popen is cleanup work, not a pre-spawn failure."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def interrupt_boot_id() -> None:
+        raise KeyboardInterrupt
+
+    def fake_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, saved_starttime, pgid))
+        return True
+
+    monkeypatch.setattr(mcp_server, "read_boot_id", interrupt_boot_id)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["error_class"] == "KeyboardInterrupt"
+    assert store.state(pending) == "failed"
+    assert cleanup_calls and cleanup_calls[0][1] is not None
+
+
 def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -> None:
     config = _config(tmp_path)
     _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
@@ -882,6 +1025,43 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     assert store.state(pending) == "failed"
 
 
+def test_launch_interrupt_during_handle_update_terminates_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown interrupt cannot escape after spawn but before durable identity."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    terminated: list[tuple[int | None, int | None, int | None]] = []
+
+    def interrupt_update(_handle: RunHandle) -> None:
+        raise KeyboardInterrupt
+
+    def fake_cleanup(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        terminated.append((pid, saved_starttime, pgid))
+        return True
+
+    monkeypatch.setattr(store, "update", interrupt_update)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["error_class"] == "KeyboardInterrupt"
+    assert store.state(pending) == "failed"
+    assert terminated and terminated[0][1] is not None
+
+
 def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -911,6 +1091,37 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     assert "failed to persist cleanup uncertainty marker" in caplog.text
     assert "original error" in caplog.text
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
+
+
+def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed process death is not enough when its uncertainty marker cannot clear."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+
+    def fail_update(_handle: RunHandle) -> None:
+        raise OSError("runs directory is not writable")
+
+    def fail_clear(_handle: RunHandle) -> None:
+        raise OSError("cleanup marker cannot be removed")
+
+    monkeypatch.setattr(store, "update", fail_update)
+    monkeypatch.setattr(store, "clear_cleanup_uncertain", fail_clear)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *args, **kwargs: True)
+
+    with pytest.raises(OSError, match="runs directory"):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["cleanup_confirmed"] is False
+    assert store.cleanup_uncertain(pending)
+    assert store.state(pending) == "running"
+    assert store.recovery_required(pending)
 
 
 def _launch_with_poison_project(
