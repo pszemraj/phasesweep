@@ -57,6 +57,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
     overrides_sha256 = hashlib.sha256(overrides_path.read_bytes()).hexdigest()
     monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", overrides_sha256)
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
     assert (
         wrapper.main(
@@ -94,28 +95,19 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
 
 
-def test_wrapper_never_publishes_a_truncated_result(tmp_path, monkeypatch) -> None:
-    """A write interrupted before the rename must not leave a partial result.json.
-
-    The phase timeout/cancel path SIGKILLs trainers, so a non-atomic write can
-    leave truncated bytes that the extractor misreports as a parse error.
-    """
+def test_wrapper_rejects_an_overrides_file_from_another_attempt(tmp_path, monkeypatch) -> None:
     wrapper = _load_wrapper()
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
 
-    def fail_fsync(_fd: int) -> None:
-        raise OSError("interrupted before the rename")
-
-    monkeypatch.setattr(wrapper.os, "fsync", fail_fsync)
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
-    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "abc123")
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "expected")
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
-    with pytest.raises(OSError, match="interrupted before the rename"):
+    with pytest.raises(ValueError, match="Resolved overrides do not match"):
         wrapper._write_result(
-            trial_dir,
-            "abc123",
+            "different",
             {
                 "checkpoint": "final.pt",
                 "device_type": "cuda",
@@ -126,7 +118,6 @@ def test_wrapper_never_publishes_a_truncated_result(tmp_path, monkeypatch) -> No
         )
 
     assert not (trial_dir / "result.json").exists()
-    assert list(trial_dir.glob(".result.json.*.tmp")) == []
 
 
 def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:

@@ -15,7 +15,7 @@ experiment: phasesweep_starter
 
 # The trainer is any command. This fake one ships inside the installed
 # package so the starter runs anywhere; replace it with your own later.
-trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
+trial_command: "python -m phasesweep.examples.fake_train {overrides}"
 override_format: argparse
 
 metric:
@@ -37,7 +37,7 @@ phases:
       lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-In this starter, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the packaged fake trainer, and reads its objective from `result.json`. Other trainers can supply objective evidence through JSON envelopes, log extraction, or W&B; see the [trainer contract](docs/config.md#trainer-contract).
+In this starter, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the packaged fake trainer, and reads its objective from `result.json`. The trainer calls `report_objective(...)`, which fills in the current attempt identity and atomically writes to the path configured by the JSON-envelope extractor. Other trainers can publish the envelope directly, use log extraction, or use W&B; see the [trainer contract](docs/config.md#trainer-contract).
 
 ## Install and try it
 

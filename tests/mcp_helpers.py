@@ -124,7 +124,7 @@ experiment: {name}
 storage: sqlite:///{tmp_path}/{name}.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
-trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
+trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
 override_format: argparse
 metric:
   name: eval_loss

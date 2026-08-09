@@ -18,6 +18,8 @@ from typing import Any
 
 import yaml
 
+from phasesweep import report_objective
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "upstream"
 
@@ -159,30 +161,7 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
     }
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically publish one JSON artifact in its destination directory.
-
-    Deliberately stdlib-only. The envelope is a contract about the *bytes* a
-    trainer writes, so any trainer in any language can satisfy it; importing a
-    phasesweep helper here would make this example a worse template than the
-    contract it demonstrates. A trainer killed mid-write must leave either the
-    previous bytes or nothing at all, never a truncated envelope that the
-    extractor would report as a parse error.
-    """
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _write_result(
-    trial_dir: Path,
     overrides_sha256: str,
     metric_record: Mapping[str, Any],
 ) -> None:
@@ -206,33 +185,19 @@ def _write_result(
     if not isinstance(device_type, str) or not device_type:
         raise ValueError(f"Final evaluation is missing its device type: {metric_record!r}")
 
-    generation_id = os.environ.get("PHASESWEEP_GENERATION_ID")
-    attempt_id = os.environ.get("PHASESWEEP_ATTEMPT_ID")
     expected_overrides_sha256 = os.environ.get("PHASESWEEP_OVERRIDES_SHA256")
-    if not generation_id or not attempt_id:
-        raise ValueError("PhaseSweep generation and attempt IDs are required for result evidence")
     if not expected_overrides_sha256 or overrides_sha256 != expected_overrides_sha256:
         raise ValueError("Resolved overrides do not match this PhaseSweep attempt")
 
-    result = {
-        "attempt_id": attempt_id,
-        "evaluation": {
-            "checkpoint": "final.pt",
-            "policy": "final_checkpoint",
-            "step": step,
-        },
-        "generation_id": generation_id,
-        "objective": {
-            "name": "val_loss",
-            "split": "validation",
-            "value": float(val_loss),
-        },
-        "overrides_sha256": overrides_sha256,
-        "runtime": {"device_type": device_type},
-        "schema_version": 1,
-        "status": "complete",
-    }
-    _atomic_write_json(trial_dir / "result.json", result)
+    report_objective(
+        float(val_loss),
+        name="val_loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="final.pt",
+        step=step,
+        extra={"runtime": {"device_type": device_type}},
+    )
 
 
 def _run_template(template_root: Path, config_path: Path) -> None:
@@ -288,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _run_template(template_root, generated_config)
     metric_record = _evaluate_final_checkpoint(template_root, trainer_run_dir)
-    _write_result(trial_dir, overrides_sha256, metric_record)
+    _write_result(overrides_sha256, metric_record)
     return 0
 
 

@@ -17,6 +17,7 @@ from phasesweep.engine import (  # noqa: E402
     run_experiment,
     run_suite,
 )
+from phasesweep.reporting import report_objective  # noqa: E402
 
 __all__ = [
     "Experiment",
@@ -30,6 +31,7 @@ __all__ = [
     "config_status",
     "load_config",
     "load_experiment",
+    "report_objective",
     "run_config",
     "run_experiment",
     "run_suite",

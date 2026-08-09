@@ -26,6 +26,7 @@ from phasesweep.evidence.evaluation import (
     evaluate_gates,
     run_extractor,
 )
+from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.files import file_sha256, private_atomic_write_text
 from phasesweep.runtime.process import ProcessResult, run_supervised
@@ -450,6 +451,12 @@ def launch_trial(
     env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
     env["PHASESWEEP_OVERRIDES_SHA256"] = overrides_sha256
     env["WANDB_RUN_ID"] = attempt_id
+    if isinstance(experiment.metric.extractor, JsonEnvelopeExtractor):
+        env["PHASESWEEP_OBJECTIVE_PATH"] = str(workdir / experiment.metric.extractor.path)
+    else:
+        # This is a reserved, extractor-dependent value. Do not let an ambient
+        # variable direct a log- or W&B-backed trial to an unrelated path.
+        env.pop("PHASESWEEP_OBJECTIVE_PATH", None)
 
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)

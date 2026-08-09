@@ -37,6 +37,7 @@ The package is organized by behavior:
 - `phasesweep.config`: Pydantic config models and strict YAML loading.
 - `phasesweep.engine`: Optuna study orchestration, fingerprints, locks, promotion, persistence, status, and suite execution.
 - `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
+- `phasesweep.reporting`: the trainer-side objective-envelope writer.
 - `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
 - `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, and the client-config installer (`phasesweep.mcp.install`).
 - `phasesweep.cli`: Click command surface.

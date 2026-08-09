@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import time
-from pathlib import Path
 from typing import Any
+
+from phasesweep import report_objective
 
 
 def _parse_kv(tokens: list[str]) -> dict[str, Any]:
@@ -40,7 +39,6 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
 def main() -> None:
     """Run the toy trainer end-to-end: parse args, compute metrics, write result.json."""
     p = argparse.ArgumentParser()
-    p.add_argument("--out", required=True)
     p.add_argument("--n_layers", type=int)
     p.add_argument("--lr", type=float)
     p.add_argument("--weight_decay", type=float)
@@ -80,31 +78,23 @@ def main() -> None:
 
     param_bytes = n_layers * 1_100_000
 
-    result = {
-        "schema_version": 1,
-        "status": "complete",
-        "generation_id": os.environ["PHASESWEEP_GENERATION_ID"],
-        "attempt_id": os.environ["PHASESWEEP_ATTEMPT_ID"],
-        "overrides_sha256": os.environ["PHASESWEEP_OVERRIDES_SHA256"],
-        "objective": {
-            "name": "eval_loss",
-            "split": "validation",
-            "value": loss,
+    report_objective(
+        loss,
+        name="eval_loss",
+        split="validation",
+        policy="synthetic",
+        checkpoint="toy_formula",
+        step=100,
+        extra={
+            "param_bytes": param_bytes,
+            "config": {
+                "n_layers": n_layers,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "dropout": dropout,
+            },
         },
-        "evaluation": {
-            "policy": "synthetic",
-            "checkpoint": "toy_formula",
-            "step": 100,
-        },
-        "param_bytes": param_bytes,
-        "config": {
-            "n_layers": n_layers,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "dropout": dropout,
-        },
-    }
-    Path(args.out).write_text(json.dumps(result, indent=2))
+    )
 
     print(f"step=100 eval_loss={loss:.6f}")
     print(f"final param_bytes={param_bytes}")

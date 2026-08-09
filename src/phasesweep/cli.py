@@ -72,6 +72,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
+from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
@@ -316,6 +317,53 @@ def init(output: Path) -> None:
     click.echo(f"  phasesweep validate {config_arg}")
     click.echo(f"  phasesweep run {config_arg} --dry-run")
     click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
+
+
+@cli.command(
+    "report-objective",
+    context_settings=CONTEXT_SETTINGS,
+    help="Publish a JSON-envelope objective from inside a PhaseSweep trial.",
+    short_help="Publish this trial's objective.",
+)
+@click.argument("value", type=float)
+@click.option("--name", required=True, help="Objective name declared by the extractor.")
+@click.option("--split", required=True, help="Evaluated data split.")
+@click.option("--policy", required=True, help="Evaluation policy, such as final_checkpoint.")
+@click.option("--checkpoint", required=True, help="Checkpoint identity for this evaluation.")
+@click.option("--step", required=True, type=click.IntRange(min=0), help="Evaluation step.")
+def report_objective_cmd(
+    value: float,
+    name: str,
+    split: str,
+    policy: str,
+    checkpoint: str,
+    step: int,
+) -> None:
+    """Publish one objective through the trainer-side reporting API.
+
+    :param float value: Finite objective value.
+    :param str name: Configured objective name.
+    :param str split: Evaluated data split.
+    :param str policy: Evaluation policy.
+    :param str checkpoint: Checkpoint identity.
+    :param int step: Non-negative evaluation step.
+    :raises click.BadParameter: If the objective metadata is invalid.
+    :raises click.ClickException: If the PhaseSweep trial environment is absent.
+    """
+    try:
+        destination = report_objective(
+            value,
+            name=name,
+            split=split,
+            policy=policy,
+            checkpoint=checkpoint,
+            step=step,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="objective") from exc
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Wrote objective to {destination}")
 
 
 @cli.command(

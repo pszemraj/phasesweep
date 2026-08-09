@@ -36,6 +36,7 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         assert sum(phase.n_trials for phase in experiment.phases) == 4
         assert experiment.phases[1].inherits == ["depth"]
         assert "phasesweep.examples.fake_train" in experiment.trial_command
+        assert "--out" not in experiment.trial_command
 
         validated = runner.invoke(cli_main, ["validate", "experiment.yaml"])
         assert validated.exit_code == 0, validated.output

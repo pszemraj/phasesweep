@@ -295,7 +295,7 @@ experiment: parallel_test
 storage: journal:///{journal_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} {{overrides}}"
 metric:
   name: eval_loss
   goal: minimize

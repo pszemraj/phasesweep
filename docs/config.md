@@ -92,12 +92,12 @@ Each format has a required template placeholder and distinct value encoding. The
 The command in `trial_command` is the training or evaluation program for one trial. PhaseSweep creates the trial directory, renders overrides, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Parse the selected [override format](#override-formats).
-- Provide a finite objective through the configured extractor: write JSON or log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
+- Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
 - Exit nonzero when the trial failed and should be recorded as failed.
 - When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
-- For a `json_envelope` extractor, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into the result envelope. PhaseSweep verifies all three before accepting its objective.
+- When writing a `json_envelope` directly, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into it. `report_objective(...)` fills these fields automatically. PhaseSweep verifies all three before accepting the objective.
 
-The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is set to the attempt ID so W&B lookup uses an immutable identity. GPU leasing may override CUDA visibility; the [GPU runtime contract](runtime.md#concurrency-model) defines discovery, disable sentinels, locking, and narrowed-environment behavior.
+The trial environment starts with the ambient variables selected by `execution.inherit_env`, then top-level `env` overrides them. Every trial then receives `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256`, overriding same-named values. A `json_envelope` trial additionally receives `PHASESWEEP_OBJECTIVE_PATH`, the absolute destination resolved from its configured trial-relative `path`; other extractor types remove any ambient value with that name. The digest covers the exact PhaseSweep-written overrides artifact used by the current override format. `WANDB_RUN_ID` is set to the attempt ID so W&B lookup uses an immutable identity. GPU leasing may override CUDA visibility; the [GPU runtime contract](runtime.md#concurrency-model) defines discovery, disable sentinels, locking, and narrowed-environment behavior.
 
 Metric extractor failures, non-finite metrics, nonzero exits, and missing objective or constraint evidence fail the trial. Gate failures follow the separate [evidence gate](#evidence-gates) policy. Constraint bound violations are different: they produce completed but infeasible trials. PhaseSweep records their raw objective values and constraint readings, but feasibility is applied during winner selection rather than sampler guidance. Winner selection takes the best-metric feasible completed trial; ordering is exact, and only metric values exactly equal to the best value resolve to the lowest trial number. PhaseSweep applies no tolerance band, because it cannot know your objective's meaningful resolution - an absolute epsilon would reorder objectives whose natural scale sits below it. When a swept key has no measurable effect, trials that land on the same value therefore resolve to the lowest-numbered one's choice, which is not evidence of a preference; if your objective is noisy, treat near-equal winners as a tie yourself rather than expecting the selector to.
 
@@ -125,7 +125,34 @@ A `json_envelope` trainer publishes this versioned shape after successful evalua
 }
 ```
 
-Copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values listed in the [config reference](config_reference.yaml). The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+Direct envelope writers copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values listed in the [config reference](config_reference.yaml). The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+
+Python trainers can publish that envelope without reconstructing its managed fields or destination:
+
+```python
+from phasesweep import report_objective
+
+report_objective(
+    value=eval_loss,
+    name="eval_loss",
+    split="validation",
+    policy="best_checkpoint",
+    checkpoint=best_checkpoint,
+    step=best_step,
+)
+```
+
+The helper reads `PHASESWEEP_OBJECTIVE_PATH` and the three attempt-identity variables, then atomically replaces the configured file. Use `extra={"param_bytes": parameter_bytes}` to add top-level values consumed by constraint extractors or evidence gates. Non-Python trainers can write the same envelope directly.
+
+Shell-based trainers can invoke the same writer without importing Python code:
+
+```bash
+phasesweep report-objective 0.123 \
+  --name val_loss --split validation --policy final_checkpoint \
+  --checkpoint final.pt --step 1000
+```
+
+PhaseSweep does not infer what "best" or "final" means inside a trainer. `best_checkpoint` should report the metric and checkpoint selected by the trainer's declared selection rule. `final_checkpoint` should report an evaluation of the final checkpoint, not merely the last periodic metric that happened to be logged. Log-regex `min`/`max` selects the best matching observation without proving that its weights were saved; `last` selects the last matching line. The W&B extractor reads one terminal summary key and does not scan history, so that key must already contain the intended best or final value.
 
 ## Override order
 

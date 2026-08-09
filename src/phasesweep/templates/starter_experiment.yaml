@@ -8,7 +8,7 @@ workdir: __PHASESWEEP_WORKDIR__
 
 # This trainer ships inside the installed PhaseSweep package. Replace it with
 # your own command after the local smoke test.
-trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
+trial_command: "python -m phasesweep.examples.fake_train {overrides}"
 override_format: argparse
 
 metric:

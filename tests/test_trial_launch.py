@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from phasesweep.config import ExecutionContext
+from phasesweep.config import ExecutionContext, JsonEnvelopeExtractor, Metric
 from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
 from phasesweep.runtime.process import ProcessResult
 from tests.conftest import make_experiment
@@ -24,6 +24,7 @@ def _capture_launch_env(
     *,
     experiment_env: dict[str, str] | None = None,
     execution: ExecutionContext | None = None,
+    metric: Metric | None = None,
     gpu_id: int | str | None = 2,
     gpu_lease_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
@@ -55,7 +56,7 @@ def _capture_launch_env(
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
     launch_trial(
-        experiment=make_experiment(env=experiment_env, execution=execution),
+        experiment=make_experiment(env=experiment_env, execution=execution, metric=metric),
         phase_name="p",
         trial_id=0,
         generation_id="generation-test",
@@ -77,6 +78,39 @@ def test_launch_trial_forwards_gpu_lease_fds(
     env = _capture_launch_env(tmp_path, monkeypatch, gpu_lease_fds=(17, 23))
 
     assert env["gpu_lease_fds"] == (17, 23)
+
+
+def test_launch_trial_injects_configured_objective_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metric = Metric(
+        name="eval_loss",
+        extractor=JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="reports/objective.json",
+            objective_name="eval_loss",
+            split="validation",
+            policy="final_checkpoint",
+        ),
+    )
+
+    env = _capture_launch_env(tmp_path, monkeypatch, metric=metric)
+
+    assert env["PHASESWEEP_OBJECTIVE_PATH"] == str(
+        tmp_path / "trial_0" / "reports" / "objective.json"
+    )
+
+
+def test_launch_trial_drops_ambient_objective_path_for_non_envelope_extractor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/not-this-trial.json")
+
+    env = _capture_launch_env(tmp_path, monkeypatch)
+
+    assert "PHASESWEEP_OBJECTIVE_PATH" not in env
 
 
 @pytest.mark.parametrize(
