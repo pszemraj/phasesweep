@@ -1810,18 +1810,32 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.storage is not None and not storage_is_in_memory(experiment.storage)
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 1
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 2
+
+
+def _artifact_root_storage_key(experiment: Experiment) -> str:
+    """Return an opaque comparison key for one persistent storage ledger.
+
+    The canonical identity may contain operational query values, including a
+    nested connection string. The artifact tree is intentionally shareable,
+    so it stores only this digest while private recovery state retains the
+    operational URL.
+
+    :param Experiment experiment: Experiment whose persistent ledger is identified.
+    :return str: Full SHA-256 hex digest of the canonical storage identity.
+    """
+    storage_identity = canonical_storage_identity(experiment.storage)
+    assert storage_identity is not None
+    return hashlib.sha256(storage_identity.encode("utf-8")).hexdigest()
 
 
 def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
     """Build the reverse ownership record for one persistent artifact root."""
-    storage_identity = canonical_storage_identity(experiment.storage)
-    assert storage_identity is not None
     return {
         "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         "artifact_root": _artifact_root_identity(experiment),
-        "storage_identity": storage_identity,
+        "storage_key": _artifact_root_storage_key(experiment),
     }
 
 
@@ -1890,8 +1904,7 @@ def _validate_artifact_root_binding(
     if raw != expected:
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-            f"ledger or experiment ({raw!r}); this config offers storage identity "
-            f"{expected['storage_identity']!r} for experiment {experiment.experiment!r}. "
+            f"ledger or experiment than {experiment.experiment!r}. "
             "Use the config that owns this tree, or move the complete tree and run "
             "'phasesweep rebind-workdir <config>'. No trial ran and nothing was published."
         )
@@ -2496,13 +2509,13 @@ def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) ->
         not isinstance(raw, dict)
         or raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
         or raw.get("experiment") != expected["experiment"]
-        or raw.get("storage_identity") != expected["storage_identity"]
+        or raw.get("storage_key") != expected["storage_key"]
         or not isinstance(recorded_root, str)
         or not Path(recorded_root).is_absolute()
     ):
         raise ArtifactRootRebindError(
             f"Artifact root {plan.destination!r} records ownership by another storage "
-            f"ledger, experiment, or source tree ({raw!r}). Refusing to rebind the "
+            "ledger, experiment, or source tree. Refusing to rebind the "
             "current studies onto it. Nothing was written."
         )
 

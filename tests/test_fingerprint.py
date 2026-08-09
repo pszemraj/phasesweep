@@ -33,6 +33,7 @@ from phasesweep.config import (
 )
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    ArtifactRootRebindError,
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     SamplerContinuationUnsupportedError,
@@ -45,8 +46,11 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.guards import (
     FINGERPRINT_SCHEMA_VERSION,
+    _ArtifactRootRebindPlan,
     _phase_fingerprint,
     _register_active_attempt,
+    _validate_artifact_root_binding,
+    _validate_artifact_root_binding_for_rebind,
 )
 from phasesweep.engine.optuna import _sqlite_study_exists
 from phasesweep.engine.run import _reject_bound_descendant_topups
@@ -1175,7 +1179,9 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     generation_dir = _experiment_dir(owner) / "generations"
     generations_before = {path.name for path in generation_dir.iterdir()}
     binding = json.loads(_artifact_root_binding_path(owner).read_text())
-    assert "owner.db" in binding["storage_identity"]
+    assert set(binding) == {"schema_version", "experiment", "artifact_root", "storage_key"}
+    assert len(binding["storage_key"]) == 64
+    assert all(character in "0123456789abcdef" for character in binding["storage_key"])
 
     foreign = _experiment("foreign.db")
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1195,6 +1201,74 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     owner_status = read_status(owner)
     assert owner_status["publication_integrity"] == "ok"
     assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
+
+
+@pytest.mark.parametrize(
+    ("owner_storage", "offered_storage", "secrets"),
+    [
+        (
+            "postgresql://user@host/db?password=FIRSTSECRET",
+            "postgresql://user@host/db?password=SECONDSECRET",
+            ("FIRSTSECRET", "SECONDSECRET"),
+        ),
+        (
+            "postgresql://user@host/db?access_token=FIRST-TOKEN",
+            "postgresql://user@host/db?access_token=SECOND-TOKEN",
+            ("FIRST-TOKEN", "SECOND-TOKEN"),
+        ),
+        (
+            "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DFIRST-PWD%3BUID%3Duser",
+            "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DSECOND-PWD%3BUID%3Duser",
+            ("FIRST-PWD", "SECOND-PWD"),
+        ),
+    ],
+    ids=["password", "access-token", "nested-odbc-connect"],
+)
+def test_artifact_root_binding_and_conflicts_never_expose_rdb_query_credentials(
+    tmp_path: Path,
+    owner_storage: str,
+    offered_storage: str,
+    secrets: tuple[str, str],
+) -> None:
+    """Shareable ownership records and diagnostics contain no operational URL values."""
+
+    def external_experiment(storage: str) -> Experiment:
+        placeholder = make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / 'placeholder.db'}",
+        )
+        return placeholder.model_copy(
+            update={
+                "storage": storage,
+                "allow_external_rdb_single_host": True,
+            }
+        )
+
+    owner = external_experiment(owner_storage)
+    offered = external_experiment(offered_storage)
+    _validate_artifact_root_binding(owner, claim_fresh=True)
+
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in _experiment_dir(owner).rglob("*")
+        if path.is_file()
+    )
+    for secret in secrets:
+        assert secret not in artifact_text
+
+    with pytest.raises(ArtifactRootConflictError) as conflict_info:
+        _validate_artifact_root_binding(offered, claim_fresh=False)
+    with pytest.raises(ArtifactRootRebindError) as rebind_info:
+        _validate_artifact_root_binding_for_rebind(
+            _ArtifactRootRebindPlan(
+                experiment=offered,
+                destination=str(_experiment_dir(offered).resolve()),
+                entries=(),
+            )
+        )
+    messages = f"{conflict_info.value}\n{rebind_info.value}"
+    for secret in secrets:
+        assert secret not in messages
 
 
 def test_relative_storage_identity_is_bound_to_the_invocation_cwd(

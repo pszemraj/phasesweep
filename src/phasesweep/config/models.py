@@ -839,8 +839,8 @@ def _validate_storage_policy(
     backend = storage_backend(storage)
     if phase.n_jobs > 1 and backend == "sqlite":
         raise ValueError(
-            f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage "
-            f"({storage!r}). SQLite serializes writers and will deadlock under "
+            f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage. "
+            "SQLite serializes writers and will deadlock under "
             "parallel Optuna access. Use storage: journal:///path.journal for a "
             "single-host parallel sweep, or an RDB URL such as "
             "postgresql://... for durable storage and dashboard access from a "
@@ -852,7 +852,7 @@ def _validate_storage_policy(
         and not allow_external_rdb_single_host
     ):
         raise ValueError(
-            f"storage {storage!r} resolves to backend {backend!r}, a shared "
+            f"The configured storage resolves to backend {backend!r}, a shared "
             "relational store. PhaseSweep's coordination (locks, generation "
             "pointers) is host-local-filesystem based, so pointing multiple "
             f"hosts at one shared {backend} storage silently breaks those safety "
@@ -902,7 +902,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
     if sampler.type in STOCHASTIC_SAMPLERS and sampler.seed is None:
         raise ValueError(
             f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
-            f"({storage!r}) requires an explicit sampler.seed. A durable study outlives the "
+            "requires an explicit sampler.seed. A durable study outlives the "
             "process that created it, so an unseeded stochastic sampler leaves trials nobody "
             "can reproduce or explain. Add an integer 'seed' to this phase's sampler block, "
             "or use sampler.type: grid to enumerate a fixed matrix."
@@ -910,7 +910,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
     if sampler.type in NON_RESUMABLE_SAMPLERS and not sampler.acknowledge_nonresumable:
         raise ValueError(
             f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
-            f"({storage!r}) requires sampler.acknowledge_nonresumable: true. This sampler's "
+            "requires sampler.acknowledge_nonresumable: true. This sampler's "
             "suggestions depend on process-local state Optuna storage does not persist, so "
             "PhaseSweep refuses to resume the phase mid-target: an interrupted run cannot be "
             "continued and n_trials cannot be raised later — each target must run in one "

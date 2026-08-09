@@ -188,6 +188,51 @@ def test_external_rdb_storage_error_is_actionable() -> None:
     assert "single host" in message
 
 
+@pytest.mark.parametrize(
+    ("storage", "secret"),
+    [
+        ("postgresql://user@host/db?password=TOPSECRET", "TOPSECRET"),
+        ("postgresql://user@host/db?access_token=TOKEN-SECRET", "TOKEN-SECRET"),
+        (
+            "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DSUPERSECRET%3BUID%3Duser",
+            "SUPERSECRET",
+        ),
+    ],
+    ids=["password", "access-token", "nested-odbc-connect"],
+)
+def test_rdb_query_credentials_never_appear_in_config_validation_errors(
+    storage: str,
+    secret: str,
+) -> None:
+    """Validation names the backend and required action without echoing its URL."""
+    phase = Phase(  # type: ignore[arg-type]
+        name="p",
+        n_trials=1,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+    common = {
+        "experiment": "credential-redaction",
+        "storage": storage,
+        "provenance": {"revision": "test-fixture-v1"},
+        "trial_command": "echo {overrides}",
+        "metric": Metric(
+            extractor=LogRegexExtractor(
+                type="log_regex",
+                pattern=r"x=(?P<value>[0-9.eE+-]+)",
+            )
+        ),
+        "phases": [phase],
+    }
+
+    with pytest.raises(ValueError) as policy_info:
+        Experiment(**common)
+    with pytest.raises(ValueError) as sampler_info:
+        Experiment(**common, allow_external_rdb_single_host=True)
+
+    assert secret not in str(policy_info.value)
+    assert secret not in str(sampler_info.value)
+
+
 def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
     """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
     study's Experiment exactly like ``storage`` and other defaulted fields
