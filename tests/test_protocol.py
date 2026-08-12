@@ -25,9 +25,16 @@ from phasesweep.config import (
     Sha256Gate,
     Suite,
 )
-from phasesweep.engine import read_status, read_winner, run_experiment
+from phasesweep.engine import (
+    PhaseSweepError,
+    PromotionError,
+    RunRequestError,
+    read_status,
+    read_winner,
+    run_experiment,
+)
 from phasesweep.engine.run import ExperimentRunOutcome
-from phasesweep.engine.selection import _apply_promotion
+from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
@@ -273,6 +280,27 @@ def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     assert winners["candidate"].gates[0]["passed"] is False
 
 
+def test_phase_promotion_stop_is_an_expected_operational_failure(tmp_path: Path) -> None:
+    """A configured phase stop is a normal failed run, not an internal bug."""
+    trainer = _write_score_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(name="baseline", n_trials=1, fixed_overrides={"score": 1.0}),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 2.0},
+                promotion={"min_delta_vs": "baseline", "min_delta": 0.5, "on_fail": "stop"},
+            ),
+        ],
+    )
+
+    with pytest.raises(PromotionError, match="Phase 'candidate' failed promotion"):
+        run_experiment(experiment)
+
+
 def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
     p = write_yaml(
         tmp_path,
@@ -322,8 +350,55 @@ def test_phase_promotion_runtime_reports_unknown_baseline(tmp_path: Path) -> Non
     with pytest.raises(
         RuntimeError,
         match=r"unknown min_delta_vs baseline 'missing'.*available prior phase winners: none",
-    ):
+    ) as exc_info:
         _apply_promotion(experiment, phase, candidate, {})
+    assert not isinstance(exc_info.value, PhaseSweepError)
+
+
+def test_suite_promotion_stop_is_an_expected_operational_failure(tmp_path: Path) -> None:
+    """A configured suite stop is a normal failed run, not an internal bug."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: stop_suite
+            defaults:
+              trial_command: "echo {overrides}"
+              metric:
+                extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
+            studies:
+              - name: baseline
+                phases:
+                  - {name: eval, n_trials: 1}
+              - name: candidate
+                promotion: {min_delta_vs: baseline, min_delta: 0.5, on_fail: stop}
+                phases:
+                  - {name: eval, n_trials: 1}
+            """,
+        )
+    )
+    assert isinstance(config, Suite)
+    baseline = Winner(trial_number=0, params={}, effective_overrides={}, metric=1.0)
+    candidate = Winner(trial_number=1, params={}, effective_overrides={}, metric=0.75)
+    candidate_spec = config.studies[1]
+
+    with pytest.raises(PromotionError, match="unknown baseline study 'baseline'"):
+        _apply_study_promotion(
+            suite=config,
+            study_name=candidate_spec.name,
+            experiment=config.experiment_for_study(candidate_spec),
+            study_winners={"eval": candidate},
+            prior_results={},
+        )
+
+    with pytest.raises(PromotionError, match="failed promotion against 'baseline.eval'"):
+        _apply_study_promotion(
+            suite=config,
+            study_name=candidate_spec.name,
+            experiment=config.experiment_for_study(candidate_spec),
+            study_winners={"eval": candidate},
+            prior_results={"baseline": {"eval": baseline}},
+        )
 
 
 def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
@@ -423,6 +498,45 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         generation_id=second_decision["candidate_generation_id"],
         attempt_id=second_decision["candidate_attempt_id"],
     ).is_dir()
+
+
+def test_suite_dependency_on_skipped_promotion_is_an_expected_failure(tmp_path: Path) -> None:
+    """A downstream dependency omitted by ``on_fail: skip`` is a policy outcome."""
+    trainer = _write_score_trainer(tmp_path)
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            f"""
+            suite: skipped_dependency
+            defaults:
+              workdir: {tmp_path}/runs
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)'}}
+            studies:
+              - name: baseline
+                phases:
+                  - name: eval
+                    n_trials: 1
+                    fixed_overrides: {{score: 1.0}}
+              - name: candidate
+                promotion: {{min_delta_vs: baseline, min_delta: 0.5, on_fail: skip}}
+                phases:
+                  - name: eval
+                    n_trials: 1
+                    fixed_overrides: {{score: 2.0}}
+              - name: downstream
+                depends_on: [candidate]
+                phases:
+                  - {{name: eval, n_trials: 1}}
+            """,
+        )
+    )
+
+    with pytest.raises(PromotionError, match="dependency 'candidate' did not complete"):
+        run_config(config)
 
 
 def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path) -> None:
@@ -533,6 +647,8 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
 
     config = load_config(p)
     assert isinstance(config, Suite)
+    with pytest.raises(RunRequestError, match="only supported for single experiment configs"):
+        run_config(config, from_phase="p", dry_run=True)
     winners = run_config(config, dry_run=True)
 
     assert "ablation_a" in winners

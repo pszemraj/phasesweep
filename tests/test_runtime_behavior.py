@@ -28,7 +28,9 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import (
+    PhaseSweepError,
     ProcessCleanupUncertainError,
+    StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TerminalReport,
     read_status,
@@ -65,7 +67,9 @@ from phasesweep.engine.trial import (
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
     ProcessResult,
+    ShutdownCleanupReport,
     SignalOwnershipUnavailableError,
     install_signal_handlers,
     signal_handler_scope,
@@ -727,8 +731,9 @@ def test_runtime_rejects_unexplained_trial_budget_shortfall(
     exp = _sleeping_score_experiment(tmp_path, experiment="budget_shortfall", n_trials=1)
     monkeypatch.setattr(optuna.Study, "optimize", lambda self, objective, **kwargs: None)
 
-    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials"):
+    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials") as exc_info:
         run_experiment(exp)
+    assert not isinstance(exc_info.value, PhaseSweepError)
 
 
 def test_runtime_platform_guard_feature_checks_and_dry_run(
@@ -865,6 +870,47 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
+
+
+def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Contradictory durable abort/trial counts are operator-visible study state."""
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    storage = f"sqlite:///{tmp_path / 'abort.db'}"
+
+    def experiment(n_trials: int) -> Experiment:
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=storage,
+            trial_command=f"python {trainer} {{overrides}}",
+            n_trials=n_trials,
+            max_consecutive_failures=2,
+            sampler={"type": "random", "seed": 7},
+        )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(experiment(3))
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    for sequence in (3, 4):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={
+                    TRIAL_OUTCOME_ATTR: {
+                        "schema_version": 1,
+                        "sequence": sequence,
+                        "outcome": "failure",
+                        "cause": "simulated external terminal row",
+                    }
+                },
+            )
+        )
+    study.set_user_attr(TRIAL_TARGET_ATTR, 4)
+
+    with pytest.raises(StudySchemaMismatchError, match="no remaining trial slots"):
+        run_experiment(experiment(4))
 
 
 def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
@@ -1740,9 +1786,25 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
                 max_consecutive_failures=1,
                 timeout_seconds_per_phase=600.0,
                 allow_incomplete_on_timeout=True,
+                gpu_policy="none",
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(
+                    type="tpe",
+                    seed=7,
+                    n_startup_trials=10,
+                    acknowledge_nonresumable=True,
+                ),
+                search_space={"x": IntParam(type="int", low=1, high=3)},
+            ),
+            Phase(
+                name="child",
+                inherits=["p"],
+                n_trials=1,
+                gpu_policy="none",
+                allow_no_gpu_isolation=True,
                 sampler=Sampler(type="random", seed=7),
                 search_space={},
-            )
+            ),
         ],
     )
 
@@ -1792,7 +1854,6 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     )
     assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
     trial_count = len(study.trials)
-    launch_count = len(launched_trials)
 
     winners = run_experiment(exp)
 
@@ -1801,7 +1862,6 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
         storage=exp.storage,
     )
     assert len(study.trials) == trial_count
-    assert len(launched_trials) == launch_count
 
     assert winners["p"].trial_number == 0
     completion = winners["p"].completion
@@ -1811,6 +1871,143 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
+
+    # The child study now binds the parent's published winner. A third
+    # identical run must still replay both studies without treating the
+    # parent's accepted partial target as a top-up, and without asking TPE to
+    # reconstruct continuation state for suggestions that will never launch.
+    launch_count = len(launched_trials)
+    replayed = run_experiment(exp)
+    assert replayed["p"].trial_number == winners["p"].trial_number
+    assert replayed["child"].trial_number == winners["child"].trial_number
+    assert len(launched_trials) == launch_count
+
+
+def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raising the timeout must remain a valid retry after timeout wins a race."""
+    import types
+
+    import phasesweep.engine.phase as phase_mod
+
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os, sys
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({"x": 1.0}, f)
+            print("x=1.0")
+        else:
+            sys.exit(1)
+        """,
+    )
+    exp = Experiment(
+        experiment="refused_partial_timeout_abort",
+        workdir=str(tmp_path / "runs"),
+        storage=f"sqlite:///{tmp_path / 'refused.db'}",
+        provenance={"revision": "test-fixture-v1"},
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                max_consecutive_failures=1,
+                timeout_seconds_per_phase=600.0,
+                gpu_policy="none",
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(type="random", seed=7),
+                search_space={},
+            )
+        ],
+    )
+
+    offset = {"seconds": 0.0}
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        phase_mod,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: real_monotonic() + offset["seconds"]),
+    )
+    real_launch_trial = phase_mod.launch_trial
+
+    def launch_and_expire(**kwargs: object) -> object:
+        executed = real_launch_trial(**kwargs)
+        if kwargs["trial_id"] == 1:
+            offset["seconds"] = 10_000.0
+        return executed
+
+    monkeypatch.setattr(phase_mod, "launch_trial", launch_and_expire)
+    with pytest.raises(TimeoutError, match="Refusing to select a winner"):
+        run_experiment(exp)
+
+    study = optuna.load_study(
+        study_name="refused_partial_timeout_abort::p",
+        storage=exp.storage,
+    )
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).consecutive_failures == 0
+
+    # The operator's documented remedy is now viable: with a fresh/larger
+    # budget, the remaining attempt can run instead of the stale failure abort
+    # rejecting the invocation during phase startup.
+    offset["seconds"] = 0.0
+    write_constant_trainer(tmp_path)
+    monkeypatch.setattr(phase_mod, "launch_trial", real_launch_trial)
+    winners = run_experiment(exp)
+    assert winners["p"].metric == pytest.approx(0.5)
+
+
+def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An orchestrator signal is cancellation, not an objective implementation bug."""
+    import phasesweep.engine.phase as phase_mod
+
+    trainer = write_constant_trainer(tmp_path)
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'shutdown.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=2,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        max_consecutive_failures=1,
+        sampler={"type": "random", "seed": 7},
+    )
+    real_launch_trial = phase_mod.launch_trial
+    interrupted = {"once": False}
+
+    def interrupt_first_launch(**kwargs: object) -> object:
+        if not interrupted["once"]:
+            interrupted["once"] = True
+            report = ShutdownCleanupReport(
+                signum=signal.SIGTERM,
+                cleanup_confirmed=True,
+                child_pgids=(),
+            )
+            raise PhaseSweepShutdown(signal.SIGTERM, report)
+        return real_launch_trial(**kwargs)
+
+    monkeypatch.setattr(phase_mod, "launch_trial", interrupt_first_launch)
+    with pytest.raises(PhaseSweepShutdown):
+        run_experiment(exp)
+
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
+
+    winners = run_experiment(exp)
+    assert winners["p"].metric == pytest.approx(0.5)
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
 
 
 @pytest.mark.parametrize("lease_timeout", [True, False])

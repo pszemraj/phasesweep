@@ -19,7 +19,12 @@ import yaml
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import (
+    PublicationAccessError,
+    PublicationIntegrityError,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
 from phasesweep.runtime.files import (
     atomic_text_writer,
     file_sha256,
@@ -34,8 +39,8 @@ log = logging.getLogger("phasesweep.engine.state")
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
 
-PublicationState = Literal["ok", "absent", "failed"]
-"""Verdict on a last-success pointer: valid, never written, or no longer valid."""
+PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
+"""Verdict on a last-success pointer, including inaccessible validation evidence."""
 
 
 @dataclass(frozen=True)
@@ -57,8 +62,8 @@ def _parse_winner_source(
 
     Shared by :func:`_load_winner` (state.py) and
     :func:`phasesweep.engine.read.read_winner`, which differ only in what they
-    do when this raises: the former re-raises as a strict ``RuntimeError``, the
-    latter treats the winner as absent. Callers must validate ``source_kind``
+    do when this raises: the former wraps it as :class:`WinnerIntegrityError`,
+    while the latter treats the winner as absent. Callers must validate ``source_kind``
     against :data:`WinnerSourceKind` themselves before calling this, since each
     site fails differently on an invalid kind.
 
@@ -712,18 +717,31 @@ def _validate_generation_manifest(
         for error text and to tell a carried-forward winner from a local one;
         ownership is checked by the caller).
     :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :raises RuntimeError: The manifest is missing, malformed, any artifact is
+    :raises PublicationAccessError: An artifact cannot be read by the current user.
+    :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
         absent, altered, unparsable, or inconsistent with the summary, or a
         winner cites a source generation this tree does not hold.
     """
 
-    def _fail(reason: str) -> RuntimeError:
+    def _fail(reason: str) -> PublicationIntegrityError:
         """Build one uniformly labeled manifest-validation error.
 
         :param str reason: Specific validation failure being reported.
-        :return RuntimeError: Error naming the generation and the reason.
+        :return PublicationIntegrityError: Error naming the generation and reason.
         """
-        return RuntimeError(f"Generation {generation_id!r} manifest validation failed: {reason}")
+        return PublicationIntegrityError(
+            f"Generation {generation_id!r} manifest validation failed: {reason}"
+        )
+
+    def _permission_fail(reason: str) -> PublicationAccessError:
+        """Build a permission-specific manifest-validation error.
+
+        :param str reason: Permission failure being reported.
+        :return PublicationAccessError: Error naming the generation and reason.
+        """
+        return PublicationAccessError(
+            f"Generation {generation_id!r} manifest validation could not run: {reason}"
+        )
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
@@ -762,6 +780,7 @@ def _validate_generation_manifest(
         summary,
         listed_files,
         _fail,
+        _permission_fail,
     )
 
     raw_phases = summary.get("phases")
@@ -799,7 +818,7 @@ def _validate_generation_manifest(
         try:
             content = artifact_path.read_bytes()
         except PermissionError as exc:
-            raise _fail(
+            raise _permission_fail(
                 _unreadable_artifact_permission_detail(f"{kind} artifact for phase {name!r}")
             ) from exc
         except OSError as exc:
@@ -847,6 +866,7 @@ def _validate_generation_manifest(
                 source.get("phase"),
                 payload,
                 _fail,
+                _permission_fail,
             )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
@@ -875,7 +895,8 @@ def _validate_winner_source_generation(
     phase_name: str,
     source_phase: object,
     payload: Mapping[str, Any],
-    fail: Callable[[str], RuntimeError],
+    fail: Callable[[str], PublicationIntegrityError],
+    permission_fail: Callable[[str], PublicationAccessError],
 ) -> None:
     """Require a carried-forward winner's source generation to exist in this tree.
 
@@ -907,9 +928,12 @@ def _validate_winner_source_generation(
     :param Mapping[str, Any] payload: Parsed winner artifact, whose
         ``generation_id``/``attempt_id``/``trial_number`` the caller has
         already checked for well-formedness and internal agreement.
-    :param Callable[[str], RuntimeError] fail: Builder for the caller's
+    :param Callable[[str], PublicationIntegrityError] fail: Builder for the caller's
         uniformly labeled manifest-validation error.
-    :raises RuntimeError: Whatever ``fail`` builds, when the cited source
+    :param Callable[[str], PublicationAccessError] permission_fail: Builder for
+        a permission-specific validation error.
+    :raises PublicationAccessError: The source winner cannot be read by the current user.
+    :raises PublicationIntegrityError: Whatever ``fail`` builds, when the cited source
         generation is unsafely named, absent from this tree, or published a
         winner record for this phase that disagrees with the carried winner.
     """
@@ -944,7 +968,7 @@ def _validate_winner_source_generation(
     try:
         content = source_winner_path.read_bytes()
     except PermissionError as exc:
-        raise fail(
+        raise permission_fail(
             _unreadable_artifact_permission_detail(
                 f"source generation {source_generation!r} winner artifact for phase "
                 f"{source_phase!r}"
@@ -985,7 +1009,8 @@ def _validate_generation_provenance_files(
     generation_dir: Path,
     summary: Mapping[str, Any],
     listed_files: Mapping[str, Mapping[str, Any]],
-    fail: Callable[[str], RuntimeError],
+    fail: Callable[[str], PublicationIntegrityError],
+    permission_fail: Callable[[str], PublicationAccessError],
 ) -> None:
     """Validate a generation's claim-time provenance files against its manifest.
 
@@ -1010,9 +1035,12 @@ def _validate_generation_provenance_files(
         identity the reproducibility record must agree with.
     :param Mapping[str, Mapping[str, Any]] listed_files: Manifest entries for
         the namespace-root provenance files, keyed by kind.
-    :param Callable[[str], RuntimeError] fail: Builder for the caller's
+    :param Callable[[str], PublicationIntegrityError] fail: Builder for the caller's
         uniformly labeled manifest-validation error.
-    :raises RuntimeError: Whatever ``fail`` builds, when a provenance file is
+    :param Callable[[str], PublicationAccessError] permission_fail: Builder for
+        a permission-specific validation error.
+    :raises PublicationAccessError: A provenance file cannot be read by the current user.
+    :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
     """
@@ -1029,7 +1057,9 @@ def _validate_generation_provenance_files(
         try:
             content = (generation_dir / filename).read_bytes()
         except PermissionError as exc:
-            raise fail(_unreadable_artifact_permission_detail(f"{kind} artifact")) from exc
+            raise permission_fail(
+                _unreadable_artifact_permission_detail(f"{kind} artifact")
+            ) from exc
         except OSError as exc:
             raise fail(f"{kind} artifact is missing or unreadable") from exc
         digest = hashlib.sha256(content).hexdigest()
@@ -1041,7 +1071,9 @@ def _validate_generation_provenance_files(
     try:
         snapshot = yaml.safe_load(snapshot_path.read_text())
     except PermissionError as exc:
-        raise fail(_unreadable_artifact_permission_detail("config_snapshot artifact")) from exc
+        raise permission_fail(
+            _unreadable_artifact_permission_detail("config_snapshot artifact")
+        ) from exc
     except (OSError, yaml.YAMLError) as exc:
         raise fail("config_snapshot artifact is not parseable") from exc
     if not isinstance(snapshot, Mapping):
@@ -1053,7 +1085,9 @@ def _validate_generation_provenance_files(
     try:
         record = json.loads(record_path.read_text())
     except PermissionError as exc:
-        raise fail(_unreadable_artifact_permission_detail("reproducibility artifact")) from exc
+        raise permission_fail(
+            _unreadable_artifact_permission_detail("reproducibility artifact")
+        ) from exc
     except (OSError, ValueError) as exc:
         raise fail("reproducibility artifact is not parseable") from exc
     if not isinstance(record, Mapping):
@@ -1086,9 +1120,14 @@ def _read_pointer_target(
     :return str | None: A safe-name target id owned by ``owner_name``, or
         ``None`` when the pointer is missing, unreadable, malformed, names
         another owner, or carries an unsafe id.
+    :raises PublicationAccessError: The pointer cannot be read by the current user.
     """
     try:
         payload = yaml.safe_load(pointer_path.read_text())
+    except PermissionError as exc:
+        raise PublicationAccessError(
+            _unreadable_artifact_permission_detail("last-success pointer")
+        ) from exc
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(payload, dict) or payload.get(owner_key) != owner_name:
@@ -1128,9 +1167,14 @@ def _read_pointer_target_summary(
     :param str owner_name: Expected owner name the summary must carry.
     :return dict[str, Any] | None: The parsed summary when readable and
         correctly named; ``None`` otherwise.
+    :raises PublicationAccessError: The summary cannot be read by the current user.
     """
     try:
         summary = yaml.safe_load(summary_path.read_text())
+    except PermissionError as exc:
+        raise PublicationAccessError(
+            _unreadable_artifact_permission_detail("generation summary")
+        ) from exc
     except (OSError, yaml.YAMLError):
         return None
     if (
@@ -1144,14 +1188,14 @@ def _read_pointer_target_summary(
 
 @dataclass(frozen=True)
 class PublicationPointer:
-    """Tri-state resolution of one last-success publication pointer.
+    """Four-state resolution of one last-success publication pointer.
 
     "Nothing was ever published" and "the recorded publication no longer
     validates" are different operational facts with opposite remedies, and
     collapsing both into ``None`` made a corrupt result tree indistinguishable
     from a fresh one (review v0.5.18 / finding F4). The reporting surfaces
     resolve through this type; path-construction helpers keep the boolean
-    :func:`_last_successful_generation_id` view, since both non-``ok`` states
+    :func:`_last_successful_generation_id` view, since all non-``ok`` states
     mean the same thing to them: nothing may be read as published.
 
     ``error`` is deliberately path-free: it names artifacts by role rather than
@@ -1163,10 +1207,10 @@ class PublicationPointer:
     state: PublicationState
     generation_id: str | None
     """Pointer target id: the published generation when ``ok``, the generation
-    whose validation failed when ``failed``, ``None`` when ``absent`` or when
-    the pointer itself is the unreadable part."""
+    whose validation failed when ``failed`` or ``permission_denied``, ``None``
+    when ``absent`` or when the pointer itself is the unreadable part."""
     error: str | None
-    """Validation diagnostic; set if and only if ``state`` is ``failed``."""
+    """Validation diagnostic for ``failed`` and ``permission_denied`` states."""
 
 
 def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
@@ -1179,12 +1223,19 @@ def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPo
     :param Path pointer_path: Last-success pointer whose read just failed.
     :param str owner_label: Human-readable owner for the diagnostic text.
     :return PublicationPointer: ``absent`` when no pointer file exists,
-        ``failed`` when one exists but cannot be resolved.
+        ``permission_denied`` when this user cannot inspect it, and ``failed``
+        when it otherwise exists but cannot be resolved.
     """
     try:
         pointer_path.stat()
     except FileNotFoundError:
         return PublicationPointer(state="absent", generation_id=None, error=None)
+    except PermissionError:
+        return PublicationPointer(
+            state="permission_denied",
+            generation_id=None,
+            error=_unreadable_artifact_permission_detail("last-success pointer"),
+        )
     except OSError:
         pass
     return PublicationPointer(
@@ -1202,7 +1253,7 @@ def _resolve_publication_pointer(
     *,
     raise_on_manifest_error: bool = False,
 ) -> PublicationPointer:
-    """Resolve the last-success pointer to ``ok`` / ``absent`` / ``failed``.
+    """Resolve the last-success pointer to its four-state validation verdict.
 
     The pointer is authoritative only when its target's own immutable summary
     parses and names this exact experiment and generation (review v0.5.15 /
@@ -1221,37 +1272,49 @@ def _resolve_publication_pointer(
     notice later corruption or operator edits. Pre-manifest legacy summaries
     keep the identity-only gate.
 
-    Every way of failing that validation -- an unresolvable pointer, a
-    missing/tampered target summary, a broken manifest -- resolves to
-    ``failed``, never ``absent``: the pointer's existence is durable evidence
-    that this tree once held a result, and a caller told "nothing published"
-    would re-run over it and advance the pointer past the corruption.
+    Every validation refusal resolves to an unusable state, never ``absent``:
+    structural or content failures become ``failed``, while an actual
+    permission denial becomes ``permission_denied``. The pointer's existence
+    is durable evidence that this tree once held a result, and a caller told
+    "nothing published" could otherwise re-run over it and advance the pointer
+    past evidence that still needs operator attention.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a versioned publication's
         manifest error for an actionable resume failure instead of reporting
-        it as ``failed``, as read-only status APIs require. Only the manifest
-        branch raises; every other failure still resolves to ``failed``.
-    :raises RuntimeError: ``raise_on_manifest_error`` is set and the target's
-        artifact manifest does not validate.
-    :return PublicationPointer: The tri-state verdict for this experiment.
+        it as an unusable verdict, as read-only status APIs require. Only the
+        manifest branch raises; every other failure resolves to ``failed`` or
+        ``permission_denied``.
+    :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
+        manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
+        the target's artifact manifest does not validate.
+    :return PublicationPointer: The publication verdict for this experiment.
     """
     pointer_path = _last_successful_generation_path(experiment)
-    generation_id = _read_pointer_target(
-        pointer_path,
-        id_key="generation_id",
-        owner_key="experiment",
-        owner_name=experiment.experiment,
-    )
+    try:
+        generation_id = _read_pointer_target(
+            pointer_path,
+            id_key="generation_id",
+            owner_key="experiment",
+            owner_name=experiment.experiment,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
     if generation_id is None:
         return _unresolvable_pointer(pointer_path, f"experiment {experiment.experiment!r}")
-    summary = _read_pointer_target_summary(
-        _generation_summary_path(experiment, generation_id),
-        id_key="generation_id",
-        target_id=generation_id,
-        owner_key="experiment",
-        owner_name=experiment.experiment,
-    )
+    try:
+        summary = _read_pointer_target_summary(
+            _generation_summary_path(experiment, generation_id),
+            id_key="generation_id",
+            target_id=generation_id,
+            owner_key="experiment",
+            owner_name=experiment.experiment,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(
+            state="permission_denied", generation_id=generation_id, error=str(exc)
+        )
     if summary is None:
         return PublicationPointer(
             state="failed",
@@ -1271,7 +1334,14 @@ def _resolve_publication_pointer(
             # the identity-only gate above; see docs/config.md's upgrade notes.
             try:
                 _validate_generation_manifest(generation_dir, generation_id, summary)
-            except RuntimeError as exc:
+            except PublicationAccessError as exc:
+                log.warning("%s", exc)
+                return PublicationPointer(
+                    state="permission_denied",
+                    generation_id=generation_id,
+                    error=str(exc),
+                )
+            except PublicationIntegrityError as exc:
                 log.warning("%s", exc)
                 return PublicationPointer(
                     state="failed", generation_id=generation_id, error=str(exc)
@@ -1290,15 +1360,17 @@ def _last_successful_generation_id(
     the path-construction and resume callers to which "never published" and
     "published but corrupt" mean the same thing: nothing here may be read as
     published. Every caller that *reports* publication state to an operator or
-    agent must use the tri-state resolver instead (review v0.5.18 / finding
+    agent must use the four-state resolver instead (review v0.5.18 / finding
     F4).
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a versioned publication's
         manifest error for an actionable resume failure instead of returning
         ``None`` as read-only status APIs require.
-    :raises RuntimeError: ``raise_on_manifest_error`` is set and the target's
-        artifact manifest does not validate.
+    :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
+        manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
+        the target's artifact manifest does not validate.
     :return str | None: The last-successful generation id, or ``None`` if the
         pointer or its target summary is missing, unreadable, malformed,
         unsafely named, owned by another experiment, or fails manifest
@@ -1506,35 +1578,43 @@ def _last_successful_suite_generation_path(suite: Suite) -> Path:
 
 
 def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
-    """Resolve the suite last-success pointer to ``ok`` / ``absent`` / ``failed``.
+    """Resolve the suite last-success pointer to its four-state validation verdict.
 
-    Suite mirror of :func:`_resolve_publication_pointer`, including its F4
-    rule that every way of failing validation resolves to ``failed`` rather
-    than ``absent``: the pointer is authoritative only when its target's own
-    immutable summary parses and names this exact suite and suite generation
+    Suite mirror of :func:`_resolve_publication_pointer`, including its rule
+    that validation refusals resolve to ``failed`` or ``permission_denied``
+    rather than ``absent``. The pointer is authoritative only when its target's
+    own immutable summary parses and names this exact suite and suite generation
     (review v0.5.15 / blocker 3), not when the per-suite-generation lifecycle
     record says so, and a schema-current summary must additionally anchor its
     winner facts to the hash-covered component summaries it recorded.
 
     :param Suite suite: Suite config with artifact root details.
-    :return PublicationPointer: The tri-state verdict for this suite.
+    :return PublicationPointer: The publication verdict for this suite.
     """
     pointer_path = _last_successful_suite_generation_path(suite)
-    generation_id = _read_pointer_target(
-        pointer_path,
-        id_key="suite_generation_id",
-        owner_key="suite",
-        owner_name=suite.suite,
-    )
+    try:
+        generation_id = _read_pointer_target(
+            pointer_path,
+            id_key="suite_generation_id",
+            owner_key="suite",
+            owner_name=suite.suite,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
     if generation_id is None:
         return _unresolvable_pointer(pointer_path, f"suite {suite.suite!r}")
-    summary = _read_pointer_target_summary(
-        _suite_generation_summary_path(suite, generation_id),
-        id_key="suite_generation_id",
-        target_id=generation_id,
-        owner_key="suite",
-        owner_name=suite.suite,
-    )
+    try:
+        summary = _read_pointer_target_summary(
+            _suite_generation_summary_path(suite, generation_id),
+            id_key="suite_generation_id",
+            target_id=generation_id,
+            owner_key="suite",
+            owner_name=suite.suite,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(
+            state="permission_denied", generation_id=generation_id, error=str(exc)
+        )
     if summary is None:
         return PublicationPointer(
             state="failed",
@@ -1564,7 +1644,14 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
         # summaries keep the identity-only gate above.
         try:
             _validate_suite_summary_integrity(generation_id, summary)
-        except RuntimeError as exc:
+        except PublicationAccessError as exc:
+            log.warning("Suite last-success pointer target could not be validated as this user")
+            return PublicationPointer(
+                state="permission_denied",
+                generation_id=generation_id,
+                error=str(exc),
+            )
+        except PublicationIntegrityError as exc:
             log.warning(
                 "Suite last-success pointer target failed integrity validation",
                 exc_info=True,
@@ -1598,19 +1685,30 @@ def _validate_suite_summary_integrity(
 
     :param str generation_id: Suite generation id, used for error text.
     :param Mapping[str, Any] summary: Parsed suite summary payload.
-    :raises RuntimeError: A study record is malformed, a component summary is
+    :raises PublicationAccessError: A component summary cannot be read by the current user.
+    :raises PublicationIntegrityError: A study record is malformed, a component summary is
         missing, altered, or misidentified, or an exposed winner is not
         anchored to any verified component summary.
     """
 
-    def _fail(reason: str) -> RuntimeError:
+    def _fail(reason: str) -> PublicationIntegrityError:
         """Build one uniformly labeled suite-integrity error.
 
         :param str reason: Specific validation failure being reported.
-        :return RuntimeError: Error naming the suite generation and the reason.
+        :return PublicationIntegrityError: Error naming the suite generation and reason.
         """
-        return RuntimeError(
+        return PublicationIntegrityError(
             f"Suite generation {generation_id!r} summary integrity validation failed: {reason}"
+        )
+
+    def _permission_fail(reason: str) -> PublicationAccessError:
+        """Build a permission-specific suite-validation error.
+
+        :param str reason: Permission failure being reported.
+        :return PublicationAccessError: Error naming the suite generation and reason.
+        """
+        return PublicationAccessError(
+            f"Suite generation {generation_id!r} summary validation could not run: {reason}"
         )
 
     records = summary.get("studies")
@@ -1641,7 +1739,7 @@ def _validate_suite_summary_integrity(
         :param str phase_name: Source component phase that produced the winner.
         :param bool include_exposure_metadata: Include completion, source, and
             promotion fields when the suite exposes its own component winner.
-        :raises RuntimeError: If the winner payload cannot be represented as safe YAML.
+        :raises PublicationIntegrityError: The winner payload cannot be represented as safe YAML.
         :return tuple[str, str]: Source phase plus canonical winner payload.
         """
         fields = full_fields if include_exposure_metadata else evidence_fields
@@ -1679,6 +1777,10 @@ def _validate_suite_summary_integrity(
             )
         try:
             content = target.read_bytes()
+        except PermissionError as exc:
+            raise _permission_fail(
+                _unreadable_artifact_permission_detail(f"study {name!r} component summary")
+            ) from exc
         except OSError as exc:
             raise _fail(f"study {name!r} component summary is missing or unreadable") from exc
         if hashlib.sha256(content).hexdigest() != recorded_sha:
@@ -2124,8 +2226,10 @@ def _load_winner(
 
     Raises:
         FileNotFoundError: ``winner.yaml`` does not exist for the phase.
-        RuntimeError: The file is unfingerprinted (legacy/hand-edited) or its
-            fingerprint disagrees with the freshly computed one.
+        WinnerIntegrityError: The file is unreadable, incomplete, ambiguously
+            scoped, or incompatible with the current partial-result policy.
+        StudyFingerprintMismatchError: The stored fingerprint disagrees with
+            the freshly computed one.
 
     """
     published_generation_id = _last_successful_generation_id(
@@ -2143,11 +2247,11 @@ def _load_winner(
     try:
         data = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc
     if not isinstance(data, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase "
             f"{phase.name!r}: top level must be a mapping."
         )
@@ -2158,7 +2262,7 @@ def _load_winner(
     stored_fp = data.get("phase_fingerprint")
 
     if stored_fp is None:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no phase_fingerprint. Refusing to use it "
             f"for --from-phase because phasesweep cannot prove it matches the "
             f"current config for skipped phase {phase.name!r}. Re-run the "
@@ -2176,12 +2280,12 @@ def _load_winner(
 
     completion = data.get("completion")
     if not isinstance(completion, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase "
             f"{phase.name!r}: missing mapping field 'completion'."
         )
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
             f"use it for skipped phase {phase.name!r} unless the current config "
             "sets allow_incomplete_on_timeout: true."
@@ -2189,21 +2293,21 @@ def _load_winner(
     generation_id = data.get("generation_id")
     attempt_id = data.get("attempt_id")
     if not isinstance(generation_id, str) or not generation_id:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid generation_id; refusing unscoped evidence."
         )
     if not isinstance(attempt_id, str) or not attempt_id:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
         )
     source_data = data.get("winner_source")
     if not isinstance(source_data, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
         )
     source_kind = source_data.get("kind")
     if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
-        raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
+        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
 
     stored_env_digest = data.get("trainer_env_digest")
     if not isinstance(stored_env_digest, str) or not stored_env_digest:
@@ -2241,6 +2345,6 @@ def _load_winner(
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc

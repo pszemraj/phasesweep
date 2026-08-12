@@ -36,21 +36,25 @@ from phasesweep.engine import (
     ArtifactRootRebindError,
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
+    RunRequestError,
     SamplerContinuationUnsupportedError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
+    WinnerIntegrityError,
     read_status,
     read_winner,
     read_winners,
 )
 from phasesweep.engine.guards import (
     FINGERPRINT_SCHEMA_VERSION,
+    _artifact_root_rebind_entries,
     _ArtifactRootRebindPlan,
     _phase_fingerprint,
     _register_active_attempt,
     _validate_artifact_root_binding,
     _validate_artifact_root_binding_for_rebind,
+    _validate_artifact_root_destination,
 )
 from phasesweep.engine.optuna import _sqlite_study_exists
 from phasesweep.engine.run import _reject_bound_descendant_topups
@@ -1203,6 +1207,79 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
 
 
+def test_unreadable_artifact_root_binding_never_recommends_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permission denial is not evidence of a foreign ledger or authority to rebind."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    binding_path = _artifact_root_binding_path(experiment)
+    binding_before = binding_path.read_bytes()
+    original_read_text = Path.read_text
+
+    def permission_denied(
+        self: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if self == binding_path:
+            raise PermissionError("permission denied")
+        return original_read_text(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", permission_denied)
+
+    with pytest.raises(ArtifactRootConflictError) as read_info:
+        read_status(experiment)
+    with pytest.raises(ArtifactRootRebindError) as rebind_info:
+        _validate_artifact_root_binding_for_rebind(
+            _ArtifactRootRebindPlan(
+                experiment=experiment,
+                destination=str(_experiment_dir(experiment).resolve()),
+                entries=(),
+            )
+        )
+
+    read_message = str(read_info.value)
+    assert "current user" in read_message
+    assert "permission denied" in read_message
+    assert "different storage ledger" not in read_message
+    assert "do not run rebind-workdir" in read_message
+    assert "refusing to rebind" in str(rebind_info.value)
+    assert binding_path.read_bytes() == binding_before
+
+    monkeypatch.setattr(Path, "read_text", original_read_text)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot = _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
+
+    def snapshot_permission_denied(
+        self: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if self == snapshot:
+            raise PermissionError("permission denied")
+        return original_read_text(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", snapshot_permission_denied)
+    with pytest.raises(ArtifactRootRebindError) as publication_info:
+        _validate_artifact_root_destination(
+            experiment,
+            _artifact_root_rebind_entries(experiment),
+        )
+    publication_message = str(publication_info.value)
+    assert "cannot be validated as the current user" in publication_message
+    assert "refusing to rebind" in publication_message
+    assert "Move the complete artifact tree" not in publication_message
+
+
 @pytest.mark.parametrize(
     ("owner_storage", "offered_storage", "secrets"),
     [
@@ -1737,7 +1814,7 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
     ]
     before = {path: path.read_bytes() for path in protected}
 
-    with pytest.raises(RuntimeError, match="already exists; refusing to overwrite history"):
+    with pytest.raises(RunRequestError, match="already exists; refusing to overwrite history"):
         run_experiment(experiment, generation_id=generation_id)
 
     assert {path: path.read_bytes() for path in protected} == before
@@ -2010,7 +2087,7 @@ def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{"trial_number": 0, "metric": {"objective":')
 
-    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
         _load_winner(exp, exp.phases[0], {})
 
 
@@ -2039,7 +2116,7 @@ def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None
         )
     )
 
-    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
         _load_winner(exp, exp.phases[0], {})
 
 

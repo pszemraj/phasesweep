@@ -166,7 +166,7 @@
 # env: dict[str, str] = {}
 # Applied over the ambient variables selected by execution.inherit_env. PhaseSweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial. A json_envelope metric also receives `PHASESWEEP_OBJECTIVE_PATH`, the absolute destination resolved from its configured path; other extractor types remove any ambient value with that name.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
-# An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID only when the environment did not already set it.
+# An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES. If any assigned token is numeric, CUDA_DEVICE_ORDER is forced to PCI_BUS_ID so the trainer uses the physical card covered by the nvidia-smi-derived host lock; UUID/MIG-only assignments preserve an explicitly configured order.
 
 # execution: ExecutionContext = {}
 # Explicit trainer execution contract; `cwd` and `inherit_env` join the semantic fingerprint, so changing either invalidates resumable studies (`record_env` does not - it changes only what is written). ExecutionContext keys:
@@ -197,7 +197,7 @@
 # type: Literal["categorical"] (required)
 # choices: list[None | bool | int | finite float | str] (required; min length 1)
 # Lists, mappings, objects, NaN, and infinities are rejected. CMA-ES rejects categorical parameters.
-# Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights.
+# Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights. With a CLI override format, choices must also have distinct rendered wire values (`[1, "1"]` is ambiguous under argparse); json_file preserves their distinct JSON types.
 
 # EXTRACTOR OBJECTS
 # An extractor must use exactly one discriminator shape. Every `path`/`file` below is a nonempty trial-relative path: absolute paths and any `..` component are rejected.

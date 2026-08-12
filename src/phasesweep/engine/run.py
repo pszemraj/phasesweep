@@ -20,10 +20,19 @@ from phasesweep.config import Config, Experiment, Phase, Suite
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import StudyContextConflictError, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    PromotionError,
+    PublicationAccessError,
+    PublicationCommitError,
+    PublicationIntegrityError,
+    RunRequestError,
+    StudyContextConflictError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.guards import (
     _experiment_lock,
     _experiment_semantic_fingerprint,
+    _load_accepted_partial_decision,
     _load_and_check_artifact_roots,
     _preflight_existing_studies,
     _PreflightCleanupReport,
@@ -180,12 +189,12 @@ def run_config(
     :param bool dry_run: If ``True``, preview commands without launching subprocesses.
     :return dict[str, Winner] | dict[str, dict[str, Winner]]: Experiment winners, or suite
         study winners keyed by study name.
-    :raises RuntimeError: ``from_phase`` was given for a suite config, which
+    :raises RunRequestError: ``from_phase`` was given for a suite config, which
         has no single phase sequence to resume.
     """
     if isinstance(config, Suite):
         if from_phase is not None:
-            raise RuntimeError("--from-phase is only supported for single experiment configs.")
+            raise RunRequestError("--from-phase is only supported for single experiment configs.")
         return run_suite(config, dry_run=dry_run)
     return run_experiment(config, from_phase=from_phase, dry_run=dry_run)
 
@@ -202,7 +211,7 @@ def config_status(config: Config) -> dict[str, Any]:
     compiled experiment status: the same payload, generation identity included,
     that a standalone experiment reports.
 
-    The suite envelope reports the *suite* last-success pointer's own tri-state
+    The suite envelope reports the *suite* last-success pointer's own four-state
     verdict (re-review v0.5.19 / observation N2). Reporting only the component
     studies let a suite whose published summary no longer validated print
     ``publication_integrity: "ok"`` for every component and exit 0, while
@@ -225,7 +234,11 @@ def config_status(config: Config) -> dict[str, Any]:
                 publication.generation_id if publication.state == "ok" else None
             ),
             "publication_integrity": publication.state,
-            **({"publication_error": publication.error} if publication.state == "failed" else {}),
+            **(
+                {"publication_error": publication.error}
+                if publication.state in {"failed", "permission_denied"}
+                else {}
+            ),
             "studies": [
                 {
                     "name": study.name,
@@ -290,9 +303,11 @@ def run_experiment(
         TrialEvidenceMissingError: A trial eligible to win no longer has the
             on-disk evidence its study records, or the selected winner's
             objective source no longer matches its frozen provenance.
-        RuntimeError: Lock contention (another orchestrator running),
-            fingerprint mismatch on ``--from-phase`` resume, or stale-reaper
-            uncertainty (review v0.5.7 / blocker 2).
+        RunRequestError: A caller-supplied generation id already names an
+            immutable generation in this experiment.
+        PhaseSweepError: An expected preflight, promotion, storage,
+            publication, or recovery refusal requires operator action.
+        RuntimeError: An internal engine invariant fails.
         ValueError: A caller-supplied generation id is not a safe filesystem name.
         FileNotFoundError: ``--from-phase`` requested but a prior phase has
             no persisted ``winner.yaml``.
@@ -593,7 +608,7 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
-        RuntimeError: A phase's promotion decision was ``stop``.
+        PromotionError: A phase's promotion decision was ``stop``.
         FileNotFoundError: A skipped phase has no persisted ``winner.yaml``
             (re-raised on non-dry-run; dry runs substitute a placeholder).
 
@@ -686,7 +701,7 @@ def _run_experiment_inner(
                 )
             if promoted is None:
                 if promotion_decision is not None and promotion_decision["action"] == "stop":
-                    raise RuntimeError(str(promotion_decision["message"]))
+                    raise PromotionError(str(promotion_decision["message"]))
                 break
             winner = promoted
             assert generation_id is not None
@@ -755,8 +770,10 @@ def _preflight_skipped_winners(
         skipped phase could be validated.
     :raises ValueError: ``from_phase`` names no phase in the experiment.
     :raises FileNotFoundError: A skipped phase has no persisted ``winner.yaml``.
-    :raises RuntimeError: A skipped phase's persisted winner is unfingerprinted
-        or its fingerprint disagrees with the current config.
+    :raises WinnerIntegrityError: A skipped phase's persisted winner is invalid
+        or incomplete.
+    :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
+        disagrees with the current config.
     """
     if from_phase is None:
         return {}
@@ -851,6 +868,12 @@ def _reject_bound_descendant_topups(
             continue
         terminal = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
         if terminal >= phase.n_trials:
+            continue
+        partial_decision = _load_accepted_partial_decision(study)
+        if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
+            # The phase has already committed a terminal accepted-timeout
+            # decision at this exact target. Identical replay performs only
+            # deterministic selection; its unused slots are not a top-up.
             continue
 
         # Reachable phase name -> every dependency-edge kind traversed to reach
@@ -972,8 +995,9 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
         ``None`` to mint a fresh random id.
     :return str: The claimed generation id (``requested_id`` if supplied and
         free, otherwise a freshly minted UUID4 hex string).
-    :raises RuntimeError: ``requested_id`` already exists, or no unused random
-        id could be minted after 10 attempts.
+    :raises RunRequestError: ``requested_id`` already exists.
+    :raises RuntimeError: No unused random id could be minted after 10 attempts,
+        which indicates broken UUID generation rather than an operator conflict.
     :raises OSError: The generation namespace or its provenance files could not
         be created.
     """
@@ -983,7 +1007,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
         try:
             _generation_dir(experiment, requested_id).mkdir()
         except FileExistsError as exc:
-            raise RuntimeError(
+            raise RunRequestError(
                 f"Generation id {requested_id!r} already exists; refusing to overwrite history."
             ) from exc
         _write_generation_provenance(experiment, requested_id, caller_owned_id=True)
@@ -1213,14 +1237,14 @@ def _validate_publishable_summary(
     :param str id_value: Expected id the summary must name.
     :param str label: Human label for error text (e.g. ``"Generation"``,
         ``"Suite generation"``).
-    :raises RuntimeError: The summary cannot be read back as a correctly
+    :raises PublicationCommitError: The summary cannot be read back as a correctly
         named mapping; the last-success pointer must not advance to it.
     :return dict[str, Any]: The parsed summary payload.
     """
     try:
         summary = yaml.safe_load(summary_path.read_text())
     except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(
+        raise PublicationCommitError(
             f"{label} {id_value!r} summary could not be read back; "
             "refusing to advance the last-success pointer."
         ) from exc
@@ -1229,7 +1253,7 @@ def _validate_publishable_summary(
         or summary.get(owner_key) != owner_value
         or summary.get(id_key) != id_value
     ):
-        raise RuntimeError(
+        raise PublicationCommitError(
             f"{label} {id_value!r} summary failed publication validation; "
             "refusing to advance the last-success pointer."
         )
@@ -1254,8 +1278,10 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to validate.
-    :raises RuntimeError: The summary or any manifest-listed artifact fails
-        validation; the last-success pointer must not advance.
+    :raises PublicationCommitError: The generation summary cannot be read back
+        or does not name this generation.
+    :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
     """
     summary = _validate_publishable_summary(
         summary_path=_generation_summary_path(experiment, generation_id),
@@ -1443,13 +1469,16 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       null, but its compatibility ``winner.yaml`` still counts as published,
       so ``is_published`` never contradicts the ``winner`` path shown beside
       it.
-    * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"``, and
-      ``publication_error`` beside it only when ``"failed"`` -- the one
+    * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
+      ``"permission_denied"``, and ``publication_error`` beside either failure
+      verdict -- the one
       conditional key in this payload (review v0.5.18 / finding F4). Published
       results that no longer validate are reported as corrupt rather than as
-      an experiment that never published; the CLI turns ``"failed"`` into a
-      non-zero exit through :class:`~phasesweep.engine.PublicationIntegrityError`
-      after printing this payload.
+      an experiment that never published. After printing this payload, the CLI
+      turns ``"failed"`` into
+      :class:`~phasesweep.engine.PublicationIntegrityError` and
+      ``"permission_denied"`` into
+      :class:`~phasesweep.engine.PublicationAccessError`; both exit non-zero.
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
@@ -1478,7 +1507,11 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
         "publication_integrity": integrity,
-        **({"publication_error": status["publication_error"]} if integrity == "failed" else {}),
+        **(
+            {"publication_error": status["publication_error"]}
+            if integrity in {"failed", "permission_denied"}
+            else {}
+        ),
         "phases": status["phases"],
     }
 
@@ -1489,7 +1522,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     :param Suite suite: Parsed suite config.
     :param bool dry_run: If ``True``, preview each study without launching subprocesses.
     :return dict[str, dict[str, Winner]]: Winners keyed by study name, then phase name.
-    :raises RuntimeError: A study declares a dependency that exposed no
+    :raises PromotionError: A study declares a dependency that exposed no
         winners, so the suite refuses to start it.
     :raises BaseException: Whatever a component run or the publication
         transaction raised, re-raised after the suite generation is durably
@@ -1532,7 +1565,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 service_pending_shutdown()
                 for dep in study_spec.depends_on:
                     if dep not in results:
-                        raise RuntimeError(
+                        raise PromotionError(
                             f"Study {study_spec.name!r} dependency {dep!r} did not complete."
                         )
                 experiment = suite.experiment_for_study(study_spec)
@@ -1717,8 +1750,10 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
 
     :param Suite suite: Suite whose generation is being published.
     :param str generation_id: Immutable suite-generation namespace to validate.
-    :raises RuntimeError: The summary, a component reference, or a component
-        manifest fails validation; the last-success pointer must not advance.
+    :raises PublicationCommitError: The suite summary cannot be read back or
+        does not name this suite generation.
+    :raises PublicationAccessError: A component artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: A component manifest fails validation.
     """
     summary = _validate_publishable_summary(
         summary_path=_suite_generation_summary_path(suite, generation_id),
@@ -1729,13 +1764,13 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         label="Suite generation",
     )
 
-    def _fail(reason: str) -> RuntimeError:
+    def _fail(reason: str) -> PublicationCommitError:
         """Build one uniformly labeled suite publication-validation error.
 
         :param str reason: Specific validation failure being reported.
-        :return RuntimeError: Error naming the suite generation and the reason.
+        :return PublicationCommitError: Error naming the suite generation and reason.
         """
-        return RuntimeError(
+        return PublicationCommitError(
             f"Suite generation {generation_id!r} failed publication validation: {reason}; "
             "refusing to advance the last-success pointer."
         )
@@ -1781,7 +1816,9 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
                 component_generation,
                 component_summary,
             )
-        except RuntimeError as exc:
+        except PublicationAccessError:
+            raise
+        except PublicationIntegrityError as exc:
             raise _fail(f"study {name!r} component manifest is invalid ({exc})") from exc
     missing = set(studies_by_name) - seen
     if missing:
@@ -1791,7 +1828,9 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         # own winner facts must be anchored to the hash-covered component
         # summaries before the pointer may advance (review v0.5.17 gap hunt).
         _validate_suite_summary_integrity(generation_id, summary)
-    except RuntimeError as exc:
+    except PublicationAccessError:
+        raise
+    except PublicationIntegrityError as exc:
         raise _fail(str(exc)) from exc
 
 

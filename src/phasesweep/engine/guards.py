@@ -23,6 +23,9 @@ from phasesweep.engine.errors import (
     ArtifactRootRebindError,
     ExperimentLockBusyError,
     LegacyArtifactRootMigrationRequiredError,
+    PhaseSweepError,
+    PublicationAccessError,
+    PublicationIntegrityError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -39,6 +42,8 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     PHASE_FINGERPRINT_ATTR,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
@@ -90,7 +95,7 @@ from phasesweep.runtime.process import (
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
 
-_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "fatal"})
+_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "cancelled", "fatal"})
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,73 @@ class _ParsedTrialOutcome:
     outcome: str
     cause: str | None
     policy: str | None
+
+
+@dataclass(frozen=True)
+class _AcceptedPartialDecision:
+    """Durable terminal decision to select from an incomplete timed-out phase."""
+
+    trial_target: int
+    outcome_sequence: int
+    finished_trials: int
+    completed_trials: int
+    timeout_scope: str
+    recovered_abort_sequence: int | None
+
+
+def _load_accepted_partial_decision(
+    study: optuna.Study,
+) -> _AcceptedPartialDecision | None:
+    """Load and validate a persisted accepted-partial timeout decision."""
+    raw = study.user_attrs.get(PHASE_DECISION_ATTR)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}. "
+            "Use a new experiment name, or archive/delete the inconsistent study."
+        )
+    trial_target = raw.get("trial_target")
+    outcome_sequence = raw.get("outcome_sequence")
+    finished_trials = raw.get("finished_trials")
+    completed_trials = raw.get("completed_trials")
+    timeout_scope = raw.get("timeout_scope")
+    recovered_abort_sequence = raw.get("recovered_abort_sequence")
+    if (
+        raw.get("schema_version") != PHASE_DECISION_SCHEMA_VERSION
+        or raw.get("decision") != "accepted_partial_timeout"
+        or type(trial_target) is not int
+        or trial_target < 1
+        or type(outcome_sequence) is not int
+        or outcome_sequence < 0
+        or type(finished_trials) is not int
+        or finished_trials < 0
+        or finished_trials >= trial_target
+        or type(completed_trials) is not int
+        or completed_trials < 0
+        or completed_trials > finished_trials
+        or timeout_scope not in {"phase", "run"}
+        or (
+            recovered_abort_sequence is not None
+            and (
+                type(recovered_abort_sequence) is not int
+                or recovered_abort_sequence < 1
+                or recovered_abort_sequence > outcome_sequence
+            )
+        )
+    ):
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: "
+            f"{raw!r}. Use a new experiment name, or archive/delete the inconsistent study."
+        )
+    return _AcceptedPartialDecision(
+        trial_target=trial_target,
+        outcome_sequence=outcome_sequence,
+        finished_trials=finished_trials,
+        completed_trials=completed_trials,
+        timeout_scope=timeout_scope,
+        recovered_abort_sequence=recovered_abort_sequence,
+    )
 
 
 @dataclass
@@ -594,7 +666,7 @@ def _verify_fingerprint(
         inherited_winners: Parent-phase winners contributing to identity.
 
     Raises:
-        RuntimeError: The study already has a fingerprint and it does not
+        StudyFingerprintMismatchError: The study already has a fingerprint and it does not
             match the current computed value (incompatible config edit).
 
     Returns:
@@ -868,6 +940,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     """Load and validate one attempt registry entry.
 
     :param Path entry_path: Registry entry file to parse.
+    :param int directory_fd: Open descriptor for the entry's validated parent directory.
     :return dict[str, Any]: The validated entry payload.
     :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
         — recovery cannot know whether a process from it is still alive.
@@ -1031,17 +1104,18 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     """Persist a failure-policy outcome before marking a stale trial ``FAIL``.
 
     An objective may have written its outcome immediately before the
-    orchestrator died. Preserve a recorded fatal exception; convert a
-    not-yet-committed success/prune to failure because recovery is about to
-    commit the trial as ``FAIL``. Malformed or duplicate records are replaced
-    with a fresh sequence so current-schema validation can still diagnose any
-    other corrupt row without stranding this stale process.
+    orchestrator died. Preserve a recorded fatal exception or explicit host
+    cancellation; convert a not-yet-committed success/prune to failure because
+    recovery is about to commit the trial as ``FAIL``. Malformed or duplicate
+    records are replaced with a fresh sequence so current-schema validation
+    can still diagnose any other corrupt row without stranding this stale
+    process.
 
     :param optuna.Study study: Study containing ``trial``, used to read every
         trial's recorded outcome and assign a fresh sequence if needed.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial about to be
         marked ``FAIL``.
-    :raises RuntimeError: The outcome could not be written to trial user
+    :raises StudyStorageUnavailableError: The outcome could not be written to trial user
         attrs; the trial is left ``RUNNING`` rather than risk silently
         dropping the failure from ``max_consecutive_failures``.
     """
@@ -1060,7 +1134,7 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         outcome = existing.outcome
         cause = existing.cause
         policy = existing.policy
-        if outcome not in {"failure", "fatal"}:
+        if outcome not in {"failure", "fatal", "cancelled"}:
             outcome = "failure"
             cause = "orchestrator stopped before Optuna committed the terminal trial state"
             policy = None
@@ -1082,7 +1156,7 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         active_trial = optuna.Trial(study, trial._trial_id)
         active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
     except Exception as exc:
-        raise RuntimeError(
+        raise StudyStorageUnavailableError(
             f"Process cleanup completed for stale RUNNING trial {trial.number} in study "
             f"{study.study_name!r}, but its durable failure outcome could not be recorded. "
             "The trial remains RUNNING so a later retry cannot silently omit this failure "
@@ -1105,9 +1179,11 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         to change (trial already terminal, study gone, or in-memory storage),
         or ``"unreachable"`` when the recorded storage could not be reached
         and the entry must be retained for a later retry.
-    :raises RuntimeError: The stale RUNNING trial could not be marked FAIL, or
-        its durable failure outcome could not be recorded; the study is left
-        inconsistent rather than silently dropping the failure.
+    :raises StudySchemaMismatchError: The registry and RUNNING trial record
+        conflicting generation identities.
+    :raises StudyStorageUnavailableError: The stale RUNNING trial could not be
+        marked FAIL, or its durable recovery state could not be recorded; the
+        study is left inconsistent rather than silently dropping the failure.
     """
     storage_url = entry["storage_locator"]
     if storage_url is None:
@@ -1156,7 +1232,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         return "terminal"
     stored_generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
     if stored_generation_id is not None and stored_generation_id != entry["generation_id"]:
-        raise RuntimeError(
+        raise StudySchemaMismatchError(
             f"Attempt registry entry {entry_path} identifies generation "
             f"{entry['generation_id']!r}, but its RUNNING trial {trial.number} in study "
             f"{entry['study_name']!r} records {stored_generation_id!r}. Refusing to "
@@ -1170,7 +1246,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
             if stored_generation_id is None:
                 active_trial.set_user_attr(GENERATION_ID_ATTR, entry["generation_id"])
         except Exception as exc:
-            raise RuntimeError(
+            raise StudyStorageUnavailableError(
                 f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
                 f"but its durable trial identity could not be restored in study "
                 f"{entry['study_name']!r}. The trial remains RUNNING and the registry "
@@ -1181,7 +1257,7 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
     try:
         study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     except Exception as exc:
-        raise RuntimeError(
+        raise StudyStorageUnavailableError(
             f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
             f"but its stale RUNNING trial {trial.number} in study "
             f"{entry['study_name']!r} could not be marked FAIL. Refusing to "
@@ -1425,8 +1501,9 @@ def _reap_stale_trials(
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
         cleanup could not be proven safe.
-    :raises RuntimeError: Cleanup succeeded but Optuna could not be updated to
-        ``FAIL``; refusing to continue with an inconsistent study.
+    :raises StudyStorageUnavailableError: Cleanup succeeded but Optuna could
+        not be updated to ``FAIL``; refusing to continue with an inconsistent
+        study.
     """
     count = 0
     try:
@@ -1454,7 +1531,7 @@ def _reap_stale_trials(
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
         except Exception as exc:
-            raise RuntimeError(
+            raise StudyStorageUnavailableError(
                 f"Stale process cleanup completed for RUNNING trial {trial.number}, "
                 f"but Optuna state could not be updated to FAIL. Refusing to continue "
                 f"with an inconsistent study. trial_dir={trial_dir}"
@@ -1714,6 +1791,12 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
         return
 
     accepted_target = _accepted_trial_target(study)
+    partial_decision = _load_accepted_partial_decision(study)
+    if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
+        # An accepted partial timeout is terminal at its frozen target.
+        # Identical replay launches no suggestions, so no process-local
+        # sampler state needs to be reconstructed.
+        return
     if phase.n_trials > accepted_target:
         raise SamplerContinuationUnsupportedError(
             f"Phase {phase.name!r} uses {phase.sampler.type!r} and raises its accepted target "
@@ -1867,8 +1950,8 @@ def _validate_artifact_root_binding(
 
     :param Experiment experiment: Config whose root and storage must agree.
     :param bool claim_fresh: Write the record when the root has no durable state.
-    :raises ArtifactRootConflictError: The record is malformed, unreadable, or
-        names another root, experiment, or storage ledger.
+    :raises ArtifactRootConflictError: The binding cannot be validated as the
+        current user, or is malformed or names another owner.
     :raises LegacyArtifactRootMigrationRequiredError: A non-empty tree predates
         the reverse binding and requires explicit adoption.
     """
@@ -1896,6 +1979,13 @@ def _validate_artifact_root_binding(
                     f"its storage ledger: {exc}. No trial ran and nothing was published."
                 ) from exc
         return
+    except PermissionError as exc:
+        raise ArtifactRootConflictError(
+            f"Artifact-root binding {path} cannot be validated as the current user "
+            "(permission denied). Use the user that owns this artifact tree or restore "
+            "read permission; do not run rebind-workdir to change an ownership record "
+            "you could not inspect."
+        ) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} is unreadable or malformed: {exc}. Refusing "
@@ -2308,6 +2398,7 @@ def _attempt_entry_recoverable_in_place(
 
     :param Path entry_path: Registry entry file to inspect.
     :param Path destination: Resolved destination experiment directory.
+    :param int directory_fd: Open descriptor for the entry's validated parent directory.
     :return bool: ``True`` when the entry's recorded trial directory exists
         under ``destination``.
     """
@@ -2426,7 +2517,14 @@ def _validate_artifact_root_destination(
         return
     try:
         published = _last_successful_generation_id(experiment, raise_on_manifest_error=True)
-    except RuntimeError as exc:
+    except PublicationAccessError as exc:
+        raise ArtifactRootRebindError(
+            f"Destination artifact root {str(destination)!r} records a publication that "
+            "cannot be validated as the current user (permission denied). Use the user "
+            "that owns this artifact tree or restore read permission; refusing to rebind "
+            "evidence that was not validated. Nothing was written."
+        ) from exc
+    except PublicationIntegrityError as exc:
         raise ArtifactRootRebindError(
             f"Destination artifact root {str(destination)!r} records a publication that does "
             f"not validate ({exc}). Move the complete artifact tree, then rebind. "
@@ -2485,20 +2583,33 @@ def _plan_artifact_root_rebinds(
             "these empty studies to the configured workdir. Nothing was written."
         )
     for plan in plans:
-        if plan.entries:
-            _validate_artifact_root_binding_for_rebind(plan)
-            _validate_artifact_root_destination(plan.experiment, plan.entries)
+        if not plan.entries:
+            continue
+        _validate_artifact_root_binding_for_rebind(plan)
+        _validate_artifact_root_destination(plan.experiment, plan.entries)
     return plans
 
 
 def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) -> None:
-    """Require an existing reverse binding to agree with the ledger being rebound."""
+    """Require an existing reverse binding to agree with the ledger being rebound.
+
+    :param _ArtifactRootRebindPlan plan: Planned binding mutation to validate.
+    :raises ArtifactRootRebindError: The binding is unreadable, malformed, or
+        cannot be validated as the current user.
+    """
     path = _artifact_root_binding_path(plan.experiment)
     try:
         raw = strict_json_loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         # Explicit rebind is the migration path for a legacy tree.
         return
+    except PermissionError as exc:
+        raise ArtifactRootRebindError(
+            f"Cannot validate artifact-root binding {path} as the current user "
+            "(permission denied). Use the user that owns this artifact tree or restore "
+            "read permission; refusing to rebind an ownership record that was not read. "
+            "Nothing was written."
+        ) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootRebindError(
             f"Cannot read artifact-root binding {path}: {exc}. Nothing was written."
@@ -2528,6 +2639,8 @@ def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str
     :return list[tuple[str, str | None, str]]: One ``(study name, previous
         root or None, new root)`` record per study written.
     """
+    if not plan.entries:
+        return []
     binding_path = _artifact_root_binding_path(plan.experiment)
     try:
         atomic_write_text(
@@ -2943,8 +3056,10 @@ def _preflight_existing_studies(
         higher trial target than the current config requests.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
-    :raises RuntimeError: Multiple studies failed preflight for mixed reasons
-        not covered by a single common exception type.
+    :raises PhaseSweepError: Multiple studies failed preflight for mixed
+        expected reasons not covered by a more specific common exception type.
+    :raises RuntimeError: Multiple studies failed and at least one error is an
+        unexpected implementation failure that must retain traceback reporting.
     """
     _warn_unbounded_environment_inheritance(experiment)
     report = cleanup_report or _PreflightCleanupReport()
@@ -3033,7 +3148,13 @@ def _preflight_existing_studies(
         )
         if cleanup_error is not None:
             raise ProcessCleanupUncertainError(message) from cleanup_error
-        raise RuntimeError(message) from first
+        unexpected = next(
+            (error for error in errors if not isinstance(error, PhaseSweepError)),
+            None,
+        )
+        if unexpected is not None:
+            raise RuntimeError(message) from unexpected
+        raise PhaseSweepError(message) from first
     return studies
 
 
@@ -3098,7 +3219,7 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
 
     :param optuna.Study study: Study whose cleanup recovery ledger should be updated.
     :param optuna.trial.FrozenTrial trial: Trial whose cleanup evidence was consumed.
-    :raises RuntimeError: The ledger could not be written; MCP cleanup
+    :raises StudyStorageUnavailableError: The ledger could not be written; MCP cleanup
         uncertainty stays set rather than being cleared without consuming the
         trial evidence.
     """
@@ -3106,7 +3227,7 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
     try:
         study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
     except Exception as exc:
-        raise RuntimeError(
+        raise StudyStorageUnavailableError(
             f"Cleanup was confirmed for trial {trial.number} in study {study.study_name}, "
             "but the study-level cleanup recovery ledger could not be updated. "
             "Refusing to clear MCP cleanup uncertainty without consuming the trial evidence."

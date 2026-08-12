@@ -31,6 +31,8 @@ from phasesweep import load_config, run_experiment
 from phasesweep.config import IntParam, Phase, Sampler, Suite
 from phasesweep.engine import (
     NoFeasibleTrialError,
+    PublicationCommitError,
+    PublicationIntegrityError,
     TerminalReport,
     generation_id_source,
     read_status,
@@ -126,6 +128,38 @@ def _suite_record_state(suite: Suite, generation_id: str) -> str | None:
 # --------------------------------------------------------------------------
 # Pre-commit validation failure (step 2): prior publication stays authoritative.
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("summary_text", "match"),
+    [
+        pytest.param(None, "could not be read back", id="missing"),
+        pytest.param(
+            "experiment: foreign\ngeneration_id: generation-test\n",
+            "failed publication validation",
+            id="wrong-owner",
+        ),
+    ],
+)
+def test_summary_readback_refusals_are_publication_commit_errors(
+    tmp_path: Path,
+    summary_text: str | None,
+    match: str,
+) -> None:
+    """A new generation's bad summary is an expected failed commit, not a bug."""
+    summary_path = tmp_path / "summary.yaml"
+    if summary_text is not None:
+        summary_path.write_text(summary_text)
+
+    with pytest.raises(PublicationCommitError, match=match):
+        engine_run._validate_publishable_summary(
+            summary_path=summary_path,
+            owner_key="experiment",
+            owner_value="expected",
+            id_key="generation_id",
+            id_value="generation-test",
+            label="Generation",
+        )
 
 
 def test_precommit_validation_failure_keeps_prior_publication(
@@ -768,7 +802,7 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
 
 
 # --------------------------------------------------------------------------
-# Publication integrity tri-state (review v0.5.18 / finding F4). "Nothing
+# Publication integrity states (review v0.5.18 / finding F4). "Nothing
 # published" and "the recorded publication no longer validates" are different
 # facts and must never collapse into the same answer: reporting corruption as
 # a fresh tree invites a re-run, which advances the pointer and leaves the
@@ -808,7 +842,7 @@ def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: 
     assert status["is_published"] is False
 
 
-def test_unreadable_pointer_is_failed_not_an_internal_permission_error(
+def test_unreadable_pointer_is_permission_denied_not_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pointer = tmp_path / "last_successful_generation.yaml"
@@ -823,8 +857,9 @@ def test_unreadable_pointer_is_failed_not_an_internal_permission_error(
 
     verdict = _unresolvable_pointer(pointer, "experiment 'x'")
 
-    assert verdict.state == "failed"
+    assert verdict.state == "permission_denied"
     assert verdict.error is not None
+    assert "permission denied" in verdict.error
 
 
 def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
@@ -895,7 +930,7 @@ def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path
 
 
 def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
-    """The tri-state must not soften the raise the resume/rebind path depends on."""
+    """The reporting verdict must not soften the raise the resume path depends on."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
@@ -904,14 +939,14 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
 
-    with pytest.raises(RuntimeError, match="does not match its recorded hash"):
+    with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
 def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     tmp_path: Path,
 ) -> None:
-    """The suite pointer gets the same tri-state as the experiment pointer."""
+    """The suite pointer gets the same four-state verdict as the experiment pointer."""
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
     pointer = _resolve_suite_publication_pointer(suite)
@@ -1521,9 +1556,9 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     Re-review v0.5.19 / observation N1: ``config.snapshot.yaml`` is owner-only,
     so a second operator reading a perfectly healthy tree got the generic
     "missing or unreadable" verdict and the "inspect or restore the generation
-    namespace" remedy -- for a permission bit. The verdict must stay ``failed``
-    (an unvalidatable tree is not a published one), but the reason must name
-    the permission denial and point at the publishing user.
+    namespace" remedy -- for a permission bit. The verdict is
+    ``permission_denied`` (an unvalidatable tree is still not exposed as a
+    published one), and the reason points at the publishing user.
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
@@ -1535,7 +1570,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     target.chmod(0o000)
     try:
         status = read_status(experiment)
-        assert status["publication_integrity"] == "failed"
+        assert status["publication_integrity"] == "permission_denied"
         assert "permission denied" in status["publication_error"]
         assert "only the publishing user" in status["publication_error"]
         assert "missing or unreadable" not in status["publication_error"]

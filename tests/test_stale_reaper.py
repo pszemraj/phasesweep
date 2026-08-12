@@ -31,6 +31,9 @@ from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     NoFeasibleTrialError,
+    PhaseSweepError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
     run_experiment,
 )
 from phasesweep.engine.guards import (
@@ -512,6 +515,45 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
 
     with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
         _preflight_existing_studies(experiment)
+
+
+def test_mixed_expected_preflight_errors_keep_operational_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heterogeneous study refusals are still expected operator outcomes."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        phases=[
+            Phase(name="a", n_trials=1, search_space={}),
+            Phase(name="b", n_trials=1, search_space={}),
+        ],
+    )
+    studies = {
+        phase.name: optuna.create_study(study_name=phase.name, direction="minimize")
+        for phase in experiment.phases
+    }
+
+    def reject_differently(study: optuna.Study) -> None:
+        if study.study_name == "a":
+            raise StudySchemaMismatchError("schema mismatch")
+        raise StudyStorageUnavailableError("storage unavailable")
+
+    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
+
+    with pytest.raises(PhaseSweepError, match="multiple unsafe studies") as exc_info:
+        _preflight_existing_studies(experiment, preloaded_studies=studies)
+    assert type(exc_info.value) is PhaseSweepError
+
+    def reject_with_bug(study: optuna.Study) -> None:
+        if study.study_name == "a":
+            raise StudySchemaMismatchError("schema mismatch")
+        raise RuntimeError("injected implementation bug")
+
+    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_with_bug)
+    with pytest.raises(RuntimeError, match="multiple unsafe studies") as exc_info:
+        _preflight_existing_studies(experiment, preloaded_studies=studies)
+    assert not isinstance(exc_info.value, PhaseSweepError)
 
 
 def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:
@@ -1058,14 +1100,21 @@ def test_kill_stale_group_returns_true_when_no_identity() -> None:
     assert kill_stale_group(pid=None, saved_starttime=None, pgid=None) is True
 
 
-def test_reaper_raises_when_tell_fails_after_cleanup(
+@pytest.mark.parametrize(
+    ("failure_site", "match"),
+    [
+        pytest.param("outcome", "durable failure outcome could not be recorded", id="outcome"),
+        pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
+        pytest.param("tell", "Optuna state could not be updated", id="tell"),
+    ],
+)
+def test_reaper_reports_storage_failures_after_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+    match: str,
 ) -> None:
-    """If ``study.tell(... FAIL)`` fails after successful process cleanup,
-    the reaper must raise — not silently skip. A phantom RUNNING trial would
-    corrupt the ``remaining`` calculation and schedule extra trials against
-    an inconsistent study state."""
+    """Every failed durable recovery write is an operator-facing storage outage."""
     exp = make_experiment(workdir=tmp_path / "runs")
     study = optuna.create_study(direction="maximize")
     trial = study.ask()
@@ -1085,12 +1134,33 @@ def test_reaper_raises_when_tell_fails_after_cleanup(
     )
     monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)
 
-    def fail_tell(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("storage write failed")
+    if failure_site == "outcome":
+        real_set_user_attr = optuna.Trial.set_user_attr
 
-    monkeypatch.setattr(study, "tell", fail_tell)
+        def fail_outcome(
+            active_trial: optuna.Trial,
+            key: str,
+            value: object,
+        ) -> None:
+            if key == TRIAL_OUTCOME_ATTR:
+                raise RuntimeError("storage write failed")
+            real_set_user_attr(active_trial, key, value)
 
-    with pytest.raises(RuntimeError, match="Optuna state could not be updated"):
+        monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_outcome)
+    elif failure_site == "ledger":
+        monkeypatch.setattr(
+            study,
+            "set_user_attr",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("storage write failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            study,
+            "tell",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("storage write failed")),
+        )
+
+    with pytest.raises(StudyStorageUnavailableError, match=match):
         _reap_stale_trials(study, exp, exp.phases[0].name)
 
     # The trial must NOT have been marked FAIL (because tell raised).
@@ -1394,6 +1464,28 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
     assert trials[stale_number].user_attrs[GENERATION_ID_ATTR] == "old-generation"
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [stale_number]
     assert not list(_attempts_dir(experiment).glob("*.json"))
+
+
+def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -> None:
+    """Conflicting durable recovery identities are operator-visible corruption."""
+    experiment = make_experiment(
+        experiment="registry-conflict",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'conflict.db'}",
+    )
+    _study, trial_dir, _number = _fabricate_registered_attempt(
+        experiment,
+        "p",
+        attempt_id="conflicting-attempt",
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="conflicting-attempt", state="allocated")
+    entry_path = _attempts_dir(experiment) / "conflicting-attempt.json"
+    entry = json.loads(entry_path.read_text())
+    entry["generation_id"] = "different-generation"
+    entry_path.write_text(json.dumps(entry))
+
+    with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
+        _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:

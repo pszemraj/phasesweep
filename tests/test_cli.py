@@ -748,10 +748,11 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     assert exit_code == 1
     assert "Traceback" not in captured.err
     payload = yaml.safe_load(captured.out)
-    assert payload["publication_integrity"] == "failed"
+    assert payload["publication_integrity"] == "permission_denied"
     assert "permission denied" in payload["publication_error"]
     assert "missing or unreadable" not in payload["publication_error"]
     assert "permission denied" in captured.err
+    assert "not evidence of corruption" in captured.err
     assert "only the publishing user" in captured.err
 
 
@@ -1175,6 +1176,8 @@ def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> No
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
         _experiment_dir(suite_b.experiment_for_study(suite_b.studies[0]))
     )
+    untouched = suite_b.experiment_for_study(suite_b.studies[1])
+    assert not _artifact_root_binding_path(untouched).exists()
 
 
 def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
@@ -1651,6 +1654,78 @@ def test_cli_boundary_names_config_for_schema_validation_error(
     assert exit_code == 2
     assert str(config_path) in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_boundary_compiles_suite_before_validate_success_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A component validation failure is bad config and never follows ``OK:``."""
+    config_path = write_yaml(
+        tmp_path,
+        """
+        suite: invalid_grid_suite
+        defaults:
+          trial_command: "echo {overrides}"
+          metric:
+            extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
+        studies:
+          - name: demo
+            phases:
+              - name: grid
+                n_trials: 1
+                sampler: {type: grid}
+                search_space:
+                  x: {type: categorical, choices: [1, 2]}
+        """,
+    )
+
+    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert str(config_path) in captured.err
+    assert "n_trials" in captured.err
+    assert "OK:" not in captured.out
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.err
+
+
+@pytest.mark.parametrize("command", ["validate", "status", "run", "rebind-workdir"])
+def test_cli_boundary_rejects_uncompilable_suite_for_every_config_command(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """All suite-consuming commands classify missing resolved fields as bad config."""
+    config_path = write_yaml(
+        tmp_path,
+        """
+        suite: missing_command_suite
+        defaults:
+          metric:
+            extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
+        studies:
+          - name: demo
+            phases:
+              - name: phase
+                n_trials: 1
+                search_space: {}
+        """,
+    )
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
+
+    exit_code = _invoke_cli_boundary([command, str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert str(config_path) in captured.err
+    assert "trial_command" in captured.err
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.err
+    assert "OK:" not in captured.out
 
 
 def test_cli_boundary_reports_expected_run_failure_without_traceback(

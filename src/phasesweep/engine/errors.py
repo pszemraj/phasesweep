@@ -56,25 +56,66 @@ class ArtifactRootRebindError(PhaseSweepError):
 
     Covers every refusal of that command: nothing is bound to move, storage is
     in-memory so no binding exists, or the destination cannot be validated as
-    the experiment's relocated artifact tree. Nothing has been written when
-    this is raised.
+    the experiment's relocated artifact tree. Validation refusals precede
+    writes; an apply-time failure in a multi-study suite can follow an earlier
+    plan that was already applied, because suite rebind is intentionally not
+    one cross-storage transaction.
     """
 
 
 class PublicationIntegrityError(PhaseSweepError):
     """Raised when a recorded publication exists but no longer validates.
 
-    Strictly a *reporting* failure, raised by the read-only surfaces
-    (``phasesweep status``, ``phasesweep show-winners``) so a corrupt result
-    tree exits non-zero instead of reading like a tree that never published
-    (review v0.5.18 / finding F4). It never blocks ``phasesweep run``:
-    generation namespaces are immutable, so a forward run cannot overwrite the
-    corrupt one, and the resume path already raises the same manifest error
-    when it loads winners. The message must therefore carry both the
-    validation error and the reason not to re-run - a successful re-run
-    advances the last-success pointer past the corrupt generation, after which
-    nothing reports it at all.
+    Read-only surfaces use this type to distinguish corruption from a tree that
+    never published, and resume/publication paths use it when a manifest they
+    must trust is malformed or no longer matches its artifacts. A fresh forward
+    run is not blocked merely because an older publication is corrupt;
+    generation namespaces are immutable, so it cannot overwrite that evidence.
     """
+
+
+class PublicationAccessError(PhaseSweepError):
+    """Raised when publication validation cannot run under the current user.
+
+    Distinct from :class:`PublicationIntegrityError`: a permission denial does
+    not show that the publication is corrupt, only that this user cannot prove
+    it sound. Read surfaces still fail closed and expose no result, but the
+    remedy is validation by the publishing user rather than restoration.
+    """
+
+
+class PublicationCommitError(PhaseSweepError):
+    """Raised when a completed generation cannot pass its publication commit.
+
+    This is a write-side failure: the generation remains unpublished because
+    its newly written summary cannot be read back or does not identify the
+    generation being committed. It is distinct from read-side integrity and
+    access verdicts about a previously published result.
+    """
+
+
+class PromotionError(PhaseSweepError):
+    """Raised when a configured promotion decision cannot expose a winner.
+
+    Covers an unavailable prior suite result (for example, one deliberately
+    omitted by an earlier ``on_fail: skip`` decision) and a failed promotion
+    whose configured action is ``on_fail: stop``. Both are ordinary run
+    outcomes selected by the suite policy, not PhaseSweep implementation bugs.
+    """
+
+
+class WinnerIntegrityError(PhaseSweepError):
+    """Raised when a saved winner cannot safely be used for a skipped phase.
+
+    The winner may be unreadable, structurally incomplete, ambiguously scoped,
+    or incompatible with the current phase's partial-result policy. These are
+    operator-visible artifact/configuration refusals; fingerprint drift keeps
+    its more specific :class:`StudyFingerprintMismatchError` type.
+    """
+
+
+class RunRequestError(PhaseSweepError):
+    """Raised when a caller requests an unsupported or conflicting run identity."""
 
 
 class TrialEvidenceMissingError(PhaseSweepError):

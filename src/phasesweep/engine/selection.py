@@ -11,7 +11,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
-from phasesweep.engine.errors import PhaseSweepError
+from phasesweep.engine.errors import PhaseSweepError, PromotionError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -544,16 +544,17 @@ def _study_phase_winner(
     :param str selector: Baseline selector, either a study name or
         ``"study.phase"``.
     :return tuple[str, Winner]: Resolved baseline label and winner.
-    :raises RuntimeError: The selector names an unknown baseline study, a
-        baseline study that exposed no winners, or a phase absent from that
-        study's winners.
+    :raises PromotionError: The selector names a baseline study or phase that
+        was not exposed by the preceding suite decisions.
+    :raises RuntimeError: ``results`` contains a baseline study with no winners,
+        which violates the suite runner's internal result invariant.
     """
     if "." in selector:
         baseline_study, phase_name = selector.split(".", 1)
     else:
         baseline_study, phase_name = selector, ""
     if baseline_study not in results:
-        raise RuntimeError(
+        raise PromotionError(
             f"Study {study_name!r} promotion references unknown baseline study {baseline_study!r}."
         )
     study_winners = results[baseline_study]
@@ -561,7 +562,7 @@ def _study_phase_winner(
         raise RuntimeError(f"Baseline study {baseline_study!r} has no winners.")
     if phase_name:
         if phase_name not in study_winners:
-            raise RuntimeError(
+            raise PromotionError(
                 f"Study {study_name!r} promotion references missing baseline phase {selector!r}."
             )
         return baseline_study, study_winners[phase_name]
@@ -588,9 +589,10 @@ def _apply_study_promotion(
         studies in the suite.
     :return tuple[dict[str, Winner] | None, dict[str, Any] | None]: Exposed
         study winners and promotion decision payload.
-    :raises RuntimeError: The study produced no winner to promote, its rule
-        failed with ``on_fail: stop``, or the baseline selector cannot be
-        resolved against ``prior_results``.
+    :raises PromotionError: The rule failed with ``on_fail: stop`` or its
+        baseline selector was not exposed by preceding suite decisions.
+    :raises RuntimeError: The current study produced no winner, which violates
+        the suite runner's internal result invariant.
     """
     study_spec = next(study for study in suite.studies if study.name == study_name)
     promotion = study_spec.promotion
@@ -642,7 +644,7 @@ def _apply_study_promotion(
         f"gates_passed={gates_passed}."
     )
     if promotion.on_fail == "stop":
-        raise RuntimeError(message)
+        raise PromotionError(message)
     if promotion.on_fail == "skip":
         log.warning("%s Skipping this study for downstream dependencies.", message)
         return None, decision

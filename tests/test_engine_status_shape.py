@@ -48,8 +48,8 @@ FAILED_PUBLICATION_STATUS_KEYS = [
 """Ordered key set when the recorded publication no longer validates.
 
 ``publication_error`` is the one conditional key: it appears only alongside
-``publication_integrity: "failed"`` so a healthy payload carries no empty
-error field (review v0.5.18 / finding F4).
+``publication_integrity: "failed"`` or ``"permission_denied"`` so a healthy
+payload carries no empty error field (review v0.5.18 / finding F4).
 """
 
 SUITE_STATUS_KEYS = [
@@ -62,7 +62,7 @@ SUITE_STATUS_KEYS = [
 ]
 """Exact ordered key set of a suite status envelope.
 
-The envelope reports the *suite* last-success pointer's own tri-state verdict
+The envelope reports the *suite* last-success pointer's own four-state verdict
 beside the per-study payloads (re-review v0.5.19 / observation N2), with
 ``publication_error`` as the same one conditional key the experiment payload
 carries.

@@ -526,12 +526,15 @@ def read_status(
       remain ``None`` because no generation id exists to report. A workdir
       that *does* have ``generation.yaml`` but no validated last-success
       pointer is unpublished as before.
-    - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` --
+    - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
+      ``"permission_denied"`` --
       *why* ``published_generation_id`` is what it is (review v0.5.18 /
       finding F4). ``"absent"`` means nothing was ever published, a healthy
       state for a fresh tree; ``"failed"`` means a last-success pointer exists
-      but its target no longer validates, and is accompanied by a short,
-      path-free ``publication_error``. The two used to be indistinguishable,
+      but its target no longer validates; ``"permission_denied"`` means this
+      user cannot complete validation without implying corruption. Both are
+      accompanied by a short, path-free ``publication_error``. These states
+      used to be indistinguishable,
       which invited a re-run over corrupt evidence. A ``"failed"`` payload
       reports exactly the no-publication facts it always did -- nothing is
       fabricated from an unvalidated generation -- so ``published_generation_id``
@@ -580,7 +583,7 @@ def read_status(
         paths in the returned mapping.
     :return dict[str, Any]: A mapping with the experiment name, the four
         identity fields above, ``publication_integrity`` (plus
-        ``publication_error`` only when it is ``"failed"``), the metric
+        ``publication_error`` only when validation failed or was denied), the metric
         descriptor, a per-phase list of trial counts plus winner presence, and
         whether the represented summary has been written -- path-free unless
         ``_include_winner_paths`` is set.
@@ -693,7 +696,11 @@ def read_status(
         "represented_generation_id": represented_generation_id,
         "is_published": is_published,
         "publication_integrity": publication_state,
-        **({"publication_error": publication.error} if publication.state == "failed" else {}),
+        **(
+            {"publication_error": publication.error}
+            if publication.state in {"failed", "permission_denied"}
+            else {}
+        ),
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
         "result_phase_plan": result_phase_plan,

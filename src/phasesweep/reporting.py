@@ -84,6 +84,8 @@ def report_objective(
     :raises RuntimeError: If called outside a compatible PhaseSweep trial.
     :raises ValueError: If objective metadata is invalid or ``extra`` replaces a
         reserved envelope field.
+    :raises TypeError: If ``extra`` cannot be encoded as JSON.
+    :raises OSError: If the completed envelope cannot be written atomically.
     :return Path: Configured objective path replaced by the completed envelope.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):

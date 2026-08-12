@@ -38,7 +38,7 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 
 `search_space` is a mapping from trainer override key to a typed float, integer, or categorical parameter object. Keys can be dotted paths such as `model.depth`; the same key namespace is used for inherited winners, contracts, fixed overrides, and sampled values. PhaseSweep rejects ambiguous compositions such as fixing a parent key while sampling one of its children, because no supported override format can represent that cleanly.
 
-Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be pairwise unequal under plain Python comparison, so `[1, 1.0, true]` is rejected as firmly as a literal repeat: Optuna records a sampled value as its `==` index into `choices`, so choices that compare equal cannot be told apart once persisted and the winner would name a value the trial never ran. Give each choice a value no other choice equals. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
+Use categorical parameters for explicit choices and integer or float parameters for ranges. `choices` must be pairwise unequal under plain Python comparison, so `[1, 1.0, true]` is rejected as firmly as a literal repeat: Optuna records a sampled value as its `==` index into `choices`, so choices that compare equal cannot be told apart once persisted and the winner would name a value the trial never ran. For CLI override formats, choices must also render to distinct wire values; for example, argparse cannot distinguish `1` from `"1"`. `json_file` preserves their JSON types and may represent that pair distinctly. Give each choice a value no other choice equals in the selected override format. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines bounds, grid completeness, sampler compatibility, and the explicit waiver for searching seed values.
 
 ## Sampler capability on persistent storage
 
@@ -273,8 +273,8 @@ Add at least one nonempty [provenance](#experiment-keys) entry identifying input
 ### RDB storage requires an explicit single-host acknowledgement
 
 ```text
-Value error, storage 'postgresql://...' resolves to backend 'postgresql', a shared
-relational store. ... Set allow_external_rdb_single_host: true ...
+Value error, The configured storage resolves to backend 'postgresql', a shared relational
+store. ... Set allow_external_rdb_single_host: true ...
 ```
 
 Add `allow_external_rdb_single_host: true` only for the [single-host RDB contract](runtime.md#concurrency-model). Otherwise use Journal storage for same-host parallel work or SQLite for sequential work.
@@ -308,7 +308,7 @@ phases.0.search_space.x.CategoricalParam.choices
   1.0 at index 1 compares equal to 1 at index 0.
 ```
 
-Remove values that compare equal under the [categorical-choice rule](#search-parameters), including equal values of different types. Adjust a fresh grid's `n_trials` to the new cardinality; use a new experiment name or storage for a populated study whose choices must change. Float grids that collapse after canonical rounding likewise need a coarser step or a different parameterization.
+Remove values that compare equal under the [categorical-choice rule](#search-parameters), including equal values of different types, or that render identically in the chosen CLI override format. Use `json_file` when distinct JSON types such as `1` and `"1"` are intentional. Adjust a fresh grid's `n_trials` to the new cardinality; use a new experiment name or storage for a populated study whose choices must change. Float grids that collapse after canonical rounding likewise need a coarser step or a different parameterization.
 
 ### JSON file override validation
 

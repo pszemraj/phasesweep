@@ -89,6 +89,10 @@ def format_hydra(overrides: dict[str, Any]) -> str:
     Returns:
         A single space-separated string of shell-quoted ``key=value`` tokens.
 
+    Raises:
+        TypeError: A value is outside the shared CLI override contract (see
+            :func:`_render_override_value`).
+
     """
     parts: list[str] = []
     for k, v in overrides.items():

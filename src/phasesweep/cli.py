@@ -25,6 +25,7 @@ from phasesweep.config import ConfigError, Experiment, Suite, load_config
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import (
     PhaseSweepError,
+    PublicationAccessError,
     PublicationIntegrityError,
     config_status,
     run_config,
@@ -168,17 +169,25 @@ def main() -> None:
 
 
 def _load_cli_config(path: Path) -> Experiment | Suite:
-    """Load a CLI config while retaining its source path in schema diagnostics.
+    """Load and fully validate a CLI config with path-aware diagnostics.
 
     :param Path path: Config file supplied to a CLI command.
-    :return Experiment | Suite: Validated config.
-    :raises ConfigError: The file cannot be parsed or fails model validation.
+    :return Experiment | Suite: Validated config. Every suite study has also
+        been compiled into an experiment to validate its resolved defaults.
+    :raises ConfigError: The file cannot be parsed, fails model validation, or
+        contains a suite study that cannot compile into an experiment.
     """
     from pydantic import ValidationError
 
     try:
-        return load_config(path)
-    except ValidationError as exc:
+        config = load_config(path)
+        if isinstance(config, Suite):
+            for study in config.studies:
+                config.experiment_for_study(study)
+        return config
+    except ConfigError:
+        raise
+    except (ValidationError, ValueError) as exc:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
@@ -504,8 +513,26 @@ def _publication_integrity_error(
     )
 
 
+def _publication_access_error(subject: str, detail: str) -> PublicationAccessError:
+    """Build the diagnostic for a publication this user cannot validate.
+
+    :param str subject: Experiment or suite the publication belongs to.
+    :param str detail: Path-free permission diagnostic from the validator.
+    :return PublicationAccessError: Complete single-line operator diagnostic.
+    """
+    detail = detail.rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail = f"{detail}."
+    return PublicationAccessError(
+        f"{subject} records a publication that cannot be validated as the current user: "
+        f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
+        "the publication as the publishing user or restore read permission before launching "
+        "another run; rebind-workdir is not a permission-repair command."
+    )
+
+
 def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
-    """Escalate a status payload's ``publication_integrity: "failed"`` to an error.
+    """Escalate an unusable publication verdict to its typed operator error.
 
     Reads the status payload that was just rendered rather than re-resolving
     the pointer, so the exit status can never disagree with what the operator
@@ -516,9 +543,15 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
     component publication is a corrupt suite result too.
 
     :param dict[str, Any] payload: ``config_status`` payload already rendered.
+    :raises PublicationAccessError: Publication validation was denied by permissions.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
     if payload.get("kind") == "suite":
+        if payload.get("publication_integrity") == "permission_denied":
+            raise _publication_access_error(
+                f"Suite {str(payload.get('suite'))!r}",
+                str(payload.get("publication_error")),
+            )
         if payload.get("publication_integrity") == "failed":
             raise _publication_integrity_error(
                 f"Suite {str(payload.get('suite'))!r}",
@@ -530,6 +563,11 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
             if isinstance(study, dict) and isinstance(study.get("status"), dict):
                 _raise_on_failed_publication(study["status"])
         return
+    if payload.get("publication_integrity") == "permission_denied":
+        raise _publication_access_error(
+            f"Experiment {str(payload.get('experiment'))!r}",
+            str(payload.get("publication_error")),
+        )
     if payload.get("publication_integrity") != "failed":
         return
     raise _publication_integrity_error(
@@ -562,6 +600,7 @@ def _show_suite_winners(suite: Suite) -> None:
     """Print the authoritative exposed winners from the last successful suite run.
 
     :param Suite suite: Compiled suite whose published summary is rendered.
+    :raises PublicationAccessError: This user cannot validate the published suite.
     :raises PublicationIntegrityError: The suite last-success pointer names a
         suite generation that no longer validates. Reported as corruption
         rather than as "no successful suite result yet", which is what a suite
@@ -571,6 +610,11 @@ def _show_suite_winners(suite: Suite) -> None:
         winners are never substituted for it.
     """
     publication = _resolve_suite_publication_pointer(suite)
+    if publication.state == "permission_denied":
+        raise _publication_access_error(
+            f"Suite {suite.suite!r}",
+            str(publication.error),
+        )
     if publication.state == "failed":
         raise _publication_integrity_error(
             f"Suite {suite.suite!r}",
@@ -649,6 +693,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     publication is labeled historical instead of silently reinterpreted.
 
     :param Experiment experiment: Experiment whose published winners are rendered.
+    :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The last-success pointer names a
         generation that no longer validates. Nothing is rendered in that case:
         printing "(no winner yet)" beside a corrupt publication reads as a
@@ -656,6 +701,11 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     """
     _validate_artifact_root_binding(experiment, claim_fresh=False)
     publication = _resolve_publication_pointer(experiment)
+    if publication.state == "permission_denied":
+        raise _publication_access_error(
+            f"Experiment {experiment.experiment!r}",
+            str(publication.error),
+        )
     if publication.state == "failed":
         raise _publication_integrity_error(
             f"Experiment {experiment.experiment!r}",
@@ -721,6 +771,8 @@ def status(config_path: Path) -> None:
     on stderr (review v0.5.18 / finding F4).
 
     :param Path config_path: Experiment or suite YAML file to inspect.
+    :raises PublicationAccessError: The reported publication cannot be
+        validated as the current user.
     :raises PublicationIntegrityError: The reported publication - or, for a
         suite, its own suite-level publication or any component study's - no
         longer validates.
@@ -788,7 +840,9 @@ def rebind_workdir(config_path: Path) -> None:
         ``workdir`` already names the artifact tree these studies own.
     :raises ArtifactRootRebindError: Storage is in-memory, every existing study
         is unbound and empty, a study cannot be read, or a destination fails
-        any of the checks above. Nothing is written.
+        any of the checks above; validation refusals write nothing. A later
+        apply-time failure can follow an earlier suite component already being
+        rebound, because the per-study storage updates are not one transaction.
     :raises ExperimentLockBusyError: Another orchestrator owns one of the
         experiment (or suite) consistency locks.
     """
@@ -892,6 +946,28 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         raise click.ClickException(str(exc)) from None
     handle = store.get(run_id)
     if handle is None:
+        with store.launch_lock() as acquired:
+            if not acquired:
+                raise click.ClickException(
+                    "another MCP launch is in progress; wait for it to finish and retry"
+                )
+            if store.is_pre_spawn_orphan(run_id):
+                if not confirm:
+                    click.echo(
+                        f"Recovery preflight for {run_id}: would remove the orphaned config "
+                        "snapshot left before any runner could spawn. Re-run with --confirm "
+                        "to perform that action."
+                    )
+                    return
+                try:
+                    store.clear_pre_spawn_orphan(run_id)
+                except ValueError as exc:
+                    raise click.ClickException(str(exc)) from None
+                click.echo(
+                    f"Removed pre-spawn orphan config snapshot for {run_id}; no runner or "
+                    "trainer was launched under that identity."
+                )
+                return
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
     if handle.launch_state == "launching" and terminal_status is None:

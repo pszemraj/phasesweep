@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import shlex
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -348,8 +349,41 @@ def test_validate_accepts_finite_hydra_fixed_override(tmp_path) -> None:
     )
 
     experiment = load_experiment(config)
-
     assert experiment.phases[0].fixed_overrides["knob"] == [1.5, -2.0]
+
+
+def test_validate_rejects_argparse_categorical_wire_collision(tmp_path: Path) -> None:
+    """Distinct categorical points must not launch byte-identical argparse values."""
+    config = _override_yaml(
+        tmp_path,
+        "argparse",
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 2\n"
+        "            sampler: {type: grid}\n"
+        "            search_space:\n"
+        "              knob: {type: categorical, choices: [1, '1']}\n",
+    )
+
+    with pytest.raises(ValidationError, match="both render as '1'.*override_format='argparse'"):
+        load_experiment(config)
+
+
+def test_validate_accepts_hydra_categorical_values_with_distinct_wires(tmp_path: Path) -> None:
+    """Hydra preserves the numeric-versus-string distinction in this grid."""
+    config = _override_yaml(
+        tmp_path,
+        "hydra",
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 2\n"
+        "            sampler: {type: grid}\n"
+        "            search_space:\n"
+        "              knob: {type: categorical, choices: [1, '1']}\n",
+    )
+
+    experiment = load_experiment(config)
+    assert experiment.phases[0].search_space["knob"].choices == [1, "1"]
 
 
 def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_path):

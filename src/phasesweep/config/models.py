@@ -21,6 +21,7 @@ from phasesweep.config.common import (
 from phasesweep.config.search import (
     NON_RESUMABLE_SAMPLERS,
     STOCHASTIC_SAMPLERS,
+    CategoricalParam,
     Sampler,
     SearchParam,
     _placeholder_values_for,
@@ -1066,6 +1067,24 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     from phasesweep.runtime.commands import _OverrideValueError, _render_override_value
 
     override_format = experiment.override_format
+    for key, param in phase.search_space.items():
+        if not isinstance(param, CategoricalParam):
+            continue
+        rendered: dict[str, tuple[int, Any]] = {}
+        for index, choice in enumerate(param.choices):
+            wire = _render_override_value(choice, override_format)
+            earlier = rendered.get(wire)
+            if earlier is not None:
+                earlier_index, earlier_choice = earlier
+                raise ValueError(
+                    f"Phase {phase.name!r}: categorical search_space key {key!r} has "
+                    f"choices {earlier_choice!r} at index {earlier_index} and {choice!r} "
+                    f"at index {index}, which both render as {wire!r} under "
+                    f"override_format={override_format!r}. Distinct search choices must "
+                    "produce distinct trainer command values; use different choices or "
+                    "override_format='json_file'."
+                )
+            rendered[wire] = (index, choice)
     for origin, overrides in _iter_fixed_override_layers(experiment, phase):
         for key, value in overrides.items():
             try:
