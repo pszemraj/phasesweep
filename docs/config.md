@@ -79,11 +79,13 @@ phase 'weight_decay': sampler=random seed=1 (resumable, reproducible)
 > [!IMPORTANT]
 > The program launched by `trial_command` must parse the selected format. PhaseSweep renders values and validates placeholders; it does not adapt your trainer's CLI.
 
+The default and primary integration is `argparse`, which is what `phasesweep init` and the shipped starter use. Choose `json_file` when the trainer consumes structured or nested configuration. `hydra` is compatibility support for an application that already uses Hydra/OmegaConf; PhaseSweep neither depends on Hydra nor performs Hydra config composition.
+
 | Format | Use when |
 | --- | --- |
-| `argparse` | New scripts using `argparse`, Click, Typer, or similar parsers. |
-| `hydra` | Existing Hydra/OmegaConf applications. |
-| `json_file` | Structured config, nested values, MCP-launched sweeps, and agent-facing workflows. |
+| `argparse` | Default for new scripts using `argparse`, Click, Typer, or similar parsers. |
+| `json_file` | Structured config, nested values, or trainers that accept a config-file path. |
+| `hydra` | Optional compatibility with an existing Hydra/OmegaConf application. |
 
 Each format has a required template placeholder and distinct value encoding. The [config reference](config_reference.yaml) defines that wire contract. The scalar/list CLI formats reject non-finite floats because their rendered `nan`/`inf` values have no distinct semantic JSON identity. `json_file` preserves JSON types and expands dotted keys into nested objects, making it the most robust boundary for structured values. Config load checks every statically known composed value with the same strict serializer used for real trials; see [JSON file override validation](#json-file-override-validation) for YAML scalar pitfalls.
 

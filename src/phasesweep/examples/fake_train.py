@@ -11,7 +11,7 @@ from phasesweep import report_objective
 
 
 def _parse_kv(tokens: list[str]) -> dict[str, Any]:
-    """Parse Hydra-style ``key=value`` tokens into a dict with light type inference.
+    """Parse optional ``key=value`` compatibility tokens with light type inference.
 
     :param list[str] tokens: Extra CLI tokens such as ``lr=0.001`` or ``use_amp=true``.
     :return dict[str, Any]: Parsed override values keyed by override name.

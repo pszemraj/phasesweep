@@ -756,7 +756,7 @@ def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
             serializer so the audit artifact can never claim a value the
             actual ``overrides.json`` wire artifact would reject (review
             v0.5.17 / finding B); load-time validation guarantees this
-            succeeds. When ``False`` (``argparse``/``hydra``), non-JSON
+            succeeds. When ``False`` (a scalar/list CLI format), non-JSON
             scalars fall back through ``default=str`` (Path, etc.) — there is
             no JSON wire artifact for those formats to diverge from.
 

@@ -375,7 +375,7 @@ class Phase(_Frozen):
     def _validate_override_key_syntax(self) -> Phase:
         r"""Reject malformed override keys before they hit the override renderer.
 
-        argparse/Hydra rendering quotes values shell-safely, but a malformed
+        CLI override rendering quotes values shell-safely, but a malformed
         *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
         produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
         treat surface noise (whitespace) as part of the key (review v0.5.6 /
@@ -383,7 +383,7 @@ class Phase(_Frozen):
 
         Permissible keys: dotted paths whose every segment is non-empty and
         matches ``[A-Za-z0-9_\-]+``. This covers ``lr``, ``model.depth``,
-        ``hydra.run.dir``, ``data.train_path``, ``optim.weight-decay``.
+        ``trainer.run.dir``, ``data.train_path``, ``optim.weight-decay``.
 
         Returns:
             Self, unchanged. Pydantic post-init validator protocol.
@@ -541,7 +541,7 @@ class Experiment(_Frozen):
             "fingerprints. Values must change whenever trial meaning changes outside this YAML."
         ),
     )
-    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
+    override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -768,8 +768,8 @@ class Experiment(_Frozen):
             # CLI override wire contract (PR #5 review / reviewer 2, blocker 3):
             # rendering a structured or non-finite value and hashing its
             # JSON-mode dump can disagree, so two different commands can share
-            # one fingerprint. Restrict argparse/Hydra values to the set where
-            # the wire form and semantic dump agree.
+            # one fingerprint. Restrict scalar/list CLI values to the set
+            # where the wire form and semantic dump agree.
             _validate_cli_override_values(self, phase)
 
             # Trial command template (v0.5.3 follow-up): render once with
@@ -1049,7 +1049,7 @@ def _validate_json_file_override_values(experiment: Experiment, phase: Phase) ->
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
-    """Reject argparse/Hydra override values with no faithful wire form.
+    """Reject scalar/list CLI override values with no faithful wire form.
 
     Config load delegates to the same recursive renderer used at trial launch,
     so the accepted values cannot drift between preflight and execution. The
@@ -1167,9 +1167,10 @@ def _validate_trial_command_template(
     * Phases declaring ``override_format: json_file`` but a template missing
       ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
       and silently runs with defaults).
-    * Phases with ``override_format: argparse`` or ``hydra`` and any inherited,
-      fixed, or sampled overrides but a template missing ``{overrides}`` —
-      same silent-no-op failure mode (review v0.5.6 / blocker 2).
+    * Phases using the default ``argparse`` format (or optional ``hydra``
+      compatibility format) with overrides but a template missing
+      ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
+      blocker 2).
 
     Both placeholder checks parse real ``str.format`` field names so that an
     escaped ``{{overrides}}`` (rendered as the literal string ``{overrides}``)
@@ -1181,7 +1182,7 @@ def _validate_trial_command_template(
         experiment: The :class:`Experiment` being validated.
         phase: The specific phase whose ``trial_command`` is being rendered.
         inherited_keys: Locked keys inherited from parents — used to decide
-            whether ``{overrides}`` is required for argparse/hydra formats.
+            whether ``{overrides}`` is required for scalar/list CLI formats.
 
     Raises:
         ValueError: Any of the failure modes listed above (typo, unbalanced
@@ -1254,8 +1255,10 @@ def _validate_trial_command_template(
             "inherited, fixed, or sampled overrides and trial_command "
             "does not reference {overrides_path}. The trainer would "
             "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or switch to override_format='argparse' / "
-            "'hydra' (which use the {overrides} placeholder)."
+            "to trial_command, or switch to the default "
+            "override_format='argparse' (which uses {overrides}). The "
+            "'hydra' compatibility format also uses {overrides} for an "
+            "existing Hydra entry point."
         )
     if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
         raise ValueError(
@@ -1277,7 +1280,7 @@ class SuiteDefaults(_Frozen):
     workdir: str = "./runs"
     trial_command: str | None = None
     provenance: dict[str, str] = Field(default_factory=dict)
-    override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
+    override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -1314,7 +1317,7 @@ class StudySpec(_Frozen):
     workdir: str | None = None
     trial_command: str | None = None
     provenance: dict[str, str] | None = None
-    override_format: Literal["argparse", "hydra", "json_file"] | None = None
+    override_format: Literal["argparse", "json_file", "hydra"] | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
     contracts: dict[str, Contract] = Field(default_factory=dict)

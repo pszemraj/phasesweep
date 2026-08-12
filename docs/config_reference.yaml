@@ -32,10 +32,10 @@
 # Operator-declared identities for trainer code, base config, data, dependencies, container, tokenizer, or other inputs outside this YAML. Keys and values must be nonempty.
 # Persistent storage requires at least one entry. The complete mapping is included in semantic fingerprints; update its values whenever an external input changes. PhaseSweep does not inspect imports or hash arbitrary trial_command inputs.
 
-# override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
-# `argparse` requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load, because only that set has one canonical wire form the semantic fingerprint preserves faithfully. Use override_format `json_file` for structured values.
-# `hydra` requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load. Non-finite floats are rejected because Hydra renders them distinctly while the semantic JSON fingerprint cannot preserve that distinction.
+# override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
+# `argparse` is the default and the format used by `phasesweep init` and the shipped starter. It requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load, because only that set has one canonical wire form the semantic fingerprint preserves faithfully. Use override_format `json_file` for structured values.
 # `json_file` requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
+# `hydra` is compatibility support for an existing Hydra/OmegaConf entry point; PhaseSweep does not depend on Hydra or perform its config composition. It requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load. Non-finite floats are rejected because their rendered values have no distinct semantic JSON identity.
 
 # metric: Metric (required)
 # Metric object keys:
@@ -307,7 +307,7 @@
 #   workdir: str = "./runs"
 #   trial_command: str | None = null
 #   provenance: dict[str, str] = {}
-#   override_format: Literal["argparse", "hydra", "json_file"] = "argparse"
+#   override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
 #   metric: Metric | None = null
 #   constraints: list[Constraint] = []
 #   contracts: dict[str, Contract] = {}
@@ -341,7 +341,7 @@
 # provenance: dict[str, str] | None = null
 # If omitted, inherits defaults.provenance; a non-null mapping replaces the default mapping, while explicit null clears it to `{}`. The compiled persistent experiment requires at least one entry.
 
-# override_format: Literal["argparse", "hydra", "json_file"] | None = null
+# override_format: Literal["argparse", "json_file", "hydra"] | None = null
 # If omitted, inherits defaults.override_format; explicit null blocks fallback and fails compilation. The resolved value follows the Experiment contract.
 
 # metric: Metric | None = null

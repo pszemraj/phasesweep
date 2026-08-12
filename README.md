@@ -85,7 +85,7 @@ effective_overrides:
 
 ## Use your own trainer
 
-Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory. Argparse and Hydra templates use `{overrides}` for the rendered parameters; `json_file` templates use `{overrides_path}`. The trainer must accept that boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
+Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory. The default and the shipped starter use `argparse`: `{overrides}` becomes ordinary `--key value` arguments. Use `json_file` with `{overrides_path}` when your trainer needs a structured config file. `hydra` remains an optional compatibility format for an existing Hydra/OmegaConf entry point; PhaseSweep does not require Hydra, and it is not the starting point for a new integration. The trainer must accept the selected boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
 
 Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
 

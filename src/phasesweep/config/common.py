@@ -137,9 +137,9 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
     Two keys collide when one's dot-path is a strict prefix of the other's.
 
     Examples:
-        * ``model`` and ``model.depth`` collide — argparse/Hydra renders
-          contradictory flags or ``model=llama model.depth=16``, and ``json_file``
-          cannot represent both a scalar and a nested object at the same key.
+        * ``model`` and ``model.depth`` collide — CLI formats render
+          contradictory arguments, and ``json_file`` cannot represent both a
+          scalar and a nested object at the same key.
         * ``model.depth`` and ``model.depths`` do **not** collide (different
           siblings, same depth).
         * ``a.b.c`` and ``a.b.c.d`` do collide.

@@ -16,7 +16,7 @@ _CliOverrideFormat = Literal["argparse", "hydra"]
 
 
 class _OverrideValueError(TypeError):
-    """A value outside the shared argparse/Hydra override contract."""
+    """A value outside the scalar/list CLI override contract."""
 
     def __init__(self, fmt: _CliOverrideFormat, value: Any, position: str) -> None:
         """Describe the exact nested value the selected CLI wire cannot render."""
@@ -38,7 +38,7 @@ def _render_override_value(
     position: str = "",
     _ancestors: set[int] | None = None,
 ) -> str:
-    """Render one value using the shared argparse/Hydra value contract.
+    """Render one value using the scalar/list CLI override contract.
 
     :param Any value: Scalar or recursively list-like override value.
     :param _CliOverrideFormat fmt: Target CLI override grammar.
@@ -206,7 +206,7 @@ def render_command(
             placeholders. Supported keys: ``overrides``, ``overrides_path``,
             ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
         overrides: The composed overrides for this trial.
-        fmt: One of ``"argparse"``, ``"hydra"``, ``"json_file"``.
+        fmt: One of ``"argparse"``, ``"json_file"``, ``"hydra"``.
         trial_dir: Per-trial directory used for ``{trial_dir}`` and for the
             ``overrides.json`` file when ``fmt == "json_file"``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
@@ -224,10 +224,7 @@ def render_command(
         ValueError: If ``fmt`` is not one of the three supported formats.
 
     """
-    if fmt == "hydra":
-        overrides_str = format_hydra(overrides)
-        overrides_path = ""
-    elif fmt == "argparse":
+    if fmt == "argparse":
         overrides_str = format_argparse(overrides)
         overrides_path = ""
     elif fmt == "json_file":
@@ -235,6 +232,9 @@ def render_command(
         overrides_path = str(
             write_json_file(overrides, trial_dir) if write_files else trial_dir / "overrides.json"
         )
+    elif fmt == "hydra":
+        overrides_str = format_hydra(overrides)
+        overrides_path = ""
     else:
         raise ValueError(f"Unknown override_format: {fmt}")
 
