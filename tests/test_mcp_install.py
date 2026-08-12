@@ -321,9 +321,28 @@ def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
 
     monkeypatch.setattr(install_edits.os, "replace", fail_replace)
 
-    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "write-error"
     assert path.read_text() == original
     assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
+
+
+def test_atomic_edit_reports_post_replace_fsync_failure(tmp_path, monkeypatch):
+    """A parent-fsync failure reports that the requested edit already committed."""
+    path = tmp_path / "mcp.json"
+    path.write_text('{"mcpServers": {}}\n')
+    real_fsync = install_edits.os.fsync
+
+    def fail_parent_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(install_edits.os, "fsync", fail_parent_fsync)
+
+    result = merge_json_member(path, "mcpServers", "phasesweep", ENTRY)
+
+    assert result == "durability-error"
+    assert json.loads(path.read_text())["mcpServers"]["phasesweep"] == ENTRY
 
 
 def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatch):
@@ -512,6 +531,19 @@ def test_server_command_refuses_missing_executable(tmp_path, monkeypatch):
         installer.resolve_server_command()
 
 
+def test_server_command_empty_sys_executable_never_resolves_from_cwd(tmp_path, monkeypatch):
+    """An embedded interpreter with no executable cannot pin a cwd-local script."""
+    local = _executable(tmp_path, name="phasesweep-mcp")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer.sys, "executable", "")
+    monkeypatch.setenv("PATH", "")
+
+    with pytest.raises(FileNotFoundError, match="cannot find an executable"):
+        installer.resolve_server_command()
+
+    assert local.is_file()
+
+
 def test_entry_styles_and_codex_toml(tmp_path):
     catalog = Path("/proj/catalog.yaml")
     assert mcp_entry("stdio", "/bin/x", catalog) == {
@@ -681,7 +713,9 @@ def test_check_install_reports_executable_before_catalog(fake_home, tmp_path, ca
     assert "no longer exists" in output
 
 
-def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_path, capsys):
+def test_check_install_reports_unconfigured_unmanaged_and_unreadable_entries(
+    fake_home, tmp_path, capsys
+):
     project = tmp_path / "proj"
     project.mkdir()
     claude = _target(project, "claude")
@@ -697,6 +731,13 @@ def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_p
     assert code == 0
     assert "unmanaged" in output
     assert "not installer-verified" in output
+
+    claude.mcp.path.write_text("{not strict json\n")
+    code = installer.check_install(project, ["claude"])
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "unreadable" in output
+    assert str(claude.mcp.path.resolve()) in output
 
 
 def test_check_install_resolves_legacy_uvx_launcher_from_path(
@@ -1466,6 +1507,26 @@ def test_installer_reports_json_config_race_as_stale(fake_home, tmp_path, capsys
     assert "config path or shape was unexpected" not in output
 
 
+def test_installer_reports_write_error_without_calling_it_a_race(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(install_edits.os, "replace", fail_replace)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "config could not be written" in output
+    assert "config changed before it could be replaced" not in output
+
+
 def test_installer_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1487,8 +1548,13 @@ def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path
     config.symlink_to(physical_config.name)
 
     assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    output = capsys.readouterr().out
+    assert str(physical_config) in output
     assert config.is_symlink()
     assert "phasesweep" in json.loads(physical_config.read_text())["mcpServers"]
+
+    assert installer.check_install(project, ["claude"]) == 0
+    assert str(physical_config) in capsys.readouterr().out
 
     assert installer.run("uninstall", project, None, ["claude"], "mcp", yes=True) == 0
     assert config.is_symlink()

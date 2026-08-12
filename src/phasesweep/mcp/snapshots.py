@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
+from phasesweep.engine.guards import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
     PublicationState,
@@ -85,12 +86,12 @@ class StatusSnapshot(_SnapshotModel):
     """Path-free terminal status view captured by the detached runner.
 
     ``current_generation_id`` and ``published_generation_id`` record the
-    mutable/last-success pointers at capture time. Run-scoped MCP reads refresh
-    them from the live tree before returning this snapshot because their public
-    contract is current pointer identity.
+    mutable/last-success pointers at capture time. Run-scoped MCP reads keep
+    them frozen so a later artifact relocation or generation cannot rewrite
+    this run's historical result.
     ``represented_generation_id`` is the generation whose winner/summary facts
-    this snapshot shows. ``is_published`` records the relationship at capture
-    time and is likewise refreshed by run-scoped MCP reads.
+    this snapshot shows. ``is_published`` records that relationship at capture
+    time.
     See :func:`phasesweep.engine.read.read_status`.
     """
 
@@ -123,8 +124,9 @@ class StatusSnapshot(_SnapshotModel):
     published_config_matches_current: bool | None = None
     """Whether the represented generation's config matched at capture time.
 
-    Run-scoped MCP reads recompute this against the current catalog config;
-    snapshots frozen before this field existed parse as ``None``.
+    Run-scoped MCP reads recompute this from the frozen represented-config
+    fingerprint and current catalog config; snapshots frozen before that
+    fingerprint existed parse as ``None``.
     """
 
     result_phase_plan: list[str] | None = None
@@ -226,6 +228,15 @@ class RunResultSnapshot(_SnapshotModel):
 
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
+    represented_config_fingerprint: str | None = None
+    """Semantic fingerprint of the represented result's config, when known.
+
+    The runner computes this while executing from its frozen catalog working
+    directory. Keeping the digest in the terminal snapshot lets later MCP
+    reads compare against the current catalog without consulting the artifact
+    tree or resolving an omitted ``execution.cwd`` against the server's own
+    unrelated working directory.
+    """
 
     def status_payload(self) -> dict[str, Any]:
         """Return the stored status in the engine reader's path-free shape.
@@ -323,6 +334,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
             summary_present=False,
         ),
         winners=[],
+        represented_config_fingerprint=None,
     )
     return snapshot.model_dump(mode="json")
 
@@ -431,6 +443,11 @@ def capture_result_snapshot(
             result_phase_plan=status["result_phase_plan"],
         ),
         winners=winner_snapshots,
+        represented_config_fingerprint=(
+            _experiment_semantic_fingerprint(experiment)
+            if status["published_config_matches_current"] is True
+            else None
+        ),
     )
     return snapshot.model_dump(mode="json")
 

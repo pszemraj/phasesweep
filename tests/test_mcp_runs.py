@@ -218,7 +218,7 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
     handles, unreadable_records = store.launch_inventory()
 
     assert [handle.run_id for handle in handles] == ["exp-valid"]
-    assert unreadable_records == 2
+    assert unreadable_records == {"run:broken", "run:exp-orphan"}
 
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:

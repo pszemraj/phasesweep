@@ -25,8 +25,10 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     ensure_private_dir,
     fsync_directory,
+    open_directory_fd,
     open_private_text,
     private_atomic_write_text,
+    read_private_text_at,
     try_lock_file,
     unlock_file,
     validate_private_dir,
@@ -400,7 +402,7 @@ class RunStore:
         handles, _unreadable = self._scan_handles()
         return handles
 
-    def launch_inventory(self) -> tuple[list[RunHandle], int]:
+    def launch_inventory(self) -> tuple[list[RunHandle], set[str]]:
         """Load handles and count records whose launch authority is unreadable.
 
         Ordinary read tools intentionally skip malformed handles so one bad
@@ -410,8 +412,8 @@ class RunStore:
 
         The caller must hold :meth:`launch_lock` across this scan and the spawn.
 
-        :return tuple[list[RunHandle], int]: Readable handles and the number of
-            distinct malformed-handle or orphan-evidence identities.
+        :return tuple[list[RunHandle], set[str]]: Readable handles and stable
+            identities for malformed handles or orphan evidence.
         """
         handles, unreadable = self._scan_handles()
         readable_ids = {handle.run_id for handle in handles}
@@ -426,7 +428,60 @@ class RunStore:
                 if SAFE_NAME_PATTERN.fullmatch(run_id) and run_id not in readable_ids:
                     unreadable.add(f"run:{run_id}")
                 break
-        return handles, len(unreadable)
+        return handles, unreadable
+
+    def is_pre_spawn_orphan(self, run_id: str) -> bool:
+        """Return whether only a pre-handle config snapshot exists for ``run_id``.
+
+        Launch writes the config snapshot before exclusively creating the
+        handle, and never spawns until both succeed. A snapshot with no handle
+        and no log, status, or cleanup evidence is therefore provably
+        pre-spawn and may be cleared by operator recovery. Any other shape is
+        ambiguous and remains fail-closed.
+
+        :param str run_id: Candidate orphan run identity.
+        :return bool: Whether the sole evidence is one valid private snapshot.
+        """
+        handle_path = self._runs_dir / f"{run_id}.json"
+        if (
+            not SAFE_NAME_PATTERN.fullmatch(run_id)
+            or handle_path.exists()
+            or handle_path.is_symlink()
+        ):
+            return False
+        snapshot = self.config_snapshot_path(run_id)
+        other_evidence = (
+            self.status_path(run_id),
+            self.log_path(run_id),
+            self.cleanup_uncertain_path(run_id),
+            self.cleanup_recovery_path(run_id),
+        )
+        if any(path.exists() or path.is_symlink() for path in other_evidence):
+            return False
+        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+        try:
+            try:
+                read_private_text_at(directory_fd, snapshot.name, snapshot)
+            except (OSError, UnsafePrivatePathError, UnicodeError):
+                return False
+        finally:
+            os.close(directory_fd)
+        return True
+
+    def clear_pre_spawn_orphan(self, run_id: str) -> None:
+        """Remove one revalidated pre-spawn orphan snapshot durably.
+
+        :param str run_id: Orphan identity previously reported by launch.
+        :raises ValueError: The evidence no longer has the provably pre-spawn shape.
+        """
+        if not self.is_pre_spawn_orphan(run_id):
+            raise ValueError(f"run {run_id!r} is not a config-snapshot-only pre-spawn orphan")
+        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+        try:
+            os.unlink(self.config_snapshot_path(run_id).name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.

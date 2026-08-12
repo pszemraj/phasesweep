@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -83,6 +84,7 @@ from phasesweep.mcp.server import (
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
     TOOL_LAUNCH_RUN,
+    AwaitRunResult,
     GetRunResultsResult,
     GetRunStatusResult,
     PhaseSweepMCP,
@@ -90,6 +92,7 @@ from phasesweep.mcp.server import (
     _status_next_action,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
+from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -526,11 +529,89 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
     else:
         store.config_snapshot_path("srv-orphan").write_text("experiment: srv\n")
 
-    with pytest.raises(RunCapacityUnknownError, match="cannot prove available launch capacity"):
+    with pytest.raises(
+        RunCapacityUnknownError, match="cannot prove available launch capacity"
+    ) as exc:
         app.launch("srv")
+
+    if record_kind == "orphan_config":
+        assert "srv-orphan" in str(exc.value)
+        assert "recover-run" in str(exc.value)
 
     assert "cmd" not in captured
     assert store.list_handles() == []
+
+
+def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    del app
+    run_id = "srv-pre-spawn-orphan"
+    snapshot = store.config_snapshot_path(run_id)
+    with open_private_text(snapshot, "x") as output:
+        output.write(config.read_text())
+
+    preflight = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+    assert preflight.exit_code == 0, preflight.output
+    assert "before any runner could spawn" in preflight.output
+    assert snapshot.is_file()
+
+    confirmed = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "no runner or trainer was launched" in confirmed.output
+    assert not snapshot.exists()
+
+
+@pytest.mark.parametrize("evidence", ["log", "dangling_handle"])
+def test_operator_recovery_refuses_ambiguous_pre_spawn_orphan(
+    tmp_path: Path,
+    evidence: str,
+) -> None:
+    """Only a snapshot with no other run evidence is safe to remove."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    del app
+    run_id = "srv-ambiguous-orphan"
+    snapshot = store.config_snapshot_path(run_id)
+    with open_private_text(snapshot, "x") as output:
+        output.write(config.read_text())
+    if evidence == "log":
+        with open_private_text(store.log_path(run_id), "x") as output:
+            output.write("runner may have started\n")
+    else:
+        handle_path = registry.state_dir / "runs" / f"{run_id}.json"
+        handle_path.symlink_to("missing-handle.json")
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "unknown run id" in result.output
+    assert snapshot.is_file()
 
 
 def test_launch_passes_config_snapshot_to_runner(
@@ -1566,6 +1647,28 @@ def test_status_and_winners_carry_the_publication_integrity_verdict(tmp_path: Pa
 
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
+    if os.geteuid() != 0:
+        snapshot = (
+            _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
+        )
+        original_mode = snapshot.stat().st_mode & 0o777
+        snapshot.chmod(0o000)
+        try:
+            denied_status_payload = app.status(experiment_id="srv")
+            denied_status = GetRunStatusResult.model_validate(denied_status_payload)
+            denied_winners = app.winners(experiment_id="srv")
+        finally:
+            snapshot.chmod(original_mode)
+        assert denied_status.publication_integrity == "permission_denied"
+        assert denied_status.published_generation_id is None
+        assert denied_status.is_published is False
+        assert denied_winners["publication_integrity"] == "permission_denied"
+        assert denied_winners["winner_count"] == 0
+        # MCP deliberately forwards the enum, not the local permission detail.
+        assert "publication_error" not in json.dumps(
+            [denied_status_payload, denied_winners], default=str
+        )
+
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
 
@@ -1736,7 +1839,7 @@ def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
 
 
-def test_run_scoped_snapshot_recomputes_publication_integrity(tmp_path: Path) -> None:
+def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) -> None:
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
@@ -1746,14 +1849,14 @@ def test_run_scoped_snapshot_recomputes_publication_integrity(tmp_path: Path) ->
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
-    assert status.publication_integrity == "failed"
-    assert status.is_published is False
-    assert status.phases[0].winner_present is False
-    assert results.publication_integrity == "failed"
-    assert results.winner_count == 0
+    assert status.publication_integrity == "ok"
+    assert status.is_published is True
+    assert status.phases[0].winner_present is True
+    assert results.publication_integrity == "ok"
+    assert results.winner_count == 1
 
 
-def test_run_scoped_snapshot_refreshes_live_generation_pointers(tmp_path: Path) -> None:
+def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) -> None:
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
@@ -1770,7 +1873,7 @@ def test_run_scoped_snapshot_refreshes_live_generation_pointers(tmp_path: Path) 
 
     after_failure = GetRunStatusResult.model_validate(app.status(run_id=run_id))
 
-    assert after_failure.current_generation_id == later_failed_id
+    assert after_failure.current_generation_id == run_id
     assert after_failure.published_generation_id == run_id
     assert after_failure.represented_generation_id == run_id
     assert after_failure.is_published is True
@@ -1780,13 +1883,13 @@ def test_run_scoped_snapshot_refreshes_live_generation_pointers(tmp_path: Path) 
 
     after_publication = GetRunStatusResult.model_validate(app.status(run_id=run_id))
 
-    assert after_publication.current_generation_id == later_published_id
-    assert after_publication.published_generation_id == later_published_id
+    assert after_publication.current_generation_id == run_id
+    assert after_publication.published_generation_id == run_id
     assert after_publication.represented_generation_id == run_id
-    assert after_publication.is_published is False
+    assert after_publication.is_published is True
 
 
-def test_run_scoped_snapshot_fails_closed_when_publication_pointer_disappears(
+def test_run_scoped_snapshot_survives_publication_pointer_removal(
     tmp_path: Path,
 ) -> None:
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
@@ -1797,11 +1900,35 @@ def test_run_scoped_snapshot_fails_closed_when_publication_pointer_disappears(
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
-    assert status.publication_integrity == "failed"
-    assert status.is_published is False
-    assert status.phases[0].winner_present is False
-    assert results.publication_integrity == "failed"
-    assert results.winner_count == 0
+    assert status.publication_integrity == "ok"
+    assert status.is_published is True
+    assert status.phases[0].winner_present is True
+    assert results.publication_integrity == "ok"
+    assert results.winner_count == 1
+
+
+def test_run_scoped_snapshot_survives_artifact_tree_relocation(tmp_path: Path) -> None:
+    """Completed run reads use frozen evidence even when the live tree moved."""
+    run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, _store = make_mcp_app(catalog)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    source = _experiment_dir(experiment)
+    relocated = tmp_path / "relocated" / source.name
+    relocated.parent.mkdir()
+    shutil.move(source, relocated)
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+    awaited = AwaitRunResult.model_validate(asyncio.run(app.await_run(run_id)))
+
+    for payload in (status, awaited):
+        assert payload.result_source == "frozen_run_snapshot"
+        assert payload.publication_integrity == "ok"
+        assert payload.phases[0].winner_present is True
+    assert results.result_source == "frozen_run_snapshot"
+    assert results.publication_integrity == "ok"
+    assert results.winner_count == 1
 
 
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(

@@ -72,6 +72,25 @@ _LOCK_UNAVAILABLE_NOTE = (
 )
 
 
+def _write_failure_note(result: str, *, subject: str = "config") -> str | None:
+    """Describe an installer write failure without misclassifying its timing.
+
+    :param str result: Atomic write result returned by the edit primitive.
+    :param str subject: User-facing name of the file being changed.
+    :return str | None: Failure detail, or ``None`` after a successful write.
+    """
+    if result == "written":
+        return None
+    if result == "stale":
+        return f"{subject} changed before it could be replaced"
+    if result == "durability-error":
+        return (
+            f"{subject} was replaced, but syncing its parent directory failed; "
+            "the edit is visible, but crash durability could not be confirmed"
+        )
+    return f"{subject} could not be written"
+
+
 @dataclass(frozen=True)
 class StepResult:
     """Outcome of one integration edit for one agent target."""
@@ -128,9 +147,10 @@ def resolve_server_command() -> str:
     :raises FileNotFoundError: If neither the active environment nor the
         absolute ``PATH`` entries contain a launchable script.
     """
-    sibling = Path(sys.executable).parent / "phasesweep-mcp"
-    if sibling.is_file() and os.access(sibling, os.X_OK):
-        return str(sibling.absolute())
+    if sys.executable:
+        sibling = Path(sys.executable).parent / "phasesweep-mcp"
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            return str(sibling.absolute())
     found = _which_on_absolute_path("phasesweep-mcp")
     if found:
         return str(Path(found).absolute())
@@ -263,7 +283,7 @@ def _apply_toml_mcp(
                 return StepResult("mcp", path, "removed")
             write_result = _atomic_write_text(path, candidate, expected=loaded)
             action: Action = "removed" if write_result == "written" else "error"
-            note = None if action == "removed" else "config changed before it could be replaced"
+            note = _write_failure_note(write_result)
             return StepResult("mcp", path, action, note=note)
 
         assert catalog is not None  # narrowed by the install-only guard above
@@ -324,7 +344,7 @@ def _apply_toml_mcp(
         action = (
             ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
-        note = None if action != "error" else "config changed before it could be replaced"
+        note = None if action != "error" else _write_failure_note(write_result)
         return StepResult("mcp", path, action, note=note)
 
 
@@ -396,6 +416,8 @@ def _apply_mcp(
                 "error",
                 note="config changed before it could be replaced",
             )
+        if action in {"write-error", "durability-error"}:
+            return StepResult("mcp", spec.path, "error", note=_write_failure_note(action))
         if action == "skipped":
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
@@ -427,6 +449,16 @@ def _apply_mcp(
             "error",
             note=(
                 "config changed before it could be replaced; merge this manually:\n"
+                f"{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
+            ),
+        )
+    if action in {"write-error", "durability-error"}:
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note=(
+                f"{_write_failure_note(action)}; merge this manually:\n"
                 f"{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
             ),
         )
@@ -636,7 +668,7 @@ def _apply_instructions(
                 retained_note = (
                     f"retained for: {', '.join(sorted(owners))}"
                     if action != "error"
-                    else "instructions changed before they could be replaced"
+                    else _write_failure_note(write_result, subject="instructions")
                 )
                 return StepResult("instructions", path, action, note=retained_note)
             removal_candidate = removed_marked_text(
@@ -651,7 +683,11 @@ def _apply_instructions(
                 return StepResult("instructions", path, "removed")
             write_result = _atomic_write_text(edit_path, removal_candidate, expected=loaded)
             action = "removed" if write_result == "written" else "error"
-            removal_note = None if action == "removed" else "instructions changed before removal"
+            removal_note = (
+                None
+                if action == "removed"
+                else _write_failure_note(write_result, subject="instructions")
+            )
             return StepResult("instructions", path, action, note=removal_note)
 
         owners.add(target.id)
@@ -676,7 +712,7 @@ def _apply_instructions(
             ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
         install_note = (
-            None if action != "error" else "instructions changed before they could be replaced"
+            None if action != "error" else _write_failure_note(write_result, subject="instructions")
         )
         return StepResult("instructions", path, action, note=install_note)
 
@@ -890,7 +926,18 @@ def _print_plan(
                 click.echo(f"    {integration:<13} (not supported)")
                 continue
             scope = " [user scope]" if integration == "mcp" and target.mcp.scope == "user" else ""
-            click.echo(f"    {integration:<13} {path}{scope}")
+            display_path = path
+            if integration == "mcp":
+                if target.mcp.scope == "project":
+                    resolved_path = _resolved_project_path(path, project)
+                else:
+                    try:
+                        resolved_path = path.resolve(strict=False)
+                    except (OSError, RuntimeError):
+                        resolved_path = None
+                if resolved_path is not None:
+                    display_path = resolved_path
+            click.echo(f"    {integration:<13} {display_path}{scope}")
             if notice and mode == "install":
                 _echo_plan_note(notice)
             if integration == "mcp" and mode == "install" and catalog is not None:
@@ -1178,21 +1225,21 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     snapshot = _read_editable_text(edit_path)
     if snapshot is None:
         return LauncherCheck(
-            spec.path,
+            edit_path,
             None,
             (),
             "unreadable",
             "config path is not a readable regular UTF-8 file",
         )
     if not snapshot.existed or not snapshot.text.strip():
-        return LauncherCheck(spec.path, None, (), "not-configured")
+        return LauncherCheck(edit_path, None, (), "not-configured")
 
     if spec.format == "toml":
         try:
             parsed = tomllib.loads(snapshot.text)
         except tomllib.TOMLDecodeError as exc:
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1200,10 +1247,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         entry = _toml_mcp_entry(parsed)
         if entry is None:
-            return LauncherCheck(spec.path, None, (), "not-configured")
+            return LauncherCheck(edit_path, None, (), "not-configured")
         if not is_managed_mcp_entry("stdio", entry) or not isinstance(entry, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unmanaged",
@@ -1217,7 +1264,7 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             data = strict_json_loads(snapshot.text, finite_floats=True)
         except ValueError:
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1225,7 +1272,7 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         if not isinstance(data, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1234,10 +1281,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         container = data.get(spec.key)
         member = container.get(SERVER_NAME) if isinstance(container, dict) else None
         if member is None:
-            return LauncherCheck(spec.path, None, (), "not-configured")
+            return LauncherCheck(edit_path, None, (), "not-configured")
         if not is_managed_mcp_entry(spec.style, member) or not isinstance(member, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unmanaged",
@@ -1252,7 +1299,7 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         status, detail = _probe_configured_catalog(args)
         if status == "ok" and not _is_absolute_phasesweep_command(command):
             detail = _LEGACY_LAUNCHER_NOTE
-    return LauncherCheck(spec.path, command, tuple(args), status, detail)
+    return LauncherCheck(edit_path, command, tuple(args), status, detail)
 
 
 def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
@@ -1285,14 +1332,17 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     for target in targets:
         result = _check_target_launcher(target)
         click.echo(f"  {target.display_name}")
+        if result.config_path is not None:
+            click.echo(f"    config        {result.config_path}")
         if result.status == "not-configured":
             click.echo(f"    mcp           {result.status:<13}")
             continue
         configured += 1
         if result.status == "unmanaged":
             click.echo(f"    mcp           unmanaged     {result.config_path}")
+        elif result.executable is None:
+            click.echo(f"    mcp           {result.status:<13}")
         else:
-            assert result.executable is not None
             invocation = shlex.join([result.executable, *result.args])
             click.echo(f"    mcp           {result.status:<13} {invocation}")
         if result.detail:

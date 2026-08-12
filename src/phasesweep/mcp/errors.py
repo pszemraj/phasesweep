@@ -184,14 +184,24 @@ class ConcurrencyLimitError(McpToolError):
 class RunCapacityUnknownError(McpToolError):
     """Raised when persisted run records cannot prove launch capacity."""
 
-    def __init__(self, unreadable_records: int) -> None:
+    def __init__(self, unreadable_records: int, recoverable_run_ids: Sequence[str] = ()) -> None:
         """Create a fail-closed capacity error without exposing state paths.
 
         :param int unreadable_records: Distinct malformed or orphaned run identities.
+        :param Sequence[str] recoverable_run_ids: Safe run ids whose only
+            evidence is a provably pre-spawn config snapshot.
         """
+        recovery = ""
+        if recoverable_run_ids:
+            ids = ", ".join(repr(run_id) for run_id in recoverable_run_ids)
+            recovery = (
+                f" Pre-spawn orphan run id(s): {ids}. Ask the operator to run "
+                "`phasesweep mcp recover-run --state-dir <configured-state-dir> "
+                "--run-id <id>` and then repeat it with `--confirm`."
+            )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
-            f"{unreadable_records} unreadable or orphaned run record(s). Do not retry or "
+            f"{unreadable_records} unreadable or orphaned run record(s).{recovery} Do not retry or "
             "launch a replacement. Ask the operator to inspect and repair the MCP state "
             "directory first."
         )

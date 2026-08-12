@@ -52,11 +52,13 @@ Action: TypeAlias = Literal[
     "skipped",
     "conflict",
     "error",
+    "write-error",
+    "durability-error",
     "lock-error",
     "removed",
     "not-found",
 ]
-AtomicWriteResult: TypeAlias = Literal["written", "stale", "error"]
+AtomicWriteResult: TypeAlias = Literal["written", "stale", "write-error", "durability-error"]
 MemberPredicate: TypeAlias = Callable[[object], bool]
 
 _INDENT_PATTERN = re.compile(r"^([ \t]+)\S", re.MULTILINE)
@@ -260,7 +262,9 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
     :param str text: Complete replacement contents.
     :param _TextSnapshot expected: Snapshot that must still match before replace.
     :return AtomicWriteResult: ``written`` on success, ``stale`` when the
-        target changed since it was read, or ``error`` when replacement failed.
+        target changed since it was read, ``write-error`` when replacement failed
+        before commit, or ``durability-error`` when the replacement committed
+        but syncing its parent directory failed.
     """
     parent_fd = -1
     temporary: str | None = None
@@ -284,10 +288,13 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
             return "stale"
         os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = None
-        os.fsync(parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            return "durability-error"
         return "written"
     except (OSError, UnsafePrivatePathError):
-        return "error"
+        return "write-error"
     finally:
         if temporary is not None and parent_fd >= 0:
             with contextlib.suppress(OSError):

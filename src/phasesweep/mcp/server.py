@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import generation_id_source, read_status, read_winners
+from phasesweep.engine.guards import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import PublicationState, Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
@@ -208,7 +209,10 @@ PublicationIntegrity = Annotated[
             "recorded but its artifacts no longer validate, so every result field reads as "
             "if nothing published. On 'failed', report the corruption to the operator and do "
             "not launch a run against this experiment: a successful run advances the "
-            "publication pointer past the corrupt result and nothing reports it afterwards."
+            "publication pointer past the corrupt result and nothing reports it afterwards. "
+            "'permission_denied': the publication may be healthy, but this user cannot "
+            "validate its owner-only evidence; expose no winners and ask the operator to "
+            "re-read it as the publishing user or restore read permission."
         )
     ),
 ]
@@ -1146,7 +1150,6 @@ class PhaseSweepMCP:
         status = (
             self._snapshot_status_payload(
                 target_id,
-                experiment,
                 snapshot,
                 result_source=result_source,
             )
@@ -1173,62 +1176,36 @@ class PhaseSweepMCP:
     def _snapshot_status_payload(
         self,
         experiment_id: str,
-        run_experiment: Experiment,
         snapshot: RunResultSnapshot,
         *,
         result_source: ResultSource,
     ) -> dict[str, Any]:
-        """Combine frozen run facts with deliberately live publication state.
+        """Return frozen run facts with a config-only live drift comparison.
 
-        Trial counts, winners, labels, and represented-generation identity stay
-        frozen. The current/published pointers and their relationship to the
-        represented generation, publication integrity, and config drift are
-        properties of the artifact tree and catalog now. Serving those fields
-        from capture time would make a run-scoped status contradict a live read.
+        A terminal run snapshot is the historical read authority for that run.
+        Publication pointers and integrity stay as captured: consulting the
+        live artifact tree here would make an intact snapshot unreadable after
+        relocation, and a later generation's damage could erase this run's
+        already-validated winners. Config drift is the sole live field and
+        compares the frozen represented-config fingerprint with the current
+        catalog.
 
         :param str experiment_id: Catalog id associated with the run.
-        :param Experiment run_experiment: Frozen config used to locate the run's tree.
         :param RunResultSnapshot snapshot: Validated frozen result snapshot.
         :param ResultSource result_source: Snapshot provenance, including the
             unavailable placeholder case.
-        :return dict[str, Any]: Frozen status with current integrity/drift verdicts.
+        :return dict[str, Any]: Frozen status with a current config-drift verdict.
         """
         status = snapshot.status_payload()
-        frozen_was_published = status["is_published"] is True
         comparison = self._catalog_comparison_experiment(experiment_id)
-        represented_generation_id = status["represented_generation_id"]
-        live = read_status(
-            run_experiment,
-            generation_id=(
-                represented_generation_id if isinstance(represented_generation_id, str) else None
-            ),
-            comparison_experiment=comparison,
-        )
-        status["current_generation_id"] = live["current_generation_id"]
-        status["published_generation_id"] = live["published_generation_id"]
-        status["is_published"] = live["is_published"]
-        live_integrity = live["publication_integrity"]
-        if frozen_was_published and live_integrity == "absent":
-            # The frozen terminal evidence proves a publication existed. A
-            # missing last-success pointer is therefore lost publication
-            # authority, not the benign never-published state used by a fresh
-            # tree. Fail closed exactly like a corrupt pointer target.
-            live_integrity = "failed"
-        status["publication_integrity"] = live_integrity
+        represented_fingerprint = snapshot.represented_config_fingerprint
         status["published_config_matches_current"] = (
-            live["published_config_matches_current"]
-            if comparison is not None and result_source != "terminal_snapshot_unavailable"
+            represented_fingerprint == _experiment_semantic_fingerprint(comparison)
+            if comparison is not None
+            and represented_fingerprint is not None
+            and result_source != "terminal_snapshot_unavailable"
             else None
         )
-        if live_integrity == "failed":
-            # A failed pointer may not expose the unvalidated publication as a
-            # current result. Keep the terminal run's frozen trial counts, but
-            # clear result-presence claims and let callers omit winner values.
-            status["is_published"] = False
-            status["published_generation_id"] = None
-            status["summary_present"] = False
-            for phase in status["phases"]:
-                phase["winner_present"] = False
         return status
 
     def _status_result(
@@ -1338,9 +1315,9 @@ class PhaseSweepMCP:
 
         The payload carries ``publication_integrity`` so an empty winner list
         is never ambiguous: ``"absent"`` means nothing has published yet,
-        ``"failed"`` means a recorded publication no longer validates and the
-        agent must stop rather than propose another run (review v0.5.18 /
-        finding F4).
+        ``"failed"`` means a recorded publication no longer validates;
+        ``"permission_denied"`` means this user cannot validate it without
+        implying corruption. Both expose no winners and require operator action.
 
         Every label describing the winners -- metric name and goal, objective
         evidence, and the declared phase plan the completeness fields are
@@ -1372,12 +1349,13 @@ class PhaseSweepMCP:
             # the same place the live branch does.
             status = self._snapshot_status_payload(
                 target_id,
-                experiment,
                 snapshot,
                 result_source=result_source,
             )
             winner_views = (
-                [] if status["publication_integrity"] == "failed" else snapshot.winner_views()
+                []
+                if status["publication_integrity"] in {"failed", "permission_denied"}
+                else snapshot.winner_views()
             )
         else:
             # Resolve the represented generation once via read_status, then
@@ -1401,6 +1379,8 @@ class PhaseSweepMCP:
                 generation_id=status["represented_generation_id"],
                 phase_names=status["result_phase_plan"],
             )
+            if status["publication_integrity"] in {"failed", "permission_denied"}:
+                winner_views = []
         represented_generation_id: str | None = status["represented_generation_id"]
         publication_integrity: PublicationState = status["publication_integrity"]
         authority_handle = handle
@@ -1567,9 +1547,15 @@ class PhaseSweepMCP:
             with self._runs.launch_lock() as acquired:
                 if not acquired:
                     raise LaunchInProgressError()
-                handles, unreadable_records = self._runs.launch_inventory()
-                if unreadable_records:
-                    raise RunCapacityUnknownError(unreadable_records)
+                handles, unreadable = self._runs.launch_inventory()
+                if unreadable:
+                    recoverable = sorted(
+                        identity.removeprefix("run:")
+                        for identity in unreadable
+                        if identity.startswith("run:")
+                        and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                    )
+                    raise RunCapacityUnknownError(len(unreadable), recoverable)
                 live = [handle for handle in handles if self._runs.state(handle) == "running"]
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)

@@ -104,9 +104,10 @@ def winners_payload(
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
     :param PublicationState publication_integrity: Whether the experiment's
-        last-success pointer is valid, absent, or names a generation that no
-        longer validates. An empty winner list means two very different things
-        under ``"absent"`` and ``"failed"`` (review v0.5.18 / finding F4).
+        last-success pointer is valid, absent, names a generation that no
+        longer validates, or cannot be validated as this user. An empty winner
+        list has different remedies under ``"absent"``, ``"failed"``, and
+        ``"permission_denied"``.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
@@ -210,7 +211,7 @@ def status_payload(
     published one -- ``False`` for a pinned read of a failed-publication
     generation, even though its winners still show.
 
-    ``publication_integrity`` carries the tri-state verdict through unchanged
+    ``publication_integrity`` carries the four-state verdict through unchanged
     (review v0.5.18 / finding F4). The accompanying ``publication_error`` is
     deliberately *not* forwarded: the enum is what an agent must branch on,
     and the free-text detail belongs to the operator-facing CLI, which is the
