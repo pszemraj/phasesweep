@@ -132,6 +132,7 @@ def _two_phase_experiment(
         workdir=str(workdir),
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=phases,
     )
 
@@ -162,6 +163,7 @@ def _promotion_chain_experiment(
         workdir=str(workdir),
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="arch",
@@ -215,6 +217,7 @@ storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -338,6 +341,7 @@ def test_fingerprint_changes_when_parent_winner_changes():
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -383,6 +387,7 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -424,6 +429,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -435,6 +441,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -470,6 +477,22 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             lambda: (
                 make_experiment(provenance={"revision": "trainer-v1"}),
                 make_experiment(provenance={"revision": "trainer-v2"}),
+            ),
+            False,
+        ),
+        (
+            "trainer_config",
+            lambda: (
+                make_experiment(
+                    trial_command="echo {config_path}",
+                    override_format="yaml_file",
+                    trainer_config={"model": {"depth": 4}},
+                ),
+                make_experiment(
+                    trial_command="echo {config_path}",
+                    override_format="yaml_file",
+                    trainer_config={"model": {"depth": 8}},
+                ),
             ),
             False,
         ),
@@ -614,6 +637,7 @@ def test_suite_fingerprint_includes_effective_invocation_cwd(
         defaults=SuiteDefaults(
             workdir=base.workdir,
             trial_command=base.trial_command,
+            override_format=base.override_format,
             metric=base.metric,
         ),
         studies=[StudySpec(name="study", phases=base.phases)],
@@ -711,6 +735,7 @@ storage: sqlite:///{db}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -779,6 +804,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -840,6 +866,7 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     first = run_experiment(experiment)
@@ -865,6 +892,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     winners = run_experiment(experiment)
@@ -1150,6 +1178,7 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
@@ -1173,6 +1202,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
             workdir=workdir,
             storage=f"sqlite:///{tmp_path / database}",
             trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            override_format="argparse",
             n_trials=1,
         )
 
@@ -1217,6 +1247,7 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
@@ -1362,6 +1393,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
         workdir=tmp_path / "runs",
         storage="sqlite:///ledger.db",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     monkeypatch.chdir(registration_cwd)
@@ -1397,6 +1429,7 @@ def test_retargeted_experiment_symlink_is_rejected_before_claim(
         workdir=original_parent,
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(owner)
@@ -1422,6 +1455,7 @@ def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> 
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
@@ -1443,6 +1477,7 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     experiment = experiment.model_copy(
@@ -1469,6 +1504,7 @@ def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
@@ -1670,6 +1706,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         workdir=tmp_path / "runs_a",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment_a)
@@ -1736,6 +1773,7 @@ def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) 
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{db_path}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
@@ -1787,6 +1825,7 @@ def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
     experiment = make_experiment(
         workdir=tmp_path / "runs_a",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
@@ -1803,6 +1842,7 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     generation_id = "fixed-generation"
@@ -1850,6 +1890,7 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     exp = make_experiment(
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
     )
     run_experiment(exp)
 
@@ -2134,6 +2175,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         env={"PHASESWEEP_TEST_SECRET": "config-secret"},
         execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
         n_trials=1,
@@ -2269,6 +2311,7 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
             experiment="t",
             workdir=str(tmp_path / "wd"),
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),

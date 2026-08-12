@@ -138,7 +138,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
 
     Examples:
         * ``model`` and ``model.depth`` collide — CLI formats render
-          contradictory arguments, and ``json_file`` cannot represent both a
+          contradictory arguments, and dotted override composition cannot represent both a
           scalar and a nested object at the same key.
         * ``model.depth`` and ``model.depths`` do **not** collide (different
           siblings, same depth).

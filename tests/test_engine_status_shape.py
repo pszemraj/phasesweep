@@ -129,6 +129,7 @@ def _write_suite(tmp_path: Path) -> Path:
           storage: sqlite:///{tmp_path}/shape.db
           provenance: {{revision: test-fixture-v1}}
           trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize

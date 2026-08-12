@@ -771,12 +771,14 @@ def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> No
         workdir=str(tmp_path / "runs_a"),
         storage=storage,
         trial_command="true {overrides}",
+        override_format="argparse",
         n_trials=1,
     )
     exp_b = make_experiment(
         workdir=str(tmp_path / "runs_b"),
         storage=storage,
         trial_command="true {overrides}",
+        override_format="argparse",
         n_trials=1,
     )
 

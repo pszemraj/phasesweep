@@ -80,6 +80,7 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         env={"TRAINER_TOKEN": secret},
     )

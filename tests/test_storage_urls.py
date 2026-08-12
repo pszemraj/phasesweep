@@ -76,6 +76,7 @@ def _storage_policy_config(
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -170,6 +171,7 @@ def test_external_rdb_storage_error_is_actionable() -> None:
             storage="postgresql://user:pass@host/db",
             provenance={"revision": "test-fixture-v1"},
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),
@@ -247,6 +249,7 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
               storage: postgresql://user:pass@host/db
               allow_external_rdb_single_host: true
               trial_command: "echo"
+              override_format: argparse
               provenance: {revision: default-v1}
               metric:
                 name: x
@@ -344,6 +347,7 @@ def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
             storage="sqlite:///test.db",
             provenance={"revision": "test-fixture-v1"},
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),

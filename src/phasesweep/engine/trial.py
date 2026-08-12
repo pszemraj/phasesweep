@@ -409,7 +409,10 @@ def launch_trial(
     # resolved overrides. See docs/runtime.md's trust-boundary note.
     resolved_overrides_path = workdir / "overrides_resolved.json"
     resolved_overrides_path.write_text(
-        _json_dump_overrides(overrides, strict=experiment.override_format == "json_file"),
+        _json_dump_overrides(
+            overrides,
+            strict=experiment.override_format in {"json_file", "yaml_file"},
+        ),
         encoding="utf-8",
     )
 
@@ -422,12 +425,17 @@ def launch_trial(
         trial_id=trial_id,
         phase=phase_name,
         run_name=run_name,
+        trainer_config=experiment.trainer_config,
     )
 
     evidence_overrides_path = (
-        workdir / "overrides.json"
-        if experiment.override_format == "json_file"
-        else resolved_overrides_path
+        workdir / "trainer_config.yaml"
+        if experiment.override_format == "yaml_file"
+        else (
+            workdir / "overrides.json"
+            if experiment.override_format == "json_file"
+            else resolved_overrides_path
+        )
     )
     overrides_sha256 = file_sha256(evidence_overrides_path)
     # Orchestrator-created trial artifact, not symlink-hardened by design (see
@@ -752,7 +760,7 @@ def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
 
     Args:
         overrides: The composed (inherited + fixed + sampled) overrides dict.
-        strict: When ``True`` (``json_file`` format), use the canonical wire
+        strict: When ``True`` (``yaml_file`` or ``json_file`` format), use the canonical wire
             serializer so the audit artifact can never claim a value the
             actual ``overrides.json`` wire artifact would reject (review
             v0.5.17 / finding B); load-time validation guarantees this

@@ -43,6 +43,7 @@ def _suite_yaml(tmp_path: Path) -> str:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize

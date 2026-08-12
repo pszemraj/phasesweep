@@ -268,6 +268,7 @@ def _sleeping_score_experiment(
         experiment=experiment,
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -300,6 +301,7 @@ storage: journal:///{journal_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -340,6 +342,7 @@ storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "false {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -381,6 +384,7 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     first = make_experiment(
         workdir=workdir,
         trial_command=f"python {success} {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
 
@@ -539,6 +543,7 @@ storage: sqlite:///{db}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -666,6 +671,7 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
 experiment: abort_recheck
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -771,6 +777,7 @@ storage: sqlite:///{tmp_path}/platform.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "echo {{overrides}}"
+override_format: argparse
 metric:
   name: x
   goal: minimize
@@ -801,6 +808,7 @@ storage: sqlite:///{tmp_path}/fail.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "false {{overrides}}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -852,6 +860,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{db}",
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=3,
         max_consecutive_failures=2,
         sampler={"type": "random", "seed": 7},
@@ -884,6 +893,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
             workdir=tmp_path / "runs",
             storage=storage,
             trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -936,6 +946,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
             workdir=tmp_path / "runs",
             storage=f"sqlite:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -971,6 +982,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
             workdir=tmp_path / "runs",
             storage=f"sqlite:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=n_trials,
             max_consecutive_failures=3,
             sampler={"type": "random", "seed": 7},
@@ -1005,6 +1017,7 @@ def test_outcome_ledger_recovers_when_abort_marker_write_fails(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{db}",
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         max_consecutive_failures=2,
         sampler={"type": "random", "seed": 7},
@@ -1053,6 +1066,7 @@ def _outcome_write_experiment(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         constraints=constraints,
         max_consecutive_failures=5,
@@ -1430,6 +1444,7 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
             workdir=tmp_path / "runs",
             storage=f"sqlite:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -1486,6 +1501,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
         workdir=tmp_path / "runs",
         storage=f"journal:///{db}",
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=3,
         n_jobs=3,
         gpu_policy="none",
@@ -1517,6 +1533,7 @@ def test_parallel_unexpected_objective_error_is_phase_fatal_and_durable(
         workdir=tmp_path / "runs",
         storage=f"journal:///{journal}",
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         n_jobs=2,
         gpu_policy="none",
@@ -1653,6 +1670,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         experiment="phase_timeout_all_terminal",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -1706,6 +1724,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         experiment="phase_timeout_allowed_abort_counter",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -1776,6 +1795,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
         storage=f"sqlite:///{tmp_path / 'decision.db'}",
         provenance={"revision": "test-fixture-v1"},
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -1912,6 +1932,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         storage=f"sqlite:///{tmp_path / 'refused.db'}",
         provenance={"revision": "test-fixture-v1"},
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -1976,6 +1997,7 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'shutdown.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         gpu_policy="none",
         allow_no_gpu_isolation=True,
@@ -2045,6 +2067,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
         experiment="gpu_lease_timeout_attribution",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -2148,6 +2171,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         sampler=Sampler(type="random", seed=0),
     )
@@ -2198,6 +2222,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     first = run_experiment(experiment)
@@ -2249,6 +2274,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
         experiment = make_experiment(
             workdir=tmp_path / "runs",
             trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            override_format="argparse",
             n_trials=1,
         )
         run_experiment(experiment)
@@ -2259,6 +2285,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
             experiment="fails",
             workdir=tmp_path / "runs",
             trial_command=f"python {failing_trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            override_format="argparse",
             n_trials=1,
             max_consecutive_failures=1,
         )
@@ -2409,6 +2436,7 @@ def test_run_suite_installs_signal_handlers_once_for_all_components(
                 defaults:
                   workdir: {tmp_path}/runs
                   trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+                  override_format: argparse
                   metric:
                     name: x
                     goal: minimize
@@ -2798,6 +2826,7 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command="false {overrides}",
+        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=10,
         timeout_seconds_per_phase=100.0,
@@ -2845,6 +2874,7 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         timeout_seconds_per_phase=0.5,
     )
@@ -2944,6 +2974,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path / "runs"}
         trial_command: "python {trainer} {{overrides}}"
+        override_format: argparse
         metric:
           name: eval_loss
           goal: minimize

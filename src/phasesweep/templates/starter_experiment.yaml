@@ -8,8 +8,18 @@ workdir: __PHASESWEEP_WORKDIR__
 
 # This trainer ships inside the installed PhaseSweep package. Replace it with
 # your own command after the local smoke test.
-trial_command: "python -m phasesweep.examples.fake_train {overrides}"
-override_format: argparse
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+# This is the trainer's ordinary base configuration. PhaseSweep copies it for
+# every trial, applies inherited/fixed/sampled dotted-path values, and passes
+# the complete generated YAML to trial_command via {config_path}.
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
 
 metric:
   name: eval_loss
@@ -29,7 +39,7 @@ phases:
     n_trials: 2
     sampler: { type: grid }
     search_space:
-      n_layers: { type: categorical, choices: [6, 8] }
+      model.n_layers: { type: categorical, choices: [6, 8] }
 
   - name: learning_rate
     comment: "Keep the winning depth fixed and compare two learning rates."
@@ -37,4 +47,4 @@ phases:
     n_trials: 2
     sampler: { type: grid }
     search_space:
-      lr: { type: categorical, choices: [0.0001, 0.0003] }
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }

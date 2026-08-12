@@ -246,6 +246,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         provenance={"revision": "test-fixture-v1"},
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -299,6 +300,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         provenance={"revision": "test-fixture-v1"},
         workdir=str(tmp_path / "runs"),
         trial_command=f"{sys.executable} {trainer}",
+        override_format="argparse",
         metric=Metric(
             name="metric",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.eE+-]+)"),
@@ -1216,6 +1218,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'p.db'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1441,6 +1444,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'partial.db'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1505,6 +1509,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
             workdir=tmp_path / "runs",
             storage=storage,
             trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            override_format="argparse",
             phases=[
                 Phase(
                     name=phase_name,
@@ -1560,6 +1565,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
             workdir=tmp_path / "runs",
             storage=f"sqlite:///{tmp_path / db_name}",
             trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=1,
         )
 
@@ -1609,6 +1615,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
             workdir=tmp_path / "runs",
             storage=storage,
             trial_command=f"{sys.executable} {trainer} {{overrides}}",
+            override_format="argparse",
             n_trials=n_trials,
         )
 
@@ -1714,6 +1721,7 @@ def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'h.db'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
         n_trials=2,
     )
 

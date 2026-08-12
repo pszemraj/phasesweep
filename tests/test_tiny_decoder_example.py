@@ -27,11 +27,16 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     wrapper = _load_wrapper()
     template_root = tmp_path / "upstream"
     template_root.mkdir()
-    base_config = tmp_path / "base.yaml"
-    base_config.write_text("num_batches: 1000\nvalidate_every: 100\nval_batches: 5\n")
-    overrides_path = tmp_path / "overrides.json"
-    overrides_path.write_text('{"learning_rate": 0.001}\n')
     trial_dir = tmp_path / "trial"
+    config_path = trial_dir / "trainer_config.yaml"
+    trial_dir.mkdir()
+    config_path.write_text(
+        f"run_dir: {trial_dir / 'trainer'}\n"
+        "num_batches: 1000\n"
+        "validate_every: 100\n"
+        "val_batches: 5\n"
+        "learning_rate: 0.001\n"
+    )
     observed: dict[str, object] = {}
 
     def fake_run(_template_root: Path, config_path: Path) -> None:
@@ -55,8 +60,8 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     monkeypatch.setattr(wrapper, "_evaluate_final_checkpoint", fake_evaluate)
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
-    overrides_sha256 = hashlib.sha256(overrides_path.read_bytes()).hexdigest()
-    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", overrides_sha256)
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", config_sha256)
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
     assert (
@@ -64,12 +69,8 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
             [
                 "--template-root",
                 str(template_root),
-                "--base-config",
-                str(base_config),
-                "--overrides-path",
-                str(overrides_path),
-                "--trial-dir",
-                str(trial_dir),
+                "--config",
+                str(config_path),
             ]
         )
         == 0
@@ -87,7 +88,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         },
         "generation_id": "generation-test",
         "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "overrides_sha256": overrides_sha256,
+        "overrides_sha256": config_sha256,
         "runtime": {"device_type": "cuda"},
         "schema_version": 1,
         "status": "complete",
@@ -95,7 +96,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
 
 
-def test_wrapper_rejects_an_overrides_file_from_another_attempt(tmp_path, monkeypatch) -> None:
+def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch) -> None:
     wrapper = _load_wrapper()
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
@@ -105,7 +106,7 @@ def test_wrapper_rejects_an_overrides_file_from_another_attempt(tmp_path, monkey
     monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "expected")
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
-    with pytest.raises(ValueError, match="Resolved overrides do not match"):
+    with pytest.raises(ValueError, match="Trainer config does not match"):
         wrapper._write_result(
             "different",
             {

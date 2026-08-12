@@ -35,6 +35,8 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.files import storage_backend, storage_is_in_memory
 
+OverrideFormat = Literal["yaml_file", "argparse", "json_file", "hydra"]
+
 
 class Metric(_Frozen):
     """Primary optimization objective: name, direction, and how to extract it."""
@@ -530,9 +532,18 @@ class Experiment(_Frozen):
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
     trial_command: str = Field(
         description=(
-            "Shell command template. Placeholders: {overrides}, {trial_dir}, {trial_id}, "
-            "{phase}, {run_name}, {overrides_path}."
+            "Shell command template. Placeholders: {config_path}, {overrides}, "
+            "{overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}."
         )
+    )
+    trainer_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Base trainer configuration embedded in this PhaseSweep YAML. In the default "
+            "yaml_file mode, inherited, fixed, and sampled dotted-path overrides are "
+            "applied to this mapping and the complete result is written to "
+            "{config_path} for every trial."
+        ),
     )
     provenance: dict[str, str] = Field(
         default_factory=dict,
@@ -541,7 +552,7 @@ class Experiment(_Frozen):
             "fingerprints. Values must change whenever trial meaning changes outside this YAML."
         ),
     )
-    override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
+    override_format: OverrideFormat = "yaml_file"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -585,6 +596,21 @@ class Experiment(_Frozen):
         """
         if self.timeout_seconds_per_run is not None:
             _require_finite("timeout_seconds_per_run", self.timeout_seconds_per_run)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trainer_config_mode(self) -> Experiment:
+        """Reject an embedded trainer config that the selected mode would ignore.
+
+        :raises ValueError: ``trainer_config`` is nonempty outside ``yaml_file`` mode.
+        :return Experiment: Self, unchanged.
+        """
+        if self.override_format != "yaml_file" and self.trainer_config:
+            raise ValueError(
+                "trainer_config is consumed only by the default override_format='yaml_file'. "
+                f"The selected compatibility format {self.override_format!r} would ignore it; "
+                "remove trainer_config or use yaml_file with {config_path}."
+            )
         return self
 
     @field_validator("experiment")
@@ -1054,7 +1080,9 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     Config load delegates to the same recursive renderer used at trial launch,
     so the accepted values cannot drift between preflight and execution. The
     supported domain is ``None``, ``bool``, ``int``, finite ``float``, ``str``,
-    and lists/tuples of those. Structured values belong to ``json_file``.
+    and lists/tuples of those. Structured trainer configuration belongs in the
+    default ``yaml_file`` mode; ``json_file`` remains an overrides-only
+    compatibility boundary.
 
     :param Experiment experiment: Experiment being validated; supplies
         ``override_format`` and the contract definitions.
@@ -1082,7 +1110,7 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                     f"at index {index}, which both render as {wire!r} under "
                     f"override_format={override_format!r}. Distinct search choices must "
                     "produce distinct trainer command values; use different choices or "
-                    "override_format='json_file'."
+                    "the default override_format='yaml_file'."
                 )
             rendered[wire] = (index, choice)
     for origin, overrides in _iter_fixed_override_layers(experiment, phase):
@@ -1094,8 +1122,8 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                 if isinstance(offender, Mapping):
                     hint = (
                         f"A mapping has no {override_format} wire form the fingerprint "
-                        "preserves faithfully. Use override_format='json_file' for "
-                        "structured values."
+                        "preserves faithfully. Use the default override_format='yaml_file' "
+                        "for structured trainer configuration."
                     )
                 elif isinstance(offender, float):
                     hint = (
@@ -1110,7 +1138,8 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                         "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
                         "into Python date/datetime objects; quote the value in YAML "
                         '(e.g. "2024-01-01") to send it as text, or use '
-                        "override_format='json_file' if the trainer needs a structured value."
+                        "the default override_format='yaml_file' if the trainer needs a "
+                        "structured value."
                     )
                 where = f" at position {exc.position}" if exc.position else ""
                 raise ValueError(
@@ -1164,11 +1193,12 @@ def _validate_trial_command_template(
 
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
+    * The primary ``yaml_file`` mode missing ``{config_path}``.
     * Phases declaring ``override_format: json_file`` but a template missing
       ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
       and silently runs with defaults).
-    * Phases using the default ``argparse`` format (or optional ``hydra``
-      compatibility format) with overrides but a template missing
+    * Phases using the explicit ``argparse`` or optional ``hydra``
+      compatibility formats with overrides but a template missing
       ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
       blocker 2).
 
@@ -1227,6 +1257,7 @@ def _validate_trial_command_template(
             trial_id=0,
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-validate",
+            trainer_config=experiment.trainer_config,
             write_files=False,
         )
     except KeyError as exc:
@@ -1234,14 +1265,38 @@ def _validate_trial_command_template(
         bad = exc.args[0] if exc.args else "<unknown>"
         raise ValueError(
             f"Phase {phase.name!r}: trial_command references unknown placeholder "
-            f"{{{bad}}}. Supported: {{overrides}}, {{overrides_path}} (json_file "
-            f"only), {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
+            f"{{{bad}}}. Supported: {{config_path}} (yaml_file only), "
+            f"{{overrides}}, {{overrides_path}} (json_file only), {{trial_dir}}, "
+            f"{{trial_id}}, {{phase}}, {{run_name}}."
         ) from exc
     except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
         ) from exc
+
+    if experiment.override_format == "yaml_file":
+        if "config_path" not in fields:
+            raise ValueError(
+                f"override_format='yaml_file' but phase {phase.name!r} trial_command "
+                "does not reference {config_path}. The trainer would never receive "
+                "the complete per-trial YAML. Add {config_path} to trial_command, or "
+                "select an explicit compatibility override_format."
+            )
+        if "overrides" in fields or "overrides_path" in fields:
+            raise ValueError(
+                f"override_format='yaml_file' but phase {phase.name!r} trial_command "
+                "references an overrides-only placeholder. Use {config_path}; it names "
+                "the complete trainer YAML after all overrides are composed."
+            )
+        return
+
+    if "config_path" in fields:
+        raise ValueError(
+            f"override_format={experiment.override_format!r} but phase {phase.name!r} "
+            "trial_command references {config_path}, which is only available in "
+            "override_format='yaml_file'."
+        )
 
     # When a phase has no overrides at all (no inherited, fixed, or sampled
     # keys), a constant trial_command is legitimate — the user is sweeping
@@ -1255,10 +1310,9 @@ def _validate_trial_command_template(
             "inherited, fixed, or sampled overrides and trial_command "
             "does not reference {overrides_path}. The trainer would "
             "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or switch to the default "
-            "override_format='argparse' (which uses {overrides}). The "
-            "'hydra' compatibility format also uses {overrides} for an "
-            "existing Hydra entry point."
+            "to trial_command, or use the default override_format='yaml_file' "
+            "with an embedded trainer_config and {config_path}. The explicit "
+            "argparse and Hydra compatibility formats use {overrides}."
         )
     if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
         raise ValueError(
@@ -1267,8 +1321,8 @@ def _validate_trial_command_template(
             "and trial_command does not reference {overrides}. All "
             "sampled parameters would be ignored — the trainer would "
             "run with the same hard-coded configuration every trial. "
-            f"Add {{overrides}} to trial_command, or switch to "
-            "override_format='json_file' (which uses {overrides_path})."
+            f"Add {{overrides}} to trial_command, or use the default "
+            "override_format='yaml_file' with trainer_config and {config_path}."
         )
 
 
@@ -1279,8 +1333,9 @@ class SuiteDefaults(_Frozen):
     allow_external_rdb_single_host: bool = False
     workdir: str = "./runs"
     trial_command: str | None = None
+    trainer_config: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, str] = Field(default_factory=dict)
-    override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
+    override_format: OverrideFormat = "yaml_file"
     metric: Metric | None = None
     constraints: list[Constraint] = Field(default_factory=list)
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -1316,8 +1371,9 @@ class StudySpec(_Frozen):
     allow_external_rdb_single_host: bool | None = None
     workdir: str | None = None
     trial_command: str | None = None
+    trainer_config: dict[str, Any] | None = None
     provenance: dict[str, str] | None = None
-    override_format: Literal["argparse", "json_file", "hydra"] | None = None
+    override_format: OverrideFormat | None = None
     metric: Metric | None = None
     constraints: list[Constraint] | None = None
     contracts: dict[str, Contract] = Field(default_factory=dict)
@@ -1452,6 +1508,7 @@ class Suite(_Frozen):
             allow_external_rdb_single_host=value("allow_external_rdb_single_host", required=True),
             workdir=value("workdir", required=True),
             trial_command=value("trial_command", required=True),
+            trainer_config=value("trainer_config") or {},
             provenance=value("provenance") or {},
             override_format=value("override_format", required=True),
             metric=value("metric", required=True),

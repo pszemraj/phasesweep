@@ -433,7 +433,9 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
-# v4 / v3 / v3: an omitted execution.cwd now contributes its effective
+# v5 / v4 / v4: the embedded complete trainer_config is now part of the core
+# experiment contract and contributes to experiment, suite, and phase identity.
+# v4 / v3 / v3: an omitted execution.cwd contributes its effective
 # invocation directory instead of an unbound null. The earlier execution
 # contract work covered only configured cwd values, which still let identical
 # persistent-study identities launch different relative commands from two
@@ -441,9 +443,9 @@ _RUN_CONTROL_KEYS = frozenset(
 # configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
 # on resume; see docs/config.md's upgrade section.
-FINGERPRINT_SCHEMA_VERSION = 4
-SUITE_FINGERPRINT_SCHEMA_VERSION = 3
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 3
+FINGERPRINT_SCHEMA_VERSION = 5
+SUITE_FINGERPRINT_SCHEMA_VERSION = 4
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 4
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
@@ -504,6 +506,7 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         "trial_command": experiment.trial_command,
+        "trainer_config": experiment.trainer_config,
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
         "execution": _execution_identity(experiment),
@@ -607,6 +610,7 @@ def _phase_semantic_payload(
     return {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         "trial_command": experiment.trial_command,
+        "trainer_config": experiment.trainer_config,
         "provenance": dict(sorted(experiment.provenance.items())),
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),

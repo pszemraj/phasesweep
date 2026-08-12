@@ -40,6 +40,7 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
         workdir=tmp_path / "wd",
         storage=storage,
         trial_command="python x.py {overrides}",
+        override_format="argparse",
         metric=Metric(
             name="loss",
             goal="minimize",
@@ -639,6 +640,7 @@ def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
         workdir=tmp_path / "wd",
         storage=f"sqlite:///{tmp_path / 'drift.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             name="x",
             goal="minimize",

@@ -104,6 +104,7 @@ def mcp_experiment_config_text(
 experiment: {name}
 {storage}workdir: {tmp_path}/runs/{name}
 trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize

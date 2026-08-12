@@ -85,6 +85,7 @@ def _stored_experiment(tmp_path: Path, *, n_trials: int = 1, env: dict[str, str]
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         env=env,
         phases=[
             Phase(
@@ -403,6 +404,7 @@ def test_terminal_callback_control_flow_exception_cannot_replace_failure(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=1,
     )
@@ -474,6 +476,7 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
               storage: sqlite:///{tmp_path}/suite.db
               provenance: {{revision: test-v1}}
               trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -534,6 +537,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=1,
     )
@@ -1078,6 +1082,7 @@ def _stored_suite_config(tmp_path: Path) -> Suite:
               storage: sqlite:///{tmp_path}/suite.db
               provenance: {{revision: test-v1}}
               trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -1253,6 +1258,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
               storage: sqlite:///{tmp_path}/suite.db
               provenance: {{revision: test-v1}}
               trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -1308,6 +1314,7 @@ def test_suite_state_write_failure_preserves_cancellation(
             defaults:
               workdir: {tmp_path}/runs
               trial_command: "echo {{overrides}}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -1592,6 +1599,7 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=1,
     )
@@ -1735,6 +1743,7 @@ def test_experiment_state_write_failure_preserves_primary_error(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=1,
     )

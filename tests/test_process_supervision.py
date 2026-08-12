@@ -960,6 +960,7 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         timeout_seconds_per_phase=0.2,
     )
@@ -1366,6 +1367,7 @@ def test_public_run_experiment_enters_signal_handler_scope(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f'{sys.executable} -c "{script}" trial_dir={{trial_dir}} {{overrides}}',
+        override_format="argparse",
     )
     run_experiment(exp)
     assert installed["called"] is True
@@ -1578,6 +1580,7 @@ def test_uncertain_cleanup_aborts_optimization_not_just_trial(
         n_trials=2,
         timeout_seconds_per_trial=0.1,
         trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
+        override_format="argparse",
     )
 
     with pytest.raises(UnsafeProcessCleanupError):
@@ -1619,6 +1622,7 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         timeout_seconds_per_trial=0.2,
         max_consecutive_failures=100,  # large, so we don't abort via that path
         trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
+        override_format="argparse",
     )
 
     phase_dir = tmp_path / "runs" / exp.experiment / exp.phases[0].name
@@ -1664,6 +1668,7 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
         n_jobs=1,  # serial path: UnsafeProcessCleanupError exits via study.optimize raise
         timeout_seconds_per_trial=0.2,
         trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
+        override_format="argparse",
     )
 
     phase_dir = tmp_path / "runs" / exp.experiment / exp.phases[0].name

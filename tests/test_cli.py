@@ -239,6 +239,7 @@ def test_validate_cli_renders_comment(tmp_path: Path) -> None:
         textwrap.dedent("""
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
@@ -274,6 +275,7 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
         storage: sqlite:///{tmp_path}/phases.db
         provenance: {{revision: test-fixture-v1}}
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
@@ -333,6 +335,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
             experiment: t
             workdir: {workdir_str}
             trial_command: "echo {{overrides}}"
+            override_format: argparse
             metric:
               extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
             phases:
@@ -372,6 +375,7 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
@@ -424,6 +428,7 @@ def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
         storage: sqlite:///{tmp_path}/owner.db
         provenance: {{revision: test-fixture-v1}}
         trial_command: "python {trainer} {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -458,6 +463,7 @@ storage: sqlite:///{tmp_path}/dry.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "false {{overrides}}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -515,6 +521,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -564,6 +571,7 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
         experiment: drift_cli
         workdir: {tmp_path}/runs
         trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        override_format: argparse
         metric:
           name: {metric_name}
           goal: minimize
@@ -610,6 +618,7 @@ def _published_experiment_config(tmp_path: Path) -> Path:
         experiment: integrity_cli
         workdir: {tmp_path}/runs
         trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -777,6 +786,7 @@ def _suite_config(tmp_path: Path) -> Path:
           storage: sqlite:///{tmp_path}/suite.db
           provenance: {{revision: test-fixture-v1}}
           trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -966,6 +976,7 @@ def _movable_experiment_configs(
             provenance: {{revision: test-fixture-v1}}
             workdir: {workdir}
             trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+            override_format: argparse
             metric:
               name: x
               goal: minimize
@@ -1015,6 +1026,7 @@ defaults:
   storage: sqlite:///{tmp_path}/suite.db
   provenance: {{revision: test-fixture-v1}}
   trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+  override_format: argparse
   metric:
     name: x
     goal: minimize
@@ -1555,6 +1567,7 @@ def test_rebind_workdir_reports_that_in_memory_storage_binds_nothing(
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
         phases:
@@ -1668,6 +1681,7 @@ def test_cli_boundary_compiles_suite_before_validate_success_output(
         suite: invalid_grid_suite
         defaults:
           trial_command: "echo {overrides}"
+          override_format: argparse
           metric:
             extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
         studies:

@@ -83,6 +83,7 @@ def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> No
         experiment="contract_test",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -113,6 +114,7 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
@@ -213,6 +215,7 @@ def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: P
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[baseline],
     )
     baseline_winner = run_experiment(initial)["baseline"]
@@ -221,6 +224,7 @@ def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: P
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             baseline,
             Phase(
@@ -251,6 +255,7 @@ def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
@@ -286,6 +291,7 @@ def test_phase_promotion_stop_is_an_expected_operational_failure(tmp_path: Path)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(name="baseline", n_trials=1, fixed_overrides={"score": 1.0}),
             Phase(
@@ -310,6 +316,7 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "python train.py {{overrides}}"
+        override_format: argparse
         metric:
           name: objective
           goal: minimize
@@ -364,6 +371,7 @@ def test_suite_promotion_stop_is_an_expected_operational_failure(tmp_path: Path)
             suite: stop_suite
             defaults:
               trial_command: "echo {overrides}"
+              override_format: argparse
               metric:
                 extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
             studies:
@@ -411,6 +419,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -511,6 +520,7 @@ def test_suite_dependency_on_skipped_promotion_is_an_expected_failure(tmp_path: 
             defaults:
               workdir: {tmp_path}/runs
               trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -546,6 +556,7 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
@@ -601,6 +612,7 @@ def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Pat
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -632,6 +644,7 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -663,6 +676,7 @@ def test_suite_study_provenance_inherits_replaces_and_clears(tmp_path: Path) -> 
             suite: provenance_suite
             defaults:
               trial_command: "echo"
+              override_format: argparse
               provenance: {revision: default-v1}
               metric:
                 name: x
@@ -700,6 +714,7 @@ def test_failed_suite_rerun_preserves_previous_summary(
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -797,6 +812,7 @@ def test_contract_keys_cannot_be_resampled() -> None:
         Experiment(
             experiment="bad_contract",
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),
@@ -953,6 +969,7 @@ def _json_equals_gate_yaml(value_literal: str) -> str:
     storage: ":memory:"
     provenance: {{revision: test-fixture-v1}}
     trial_command: "echo {{overrides}}"
+    override_format: argparse
     metric:
       name: loss
       goal: minimize

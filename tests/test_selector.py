@@ -230,6 +230,7 @@ def test_rejects_nan_constraint_values_defensively(tmp_path):
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),

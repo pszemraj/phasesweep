@@ -4,8 +4,31 @@
 experiment: tiny_decoder_enwik8_gpu_smoke
 storage: null
 workdir: /tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke
-trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --base-config examples/tiny_decoder_enwik8/upstream/configs/test.yaml --overrides-path {overrides_path} --trial-dir {trial_dir}"
-override_format: json_file
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --config {config_path}"
+trainer_config:
+  run_dir: "{trial_dir}/trainer"
+  num_tokens: 256
+  dim: 128
+  depth: 2
+  heads: 4
+  dim_head: 32
+  tied_embedding: true
+  flash_attn: true
+  compile: false
+  use_autocast: true
+  num_batches: 10
+  batch_size: 2
+  grad_accum_every: 2
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  data_path: data/enwik8.gz
+  seq_len: 128
+  validate_every: 5
+  val_batches: 50
+  generate_every: 1000
+  save_every: 1000
+  seed: 7
 timeout_seconds_per_run: 300
 env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID

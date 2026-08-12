@@ -1622,6 +1622,7 @@ def test_status_and_winners_carry_the_publication_integrity_verdict(tmp_path: Pa
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="p",
@@ -1707,6 +1708,7 @@ def _drift_experiment(
         workdir=str(tmp_path / "runs"),
         execution=ExecutionContext(cwd=str(tmp_path)),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             name=metric_name,
             goal=goal,
@@ -2306,6 +2308,7 @@ def _real_run_app(tmp_path: Path) -> tuple[PhaseSweepMCP, Experiment]:
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="p",
@@ -2541,6 +2544,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="p",

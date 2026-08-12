@@ -5,17 +5,20 @@ import shlex
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment, run_experiment
 from phasesweep.runtime.commands import (
+    compose_trainer_config,
     dump_overrides_json,
+    dump_trainer_config_yaml,
     format_argparse,
     format_hydra,
     render_command,
     write_json_file,
 )
-from tests.conftest import copy_fake_train, write_yaml
+from tests.conftest import copy_fake_train, make_experiment, write_yaml
 
 
 @pytest.mark.parametrize(
@@ -134,6 +137,143 @@ def test_render_command_json_file(tmp_path):
     assert data == {"a": {"b": 1, "c": 2}, "d": "x"}
 
 
+def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
+    base = {
+        "model": {"name": "tiny", "depth": 4, "dropout": 0.1},
+        "optimizer": {"name": "adamw", "lr": 3e-4},
+        "data": {"path": "data/train.jsonl"},
+        "output_dir": "{trial_dir}/trainer/{phase}-{trial_id}",
+    }
+
+    command = render_command(
+        "python train.py {config_path}",
+        {
+            "model.depth": 8,
+            "optimizer.lr": 1e-4,
+            "trainer.seed": 17,
+            "trainer.label": "{trial_dir}",
+        },
+        "yaml_file",
+        trial_dir=tmp_path,
+        trial_id=3,
+        phase="depth",
+        run_name="x-depth-3",
+        trainer_config=base,
+    )
+
+    config_path = tmp_path / "trainer_config.yaml"
+    assert shlex.split(command) == ["python", "train.py", str(config_path)]
+    assert yaml.safe_load(config_path.read_text()) == {
+        "data": {"path": "data/train.jsonl"},
+        "model": {"name": "tiny", "depth": 8, "dropout": 0.1},
+        "optimizer": {"name": "adamw", "lr": 1e-4},
+        "output_dir": f"{tmp_path}/trainer/depth-3",
+        "trainer": {"label": "{trial_dir}", "seed": 17},
+    }
+    assert base["model"]["depth"] == 4
+
+
+def test_yaml_file_dump_is_deterministic_across_mapping_order() -> None:
+    left = {"z": 1, "nested": {"b": 2, "a": [True, None]}, "a": "first"}
+    right = {"a": "first", "nested": {"a": [True, None], "b": 2}, "z": 1}
+
+    assert dump_trainer_config_yaml(left) == dump_trainer_config_yaml(right)
+
+
+def test_compose_trainer_config_replaces_exact_leaf_but_rejects_scalar_descent() -> None:
+    assert compose_trainer_config(
+        {"model": {"depth": 4, "legacy": True}},
+        {"model": "pretrained/model"},
+    ) == {"model": "pretrained/model"}
+
+    with pytest.raises(ValueError, match=r"path 'model'.*not a mapping"):
+        compose_trainer_config({"model": "pretrained/model"}, {"model.depth": 8})
+
+
+def test_yaml_file_is_the_default_and_requires_config_path(tmp_path: Path) -> None:
+    valid = write_yaml(
+        tmp_path,
+        """
+        experiment: yaml_first
+        trial_command: "python train.py {config_path}"
+        trainer_config:
+          model: {depth: 4}
+          optimizer: {lr: 0.001}
+        metric:
+          name: loss
+          goal: minimize
+          extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
+        phases:
+          - name: depth
+            n_trials: 1
+            search_space:
+              model.depth: {type: int, low: 4, high: 8}
+        """,
+    )
+
+    experiment = load_experiment(valid)
+    assert experiment.override_format == "yaml_file"
+    assert experiment.trainer_config["model"]["depth"] == 4
+
+    invalid = valid.with_name("missing-placeholder.yaml")
+    invalid.write_text(valid.read_text().replace("{config_path}", "--fixed"))
+    with pytest.raises(ValidationError, match=r"does not reference \{config_path\}"):
+        load_experiment(invalid)
+
+
+def test_yaml_file_validation_rejects_unusable_base_path(tmp_path: Path) -> None:
+    config = write_yaml(
+        tmp_path,
+        """
+        experiment: bad_base
+        trial_command: "python train.py {config_path}"
+        trainer_config:
+          model: pretrained/model
+        metric:
+          name: loss
+          goal: minimize
+          extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
+        phases:
+          - name: depth
+            n_trials: 1
+            search_space:
+              model.depth: {type: int, low: 4, high: 8}
+        """,
+    )
+
+    with pytest.raises(ValidationError, match=r"trainer_config path 'model'.*not a mapping"):
+        load_experiment(config)
+
+
+def test_yaml_file_rejects_nonportable_yaml_values_at_config_load(tmp_path: Path) -> None:
+    config = write_yaml(
+        tmp_path,
+        """
+        experiment: bad_value
+        trial_command: "python train.py {config_path}"
+        trainer_config:
+          cutoff: 2024-01-01
+        metric:
+          name: loss
+          goal: minimize
+          extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
+        phases: [{name: p, n_trials: 1}]
+        """,
+    )
+
+    with pytest.raises(ValidationError, match=r"trainer_config.cutoff.*type date"):
+        load_experiment(config)
+
+
+def test_compatibility_format_rejects_ignored_trainer_config() -> None:
+    with pytest.raises(ValueError, match="would ignore it"):
+        make_experiment(
+            override_format="argparse",
+            trial_command="echo {overrides}",
+            trainer_config={"model": {"depth": 4}},
+        )
+
+
 def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
     p = write_yaml(
         tmp_path,
@@ -153,7 +293,7 @@ def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
         """,
     )
 
-    with pytest.raises(ValidationError, match="override_format='hydra'.*json_file"):
+    with pytest.raises(ValidationError, match="override_format='hydra'.*yaml_file"):
         load_experiment(p)
 
 
@@ -420,6 +560,7 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
             suite: mixed_formats
             defaults:
               trial_command: "echo {overrides}"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -486,6 +627,7 @@ storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -526,6 +668,7 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -568,6 +711,7 @@ def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: st
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize

@@ -99,6 +99,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
 experiment: {name}
 workdir: {tmp_path}/runs
 trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+override_format: argparse
 metric:
   name: x
   goal: minimize
@@ -253,6 +254,7 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         sampler=Sampler(type="random", seed=0),
     )
@@ -397,6 +399,7 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(name="a", n_trials=1, sampler=SEEDED_RANDOM, search_space={}),
             Phase(
@@ -540,6 +543,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
         sampler=SEEDED_RANDOM,
     )
@@ -709,6 +713,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 experiment: record_fail
 workdir: {tmp_path}/runs
 trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+override_format: argparse
 metric:
   name: x
   goal: minimize
@@ -870,6 +875,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=phases,
     )
     run_experiment(experiment)

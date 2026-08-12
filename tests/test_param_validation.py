@@ -38,6 +38,7 @@ def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
         f"""
         experiment: t
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -125,6 +126,7 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
         """
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -225,6 +227,7 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
         """
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -250,6 +253,7 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
                 """
                 experiment: t
                 trial_command: "echo {overrides}"
+                override_format: argparse
                 metric:
                   name: x
                   goal: minimize
@@ -335,6 +339,7 @@ def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> N
         """
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -423,6 +428,7 @@ def test_rejects_dotted_prefix_collisions() -> None:
             Experiment(
                 experiment=f"t_{case}",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -546,6 +552,7 @@ def test_trial_command_accepts_supported_templates() -> None:
             "normal_template_with_output",
             lambda: make_experiment(
                 trial_command="python train.py --out {trial_dir}/result.json {overrides}",
+                override_format="argparse",
                 n_trials=1,
             ),
         ),
@@ -572,6 +579,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -714,6 +722,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize

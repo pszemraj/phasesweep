@@ -66,6 +66,7 @@ def test_run_experiment_writes_summary_at_namespaced_path(tmp_path: Path) -> Non
     exp = make_experiment(
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
     )
     run_experiment(exp)
     assert (_summary_path(exp)).is_file()
@@ -86,6 +87,7 @@ def test_experiment_name_rejected(bad_name: str) -> None:
         Experiment(
             experiment=bad_name,
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),
@@ -104,6 +106,7 @@ def test_experiment_name_accepts_valid() -> None:
     Experiment(
         experiment="tiny_lm-16mb",
         trial_command="echo {overrides}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),

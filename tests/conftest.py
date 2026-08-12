@@ -118,6 +118,7 @@ def make_experiment(
     storage: str | None = None,
     trial_command: str = "echo {overrides}",
     override_format: str = "argparse",
+    trainer_config: dict[str, Any] | None = None,
     metric: Metric | None = None,
     constraints: list[Constraint] | None = None,
     phases: list[Phase] | None = None,
@@ -164,6 +165,8 @@ def make_experiment(
         ),
         phases=phases,
     )
+    if trainer_config is not None:
+        kwargs["trainer_config"] = trainer_config
     if workdir is not None:
         kwargs["workdir"] = str(workdir)
     if storage is not None:

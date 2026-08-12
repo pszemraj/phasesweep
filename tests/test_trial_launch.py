@@ -6,11 +6,13 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from phasesweep.config import ExecutionContext, JsonEnvelopeExtractor, Metric
 from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
@@ -27,6 +29,8 @@ def _capture_launch_env(
     metric: Metric | None = None,
     gpu_id: int | str | None = 2,
     gpu_lease_fds: tuple[int, ...] = (),
+    experiment_kwargs: dict[str, Any] | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
@@ -43,6 +47,7 @@ def _capture_launch_env(
         gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
         captured.update(env)
+        captured["command"] = _cmd
         captured["run_supervised_attempt_id"] = attempt_id
         if cwd is not None:
             captured["run_supervised_cwd"] = cwd
@@ -56,13 +61,18 @@ def _capture_launch_env(
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
     launch_trial(
-        experiment=make_experiment(env=experiment_env, execution=execution, metric=metric),
+        experiment=make_experiment(
+            env=experiment_env,
+            execution=execution,
+            metric=metric,
+            **(experiment_kwargs or {}),
+        ),
         phase_name="p",
         trial_id=0,
         generation_id="generation-test",
         attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
-        overrides={},
+        overrides={} if overrides is None else overrides,
         timeout_seconds=None,
         gpu_id=gpu_id,
         gpu_lease_fds=gpu_lease_fds,
@@ -163,6 +173,51 @@ def test_launch_trial_cuda_environment(
     assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
     assert env["WANDB_RUN_ID"] == "attempt-test"
     assert env["run_supervised_attempt_id"] == "attempt-test"
+
+
+def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default boundary gives the trainer one complete, identity-bound YAML."""
+    trial_dir = tmp_path / "trial_0"
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={
+            "trial_command": "python train.py --config {config_path}",
+            "override_format": "yaml_file",
+            "trainer_config": {
+                "model": {"depth": 4, "width": 128},
+                "output_dir": "{trial_dir}/outputs",
+            },
+        },
+        overrides={"model.depth": 8, "run_label": "{trial_dir}"},
+    )
+
+    config_path = trial_dir / "trainer_config.yaml"
+    assert yaml.safe_load(config_path.read_text()) == {
+        "model": {"depth": 8, "width": 128},
+        "output_dir": f"{trial_dir}/outputs",
+        # Runtime placeholders are a base-config feature. Sampled and fixed
+        # string values remain literal trainer data.
+        "run_label": "{trial_dir}",
+    }
+    assert shlex.split(captured["command"]) == [
+        "python",
+        "train.py",
+        "--config",
+        str(config_path),
+    ]
+    assert (
+        captured["PHASESWEEP_OVERRIDES_SHA256"]
+        == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    )
+    assert json.loads((trial_dir / "overrides_resolved.json").read_text()) == {
+        "model.depth": 8,
+        "run_label": "{trial_dir}",
+    }
 
 
 def test_launch_trial_inherit_env_all_passes_ambient(

@@ -79,6 +79,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -169,6 +170,7 @@ def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> N
             suite: execution_suite
             defaults:
               trial_command: "echo"
+              override_format: argparse
               metric:
                 name: x
                 goal: minimize
@@ -208,6 +210,47 @@ def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> N
     # Explicit null is not "inherit the default block" — it is a reset.
     assert reset.execution == ExecutionContext()
     assert reset.execution.inherit_env == "all"
+
+
+def test_suite_trainer_config_is_inherited_replaced_or_cleared(tmp_path: Path) -> None:
+    """Suites preserve the one-YAML trainer boundary without implicit deep merges."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: trainer_config_suite
+            defaults:
+              trial_command: "python train.py {config_path}"
+              trainer_config:
+                model: {depth: 4, width: 128}
+                optimizer: {lr: 0.001}
+              metric:
+                name: loss
+                goal: minimize
+                extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}
+            studies:
+              - name: inherited
+                phases: [{name: p, n_trials: 1}]
+              - name: replaced
+                trainer_config:
+                  model: {depth: 8}
+                phases: [{name: p, n_trials: 1}]
+              - name: cleared
+                trainer_config: null
+                phases: [{name: p, n_trials: 1}]
+            """,
+        )
+    )
+
+    assert isinstance(config, Suite)
+    inherited, replaced, cleared = (config.experiment_for_study(study) for study in config.studies)
+    assert inherited.override_format == "yaml_file"
+    assert inherited.trainer_config == {
+        "model": {"depth": 4, "width": 128},
+        "optimizer": {"lr": 0.001},
+    }
+    assert replaced.trainer_config == {"model": {"depth": 8}}
+    assert cleared.trainer_config == {}
 
 
 @pytest.mark.parametrize(
@@ -264,6 +307,7 @@ storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "first {overrides}"
 trial_command: "second {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -278,6 +322,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -294,6 +339,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -320,6 +366,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -371,7 +418,7 @@ def test_n_jobs_default_is_one(tmp_path):
 experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
+trial_command: "echo {config_path}"
 metric:
   name: loss
   goal: minimize
@@ -382,7 +429,7 @@ phases:
     search_space: { x: { type: float, low: 0, high: 1 } }
 """
     exp = load_experiment(write_yaml(tmp_path, body))
-    assert exp.override_format == "argparse"
+    assert exp.override_format == "yaml_file"
     assert exp.phases[0].n_jobs == 1
     assert exp.phases[0].max_consecutive_failures == 5
 
@@ -458,6 +505,7 @@ def _sampler_policy_yaml(
         "experiment: t\n"
         f"{header}"
         'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
         "metric:\n"
         "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
         "phases:\n"
