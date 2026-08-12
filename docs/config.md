@@ -271,7 +271,7 @@ trial_command: "python train.py {overrides}"
 override_format: argparse
 ```
 
-Populated studies created with another boundary have different fingerprints and cannot be mixed with the generated-YAML path; use a fresh experiment identity or finish them under their explicit old format.
+Changing from a compatibility boundary to generated YAML changes the fingerprint and cannot be mixed into a populated study; use a fresh experiment identity or finish that study under its old explicit format. The fingerprint-schema migration below also applies to configs that retain a compatibility format.
 
 ### `metric.extractor` no longer accepts `type: json`
 
@@ -330,15 +330,15 @@ sampler.acknowledge_nonresumable: true. ...
 
 Apply the [persistent-storage sampler contract](#sampler-capability-on-persistent-storage): seed stochastic samplers and acknowledge TPE/CMA-ES restart limits. The acknowledgement is run-control, so adding it does not invalidate an existing study.
 
-### Fingerprints now include the execution contract
+### Fingerprints now include the trainer config and execution contract
 
-Current fingerprints include the [trainer execution context](#experiment-keys). Populated studies created under earlier schemas fail their next resume or top-up:
+The phase fingerprint schema moved to version 5 (experiment and suite fingerprints moved to version 4) so persisted identities explicitly attest both the complete embedded `trainer_config` and the [trainer execution context](#experiment-keys). Changing the base trainer YAML therefore invalidates every affected phase rather than allowing new trial semantics into an old study. Populated studies created under earlier schemas fail their next resume or top-up, including configs that explicitly retain a compatibility format:
 
 ```text
 StudyFingerprintMismatchError: Study 'exp::phase' was created with a different phase config ...
 ```
 
-Finish or archive in-flight studies under the old release, or use a new experiment name. Earlier published generations remain readable but report config drift rather than adopting the new execution identity.
+Finish or archive in-flight studies under the old release, or use a new experiment name. Earlier published generations remain readable but report config drift rather than adopting the new trainer identity.
 
 ### Categorical `choices` must be pairwise unequal
 

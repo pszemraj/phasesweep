@@ -597,7 +597,7 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
 def test_validate_accepts_json_file_fixed_override(
     tmp_path, literal: str, expected: object
 ) -> None:
-    """Values supported by strict JSON remain available only on the json_file wire."""
+    """The explicit JSON compatibility wire retains its structured value support."""
     p = _override_yaml(
         tmp_path,
         "json_file",

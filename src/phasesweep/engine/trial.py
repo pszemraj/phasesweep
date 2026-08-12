@@ -363,7 +363,7 @@ def launch_trial(
 
     Args:
         experiment: Parsed experiment config; provides ``trial_command``,
-            ``override_format``, and ``env``.
+            ``trainer_config``, ``override_format``, and ``env``.
         phase_name: Name of the running phase (used in ``run_name`` and logs).
         trial_id: Optuna's numeric trial number.
         generation_id: Identity of the current engine invocation.
@@ -390,10 +390,10 @@ def launch_trial(
     Raises:
         TrialExecutionError: The configured ``execution.cwd`` does not resolve
             to a directory on this host.
-        OSError: A trial artifact (resolved overrides, command record, the
-            opt-in ``environment.json``, or the captured output streams) could
-            not be written. Raised before the trainer starts, so no subprocess
-            is left behind.
+        OSError: A trial artifact (generated trainer config, resolved overrides,
+            command record, the opt-in ``environment.json``, or the captured
+            output streams) could not be written. Raised before the trainer
+            starts, so no subprocess is left behind.
         UnsafePrivatePathError: ``execution.record_env`` is set and an existing
             ``environment.json`` in the trial directory is not a private,
             unshared regular file.
@@ -760,13 +760,14 @@ def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
 
     Args:
         overrides: The composed (inherited + fixed + sampled) overrides dict.
-        strict: When ``True`` (``yaml_file`` or ``json_file`` format), use the canonical wire
-            serializer so the audit artifact can never claim a value the
-            actual ``overrides.json`` wire artifact would reject (review
-            v0.5.17 / finding B); load-time validation guarantees this
-            succeeds. When ``False`` (a scalar/list CLI format), non-JSON
-            scalars fall back through ``default=str`` (Path, etc.) — there is
-            no JSON wire artifact for those formats to diverge from.
+        strict: When ``True`` (``yaml_file`` or ``json_file`` format), use the
+            canonical strict serializer. This keeps the audit record in the
+            portable value domain accepted by complete trainer YAML and makes
+            it byte-faithful to the JSON compatibility wire. Load-time
+            validation guarantees this succeeds. When ``False`` (a scalar/list
+            CLI format), non-JSON scalars fall back through ``default=str``
+            (Path, etc.) — there is no JSON wire artifact for those formats to
+            diverge from.
 
     Returns:
         Trailing-newline-terminated, sorted, two-space-indented JSON.
