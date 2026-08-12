@@ -24,18 +24,25 @@
 # With persistent storage each phase study is bound to the one resolved <workdir>/<experiment> root it publishes into, so re-running the same config against a second workdir is refused instead of producing a divergent second result tree. Keep it stable across resumptions; if you genuinely relocate the artifact tree, move it first and then run `phasesweep rebind-workdir CONFIG`.
 
 # trial_command: str (required)
-# Shell command for one trial. Supported format fields are `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`; path-like substitutions and rendered override tokens are shell-quoted.
-# Config loading checks format syntax and supported fields, plus statically known values for a json_file contract, but not executable/path existence, trainer parser compatibility, or evidence production.
-# An override-free phase may use a constant command. Any inherited, contract, fixed, or sampled override requires the placeholder selected by override_format.
+# Shell command for one trial. Supported format fields are `{config_path}`, `{overrides}`, `{overrides_path}`, `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}`; path-like substitutions and rendered override tokens are shell-quoted.
+# Config loading checks format syntax, supported fields, and the exact generated payload for yaml_file/json_file, but not executable/path existence, trainer parser compatibility, or evidence production.
+# The default yaml_file mode always requires `{config_path}`. An override-free compatibility-format phase may use a constant command; any inherited, contract, fixed, or sampled override requires `{overrides}` for argparse/hydra or `{overrides_path}` for json_file.
+
+# trainer_config: dict[str, Any] = {}
+# The trainer's base configuration, embedded in this same operator-authored YAML. In the default yaml_file mode, PhaseSweep deep-copies it per trial, applies the composed dotted-path overrides, writes the complete result to `<trial_dir>/trainer_config.yaml`, and substitutes that path into `{config_path}`.
+# Keys at every mapping level must be strings. Values may be strings, booleans, integers, finite floats, null, lists, or nested mappings; quote YAML dates/timestamps to keep them strings. Generated YAML is deterministic (sorted mapping keys). Validation and dry-run compose and serialize the payload without writing the file.
+# String values in this mapping may contain `{trial_dir}`, `{trial_id}`, `{phase}`, or `{run_name}`; those runtime placeholders expand before overrides are applied. Override-supplied strings remain literal. A dotted override creates missing mappings and replaces the final value, but cannot descend through an existing scalar or list.
+# This complete mapping joins experiment and phase fingerprints. A nonempty trainer_config with argparse, json_file, or hydra is rejected because those explicit compatibility formats would ignore it.
 
 # provenance: dict[str, str] = {}
-# Operator-declared identities for trainer code, base config, data, dependencies, container, tokenizer, or other inputs outside this YAML. Keys and values must be nonempty.
+# Operator-declared identities for trainer code, data, dependencies, container, tokenizer, or other inputs outside this YAML. The embedded trainer_config is already fingerprinted. Keys and values must be nonempty.
 # Persistent storage requires at least one entry. The complete mapping is included in semantic fingerprints; update its values whenever an external input changes. PhaseSweep does not inspect imports or hash arbitrary trial_command inputs.
 
-# override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
-# `argparse` is the default and the format used by `phasesweep init` and the shipped starter. It requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load, because only that set has one canonical wire form the semantic fingerprint preserves faithfully. Use override_format `json_file` for structured values.
-# `json_file` requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
-# `hydra` is compatibility support for an existing Hydra/OmegaConf entry point; PhaseSweep does not depend on Hydra or perform its config composition. It requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load. Non-finite floats are rejected because their rendered values have no distinct semantic JSON identity.
+# override_format: Literal["yaml_file", "argparse", "json_file", "hydra"] = "yaml_file"
+# `yaml_file` is the core, default, and `phasesweep init` workflow. It requires `{config_path}` and uses trainer_config as described above; it never emits per-key CLI tokens and does not require Hydra.
+# `argparse` is explicit compatibility for an existing flag parser. It requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load because only that set has one canonical wire form.
+# `json_file` is explicit overrides-only compatibility. It requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`; it does not include trainer_config. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
+# `hydra` is compatibility support for an existing Hydra/OmegaConf entry point; PhaseSweep does not depend on Hydra or perform its config composition. It requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load.
 
 # metric: Metric (required)
 # Metric object keys:
@@ -165,6 +172,7 @@
 
 # env: dict[str, str] = {}
 # Applied over the ambient variables selected by execution.inherit_env. PhaseSweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial. A json_envelope metric also receives `PHASESWEEP_OBJECTIVE_PATH`, the absolute destination resolved from its configured path; other extractor types remove any ambient value with that name.
+# The historically named PHASESWEEP_OVERRIDES_SHA256 is the digest of the exact PhaseSweep-written trainer input: the complete trainer_config.yaml in default mode, overrides.json in JSON compatibility mode, or overrides_resolved.json in a CLI compatibility mode.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES. If any assigned token is numeric, CUDA_DEVICE_ORDER is forced to PCI_BUS_ID so the trainer uses the physical card covered by the nvidia-smi-derived host lock; UUID/MIG-only assignments preserve an explicitly configured order.
 
@@ -197,7 +205,7 @@
 # type: Literal["categorical"] (required)
 # choices: list[None | bool | int | finite float | str] (required; min length 1)
 # Lists, mappings, objects, NaN, and infinities are rejected. CMA-ES rejects categorical parameters.
-# Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights. With a CLI override format, choices must also have distinct rendered wire values (`[1, "1"]` is ambiguous under argparse); json_file preserves their distinct JSON types.
+# Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights. With a CLI compatibility format, choices must also have distinct rendered wire values (`[1, "1"]` is ambiguous under argparse); yaml_file and json_file preserve their distinct numeric/string types.
 
 # EXTRACTOR OBJECTS
 # An extractor must use exactly one discriminator shape. Every `path`/`file` below is a nonempty trial-relative path: absolute paths and any `..` component are rejected.
@@ -306,8 +314,9 @@
 #   allow_external_rdb_single_host: bool = false
 #   workdir: str = "./runs"
 #   trial_command: str | None = null
+#   trainer_config: dict[str, Any] = {}
 #   provenance: dict[str, str] = {}
-#   override_format: Literal["argparse", "json_file", "hydra"] = "argparse"
+#   override_format: Literal["yaml_file", "argparse", "json_file", "hydra"] = "yaml_file"
 #   metric: Metric | None = null
 #   constraints: list[Constraint] = []
 #   contracts: dict[str, Contract] = {}
@@ -338,10 +347,13 @@
 # trial_command: str | None = null
 # If omitted, inherits defaults.trial_command; explicit null blocks fallback and fails compilation. It must resolve non-null.
 
+# trainer_config: dict[str, Any] | None = null
+# If omitted, inherits defaults.trainer_config; a non-null mapping replaces the complete default mapping, while explicit null clears it to `{}`. The compiled mapping follows the Experiment trainer_config contract.
+
 # provenance: dict[str, str] | None = null
 # If omitted, inherits defaults.provenance; a non-null mapping replaces the default mapping, while explicit null clears it to `{}`. The compiled persistent experiment requires at least one entry.
 
-# override_format: Literal["argparse", "json_file", "hydra"] | None = null
+# override_format: Literal["yaml_file", "argparse", "json_file", "hydra"] | None = null
 # If omitted, inherits defaults.override_format; explicit null blocks fallback and fails compilation. The resolved value follows the Experiment contract.
 
 # metric: Metric | None = null

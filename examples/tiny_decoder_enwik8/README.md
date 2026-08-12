@@ -1,6 +1,6 @@
 # Tiny Decoder Enwik8 example
 
-This example runs a tiny Enwik8 decoder training sweep with PhaseSweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The trainer accepts YAML config files but not per-key CLI overrides, so `run_trial.py` adapts PhaseSweep's `json_file` override format into one composed YAML file per trial. The model shape stays fixed in `base.yaml`; the three phases tune optimizer scale, regularization, and training stability.
+This example runs a tiny Enwik8 decoder training sweep with PhaseSweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). Its complete base configuration lives under `trainer_config` in the same PhaseSweep YAML as the search plan. PhaseSweep applies each trial's inherited, fixed, and sampled values and materializes `trainer_config.yaml`; `run_trial.py` passes that file to the upstream trainer and publishes the final-checkpoint objective. The model shape stays fixed while the three phases tune optimizer scale, regularization, and training stability.
 
 ## Setup
 
@@ -11,7 +11,7 @@ git submodule update --init examples/tiny_decoder_enwik8/upstream
 pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
-The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` runs the trainer with the upstream checkout as its working directory, which is how `base.yaml`'s relative `data_path: data/enwik8.gz` resolves.
+The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
@@ -60,4 +60,4 @@ Restart the selected client after installation, then ask it to list the availabl
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
 
-Both configs declare trainer and data provenance because they reuse persistent studies. Update those tokens whenever the wrapper, pinned template revision, base config, data preparation, or dependencies change; the changed provenance will make PhaseSweep refuse an incompatible top-up.
+Both configs declare trainer and data provenance because they reuse persistent studies. The embedded trainer config is fingerprinted automatically; update the external provenance tokens whenever the wrapper, pinned template revision, data preparation, or dependencies change so PhaseSweep refuses an incompatible top-up.

@@ -1,6 +1,6 @@
 # PhaseSweep
 
-PhaseSweep runs YAML-defined, phase-chained hyperparameter sweeps over your own training script. Your trainer owns the experiment; PhaseSweep decides what to try next, persists each phase winner, and can pass selected winners forward as fixed inputs to later phases.
+PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer's base configuration, the metric, and the search plan. PhaseSweep materializes a complete trainer YAML for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
 
 This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-keys) explains the inheritance model and its tradeoffs.
 
@@ -13,10 +13,16 @@ One YAML file defines an experiment: a trainer command, a metric to optimize, an
 ```yaml
 experiment: phasesweep_starter
 
-# The trainer is any command. This fake one ships inside the installed
-# package so the starter runs anywhere; replace it with your own later.
-trial_command: "python -m phasesweep.examples.fake_train {overrides}"
-override_format: argparse
+# The trainer receives one complete generated YAML per trial.
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
 
 metric:
   name: eval_loss
@@ -27,17 +33,17 @@ phases:
     n_trials: 2
     sampler: { type: grid }
     search_space:
-      n_layers: { type: categorical, choices: [6, 8] }
+      model.n_layers: { type: categorical, choices: [6, 8] }
 
   - name: learning_rate
-    inherits: [depth] # the winning n_layers becomes a fixed input here
+    inherits: [depth] # the winning model.n_layers is fixed here
     n_trials: 2
     sampler: { type: grid }
     search_space:
-      lr: { type: categorical, choices: [0.0001, 0.0003] }
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-In this starter, PhaseSweep renders `{overrides}` from the sampled and inherited parameters, launches the packaged fake trainer, and reads its objective from `result.json`. The trainer calls `report_objective(...)`, which fills in the current attempt identity and atomically writes to the path configured by the JSON-envelope extractor. Other trainers can publish the envelope directly, use log extraction, or use W&B; see the [trainer contract](docs/config.md#trainer-contract).
+In this starter, PhaseSweep copies `trainer_config`, applies each trial's sampled and inherited dotted-path values, writes `trainer_config.yaml` inside the trial directory, and substitutes its path into `{config_path}`. The packaged fake trainer reads that complete YAML and reports its objective through `report_objective(...)`. W&B is an optional evidence source, not a configuration mode; see the [trainer contract](docs/config.md#trainer-contract).
 
 ## Install and try it
 
@@ -55,15 +61,15 @@ phasesweep run experiment.yaml        # four tiny trials, a few seconds
 The run log shows the phase chaining directly (abridged):
 
 ```text
-[depth/trial_0] python -m phasesweep.examples.fake_train ... --n_layers 8
-[depth/trial_1] python -m phasesweep.examples.fake_train ... --n_layers 6
-phase=depth WINNER trial=0 metric=0.3 params={'n_layers': 8}
-[learning_rate/trial_0] python -m phasesweep.examples.fake_train ... --n_layers 8 --lr 0.0003
-[learning_rate/trial_1] python -m phasesweep.examples.fake_train ... --n_layers 8 --lr 0.0001
-phase=learning_rate WINNER trial=0 metric=0.3 params={'lr': 0.0003}
+[depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+[depth/trial_1] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=depth WINNER trial=0 metric=0.3 params={'model.n_layers': 8}
+[learning_rate/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+[learning_rate/trial_1] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
 ```
 
-The `depth` winner's `--n_layers 8` is injected into every `learning_rate` trial as a fixed flag. Winners persist in the working directory, so you can inspect them any time (abridged):
+The `depth` winner's `model.n_layers: 8` is injected into every `learning_rate` trial's complete YAML. Winners persist in the working directory, so you can inspect them any time (abridged):
 
 ```bash
 phasesweep show-winners experiment.yaml
@@ -76,16 +82,18 @@ metric:
   goal: minimize
 trial_number: 0
 params:
-  lr: 0.0003
+  optimizer.lr: 0.0003
 effective_overrides:
-  n_layers: 8
-  lr: 0.0003
+  model.n_layers: 8
+  optimizer.lr: 0.0003
 # ... completion state, fingerprints, and objective provenance follow
 ```
 
 ## Use your own trainer
 
-Point `trial_command` at your training script and adjust the search spaces. `{trial_dir}` is the per-trial output directory. The default and the shipped starter use `argparse`: `{overrides}` becomes ordinary `--key value` arguments. Use `json_file` with `{overrides_path}` when your trainer needs a structured config file. `hydra` remains an optional compatibility format for an existing Hydra/OmegaConf entry point; PhaseSweep does not require Hydra, and it is not the starting point for a new integration. The trainer must accept the selected boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
+Put your trainer's normal base configuration under `trainer_config`, point `trial_command` at its YAML entry point, and pass `{config_path}` where that entry point expects the file. Dotted search keys such as `model.depth` update the corresponding nested value; every other base setting is preserved. String values inside `trainer_config` may use `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}` for per-trial paths and labels.
+
+The default `yaml_file` path is the intended integration. Explicit `argparse`, `json_file`, and `hydra` modes remain for an existing trainer boundary; Hydra is compatibility only, and PhaseSweep neither depends on it nor uses it for composition. The trainer must accept the selected boundary, exit correctly, and provide finite evidence through the configured extractor, as defined by the [trainer contract](docs/config.md#trainer-contract).
 
 Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
 
