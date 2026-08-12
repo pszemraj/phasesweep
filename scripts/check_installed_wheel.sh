@@ -52,16 +52,25 @@ done < <(git -C "$repo_root" ls-files --stage -z)
 
 # GNU tar applies --exclude only to names it reads afterwards, so the excludes
 # must precede --files-from or they are silently ignored.
-git -C "$repo_root" ls-files --cached --others --exclude-standard -z \
-  | tar -C "$repo_root" "${tar_excludes[@]}" --null --files-from=- -cf - \
-  | tar -C "$source_root" -xf - \
-  || fail "working-tree overlay from $repo_root into $source_root failed"
+if ((${#tar_excludes[@]})); then
+  git -C "$repo_root" ls-files --cached --others --exclude-standard -z \
+    | tar -C "$repo_root" "${tar_excludes[@]}" --null --files-from=- -cf - \
+    | tar -C "$source_root" -xf - \
+    || fail "working-tree overlay from $repo_root into $source_root failed"
+else
+  git -C "$repo_root" ls-files --cached --others --exclude-standard -z \
+    | tar -C "$repo_root" --null --files-from=- -cf - \
+    | tar -C "$source_root" -xf - \
+    || fail "working-tree overlay from $repo_root into $source_root failed"
+fi
 
-for exclude in "${tar_excludes[@]}"; do
-  gitlink="$source_root/${exclude#--exclude=}/.git"
-  [[ ! -e "$gitlink" ]] \
-    || fail "submodule gitlink leaked into the fresh clone at $gitlink; setuptools-scm would see broken git metadata"
-done
+if ((${#tar_excludes[@]})); then
+  for exclude in "${tar_excludes[@]}"; do
+    gitlink="$source_root/${exclude#--exclude=}/.git"
+    [[ ! -e "$gitlink" ]] \
+      || fail "submodule gitlink leaked into the fresh clone at $gitlink; setuptools-scm would see broken git metadata"
+  done
+fi
 
 source_describe="$(git -C "$source_root" "${describe_args[@]}")" \
   || fail "git ${describe_args[*]} failed in the overlaid clone $source_root; the clone's git metadata is broken and setuptools-scm would fall back to a wrong version"
@@ -125,6 +134,8 @@ fi
 
 python -c 'import phasesweep, pathlib, sys; sys.exit(0 if pathlib.Path(phasesweep.__file__).is_relative_to(pathlib.Path(sys.argv[1])) else 1)' "$site_packages" \
   || fail "imported phasesweep from outside $site_packages; the smoke would be testing the checkout, not the wheel"
+python -c 'import phasesweep.examples.fake_train' \
+  || fail "installed wheel cannot import phasesweep.examples.fake_train"
 
 command -v phasesweep >/dev/null \
   || fail "console script 'phasesweep' is missing from $install_root/bin"

@@ -121,8 +121,15 @@ def test_launch_trial_drops_ambient_objective_path_for_non_envelope_extractor(
             {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
             2,
             "2",
+            "PCI_BUS_ID",
+            id="numeric-forces-lock-compatible-order",
+        ),
+        pytest.param(
+            {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+            "GPU-deadbeef",
+            "GPU-deadbeef",
             "FASTEST_FIRST",
-            id="operator-device-order",
+            id="uuid-preserves-operator-device-order",
         ),
         pytest.param(
             None,

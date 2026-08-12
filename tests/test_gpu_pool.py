@@ -298,6 +298,7 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
     """A guardian retains the lock through FD scrubbing, parent death, and descendants."""
     locks = tmp_path / "locks"
     locks.mkdir()
+    locks.chmod(0o700)
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: locks)
     started = tmp_path / "trainer_started"
     worker = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
@@ -664,14 +665,18 @@ def test_empty_cuda_visible_devices_sentinel_is_pinned(monkeypatch) -> None:
         assert gid.visible_devices == ""
 
 
-def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(monkeypatch) -> None:
+@pytest.mark.parametrize("sentinel", ["-1", "-1,"])
+def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
     """The opted-in parallel CPU path pins a configured disable the same way."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
-    pool = GpuPool.create(n_jobs=4, allow_no_gpu=True, cuda_visible_devices="-1")
+    pool = GpuPool.create(n_jobs=4, allow_no_gpu=True, cuda_visible_devices=sentinel)
 
     with pool.acquire() as gid:
-        assert gid.visible_devices == "-1"
+        assert gid.visible_devices == sentinel
 
 
 def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> None:
@@ -693,6 +698,29 @@ def test_ambient_scheduler_sentinel_warns_and_becomes_empty_visibility(monkeypat
     with pool.acquire() as gid:
         assert gid.visible_devices == ""
     assert any("treating it as empty visibility" in record.message for record in caplog.records)
+
+
+def test_ambient_mixed_disable_sentinel_warns_and_becomes_empty_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,-1")
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1)
+
+    with pool.acquire() as gid:
+        assert gid.visible_devices == ""
+    assert any("mixes the '-1' disable sentinel" in record.message for record in caplog.records)
+
+
+def test_configured_mixed_disable_sentinel_remains_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    with pytest.raises(RuntimeError, match="cannot be mixed"):
+        GpuPool.create(n_jobs=1, cuda_visible_devices="0,-1")
 
 
 def test_configured_junk_visibility_is_not_a_disable_sentinel(monkeypatch) -> None:
@@ -776,6 +804,7 @@ def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
     assert len(released) == 1
 
 
+@pytest.mark.hardware
 @pytest.mark.skipif(shutil.which("nvidia-smi") is None, reason="nvidia-smi is not installed")
 def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
     """On real GPU hardware, index 0 locks under the UUID nvidia-smi reports for it."""

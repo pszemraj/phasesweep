@@ -378,8 +378,9 @@ def launch_trial(
             trainer work (review v0.5.16 / blocker 6).
         gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
-        gpu_lease_fds: Host GPU-lock descriptors inherited by the trainer so
-            exclusion lasts for its process lifetime even if the orchestrator
+        gpu_lease_fds: Host GPU-lock descriptors inherited by the trusted
+            supervisor guardian (not trainer code) so exclusion lasts until
+            the whole trainer process group exits, even if the orchestrator
             exits abruptly.
 
     Returns:
@@ -459,8 +460,15 @@ def launch_trial(
         env.pop("PHASESWEEP_OBJECTIVE_PATH", None)
 
     if gpu_id is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+        visible_devices = str(gpu_id)
+        env["CUDA_VISIBLE_DEVICES"] = visible_devices
+        if any(token.strip().isdigit() for token in visible_devices.split(",")):
+            # Numeric tokens are locked against nvidia-smi's PCI-order index
+            # map, so allowing FASTEST_FIRST here could run on a different
+            # physical card than the one whose host lock we hold.
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        else:
+            env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         log.debug("[%s/trial_%d] GPU assigned: %s", phase_name, trial_id, gpu_id)
 
     _warn_dropped_cuda_visibility(
@@ -523,7 +531,9 @@ def extract_trial_result(
 
     A trial that produced a finite metric and finite constraint values but violated
     a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation
-    failure, and should still inform the sampler.
+    failure, and should still inform the sampler. Expected extraction and gate
+    failures are returned in :class:`TrialResult`; this function has no domain
+    exception outcome for callers to catch.
 
     Args:
         experiment: Parsed config; supplies the metric and constraint extractors.

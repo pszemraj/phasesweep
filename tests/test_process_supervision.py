@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -1016,6 +1017,42 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     _assert_descendant_dies(
         child_pid, on_timeout_msg=f"background descendant {child_pid} survived root exit"
     )
+
+
+def test_descendant_reaping_grace_is_outside_trial_wallclock(tmp_path: Path) -> None:
+    """An in-budget root exit remains a lifecycle failure, not a timeout."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    ready = tmp_path / "descendant_ready"
+    child_script = (
+        "import os, pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, "
+        "lambda *_: (time.sleep(0.8), os._exit(0))); "
+        f"pathlib.Path({str(ready)!r}).touch(); "
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import os, pathlib, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        f"ready = pathlib.Path({str(ready)!r}); "
+        "\nwhile not ready.exists(): time.sleep(0.005)\n"
+        "os._exit(0)"
+    )
+
+    started = time.monotonic()
+    result = _run_supervised(
+        trial_dir,
+        shlex.join([sys.executable, "-c", parent_script]),
+        timeout=0.5,
+        attempt_id="post-root-grace-attempt",
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.timed_out is False
+    assert result.return_code == 0
+    assert result.failure_reason is not None
+    assert "still had live descendants" in result.failure_reason
+    assert elapsed > 0.7, "test did not exercise cleanup beyond the wallclock budget"
 
 
 def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:

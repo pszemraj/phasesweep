@@ -596,11 +596,23 @@ class GpuPool:
         )
         detected_uuid_map: dict[str, str] | None = None
         if user_cvd is not None:
-            devices = _devices_from_cuda_visible_devices(user_cvd)
+            try:
+                devices = _devices_from_cuda_visible_devices(user_cvd)
+            except RuntimeError:
+                if not ambient_cvd:
+                    raise
+                log.warning(
+                    "Ambient CUDA_VISIBLE_DEVICES=%r mixes the '-1' disable sentinel "
+                    "with device tokens; treating it as empty visibility and pinning "
+                    "CUDA_VISIBLE_DEVICES='' for trial processes.",
+                    user_cvd,
+                )
+                devices = []
+                user_cvd = ""
         else:
             detected_ids, detected_uuid_map = _detect_gpu_inventory()
             devices = _normalize_devices(detected_ids)
-        if user_cvd is not None and not devices and user_cvd.strip() not in {"", "-1"}:
+        if user_cvd is not None and not devices and not _is_cuda_disable_value(user_cvd):
             if not ambient_cvd:
                 raise RuntimeError(
                     f"Configured CUDA_VISIBLE_DEVICES value {user_cvd!r} is not the empty "
@@ -658,20 +670,17 @@ class GpuPool:
                     "allow_no_gpu_isolation: true is set.",
                     message,
                 )
-                return cls(devices=[], pinned_visible_devices=pinned)
+                return cls(devices=[])
             if n_jobs <= 1:
                 log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
-                return cls(devices=[], pinned_visible_devices=pinned)
+                return cls(devices=[])
             if allow_no_gpu:
                 log.warning(
                     "n_jobs=%d, no GPUs detected — running without CUDA_VISIBLE_DEVICES "
-                    "isolation (allow_no_gpu_isolation: true).%s",
+                    "isolation (allow_no_gpu_isolation: true).",
                     n_jobs,
-                    ""
-                    if pinned is None
-                    else f" Trial environments pin CUDA_VISIBLE_DEVICES={pinned!r}.",
                 )
-                return cls(devices=[], pinned_visible_devices=pinned)
+                return cls(devices=[])
             raise RuntimeError(
                 f"n_jobs={n_jobs} but no GPUs detected. Set gpu_ids or gpu_devices "
                 "explicitly in the phase config, or set allow_no_gpu_isolation: true "
@@ -899,6 +908,13 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
     if "-1" in raw:
         raise RuntimeError("CUDA_VISIBLE_DEVICES=-1 cannot be mixed with visible device tokens.")
     return _normalize_devices(raw)
+
+
+def _is_cuda_disable_value(value: str) -> bool:
+    """Return whether a visibility string is an empty or ``-1`` sentinel."""
+    if not value.strip():
+        return True
+    return [token.strip() for token in value.split(",") if token.strip()] == ["-1"]
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:

@@ -32,6 +32,7 @@ import time
 # directly (the parent already imports this module).
 _HEADER_LEN = 10
 _READY_PID_WIDTH = 10
+_TRAINER_ROOT_EXITED = b"X"
 _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
 _GROUP_TERM_GRACE_SECONDS = 10.0
@@ -300,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
     os.close(ack_fd)
     try:
         _, status = os.waitpid(child_pid, 0)
+        with contextlib.suppress(OSError):
+            os.write(ready_fd, _TRAINER_ROOT_EXITED)
         if _reap_remaining_group(child_pid):
             with contextlib.suppress(OSError):
                 os.write(ready_fd, _DESCENDANTS_REAPED)

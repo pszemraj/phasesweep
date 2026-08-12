@@ -1206,9 +1206,11 @@ def _spawn_blocked_supervisor(
         end of the acknowledgement pipe, and the read end of the guardian
         status pipe. The caller owns both descriptors. It must send the framed
         launch payload (see :func:`_encode_launch_payload`) and close
-        ``ack_write`` once the trainer identity is durably persisted; after
-        the guardian exits, ``status_read`` yields ``b"D"`` when it had to reap
-        descendants left behind by the trainer root, otherwise EOF.
+        ``ack_write`` once the trainer identity is durably persisted.
+        ``status_read`` yields ``b"X"`` as soon as the trainer root exits and
+        then ``b"D"`` when the guardian had to reap descendants, otherwise
+        EOF. Waiting for descendant cleanup after ``b"X"`` is outside the
+        trainer wallclock budget.
 
     Raises:
         _LaunchDeadlineExpired: The launch deadline expired before the
@@ -1329,9 +1331,10 @@ def run_supervised(
     capped to the remaining budget, the deadline is re-checked after
     identity persistence and *before* the trainer payload crosses the ack
     pipe — an expired deadline aborts the blocked supervisor and returns a
-    timeout without ever starting the trainer — and the final ``proc.wait``
-    uses the recomputed remainder, never the original duration. Cleanup
-    grace after a timeout is explicitly post-deadline time.
+    timeout without ever starting the trainer — and the wait for the trainer
+    root uses the recomputed remainder, never the original duration. Cleanup
+    grace after a timeout or an in-budget root exit is explicitly
+    post-deadline time.
 
     Once the supervisor is spawned, launch failures — an expired deadline, a
     failed identity write, a failed payload delivery — never propagate: the
@@ -1512,18 +1515,26 @@ def run_supervised(
     cleanup_confirmed = True
 
     try:
-        try:
-            # Recompute the remainder: the original duration would silently
-            # extend the budget by however long launch bookkeeping took
-            # (review v0.5.16 / blocker 6).
-            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+        root_status: bytes | None
+        if deadline is None:
+            root_status = os.read(status_read, 1)
+        else:
+            root_status = _read_pipe_frame(status_read, 1, deadline=deadline)
+        if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
             failure_reason = f"timeout after {timeout}s"
             log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
-            guardian_status = os.read(status_read, 1)
+            # The trainer root exited within its budget. Descendant cleanup is
+            # lifecycle teardown, so the guardian's SIGTERM/SIGKILL grace must
+            # not retroactively turn this into a wallclock timeout.
+            proc.wait()
+            guardian_status = (
+                os.read(status_read, 1)
+                if root_status == _supervisor._TRAINER_ROOT_EXITED
+                else root_status
+            )
             os.close(status_read)
             status_read = None
             if guardian_status == _supervisor._DESCENDANTS_REAPED:
