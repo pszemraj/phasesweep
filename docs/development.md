@@ -24,7 +24,7 @@ mypy src
 scripts/check_installed_wheel.sh
 ```
 
-The final script builds a wheel in a temporary directory, installs it into a temporary prefix, asserts the installed version matches the one `git describe` implies for the checkout, checks both console entry points and packaged data, and exercises `phasesweep init`, validation, dry-run, and catalog scaffolding without relying on the checkout at runtime. Every assertion prints a `check_installed_wheel:` diagnostic before exiting non-zero. It leaves no build or acceptance artifact in the repository.
+The final script builds a wheel in a temporary directory, asserts its packaged-data members retain public read bits, installs it into a temporary prefix, checks that the installed version matches the one `git describe` implies for the checkout, verifies both console entry points and packaged-data presence, and exercises `phasesweep init`, validation, dry-run, and catalog scaffolding without relying on the checkout at runtime. Every assertion prints a `check_installed_wheel:` diagnostic before exiting non-zero. It leaves no build or acceptance artifact in the repository.
 
 Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. There is currently no CI workflow, Makefile, or justfile wrapping these commands.
 
@@ -81,6 +81,7 @@ Tests are organized by behavior:
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`, `tests/test_engine_status_shape.py`, `tests/test_publication_transaction.py`, `tests/test_trial_evidence.py`: timeout policy, contracts, evidence gates, promotion, suites, publication transactions, evidence-integrity guards, and read-only engine views.
 - `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
 - `tests/test_init.py`: starter creation, validation, dry-run, catalog scaffolding, output placement, and overwrite refusal.
+- `tests/test_reporting.py`: summary rendering, winner manifests, and report serialization.
 - `tests/test_tiny_decoder_example.py`: adapter composition, attempt-scoped final-checkpoint result envelopes, zero-seed handling, and empty-validation rejection.
 - `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.
 

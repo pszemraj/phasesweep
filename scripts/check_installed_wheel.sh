@@ -3,6 +3,10 @@
 # prefix, and exercise the installed starter workflow. Every artifact lives
 # under a temporary root that is removed on exit; the repository is untouched.
 set -euo pipefail
+# Make build/copy staging deterministic while still preserving a source file
+# that is explicitly narrower than 0644; tar and wheel builders otherwise
+# mask ordinary package-data read bits under a caller's restrictive umask.
+umask 022
 
 fail() {
   echo "check_installed_wheel: $*" >&2
@@ -93,6 +97,13 @@ pip wheel --no-deps --wheel-dir "$wheel_dir" "$source_root" \
 wheel_files=("$wheel_dir"/*.whl)
 [[ ${#wheel_files[@]} -eq 1 && -f "${wheel_files[0]}" ]] \
   || fail "expected exactly one wheel in $wheel_dir, found ${#wheel_files[@]}: ${wheel_files[*]}"
+for packaged_member in \
+  "phasesweep/py.typed" \
+  "phasesweep/templates/starter_experiment.yaml" \
+  "phasesweep/mcp/agent_prompt.md"; do
+  python -c 'import sys, zipfile; info = zipfile.ZipFile(sys.argv[1]).getinfo(sys.argv[2]); raise SystemExit(0 if (info.external_attr >> 16) & 0o444 == 0o444 else 1)' "${wheel_files[0]}" "$packaged_member" \
+    || fail "wheel member is not world-readable: $packaged_member"
+done
 pip install --ignore-installed --no-deps --prefix "$install_root" "${wheel_files[0]}" \
   || fail "pip install of ${wheel_files[0]} into $install_root failed"
 
