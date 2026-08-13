@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
+from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
@@ -239,12 +241,38 @@ def claim_runner_handle(
 
 
 def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
-    """Invoke the detached runner in-process and restore the caller's directory."""
+    """Invoke the detached runner in-process without stealing pytest's process state.
+
+    The real runner is a process entry point and therefore owns shutdown
+    signals for its lifetime. Tests call it in pytest's process, where that
+    ownership must end with this helper just like the temporary cwd does.
+
+    :param list[str] argv: Detached runner arguments.
+    :param Path | None cwd: Runner working directory, or the current directory.
+    :return int: Runner process exit code.
+    """
     original = Path.cwd()
+    restore_signal = signal.signal
+    restore_mask = getattr(signal, "pthread_sigmask", None)
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
+    prior_owner = runtime_process._process_lifetime_owner
+    prior_depth = runtime_process._scope_depth
     try:
         return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
     finally:
         os.chdir(original)
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(
+                signal.SIG_BLOCK,
+                set(runtime_process._SHUTDOWN_SIGNALS),
+            )
+        for sig, handler in prior_handlers.items():
+            restore_signal(sig, handler)
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(signal.SIG_SETMASK, prior_mask)
+        runtime_process._process_lifetime_owner = prior_owner
+        runtime_process._scope_depth = prior_depth
 
 
 def runner_argv(

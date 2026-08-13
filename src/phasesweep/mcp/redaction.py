@@ -172,6 +172,7 @@ def winners_payload(
         "experiment_id": experiment_id,
         "run_id": run_id,
         "result_source": result_source,
+        "represented_generation_id": represented_generation_id,
         "publication_integrity": publication_integrity,
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,

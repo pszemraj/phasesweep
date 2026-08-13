@@ -417,8 +417,11 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     status_properties = output_schemas[TOOL_GET_RUN_STATUS]["properties"]
     assert "result_context" in results_properties
     assert "published_config_matches_current" in results_properties
+    assert results_properties["result_source"]["description"]
+    assert "represented_generation_id" in results_properties
     assert "result_context" in status_properties
     assert "published_config_matches_current" in status_properties
+    assert status_properties["result_source"]["description"]
     assert "result_phase_plan" in status_properties
 
     resources = asyncio.run(server.list_resources())

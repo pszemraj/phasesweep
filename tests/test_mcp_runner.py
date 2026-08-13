@@ -72,6 +72,43 @@ pytestmark = pytest.mark.skipif(
 SEEDED_RANDOM = Sampler(type="random", seed=0)
 
 
+def test_in_process_runner_helper_restores_host_signal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process-entry-point runner must not retain pytest's signal ownership."""
+    import phasesweep.runtime.process as runtime_process
+
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+    def host_handler(_signum: int, _frame: object) -> None:
+        return None
+
+    def fake_main(_argv: list[str]) -> int:
+        runtime_process.install_signal_handlers()
+        os.chdir(tmp_path)
+        return 23
+
+    try:
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            signal.signal(sig, host_handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        original_cwd = Path.cwd()
+        monkeypatch.setattr(mcp_runner, "main", fake_main)
+
+        assert runner_main([], cwd=tmp_path) == 23
+
+        assert Path.cwd() == original_cwd
+        for sig in runtime_process._SHUTDOWN_SIGNALS:
+            assert signal.getsignal(sig) is host_handler
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == (prior_mask | {signal.SIGTERM})
+        assert not runtime_process._process_lifetime_owner
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, handler)
+
+
 def _slow_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
     config = tmp_path / "exp.yaml"
     config.write_text(

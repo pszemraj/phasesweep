@@ -279,6 +279,7 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
 
     assert payload["run_id"] == "exp-run"
     assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["represented_generation_id"] == "generation-new"
     # Completeness is measured against the plan the caller supplied, which for
     # a published result is that generation's own (review v0.5.16 / blocker 4).
     assert payload["declared_phase_count"] == 2

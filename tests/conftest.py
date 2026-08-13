@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import signal
 import sqlite3
 import stat
 import textwrap
@@ -101,26 +102,35 @@ def isolate_host_gpu_detection(
 
 @pytest.fixture(autouse=True)
 def isolate_signal_ownership_tokens() -> Iterator[None]:
-    """Snapshot and restore the process-lifetime signal-ownership tokens per test.
+    """Snapshot and restore PhaseSweep's process-level signal state per test.
 
     ``phasesweep.runtime.process._process_lifetime_owner`` and ``_scope_depth``
     are plain module globals (review v0.5.15 / blocker 2B), deliberately not
     re-derived from OS ground truth the way the actual signal handlers are.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
-    in-process) would otherwise permanently flip ``_process_lifetime_owner``
-    for the rest of the pytest process, silently turning every later
-    ``signal_handler_scope()`` call into a no-op regardless of what OS-level
-    handlers that later test itself restores. This is a cheap attribute
-    save/restore, matching the existing convention in this suite of tests
-    manually restoring real signal handlers around themselves.
+    in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
+    SIGHUP handlers and unblock those signals, as well as flipping the private
+    ownership tokens. Later Ctrl-C and CI timeout signals would then enter
+    PhaseSweep's shutdown handler instead of pytest's. Restore the kernel mask,
+    OS handlers, and ownership bookkeeping as one fixture-level transaction.
     """
     import phasesweep.runtime.process as process
 
+    restore_signal = signal.signal
+    restore_mask = getattr(signal, "pthread_sigmask", None)
     prior_owner = process._process_lifetime_owner
     prior_depth = process._scope_depth
+    prior_handlers = {sig: signal.getsignal(sig) for sig in process._SHUTDOWN_SIGNALS}
+    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
     try:
         yield
     finally:
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(signal.SIG_BLOCK, set(process._SHUTDOWN_SIGNALS))
+        for sig, handler in prior_handlers.items():
+            restore_signal(sig, handler)
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(signal.SIG_SETMASK, prior_mask)
         process._process_lifetime_owner = prior_owner
         process._scope_depth = prior_depth
 

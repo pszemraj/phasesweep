@@ -516,7 +516,13 @@ class GetRunStatusResult(_ResultPayload):
     """Structured output for get_run_status."""
 
     experiment_id: ExperimentId
-    result_source: ResultSource
+    result_source: ResultSource = Field(
+        description=(
+            "Where the result facts came from: the mutable shared study for a live/current "
+            "read, an immutable terminal run snapshot, or an unavailable terminal-snapshot "
+            "placeholder whose counts are explicitly untrusted."
+        )
+    )
     current_generation_id: str | None = Field(
         description=(
             "Most recent generation id known to this experiment; may be failed or "
@@ -650,7 +656,20 @@ class GetRunResultsResult(_ResultPayload):
 
     experiment_id: ExperimentId
     run_id: RunId | None
-    result_source: ResultSource
+    result_source: ResultSource = Field(
+        description=(
+            "Where the result facts came from: the mutable shared study for a live/current "
+            "read, an immutable terminal run snapshot, or an unavailable terminal-snapshot "
+            "placeholder whose counts are explicitly untrusted."
+        )
+    )
+    represented_generation_id: str | None = Field(
+        description=(
+            "Generation whose winners and completeness this payload represents. During a "
+            "live experiment-scoped read this may be the in-flight run generation; null when "
+            "there is no represented generation."
+        )
+    )
     publication_integrity: PublicationIntegrity
     result_context: ResultContext
     published_config_matches_current: PublishedConfigMatchesCurrent
@@ -1154,10 +1173,10 @@ class PhaseSweepMCP:
                 result_source=result_source,
             )
             if snapshot is not None
-            else read_status(
+            else self._live_status_payload(
+                target_id,
                 experiment,
-                generation_id=handle.run_id if handle is not None else None,
-                comparison_experiment=self._catalog_comparison_experiment(target_id),
+                handle,
             )
         )
         return target_id, status, run, handle, result_source
@@ -1172,6 +1191,34 @@ class PhaseSweepMCP:
             return self._registry.get(experiment_id).experiment
         except UnknownExperimentError:
             return None
+
+    def _live_status_payload(
+        self,
+        experiment_id: str,
+        experiment: Experiment,
+        handle: RunHandle | None,
+    ) -> dict[str, Any]:
+        """Read live status and leave catalog drift unknown after decataloging.
+
+        ``read_status`` normally compares against its read config when no
+        comparison config is supplied. A run snapshot remains the correct
+        artifact locator after its catalog entry is removed, but it is not a
+        current catalog config and therefore cannot support a drift verdict.
+
+        :param str experiment_id: Catalog id associated with the read target.
+        :param Experiment experiment: Current catalog config or live run snapshot config.
+        :param RunHandle | None handle: Optional live run pinning the represented generation.
+        :return dict[str, Any]: Path-free live status payload.
+        """
+        comparison = self._catalog_comparison_experiment(experiment_id)
+        status = read_status(
+            experiment,
+            generation_id=handle.run_id if handle is not None else None,
+            comparison_experiment=comparison,
+        )
+        if comparison is None:
+            status["published_config_matches_current"] = None
+        return status
 
     def _snapshot_status_payload(
         self,
@@ -1365,10 +1412,10 @@ class PhaseSweepMCP:
             # is the queried run_id itself when pinned, else the captured
             # published id -- never the live current pointer, which is what
             # this used to (incorrectly) label winners with.
-            status = read_status(
+            status = self._live_status_payload(
+                target_id,
                 experiment,
-                generation_id=handle.run_id if handle is not None else None,
-                comparison_experiment=self._catalog_comparison_experiment(target_id),
+                handle,
             )
             # Enumerate the plan that generation published under, not the one
             # the config declares now: a phase renamed since publication used

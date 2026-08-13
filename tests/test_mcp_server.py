@@ -45,6 +45,7 @@ from phasesweep.engine import (
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.guards import (
     _experiment_lock,
+    _experiment_semantic_fingerprint,
     _phase_fingerprint,
     _reap_stale_trials,
     _register_active_attempt,
@@ -527,7 +528,8 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
     if record_kind == "malformed_handle":
         (tmp_path / "state" / "runs" / "srv-broken.json").write_text("{not valid json")
     else:
-        store.config_snapshot_path("srv-orphan").write_text("experiment: srv\n")
+        with open_private_text(store.config_snapshot_path("srv-orphan"), "x") as output:
+            output.write("experiment: srv\n")
 
     with pytest.raises(
         RunCapacityUnknownError, match="cannot prove available launch capacity"
@@ -1532,6 +1534,51 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
 
     assert result["experiment_id"] == "old"
     assert result["phases"][0]["params"] == {"lr": "<redacted>"}
+
+
+def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> None:
+    old_config = _config(tmp_path, name="old")
+    old_exp = load_config(old_config)
+    assert isinstance(old_exp, Experiment)
+    run_id = "old-live-published"
+    _write_winner_yaml(
+        old_exp,
+        "p",
+        phase_fingerprint=_phase_fingerprint(old_exp, old_exp.phases[0], {}),
+        generation_id=run_id,
+    )
+    _generation_summary_path(old_exp, run_id).write_text(
+        yaml.safe_dump(
+            {
+                "config_fingerprint": _experiment_semantic_fingerprint(old_exp),
+                "metric": {"name": "loss", "goal": "minimize"},
+                "phase_plan": [{"name": "p"}],
+            },
+            sort_keys=False,
+        )
+    )
+
+    other_config = _config(tmp_path, name="other")
+    app, _registry, store = make_mcp_app(write_mcp_catalog(tmp_path, {"other": other_config}))
+    snapshot = old_config.read_bytes()
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    store.create(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id="old",
+            config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        )
+    )
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.result_source == "current_shared_study"
+    assert results.result_source == "current_shared_study"
+    assert status.represented_generation_id == run_id
+    assert results.represented_generation_id == run_id
+    assert status.published_config_matches_current is None
+    assert results.published_config_matches_current is None
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])
@@ -3324,6 +3371,7 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
         assert payload["run"]["state"] == "running"
         assert payload["run"]["recovery_required"] is False
     assert winners["result_source"] == "current_shared_study"
+    assert winners["represented_generation_id"] == run_id
     assert awaited["reason"] == "timeout"
 
 
