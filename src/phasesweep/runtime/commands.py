@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shlex
 from copy import deepcopy
 from pathlib import Path
@@ -234,14 +235,19 @@ def compose_trainer_config(
 def _substitute_trainer_config_placeholders(value: Any, substitutions: dict[str, str]) -> Any:
     """Expand PhaseSweep runtime placeholders inside trainer-config strings.
 
+    Each source string is scanned once so placeholder-like text inside a real
+    replacement value (for example, a workdir containing ``{phase}``) remains
+    literal instead of being substituted again.
+
     :param Any value: Configuration subtree to copy and expand.
     :param dict[str, str] substitutions: Literal placeholder-to-value mapping.
     :return Any: Expanded copy of ``value``.
     """
     if isinstance(value, str):
-        for placeholder, replacement in substitutions.items():
-            value = value.replace(placeholder, replacement)
-        return value
+        pattern = "|".join(re.escape(placeholder) for placeholder in substitutions)
+        if not pattern:
+            return value
+        return re.sub(pattern, lambda match: substitutions[match.group(0)], value)
     if isinstance(value, list):
         return [_substitute_trainer_config_placeholders(item, substitutions) for item in value]
     if isinstance(value, dict):

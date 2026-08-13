@@ -138,6 +138,8 @@ def test_render_command_json_file(tmp_path):
 
 
 def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
+    trial_dir = tmp_path / "work-{phase}" / "trial-{trial_id}"
+    trial_dir.mkdir(parents=True)
     base = {
         "model": {"name": "tiny", "depth": 4, "dropout": 0.1},
         "optimizer": {"name": "adamw", "lr": 3e-4},
@@ -154,20 +156,20 @@ def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> N
             "trainer.label": "{trial_dir}",
         },
         "yaml_file",
-        trial_dir=tmp_path,
+        trial_dir=trial_dir,
         trial_id=3,
         phase="depth",
         run_name="x-depth-3",
         trainer_config=base,
     )
 
-    config_path = tmp_path / "trainer_config.yaml"
+    config_path = trial_dir / "trainer_config.yaml"
     assert shlex.split(command) == ["python", "train.py", str(config_path)]
     assert yaml.safe_load(config_path.read_text()) == {
         "data": {"path": "data/train.jsonl"},
         "model": {"name": "tiny", "depth": 8, "dropout": 0.1},
         "optimizer": {"name": "adamw", "lr": 1e-4},
-        "output_dir": f"{tmp_path}/trainer/depth-3",
+        "output_dir": f"{trial_dir}/trainer/depth-3",
         "trainer": {"label": "{trial_dir}", "seed": 17},
     }
     assert base["model"]["depth"] == 4
