@@ -796,7 +796,7 @@ def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
     excludes every other run from the GPU."""
 
     class _Handle:
-        def seek(self, pos: int) -> None:
+        def seek(self, _pos: int) -> None:
             pass
 
         def truncate(self) -> None:

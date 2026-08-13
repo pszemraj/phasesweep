@@ -2381,7 +2381,7 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
     try:
 
         def make_sentinel(tag: int):
-            def handler(signum: int, frame: object) -> None:
+            def handler(signum: int, _frame: object) -> None:
                 return None
 
             handler.__name__ = f"sentinel_{tag}"

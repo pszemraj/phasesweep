@@ -1384,7 +1384,7 @@ def test_dry_run_does_not_enter_signal_handler_scope(
     assert installed["called"] is False
 
 
-def testdefer_shutdown_signals_blocks_and_restores() -> None:
+def test_defer_shutdown_signals_blocks_and_restores() -> None:
     """The context manager must add SIGTERM/SIGINT to the thread mask on entry
     and restore the original mask on exit."""
     if not hasattr(signal, "pthread_sigmask"):
