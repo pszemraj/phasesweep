@@ -911,7 +911,11 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
 
 
 def _is_cuda_disable_value(value: str) -> bool:
-    """Return whether a visibility string is an empty or ``-1`` sentinel."""
+    """Return whether a visibility string is an empty or ``-1`` sentinel.
+
+    :param str value: CUDA visibility string to classify.
+    :return bool: Whether ``value`` disables CUDA device visibility.
+    """
     if not value.strip():
         return True
     return [token.strip() for token in value.split(",") if token.strip()] == ["-1"]

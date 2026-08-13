@@ -22,7 +22,12 @@ class _OverrideValueError(TypeError):
     """A value outside the scalar/list CLI override contract."""
 
     def __init__(self, fmt: _CliOverrideFormat, value: Any, position: str) -> None:
-        """Describe the exact nested value the selected CLI wire cannot render."""
+        """Describe the exact nested value the selected CLI wire cannot render.
+
+        :param _CliOverrideFormat fmt: Selected CLI override grammar.
+        :param Any value: Unsupported value encountered while rendering.
+        :param str position: Nested list position used in the diagnostic.
+        """
         self.value = value
         self.position = position
         where = f" at position {position}" if position else ""

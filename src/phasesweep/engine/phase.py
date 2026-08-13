@@ -90,7 +90,15 @@ def _partial_completion_for_replay(
     *,
     outcome_sequence: int,
 ) -> dict[str, Any]:
-    """Re-prove and return the frozen completion metadata for a decision replay."""
+    """Re-prove and return the frozen completion metadata for a decision replay.
+
+    :param optuna.Study study: Study whose current terminal counts are verified.
+    :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
+    :param int outcome_sequence: Current durable outcome sequence for the study.
+    :raises StudySchemaMismatchError: Trial counts or the outcome sequence changed
+        after the accepted-partial decision was committed.
+    :return dict[str, Any]: Frozen incomplete-completion metadata for publication.
+    """
     trials = study.get_trials(deepcopy=False)
     finished_trials = _finished_trial_count(trials)
     completed_trials = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)

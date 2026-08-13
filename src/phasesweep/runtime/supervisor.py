@@ -159,7 +159,12 @@ def _trainer_group_alive(pgid: int) -> bool:
 
 
 def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
-    """Wait until ``pgid`` is gone, bounded only when ``timeout`` is set."""
+    """Wait until ``pgid`` is gone, bounded only when ``timeout`` is set.
+
+    :param int pgid: Process group whose exit is awaited.
+    :param float | None timeout: Maximum seconds to wait, or ``None`` for no deadline.
+    :return bool: ``True`` once the group is gone, or ``False`` when the deadline expires.
+    """
     deadline = None if timeout is None else time.monotonic() + timeout
     while _trainer_group_alive(pgid):
         if deadline is not None and time.monotonic() >= deadline:
@@ -211,7 +216,13 @@ def _close_trainer_fds() -> None:
 
 
 def _run_trainer(ready_fd: int, ack_fd: int) -> int:
-    """Create the trainer session, cross the launch barrier, and exec it."""
+    """Create the trainer session, cross the launch barrier, and exec it.
+
+    :param int ready_fd: Descriptor used to publish the trainer process identity.
+    :param int ack_fd: Descriptor carrying the committed launch payload.
+    :return int: Supervisor error status when setup or ``execve`` fails; a
+        successful call replaces the process and does not return.
+    """
     try:
         os.setsid()
     except OSError:
@@ -246,7 +257,12 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
 
 
 def _return_child_status(status: int) -> int:
-    """Return an exit status or reproduce the trainer root's signal."""
+    """Return an exit status or reproduce the trainer root's signal.
+
+    :param int status: Raw wait status returned for the trainer root.
+    :return int: Root exit status, conventional signal status if signal delivery
+        returns, or ``70`` for an unrecognized wait state.
+    """
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
     if os.WIFSIGNALED(status):

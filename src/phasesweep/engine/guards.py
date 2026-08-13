@@ -136,7 +136,14 @@ class _AcceptedPartialDecision:
 def _load_accepted_partial_decision(
     study: optuna.Study,
 ) -> _AcceptedPartialDecision | None:
-    """Load and validate a persisted accepted-partial timeout decision."""
+    """Load and validate a persisted accepted-partial timeout decision.
+
+    :param optuna.Study study: Study whose terminal phase decision is inspected.
+    :raises StudySchemaMismatchError: The stored decision has an unsupported or
+        internally inconsistent shape.
+    :return _AcceptedPartialDecision | None: Validated decision, or ``None``
+        when the study has no accepted-partial decision.
+    """
     raw = study.user_attrs.get(PHASE_DECISION_ATTR)
     if raw is None:
         return None
@@ -1463,7 +1470,15 @@ def _collect_attempt_generation(
     attempt_generations: dict[str, str] | None,
     attempt_locations: dict[str, tuple[str, int, str]] | None,
 ) -> None:
-    """Collect one trial's durable attempt, generation, and study-local locator."""
+    """Collect one trial's durable attempt, generation, and study-local locator.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose durable identity is collected.
+    :param str phase_name: Phase that owns ``trial``.
+    :param set[str] | None attempt_ids: Optional destination for known attempt IDs.
+    :param dict[str, str] | None attempt_generations: Optional attempt-to-generation map.
+    :param dict[str, tuple[str, int, str]] | None attempt_locations: Optional
+        attempt-to-phase/trial/generation locator map.
+    """
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         return
@@ -1917,7 +1932,11 @@ def _artifact_root_storage_key(experiment: Experiment) -> str:
 
 
 def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
-    """Build the reverse ownership record for one persistent artifact root."""
+    """Build the reverse ownership record for one persistent artifact root.
+
+    :param Experiment experiment: Experiment whose artifact root is bound.
+    :return dict[str, Any]: Versioned experiment, root, and storage identity record.
+    """
     return {
         "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
         "experiment": experiment.experiment,
@@ -1927,7 +1946,12 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
 
 
 def _root_contains_durable_state(experiment: Experiment) -> bool:
-    """Return whether an unbound root contains more than the opened run log."""
+    """Return whether an unbound root contains more than the opened run log.
+
+    :param Experiment experiment: Experiment whose artifact root is inspected.
+    :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
+    :return bool: Whether the root contains durable state beyond its binding and run log.
+    """
     root = _experiment_dir(experiment)
     if not root.is_dir():
         return False
@@ -2640,6 +2664,7 @@ def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str
 
     :param _ArtifactRootRebindPlan plan: Plan already validated by
         :func:`_plan_artifact_root_rebinds`.
+    :raises ArtifactRootRebindError: The destination ownership record cannot be written.
     :return list[tuple[str, str | None, str]]: One ``(study name, previous
         root or None, new root)`` record per study written.
     """

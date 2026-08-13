@@ -1978,6 +1978,9 @@ class PhaseSweepMCP:
         :param str | None from_phase: Optional phase to resume from.
         :param RunHandle pending: Pre-spawn persisted handle.
         :param Path config_snapshot_path: Config snapshot path consumed by the runner.
+        :raises OSError: The log or detached runner cannot be opened before spawn.
+        :raises _SpawnBookkeepingError: Post-spawn identity bookkeeping fails; the
+            exception records whether cleanup of the spawned process group was confirmed.
         :return RunHandle: Unsaved run handle for the spawned runner.
         """
         run_id = pending.run_id
