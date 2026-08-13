@@ -19,7 +19,7 @@ This is an orchestration example, not a PyTorch training-template recommendation
 
 ## CLI smoke sweep
 
-For a genuinely short GPU integration check, run the dedicated two-trial config first. It explicitly leases CUDA device `0`, runs 10 training batches per trial, disables W&B, has bounded trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
+For a genuinely short GPU integration check, run the dedicated two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. It is also the canonical minimal schema for this example's `trainer_config`: the wrapper passes those upstream trainer keys through unchanged and requires `run_dir` for checkpoint output. The config explicitly leases CUDA device `0`, runs 10 training batches per trial, disables W&B, has bounded trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/gpu_smoke.yaml

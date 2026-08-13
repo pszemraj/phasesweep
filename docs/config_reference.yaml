@@ -73,6 +73,8 @@
 # phases: list[Phase] (required; min length 1)
 # Phase names must be unique and are evaluated in declaration order. Each Phase object accepts the following keys.
 
+# PHASE OBJECT (each entry nested under `phases`)
+
 # name: str (required)
 # Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names.
 
