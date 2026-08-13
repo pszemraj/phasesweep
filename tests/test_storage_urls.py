@@ -389,6 +389,30 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
             "postgresql://sweep:new-secret@db.internal:5432/studies",
         ),
         (
+            "authority user rotation",
+            "postgresql://old-user:secret@db.internal/studies",
+            "postgresql://new-user:secret@db.internal/studies",
+        ),
+        (
+            "query password rotation",
+            "postgresql://sweep@db.internal/studies?password=old-secret",
+            "postgresql://sweep@db.internal/studies?PASSWORD=new-secret",
+        ),
+        (
+            "access token rotation",
+            "postgresql://sweep@db.internal/studies?access_token=old-token",
+            "postgresql://sweep@db.internal/studies?ACCESS-TOKEN=new-token",
+        ),
+        (
+            "nested ODBC credential rotation",
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC%3BDriver%7D%3BSERVER%3Ddb.internal%3B"
+            "DATABASE%3Dstudies%3BUID%3Dold-user%3BPWD%3D%7Bold%3Bsecret%7D",
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC%3BDriver%7D%3BSERVER%3Ddb.internal%3B"
+            "DATABASE%3Dstudies%3Buid%3Dnew-user%3Bpwd%3D%7Bnew%3Bsecret%7D",
+        ),
+        (
             "query order",
             "postgresql://sweep@db.internal/studies?a=1&b=2",
             "postgresql://sweep@db.internal/studies?b=2&a=1",
@@ -444,7 +468,6 @@ def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: st
     [
         ("database", "postgresql://u@h/db_a", "postgresql://u@h/db_b"),
         ("host", "postgresql://u@host_a/db", "postgresql://u@host_b/db"),
-        ("user", "postgresql://user_a@h/db", "postgresql://user_b@h/db"),
         ("non-default port", "postgresql://u@h:5432/db", "postgresql://u@h:6432/db"),
         ("dialect family", "postgresql://u@h/db", "mysql://u@h/db"),
         (
@@ -462,6 +485,26 @@ def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: st
             "postgresql://u@h/db?options=-csearch_path%3Dresearch_a",
             "postgresql://u@h/db?options=-csearch_path%3Dresearch_b",
         ),
+        (
+            "different schema option",
+            "postgresql://u@h/db?schema=research_a",
+            "postgresql://u@h/db?schema=research_b",
+        ),
+        (
+            "different retained target option",
+            "postgresql://u@h/db?cluster=primary",
+            "postgresql://u@h/db?cluster=archive",
+        ),
+        (
+            "different nested ODBC server",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb-a%3BDATABASE%3Dstudies%3BPWD%3Dx",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb-b%3BDATABASE%3Dstudies%3BPWD%3Dy",
+        ),
+        (
+            "different nested ODBC database",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dstudies-a%3BPWD%3Dx",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dstudies-b%3BPWD%3Dy",
+        ),
     ],
 )
 def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right: str) -> None:
@@ -470,15 +513,15 @@ def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right
 
 
 def test_rdb_identity_excludes_credentials_and_keeps_socket_path() -> None:
-    """The password never reaches the lock identity; ``host=`` (unix socket) does."""
+    """Credentials never reach identity; ``host=`` (unix socket) does."""
     identity = canonical_storage_identity(
         "postgresql://sweep:hunter2@/studies?host=/var/run/postgresql&connect_timeout=10"
     )
 
     assert identity is not None
     assert "hunter2" not in identity
+    assert "sweep" not in identity
     assert "connect_timeout" not in identity
-    assert "sweep" in identity
     assert "studies" in identity
     # The socket directory is identity-bearing, percent-encoded in the identity.
     assert "%2Fvar%2Frun%2Fpostgresql" in identity
@@ -490,7 +533,7 @@ def test_rdb_identity_is_deterministic_and_prefixed() -> None:
 
     identity = canonical_storage_identity(url)
 
-    assert identity == "rdb://postgresql://sweep@db.internal:5432/studies?a=1&b=2"
+    assert identity == "rdb://postgresql://db.internal:5432/studies?a=1&b=2"
     assert identity == canonical_storage_identity(url)
 
 

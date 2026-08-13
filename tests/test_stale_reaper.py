@@ -64,6 +64,7 @@ from phasesweep.engine.state import (
     _trial_dir_for,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.runtime.files import canonical_storage_identity
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -1326,9 +1327,35 @@ def _fabricate_registered_attempt(
     return study, trial_dir, number
 
 
-def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("storage", "secret", "expected_identity"),
+    [
+        (
+            "postgresql://researcher:secret@db.internal/studies?sslmode=require",
+            "secret",
+            "rdb://postgresql://db.internal:5432/studies",
+        ),
+        (
+            "postgresql://researcher@db.internal/studies?access_token=secret-token",
+            "secret-token",
+            "rdb://postgresql://db.internal:5432/studies",
+        ),
+        (
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BUID%3Duser%3BPWD%3Dsecret-pwd",
+            "secret-pwd",
+            "rdb://mssql://:1433/?odbc_connect=SERVER%3Ddb.internal%3BDATABASE%3Dstudies",
+        ),
+    ],
+    ids=["authority", "access-token", "nested-odbc"],
+)
+def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(
+    tmp_path: Path,
+    storage: str,
+    secret: str,
+    expected_identity: str,
+) -> None:
     """Credential-bearing recovery locators never land in public artifacts."""
-    storage = "postgresql://researcher:secret@db.internal/studies?sslmode=require"
     experiment = make_experiment(
         experiment="private-registry",
         workdir=tmp_path / "runs",
@@ -1351,8 +1378,8 @@ def test_active_attempt_registry_is_private_and_uses_a_frozen_locator(tmp_path: 
     payload = json.loads(entry_path.read_text())
     assert payload["schema_version"] == ATTEMPT_REGISTRY_SCHEMA_VERSION
     assert payload["storage_locator"] == storage
-    assert payload["storage_identity"] == "rdb://postgresql://researcher@db.internal:5432/studies"
-    assert "secret" not in payload["storage_identity"]
+    assert payload["storage_identity"] == expected_identity
+    assert secret not in payload["storage_identity"]
     assert "storage" not in payload
     assert entry_path.parent.stat().st_mode & 0o777 == 0o700
     assert entry_path.stat().st_mode & 0o777 == 0o600
@@ -1550,6 +1577,59 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         stale.wait(timeout=5)
 
 
+@pytest.mark.parametrize("current_phases", ["renamed", "removed"])
+def test_registry_recovery_uses_rotated_credential_for_same_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    current_phases: str,
+) -> None:
+    """A stale attempt remains reachable after credential and phase-graph changes."""
+    old_experiment = make_experiment(
+        experiment="credential-rotation",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+    )
+    study, trial_dir, stale_number = _fabricate_registered_attempt(
+        old_experiment,
+        "old-phase",
+        attempt_id="rotated-attempt",
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="rotated-attempt", state="allocated")
+
+    old_locator = "postgresql://old-user:old-secret@db.internal/studies?access_token=old-token"
+    current_locator = "postgresql://new-user:new-secret@db.internal/studies?access_token=new-token"
+    entry_path = _attempts_dir(old_experiment) / "rotated-attempt.json"
+    entry = json.loads(entry_path.read_text())
+    entry["storage_locator"] = old_locator
+    entry["storage_identity"] = canonical_storage_identity(old_locator)
+    entry_path.write_text(json.dumps(entry))
+
+    phases = (
+        [old_experiment.phases[0].model_copy(update={"name": "new-phase"})]
+        if current_phases == "renamed"
+        else []
+    )
+    current_experiment = old_experiment.model_copy(
+        update={"storage": current_locator, "phases": phases}
+    )
+    loaded_locators: list[str] = []
+
+    def load_study(*, study_name: str, storage: str) -> optuna.Study:
+        assert study_name == study.study_name
+        loaded_locators.append(storage)
+        return study
+
+    monkeypatch.setattr(optuna, "load_study", load_study)
+
+    report = _PreflightCleanupReport()
+    _preflight_active_attempts(current_experiment, report)
+
+    assert loaded_locators == [current_locator]
+    assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+    assert report.recovered_attempt_ids == {"rotated-attempt"}
+    assert not entry_path.exists()
+
+
 def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) -> None:
     """A registered attempt is repaired through its *recorded* storage URL.
 
@@ -1576,7 +1656,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
 
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(old_exp, report)
+    _preflight_active_attempts(_exp("new.db"), report)
 
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))

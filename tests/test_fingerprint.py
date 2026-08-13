@@ -1332,13 +1332,13 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     ],
     ids=["password", "access-token", "nested-odbc-connect"],
 )
-def test_artifact_root_binding_and_conflicts_never_expose_rdb_query_credentials(
+def test_artifact_root_binding_survives_rdb_query_credential_rotation(
     tmp_path: Path,
     owner_storage: str,
     offered_storage: str,
     secrets: tuple[str, str],
 ) -> None:
-    """Shareable ownership records and diagnostics contain no operational URL values."""
+    """Credential rotation retains root ownership without publishing secrets."""
 
     def external_experiment(storage: str) -> Experiment:
         placeholder = make_experiment(
@@ -1364,19 +1364,14 @@ def test_artifact_root_binding_and_conflicts_never_expose_rdb_query_credentials(
     for secret in secrets:
         assert secret not in artifact_text
 
-    with pytest.raises(ArtifactRootConflictError) as conflict_info:
-        _validate_artifact_root_binding(offered, claim_fresh=False)
-    with pytest.raises(ArtifactRootRebindError) as rebind_info:
-        _validate_artifact_root_binding_for_rebind(
-            _ArtifactRootRebindPlan(
-                experiment=offered,
-                destination=str(_experiment_dir(offered).resolve()),
-                entries=(),
-            )
+    _validate_artifact_root_binding(offered, claim_fresh=False)
+    _validate_artifact_root_binding_for_rebind(
+        _ArtifactRootRebindPlan(
+            experiment=offered,
+            destination=str(_experiment_dir(offered).resolve()),
+            entries=(),
         )
-    messages = f"{conflict_info.value}\n{rebind_info.value}"
-    for secret in secrets:
-        assert secret not in messages
+    )
 
 
 def test_relative_storage_identity_is_bound_to_the_invocation_cwd(

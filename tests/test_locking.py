@@ -673,7 +673,35 @@ def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
     )
 
 
-def test_run_lock_collides_for_equivalent_rdb_storage_urls(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("left_storage", "right_storage"),
+    [
+        (
+            "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
+            "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?password=old-secret",
+            "postgresql://sweep@db.internal/studies?password=new-secret",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?access_token=old-token",
+            "postgresql://sweep@db.internal/studies?access_token=new-token",
+        ),
+        (
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BPWD%3Dold-secret",
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BPWD%3Dnew-secret",
+        ),
+    ],
+    ids=["authority", "query-password", "access-token", "nested-odbc"],
+)
+def test_run_lock_collides_for_equivalent_rdb_storage_urls(
+    tmp_path: Path,
+    left_storage: str,
+    right_storage: str,
+) -> None:
     """Equivalent external-RDB URLs must land on one storage lock.
 
     ``allow_external_rdb_single_host: true`` promises that host-local locking
@@ -683,14 +711,8 @@ def test_run_lock_collides_for_equivalent_rdb_storage_urls(tmp_path: Path) -> No
     Distinct workdirs keep the output locks apart, so any shared path is the
     storage lock.
     """
-    exp_a = _rdb_experiment(
-        tmp_path / "runs_a",
-        "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
-    )
-    exp_b = _rdb_experiment(
-        tmp_path / "runs_b",
-        "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
-    )
+    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
+    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
 
     assert set(_run_lock_paths(exp_a)) & set(_run_lock_paths(exp_b))
 

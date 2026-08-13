@@ -1175,15 +1175,23 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         ) from exc
 
 
-def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) -> str:
-    """Mark the entry's Optuna trial FAIL through its *recorded* storage.
+def _registry_attempt_fail_stale_trial(
+    entry: dict[str, Any],
+    entry_path: Path,
+    *,
+    current_storage: str | None,
+) -> str:
+    """Mark the entry's Optuna trial FAIL through a matching storage locator.
 
-    Uses the study name and storage URL captured at allocation, not the
-    current config, so a renamed phase or changed storage URL still reaches
-    the right study.
+    The allocation-time locator remains the authority when the current config
+    names another target. When both credential-free identities match, the
+    current locator is preferred so credential rotation cannot strand a stale
+    trial behind an obsolete password or token. Phase rename/removal does not
+    affect this comparison because registry recovery is phase-graph-independent.
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
+    :param str | None current_storage: Current config's operational storage URL.
     :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger, ``"terminal"`` when nothing needed
@@ -1196,7 +1204,12 @@ def _registry_attempt_fail_stale_trial(entry: dict[str, Any], entry_path: Path) 
         marked FAIL, or its durable recovery state could not be recorded; the
         study is left inconsistent rather than silently dropping the failure.
     """
-    storage_url = entry["storage_locator"]
+    current_identity = canonical_storage_identity(current_storage)
+    storage_url = (
+        storage_recovery_locator(current_storage)
+        if current_identity == entry["storage_identity"]
+        else entry["storage_locator"]
+    )
     if storage_url is None:
         # In-memory storage died with its orchestrator; nothing to update.
         return "terminal"
@@ -1320,7 +1333,11 @@ def _preflight_active_attempts(
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
                 raise
-            outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+            outcome = _registry_attempt_fail_stale_trial(
+                entry,
+                entry_path,
+                current_storage=experiment.storage,
+            )
             if outcome in {"reaped", "recovered"}:
                 report.recovered_attempt_ids.add(attempt_id)
                 report.recovered_attempt_generations[attempt_id] = entry["generation_id"]
@@ -1918,10 +1935,10 @@ ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 2
 def _artifact_root_storage_key(experiment: Experiment) -> str:
     """Return an opaque comparison key for one persistent storage ledger.
 
-    The canonical identity may contain operational query values, including a
-    nested connection string. The artifact tree is intentionally shareable,
-    so it stores only this digest while private recovery state retains the
-    operational URL.
+    The canonical identity is credential-free but may contain other target
+    selectors from a query or nested connection string. The artifact tree is
+    intentionally shareable, so it stores only this digest while private
+    recovery state retains the operational URL.
 
     :param Experiment experiment: Experiment whose persistent ledger is identified.
     :return str: Full SHA-256 hex digest of the canonical storage identity.

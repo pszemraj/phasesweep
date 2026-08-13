@@ -1318,6 +1318,26 @@ _RDB_CONNECTION_ONLY_OPTIONS = frozenset(
 )
 _RDB_CONNECTION_ONLY_OPTION_PREFIXES = ("keepalives",)
 
+# Authentication selects how a client reaches an RDB target, not which
+# database ledger it reaches. Normalize common spellings after stripping
+# punctuation so top-level URL parameters and nested ODBC fields share one
+# case-insensitive policy.
+_RDB_CREDENTIAL_OPTION_NAMES = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authtoken",
+        "password",
+        "passwd",
+        "pwd",
+        "token",
+        "uid",
+        "user",
+        "userid",
+        "username",
+    }
+)
+
 
 def _is_connection_only_rdb_option(key: str) -> bool:
     """Return whether an RDB URL query key configures the connection, not the target.
@@ -1331,12 +1351,62 @@ def _is_connection_only_rdb_option(key: str) -> bool:
     )
 
 
+def _is_rdb_credential_option(key: str) -> bool:
+    """Return whether a URL or DSN key carries authentication material.
+
+    :param str key: Top-level query key or nested ODBC field name.
+    :return bool: True when the key must not participate in target identity.
+    """
+    normalized = "".join(character for character in key.lower() if character.isalnum())
+    return normalized in _RDB_CREDENTIAL_OPTION_NAMES
+
+
+def _odbc_identity_value(value: str) -> str:
+    """Remove credential fields from an ODBC connection string.
+
+    ODBC values may brace semicolon-containing field values, so splitting on
+    every semicolon would corrupt target selectors such as ``SERVER`` or
+    ``DATABASE``. Braced values and escaped closing braces are retained byte
+    for byte; only complete credential fields are removed.
+
+    :param str value: Decoded ``odbc_connect`` query value.
+    :return str: Connection string retaining only non-credential fields.
+    """
+    fields: list[str] = []
+    field_start = 0
+    in_braces = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "{" and not in_braces:
+            in_braces = True
+        elif character == "}" and in_braces:
+            if index + 1 < len(value) and value[index + 1] == "}":
+                index += 1
+            else:
+                in_braces = False
+        elif character == ";" and not in_braces:
+            fields.append(value[field_start:index])
+            field_start = index + 1
+        index += 1
+    fields.append(value[field_start:])
+
+    retained = []
+    for field in fields:
+        key, separator, _field_value = field.partition("=")
+        if separator and _is_rdb_credential_option(key.strip()):
+            continue
+        if field:
+            retained.append(field)
+    return ";".join(retained)
+
+
 def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]:
     """Return the identity-bearing query pairs of an RDB URL, in stable order.
 
-    Connection-only options are dropped; everything else is kept, because a
-    parameter such as libpq's ``host=/var/run/postgresql`` (unix socket) or a
-    schema selector really does name a different target.
+    Connection-only and credential options are dropped; target selectors such
+    as libpq's ``host=/var/run/postgresql`` (unix socket), schema options, and
+    non-credential fields inside ``odbc_connect`` are retained.
 
     :param Mapping[str, Any] query: SQLAlchemy ``URL.query`` mapping; a value may
         be a tuple when the URL repeats a key.
@@ -1344,10 +1414,16 @@ def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]
     """
     pairs: list[tuple[str, str]] = []
     for key, value in query.items():
-        if _is_connection_only_rdb_option(key):
+        if _is_connection_only_rdb_option(key) or _is_rdb_credential_option(key):
             continue
         values = value if isinstance(value, tuple | list) else (value,)
-        pairs.extend((key, str(item)) for item in values)
+        pairs.extend(
+            (
+                key,
+                _odbc_identity_value(str(item)) if key.lower() == "odbc_connect" else str(item),
+            )
+            for item in values
+        )
     return sorted(pairs, key=lambda pair: (pair[0].lower(), pair[0], pair[1]))
 
 
@@ -1356,8 +1432,9 @@ def _canonical_rdb_identity(storage: str) -> str:
 
     Equivalent spellings of one database must produce one identity, or the
     same-host experiment lock silently splits and two orchestrators write the
-    same study (review v0.5.17 / blocker 5). Normalized away: the password
-    (rotating a credential must not orphan a live lock), the driver
+    same study (review v0.5.17 / blocker 5). Normalized away: authentication
+    material in the authority, query, or a nested ODBC connection string; the
+    driver
     (``postgresql``/``postgresql+psycopg``/``postgresql+psycopg2`` collide on
     the base dialect), host case, a port left implicit when it equals the
     family default, query-parameter order, and connection-only query options.
@@ -1365,7 +1442,7 @@ def _canonical_rdb_identity(storage: str) -> str:
     Emitted form (each component percent-encoded so no separator is
     ambiguous)::
 
-        rdb://<family>://<user>@<host>[:<port>]/<database>[?<sorted-query>]
+        rdb://<family>://<host>[:<port>]/<database>[?<sorted-query>]
 
     :param str storage: A non-file Optuna storage URL (``postgresql://...``, ...).
     :return str: The canonical identity, or ``storage`` unchanged when
@@ -1385,12 +1462,11 @@ def _canonical_rdb_identity(storage: str) -> str:
     family = url.drivername.split("+", 1)[0].lower()
     port = url.port if url.port is not None else _RDB_DEFAULT_PORTS.get(family)
     port_segment = "" if port is None else f":{port}"
-    user = quote(url.username or "", safe="")
     host = quote((url.host or "").lower(), safe="")
     database = quote(url.database or "", safe="")
     query = urlencode(_rdb_identity_query_pairs(url.query))
     query_segment = f"?{query}" if query else ""
-    return f"rdb://{family}://{user}@{host}{port_segment}/{database}{query_segment}"
+    return f"rdb://{family}://{host}{port_segment}/{database}{query_segment}"
 
 
 def canonical_storage_identity(storage: str | None) -> str | None:
@@ -1403,9 +1479,10 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     ``sqlite:///`` prefix so dialect choice never splits the lock.
 
     Non-file RDB URLs (``postgresql://``, ``mysql://``, ...) are canonicalized
-    by :func:`_canonical_rdb_identity`: password, driver suffix, host case,
-    implicit vs. explicit default port, query order, and connection-only query
-    options are all normalized away. What is *not* resolved: DNS aliases and
+    by :func:`_canonical_rdb_identity`: authentication material, driver suffix,
+    host case, implicit vs. explicit default port, query order, and
+    connection-only query options are all normalized away. What is *not*
+    resolved: DNS aliases and
     ``CNAME``s, load-balancer or pgbouncer endpoints, ``PGSERVICE`` service
     files, ``~/.pg_service.conf`` or environment-supplied defaults, and
     ``localhost`` vs. ``127.0.0.1`` vs. a unix socket. Those all reach the same
