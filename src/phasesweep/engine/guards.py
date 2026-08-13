@@ -49,6 +49,8 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_INPUT_ATTR,
+    TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -2383,8 +2385,8 @@ def _validate_relocated_trial_evidence(
         with their recorded bindings.
     :raises ArtifactRootRebindError: A study holds a RUNNING trial that cannot
         be recovered at this destination, records a malformed trial directory,
-        or names a trial directory that does not exist under the destination
-        tree.
+        names a trial directory that does not exist under the destination tree,
+        or a selection candidate's recorded trainer input is missing or altered.
     """
     offered = _artifact_root_identity(experiment)
     for entry in entries:
@@ -2424,6 +2426,22 @@ def _validate_relocated_trial_evidence(
                     "is a stale copy taken before that trial ran. Move the complete artifact "
                     "tree, then rebind. Nothing was written."
                 )
+            if _selection_candidate_identity(trial) is not None:
+                try:
+                    _verify_trainer_input_evidence(
+                        translated,
+                        trial.user_attrs.get(TRAINER_INPUT_ATTR),
+                        subject=(
+                            f"Destination trial {trial.number} of study {entry.study.study_name!r}"
+                        ),
+                    )
+                except TrialEvidenceMissingError as exc:
+                    raise ArtifactRootRebindError(
+                        f"Destination artifact root {str(_experiment_dir(experiment))!r} "
+                        f"does not retain the recorded generated trainer input for trial "
+                        f"{trial.number} of study {entry.study.study_name!r}: {exc} "
+                        "Move the complete artifact tree, then rebind. Nothing was written."
+                    ) from exc
 
 
 def _attempt_entry_recoverable_in_place(
@@ -2766,6 +2784,12 @@ _TRIAL_EVIDENCE_REMEDY = (
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced (PR #5 review / reviewer 2, blocker 7).
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
+_TRAINER_INPUT_FILENAMES = {
+    "yaml_file": "trainer_config.yaml",
+    "json_file": "overrides.json",
+    "argparse": "overrides_resolved.json",
+    "hydra": "overrides_resolved.json",
+}
 
 
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
@@ -2890,12 +2914,100 @@ def _verify_objective_source_evidence(
         )
 
 
+def _verify_trainer_input_evidence(
+    trial_dir: Path,
+    record: Any,
+    *,
+    subject: str,
+) -> None:
+    """Content-verify the historical generated input one trainer consumed.
+
+    The filename comes from the trial's versioned record, not the current
+    experiment config. Validating the format/filename pair keeps that
+    historical path trial-relative and prevents a malformed ledger value from
+    redirecting verification outside the evidence directory.
+
+    :param Path trial_dir: Structurally translated trial evidence directory.
+    :param Any record: Raw ``TRAINER_INPUT_ATTR`` Optuna user attribute.
+    :param str subject: Caller-built trial label for diagnostics.
+    :raises TrialEvidenceMissingError: The record is absent or malformed, or
+        its exact file bytes are missing or changed.
+    """
+    if not isinstance(record, Mapping):
+        raise TrialEvidenceMissingError(
+            f"{subject} has no valid {TRAINER_INPUT_ATTR!r} record, so its historical "
+            f"trainer input cannot be verified. {_TRIAL_EVIDENCE_REMEDY}"
+        )
+    input_format = record.get("format")
+    filename = record.get("filename")
+    expected_filename = (
+        _TRAINER_INPUT_FILENAMES.get(input_format) if isinstance(input_format, str) else None
+    )
+    if (
+        record.get("schema_version") != TRAINER_INPUT_SCHEMA_VERSION
+        or expected_filename is None
+        or filename != expected_filename
+    ):
+        raise TrialEvidenceMissingError(
+            f"{subject} has a malformed or unsupported {TRAINER_INPUT_ATTR!r} record "
+            f"{dict(record)!r}, so its historical trainer input cannot be located safely. "
+            f"{_TRIAL_EVIDENCE_REMEDY}"
+        )
+    recorded_size = record.get("size_bytes")
+    recorded_digest = record.get("sha256")
+    if (
+        not isinstance(recorded_size, int)
+        or isinstance(recorded_size, bool)
+        or recorded_size < 0
+        or not isinstance(recorded_digest, str)
+        or len(recorded_digest) != 64
+        or any(character not in "0123456789abcdef" for character in recorded_digest)
+    ):
+        raise TrialEvidenceMissingError(
+            f"{subject} has an invalid size or content identity in its "
+            f"{TRAINER_INPUT_ATTR!r} record. {_TRIAL_EVIDENCE_REMEDY}"
+        )
+
+    input_path = trial_dir / filename
+    if not input_path.is_file():
+        raise TrialEvidenceMissingError(
+            f"{subject} is missing its recorded trainer input {filename!r} under "
+            f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+        )
+    try:
+        actual_size = input_path.stat().st_size
+    except OSError as exc:
+        raise TrialEvidenceMissingError(
+            f"{subject} cannot read its recorded trainer input {filename!r} at "
+            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+        ) from exc
+    if actual_size != recorded_size:
+        raise TrialEvidenceMissingError(
+            f"{subject} recorded trainer input {filename!r} as {recorded_size} bytes, but "
+            f"that file is now {actual_size} bytes. {_TRIAL_EVIDENCE_REMEDY}"
+        )
+    try:
+        actual_digest = file_sha256(input_path)
+    except OSError as exc:
+        raise TrialEvidenceMissingError(
+            f"{subject} cannot content-verify its recorded trainer input {filename!r} at "
+            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+        ) from exc
+    if actual_digest != recorded_digest:
+        raise TrialEvidenceMissingError(
+            f"{subject} recorded trainer input {filename!r} with sha256 {recorded_digest}, "
+            f"but that file now hashes to {actual_digest}: the exact trainer input bytes "
+            f"have changed. {_TRIAL_EVIDENCE_REMEDY}"
+        )
+
+
 def _verify_trial_evidence_dir(
     trial_dir: Path,
     *,
     subject: str,
     attempt_id: str,
     provenance: Mapping[str, Any] | None,
+    trainer_input: Any,
     verify_objective_digest: bool,
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
@@ -2921,9 +3033,11 @@ def _verify_trial_evidence_dir(
     :param str subject: Caller-built label naming the study, phase, and trial.
     :param str attempt_id: Attempt identity the lifecycle record must belong to.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
+    :param Any trainer_input: Versioned historical generated-input record.
     :param bool verify_objective_digest: Re-hash the objective source as well.
-    :raises TrialEvidenceMissingError: The directory, an audit artifact, or the
-        recorded objective source is missing, foreign, or altered.
+    :raises TrialEvidenceMissingError: The directory, an audit artifact, the
+        generated trainer input, or recorded objective source is missing,
+        foreign, or altered.
     """
     if not trial_dir.is_dir():
         raise TrialEvidenceMissingError(
@@ -2942,6 +3056,7 @@ def _verify_trial_evidence_dir(
                 f"{subject} is missing its {filename!r} audit artifact under "
                 f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
             )
+    _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
         trial_dir,
         provenance,
@@ -2966,19 +3081,20 @@ def _validate_selection_evidence(
 
     Only selection-eligible trials are candidates
     (:func:`_selection_candidate_identity`); the rest can never win, so passing
-    over them cannot bias the result. Candidates are checked for existence and
-    identity only - no objective digest - because the default objective source
-    is the trainer's unbounded ``stdout.log``, and re-hashing every candidate's
-    log on every top-up would cost the whole study's log volume per resume. The
-    trial that actually becomes a winner is digest-verified at selection time
-    instead (:func:`_verify_winner_objective_evidence`).
+    over them cannot bias the result. Every candidate's small generated trainer
+    input is content-verified. The potentially unbounded objective source is
+    checked for existence and recorded size only, because re-hashing every
+    candidate's ``stdout.log`` on every top-up would cost the whole study's log
+    volume per resume. The winning objective source is digest-verified at
+    selection time instead (:func:`_verify_winner_objective_evidence`).
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
     :param Mapping[str, optuna.Study] studies: Existing phase studies keyed by
         phase name, as returned by :func:`_preflight_existing_studies`.
     :raises TrialEvidenceMissingError: A selection-eligible trial records an
         unusable trial directory, or its evidence directory, audit artifacts,
-        or recorded objective source are no longer in this tree.
+        generated trainer input, or recorded objective source are no longer in
+        this tree.
     """
     for phase_name, study in studies.items():
         phase_dir = _phase_dir(experiment, phase_name)
@@ -3019,6 +3135,7 @@ def _validate_selection_evidence(
                 subject=subject,
                 attempt_id=attempt_id,
                 provenance=_trial_objective_provenance(trial),
+                trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
                 verify_objective_digest=False,
             )
 
@@ -3030,15 +3147,15 @@ def _verify_winner_objective_evidence(
 ) -> None:
     """Digest-verify the evidence behind a trial that is about to be published.
 
-    The launch preflight proves every candidate's evidence *exists*; this proves
-    the one trial that actually won is still byte-for-byte the evidence its
-    frozen provenance recorded. The split is deliberate: the default objective
-    source is an uncapped trainer log, so hashing every candidate on every
-    top-up is O(total trainer log bytes) per resume - potentially tens of
-    gigabytes - while hashing only the published winner is bounded by one
-    trial's log and still catches every deletion and every result-affecting
-    edit, including a tamper that preserves byte length (PR #5 review /
-    reviewer 2, blocker 7).
+    The launch preflight content-verifies every candidate's small generated
+    trainer input and proves its objective source still exists; this additionally
+    proves the winning objective source is byte-for-byte the evidence its frozen
+    provenance recorded. The split is deliberate: the default objective source
+    is an uncapped trainer log, so hashing every candidate on every top-up is
+    O(total trainer log bytes) per resume - potentially tens of gigabytes -
+    while hashing only the published winner is bounded by one trial's log and
+    still catches every deletion and every result-affecting edit, including a
+    tamper that preserves byte length (PR #5 review / reviewer 2, blocker 7).
 
     It runs on every selection, so a deadline-truncated partial publication is
     covered on the same terms as a complete one.
@@ -3047,7 +3164,8 @@ def _verify_winner_objective_evidence(
     :param str phase_name: Phase whose winner was just selected.
     :param SelectedTrial selected: The winning trial and its frozen provenance.
     :raises TrialEvidenceMissingError: The winner's evidence directory, audit
-        artifacts, or objective source are missing, foreign, or altered.
+        artifacts, generated trainer input, or objective source are missing,
+        foreign, or altered.
     """
     trial_dir = _trial_dir_for(
         experiment,
@@ -3064,6 +3182,7 @@ def _verify_winner_objective_evidence(
         ),
         attempt_id=selected.attempt_id,
         provenance=selected.objective_provenance,
+        trainer_input=selected.trainer_input,
         verify_objective_digest=True,
     )
 

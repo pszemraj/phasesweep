@@ -12,12 +12,13 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.engine.errors import PhaseSweepError
+from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     ExtractorError,
@@ -27,8 +28,12 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor
-from phasesweep.runtime.commands import render_command
-from phasesweep.runtime.files import file_sha256, private_atomic_write_text
+from phasesweep.runtime.commands import (
+    dump_json_file_overrides,
+    dump_trial_trainer_config_yaml,
+    render_command,
+)
+from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
 from phasesweep.runtime.process import ProcessResult, run_supervised
 
 log = logging.getLogger("phasesweep.engine.trial")
@@ -40,6 +45,31 @@ class ExecutedTrial:
 
     ctx: TrialContext
     process: ProcessResult
+    trainer_input: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PreparedTrainerInput:
+    """Exact generated trainer input, materialized before subprocess launch."""
+
+    format: str
+    filename: str
+    content: bytes
+
+    @property
+    def sha256(self) -> str:
+        """Return the identity injected into the trainer environment."""
+        return hashlib.sha256(self.content).hexdigest()
+
+    def record(self) -> dict[str, Any]:
+        """Return the versioned Optuna user-attribute payload."""
+        return {
+            "schema_version": TRAINER_INPUT_SCHEMA_VERSION,
+            "format": self.format,
+            "filename": self.filename,
+            "size_bytes": len(self.content),
+            "sha256": self.sha256,
+        }
 
 
 @dataclass
@@ -340,6 +370,66 @@ def _failed_trial(
     )
 
 
+def prepare_trainer_input(
+    *,
+    experiment: Experiment,
+    phase_name: str,
+    trial_id: int,
+    attempt_id: str,
+    trial_dir: Path,
+    overrides: dict[str, Any],
+) -> PreparedTrainerInput:
+    """Atomically write and identify the exact input one trainer will consume.
+
+    One serialized byte string is used for the atomic write, environment
+    digest, and durable trial record. CLI modes consume the resolved-overrides
+    audit file; file modes consume their generated YAML or JSON file.
+
+    :param Experiment experiment: Experiment supplying format and base config.
+    :param str phase_name: Phase label used for runtime placeholders.
+    :param int trial_id: Numeric trial identifier used for placeholders.
+    :param str attempt_id: Attempt identity used in ``run_name`` placeholders.
+    :param Path trial_dir: Per-trial artifact directory.
+    :param dict[str, Any] overrides: Fully composed trial overrides.
+    :return PreparedTrainerInput: Materialized input bytes and historical identity.
+    """
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    resolved_text = _json_dump_overrides(
+        overrides,
+        strict=experiment.override_format in {"json_file", "yaml_file"},
+    )
+    resolved_path = trial_dir / "overrides_resolved.json"
+    atomic_write_text(resolved_path, resolved_text)
+
+    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    if experiment.override_format == "yaml_file":
+        filename = "trainer_config.yaml"
+        text = dump_trial_trainer_config_yaml(
+            experiment.trainer_config,
+            overrides,
+            substitutions={
+                "{trial_dir}": str(trial_dir),
+                "{trial_id}": str(trial_id),
+                "{phase}": phase_name,
+                "{run_name}": run_name,
+            },
+        )
+    elif experiment.override_format == "json_file":
+        filename = "overrides.json"
+        text = dump_json_file_overrides(overrides)
+    else:
+        filename = "overrides_resolved.json"
+        text = resolved_text
+
+    if filename != resolved_path.name:
+        atomic_write_text(trial_dir / filename, text)
+    return PreparedTrainerInput(
+        format=experiment.override_format,
+        filename=filename,
+        content=text.encode("utf-8"),
+    )
+
+
 def launch_trial(
     *,
     experiment: Experiment,
@@ -352,6 +442,7 @@ def launch_trial(
     timeout_seconds: float | None,
     gpu_id: int | str | None = None,
     gpu_lease_fds: tuple[int, ...] = (),
+    prepared_input: PreparedTrainerInput | None = None,
 ) -> ExecutedTrial:
     """Launch the trial subprocess. Call this while holding the GPU lease.
 
@@ -382,6 +473,9 @@ def launch_trial(
             supervisor guardian (not trainer code) so exclusion lasts until
             the whole trainer process group exits, even if the orchestrator
             exits abruptly.
+        prepared_input: Exact input already materialized and persisted by the
+            Optuna objective. Direct callers may omit it; launch then prepares
+            the input itself before starting the subprocess.
 
     Returns:
         :class:`ExecutedTrial` bundling the trial context, the supervised
@@ -407,16 +501,15 @@ def launch_trial(
     # reserved for the lock namespace and MCP state; forcing trial dirs
     # private would break normal operator/tool visibility into logs and
     # resolved overrides. See docs/runtime.md's trust-boundary note.
-    resolved_overrides_path = workdir / "overrides_resolved.json"
-    resolved_overrides_path.write_text(
-        _json_dump_overrides(
-            overrides,
-            strict=experiment.override_format in {"json_file", "yaml_file"},
-        ),
-        encoding="utf-8",
-    )
-
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    trainer_input = prepared_input or prepare_trainer_input(
+        experiment=experiment,
+        phase_name=phase_name,
+        trial_id=trial_id,
+        attempt_id=attempt_id,
+        trial_dir=workdir,
+        overrides=overrides,
+    )
     cmd = render_command(
         experiment.trial_command,
         overrides,
@@ -426,18 +519,9 @@ def launch_trial(
         phase=phase_name,
         run_name=run_name,
         trainer_config=experiment.trainer_config,
+        materialized_input_path=workdir / trainer_input.filename,
     )
-
-    evidence_overrides_path = (
-        workdir / "trainer_config.yaml"
-        if experiment.override_format == "yaml_file"
-        else (
-            workdir / "overrides.json"
-            if experiment.override_format == "json_file"
-            else resolved_overrides_path
-        )
-    )
-    overrides_sha256 = file_sha256(evidence_overrides_path)
+    overrides_sha256 = trainer_input.sha256
     # Orchestrator-created trial artifact, not symlink-hardened by design (see
     # the trust-boundary comment above).
     (workdir / "command.txt").write_text(cmd + "\n")
@@ -513,7 +597,11 @@ def launch_trial(
         duration_seconds=proc_result.duration_seconds,
     )
 
-    return ExecutedTrial(ctx=ctx, process=proc_result)
+    return ExecutedTrial(
+        ctx=ctx,
+        process=proc_result,
+        trainer_input=trainer_input.record(),
+    )
 
 
 def extract_trial_result(

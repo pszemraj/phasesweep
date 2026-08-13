@@ -59,6 +59,7 @@ from phasesweep.engine.state import (
     RETURN_CODE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
+    TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -76,6 +77,7 @@ from phasesweep.engine.trial import (
     _inherit_env_contract,
     extract_trial_result,
     launch_trial,
+    prepare_trainer_input,
 )
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool
@@ -852,6 +854,18 @@ def _run_phase(
                         timeout_seconds = remaining_wallclock
                         timeout_capped_by_wallclock = True
 
+                prepared_input = prepare_trainer_input(
+                    experiment=experiment,
+                    phase_name=phase.name,
+                    trial_id=trial.number,
+                    attempt_id=attempt_id,
+                    trial_dir=trial_dir,
+                    overrides=overrides,
+                )
+                # Persist the historical input identity before the trainer is
+                # started. If this ledger write fails, no subprocess consumes
+                # evidence that the study cannot later verify.
+                trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
                 executed = launch_trial(
                     experiment=experiment,
                     phase_name=phase.name,
@@ -863,6 +877,7 @@ def _run_phase(
                     timeout_seconds=timeout_seconds,
                     gpu_id=gpu_assignment.visible_devices,
                     gpu_lease_fds=gpu_assignment.lease_fds,
+                    prepared_input=prepared_input,
                 )
 
                 # CRITICAL: this check must happen INSIDE the GPU lease (review

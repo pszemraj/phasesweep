@@ -54,6 +54,7 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _last_successful_generation_path,
+    _phase_dir,
     _resolve_suite_publication_pointer,
     _suite_generation_summary_path,
     _winner_path,
@@ -1220,6 +1221,38 @@ def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
     assert "trial 1" in captured.err
     assert str(workdir_b) in captured.err
     assert "stale copy" in captured.err
+    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+def test_rebind_workdir_refuses_a_copy_missing_generated_trainer_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A copied tree must retain the exact generated input of every candidate."""
+    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
+    for config in (config_a, config_b):
+        config.write_text(
+            config.read_text()
+            .replace("{overrides}", "--config {config_path}")
+            .replace("override_format: argparse", "override_format: yaml_file")
+        )
+    experiment_a = load_experiment(config_a)
+    run_experiment(experiment_a)
+    shutil.copytree(workdir_a, workdir_b)
+    copied = load_experiment(config_b)
+    copied_trial_dirs = sorted(_phase_dir(copied, "p").glob("trial_*"))
+    assert len(copied_trial_dirs) == 1
+    (copied_trial_dirs[0] / "trainer_config.yaml").unlink()
+
+    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    assert "trainer_config.yaml" in captured.err
+    assert "recorded generated trainer input" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 

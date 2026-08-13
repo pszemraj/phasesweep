@@ -19,6 +19,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_INPUT_ATTR,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -49,6 +50,8 @@ class SelectedTrial:
     # Digest of the trainer environment this trial ran under (review v0.5.18 /
     # finding F3); None for trials persisted before the record existed.
     trainer_env_digest: str | None = None
+    # Versioned identity of the exact generated input consumed by the trainer.
+    trainer_input: dict[str, Any] | None = None
 
 
 class NoFeasibleTrialError(PhaseSweepError):
@@ -182,6 +185,7 @@ def select_winner(
                 provenance = parsed_provenance
 
     env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
+    raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)
 
     return SelectedTrial(
         trial_number=best.number,
@@ -193,6 +197,7 @@ def select_winner(
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
         objective_provenance=provenance,
         trainer_env_digest=env_digest if isinstance(env_digest, str) and env_digest else None,
+        trainer_input=(dict(raw_trainer_input) if isinstance(raw_trainer_input, dict) else None),
     )
 
 

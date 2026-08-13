@@ -60,7 +60,7 @@ def _capture_launch_env(
         )
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
-    launch_trial(
+    executed = launch_trial(
         experiment=make_experiment(
             env=experiment_env,
             execution=execution,
@@ -77,6 +77,7 @@ def _capture_launch_env(
         gpu_id=gpu_id,
         gpu_lease_fds=gpu_lease_fds,
     )
+    captured["trainer_input"] = executed.trainer_input
     return captured
 
 
@@ -214,6 +215,13 @@ def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
         captured["PHASESWEEP_OVERRIDES_SHA256"]
         == hashlib.sha256(config_path.read_bytes()).hexdigest()
     )
+    assert captured["trainer_input"] == {
+        "schema_version": 1,
+        "format": "yaml_file",
+        "filename": "trainer_config.yaml",
+        "size_bytes": config_path.stat().st_size,
+        "sha256": captured["PHASESWEEP_OVERRIDES_SHA256"],
+    }
     assert json.loads((trial_dir / "overrides_resolved.json").read_text()) == {
         "model.depth": 8,
         "run_label": "{trial_dir}",

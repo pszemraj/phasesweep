@@ -159,16 +159,14 @@ def dump_overrides_json(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 
-def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
-    """Write a JSON overrides file with dotted keys expanded into nested dicts.
+def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
+    """Serialize JSON-file overrides after expanding dotted keys.
 
     Args:
         overrides: Mapping from override key (may contain dots) to value.
-        trial_dir: Per-trial directory; the file is written as
-            ``<trial_dir>/overrides.json``.
 
     Returns:
-        The path to the written ``overrides.json`` file.
+        The exact UTF-8 text for ``overrides.json``.
 
     Raises:
         ValueError: A dotted key collides with an existing scalar or would
@@ -190,8 +188,30 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
         if parts[-1] in cur and isinstance(cur[parts[-1]], dict):
             raise ValueError(f"Cannot expand override {k!r}: it would replace a nested object.")
         cur[parts[-1]] = v
+    return dump_overrides_json(nested)
+
+
+def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
+    """Write a JSON overrides file with dotted keys expanded into nested dicts.
+
+    Args:
+        overrides: Mapping from override key (may contain dots) to value.
+        trial_dir: Per-trial directory; the file is written as
+            ``<trial_dir>/overrides.json``.
+
+    Returns:
+        The path to the written ``overrides.json`` file.
+
+    Raises:
+        ValueError: A dotted key collides with an existing scalar or would
+            replace a nested object built by another key, or the payload
+            contains a non-finite float.
+        TypeError: The payload contains a value the strict encoder cannot
+            represent.
+
+    """
     path = trial_dir / "overrides.json"
-    path.write_text(dump_overrides_json(nested))
+    path.write_text(dump_json_file_overrides(overrides))
     return path
 
 
@@ -328,6 +348,30 @@ def dump_trainer_config_yaml(payload: dict[str, Any]) -> str:
     return yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
 
 
+def dump_trial_trainer_config_yaml(
+    trainer_config: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> str:
+    """Serialize the complete trainer YAML consumed by one trial.
+
+    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
+    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
+    :param dict[str, str] | None substitutions: Runtime placeholders expanded
+        recursively in base-config string values before overrides are applied.
+    :raises TypeError: The complete config contains an unsupported YAML value.
+    :raises ValueError: Override composition or YAML validation fails.
+    :return str: Exact UTF-8 text for ``trainer_config.yaml``.
+    """
+    base = (
+        trainer_config
+        if not substitutions
+        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
+    )
+    return dump_trainer_config_yaml(compose_trainer_config(base, overrides))
+
+
 def write_trainer_config_yaml(
     trainer_config: dict[str, Any],
     overrides: dict[str, Any],
@@ -346,14 +390,15 @@ def write_trainer_config_yaml(
     :raises ValueError: Override composition or YAML validation fails.
     :return Path: Path to the generated complete trainer config.
     """
-    base = (
-        trainer_config
-        if not substitutions
-        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
-    )
-    payload = compose_trainer_config(base, overrides)
     path = trial_dir / "trainer_config.yaml"
-    path.write_text(dump_trainer_config_yaml(payload), encoding="utf-8")
+    path.write_text(
+        dump_trial_trainer_config_yaml(
+            trainer_config,
+            overrides,
+            substitutions=substitutions,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -368,6 +413,7 @@ def render_command(
     run_name: str,
     trainer_config: dict[str, Any] | None = None,
     write_files: bool = True,
+    materialized_input_path: Path | None = None,
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
@@ -393,6 +439,9 @@ def render_command(
         write_files: When ``False``, render paths without writing
             ``trainer_config.yaml`` or ``overrides.json``. Used by dry-run
             previews so they are filesystem-pure.
+        materialized_input_path: Exact generated input already written by the
+            launch path. When supplied for a file mode, command rendering uses
+            this path without serializing or rewriting the input.
 
     Returns:
         The fully rendered, shell-ready command string.
@@ -411,7 +460,9 @@ def render_command(
             "{phase}": phase,
             "{run_name}": run_name,
         }
-        if write_files:
+        if materialized_input_path is not None:
+            config_path = str(materialized_input_path)
+        elif write_files:
             config_path = str(
                 write_trainer_config_yaml(
                     base,
@@ -434,9 +485,14 @@ def render_command(
         overrides_path = ""
     elif fmt == "json_file":
         overrides_str = ""
-        overrides_path = str(
-            write_json_file(overrides, trial_dir) if write_files else trial_dir / "overrides.json"
-        )
+        if materialized_input_path is not None:
+            overrides_path = str(materialized_input_path)
+        else:
+            overrides_path = str(
+                write_json_file(overrides, trial_dir)
+                if write_files
+                else trial_dir / "overrides.json"
+            )
     elif fmt == "hydra":
         overrides_str = format_hydra(overrides)
         overrides_path = ""

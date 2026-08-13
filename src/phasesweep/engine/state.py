@@ -190,6 +190,11 @@ GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance (review v0.5.17 /
 # finding F); written when metric extraction succeeds.
 OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
+# Versioned identity of the exact generated input consumed by the trainer.
+# The record stores only format, trial-relative filename, byte length, and
+# SHA-256; the generated file itself remains the evidence.
+TRAINER_INPUT_ATTR = "phasesweep_trainer_input"
+TRAINER_INPUT_SCHEMA_VERSION = 1
 # SHA-256 of the exact trainer environment this trial's subprocess received
 # (review v0.5.18 / finding F3). Written at allocation, so failed trials carry
 # it too. Ambient VALUES are never stored here — the digest identifies the

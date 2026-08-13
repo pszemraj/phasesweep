@@ -13,6 +13,7 @@ an earlier generation must find that generation in this same tree.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import (
+    TRAINER_INPUT_ATTR,
     _experiment_dir,
     _generation_path,
     _generations_dir,
@@ -75,6 +77,7 @@ def _evidence_experiment(
     trainer_body: str = _CONSTANT_TRAINER,
     max_consecutive_failures: int = 3,
     fixed_overrides: dict[str, object] | None = None,
+    override_format: str = "argparse",
 ) -> Experiment:
     """Build a one-phase experiment on sqlite storage with a seeded sampler.
 
@@ -82,11 +85,23 @@ def _evidence_experiment(
     rather than starting over, which is the whole subject here.
     """
     trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
+    if override_format == "yaml_file":
+        trial_command = f"python {trainer} --out {{trial_dir}}/r.json --config {{config_path}}"
+        trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
+    elif override_format == "json_file":
+        trial_command = (
+            f"python {trainer} --out {{trial_dir}}/r.json --overrides {{overrides_path}}"
+        )
+        trainer_config = None
+    else:
+        trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        trainer_config = None
     return make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        trial_command=trial_command,
+        override_format=override_format,
+        trainer_config=trainer_config,
         phases=[
             Phase(
                 name="p",
@@ -124,6 +139,39 @@ def _trial_count(experiment: Experiment) -> int:
 def _pointer_bytes(experiment: Experiment) -> bytes:
     """Return the raw last-success pointer, the single publication event."""
     return _last_successful_generation_path(experiment).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("override_format", "filename"),
+    [
+        ("yaml_file", "trainer_config.yaml"),
+        ("json_file", "overrides.json"),
+        ("argparse", "overrides_resolved.json"),
+        ("hydra", "overrides_resolved.json"),
+    ],
+)
+def test_trial_records_the_exact_generated_trainer_input(
+    tmp_path: Path,
+    override_format: str,
+    filename: str,
+) -> None:
+    """Every input mode persists one format-independent historical record."""
+    experiment = _evidence_experiment(tmp_path, override_format=override_format)
+    run_experiment(experiment)
+    input_path = _sole_trial_dir(experiment) / filename
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    record = study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
+
+    assert record == {
+        "schema_version": 1,
+        "format": override_format,
+        "filename": filename,
+        "size_bytes": input_path.stat().st_size,
+        "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+    }
 
 
 def _published_winner_payload(experiment: Experiment, generation_id: str) -> dict:
@@ -218,6 +266,63 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     assert winners["p"].trial_number == 0
     assert read_status(topup)["publication_integrity"] == "ok"
     assert_published_winner_evidence_local(_experiment_dir(topup))
+
+
+@pytest.mark.parametrize(
+    ("override_format", "filename", "damage"),
+    [
+        pytest.param("yaml_file", "trainer_config.yaml", "delete", id="yaml-delete"),
+        pytest.param("yaml_file", "trainer_config.yaml", "alter", id="yaml-alter"),
+        pytest.param("json_file", "overrides.json", "delete", id="json-delete"),
+        pytest.param("json_file", "overrides.json", "alter", id="json-alter"),
+    ],
+)
+def test_topup_refuses_damaged_generated_trainer_input(
+    tmp_path: Path,
+    override_format: str,
+    filename: str,
+    damage: str,
+) -> None:
+    """Every candidate retains the exact historical file its trainer consumed."""
+    experiment = _evidence_experiment(tmp_path, override_format=override_format)
+    run_experiment(experiment)
+    pointer_before = _pointer_bytes(experiment)
+    input_path = _sole_trial_dir(experiment) / filename
+
+    if damage == "delete":
+        input_path.unlink()
+    else:
+        original = input_path.read_bytes()
+        input_path.write_bytes(b"!" + original[1:])
+        assert input_path.stat().st_size == len(original)
+
+    topup = _evidence_experiment(
+        tmp_path,
+        n_trials=2,
+        override_format=override_format,
+    )
+    with pytest.raises(TrialEvidenceMissingError, match="trainer input"):
+        run_experiment(topup)
+
+    assert _trial_count(topup) == 1
+    assert _pointer_bytes(topup) == pointer_before
+
+
+def test_carried_winner_requires_its_original_generated_input(tmp_path: Path) -> None:
+    """A later generation cannot carry a winner whose trainer input disappeared."""
+    experiment = _evidence_experiment(tmp_path, override_format="yaml_file")
+    run_experiment(experiment)
+    run_experiment(experiment)
+    carrying_generation = _last_successful_generation_id(experiment)
+    assert carrying_generation is not None
+    pointer_before = _pointer_bytes(experiment)
+    (_sole_trial_dir(experiment) / "trainer_config.yaml").unlink()
+
+    with pytest.raises(TrialEvidenceMissingError, match="trainer_config.yaml"):
+        run_experiment(experiment)
+
+    assert _last_successful_generation_id(experiment) == carrying_generation
+    assert _pointer_bytes(experiment) == pointer_before
 
 
 # --------------------------------------------------------------------------
