@@ -124,8 +124,12 @@ def _partial_completion_for_replay(
     }
 
 
-class _PolicyStateWriteError(RuntimeError):
+class _PolicyStateWriteError(StudyStorageUnavailableError):
     """Raised when durable failure-policy state cannot be persisted."""
+
+
+class _DeadlineTrialExecutionError(TrialExecutionError):
+    """Raised when a trial fails specifically because a run deadline expired."""
 
 
 class _TrialOutcomeUnrecordedAbort(BaseException):
@@ -394,6 +398,11 @@ def _run_phase(
             (PR #5 review / reviewer 2 pass 2, blocker 4).
         StudySchemaMismatchError: Persisted phase recovery state contradicts
             the study's terminal trial count.
+        TimeoutError: The phase or run deadline expires before the requested
+            trial budget completes and partial publication is disabled, or
+            before any feasible trial completes.
+        PhaseSweepShutdown: The orchestrator receives a handled shutdown
+            signal; propagated after recording a non-failure trial outcome.
         RuntimeError: Optuna returned before the requested trial budget without
             a timeout, abort, or exception, which violates the runner invariant.
 
@@ -550,6 +559,12 @@ def _run_phase(
     fatal_abort: dict[str, BaseException | None] = {"exception": None}
     deadline_exhausted = {"flag": False}
     csv_throttle = CsvSnapshotThrottle()
+
+    def _stop_for_deadline() -> None:
+        """Record causal deadline exhaustion and stop scheduling peer trials."""
+        deadline_exhausted["flag"] = True
+        with contextlib.suppress(Exception):
+            study.stop()
 
     def _record_fatal_abort(error: BaseException) -> None:
         """Record the first fatal objective exception and stop peer launches.
@@ -846,8 +861,8 @@ def _run_phase(
                 if optimize_deadline is not None:
                     remaining_wallclock = optimize_deadline - time.monotonic()
                     if remaining_wallclock <= 0.0:
-                        deadline_exhausted["flag"] = True
-                        raise TrialExecutionError(
+                        _stop_for_deadline()
+                        raise _DeadlineTrialExecutionError(
                             f"{timeout_source or 'wallclock'} deadline reached before trial launch."
                         )
                     if timeout_seconds is None or remaining_wallclock < timeout_seconds:
@@ -912,8 +927,8 @@ def _run_phase(
 
                     raise cleanup_error
         except GpuLeaseTimeoutError as exc:
-            deadline_exhausted["flag"] = True
-            raise TrialExecutionError(str(exc)) from exc
+            _stop_for_deadline()
+            raise _DeadlineTrialExecutionError(str(exc)) from exc
 
         # Extraction happens outside GPU lease but INSIDE the phase/run
         # wallclock budget: the configured timeouts bound the whole trial,
@@ -931,7 +946,7 @@ def _run_phase(
             # killed by the wallclock-capped budget, extraction, or gate
             # enforcement. Merely observing another failure after the clock
             # elapsed must not relabel it as a timeout.
-            deadline_exhausted["flag"] = True
+            _stop_for_deadline()
 
         trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
         trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
@@ -961,7 +976,10 @@ def _run_phase(
         # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf (#4).
         if result.failure_reason:
             trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
-            raise TrialExecutionError(result.failure_reason)
+            error_type = (
+                _DeadlineTrialExecutionError if result.deadline_exhausted else TrialExecutionError
+            )
+            raise error_type(result.failure_reason)
 
         for cname, cval in result.constraints.items():
             trial.set_user_attr(constraint_attr(cname), cval)
@@ -1009,6 +1027,9 @@ def _run_phase(
         except optuna.TrialPruned as exc:
             _record_outcome(trial, "pruned", cause=str(exc))
             raise
+        except _DeadlineTrialExecutionError as exc:
+            _record_outcome(trial, "cancelled", cause=str(exc))
+            raise
         except TrialExecutionError as exc:
             _record_outcome(trial, "failure", cause=str(exc))
             raise
@@ -1037,10 +1058,11 @@ def _run_phase(
             raise
         except PhaseSweepShutdown as exc:
             # A host shutdown cancels the orchestration attempt; it is not a
-            # trainer failure or an internal objective bug. Optuna will still
-            # close the active trial while propagating SystemExit, so give the
-            # terminal row an ordered, non-failure outcome without installing
-            # a durable phase-abort marker that would wedge the next run.
+            # trainer failure or an internal objective bug. Optuna propagates
+            # SystemExit without promising a terminal trial transition, so the
+            # durable outcome is the recovery authority: a later stale-attempt
+            # pass may close the row, but must not turn the interruption into a
+            # failure streak or durable phase abort.
             _record_outcome(
                 trial,
                 "cancelled",

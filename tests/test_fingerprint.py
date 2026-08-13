@@ -83,6 +83,7 @@ from phasesweep.engine.state import (
     _winner_path,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.runtime.files import atomic_text_writer
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
@@ -1190,6 +1191,24 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     study = optuna.load_study(study_name="t::p", storage=storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
+
+
+def test_binding_claim_ignores_its_atomic_staging_file(tmp_path: Path) -> None:
+    """A concurrent binding reader must not misclassify the writer's temp file."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    binding_path = _artifact_root_binding_path(experiment)
+    with atomic_text_writer(binding_path) as staged:
+        staging = list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
+        assert len(staging) == 1
+
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        staged.write(binding_path.read_text(encoding="utf-8"))
+
+    assert binding_path.is_file()
+    assert not list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
 
 
 def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:

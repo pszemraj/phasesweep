@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import IO, Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
+from phasesweep.errors import LockBusyError, PhaseSweepError
+
 log = logging.getLogger("phasesweep.runtime.files")
 
 POSIX_RUNTIME_ERROR = (
@@ -43,15 +45,15 @@ def file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
-class UnsafeLockPathError(RuntimeError):
+class UnsafeLockPathError(PhaseSweepError):
     """Raised when a lock directory or file is not safe to trust."""
 
 
-class UnsafePrivatePathError(RuntimeError):
+class UnsafePrivatePathError(PhaseSweepError):
     """Raised when a private directory or file is not safe to mutate."""
 
 
-class PlatformCapabilityError(RuntimeError):
+class PlatformCapabilityError(PhaseSweepError):
     """Raised when the host lacks a capability required for safe operation."""
 
 
@@ -346,12 +348,12 @@ def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
 
     :param Path path: Lock file path to hold during the context.
     :param str busy_message: Error message used when the lock is already held.
-    :raises RuntimeError: If the lock cannot be acquired immediately.
+    :raises LockBusyError: If the lock cannot be acquired immediately.
     :return Iterator[None]: Context manager iterator for the held lock.
     """
     handle = try_lock_file(path)
     if handle is None:
-        raise RuntimeError(busy_message)
+        raise LockBusyError(busy_message)
     try:
         yield
     finally:

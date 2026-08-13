@@ -524,7 +524,7 @@ def launch_trial(
     overrides_sha256 = trainer_input.sha256
     # Orchestrator-created trial artifact, not symlink-hardened by design (see
     # the trust-boundary comment above).
-    (workdir / "command.txt").write_text(cmd + "\n")
+    (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
     # Environment and working directory follow the explicit execution
     # contract instead of unbounded ambient inheritance (review v0.5.17 /

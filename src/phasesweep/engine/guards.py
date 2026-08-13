@@ -217,15 +217,9 @@ class _PreflightCleanupReport:
 def _lock_digest(material: dict[str, Any]) -> str:
     """Hash a lock-material dict into a 24-char hex digest.
 
-    Args:
-        material: The output of :func:`_lock_material` (or any
-            JSON-serialisable dict).
-
-    Returns:
-        First 24 hex characters of the SHA-256 of the canonicalised JSON. 24
-        chars = 96 bits — well past collision risk for a same-host advisory
-        lock filename.
-
+    :param dict[str, Any] material: Lock identity material, represented as a
+        JSON-serializable mapping.
+    :return str: First 24 hex characters of the canonical JSON's SHA-256.
     """
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
@@ -240,18 +234,10 @@ def _lock_path_from_material(name: str, material: dict[str, str], label: str) ->
     material keys on — the resolved output namespace for the output lock —
     not from an arbitrary spelling of it (review v0.5.17 gap hunt).
 
-    Args:
-        name: Human-readable identity prefix, derived from the lock material's
-            own identity.
-        material: Lock-material dict produced by :func:`_lock_material` or
-            similar; hashed into the digest segment.
-        label: A short human-readable label (``"output"``, ``"storage"``,
-            phase name, ...).
-
-    Returns:
-        Resolved absolute path to the lock file (the file itself is not
-        created here; ``open(...).flock()`` does that lazily).
-
+    :param str name: Human-readable prefix derived from the lock identity.
+    :param dict[str, str] material: Identity material hashed into the filename.
+    :param str label: Short lock role such as ``"output"`` or ``"storage"``.
+    :return Path: Absolute lock path; the lock file is created lazily.
     """
     return _lock_dir() / f"{name}__{label}__{_lock_digest(material)}.lock"
 
@@ -265,12 +251,8 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
     ``summary.yaml`` (review v0.5.6 / blocker 1). Always taken regardless of
     storage backend, including in-memory storage.
 
-    Args:
-        experiment: Parsed experiment config; supplies workdir + experiment name.
-
-    Returns:
-        Lock-material dict keyed on the resolved experiment directory.
-
+    :param Experiment experiment: Experiment supplying the output namespace.
+    :return dict[str, str]: Lock material keyed on the resolved experiment directory.
     """
     # Resolve the FULL directory, leaf included: _experiment_dir resolves only
     # the workdir prefix before appending the experiment name, so a symlinked
@@ -288,13 +270,9 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
     point at different workdirs. Returns ``None`` for in-memory storage —
     there is no shared backend, so the output lock alone is sufficient.
 
-    Args:
-        experiment: Parsed experiment config; supplies storage + experiment name.
-
-    Returns:
-        Lock-material dict keyed on canonical storage identity, or ``None``
-        when storage is in-memory.
-
+    :param Experiment experiment: Experiment supplying storage and study namespace.
+    :return dict[str, str] | None: Canonical persistent-storage lock material,
+        or ``None`` for in-memory storage.
     """
     if storage_is_in_memory(experiment.storage):
         # In-memory URLs (``sqlite:///:memory:`` and spellings thereof) have
@@ -322,13 +300,9 @@ def _run_lock_paths(experiment: Experiment) -> list[Path]:
     for clear error messages, not for deadlock avoidance (we use
     ``LOCK_NB``).
 
-    Args:
-        experiment: Parsed experiment config.
-
-    Returns:
-        Lock-file paths sorted by string order. Length is 1 (output only) for
-        in-memory storage, 2 (output + storage) otherwise.
-
+    :param Experiment experiment: Experiment whose lock set is derived.
+    :return list[Path]: Lock paths in deterministic string order: one output
+        lock for in-memory storage, otherwise output and storage locks.
     """
     # The output lock's filename prefix comes from the RESOLVED namespace
     # leaf, not the configured experiment name: a symlinked experiment leaf
@@ -367,16 +341,9 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
 
     Both locks are *same-host advisory only*; multi-host coordination would need durable per-trial leases and heartbeats rather than just host-local flock files.
 
-    Args:
-        experiment: Parsed experiment config.
-
-    Yields:
-        ``None``. Use as ``with _experiment_lock(exp): ...``.
-
-    Raises:
-        ExperimentLockBusyError: Another phasesweep process holds one of the required
-            locks (output namespace or storage identity).
-
+    :param Experiment experiment: Experiment whose complete lock set is acquired.
+    :raises ExperimentLockBusyError: Another process holds the output or storage lock.
+    :return Iterator[None]: Context manager iterator for the held lock set.
     """
     paths = _run_lock_paths(experiment)
     handles: list[Any] = []
@@ -561,15 +528,9 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
 def _suite_fingerprint(suite: Suite) -> str:
     """Hash the fully compiled suite plan, including historical annotations.
 
-    Args:
-        suite: Parsed suite config; each study's name, dependency edges,
-            promotion rule, and fully resolved experiment contribute to the
-            digest.
-
-    Returns:
-        SHA-256 hex digest (64 characters) of the canonicalised suite payload.
-        Stamped onto suite-generation records to detect incompatible suite edits.
-
+    :param Suite suite: Suite whose study names, dependency edges, promotion
+        rules, and resolved experiments contribute to the digest.
+    :return str: SHA-256 of the canonical suite payload.
     """
     payload = {
         "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
@@ -603,17 +564,12 @@ def _phase_semantic_payload(
     ``experiment.env`` which v0.5.1 missed: env vars like ``CUBLAS_WORKSPACE_CONFIG``
     or ``MY_TRAINER_SEED`` change training behavior and must invalidate reuse.
 
-    Args:
-        experiment: The full experiment config; contributes ``trial_command``,
-            ``override_format``, ``env``, metric, and constraints.
-        phase: The phase being fingerprinted; ``_RUN_CONTROL_KEYS`` are stripped.
-        inherited_winners: Winners loaded from parent phases; their
-            ``effective_overrides`` are part of this phase's identity.
-
-    Returns:
-        A JSON-serialisable dict containing the configured trial semantics and
-        operator-declared external provenance.
-
+    :param Experiment experiment: Experiment supplying command, input format,
+        environment, metric, constraints, and provenance.
+    :param Phase phase: Phase whose run-control keys are excluded.
+    :param dict[str, Winner] inherited_winners: Parent winners whose effective
+        overrides contribute to identity.
+    :return dict[str, Any]: JSON-serializable configured trial semantics.
     """
     semantic_phase = _semantic_phase_dump(phase)
     return {
@@ -647,18 +603,12 @@ def _phase_fingerprint(
     chars (64 bits) — defensible against accidental collision but no reason
     to leave the door open in scientific-workflow metadata.
 
-    Args:
-        experiment: The experiment config (forwarded to
-            :func:`_phase_semantic_payload`).
-        phase: The phase being fingerprinted.
-        inherited_winners: Parent-phase winners; their effective overrides
-            contribute to identity.
-
-    Returns:
-        SHA-256 hex digest (64 characters) of the canonicalised semantic
-        payload. Used to detect incompatible re-runs and stamped onto
-        ``winner.yaml`` files for cross-version verification.
-
+    :param Experiment experiment: Experiment forwarded to
+        :func:`_phase_semantic_payload`.
+    :param Phase phase: Phase being fingerprinted.
+    :param dict[str, Winner] inherited_winners: Parent winners contributing
+        effective overrides to identity.
+    :return str: SHA-256 of the canonical semantic payload.
     """
     payload = _phase_semantic_payload(experiment, phase, inherited_winners)
     return _semantic_payload_digest(payload)
@@ -672,19 +622,13 @@ def _verify_fingerprint(
 ) -> str:
     """Stamp a fresh study with its fingerprint or fail on mismatch.
 
-    Args:
-        study: The Optuna study being verified or stamped.
-        experiment: The current experiment config.
-        phase: The phase whose fingerprint should match the stored one.
-        inherited_winners: Parent-phase winners contributing to identity.
-
-    Raises:
-        StudyFingerprintMismatchError: The study already has a fingerprint and it does not
-            match the current computed value (incompatible config edit).
-
-    Returns:
-        The verified fingerprint.
-
+    :param optuna.Study study: Study being verified or stamped.
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase whose fingerprint must match.
+    :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
+    :raises StudyFingerprintMismatchError: The populated study has an incompatible
+        persisted fingerprint.
+    :return str: Verified current fingerprint.
     """
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
     existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
@@ -730,19 +674,13 @@ def _trial_dir_for_reaping(
     current launch path could persist the directory and before any subprocess
     could be started, so the canonical directory is safe to use for recovery.
 
-    Args:
-        trial: RUNNING Optuna trial being reaped.
-        experiment: Parsed experiment.
-        phase_name: Phase containing the trial.
-        study_name: Study name for operator-facing diagnostics.
-
-    Returns:
-        Persisted trial directory, or the canonical directory for a pre-launch
-        RUNNING trial with no persisted directory attr.
-
-    Raises:
-        ProcessCleanupUncertainError: ``phasesweep_trial_dir`` exists but is not a non-empty string, so the reaper cannot safely locate the trial identity files.
-
+    :param optuna.trial.FrozenTrial trial: Running trial being reaped.
+    :param Experiment experiment: Parsed experiment.
+    :param str phase_name: Phase containing the trial.
+    :param str study_name: Study name used in diagnostics.
+    :raises ProcessCleanupUncertainError: A persisted trial-directory value is
+        invalid, so identity files cannot be located safely.
+    :return Path: Persisted trial directory, or the canonical pre-launch directory.
     """
     if TRIAL_DIR_ATTR not in trial.user_attrs:
         trial_dir = _trial_dir_for(experiment, phase_name, trial.number)
@@ -848,19 +786,15 @@ def _register_active_attempt(
     ever existing, and costs nothing to undo because this runs before the GPU
     lease and the trainer (PR #5 review / reviewer 2 pass 2, blocker 5).
 
-    Args:
-        experiment: Parsed experiment config (supplies the registry root).
-        attempt_id: Immutable attempt identity; also the entry filename.
-        phase_name: Phase the attempt belongs to, as configured *now*.
-        study_name: Fully qualified Optuna study name.
-        trial_number: Optuna trial number bound to this attempt.
-        trial_dir: Resolved per-trial directory holding lifecycle/identity.
-        generation_id: Engine invocation identity.
-
-    Raises:
-        ActiveAttemptPersistenceError: The registry entry could not be
-            written. No trainer was started and no GPU lease was consumed.
-
+    :param Experiment experiment: Experiment supplying the registry root.
+    :param str attempt_id: Immutable attempt identity and entry filename.
+    :param str phase_name: Producing phase name.
+    :param str study_name: Fully qualified Optuna study name.
+    :param int trial_number: Optuna trial number bound to the attempt.
+    :param Path trial_dir: Trial directory holding lifecycle and process identity.
+    :param str generation_id: Engine invocation identity.
+    :raises ActiveAttemptPersistenceError: The entry could not be written, so
+        no trainer was started or GPU lease consumed.
     """
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
     try:
@@ -897,10 +831,8 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     nothing in the study, and garbage-collects the file. Only a *missing*
     entry loses information (PR #5 review / reviewer 2 pass 2, blocker 5).
 
-    Args:
-        experiment: Parsed experiment config (supplies the registry root).
-        attempt_id: Attempt whose Optuna trial reached a terminal state.
-
+    :param Experiment experiment: Experiment supplying the registry root.
+    :param str attempt_id: Attempt whose trial reached a terminal state.
     """
     with (
         contextlib.suppress(OSError, ProcessCleanupUncertainError),
@@ -982,8 +914,11 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             payload.get("storage_locator") is not None
             and not isinstance(payload.get("storage_locator"), str)
         )
-        or canonical_storage_identity(payload.get("storage_locator"))
-        != payload.get("storage_identity")
+        or (
+            payload.get("storage_locator") is not None
+            and canonical_storage_identity(payload.get("storage_locator"))
+            != payload.get("storage_identity")
+        )
         or not isinstance(payload.get("generation_id"), str)
         or not payload.get("generation_id")
         or type(payload.get("trial_number")) is not int
@@ -994,6 +929,26 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             "from this attempt is running."
         )
     return payload
+
+
+def _attempt_process_resolution(
+    lifecycle: AttemptLifecycle | None,
+    *,
+    identity_exists: bool,
+) -> str:
+    """Classify the fail-closed recovery authority for one interrupted attempt.
+
+    :param AttemptLifecycle | None lifecycle: Validated durable lifecycle, if present.
+    :param bool identity_exists: Whether a retained process-identity file exists.
+    :return str: ``"exited"`` for confirmed cleanup, ``"allocated"`` when launch
+        provably never began, or ``"identity"`` when the process identity must
+        be validated (and, outside inspection mode, cleaned).
+    """
+    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+        return "exited"
+    if not identity_exists and lifecycle is not None and lifecycle.state == "allocated":
+        return "allocated"
+    return "identity"
 
 
 def _registry_attempt_process_is_resolved(
@@ -1029,10 +984,13 @@ def _registry_attempt_process_is_resolved(
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} has a malformed lifecycle record in {trial_dir}."
         ) from exc
-    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+    resolution = _attempt_process_resolution(
+        lifecycle,
+        identity_exists=(trial_dir / PROCESS_IDENTITY_FILE).exists(),
+    )
+    if resolution == "exited":
         return
-    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
-    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+    if resolution == "allocated":
         return
     try:
         identity = read_stale_process_identity(trial_dir, expected_attempt_id=attempt_id)
@@ -1437,7 +1395,12 @@ def _resolve_attempt_for_reaping(
     :raises ProcessCleanupUncertainError: The attempt cannot be proven safe.
     """
     lifecycle = _attempt_lifecycle_for_reaping(trial, trial_dir, study_name)
-    if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
+    resolution = _attempt_process_resolution(
+        lifecycle,
+        identity_exists=(trial_dir / PROCESS_IDENTITY_FILE).exists(),
+    )
+    if resolution == "exited":
+        assert lifecycle is not None
         log.warning(
             "Trial %d in study %s exited (rc=%s) before its terminal state was "
             "committed; failing it without signalling.",
@@ -1446,8 +1409,7 @@ def _resolve_attempt_for_reaping(
             lifecycle.return_code,
         )
         return
-    identity_missing = not (trial_dir / PROCESS_IDENTITY_FILE).exists()
-    if identity_missing and lifecycle is not None and lifecycle.state == "allocated":
+    if resolution == "allocated":
         # A missing identity is exactly what 'allocated' predicts: the worker
         # died queued (e.g. waiting for a GPU) before launch began. The
         # launcher durably advances to 'launching' before Popen; that state and
@@ -1974,9 +1936,25 @@ def _root_contains_durable_state(experiment: Experiment) -> bool:
     root = _experiment_dir(experiment)
     if not root.is_dir():
         return False
-    ignored = {"run.log", _artifact_root_binding_path(experiment).name}
+    binding_name = _artifact_root_binding_path(experiment).name
+    ignored = {"run.log", binding_name}
+    staging_prefix = f".{binding_name}."
     try:
-        return any(path.name not in ignored for path in root.iterdir())
+        for path in root.iterdir():
+            name = path.name
+            if name in ignored:
+                continue
+            if (
+                name.startswith(staging_prefix)
+                and name.endswith(".tmp")
+                and path.is_file()
+                and not path.is_symlink()
+            ):
+                token = name[len(staging_prefix) : -len(".tmp")]
+                if len(token) == 16 and all(character in "0123456789abcdef" for character in token):
+                    continue
+            return True
+        return False
     except OSError as exc:
         raise ArtifactRootConflictError(
             f"Cannot inspect artifact root {_artifact_root_identity(experiment)!r}: {exc}."
@@ -2831,17 +2809,28 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> Mapping[str,
 
     :param optuna.trial.FrozenTrial trial: Trial whose provenance attr is read.
     :return Mapping[str, Any] | None: The parsed record, or ``None`` when the
-        trial predates the record (review v0.5.17 / finding F) or stored
-        something this build cannot parse as a mapping.
+        trial predates the record (review v0.5.17 / finding F).
+    :raises TrialEvidenceMissingError: A present provenance record is corrupt
+        or has an unsupported shape.
     """
-    raw = trial.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
-    if not isinstance(raw, str) or not raw:
+    if OBJECTIVE_PROVENANCE_ATTR not in trial.user_attrs:
         return None
+    raw = trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR]
+    if not isinstance(raw, str) or not raw:
+        raise TrialEvidenceMissingError(
+            f"Trial {trial.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+        )
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, Mapping) else None
+    except json.JSONDecodeError as exc:
+        raise TrialEvidenceMissingError(
+            f"Trial {trial.number} has corrupt {OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise TrialEvidenceMissingError(
+            f"Trial {trial.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+        )
+    return parsed
 
 
 def _verify_objective_source_evidence(
@@ -3253,6 +3242,8 @@ def _preflight_existing_studies(
     try:
         _preflight_active_attempts(experiment, report)
     except Exception as exc:
+        if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
+            report.mark_uncertain(exc)
         errors.append(exc)
     reached = from_phase is None
     for phase in experiment.phases:
@@ -3283,7 +3274,7 @@ def _preflight_existing_studies(
                 uncertain_attempt_ids=report.uncertain_attempt_ids,
             )
         except Exception as exc:
-            if isinstance(exc, ProcessCleanupUncertainError):
+            if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
                 report.mark_uncertain(exc)
             errors.append(exc)
             continue

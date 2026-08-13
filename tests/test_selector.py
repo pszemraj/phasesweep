@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import optuna
@@ -14,11 +15,14 @@ from phasesweep.config import (
     Metric,
     Phase,
 )
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
+    GATES_ATTR,
     GENERATION_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     constraint_attr,
 )
@@ -39,7 +43,16 @@ def _make_study():
     return optuna.create_study(direction="minimize", sampler=optuna.samplers.RandomSampler(seed=0))
 
 
-def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None, env_digest=None):
+def _add_trial(
+    study,
+    value,
+    *,
+    feasible=True,
+    constraint_vals=None,
+    params=None,
+    env_digest=None,
+    extra_user_attrs=None,
+):
     distributions: dict = {}
     pvals: dict = {}
     for k, v in (params or {}).items():
@@ -52,6 +65,7 @@ def _add_trial(study, value, *, feasible=True, constraint_vals=None, params=None
     }
     if env_digest is not None:
         user_attrs[TRAINER_ENV_DIGEST_ATTR] = env_digest
+    user_attrs.update(extra_user_attrs or {})
     for cn, cv in (constraint_vals or {}).items():
         user_attrs[constraint_attr(cn)] = cv
     trial = optuna.trial.create_trial(
@@ -112,6 +126,25 @@ def test_no_feasible_raises():
     study = _make_study()
     _add_trial(study, 0.1, feasible=False, params={"x": 1})
     with pytest.raises(NoFeasibleTrialError):
+        select_winner(study, exp)
+
+
+@pytest.mark.parametrize(
+    ("attr", "value"),
+    [
+        (OBJECTIVE_PROVENANCE_ATTR, "{not-json"),
+        (OBJECTIVE_PROVENANCE_ATTR, json.dumps([])),
+        (GATES_ATTR, "{not-json"),
+        (GATES_ATTR, json.dumps([{"type": "required_file"}])),
+    ],
+)
+def test_corrupt_winner_evidence_attrs_fail_closed(attr: str, value: str) -> None:
+    """Present-but-corrupt evidence is not treated as absent legacy state."""
+    exp = _make_exp()
+    study = _make_study()
+    _add_trial(study, 0.1, extra_user_attrs={attr: value})
+
+    with pytest.raises(TrialEvidenceMissingError, match="(corrupt|malformed)"):
         select_winner(study, exp)
 
 

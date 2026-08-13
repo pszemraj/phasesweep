@@ -79,6 +79,27 @@ def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.fixture(autouse=True)
+def isolate_host_gpu_detection(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep ordinary tests independent of the host's NVIDIA driver state.
+
+    Hardware-marked tests opt out and may explicitly exercise the real host.
+    GPU behavior tests replace these defaults with the inventory and driver
+    state required by each case.
+    """
+    if request.node.get_closest_marker("hardware") is not None:
+        return
+    # The empty CUDA sentinel also reaches runner/trainer subprocesses, where
+    # this process's monkeypatches cannot. Individual GPU tests replace or
+    # delete it when exercising ambient visibility and auto-detection.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore the process-lifetime signal-ownership tokens per test.
 

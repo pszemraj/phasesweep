@@ -11,7 +11,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
-from phasesweep.engine.errors import PhaseSweepError, PromotionError
+from phasesweep.engine.errors import PhaseSweepError, PromotionError, TrialEvidenceMissingError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -164,25 +164,45 @@ def select_winner(
     assert selected_value is not None  # same invariant
     raw_gates = best.user_attrs.get(GATES_ATTR)
     gates: list[dict[str, Any]] = []
-    if isinstance(raw_gates, str) and raw_gates:
+    if raw_gates is not None:
+        if not isinstance(raw_gates, str) or not raw_gates:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {GATES_ATTR!r} evidence."
+            )
         try:
             parsed_gates = json.loads(raw_gates)
-        except json.JSONDecodeError:
-            pass
-        else:
-            if isinstance(parsed_gates, list):
-                gates = [item for item in parsed_gates if isinstance(item, dict)]
+        except json.JSONDecodeError as exc:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has corrupt {GATES_ATTR!r} JSON evidence."
+            ) from exc
+        if not isinstance(parsed_gates, list) or any(
+            not isinstance(item, dict) or type(item.get("passed")) is not bool
+            for item in parsed_gates
+        ):
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {GATES_ATTR!r} evidence."
+            )
+        gates = parsed_gates
 
     provenance: dict[str, Any] | None = None
     raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
-    if isinstance(raw_provenance, str) and raw_provenance:
+    if raw_provenance is not None:
+        if not isinstance(raw_provenance, str) or not raw_provenance:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+            )
         try:
             parsed_provenance = json.loads(raw_provenance)
-        except json.JSONDecodeError:
-            pass
-        else:
-            if isinstance(parsed_provenance, dict):
-                provenance = parsed_provenance
+        except json.JSONDecodeError as exc:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has corrupt "
+                f"{OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
+            ) from exc
+        if not isinstance(parsed_provenance, dict):
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+            )
+        provenance = parsed_provenance
 
     env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
     raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)

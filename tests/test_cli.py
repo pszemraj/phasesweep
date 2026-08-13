@@ -59,8 +59,10 @@ from phasesweep.engine.state import (
     _suite_generation_summary_path,
     _winner_path,
 )
+from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
+from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
@@ -1794,6 +1796,58 @@ def test_cli_boundary_reports_expected_run_failure_without_traceback(
     assert "Traceback" not in captured.out
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        UnsafeLockPathError("PHASESWEEP_LOCK_DIR must be an absolute path"),
+        LockBusyError("another suite process holds the lock"),
+    ],
+)
+def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
+    error: PhaseSweepError,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runtime configuration and lock contention are failures, not bugs."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    _stub_run_command(monkeypatch, error)
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(error) in captured.err
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.err
+
+
+def test_cli_boundary_classifies_relative_lock_directory_as_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The real lock-directory validator reaches exit 1 without a traceback."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
+    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+    monkeypatch.setattr(
+        "phasesweep.cli.run_config",
+        lambda *_args, **_kwargs: lock_dir(),
+    )
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "PHASESWEEP_LOCK_DIR must be an absolute path" in captured.err
+    assert "Traceback" not in captured.err
+    assert "internal error" not in captured.err
+
+
 def test_cli_boundary_adds_traceback_for_expected_failure_when_verbose(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1896,11 +1950,14 @@ def test_expected_operational_failures_share_one_base() -> None:
         ProcessCleanupUncertainError,
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
+        GpuConfigurationError,
+        LockBusyError,
         SamplerContinuationUnsupportedError,
         StudyContextConflictError,
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,
         StudyStorageUnavailableError,
         TrialTargetRegressionError,
+        UnsafeLockPathError,
     ):
         assert issubclass(error_type, PhaseSweepError), error_type.__name__

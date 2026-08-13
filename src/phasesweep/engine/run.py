@@ -540,7 +540,10 @@ def _run_experiment_outcome(
             )
             if (
                 not cleanup.cleanup_confirmed
-                and not isinstance(primary_error, ProcessCleanupUncertainError)
+                and not isinstance(
+                    primary_error,
+                    (ProcessCleanupUncertainError, StudyStorageUnavailableError),
+                )
                 and not shutdown_cleanup_uncertain
             ):
                 # Cleanup uncertainty intentionally becomes the actionable error;

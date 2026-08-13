@@ -17,6 +17,7 @@ from phasesweep.engine.guards import (
     _experiment_lock,
     _run_lock_paths,
 )
+from phasesweep.errors import LockBusyError, PhaseSweepError
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import make_experiment
 
@@ -106,6 +107,22 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     override.chmod(0o750)
     with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
         runtime_files.lock_dir()
+    assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
+
+
+def test_busy_generic_lock_is_an_operational_error(tmp_path: Path) -> None:
+    """Suite-style lock contention belongs to the CLI's expected boundary."""
+    lock_path = tmp_path / "busy.lock"
+    held = runtime_files.try_lock_file(lock_path)
+    assert held is not None
+    try:
+        with (
+            pytest.raises(LockBusyError, match="already busy"),
+            runtime_files.exclusive_lock(lock_path, busy_message="already busy"),
+        ):
+            pytest.fail("the held lock must not be reacquired")
+    finally:
+        runtime_files.unlock_file(held)
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(

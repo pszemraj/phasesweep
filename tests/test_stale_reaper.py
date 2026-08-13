@@ -520,6 +520,30 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         _preflight_existing_studies(experiment)
 
 
+def test_registry_storage_failure_marks_cleanup_report_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aborted registry scan cannot report cleanup as confirmed."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    failure = StudyStorageUnavailableError("registry storage unavailable")
+    monkeypatch.setattr(
+        "phasesweep.engine.guards._preflight_active_attempts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    report = _PreflightCleanupReport()
+
+    with pytest.raises(StudyStorageUnavailableError, match="registry storage unavailable"):
+        _preflight_existing_studies(
+            experiment,
+            cleanup_report=report,
+            preloaded_studies={},
+        )
+
+    assert report.cleanup_confirmed is False
+    assert report.error is failure
+
+
 def test_mixed_expected_preflight_errors_keep_operational_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1494,6 +1518,35 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
     assert trials[stale_number].user_attrs[ATTEMPT_ID_ATTR] == "partial-attempt"
     assert trials[stale_number].user_attrs[GENERATION_ID_ATTR] == "old-generation"
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [stale_number]
+    assert not list(_attempts_dir(experiment).glob("*.json"))
+
+
+@pytest.mark.parametrize("storage", [":memory:", "sqlite:///:memory:", "sqlite://"])
+def test_in_memory_attempt_registry_accepts_locatorless_entries(
+    tmp_path: Path,
+    storage: str,
+) -> None:
+    """In-memory attempts have an identity but intentionally no recovery URL."""
+    experiment = make_experiment(
+        experiment="memory-registry",
+        workdir=tmp_path / "runs",
+        storage=storage,
+    )
+    trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__memory-attempt"
+    trial_dir.mkdir(parents=True)
+    write_attempt_lifecycle(trial_dir, attempt_id="memory-attempt", state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id="memory-attempt",
+        phase_name="p",
+        study_name="memory-registry::p",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id="memory-generation",
+    )
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 

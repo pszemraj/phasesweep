@@ -211,7 +211,7 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
 
     """
     path = trial_dir / "overrides.json"
-    path.write_text(dump_json_file_overrides(overrides))
+    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
     return path
 
 
@@ -449,6 +449,10 @@ def render_command(
     Raises:
         ValueError: If ``fmt`` is not one of the four supported formats, or a
             dotted override cannot be composed into ``trainer_config``.
+        TypeError: A configured value cannot be represented by the selected
+            command or generated-file format.
+        OSError: ``write_files`` is true and a generated trainer input cannot
+            be written.
 
     """
     config_path = ""

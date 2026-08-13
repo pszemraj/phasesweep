@@ -1033,7 +1033,7 @@ def test_outcome_ledger_recovers_when_abort_marker_write_fails(
         real_set_user_attr(study, key, value)
 
     monkeypatch.setattr(optuna.Study, "set_user_attr", fail_first_abort_marker)
-    with pytest.raises(RuntimeError, match="abort marker could not be persisted"):
+    with pytest.raises(StudyStorageUnavailableError, match="abort marker could not be persisted"):
         run_experiment(exp)
 
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
@@ -1723,6 +1723,8 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     exp = Experiment(
         experiment="phase_timeout_allowed_abort_counter",
         workdir=str(tmp_path / "runs"),
+        storage=f"sqlite:///{tmp_path / 'timeout-counter.db'}",
+        provenance={"revision": "test-fixture-v1"},
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
         metric=Metric(
@@ -1735,6 +1737,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
                 max_consecutive_failures=1,
                 timeout_seconds_per_phase=8.0,
                 allow_incomplete_on_timeout=True,
+                sampler=Sampler(type="random", seed=7),
                 search_space={},
             )
         ],
@@ -1754,6 +1757,18 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
+    study = optuna.load_study(
+        study_name="phase_timeout_allowed_abort_counter::p",
+        storage=exp.storage,
+    )
+    deadline_trials = [
+        trial
+        for trial in study.trials
+        if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "cancelled"
+    ]
+    assert len(deadline_trials) == 1
+    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).consecutive_failures == 0
 
 
 @pytest.mark.parametrize("clock_elapses", [True, False])
@@ -1836,7 +1851,10 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     monkeypatch.setattr(
         phase_mod,
         "time",
-        types.SimpleNamespace(monotonic=lambda: real_monotonic() + offset["seconds"]),
+        types.SimpleNamespace(
+            monotonic=lambda: real_monotonic() + offset["seconds"],
+            sleep=lambda _seconds: None,
+        ),
     )
     real_launch_trial = phase_mod.launch_trial
     launched_trials: list[int] = []
@@ -1955,7 +1973,10 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     monkeypatch.setattr(
         phase_mod,
         "time",
-        types.SimpleNamespace(monotonic=lambda: real_monotonic() + offset["seconds"]),
+        types.SimpleNamespace(
+            monotonic=lambda: real_monotonic() + offset["seconds"],
+            sleep=lambda _seconds: None,
+        ),
     )
     real_launch_trial = phase_mod.launch_trial
 
@@ -2821,7 +2842,10 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     monkeypatch.setattr(
         phase_mod,
         "time",
-        types.SimpleNamespace(monotonic=lambda: next(calls, real_now + 1_000.0)),
+        types.SimpleNamespace(
+            monotonic=lambda: next(calls, real_now + 1_000.0),
+            sleep=lambda _seconds: None,
+        ),
     )
     experiment = make_experiment(
         workdir=tmp_path / "runs",

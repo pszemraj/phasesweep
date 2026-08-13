@@ -91,6 +91,25 @@ def test_launch_trial_forwards_gpu_lease_fds(
     assert env["gpu_lease_fds"] == (17, 23)
 
 
+def test_launch_trial_writes_command_as_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-ASCII trial paths do not depend on the process locale."""
+    command_encoding: list[str | None] = []
+    real_write_text = Path.write_text
+
+    def capture_encoding(path: Path, text: str, *, encoding: str | None = None) -> int:
+        if path.name == "command.txt":
+            command_encoding.append(encoding)
+        return real_write_text(path, text, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", capture_encoding)
+    _capture_launch_env(tmp_path / "tríäl", monkeypatch)
+
+    assert command_encoding == ["utf-8"]
+
+
 def test_launch_trial_injects_configured_objective_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

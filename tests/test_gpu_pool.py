@@ -19,6 +19,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
 )
+from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
     GpuDevice,
@@ -47,12 +48,10 @@ def deterministic_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
     which GPUs the test host happens to have. Tests that exercise resolution
     re-patch the probe themselves.
     """
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr(
         "phasesweep.runtime.gpu._detect_gpu_uuid_map",
         lambda: dict(_TEST_UUID_MAP),
     )
-    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
 
 
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
@@ -169,8 +168,23 @@ def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(RuntimeError, match="could not enumerate GPUs.*double-book"):
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
         GpuPool.create(n_jobs=1)
+
+
+def test_ambient_cuda_visibility_fails_when_nvidia_smi_is_broken_on_gpu_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+    monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
+
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
+        GpuPool.create(n_jobs=1)
+
+    pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
+    with pool.acquire() as assignment:
+        assert assignment.visible_devices == ""
 
 
 def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(

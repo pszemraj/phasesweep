@@ -321,11 +321,23 @@ def _override_yaml(tmp_path, override_format: str, body: str):
     )
 
 
-def test_write_json_file_uses_the_canonical_strict_serializer(tmp_path):
+def test_write_json_file_uses_the_canonical_strict_serializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The wire artifact and the load-time check must share one encoder."""
+    encodings: list[str | None] = []
+    real_write_text = Path.write_text
+
+    def capture_encoding(path: Path, text: str, *, encoding: str | None = None) -> int:
+        encodings.append(encoding)
+        return real_write_text(path, text, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", capture_encoding)
     path = write_json_file({"a.b": 1, "c": "x"}, tmp_path)
 
     assert path.read_text() == dump_overrides_json({"a": {"b": 1}, "c": "x"})
+    assert encodings == ["utf-8"]
     with pytest.raises(TypeError):
         dump_overrides_json({"cutoff": datetime.date(2024, 1, 1)})
     with pytest.raises(TypeError):
