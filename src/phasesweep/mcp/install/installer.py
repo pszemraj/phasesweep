@@ -568,10 +568,18 @@ def _instruction_plan_note(target: AgentTarget, project: Path, mode: Mode) -> st
             snapshot.text,
             _valid_instruction_owner_ids(edit_path, project),
         )
-    except ValueError:
-        return None
+    except ValueError as exc:
+        return (
+            "instructions markers are incomplete or repeated; apply will refuse this file "
+            f"({exc}). Restore one complete PhaseSweep marker block or remove the broken "
+            "block manually, then retry"
+        )
     if block is None:
-        return None
+        return (
+            "instructions block has missing or invalid ownership metadata; apply will refuse "
+            "this file. Restore a PHASESWEEP_OWNERS line naming the installed client owners, "
+            "or remove the marker block manually, then retry"
+        )
     owners, installed_prompt = block
     if not owners:
         return None
@@ -644,7 +652,11 @@ def _apply_instructions(
                 "instructions",
                 path,
                 "error",
-                note="instructions block has missing or invalid ownership metadata",
+                note=(
+                    "instructions block has missing or invalid ownership metadata; restore a "
+                    "PHASESWEEP_OWNERS line naming the installed client owners, or remove the "
+                    "marker block manually, then retry"
+                ),
             )
         owners, installed_prompt = block
         if mode == "uninstall":
@@ -820,7 +832,13 @@ def _integrations(integration: Literal["mcp", "instructions", "all"]) -> tuple[I
     return (integration,)
 
 
-def _mcp_plan_note(target: AgentTarget, command: str, catalog: Path) -> str:
+def _mcp_plan_note(
+    target: AgentTarget,
+    command: str,
+    catalog: Path | None,
+    project: Path,
+    mode: Mode,
+) -> str:
     """Describe the MCP entry already on disk and what installing will do to it.
 
     Answers the only question the plan cannot leave to the post-apply verdicts:
@@ -832,24 +850,34 @@ def _mcp_plan_note(target: AgentTarget, command: str, catalog: Path) -> str:
 
     :param AgentTarget target: Client whose MCP config the plan would edit.
     :param str command: Absolute ``phasesweep-mcp`` executable to be pinned.
-    :param Path catalog: Absolute catalog path the installed entry will pass.
+    :param Path | None catalog: Absolute catalog path the installed entry will
+        pass; required for an install plan.
+    :param Path project: Project root anchoring project-scoped config paths.
+    :param Mode mode: Planned installer action.
     :return str: Plan note, possibly spanning several lines.
     """
-    check = _check_target_launcher(target)
+    check = _check_target_launcher(target, project)
     if check.status == "not-configured":
-        return "no existing phasesweep entry; installing creates one"
+        return (
+            "no existing phasesweep entry; installing creates one"
+            if mode == "install"
+            else "no managed phasesweep entry; uninstall changes nothing"
+        )
     if check.status == "unmanaged":
         return (
             "an existing phasesweep entry is not a shape this installer owns; it will be left "
-            "untouched and printed for manual merge"
+            + ("untouched and printed for manual merge" if mode == "install" else "untouched")
         )
     if check.status == "unreadable" or check.executable is None:
-        # No argv was recovered, so there is no existing invocation to describe.
+        detail = f" ({check.detail})" if check.detail else ""
         return (
-            "the existing config could not be read as a phasesweep entry; it will be left "
-            "untouched and the entry printed for manual merge"
+            "the config cannot be safely inspected; apply will refuse this target and leave "
+            f"it untouched{detail}"
         )
     current = shlex.join([check.executable, *check.args])
+    if mode == "uninstall":
+        return f"managed entry WILL BE REMOVED\nentry: {current}"
+    assert catalog is not None
     planned = shlex.join([command, "--catalog", str(catalog)])
     if current == planned:
         return "an existing phasesweep entry already matches this plan; it stays unchanged"
@@ -940,8 +968,16 @@ def _print_plan(
             click.echo(f"    {integration:<13} {display_path}{scope}")
             if notice and mode == "install":
                 _echo_plan_note(notice)
-            if integration == "mcp" and mode == "install" and catalog is not None:
-                _echo_plan_note(_mcp_plan_note(target, command, catalog))
+            if integration == "mcp":
+                _echo_plan_note(
+                    _mcp_plan_note(
+                        target,
+                        command,
+                        catalog,
+                        project,
+                        mode,
+                    )
+                )
             if integration == "instructions":
                 shared_note = _instruction_plan_note(target, project, mode)
                 if shared_note:
@@ -1061,7 +1097,7 @@ def run(
     if mode == "install" and not dry_run and "mcp" in integrations:
         click.echo("\nverification:")
         for target in targets:
-            verification = _check_target_launcher(target)
+            verification = _check_target_launcher(target, project)
             click.echo(f"  {target.display_name:<20} {verification.status}")
             if verification.detail:
                 for line in verification.detail.splitlines():
@@ -1096,6 +1132,7 @@ CheckStatus: TypeAlias = Literal[
     "ok",
     "missing",
     "not-executable",
+    "not-launchable",
     "catalog-missing",
     "unmanaged",
     "not-configured",
@@ -1103,7 +1140,7 @@ CheckStatus: TypeAlias = Literal[
 ]
 
 _CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset(
-    {"missing", "not-executable", "catalog-missing", "unreadable"}
+    {"missing", "not-executable", "not-launchable", "catalog-missing", "unreadable"}
 )
 
 # A legacy pinned-launcher entry that resolves here still resolves its launcher from
@@ -1129,8 +1166,9 @@ class LauncherCheck:
     def ok(self) -> bool:
         """Whether this check needs no further operator action.
 
-        :return bool: True unless the launcher is missing, not executable, its
-            catalog is missing, or the config is unreadable.
+        :return bool: True unless the launcher is missing, not executable or
+            not launchable through its shebang, its catalog is missing, or the
+            config is unreadable.
         """
         return self.status not in _CHECK_ATTENTION_STATUSES
 
@@ -1168,6 +1206,24 @@ def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
         )
     if not os.access(path, os.X_OK):
         return "not-executable", f"{command} exists but is not executable; check its permissions"
+    try:
+        with path.open("rb") as launcher:
+            first_line = launcher.readline(4097)
+    except OSError as exc:
+        return "not-launchable", f"{command} cannot be inspected ({exc}); check its permissions"
+    if first_line.startswith(b"#!"):
+        try:
+            shebang = shlex.split(first_line[2:].decode("utf-8").strip())
+        except (UnicodeError, ValueError):
+            return "not-launchable", f"{command} has an invalid interpreter line; reinstall it"
+        interpreter = Path(shebang[0]) if shebang else None
+        if interpreter is None or not interpreter.is_absolute():
+            return "not-launchable", f"{command} has an invalid interpreter line; reinstall it"
+        if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+            return "not-launchable", (
+                f"{command} names missing or non-executable interpreter {interpreter}; "
+                "recreate that environment and rerun `phasesweep mcp install`"
+            )
     return "ok", None
 
 
@@ -1194,7 +1250,7 @@ def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | N
     return "ok", None
 
 
-def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
+def _check_target_launcher(target: AgentTarget, project: Path) -> LauncherCheck:
     """Read one target's configured phasesweep MCP entry and probe it.
 
     Read-only counterpart to :func:`_apply_mcp`: recognizes every entry shape
@@ -1208,12 +1264,32 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     nothing about the PATH the client will launch with.
 
     :param AgentTarget target: Client to inspect.
+    :param Path project: Project root that must contain project-scoped configs.
     :return LauncherCheck: Verification outcome for this target.
     """
     spec = target.mcp
-    try:
-        edit_path = spec.path.resolve(strict=False)
-    except (OSError, RuntimeError):
+    if spec.scope == "project":
+        edit_path = _resolved_project_path(spec.path, project)
+        if edit_path is None:
+            return LauncherCheck(
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "refusing project config path that resolves outside the project",
+            )
+    else:
+        try:
+            edit_path = spec.path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return LauncherCheck(
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "config path could not be resolved",
+            )
+    if edit_path is None:
         return LauncherCheck(
             spec.path,
             None,
@@ -1308,10 +1384,11 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     Read-only counterpart to ``install``/``uninstall`` (review v0.5.15 / item
     G): for every selected target, inspects whatever phasesweep MCP entry is
     already on disk, reports
-    whether it is installer-managed, whether its launcher executable resolves,
-    and whether the ``--catalog`` path it passes is still a readable file, then
-    prints repair guidance for anything broken. Never edits a client file or
-    reaches the network.
+    whether it is installer-managed, whether its launcher executable and
+    shebang interpreter resolve, and whether the ``--catalog`` path it passes
+    is still a readable file, then prints repair guidance for anything broken.
+    Never edits a client file, executes a configured launcher, or reaches the
+    network.
 
     :param Path project: Project root anchoring project-scoped paths.
     :param Sequence[str] | None agent_ids: Explicit target ids, or ``None`` to
@@ -1330,7 +1407,7 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     attention = 0
     configured = 0
     for target in targets:
-        result = _check_target_launcher(target)
+        result = _check_target_launcher(target, project)
         click.echo(f"  {target.display_name}")
         if result.config_path is not None:
             click.echo(f"    config        {result.config_path}")

@@ -678,6 +678,25 @@ def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
     assert "not executable" in output
 
 
+def test_check_install_reports_launcher_with_missing_shebang_interpreter(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    script.write_text("#!/missing/environment/bin/python\n")
+    claude = _target(project, "claude")
+    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
+
+    code = installer.check_install(project, ["claude"])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "not-launchable" in output
+    assert "missing or non-executable interpreter" in output
+    assert "recreate that environment" in output
+
+
 def test_check_install_reports_missing_catalog(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1112,6 +1131,25 @@ def test_installer_reports_repeated_instruction_markers_separately_from_ownershi
     assert instructions.read_text() == original
 
 
+def test_instruction_plan_warns_when_ownership_metadata_is_missing(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+    original = f"{MARKDOWN_START}\nPhaseSweep rules.\n{MARKDOWN_END}\n"
+    instructions.write_text(original)
+
+    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "apply will refuse this file" in output
+    assert "Restore a PHASESWEEP_OWNERS line" in output
+    assert "instructions block has missing or invalid ownership metadata" in output
+    assert output.index("apply will refuse this file") < output.index("instructions  error")
+    assert output.lower().count("phasesweep_owners") == 2
+    assert instructions.read_text() == original
+
+
 def test_installer_supports_shared_symlinked_instruction_file(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1296,6 +1334,25 @@ def test_install_plan_discloses_a_legacy_entry_rewrite_before_confirming(fake_ho
     assert claude.mcp.path.read_bytes() == before
 
 
+def test_uninstall_plan_discloses_the_managed_entry_before_removal(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    claude = _target(project, "claude")
+    before = claude.mcp.path.read_bytes()
+    capsys.readouterr()
+
+    assert installer.run("uninstall", project, None, ["claude"], "mcp", yes=True, dry_run=True) == 0
+
+    output = capsys.readouterr().out
+    invocation = shlex.join([installer.resolve_server_command(), "--catalog", str(catalog)])
+    assert "managed entry WILL BE REMOVED" in output
+    assert f"entry: {invocation}" in output
+    assert output.index("WILL BE REMOVED") < output.index("would-remove")
+    assert claude.mcp.path.read_bytes() == before
+
+
 def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, capsys, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1303,10 +1360,10 @@ def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, ca
     real_check = installer._check_target_launcher
     checks = 0
 
-    def observed_check(target):
+    def observed_check(target, checked_project):
         nonlocal checks
         checks += 1
-        return real_check(target)
+        return real_check(target, checked_project)
 
     monkeypatch.setattr(installer, "_check_target_launcher", observed_check)
 
@@ -1332,7 +1389,7 @@ def test_installer_returns_failure_when_post_install_verification_is_not_ok(
     monkeypatch.setattr(
         installer,
         "_check_target_launcher",
-        lambda _target: installer.LauncherCheck(
+        lambda _target, _project: installer.LauncherCheck(
             target.mcp.path,
             None,
             (),
@@ -1361,7 +1418,9 @@ def test_installer_verification_uses_the_check_install_attention_predicate(
     monkeypatch.setattr(
         installer,
         "_check_target_launcher",
-        lambda _target: installer.LauncherCheck(target.mcp.path, None, (), "unmanaged", None),
+        lambda _target, _project: installer.LauncherCheck(
+            target.mcp.path, None, (), "unmanaged", None
+        ),
     )
 
     code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
@@ -1643,6 +1702,46 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
     assert code == 1
     assert "resolves outside the project" in capsys.readouterr().out
     assert not (outside / "mcp.json").exists()
+
+
+def test_project_symlink_escape_is_refused_by_plan_apply_and_check_install(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    outside = tmp_path / "dotfiles"
+    outside.mkdir()
+    external_config = outside / "mcp.json"
+    external_config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "phasesweep": mcp_entry("stdio", installer.resolve_server_command(), catalog)
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    before = external_config.read_bytes()
+    (project / ".cursor").symlink_to(outside, target_is_directory=True)
+
+    code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "apply will refuse this target" in output
+    assert "refusing project config path that resolves outside the project" in output
+    assert output.index("apply will refuse this target") < output.index("    mcp           error")
+    assert external_config.read_bytes() == before
+
+    assert installer.check_install(project, ["cursor"]) == 1
+    checked = capsys.readouterr()
+    assert "unreadable" in checked.out
+    assert "refusing project config path that resolves outside the project" in checked.out
+    assert "need attention" in checked.err
+    assert external_config.read_bytes() == before
 
 
 def test_installer_reuses_containment_resolution_across_symlink_swap(

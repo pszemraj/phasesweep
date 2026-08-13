@@ -39,7 +39,7 @@ Add another `--from` for each experiment. Use `-o` to choose another catalog fil
 phasesweep mcp install
 ```
 
-The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config - including whether a recognized legacy launcher entry will be rewritten to the pinned executable, shown before the confirmation prompt. After confirmation it applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
+The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config - including whether a recognized legacy launcher entry will be rewritten to the pinned executable. Uninstall plans print the complete managed invocation they will remove. An invalid shared-instructions ownership block is disclosed with remediation before confirmation instead of appearing only as an apply error. After confirmation the installer applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
 
 The supported clients are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode. A missing catalog is never created implicitly; return to the review step instead.
 
@@ -67,12 +67,12 @@ Project scope is used where the client reliably supports it. Claude Desktop and 
 
 ### File preservation
 
-Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed. Project-scoped symlinks are followed only when the resolved target remains inside the selected project. Each operation pins that physical target, serializes against other PhaseSweep installers, and refuses replacement if the file changes during the transaction. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
+Automatic edits are limited to regular UTF-8 physical targets. User-scoped dotfile symlinks are followed. Project-scoped symlinks are followed only when the resolved target remains inside the selected project; plan, apply, post-apply verification, and `check-install` all refuse an escaping path rather than auditing the external target. Each operation pins that physical target, serializes against other PhaseSweep installers, and refuses replacement if the file changes during the transaction. Malformed configs and unmanaged same-name entries are left untouched with manual guidance.
 
 JSON ownership is inferred from the exact generated shape; no receipt records which entry the installer created. A hand-authored entry with that shape is therefore managed and may be replaced or removed. Any differing key or argument makes it unmanaged. Codex TOML additionally requires the installer's marker lines. Shared project instructions use one marker-fenced block plus an owner set; removing one client retains the other owners' block, and removing the final owner removes it.
 
 - Marker-fenced instructions and managed Codex TOML preserve unrelated bytes according to their marker contract.
-- Strict JSON may be reserialized. Key order, number spelling (`1e2`, `1.50`), indentation, newline style, final-newline state, and permissions are preserved, but compact spacing may normalize (`{"a":1}` may become `{"a": 1}`).
+- Strict JSON is reserialized as a complete document. Key order, number spelling (`1e2`, `1.50`), newline style, final-newline state, and permissions are preserved. An already indented document keeps its detected indentation; a compact one-line document has no indentation to detect and is expanded to the installer's two-space multiline form, so whitespace anywhere in it may change.
 - Duplicate keys, comments, JSON5, non-finite values, and overflowing numbers are refused.
 - Empty files and empty JSON containers remain after uninstall because whole-file creation ownership is not persisted.
 
@@ -106,7 +106,7 @@ phasesweep mcp check-install
 phasesweep mcp check-install --agent claude
 ```
 
-The report distinguishes a resolvable managed launcher (`ok`), missing or non-executable launchers, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. It does not parse the catalog or test server startup; use `phasesweep mcp check` for those validations. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
+The report distinguishes a resolvable managed launcher (`ok`), missing or non-executable launchers, scripts whose shebang interpreter is gone, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. It inspects files but deliberately does not execute a configured launcher, parse the catalog, import the MCP SDK from another environment, or test server startup. From the environment named by the launcher, `python -c 'import mcp, phasesweep.mcp.server'` checks the runtime imports and `phasesweep mcp check --catalog PATH` checks catalog startup. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
 
 For CI, explicit catalog review, or troubleshooting, run:
 
@@ -125,7 +125,7 @@ The package is not published, and the MCP runtime carries no deprecated tool ali
 ## Troubleshooting
 
 - `MCP support is not installed`: activate the intended conda environment, run the install command from step 1, then retry.
-- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`, activate or repair the environment named by the absolute command, rerun the installer, and restart the client.
+- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`. If its static launcher/catalog checks pass, activate the environment named by the absolute command, run `python -c 'import mcp, phasesweep.mcp.server'`, then run `phasesweep mcp check --catalog PATH`; repair the environment or rerun the installer if either check fails, then restart the client.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the corresponding catalog flag only if that is the authority you intend, then restart the MCP client.
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
