@@ -3,8 +3,8 @@
 This module is the single public surface for *reading* run state without
 launching anything or reaching into engine-private path helpers. The MCP
 layer is the primary consumer; the CLI consumes a narrow slice of it (see
-``_with_generation_identity`` in ``cli.py``) for its generation-identity
-split, so winner and status shapes have exactly one definition.
+:func:`config_status`) for its path-bearing status view, so winner and status
+shapes have exactly one definition.
 
 Reads here are permissive about partial run state and never raise on a missing
 winner. They still fail closed when the artifact root belongs to another
@@ -581,6 +581,10 @@ def read_status(
         path-bearing phase payload used by :func:`config_status`. Leave
         ``False`` for any agent-visible caller: ``True`` puts absolute winner
         paths in the returned mapping.
+    :raises ArtifactRootConflictError: If the artifact root cannot be read or
+        is bound to a different storage ledger or experiment. This includes
+        the legacy-tree migration subclass.
+    :raises ValueError: If ``generation_id`` is not a safe generation name.
     :return dict[str, Any]: A mapping with the experiment name, the four
         identity fields above, ``publication_integrity`` (plus
         ``publication_error`` only when validation failed or was denied), the metric
