@@ -26,13 +26,24 @@ def reporting_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     return destination
 
 
-def test_report_objective_writes_extractable_attempt_envelope(
+def test_report_objective_creates_nested_parent_and_replaces_extractable_envelope(
     reporting_environment: Path,
     tmp_path: Path,
 ) -> None:
-    """The helper fills managed identity and preserves extra scalar evidence."""
-    reporting_environment.parent.mkdir(parents=True)
-    reporting_environment.write_text("previous incomplete result")
+    """The helper owns nested publication setup and atomic replacement."""
+    assert not reporting_environment.parent.exists()
+
+    written = report_objective(
+        0.125,
+        name="eval_loss",
+        split="validation",
+        policy="best_checkpoint",
+        checkpoint="checkpoint-40",
+        step=40,
+        extra={"param_bytes": 1024},
+    )
+    assert written.is_file()
+    written.write_text("previous incomplete result")
 
     written = report_objective(
         0.125,

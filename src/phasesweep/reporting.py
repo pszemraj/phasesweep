@@ -71,7 +71,8 @@ def report_objective(
     The destination and attempt identity come from environment variables injected
     for a ``json_envelope`` metric extractor. ``extra`` may add top-level JSON
     fields for constraint extractors or evidence gates, but cannot replace the
-    envelope fields managed by this helper.
+    envelope fields managed by this helper. Missing parent directories in a
+    nested configured destination are created by the atomic artifact writer.
 
     :param float value: Finite objective value produced by the evaluation.
     :param str name: Objective name declared by the metric extractor.

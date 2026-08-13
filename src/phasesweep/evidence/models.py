@@ -34,13 +34,36 @@ def _validate_trial_path(value: str) -> str:
     """Require a non-empty path inside the trial directory.
 
     :param str value: Candidate trial-relative path.
-    :raises ValueError: If ``value`` is empty, absolute, or escapes upward.
+    :raises ValueError: If ``value`` is empty, absolute, escapes upward, or
+        contains a NUL byte that no filesystem call can accept.
     :return str: Validated trial-relative path.
     """
     path = Path(value)
-    if not value or path.is_absolute() or ".." in path.parts:
+    if not value or "\0" in value or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"trial-relative path required; got {value!r}.")
     return value
+
+
+def _validate_trial_file_path(value: str) -> str:
+    """Require a trial-relative path that names a descendant file location.
+
+    ``.`` legitimately names the whole trial directory for an
+    ``artifact_size`` directory gate, but every extractor and file-backed gate
+    requires a file below that root. Rejecting the root at config load avoids
+    deferring an impossible file open to the first trial.
+
+    :param str value: Candidate trial-relative file path.
+    :raises ValueError: If ``value`` violates the shared path contract or
+        resolves to the trial directory itself.
+    :return str: Validated descendant file path.
+    """
+    validated = _validate_trial_path(value)
+    if not Path(validated).parts:
+        raise ValueError(
+            "trial-relative path required; a file path must name a descendant "
+            f"of trial_dir, not {value!r}."
+        )
+    return validated
 
 
 def _validate_json_key(value: str | None) -> str | None:
@@ -71,6 +94,21 @@ class _TrialPathModel(_Frozen):
         return _validate_trial_path(value)
 
 
+class _TrialFilePathModel(_Frozen):
+    """Mixin for config models containing trial-relative file path fields."""
+
+    @field_validator("path", "file", check_fields=False)
+    @classmethod
+    def _trial_file_path_is_relative(cls, value: str) -> str:
+        """Validate trial-relative file path fields.
+
+        :param str value: Candidate trial-relative file path.
+        :raises ValueError: If the path is unsafe or names the trial root.
+        :return str: Validated descendant file path.
+        """
+        return _validate_trial_file_path(value)
+
+
 class _JsonKeyModel(_Frozen):
     """Mixin for config models containing dotted JSON key fields."""
 
@@ -85,7 +123,7 @@ class _JsonKeyModel(_Frozen):
         return _validate_json_key(value)
 
 
-class JsonExtractor(_TrialPathModel, _JsonKeyModel):
+class JsonExtractor(_TrialFilePathModel, _JsonKeyModel):
     """Extract a scalar from a JSON file via a dot-separated key path."""
 
     type: Literal["json"]
@@ -93,7 +131,7 @@ class JsonExtractor(_TrialPathModel, _JsonKeyModel):
     key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
 
 
-class JsonEnvelopeExtractor(_TrialPathModel):
+class JsonEnvelopeExtractor(_TrialFilePathModel):
     """Extract a scalar from a versioned, attempt-bound result envelope."""
 
     type: Literal["json_envelope"]
@@ -105,7 +143,7 @@ class JsonEnvelopeExtractor(_TrialPathModel):
     expected_step: int | None = Field(default=None, ge=0)
 
 
-class LogRegexExtractor(_TrialPathModel):
+class LogRegexExtractor(_TrialFilePathModel):
     """Extract a scalar from a log file via regex with a named 'value' group."""
 
     type: Literal["log_regex"]
@@ -258,14 +296,14 @@ class _ObjectiveEvidenceFields(BaseModel):
     expected_step_value_bound: bool
 
 
-class RequiredFileGate(_TrialPathModel):
+class RequiredFileGate(_TrialFilePathModel):
     """Require a file to exist under the trial directory."""
 
     type: Literal["required_file"]
     path: str
 
 
-class JsonEqualsGate(_TrialPathModel, _JsonKeyModel):
+class JsonEqualsGate(_TrialFilePathModel, _JsonKeyModel):
     """Require a JSON key to equal an expected JSON scalar.
 
     ``value`` must be a JSON scalar (``bool``, ``int``, ``float``, ``str``, or
@@ -325,7 +363,7 @@ class JsonEqualsGate(_TrialPathModel, _JsonKeyModel):
         return value
 
 
-class JsonScalarBoundGate(_TrialPathModel, _JsonKeyModel):
+class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
     """Require a JSON key to be a finite scalar within optional bounds."""
 
     type: Literal["json_scalar_bound"]
@@ -365,6 +403,11 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
         :raises ValueError: If source/key pairing or byte bounds are invalid.
         :return ArtifactSizeGate: Validated gate config.
         """
+        if self.source != "directory" and not Path(self.path).parts:
+            raise ValueError(
+                "artifact_size gate path='.' is valid only with source=directory; "
+                f"source={self.source!r} requires a descendant file path."
+            )
         if self.source == "json" and self.key is None:
             raise ValueError("artifact_size gate with source=json must define key.")
         if self.source != "json" and self.key is not None:
@@ -377,7 +420,7 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
         return self
 
 
-class Sha256Gate(_TrialPathModel):
+class Sha256Gate(_TrialFilePathModel):
     """Require a file's SHA-256 digest to match an expected hex string."""
 
     type: Literal["sha256"]

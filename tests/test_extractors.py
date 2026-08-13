@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.config import (
+    ArtifactSizeGate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
@@ -269,7 +270,7 @@ def test_json_envelope_rejects_mismatched_provenance(tmp_path, path, value, matc
 
 
 def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
-    bad_paths = ["/tmp/result.json", "../result.json", ""]
+    bad_paths = ["/tmp/result.json", "../result.json", "", ".", "result\0.json"]
     bad_keys = ["", ".x", "x."]
 
     for bad_path in bad_paths:
@@ -279,6 +280,14 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     for bad_key in bad_keys:
         with pytest.raises(ValidationError, match="JSON key"):
             JsonEqualsGate(type="json_equals", path="result.json", key=bad_key, value=1)
+
+    with pytest.raises(ValidationError, match="valid only with source=directory"):
+        ArtifactSizeGate(type="artifact_size", source="file", path=".", max_bytes=1)
+
+    assert (
+        ArtifactSizeGate(type="artifact_size", source="directory", path=".", min_bytes=0).path
+        == "."
+    )
 
 
 def test_log_regex_selects_last_or_min_value(tmp_path):

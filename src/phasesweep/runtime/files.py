@@ -956,6 +956,9 @@ def _new_shared_temp_fd(directory: Path, leaf: str) -> tuple[int, Path]:
 def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
     """Write text through a same-directory temp file and atomically replace ``path``.
 
+    Missing parent directories are created before the staging file is opened,
+    so callers may publish directly to a nested artifact path.
+
     File modes follow the ``workdir`` trust boundary documented in
     ``docs/runtime.md``: the experiment artifact tree is deliberately *not*
     owner-only, because operators and tooling need ordinary access to winners,
@@ -1019,6 +1022,7 @@ def atomic_write_text(path: Path, text: str) -> None:
 
     :param Path path: Destination path to replace.
     :param str text: Text to write using UTF-8 encoding.
+    :raises OSError: Parent creation, staging, replacement, or durability fails.
     """
     with atomic_text_writer(path) as handle:
         handle.write(text)

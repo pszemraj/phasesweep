@@ -103,7 +103,7 @@ Each mode has a required template placeholder and distinct value encoding. The [
 The command in `trial_command` is the training or evaluation program for one trial. PhaseSweep creates the trial directory, materializes the selected input boundary, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Read the complete YAML at `{config_path}` in the default mode, or parse the explicitly selected compatibility [override format](#override-formats).
-- Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary.
+- Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary. `report_objective(...)` creates missing parent directories when the envelope uses a nested trial-relative path.
 - Exit nonzero when the trial failed and should be recorded as failed.
 - When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
 - When writing a `json_envelope` directly, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into it. `report_objective(...)` fills these fields automatically. PhaseSweep verifies all three before accepting the objective.

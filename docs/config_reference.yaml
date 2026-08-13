@@ -210,7 +210,7 @@
 # Choices must be pairwise unequal under plain Python comparison, so `[1, 1.0]`, `[1, true]`, and `[0, false]` are rejected alongside a literal repeat. Optuna records a sampled value as its `==` index into `choices`, so equal choices collapse onto the first of them in the published winner and in every inherited override; a repeat also inflates grid cardinality and skews sampling weights. With a CLI compatibility format, choices must also have distinct rendered wire values (`[1, "1"]` is ambiguous under argparse); yaml_file and json_file preserve their distinct numeric/string types.
 
 # EXTRACTOR OBJECTS
-# An extractor must use exactly one discriminator shape. Every `path`/`file` below is a nonempty trial-relative path: absolute paths and any `..` component are rejected.
+# An extractor or gate must use exactly one discriminator shape. Every file-backed `path`/`file` below is a nonempty trial-relative file path: absolute paths, any `..` component, NUL bytes, and `.` (the trial directory itself) are rejected. The one exception is an artifact_size gate with source: directory, where path: . intentionally measures the complete trial directory.
 # Every JSON `key` is a nonempty dotted lookup path with no empty segment. Extractor runtime failures fail the trial.
 
 # type: Literal["json"] (required)
@@ -225,7 +225,7 @@
 # policy: str (required; nonempty)
 # checkpoint: str | None = null (nonempty when set)
 # expected_step: int | None = null (>= 0)
-# Requires schema_version=1, status=complete, matching generation/attempt IDs and resolved-overrides digest, a numeric objective value with the configured name/split, and evaluation metadata with the configured policy. Every envelope must identify a checkpoint and non-negative step; checkpoint and step are matched exactly when configured. Python trainers may call `phasesweep.report_objective(...)`; it fills the managed identity, writes to `PHASESWEEP_OBJECTIVE_PATH`, and atomically replaces the envelope.
+# Requires schema_version=1, status=complete, matching generation/attempt IDs and resolved-overrides digest, a numeric objective value with the configured name/split, and evaluation metadata with the configured policy. Every envelope must identify a checkpoint and non-negative step; checkpoint and step are matched exactly when configured. Python trainers may call `phasesweep.report_objective(...)`; it fills the managed identity, creates missing parent directories for a nested configured path, writes to `PHASESWEEP_OBJECTIVE_PATH`, and atomically replaces the envelope.
 
 # type: Literal["log_regex"] (required)
 # file: str = "stdout.log"
