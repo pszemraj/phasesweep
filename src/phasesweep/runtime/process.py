@@ -50,6 +50,9 @@ log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
+_GUARDIAN_EXIT_TIMEOUT_SECONDS = (
+    _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
+)
 # With the -I -S stdlib-only launch (review v0.5.15 / blocker 1), supervisor
 # startup no longer pays phasesweep's package-import cost (~0.55s pre-fix) —
 # real-world readiness lands in ~30ms. 10s stays generous headroom for a
@@ -777,6 +780,31 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     except ChildProcessError:
         pass  # Already reaped elsewhere (e.g. a concurrent wait()).
     return cleanup_confirmed
+
+
+def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
+    """Bound the in-band wait for the post-root lease guardian.
+
+    The guardian deliberately remains alive after SIGKILL when it cannot prove
+    the trainer group is gone, retaining inherited GPU lease descriptors. The
+    orchestrator must not wait for that fail-closed lease holder forever: it
+    returns cleanup uncertainty so the phase aborts without scheduling more
+    work, while the detached guardian continues protecting the device.
+
+    :param subprocess.Popen proc: Guardian process whose trainer root already exited.
+    :return bool: Whether the guardian exited inside its cleanup allowance.
+    """
+    try:
+        proc.wait(timeout=_GUARDIAN_EXIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        log.error(
+            "Lease guardian PID %d did not finish descendant cleanup within %.1fs; "
+            "returning cleanup uncertainty while it retains the GPU lease",
+            proc.pid,
+            _GUARDIAN_EXIT_TIMEOUT_SECONDS,
+        )
+        return False
+    return True
 
 
 def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
@@ -1529,14 +1557,22 @@ def run_supervised(
             # The trainer root exited within its budget. Descendant cleanup is
             # lifecycle teardown, so the guardian's SIGTERM/SIGKILL grace must
             # not retroactively turn this into a wallclock timeout.
-            proc.wait()
-            guardian_status = (
-                os.read(status_read, 1)
-                if root_status == _supervisor._TRAINER_ROOT_EXITED
-                else root_status
-            )
-            os.close(status_read)
-            status_read = None
+            guardian_exited = _wait_for_guardian_exit(proc)
+            guardian_status = None
+            if guardian_exited:
+                guardian_status = (
+                    os.read(status_read, 1)
+                    if root_status == _supervisor._TRAINER_ROOT_EXITED
+                    else root_status
+                )
+                os.close(status_read)
+                status_read = None
+            else:
+                cleanup_confirmed = False
+                failure_reason = (
+                    f"trainer root exited, but lease guardian {proc.pid} could not "
+                    "confirm descendant cleanup within its bounded allowance"
+                )
             if guardian_status == _supervisor._DESCENDANTS_REAPED:
                 failure_reason = (
                     f"root process exited with code {proc.returncode}, "
@@ -1979,7 +2015,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
                 confirmed[pgid] = True
         survivors = still_alive
         if survivors:
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     for pgid in survivors:
         log.error("Process group %d still appears alive after SIGKILL", pgid)
@@ -2106,10 +2142,28 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
             if not entry.name.isdigit():
                 continue
             stat, conclusive = _read_proc_stat_result(entry)
-            complete = complete and conclusive
+            pid = int(entry.name)
+            if not conclusive:
+                # Hardened procfs mounts commonly hide processes owned by
+                # other users. An unreadable host-global entry is irrelevant
+                # when the kernel can still prove it belongs to another group;
+                # only a possibly-matching entry makes this scan incomplete.
+                try:
+                    unreadable_pgid = os.getpgid(pid)
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                if unreadable_pgid != pgid:
+                    continue
+                member_pids.append(pid)
+                complete = False
+                all_members_terminal = False
+                continue
             if stat is None or stat.pgrp != pgid:
                 continue
-            member_pids.append(int(entry.name))
+            member_pids.append(pid)
             if stat.state not in {"Z", "X"}:
                 all_members_terminal = False
     except OSError:

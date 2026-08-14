@@ -1370,6 +1370,36 @@ def test_binding_claim_ignores_its_atomic_staging_file(tmp_path: Path) -> None:
     assert not list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
 
 
+def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
+    """A note or OS metadata file does not turn a fresh root into a legacy tree."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    root = _experiment_dir(experiment)
+    root.mkdir(parents=True)
+    (root / ".DS_Store").write_bytes(b"metadata")
+    (root / "notes.md").write_text("operator notes\n", encoding="utf-8")
+
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
+
+    assert _artifact_root_binding_path(experiment).is_file()
+
+
+def test_unbound_known_phasesweep_state_names_the_blocking_entry(tmp_path: Path) -> None:
+    """Known engine state still requires explicit adoption and is identifiable."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    (_experiment_dir(experiment) / "generations").mkdir(parents=True)
+
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match="'generations'"):
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
+
+    assert not _artifact_root_binding_path(experiment).exists()
+
+
 def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     """One tree cannot mix publication files from one DB with counts from another."""
     trainer = write_constant_trainer(tmp_path)

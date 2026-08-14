@@ -35,6 +35,7 @@ _READY_PID_WIDTH = 10
 _TRAINER_ROOT_EXITED = b"X"
 _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
+_GROUP_MAX_POLL_SECONDS = 0.5
 _GROUP_TERM_GRACE_SECONDS = 10.0
 
 
@@ -145,8 +146,20 @@ def _trainer_group_alive(pgid: int) -> bool:
             except FileNotFoundError:
                 continue
             except (IndexError, OSError, ValueError):
-                complete = False
-                continue
+                # hidepid/ProtectProc can hide unrelated users' stat files.
+                # getpgid still lets the kernel exclude those entries from
+                # this trainer group; only an unreadable possible member keeps
+                # the lease fail-closed.
+                try:
+                    unreadable_pgid = os.getpgid(int(entry.name))
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                if unreadable_pgid != pgid:
+                    continue
+                return True
             if member_pgid != pgid:
                 continue
             found_member = True
@@ -166,10 +179,12 @@ def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
     :return bool: ``True`` once the group is gone, or ``False`` when the deadline expires.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
+    poll_seconds = _GROUP_POLL_SECONDS
     while _trainer_group_alive(pgid):
         if deadline is not None and time.monotonic() >= deadline:
             return False
-        time.sleep(_GROUP_POLL_SECONDS)
+        time.sleep(poll_seconds)
+        poll_seconds = min(poll_seconds * 2, _GROUP_MAX_POLL_SECONDS)
     return True
 
 

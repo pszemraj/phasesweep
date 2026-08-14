@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import builtins
 import contextlib
+import io
 import json
 import os
 import select
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
@@ -27,13 +30,16 @@ from phasesweep.runtime.process import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     PhaseSweepShutdown,
     StaleProcessIdentity,
+    _group_member_pids,
     _GroupMemberScan,
     _kill_group,
     _process_group_alive_with_members,
+    _ProcStat,
     _shutdown_handler,
     _spawn_blocked_supervisor,
     _terminate_process_group,
     _terminate_process_groups,
+    _wait_for_guardian_exit,
     cleanup_stale_trial_process,
     defer_shutdown_signals,
     is_pid_alive,
@@ -1034,6 +1040,98 @@ def test_descendant_reaping_grace_is_outside_trial_wallclock(tmp_path: Path) -> 
     assert result.failure_reason is not None
     assert "still had live descendants" in result.failure_reason
     assert elapsed > 0.7, "test did not exercise cleanup beyond the wallclock budget"
+
+
+def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
+    """A fail-closed detached guardian cannot park the orchestrator forever."""
+    observed: list[float | None] = []
+
+    class StuckGuardian:
+        pid = 4242
+
+        def wait(self, timeout: float | None = None) -> None:
+            observed.append(timeout)
+            raise subprocess.TimeoutExpired("guardian", timeout)
+
+    assert _wait_for_guardian_exit(StuckGuardian()) is False  # type: ignore[arg-type]
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert observed[0] > supervisor._GROUP_TERM_GRACE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("unreadable_pgid", "expected"),
+    [
+        pytest.param(9999, ((11,), True, True), id="unrelated-entry-is-irrelevant"),
+        pytest.param(1234, ((11, 22), False, False), id="possible-member-is-uncertain"),
+    ],
+)
+def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
+    monkeypatch: pytest.MonkeyPatch,
+    unreadable_pgid: int,
+    expected: tuple[tuple[int, ...], bool, bool],
+) -> None:
+    """Host-global hidepid failures do not poison an unrelated trainer group."""
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(path: Path):  # noqa: ANN202
+        if path == Path("/proc"):
+            return iter((Path("/proc/11"), Path("/proc/22")))
+        return real_iterdir(path)
+
+    def fake_stat(path: Path) -> tuple[_ProcStat | None, bool]:
+        if path.name == "11":
+            return _ProcStat(state="Z", pgrp=1234, starttime=1), True
+        return None, False
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    monkeypatch.setattr("phasesweep.runtime.process._read_proc_stat_result", fake_stat)
+    monkeypatch.setattr("phasesweep.runtime.process.os.getpgid", lambda _pid: unreadable_pgid)
+
+    scan = _group_member_pids(1234)
+
+    assert (scan.pids, scan.complete, scan.all_members_terminal) == expected
+
+
+@pytest.mark.parametrize(
+    ("unreadable_pgid", "expected_alive"),
+    [
+        pytest.param(9999, False, id="unrelated-entry-is-irrelevant"),
+        pytest.param(1234, True, id="possible-member-keeps-lease"),
+    ],
+)
+def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    unreadable_pgid: int,
+    expected_alive: bool,
+) -> None:
+    """The stdlib guardian applies the same target-scoped completeness rule."""
+
+    class Entries:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def __iter__(self):  # noqa: ANN204
+            return iter((SimpleNamespace(name="11"), SimpleNamespace(name="22")))
+
+    real_open = builtins.open
+
+    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):  # noqa: ANN202
+        if path == "/proc/11/stat":
+            return io.BytesIO(b"11 (trainer) Z 1 1234 0")
+        if path == "/proc/22/stat":
+            raise PermissionError(path)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.killpg", lambda *_args: None)
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.scandir", lambda _path: Entries())
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.getpgid", lambda _pid: unreadable_pgid)
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    assert supervisor._trainer_group_alive(1234) is expected_alive
 
 
 def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:

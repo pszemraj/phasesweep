@@ -1943,23 +1943,36 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
     }
 
 
-def _root_contains_durable_state(experiment: Experiment) -> bool:
-    """Return whether an unbound root contains more than the opened run log.
+def _root_durable_state_entry(experiment: Experiment) -> str | None:
+    """Return the first known PhaseSweep state entry in an unbound root.
+
+    Arbitrary operator files do not establish storage ownership. A note,
+    ``.DS_Store``, or other unrelated file may already live in a chosen output
+    directory before the first run, and treating it as a legacy PhaseSweep
+    tree makes the experiment name unusable. Only paths PhaseSweep itself
+    creates can require explicit adoption.
 
     :param Experiment experiment: Experiment whose artifact root is inspected.
     :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
-    :return bool: Whether the root contains durable state beyond its binding and run log.
+    :return str | None: Known durable entry name, or ``None`` for a fresh root.
     """
     root = _experiment_dir(experiment)
     if not root.is_dir():
-        return False
+        return None
     binding_name = _artifact_root_binding_path(experiment).name
-    ignored = {"run.log", binding_name}
+    durable_names = {
+        "attempts",
+        "generation.yaml",
+        "generations",
+        "last_successful_generation.yaml",
+        "summary.yaml",
+        *(phase.name for phase in experiment.phases),
+    }
     staging_prefix = f".{binding_name}."
     try:
         for path in root.iterdir():
             name = path.name
-            if name in ignored:
+            if name in {"run.log", binding_name}:
                 continue
             if (
                 name.startswith(staging_prefix)
@@ -1970,8 +1983,9 @@ def _root_contains_durable_state(experiment: Experiment) -> bool:
                 token = name[len(staging_prefix) : -len(".tmp")]
                 if len(token) == 16 and all(character in "0123456789abcdef" for character in token):
                     continue
-            return True
-        return False
+            if name in durable_names:
+                return name
+        return None
     except OSError as exc:
         raise ArtifactRootConflictError(
             f"Cannot inspect artifact root {_artifact_root_identity(experiment)!r}: {exc}."
@@ -2004,10 +2018,12 @@ def _validate_artifact_root_binding(
     try:
         raw = strict_json_loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        if _root_contains_durable_state(experiment):
+        durable_entry = _root_durable_state_entry(experiment)
+        if durable_entry is not None:
             raise LegacyArtifactRootMigrationRequiredError(
-                f"Artifact root {expected['artifact_root']!r} contains durable state but "
-                "records no storage-ledger binding. An ordinary run or read cannot infer "
+                f"Artifact root {expected['artifact_root']!r} contains PhaseSweep state "
+                f"entry {durable_entry!r} but records no storage-ledger binding. An "
+                "ordinary run or read cannot infer "
                 "which database owns this publication. Run 'phasesweep rebind-workdir "
                 "<config>' with a config naming this complete tree to adopt it explicitly. "
                 "No trial ran and nothing was published."
