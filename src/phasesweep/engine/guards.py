@@ -899,6 +899,16 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             "alive. Investigate the attempt's trial directory, then delete the "
             "entry file if you are certain nothing is running."
         ) from exc
+    locator_identity: str | None = None
+    if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):
+        try:
+            locator_identity = canonical_storage_identity(payload["storage_locator"])
+        except ValueError as exc:
+            raise ProcessCleanupUncertainError(
+                f"Attempt registry entry {entry_path} has an unsupported or partial "
+                "schema. Delete the entry file only if you are certain no process "
+                "from this attempt is running."
+            ) from exc
     if (
         not isinstance(payload, dict)
         or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
@@ -916,8 +926,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         )
         or (
             payload.get("storage_locator") is not None
-            and canonical_storage_identity(payload.get("storage_locator"))
-            != payload.get("storage_identity")
+            and locator_identity != payload.get("storage_identity")
         )
         or not isinstance(payload.get("generation_id"), str)
         or not payload.get("generation_id")

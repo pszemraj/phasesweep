@@ -1323,24 +1323,31 @@ _RDB_DEFAULT_PORTS = {
 }
 
 # Query options that configure *how* we connect, not *what* we connect to.
-# Excluding them fails safe: an excluded identity-bearing option can only
-# over-collide (a spurious "already running" error), whereas keeping a
-# connection-only option would split the lock for one shared database.
+# Keep this policy conservative: wrongly excluding a target selector could
+# make different ledgers share both a lock and an artifact-root ownership key,
+# while retaining an unknown connection option only splits one target's identity.
 _RDB_CONNECTION_ONLY_OPTIONS = frozenset(
     {
-        "application_name",
+        "applicationname",
+        "authentication",
         "charset",
-        "connect_timeout",
-        "read_timeout",
+        "driver",
+        "encrypt",
+        "hostnameincertificate",
+        "integratedsecurity",
+        "servercertificate",
         "sslcert",
         "sslkey",
         "sslmode",
         "sslrootcert",
-        "target_session_attrs",
-        "write_timeout",
+        "targetsessionattrs",
+        "tlsversion",
+        "trustedconnection",
+        "trustservercertificate",
     }
 )
 _RDB_CONNECTION_ONLY_OPTION_PREFIXES = ("keepalives",)
+_RDB_CONNECTION_ONLY_OPTION_SUFFIXES = ("timeout",)
 
 # Authentication selects how a client reaches an RDB target, not which
 # database ledger it reaches. Normalize common spellings after stripping
@@ -1361,6 +1368,36 @@ _RDB_CREDENTIAL_OPTION_NAMES = frozenset(
         "username",
     }
 )
+_RDB_CREDENTIAL_OPTION_SUFFIXES = ("password", "secret", "token")
+
+# Conventional target-selector order keeps identities readable while making
+# nested ODBC field order immaterial. Unknown retained fields follow these in
+# case-insensitive lexical order.
+_ODBC_TARGET_OPTION_ORDER = {
+    "dsn": 0,
+    "server": 1,
+    "host": 1,
+    "address": 1,
+    "addr": 1,
+    "networkaddress": 1,
+    "port": 2,
+    "instance": 3,
+    "database": 4,
+    "initialcatalog": 4,
+    "socket": 5,
+    "schema": 6,
+    "currentschema": 6,
+    "searchpath": 6,
+}
+
+
+def _normalize_rdb_option_name(key: str) -> str:
+    """Normalize an RDB option name for case-insensitive policy matching.
+
+    :param str key: Top-level query key or nested ODBC field name.
+    :return str: Lowercase alphanumeric option name.
+    """
+    return "".join(character for character in key.casefold() if character.isalnum())
 
 
 def _is_connection_only_rdb_option(key: str) -> bool:
@@ -1369,9 +1406,11 @@ def _is_connection_only_rdb_option(key: str) -> bool:
     :param str key: Query parameter name from an RDB storage URL.
     :return bool: True when the option must be excluded from lock identity.
     """
-    lowered = key.lower()
-    return lowered in _RDB_CONNECTION_ONLY_OPTIONS or lowered.startswith(
-        _RDB_CONNECTION_ONLY_OPTION_PREFIXES
+    normalized = _normalize_rdb_option_name(key)
+    return (
+        normalized in _RDB_CONNECTION_ONLY_OPTIONS
+        or normalized.startswith(_RDB_CONNECTION_ONLY_OPTION_PREFIXES)
+        or normalized.endswith(_RDB_CONNECTION_ONLY_OPTION_SUFFIXES)
     )
 
 
@@ -1381,48 +1420,147 @@ def _is_rdb_credential_option(key: str) -> bool:
     :param str key: Top-level query key or nested ODBC field name.
     :return bool: True when the key must not participate in target identity.
     """
-    normalized = "".join(character for character in key.lower() if character.isalnum())
-    return normalized in _RDB_CREDENTIAL_OPTION_NAMES
+    normalized = _normalize_rdb_option_name(key)
+    return normalized in _RDB_CREDENTIAL_OPTION_NAMES or normalized.endswith(
+        _RDB_CREDENTIAL_OPTION_SUFFIXES
+    )
 
 
-def _odbc_identity_value(value: str) -> str:
-    """Remove credential fields from an ODBC connection string.
+def _split_odbc_fields(value: str) -> list[str]:
+    """Split an ODBC connection string without splitting braced values.
 
-    ODBC values may brace semicolon-containing field values, so splitting on
-    every semicolon would corrupt target selectors such as ``SERVER`` or
-    ``DATABASE``. Braced values and escaped closing braces are retained byte
-    for byte; only complete credential fields are removed.
+    A brace starts quoting only immediately after a field's first ``=``.
+    Inside a braced value, ``}}`` is an escaped closing brace.
 
     :param str value: Decoded ``odbc_connect`` query value.
-    :return str: Connection string retaining only non-credential fields.
+    :return list[str]: Raw ``key=value`` fields in source order.
+    :raises ValueError: A braced field value is unterminated.
     """
     fields: list[str] = []
     field_start = 0
     in_braces = False
+    saw_separator = False
+    value_started = False
     index = 0
     while index < len(value):
         character = value[index]
-        if character == "{" and not in_braces:
-            in_braces = True
-        elif character == "}" and in_braces:
-            if index + 1 < len(value) and value[index + 1] == "}":
-                index += 1
-            else:
-                in_braces = False
-        elif character == ";" and not in_braces:
+        if in_braces:
+            if character == "}":
+                if index + 1 < len(value) and value[index + 1] == "}":
+                    index += 1
+                else:
+                    in_braces = False
+        elif character == ";":
             fields.append(value[field_start:index])
             field_start = index + 1
+            saw_separator = False
+            value_started = False
+        elif not saw_separator:
+            if character == "=":
+                saw_separator = True
+        elif not value_started:
+            value_started = True
+            if character == "{":
+                in_braces = True
         index += 1
+    if in_braces:
+        raise ValueError(
+            "Malformed ODBC storage target: unterminated braced value in odbc_connect."
+        )
     fields.append(value[field_start:])
+    return fields
 
-    retained = []
-    for field in fields:
-        key, separator, _field_value = field.partition("=")
-        if separator and _is_rdb_credential_option(key.strip()):
+
+def _canonical_odbc_field_value(value: str) -> str:
+    """Return one ODBC value in a deterministic brace-safe spelling.
+
+    :param str value: Raw field value following its first ``=``.
+    :return str: Semantically equivalent value with canonical brace escaping.
+    :raises ValueError: A braced value has trailing text or an unescaped brace.
+    """
+    if value.startswith("{"):
+        if not value.endswith("}"):
+            raise ValueError("Malformed ODBC storage target: invalid braced value in odbc_connect.")
+        inner = value[1:-1]
+        decoded: list[str] = []
+        index = 0
+        while index < len(inner):
+            character = inner[index]
+            if character == "}":
+                if index + 1 >= len(inner) or inner[index + 1] != "}":
+                    raise ValueError(
+                        "Malformed ODBC storage target: unescaped closing brace in odbc_connect."
+                    )
+                decoded.append("}")
+                index += 2
+                continue
+            decoded.append(character)
+            index += 1
+        semantic_value = "".join(decoded)
+    else:
+        semantic_value = value
+
+    if (
+        ";" in semantic_value
+        or "}" in semantic_value
+        or semantic_value.startswith("{")
+        or semantic_value != semantic_value.strip()
+    ):
+        return "{" + semantic_value.replace("}", "}}") + "}"
+    return semantic_value
+
+
+def _odbc_identity_value(value: str) -> str:
+    """Canonicalize target fields in an ODBC connection string.
+
+    ODBC values may brace semicolon-containing field values, so splitting on
+    every semicolon would corrupt target selectors such as ``SERVER`` or
+    ``DATABASE``. Braced values and escaped closing braces are decoded and
+    emitted in one canonical spelling. Field names are case-normalized,
+    connection-only and credential fields are removed, and retained target
+    fields are ordered deterministically.
+
+    ODBC uses the first value when a keyword is repeated. Reject duplicate
+    retained target keys instead of sorting them and possibly changing which
+    target wins.
+
+    :param str value: Decoded ``odbc_connect`` query value.
+    :return str: Canonical connection string retaining only target fields.
+    :raises ValueError: A field is malformed or a retained target field occurs
+        more than once.
+    """
+    retained: dict[str, tuple[str, str]] = {}
+    for field in _split_odbc_fields(value):
+        if not field.strip():
             continue
-        if field:
-            retained.append(field)
-    return ";".join(retained)
+        key, separator, field_value = field.partition("=")
+        if not separator:
+            raise ValueError("Malformed ODBC storage target: field without '=' in odbc_connect.")
+        key = key.strip()
+        if _is_rdb_credential_option(key) or _is_connection_only_rdb_option(key):
+            continue
+        canonical_key = _normalize_rdb_option_name(key)
+        if not canonical_key:
+            raise ValueError("Malformed ODBC storage target: empty field name in odbc_connect.")
+        if canonical_key in retained:
+            raise ValueError(
+                "Ambiguous ODBC storage target: duplicate field "
+                f"{key!r} in odbc_connect; specify each target selector once."
+            )
+        retained[canonical_key] = (
+            canonical_key.upper(),
+            _canonical_odbc_field_value(field_value),
+        )
+
+    ordered = sorted(
+        retained.items(),
+        key=lambda item: (
+            _ODBC_TARGET_OPTION_ORDER.get(_normalize_rdb_option_name(item[0]), 100),
+            item[0],
+        ),
+    )
+    canonical_fields = [f"{key}={field_value}" for _, (key, field_value) in ordered]
+    return ";".join(canonical_fields)
 
 
 def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -1448,7 +1586,10 @@ def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]
             )
             for item in values
         )
-    return sorted(pairs, key=lambda pair: (pair[0].lower(), pair[0], pair[1]))
+    # Sorting only by key is deliberate: Python's stable sort keeps repeated
+    # target values in their configured order, since failover order may affect
+    # which ledger is reached.
+    return sorted(pairs, key=lambda pair: (pair[0].lower(), pair[0]))
 
 
 def _canonical_rdb_identity(storage: str) -> str:
@@ -1470,7 +1611,9 @@ def _canonical_rdb_identity(storage: str) -> str:
 
     :param str storage: A non-file Optuna storage URL (``postgresql://...``, ...).
     :return str: The canonical identity, or ``storage`` unchanged when
-        SQLAlchemy cannot parse it — lock-path derivation must never crash.
+        SQLAlchemy cannot parse it.
+    :raises ValueError: A nested ODBC target repeats a normalized target field
+        or contains malformed field or brace syntax.
     """
     # Local import: SQLAlchemy ships with Optuna, but this module is on the
     # `phasesweep --help` path and importing it costs ~80ms we only owe for
@@ -1505,24 +1648,22 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     Non-file RDB URLs (``postgresql://``, ``mysql://``, ...) are canonicalized
     by :func:`_canonical_rdb_identity`: authentication material, driver suffix,
     host case, implicit vs. explicit default port, query order, and
-    connection-only query options are all normalized away. What is *not*
-    resolved: DNS aliases and
+    connection-only query options are all normalized away. DNS aliases and
     ``CNAME``s, load-balancer or pgbouncer endpoints, ``PGSERVICE`` service
     files, ``~/.pg_service.conf`` or environment-supplied defaults, and
-    ``localhost`` vs. ``127.0.0.1`` vs. a unix socket. Those all reach the same
-    database under different identities, so operators relying on
+    ``localhost`` vs. ``127.0.0.1`` vs. a unix socket are not resolved. Those
+    can reach the same database under different identities, so operators using
     ``allow_external_rdb_single_host: true`` must still spell the storage URL
-    the same way in every config that shares one database.
+    consistently across configs that share one database.
 
-    Args:
-        storage: An Optuna storage URL, or ``None`` for in-memory storage.
-
-    Returns:
-        The canonical identity string used to derive the same-host storage
-        lock path, or ``None`` for in-memory storage (no shared backend to
-        collide on). Storage strings SQLAlchemy cannot parse are returned
-        unchanged.
-
+    :param str | None storage: An Optuna storage URL, or ``None`` for in-memory
+        storage.
+    :return str | None: The canonical identity string used to derive the
+        same-host storage lock path, or ``None`` for in-memory storage (no
+        shared backend to collide on). Storage strings SQLAlchemy cannot parse
+        are returned unchanged.
+    :raises ValueError: A nested ODBC target repeats a normalized target field
+        or contains malformed field or brace syntax.
     """
     if storage is None:
         return None

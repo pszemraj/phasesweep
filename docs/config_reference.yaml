@@ -14,6 +14,7 @@
 # storage: str | None = null
 # `null`, `:memory:`, `sqlite://`, `sqlite:///:memory:`, and SQLite `uri=true` targets using `mode=memory` create fresh in-memory studies. Trial numbers, study state, and the current winner/summary view restart on every invocation; use persistent storage for resumable work.
 # `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs (RDB backends such as postgresql:// or mysql://) pass through to Optuna but are rejected at config validation unless allow_external_rdb_single_host: true is also set.
+# RDB identity ignores authentication plus driver, encryption, and timeout settings. Nested `odbc_connect` target keys are case-insensitive and order-independent; each target selector may appear only once.
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
 
 # allow_external_rdb_single_host: bool = false

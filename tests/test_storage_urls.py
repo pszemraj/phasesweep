@@ -404,6 +404,16 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
             "postgresql://sweep@db.internal/studies?ACCESS-TOKEN=new-token",
         ),
         (
+            "SSL password rotation",
+            "postgresql://sweep@db.internal/studies?sslpassword=old-secret",
+            "postgresql://sweep@db.internal/studies?SSL_PASSWORD=new-secret",
+        ),
+        (
+            "client secret rotation",
+            "postgresql://sweep@db.internal/studies?client_secret=old-secret",
+            "postgresql://sweep@db.internal/studies?CLIENT-SECRET=new-secret",
+        ),
+        (
             "nested ODBC credential rotation",
             "mssql+pyodbc:///?odbc_connect="
             "DRIVER%3D%7BODBC%3BDriver%7D%3BSERVER%3Ddb.internal%3B"
@@ -411,6 +421,50 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
             "mssql+pyodbc:///?odbc_connect="
             "DRIVER%3D%7BODBC%3BDriver%7D%3BSERVER%3Ddb.internal%3B"
             "DATABASE%3Dstudies%3Buid%3Dnew-user%3Bpwd%3D%7Bnew%3Bsecret%7D",
+        ),
+        (
+            "nested ODBC client-secret rotation",
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BClientSecret%3Dold-secret",
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3Bclient_secret%3Dnew-secret",
+        ),
+        (
+            "nested ODBC field order",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb.internal%3BDATABASE%3Dstudies",
+            "mssql+pyodbc:///?odbc_connect=DATABASE%3Dstudies%3BSERVER%3Ddb.internal",
+        ),
+        (
+            "nested ODBC field-name case",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb.internal%3BDATABASE%3Dstudies",
+            "mssql+pyodbc:///?odbc_connect=server%3Ddb.internal%3Bdatabase%3Dstudies",
+        ),
+        (
+            "nested ODBC connection options",
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC+Driver+17+for+SQL+Server%7D%3B"
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BEncrypt%3Dno%3B"
+            "TrustServerCertificate%3Dyes%3BTrusted_Connection%3Dyes%3B"
+            "Integrated+Security%3DSSPI%3BConnection+Timeout%3D5%3B"
+            "Query+Timeout%3D10%3BCommand+Timeout%3D20%3BTLSVersion%3D1.2",
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC+Driver+18+for+SQL+Server%7D%3B"
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BEncrypt%3Dyes%3B"
+            "TrustServerCertificate%3Dno%3BTrusted_Connection%3Dno%3B"
+            "Integrated+Security%3Dfalse%3BConnection+Timeout%3D30%3B"
+            "Query+Timeout%3D40%3BCommand+Timeout%3D50%3BTLSVersion%3D1.3",
+        ),
+        (
+            "nested ODBC braced target values",
+            "mssql+pyodbc:///?odbc_connect="
+            "SERVER%3D%7Bdb%3Bnode%7D%3BDATABASE%3D%7Bstudies%7D%7Dprod%7D",
+            "mssql+pyodbc:///?odbc_connect="
+            "DATABASE%3D%7Bstudies%7D%7Dprod%7D%3BSERVER%3D%7Bdb%3Bnode%7D",
+        ),
+        (
+            "nested ODBC redundant braces",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3D%7Bdb.internal%7D%3BDATABASE%3Dstudies",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb.internal%3BDATABASE%3Dstudies",
         ),
         (
             "query order",
@@ -505,11 +559,114 @@ def test_equivalent_rdb_urls_share_one_identity(label: str, left: str, right: st
             "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dstudies-a%3BPWD%3Dx",
             "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dstudies-b%3BPWD%3Dy",
         ),
+        (
+            "different nested ODBC port",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BPORT%3D1433%3BDATABASE%3Dstudies",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BPORT%3D1434%3BDATABASE%3Dstudies",
+        ),
+        (
+            "different nested ODBC DSN",
+            "mssql+pyodbc:///?odbc_connect=DSN%3Dstudies-primary",
+            "mssql+pyodbc:///?odbc_connect=DSN%3Dstudies-archive",
+        ),
+        (
+            "different nested ODBC instance",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BINSTANCE%3Dprimary%3BDATABASE%3Dx",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BINSTANCE%3Darchive%3BDATABASE%3Dx",
+        ),
+        (
+            "different nested ODBC socket",
+            "mssql+pyodbc:///?odbc_connect=SOCKET%3D%2Fvar%2Frun%2Fdb-a%3BDATABASE%3Dx",
+            "mssql+pyodbc:///?odbc_connect=SOCKET%3D%2Fvar%2Frun%2Fdb-b%3BDATABASE%3Dx",
+        ),
+        (
+            "different nested ODBC schema",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dx%3BSCHEMA%3Da",
+            "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BDATABASE%3Dx%3BSCHEMA%3Db",
+        ),
     ],
 )
 def test_distinct_rdb_urls_keep_distinct_identities(label: str, left: str, right: str) -> None:
     """Canonicalization must not over-collide onto genuinely different targets."""
     assert canonical_storage_identity(left) != canonical_storage_identity(right), label
+
+
+def test_duplicate_nested_odbc_target_fields_are_rejected() -> None:
+    """Ambiguous duplicate targets fail config validation without leaking values."""
+    storage = (
+        "mssql+pyodbc:///?odbc_connect="
+        "SERVER%3Ddb-a%3BDATABASE%3Dstudies%3Bserver%3Ddb-b%3BPWD%3DSUPERSECRET"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Ambiguous ODBC storage target: duplicate field 'server' in "
+            "odbc_connect; specify each target selector once"
+        ),
+    ):
+        canonical_storage_identity(storage)
+
+    phase = Phase(  # type: ignore[arg-type]
+        name="p",
+        n_trials=1,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        Experiment(
+            experiment="ambiguous-odbc",
+            storage=storage,
+            allow_external_rdb_single_host=True,
+            provenance={"revision": "test-fixture-v1"},
+            trial_command="echo {overrides}",
+            metric=Metric(
+                extractor=LogRegexExtractor(
+                    type="log_regex",
+                    pattern=r"x=(?P<value>[0-9.eE+-]+)",
+                )
+            ),
+            phases=[phase],
+        )
+
+    assert exc_info.value.errors(include_input=False)[0]["loc"] == ("storage",)
+    message = str(exc_info.value)
+    assert "duplicate field 'server'" in message
+    for private_value in ("db-a", "db-b", "studies", "SUPERSECRET"):
+        assert private_value not in message
+
+
+def test_duplicate_nested_odbc_target_fields_normalize_punctuation() -> None:
+    """Punctuation variants of one target key remain an ambiguous duplicate."""
+    storage = (
+        "mssql+pyodbc:///?odbc_connect=INITIAL+CATALOG%3Dstudies-a%3BInitialCatalog%3Dstudies-b"
+    )
+
+    with pytest.raises(ValueError, match="duplicate field 'InitialCatalog'"):
+        canonical_storage_identity(storage)
+
+
+def test_malformed_nested_odbc_braces_are_rejected() -> None:
+    """Malformed braced target values must not receive a misleading identity."""
+    storage = "mssql+pyodbc:///?odbc_connect=SERVER%3D%7Bdb.internal%3BDATABASE%3Dx"
+
+    with pytest.raises(ValueError, match="unterminated braced value in odbc_connect"):
+        canonical_storage_identity(storage)
+
+
+def test_malformed_nested_odbc_field_is_rejected() -> None:
+    """Every non-empty ODBC field must use the structured ``key=value`` form."""
+    storage = "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb%3BBROKEN%3BDATABASE%3Dx"
+
+    with pytest.raises(ValueError, match="field without '=' in odbc_connect"):
+        canonical_storage_identity(storage)
+
+
+def test_repeated_top_level_target_query_values_preserve_order() -> None:
+    """Repeated target values retain failover order instead of sorting it away."""
+    left = "postgresql://u@/db?host=db-a&host=db-b"
+    right = "postgresql://u@/db?host=db-b&host=db-a"
+
+    assert canonical_storage_identity(left) != canonical_storage_identity(right)
 
 
 def test_rdb_identity_excludes_credentials_and_keeps_socket_path() -> None:

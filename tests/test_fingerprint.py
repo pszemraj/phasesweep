@@ -1336,12 +1336,40 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
             ("FIRST-TOKEN", "SECOND-TOKEN"),
         ),
         (
+            "postgresql://user@host/db?sslpassword=FIRST-SECRET",
+            "postgresql://user@host/db?sslpassword=SECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
+        (
+            "postgresql://user@host/db?client_secret=FIRST-SECRET",
+            "postgresql://user@host/db?client_secret=SECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
+        (
             "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DFIRST-PWD%3BUID%3Duser",
             "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DSECOND-PWD%3BUID%3Duser",
             ("FIRST-PWD", "SECOND-PWD"),
         ),
+        (
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC%20Driver%2017%20for%20SQL%20Server%7D%3B"
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BEncrypt%3Dyes%3B"
+            "ClientSecret%3DFIRST-SECRET",
+            "mssql+pyodbc:///?odbc_connect="
+            "database%3Dstudies%3Bserver%3Ddb.internal%3B"
+            "DRIVER%3D%7BODBC%20Driver%2018%20for%20SQL%20Server%7D%3B"
+            "Encrypt%3Dno%3Bclient_secret%3DSECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
     ],
-    ids=["password", "access-token", "nested-odbc-connect"],
+    ids=[
+        "password",
+        "access-token",
+        "sslpassword",
+        "client-secret",
+        "nested-odbc-connect",
+        "equivalent-nested-odbc-spelling",
+    ],
 )
 def test_artifact_root_binding_survives_rdb_query_credential_rotation(
     tmp_path: Path,
@@ -1375,6 +1403,8 @@ def test_artifact_root_binding_survives_rdb_query_credential_rotation(
     for secret in secrets:
         assert secret not in artifact_text
 
+    binding_path = _artifact_root_binding_path(owner)
+    binding_before = binding_path.read_bytes()
     _validate_artifact_root_binding(offered, claim_fresh=False)
     _validate_artifact_root_binding_for_rebind(
         _ArtifactRootRebindPlan(
@@ -1383,6 +1413,7 @@ def test_artifact_root_binding_survives_rdb_query_credential_rotation(
             entries=(),
         )
     )
+    assert binding_path.read_bytes() == binding_before
 
 
 def test_relative_storage_identity_is_bound_to_the_invocation_cwd(

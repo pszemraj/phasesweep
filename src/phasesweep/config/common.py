@@ -13,7 +13,10 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 class _Frozen(BaseModel):
     """Base for all config models: frozen + reject unknown keys."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Config values can contain storage credentials and environment secrets.
+    # Pydantic normally repeats the rejected input in ValidationError text,
+    # which would leak those values through CLI diagnostics.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
 def _require_finite(label: str, value: float) -> None:

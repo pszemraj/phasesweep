@@ -7,6 +7,7 @@ import signal
 import stat
 import threading
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -668,6 +669,11 @@ def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
     )
 
 
+def _odbc_storage(connection_string: str) -> str:
+    """Encode a readable ODBC connection string as a SQLAlchemy URL."""
+    return f"mssql+pyodbc:///?odbc_connect={quote_plus(connection_string)}"
+
+
 @pytest.mark.parametrize(
     ("left_storage", "right_storage"),
     [
@@ -684,13 +690,54 @@ def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
             "postgresql://sweep@db.internal/studies?access_token=new-token",
         ),
         (
-            "mssql+pyodbc:///?odbc_connect="
-            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BPWD%3Dold-secret",
-            "mssql+pyodbc:///?odbc_connect="
-            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BPWD%3Dnew-secret",
+            "postgresql://sweep@db.internal/studies?sslpassword=old-secret",
+            "postgresql://sweep@db.internal/studies?sslpassword=new-secret",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?client_secret=old-secret",
+            "postgresql://sweep@db.internal/studies?client_secret=new-secret",
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=old-secret"),
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=new-secret"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PORT=1433"),
+            _odbc_storage("PORT=1433;DATABASE=studies;SERVER=db.internal"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies"),
+            _odbc_storage("server=db.internal;database=studies"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;ClientSecret=old-secret"),
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;client_secret=new-secret"),
+        ),
+        (
+            _odbc_storage(
+                "DRIVER={ODBC Driver 17 for SQL Server};SERVER=db.internal;"
+                "DATABASE=studies;Encrypt=yes;TrustServerCertificate=no;"
+                "Connection Timeout=30"
+            ),
+            _odbc_storage(
+                "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.internal;"
+                "DATABASE=studies;Encrypt=no;TrustServerCertificate=yes;"
+                "Connection Timeout=60"
+            ),
         ),
     ],
-    ids=["authority", "query-password", "access-token", "nested-odbc"],
+    ids=[
+        "authority",
+        "query-password",
+        "access-token",
+        "sslpassword",
+        "client-secret",
+        "nested-odbc-credential",
+        "nested-odbc-field-order",
+        "nested-odbc-field-case",
+        "nested-odbc-client-secret",
+        "nested-odbc-connection-options",
+    ],
 )
 def test_run_lock_collides_for_equivalent_rdb_storage_urls(
     tmp_path: Path,
@@ -712,11 +759,29 @@ def test_run_lock_collides_for_equivalent_rdb_storage_urls(
     assert set(_run_lock_paths(exp_a)) & set(_run_lock_paths(exp_b))
 
 
-def test_run_lock_does_not_collide_for_different_rdb_databases(tmp_path: Path) -> None:
-    """Canonicalization must not over-collide: distinct databases stay independent."""
-    exp_a = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_a")
-    exp_b = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_b")
-    exp_b = exp_b.model_copy(update={"experiment": "other"})
+@pytest.mark.parametrize(
+    ("selector", "left_value", "right_value"),
+    [
+        ("SERVER", "db-a", "db-b"),
+        ("DATABASE", "studies-a", "studies-b"),
+        ("PORT", "1433", "1434"),
+        ("DSN", "studies-a", "studies-b"),
+        ("SOCKET", "/tmp/db-a", "/tmp/db-b"),
+        ("SCHEMA", "alpha", "beta"),
+    ],
+    ids=["server", "database", "port", "dsn", "socket", "schema"],
+)
+def test_run_lock_does_not_collide_for_different_rdb_targets(
+    tmp_path: Path,
+    selector: str,
+    left_value: str,
+    right_value: str,
+) -> None:
+    """Canonicalization must not over-collide distinct RDB target selectors."""
+    left_storage = _odbc_storage(f"{selector}={left_value}")
+    right_storage = _odbc_storage(f"{selector}={right_value}")
+    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
+    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
 
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 

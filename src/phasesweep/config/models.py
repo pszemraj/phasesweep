@@ -33,7 +33,11 @@ from phasesweep.evidence.models import (
     ObjectiveExtractor,
     objective_evidence_assurance,
 )
-from phasesweep.runtime.files import storage_backend, storage_is_in_memory
+from phasesweep.runtime.files import (
+    canonical_storage_identity,
+    storage_backend,
+    storage_is_in_memory,
+)
 
 OverrideFormat = Literal["yaml_file", "argparse", "json_file", "hydra"]
 
@@ -509,7 +513,7 @@ class Experiment(_Frozen):
             "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
             "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
             "(RDB backends additionally require allow_external_rdb_single_host: true; "
-            "see below). "
+            "see below). Nested odbc_connect strings must name each target selector once. "
             "Null for non-resumable in-memory runs (not recommended). "
             "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
             "scheme intentionally so study identity stays stable across n_jobs changes."
@@ -566,6 +570,18 @@ class Experiment(_Frozen):
         ),
     )
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+
+    @field_validator("storage")
+    @classmethod
+    def _storage_identity_is_unambiguous(cls, value: str | None) -> str | None:
+        """Reject storage locators with ambiguous nested ODBC target fields.
+
+        :param str | None value: Configured Optuna storage locator.
+        :raises ValueError: An ``odbc_connect`` target selector appears more than once.
+        :return str | None: The validated locator, unchanged.
+        """
+        canonical_storage_identity(value)
+        return value
 
     @model_validator(mode="after")
     def _validate_persistent_provenance(self) -> Experiment:

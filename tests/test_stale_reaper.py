@@ -1436,6 +1436,30 @@ def test_attempt_registry_refuses_unsafe_private_authority(
         _inspect_active_attempts(experiment)
 
 
+def test_attempt_registry_rejects_ambiguous_odbc_target_keys(tmp_path: Path) -> None:
+    """A legacy ambiguous locator remains a fail-closed recovery condition."""
+    experiment = make_experiment(
+        experiment="ambiguous-registry",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+    )
+    _fabricate_registered_attempt(
+        experiment,
+        "p",
+        attempt_id="ambiguous-attempt",
+    )
+    entry_path = _attempts_dir(experiment) / "ambiguous-attempt.json"
+    entry = json.loads(entry_path.read_text())
+    entry["storage_locator"] = (
+        "mssql+pyodbc:///?odbc_connect=SERVER%3Ddb-a%3Bserver%3Ddb-b%3BDATABASE%3Dstudies"
+    )
+    entry["storage_identity"] = "legacy-ambiguous-identity"
+    entry_path.write_text(json.dumps(entry), encoding="utf-8")
+
+    with pytest.raises(ProcessCleanupUncertainError, match="unsupported or partial schema"):
+        _inspect_active_attempts(experiment)
+
+
 def test_relative_registry_storage_recovers_from_the_registration_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1613,10 +1637,43 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("current_phases", ["renamed", "removed"])
+@pytest.mark.parametrize(
+    ("old_locator", "current_locator"),
+    [
+        pytest.param(
+            "postgresql://old-user:old-secret@db.internal/studies?access_token=old-token",
+            "postgresql://new-user:new-secret@db.internal/studies?access_token=new-token",
+            id="authority-and-access-token",
+        ),
+        pytest.param(
+            "postgresql://user@db.internal/studies?sslpassword=old-secret",
+            "postgresql://user@db.internal/studies?sslpassword=new-secret",
+            id="sslpassword",
+        ),
+        pytest.param(
+            "postgresql://user@db.internal/studies?client_secret=old-secret",
+            "postgresql://user@db.internal/studies?client_secret=new-secret",
+            id="client-secret",
+        ),
+        pytest.param(
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC%20Driver%2017%20for%20SQL%20Server%7D%3B"
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BEncrypt%3Dyes%3B"
+            "ClientSecret%3Dold-secret",
+            "mssql+pyodbc:///?odbc_connect="
+            "database%3Dstudies%3Bserver%3Ddb.internal%3B"
+            "DRIVER%3D%7BODBC%20Driver%2018%20for%20SQL%20Server%7D%3B"
+            "Encrypt%3Dno%3Bclient_secret%3Dnew-secret",
+            id="nested-client-secret-and-equivalent-spelling",
+        ),
+    ],
+)
 def test_registry_recovery_uses_rotated_credential_for_same_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     current_phases: str,
+    old_locator: str,
+    current_locator: str,
 ) -> None:
     """A stale attempt remains reachable after credential and phase-graph changes."""
     old_experiment = make_experiment(
@@ -1631,8 +1688,6 @@ def test_registry_recovery_uses_rotated_credential_for_same_target(
     )
     write_attempt_lifecycle(trial_dir, attempt_id="rotated-attempt", state="allocated")
 
-    old_locator = "postgresql://old-user:old-secret@db.internal/studies?access_token=old-token"
-    current_locator = "postgresql://new-user:new-secret@db.internal/studies?access_token=new-token"
     entry_path = _attempts_dir(old_experiment) / "rotated-attempt.json"
     entry = json.loads(entry_path.read_text())
     entry["storage_locator"] = old_locator
