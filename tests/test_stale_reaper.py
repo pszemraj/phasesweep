@@ -551,9 +551,29 @@ def test_registry_storage_failure_marks_cleanup_report_uncertain(
     assert report.error is failure
 
 
+@pytest.mark.parametrize(
+    ("secondary_error", "expected_type", "operational"),
+    [
+        pytest.param(
+            StudyStorageUnavailableError("storage unavailable"),
+            PhaseSweepError,
+            True,
+            id="all-operational",
+        ),
+        pytest.param(
+            RuntimeError("injected implementation bug"),
+            RuntimeError,
+            False,
+            id="contains-internal-error",
+        ),
+    ],
+)
 def test_mixed_preflight_error_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    secondary_error: Exception,
+    expected_type: type[Exception],
+    operational: bool,
 ) -> None:
     """A mixed aggregate is operational only when every cause is expected."""
     experiment = make_experiment(
@@ -568,26 +588,17 @@ def test_mixed_preflight_error_boundary(
         for phase in experiment.phases
     }
 
-    cases = [
-        (StudyStorageUnavailableError("storage unavailable"), PhaseSweepError, True),
-        (RuntimeError("injected implementation bug"), RuntimeError, False),
-    ]
-    for secondary_error, expected_type, operational in cases:
+    def reject_differently(study: optuna.Study) -> None:
+        if study.study_name == "a":
+            raise StudySchemaMismatchError("schema mismatch")
+        raise secondary_error
 
-        def reject_differently(
-            study: optuna.Study,
-            error: Exception = secondary_error,
-        ) -> None:
-            if study.study_name == "a":
-                raise StudySchemaMismatchError("schema mismatch")
-            raise error
-
-        monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
-        with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
-            _preflight_existing_studies(experiment, preloaded_studies=studies)
-        assert isinstance(exc_info.value, PhaseSweepError) is operational
-        if operational:
-            assert type(exc_info.value) is PhaseSweepError
+    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
+    with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
+        _preflight_existing_studies(experiment, preloaded_studies=studies)
+    assert isinstance(exc_info.value, PhaseSweepError) is operational
+    if operational:
+        assert type(exc_info.value) is PhaseSweepError
 
 
 def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:

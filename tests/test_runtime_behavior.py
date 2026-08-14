@@ -707,9 +707,10 @@ phases:
     runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
     trial_dirs = sorted(runs_dir.glob("trial_*"))
     launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
-    assert len(launched) <= 2, (
+    assert 1 <= len(launched) <= 2, (
         f"With max_consecutive_failures=1 and a 1-slot GPU pool, expected at "
-        f"most 2 trial launches (1 failing + 1 in-flight before abort propagates); "
+        f"least 1 and at most 2 trial launches (1 failing + at most 1 in-flight "
+        f"before abort propagates); "
         f"got {len(launched)}. Launched: {[d.name for d in launched]}. "
         "Queued threads ignored the post-acquire abort flag."
     )
@@ -2673,7 +2674,7 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
 
 def test_service_pending_shutdown_is_noop_without_absorbed_signal() -> None:
     """The explicit checkpoint does nothing when no shutdown was absorbed."""
-    runtime_process.service_pending_shutdown()
+    assert runtime_process.service_pending_shutdown() is None
 
 
 def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:

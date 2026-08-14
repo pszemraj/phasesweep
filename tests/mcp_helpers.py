@@ -198,16 +198,22 @@ def make_run_handle(
 ) -> RunHandle:
     if launch_state == "launching":
         process_id = None
+        process_group_id = None
         process_starttime = None
     else:
         process_id = os.getpid() if pid is None else pid
+        # Default fixtures need a genuinely live PID so RunStore state checks
+        # see a running handle, but must never target pytest's own process
+        # group if a cancellation guard regresses. Explicit PID fixtures keep
+        # their matching PGID for process-lifecycle tests.
+        process_group_id = 2_000_000_000 if pid is None else process_id
         process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
         run_id=run_id,
         experiment_id=experiment_id,
         config_sha256=config_sha256,
         pid=process_id,
-        pgid=process_id,
+        pgid=process_group_id,
         pid_starttime=process_starttime,
         started_at=utc_now_iso(),
         launch_state=launch_state,

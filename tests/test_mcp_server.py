@@ -3082,7 +3082,9 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         allow_cancel=True,
     )
     store.create(handle)
+    store.mark_cleanup_uncertain(handle)
     assert store.state(handle) == "running"
+    assert store.cleanup_uncertain_path(run_id).is_file()
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
         write_run_status(
@@ -3104,6 +3106,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         "cleanup_confirmed": True,
         "recovery_required": False,
     }
+    assert not store.cleanup_uncertain_path(run_id).exists()
 
 
 def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Path) -> None:
