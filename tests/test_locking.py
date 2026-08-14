@@ -19,7 +19,11 @@ from phasesweep.engine.guards import (
 )
 from phasesweep.errors import LockBusyError, PhaseSweepError
 from phasesweep.runtime import files as runtime_files
-from tests.conftest import make_experiment
+from tests.conftest import (
+    make_experiment,
+    patch_directory_fsync_failure,
+    raise_after_first_successful_call,
+)
 
 
 def test_missing_nofollow_is_a_platform_capability_error(
@@ -476,14 +480,7 @@ def test_private_atomic_write_logs_directory_fsync_failure(
     state.mkdir(mode=0o700)
     state.chmod(0o700)
     path = state / "status.json"
-    real_fsync = os.fsync
-
-    def fail_directory_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("simulated directory fsync failure")
-        real_fsync(fd)
-
-    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
     caplog.set_level("WARNING", logger="phasesweep.runtime.files")
 
     runtime_files.private_atomic_write_text(path, "committed")
@@ -511,21 +508,15 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
 
     target = tmp_path / "nested" / "dir"
     target.mkdir(parents=True)
-    real_close = os.close
-    fired = False
-
-    def close_then_shutdown(fd: int) -> None:
-        nonlocal fired
-        real_close(fd)
-        if not fired:
-            fired = True
-            raise InjectedShutdown
-
+    close_then_shutdown, close_calls = raise_after_first_successful_call(
+        os.close,
+        InjectedShutdown(),
+    )
     monkeypatch.setattr(os, "close", close_then_shutdown)
 
     with pytest.raises(InjectedShutdown):
         runtime_files.open_directory_fd(target, create=False, private_final=False)
-    assert fired
+    assert close_calls
 
 
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
@@ -641,40 +632,27 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
         pass
 
 
-def test_run_lock_does_not_collide_for_different_experiment_dirs(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("storage_a_name", "storage_b_name"),
+    [
+        pytest.param("a.db", "b.db", id="different-storage-and-name"),
+        pytest.param("shared.db", "shared.db", id="shared-storage-different-name"),
+    ],
+)
+def test_run_lock_does_not_collide_for_distinct_experiment_names(
+    tmp_path: Path, storage_a_name: str, storage_b_name: str
 ) -> None:
-    """Same workdir but different experiment names → different output dirs →
-    no collision (output lock identities differ).
-    """
-    exp_a = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'a.db'}"
-    )
-    exp_b = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'b.db'}"
-    )
-    exp_b = exp_b.model_copy(update={"experiment": "other"})
-
-    with _experiment_lock(exp_a), _experiment_lock(exp_b):
-        pass  # must not raise
-
-
-def test_run_lock_does_not_collide_for_different_experiment_names(
-    tmp_path: Path,
-) -> None:
-    """Same storage, distinct experiment namespaces → no collision.
-
-    A shared SQLite store can hold multiple independent experiments; locking
-    them out of running concurrently would over-restrict the user.
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
+    """Distinct experiment namespaces do not share output or storage locks."""
+    storage_a = f"sqlite:///{tmp_path / storage_a_name}"
+    storage_b = f"sqlite:///{tmp_path / storage_b_name}"
+    exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_a)
+    exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_b)
     # make_experiment hardcodes experiment="t"; clone exp_b with another name.
     exp_b = exp_b.model_copy(update={"experiment": "other"})
 
-    # Both output and storage lock identities differ — sets share no element.
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
+    with _experiment_lock(exp_a), _experiment_lock(exp_b):
+        pass  # must not raise
 
 
 def _rdb_experiment(workdir: Path, storage: str) -> Experiment:

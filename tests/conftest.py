@@ -13,10 +13,11 @@ import signal
 import sqlite3
 import stat
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
+import optuna
 import pytest
 import yaml
 
@@ -37,6 +38,74 @@ from phasesweep.runtime.process import _read_proc_stat
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def raise_after_first_successful_call(
+    callback: Callable[_P, _R],
+    error: BaseException,
+) -> tuple[Callable[_P, _R], list[None]]:
+    """Wrap ``callback`` so its first successful call raises ``error`` afterward."""
+    calls: list[None] = []
+
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        result = callback(*args, **kwargs)
+        calls.append(None)
+        if len(calls) == 1:
+            raise error
+        return result
+
+    return wrapped, calls
+
+
+def patch_directory_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    """Make directory fsync fail while preserving regular-file fsync calls."""
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(message)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+
+def patch_path_method_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Path,
+    method_name: str,
+    error: OSError,
+) -> None:
+    """Make one ``Path`` method fail only for ``target``."""
+    original_method = getattr(Path, method_name)
+
+    def fail_target(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            raise error
+        return original_method(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method_name, fail_target)
+
+
+def patch_rejected_trial_user_attr(
+    monkeypatch: pytest.MonkeyPatch,
+    rejected_key: str,
+    message: str,
+) -> Callable[[optuna.Trial, str, Any], None]:
+    """Make one Optuna trial-user-attribute key fail to persist."""
+    real_set_user_attr = optuna.Trial.set_user_attr
+
+    def reject_key(trial: optuna.Trial, key: str, value: Any) -> None:
+        if key == rejected_key:
+            raise RuntimeError(message)
+        real_set_user_attr(trial, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", reject_key)
+    return real_set_user_attr
 
 
 @contextlib.contextmanager

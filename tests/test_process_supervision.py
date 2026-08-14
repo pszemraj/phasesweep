@@ -42,7 +42,7 @@ from phasesweep.runtime.process import (
     reap_child,
     run_supervised,
 )
-from tests.conftest import is_pid_zombie, make_experiment
+from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
 
 
 def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -635,16 +635,10 @@ def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
         """Interrupt the first parent-side pipe close after the descriptor closes."""
 
     fake_proc = object()
-    real_close = os.close
-    fired = False
-
-    def close_then_fail(fd: int) -> None:
-        nonlocal fired
-        real_close(fd)
-        if not fired:
-            fired = True
-            raise InjectedClose
-
+    close_then_fail, close_calls = raise_after_first_successful_call(
+        os.close,
+        InjectedClose(),
+    )
     monkeypatch.setattr(process.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
     monkeypatch.setattr(process, "_abort_launch", lambda proc, pgid: True)
     monkeypatch.setattr(process.os, "close", close_then_fail)
@@ -656,7 +650,7 @@ def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
     ):
         process._spawn_blocked_supervisor(stdout=fout, stderr=ferr)
 
-    assert fired
+    assert close_calls
 
 
 def _frame(body: bytes) -> bytes:
@@ -822,17 +816,40 @@ def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
         assert not blocked & (1 << (sig - 1)), f"signal {sig} is blocked in the trainer"
 
 
-def test_deadline_expired_before_payload_never_starts_trainer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("identity_delay", "timeout", "command", "attempt_id", "wait_after", "pre_payload"),
+    [
+        pytest.param(
+            0.5,
+            0.2,
+            "touch {marker}",
+            "pre-payload-deadline-attempt",
+            0.2,
+            True,
+            id="deadline-expires-before-payload",
+        ),
+        pytest.param(
+            0.6,
+            1.0,
+            "sleep 0.6 && touch {marker}",
+            "remaining-budget-attempt",
+            0.0,
+            False,
+            id="wait-uses-remaining-budget",
+        ),
+    ],
+)
+def test_supervised_deadline_uses_remaining_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_delay: float,
+    timeout: float,
+    command: str,
+    attempt_id: str,
+    wait_after: float,
+    pre_payload: bool,
 ) -> None:
-    """A budget that expires during launch bookkeeping must not start the trainer.
-
-    Pre-fix (review v0.5.16 / blocker 6), the timeout was applied only at
-    ``proc.wait``: supervisor spawn, readiness, identity persistence, and
-    payload delivery all ran on an already-expired budget and the trainer
-    still started. The deadline is now re-checked before the payload crosses
-    the ack pipe.
-    """
+    """Launch bookkeeping consumes the same budget used by trainer waiting."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     marker = tmp_path / "trainer_ran.txt"
@@ -843,23 +860,24 @@ def test_deadline_expired_before_payload_never_starts_trainer(
 
     def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
         real_write_identity(path, identity)
-        time.sleep(0.5)
+        time.sleep(identity_delay)
 
     monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
 
     result = _run_supervised(
         trial_dir,
-        f"touch {marker}",
-        timeout=0.2,
-        attempt_id="pre-payload-deadline-attempt",
+        command.format(marker=marker),
+        timeout=timeout,
+        attempt_id=attempt_id,
     )
 
     assert result.timed_out
-    assert result.failure_reason is not None
-    assert "before trainer launch" in result.failure_reason
-    assert result.cleanup_confirmed
-    # The trainer command itself never ran: the payload was never delivered.
-    time.sleep(0.2)
+    if pre_payload:
+        assert result.failure_reason is not None
+        assert "before trainer launch" in result.failure_reason
+        assert result.cleanup_confirmed
+    if wait_after:
+        time.sleep(wait_after)
     assert not marker.exists()
 
 
@@ -904,42 +922,6 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
     # Bounded by the budget plus kill/reap grace — nowhere near the slow
     # supervisor's 1s startup + fixed 10s readiness allowance.
     assert elapsed < 5.0
-    assert not marker.exists()
-
-
-def test_proc_wait_uses_remaining_budget_not_original_duration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Launch overhead must consume the budget, not silently extend it.
-
-    Pre-fix, ``proc.wait(timeout=<original duration>)`` restarted the clock
-    after launch bookkeeping, so a trainer could run for (overhead + budget)
-    wallclock (review v0.5.16 / blocker 6).
-    """
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    marker = tmp_path / "trainer_finished.txt"
-
-    import phasesweep.runtime.process as _process
-
-    real_write_identity = _process._write_process_identity
-
-    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
-        real_write_identity(path, identity)
-        time.sleep(0.6)
-
-    monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
-
-    # The trainer needs 0.6s; the original 1.0s duration would fit it, but
-    # after 0.6s of injected launch overhead only ~0.4s of budget remains.
-    result = _run_supervised(
-        trial_dir,
-        f"sleep 0.6 && touch {marker}",
-        timeout=1.0,
-        attempt_id="remaining-budget-attempt",
-    )
-
-    assert result.timed_out
     assert not marker.exists()
 
 

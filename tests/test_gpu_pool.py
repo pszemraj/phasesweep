@@ -73,12 +73,42 @@ def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
         assert gid.lease_fds == ()
 
 
-def test_gpu_pool_create_normalizes_explicit_device_tokens(monkeypatch) -> None:
-    uuid = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+@pytest.mark.parametrize(
+    ("uuid", "ambient_tokens", "explicit_devices", "expected_tokens"),
+    [
+        pytest.param(
+            "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            None,
+            [" GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa "],
+            ["GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+            id="explicit-token-is-stripped",
+        ),
+        pytest.param(
+            "GPU-deadbeef",
+            "0,GPU-deadbeef",
+            None,
+            ["0"],
+            id="ambient-index-and-uuid-deduplicate",
+        ),
+    ],
+)
+def test_gpu_pool_normalizes_and_deduplicates_device_tokens(
+    monkeypatch,
+    uuid: str,
+    ambient_tokens: str | None,
+    explicit_devices: list[str] | None,
+    expected_tokens: list[str],
+) -> None:
+    """Equivalent device spellings become one canonical pool device."""
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
-    pool = GpuPool.create(n_jobs=1, explicit_devices=[f" {uuid} "])
+    if ambient_tokens is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_tokens)
 
-    assert [device.visible_token for device in pool._devices] == [uuid]
+    pool = GpuPool.create(n_jobs=1, explicit_devices=explicit_devices)
+
+    assert [device.visible_token for device in pool._devices] == expected_tokens
 
 
 def test_explicit_gpu_ids_honored_for_single_job():
@@ -468,17 +498,6 @@ def test_ambient_uuid_and_configured_index_share_one_lock(tmp_path, monkeypatch)
             pass
 
 
-def test_duplicate_spellings_of_one_gpu_are_leased_once(monkeypatch) -> None:
-    """Two tokens naming one card collapse to a single device instead of deadlocking."""
-    uuid = "GPU-deadbeef"
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", f"0,{uuid}")
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
-
-    pool = GpuPool.create(n_jobs=1)
-
-    assert [device.visible_token for device in pool._devices] == ["0"]
-
-
 def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
     """MIG instances lock on themselves; parent-GPU binding is a documented gap."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
@@ -638,16 +657,37 @@ def test_lowercase_mig_uuid_rebinds_trainer_visibility_to_inventory_spelling(
     assert pool._devices[0].lock_identity == mig_uuid
 
 
-def test_whole_node_rejects_case_only_uuid_aliases(monkeypatch) -> None:
-    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
+@pytest.mark.parametrize(
+    ("uuid", "tokens", "error_match"),
+    [
+        pytest.param(
+            "GPU-2b234567-89ab-cdef-0123-456789abcdef",
+            [
+                "GPU-2b234567-89ab-cdef-0123-456789abcdef",
+                "gpu-2b234567-89ab-cdef-0123-456789abcdef",
+            ],
+            "only 1 distinct physical GPU",
+            id="case-only-uuid-alias",
+        ),
+        pytest.param(
+            "GPU-32ad40d6-019f-386a-321d-3901216c78ad",
+            ["0", "GPU-32ad40d6-019f-386a-321d-3901216c78ad"],
+            "whole_node.*2 CUDA device token",
+            id="index-and-uuid-alias",
+        ),
+    ],
+)
+def test_whole_node_rejects_physical_gpu_aliases(
+    monkeypatch,
+    uuid: str,
+    tokens: list[str],
+    error_match: str,
+) -> None:
+    """Whole-node mode fails closed when tokens name one physical GPU."""
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
 
-    with pytest.raises(RuntimeError, match="only 1 distinct physical GPU"):
-        GpuPool.create(
-            n_jobs=1,
-            explicit_devices=[uuid, uuid.lower()],
-            policy="whole_node",
-        )
+    with pytest.raises(RuntimeError, match=error_match):
+        GpuPool.create(n_jobs=1, explicit_devices=tokens, policy="whole_node")
 
 
 @pytest.mark.parametrize("prefix", ["GPU-", "MIG-"])
@@ -752,16 +792,41 @@ def test_configured_junk_visibility_is_not_a_disable_sentinel(monkeypatch) -> No
         GpuPool.create(n_jobs=1, cuda_visible_devices=",")
 
 
-def test_lock_layer_failure_does_not_shrink_the_pool(tmp_path, monkeypatch) -> None:
-    """A raising lock layer must hand every candidate back: a silently shrunk
-    pool deadlocks later acquires or relabels them as lease timeouts."""
+@pytest.mark.parametrize(
+    ("explicit_ids", "policy", "fail_on_call", "expected_visible"),
+    [
+        pytest.param(
+            [3],
+            "single_per_trial",
+            1,
+            "3",
+            id="single-device-pool-restores-candidate",
+        ),
+        pytest.param(
+            [0, 1],
+            "whole_node",
+            2,
+            "0,1",
+            id="whole-node-pool-releases-partial-leases",
+        ),
+    ],
+)
+def test_lock_layer_failure_rolls_back_gpu_pool(
+    tmp_path,
+    monkeypatch,
+    explicit_ids: list[int],
+    policy: str,
+    fail_on_call: int,
+    expected_visible: str,
+) -> None:
+    """A lock failure restores candidates and permits a later acquisition."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
+    pool = GpuPool.create(n_jobs=1, explicit_ids=explicit_ids, policy=policy)
     calls = {"n": 0}
 
     def flaky_lease(device: GpuDevice) -> object:
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] == fail_on_call:
             raise OSError("lock layer failure")
         return _try_host_gpu_lease(device)
 
@@ -770,33 +835,12 @@ def test_lock_layer_failure_does_not_shrink_the_pool(tmp_path, monkeypatch) -> N
     with pytest.raises(OSError, match="lock layer failure"), pool.acquire():
         pass
 
-    assert [device.visible_token for device in pool._available] == ["3"]
+    if policy == "single_per_trial":
+        assert [device.visible_token for device in pool._available] == [expected_visible]
+    else:
+        assert pool._whole_node_in_use is False
     with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
-        assert gid.visible_devices == "3"
-
-
-def test_whole_node_lock_layer_failure_releases_partial_leases(tmp_path, monkeypatch) -> None:
-    """A mid-set lock failure must release already-taken host locks and clear
-    the in-use flag, or every later whole-node acquisition deadlocks."""
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
-    calls = {"n": 0}
-
-    def flaky_lease(device: GpuDevice) -> object:
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise OSError("lock layer failure")
-        return _try_host_gpu_lease(device)
-
-    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", flaky_lease)
-
-    with pytest.raises(OSError, match="lock layer failure"), pool.acquire():
-        pass
-
-    assert pool._whole_node_in_use is False
-    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", _try_host_gpu_lease)
-    with pool.acquire(deadline=time.monotonic() + 2.0) as gid:
-        assert gid.visible_devices == "0,1"
+        assert gid.visible_devices == expected_visible
 
 
 def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
@@ -1003,17 +1047,6 @@ def test_single_per_trial_still_accepts_duplicate_device_tokens() -> None:
     )
 
     assert phase.gpu_ids == [0, 0, 1]
-
-
-def test_whole_node_rejects_two_tokens_naming_one_physical_gpu(monkeypatch) -> None:
-    """Physical aliasing is invisible to config validation (it needs nvidia-smi),
-    so the pool must fail closed instead of leasing a 1-GPU world under a 2-GPU
-    fingerprint (PR #5 review / reviewer 2, blocker 2)."""
-    uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
-
-    with pytest.raises(RuntimeError, match="whole_node.*2 CUDA device token"):
-        GpuPool.create(n_jobs=1, explicit_devices=["0", uuid], policy="whole_node")
 
 
 def test_whole_node_accepts_distinct_physical_gpus(monkeypatch) -> None:
