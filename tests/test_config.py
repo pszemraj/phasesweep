@@ -17,7 +17,7 @@ from phasesweep.config import (
     Sampler,
     Suite,
 )
-from tests.conftest import write_yaml
+from tests.conftest import assert_invalid_experiment_yaml, write_yaml
 
 
 @pytest.mark.parametrize(
@@ -96,10 +96,7 @@ def test_invalid_experiment_relationships(
     body: str,
     match: str,
 ) -> None:
-    cfg = tmp_path / "exp.yaml"
-    cfg.write_text(body)
-    with pytest.raises(ValueError, match=match):
-        load_experiment(cfg)
+    assert_invalid_experiment_yaml(tmp_path, body, match)
 
 
 @pytest.mark.parametrize("name", ["bad name with spaces", "bad\n"])

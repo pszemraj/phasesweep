@@ -28,7 +28,7 @@ from phasesweep.config import (
 )
 from phasesweep.config.common import _find_prefix_collisions
 from phasesweep.engine.optuna import _build_sampler
-from tests.conftest import make_experiment, write_yaml
+from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
 
 def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
@@ -166,9 +166,7 @@ def test_validate_rejects_incompatible_phase_settings(
     tmp_path: Path, body: str, match: str
 ) -> None:
     """Validation rejects incompatible sampler and parameter declarations."""
-    p = write_yaml(tmp_path, body)
-    with pytest.raises(ValidationError, match=match):
-        load_experiment(p)
+    assert_invalid_experiment_yaml(tmp_path, body, match)
 
 
 def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:

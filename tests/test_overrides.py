@@ -18,7 +18,12 @@ from phasesweep.runtime.commands import (
     render_command,
     write_json_file,
 )
-from tests.conftest import copy_fake_train, make_experiment, write_yaml
+from tests.conftest import (
+    assert_invalid_experiment_yaml,
+    copy_fake_train,
+    make_experiment,
+    write_yaml,
+)
 
 
 @pytest.mark.parametrize(
@@ -267,10 +272,7 @@ def test_yaml_file_rejects_invalid_trainer_config(
     body: str,
     error_match: str,
 ) -> None:
-    config = write_yaml(tmp_path, body)
-
-    with pytest.raises(ValidationError, match=error_match):
-        load_experiment(config)
+    assert_invalid_experiment_yaml(tmp_path, body, error_match)
 
 
 def test_compatibility_format_rejects_ignored_trainer_config() -> None:

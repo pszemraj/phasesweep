@@ -20,7 +20,9 @@ from typing import Any, ParamSpec, TypeVar
 import optuna
 import pytest
 import yaml
+from pydantic import ValidationError
 
+from phasesweep import load_experiment
 from phasesweep.config import (
     Constraint,
     ExecutionContext,
@@ -295,6 +297,12 @@ def write_yaml(tmp_path: Path, body: str) -> Path:
     p = tmp_path / "exp.yaml"
     p.write_text(textwrap.dedent(body))
     return p
+
+
+def assert_invalid_experiment_yaml(tmp_path: Path, body: str, match: str) -> None:
+    """Assert that one YAML experiment fails model validation."""
+    with pytest.raises(ValidationError, match=match):
+        load_experiment(write_yaml(tmp_path, body))
 
 
 def write_trainer(path: Path, body: str) -> Path:
