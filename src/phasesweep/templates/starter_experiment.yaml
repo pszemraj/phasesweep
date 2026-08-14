@@ -5,6 +5,10 @@ storage: __PHASESWEEP_STORAGE__
 provenance:
   revision: "phasesweep-starter-v1"
 workdir: __PHASESWEEP_WORKDIR__
+execution:
+  # Keep the portable base environment without sweeping in shell credentials
+  # or unrelated ambient values as persistent study semantics.
+  inherit_env: none
 
 # This trainer ships inside the installed PhaseSweep package. Replace it with
 # your own command after the local smoke test.

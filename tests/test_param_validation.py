@@ -515,6 +515,20 @@ def test_trial_command_unbalanced_brace_rejected() -> None:
         make_experiment(trial_command="echo {trial_dir", n_trials=1)
 
 
+def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        make_experiment(
+            trial_command="python train.py --config {config_path}",
+            override_format="yaml_file",
+            trainer_config={"optimizer": {"learning_rate": float("nan")}},
+            n_trials=1,
+        )
+
+    message = str(exc_info.value)
+    assert "trainer_config and composed overrides are invalid" in message
+    assert "unbalanced braces" not in message
+
+
 def test_trial_command_accepts_supported_templates() -> None:
     """Accepted templates include normal overrides, format specs, and no-override phases."""
     cases = [

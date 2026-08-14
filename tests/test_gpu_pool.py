@@ -204,6 +204,7 @@ def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
 
 def test_ambient_cuda_visibility_fails_when_nvidia_smi_is_broken_on_gpu_host(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
@@ -212,9 +213,12 @@ def test_ambient_cuda_visibility_fails_when_nvidia_smi_is_broken_on_gpu_host(
     with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
         GpuPool.create(n_jobs=1)
 
-    pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
+    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
+        pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
     with pool.acquire() as assignment:
         assert assignment.visible_devices == ""
+    assert "pinning CUDA_VISIBLE_DEVICES='' without GPU host locks" in caplog.text
+    assert "running without CUDA isolation" not in caplog.text
 
 
 def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(

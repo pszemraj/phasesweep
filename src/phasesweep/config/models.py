@@ -1258,7 +1258,7 @@ def _validate_trial_command_template(
 
     """
     # Lazy import to avoid a circular config <-> overrides cycle.
-    from phasesweep.runtime.commands import render_command
+    from phasesweep.runtime.commands import dump_trial_trainer_config_yaml, render_command
 
     # Build a synthetic override dict: one value per locked or sampled key.
     # Inherited keys are present in the real call too (they come from parent
@@ -1272,6 +1272,14 @@ def _validate_trial_command_template(
     has_overrides = bool(overrides)
 
     placeholder_dir = Path("__phasesweep_validate_trial_dir__")
+    if experiment.override_format == "yaml_file":
+        try:
+            dump_trial_trainer_config_yaml(experiment.trainer_config, overrides)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
+                f"{type(exc).__name__}: {exc}."
+            ) from exc
     # Parse the template once so we can both (a) preflight-render below and
     # (b) check that the documented placeholders are actually referenced.
     # Both arms surface the same "failed to render" wrapping for unbalanced

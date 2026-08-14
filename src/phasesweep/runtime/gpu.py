@@ -655,11 +655,18 @@ class GpuPool:
                         f"{message}; set allow_no_gpu_isolation: true only to accept "
                         "running without GPU host locks."
                     )
-                log.warning(
-                    "%s; running without CUDA isolation because "
-                    "allow_no_gpu_isolation: true is set.",
-                    message,
-                )
+                if pinned == "":
+                    log.warning(
+                        "%s; pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
+                        "allow_no_gpu_isolation: true is set.",
+                        message,
+                    )
+                else:
+                    log.warning(
+                        "%s; running without CUDA isolation because "
+                        "allow_no_gpu_isolation: true is set.",
+                        message,
+                    )
                 return cls(devices=[], pinned_visible_devices=pinned)
             if pinned is not None:
                 if ambient_inventory_failure:

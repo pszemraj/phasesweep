@@ -18,16 +18,16 @@ trainer_config:
   use_autocast: true
   num_batches: 10
   batch_size: 2
-  grad_accum_every: 2
+  grad_accum_every: 1
   learning_rate: 0.001
   weight_decay: 0.0
   grad_clip_norm: 1.0
   data_path: data/enwik8.gz
   seq_len: 128
-  validate_every: 5
-  val_batches: 50
-  generate_every: 1000
-  save_every: 1000
+  validate_every: 10
+  val_batches: 2
+  generate_every: 1000000
+  save_every: 1000000
   seed: 7
 timeout_seconds_per_run: 300
 env:
@@ -55,13 +55,6 @@ phases:
     timeout_seconds_per_trial: 120
     sampler:
       type: grid
-    fixed_overrides:
-      num_batches: 10
-      grad_accum_every: 1
-      validate_every: 10
-      val_batches: 2
-      generate_every: 1000000
-      save_every: 1000000
     gates:
       - type: json_equals
         path: result.json

@@ -37,6 +37,7 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         assert experiment.phases[1].inherits == ["depth"]
         assert "phasesweep.examples.fake_train" in experiment.trial_command
         assert experiment.override_format == "yaml_file"
+        assert experiment.execution.inherit_env == "none"
         assert "{config_path}" in experiment.trial_command
         assert experiment.trainer_config["model"]["n_layers"] == 8
         assert "--out" not in experiment.trial_command
