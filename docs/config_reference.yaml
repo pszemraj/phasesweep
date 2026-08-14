@@ -12,7 +12,7 @@
 # Nonempty ASCII `[A-Za-z0-9_-]+`; selects output paths, locks, and `<experiment>::<phase>` Optuna study names.
 
 # storage: str | None = null
-# `null` creates fresh in-memory studies and restarts trial numbers on every invocation. Trial directories remain generation/attempt-scoped, but study state and the current winner/summary view restart; use persistent storage for resumable work.
+# `null`, `:memory:`, `sqlite://`, `sqlite:///:memory:`, and SQLite `uri=true` targets using `mode=memory` create fresh in-memory studies. Trial numbers, study state, and the current winner/summary view restart on every invocation; use persistent storage for resumable work.
 # `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs (RDB backends such as postgresql:// or mysql://) pass through to Optuna but are rejected at config validation unless allow_external_rdb_single_host: true is also set.
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
 
@@ -35,7 +35,7 @@
 # This complete mapping joins experiment and phase fingerprints. A nonempty trainer_config with argparse, json_file, or hydra is rejected because those explicit compatibility formats would ignore it.
 
 # provenance: dict[str, str] = {}
-# Operator-declared identities for trainer code, data, dependencies, container, tokenizer, or other inputs outside this YAML. The embedded trainer_config is already fingerprinted. Keys and values must be nonempty.
+# Operator-declared identities for trainer code, data, dependencies, container, tokenizer, or other inputs outside this YAML. The embedded trainer_config is already fingerprinted. Keys and values must contain non-whitespace text.
 # Persistent storage requires at least one entry. The complete mapping is included in semantic fingerprints; update its values whenever an external input changes. PhaseSweep does not inspect imports or hash arbitrary trial_command inputs.
 
 # override_format: Literal["yaml_file", "argparse", "json_file", "hydra"] = "yaml_file"
@@ -43,6 +43,7 @@
 # `argparse` is explicit compatibility for an existing flag parser. It requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load because only that set has one canonical wire form.
 # `json_file` is explicit overrides-only compatibility. It requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`; it does not include trainer_config. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
 # `hydra` is compatibility support for an existing Hydra/OmegaConf entry point; PhaseSweep does not depend on Hydra or perform its config composition. It requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load.
+# Contract and phase fixed_overrides are validated at config load against the selected format's value grammar; yaml_file uses the portable trainer_config domain above.
 
 # metric: Metric (required)
 # Metric object keys:
@@ -74,6 +75,7 @@
 # Phase names must be unique and are evaluated in declaration order. Each Phase object accepts the following keys.
 
 # PHASE OBJECT (each entry nested under `phases`)
+# Phase fingerprints exclude these run-control fields: comment, n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation, max_consecutive_failures, allow_unbounded_trials, timeout_seconds_per_phase, allow_incomplete_on_timeout, allow_partial_grid, allow_seed_search, and sampler.acknowledge_nonresumable. Their individual safety rules still apply; other phase fields are semantic unless stated otherwise.
 
 # name: str (required)
 # Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names.
@@ -183,9 +185,9 @@
 #   cwd: str | None = null
 #   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null uses the orchestrator's invocation directory, whose resolved path still joins the semantic fingerprint and is frozen into each generation config snapshot. When set for an MCP catalog entry, the path must be absolute.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
-#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds exactly those variables to that base set. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
+#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds variables that exist in the parent environment to that base set. Missing names are omitted, not errors. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
 #   record_env: bool = false
-#   Write the composed trainer environment to `environment.json` in every trial directory (digest, inherit_env contract, and every name-value pair). Off by default because those values include secrets; the file is created owner-only (0600) inside the otherwise operator-readable trial directory. Independently of this flag, every trial records the environment's SHA-256 digest and its sorted variable NAMES as trial attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
+#   Write the composed base environment to `environment.json` before PhaseSweep's per-trial and GPU variables are injected (digest, inherit_env contract, and every base name-value pair). Off by default because those values include secrets; the file is owner-only (0600). Independently of this flag, every trial records that base environment's SHA-256 digest and sorted names as trial attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.
@@ -341,7 +343,7 @@
 # If omitted, inherits defaults.storage; explicit null clears a persistent default and selects in-memory storage.
 
 # allow_external_rdb_single_host: bool | None = null
-# If omitted, inherits defaults.allow_external_rdb_single_host. Follows the Experiment contract once resolved.
+# If omitted, inherits defaults.allow_external_rdb_single_host; explicit null blocks fallback and fails compilation. Follows the Experiment contract once resolved.
 
 # workdir: str | None = null
 # If omitted, inherits defaults.workdir; explicit null blocks fallback and fails compilation because Experiment.workdir is required after resolution.
@@ -377,7 +379,7 @@
 # If omitted, inherits defaults.timeout_seconds_per_run; explicit null clears that default and disables the per-study run deadline.
 
 # execution: ExecutionContext | None = null
-# If omitted, inherits defaults.execution; a non-null value replaces the default wholesale (no per-key merge), while explicit null resets to the built-in contract ({cwd: null, inherit_env: "all"}).
+# If omitted, inherits defaults.execution; a non-null value replaces the default wholesale (no per-key merge), while explicit null resets to the built-in contract ({cwd: null, inherit_env: "all", record_env: false}).
 
 # promotion: Promotion | None = null
 # Compares this study's final exposed phase winner with the selected prior-study winner. Uses the Promotion contract above.
