@@ -119,6 +119,16 @@ from tests.mcp_helpers import (
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
 
+def _counting_success_callback(calls: list[None]) -> Callable[..., bool]:
+    """Return a permissive cleanup stub that records each invocation."""
+
+    def callback(*args: object, **kwargs: object) -> bool:
+        calls.append(None)
+        return True
+
+    return callback
+
+
 def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
     path = tmp_path / f"{name}.yaml"
     path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
@@ -3467,21 +3477,19 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     )
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
 
-    runner_cleanup_calls = 0
+    runner_cleanup_calls: list[None] = []
     trial_cleanup_allowed = False
     trial_cleanup_calls = 0
-
-    def runner_cleanup(*args: object, **kwargs: object) -> bool:
-        nonlocal runner_cleanup_calls
-        runner_cleanup_calls += 1
-        return True
 
     def trial_cleanup(_identity: StaleProcessIdentity) -> bool:
         nonlocal trial_cleanup_calls
         trial_cleanup_calls += 1
         return trial_cleanup_allowed
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", runner_cleanup)
+    monkeypatch.setattr(
+        "phasesweep.cli.kill_stale_group",
+        _counting_success_callback(runner_cleanup_calls),
+    )
     monkeypatch.setattr(
         "phasesweep.engine.guards.cleanup_stale_trial_process",
         trial_cleanup,
@@ -3493,14 +3501,14 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
 
     assert dry.exit_code == 0, dry.output
     assert "reconcile 1 registered attempt" in dry.output
-    assert runner_cleanup_calls == 0
+    assert len(runner_cleanup_calls) == 0
     assert trial_cleanup_calls == 0
 
     refused = runner.invoke(cli_main, [*command, "--confirm"])
 
     assert refused.exit_code != 0
     assert "may still have a live process group" in refused.output
-    assert runner_cleanup_calls == 1
+    assert len(runner_cleanup_calls) == 1
     assert trial_cleanup_calls == 1
     assert entry_path.is_file()
     assert not store.status_path(run_id).exists()
@@ -3933,18 +3941,8 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     cleanup or re-reaping the stale trial.
     """
     run_id = "srv-retry-result-repair"
-    runner_cleanup_calls = 0
-    trial_cleanup_calls = 0
-
-    def fake_runner_cleanup(*args: object, **kwargs: object) -> bool:
-        nonlocal runner_cleanup_calls
-        runner_cleanup_calls += 1
-        return True
-
-    def fake_trial_cleanup(*args: object, **kwargs: object) -> bool:
-        nonlocal trial_cleanup_calls
-        trial_cleanup_calls += 1
-        return True
+    runner_cleanup_calls: list[None] = []
+    trial_cleanup_calls: list[None] = []
 
     app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
         tmp_path,
@@ -3953,8 +3951,8 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         include_generation_record=True,
         mark_cleanup_uncertain=False,
         snapshot_bound_to_generation=True,
-        kill_stale_group_stub=fake_runner_cleanup,
-        cleanup_trial_stub=fake_trial_cleanup,
+        kill_stale_group_stub=_counting_success_callback(runner_cleanup_calls),
+        cleanup_trial_stub=_counting_success_callback(trial_cleanup_calls),
         monkeypatch=monkeypatch,
     )
 
@@ -3989,15 +3987,15 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert store.recovery_required(handle)
-    assert runner_cleanup_calls == 1
-    assert trial_cleanup_calls == 1
+    assert len(runner_cleanup_calls) == 1
+    assert len(trial_cleanup_calls) == 1
 
     retry = runner.invoke(cli_main, command)
 
     assert retry.exit_code == 0, retry.output
     assert "Finalized stored terminal result snapshot" in retry.output
-    assert runner_cleanup_calls == 1
-    assert trial_cleanup_calls == 1
+    assert len(runner_cleanup_calls) == 1
+    assert len(trial_cleanup_calls) == 1
     assert snapshot_calls == 2
     assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]
     terminal = json.loads(store.status_path(run_id).read_text())

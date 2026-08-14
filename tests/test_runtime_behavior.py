@@ -79,6 +79,7 @@ from phasesweep.runtime.process import (
 from tests.conftest import (
     copy_fake_train,
     make_experiment,
+    patch_rejected_trial_user_attr,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -1076,21 +1077,6 @@ def _outcome_write_experiment(
     )
 
 
-def _patch_rejected_trial_outcome_writes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Callable[[optuna.Trial, str, Any], None]:
-    """Reject outcome attributes and return Optuna's original writer for restoration."""
-    real_set_user_attr = optuna.Trial.set_user_attr
-
-    def refuse_outcome_writes(trial: optuna.Trial, key: str, value: object) -> None:
-        if key == TRIAL_OUTCOME_ATTR:
-            raise RuntimeError("injected outcome write failure")
-        real_set_user_attr(trial, key, value)
-
-    monkeypatch.setattr(optuna.Trial, "set_user_attr", refuse_outcome_writes)
-    return real_set_user_attr
-
-
 def test_transient_trial_outcome_write_failure_is_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1233,7 +1219,11 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         constraints=constraints,
     )
 
-    real_set_user_attr = _patch_rejected_trial_outcome_writes(monkeypatch)
+    real_set_user_attr = patch_rejected_trial_user_attr(
+        monkeypatch,
+        TRIAL_OUTCOME_ATTR,
+        "injected outcome write failure",
+    )
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
@@ -1287,7 +1277,11 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
         n_jobs=2,
     )
 
-    _patch_rejected_trial_outcome_writes(monkeypatch)
+    patch_rejected_trial_user_attr(
+        monkeypatch,
+        TRIAL_OUTCOME_ATTR,
+        "injected outcome write failure",
+    )
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
@@ -2490,14 +2484,13 @@ def test_run_suite_installs_signal_handlers_once_for_all_components(
             signal.signal(sig, handler)
 
 
-def _signal_scope_errors_from_worker() -> list[BaseException]:
-    """Enter the signal-handler scope on a worker and return captured failures."""
+def _worker_errors(operation: Callable[[], None]) -> list[BaseException]:
+    """Run one operation on a worker and return captured failures."""
     errors: list[BaseException] = []
 
     def worker() -> None:
         try:
-            with signal_handler_scope():
-                pass
+            operation()
         except BaseException as exc:  # noqa: BLE001 - returned for the main thread to assert on
             errors.append(exc)
 
@@ -2505,6 +2498,12 @@ def _signal_scope_errors_from_worker() -> list[BaseException]:
     thread.start()
     thread.join()
     return errors
+
+
+def _enter_signal_handler_scope() -> None:
+    """Enter and leave one signal-handler scope."""
+    with signal_handler_scope():
+        pass
 
 
 def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> None:
@@ -2520,7 +2519,7 @@ def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> 
             if signal.getsignal(sig) is runtime_process._shutdown_handler:
                 signal.signal(sig, signal.SIG_DFL)
 
-        errors = _signal_scope_errors_from_worker()
+        errors = _worker_errors(_enter_signal_handler_scope)
 
         assert len(errors) == 1
         assert isinstance(errors[0], SignalOwnershipUnavailableError)
@@ -2544,7 +2543,7 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
         for sig in runtime_process._SHUTDOWN_SIGNALS:
             assert signal.getsignal(sig) is runtime_process._shutdown_handler
 
-        errors = _signal_scope_errors_from_worker()
+        errors = _worker_errors(_enter_signal_handler_scope)
 
         assert errors == []
         # Entry-point ownership persists: the nested scope did not tear it down.
@@ -2617,18 +2616,8 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
         for sig in runtime_process._SHUTDOWN_SIGNALS:
             signal.signal(sig, host_handler)
 
-        errors: list[BaseException] = []
-
-        def worker() -> None:
-            try:
-                install_signal_handlers()
-            except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
-                errors.append(exc)
-
         with signal_handler_scope():
-            thread = threading.Thread(target=worker)
-            thread.start()
-            thread.join()
+            errors = _worker_errors(install_signal_handlers)
             assert not runtime_process._process_lifetime_owner
 
         assert len(errors) == 1

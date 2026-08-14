@@ -82,7 +82,7 @@ from phasesweep.runtime.process import (
     read_stale_process_identity,
     write_attempt_lifecycle,
 )
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import make_experiment, patch_rejected_trial_user_attr, write_trainer
 
 
 def _write_test_process_identity(
@@ -545,11 +545,31 @@ def test_registry_storage_failure_marks_cleanup_report_uncertain(
     assert report.error is failure
 
 
-def test_mixed_expected_preflight_errors_keep_operational_boundary(
+@pytest.mark.parametrize(
+    ("secondary_error", "expected_type", "operational"),
+    [
+        pytest.param(
+            StudyStorageUnavailableError("storage unavailable"),
+            PhaseSweepError,
+            True,
+            id="all-errors-are-operational",
+        ),
+        pytest.param(
+            RuntimeError("injected implementation bug"),
+            RuntimeError,
+            False,
+            id="unexpected-error-remains-internal",
+        ),
+    ],
+)
+def test_mixed_preflight_error_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    secondary_error: Exception,
+    expected_type: type[Exception],
+    operational: bool,
 ) -> None:
-    """Heterogeneous study refusals are still expected operator outcomes."""
+    """A mixed aggregate is operational only when every cause is expected."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         phases=[
@@ -565,23 +585,15 @@ def test_mixed_expected_preflight_errors_keep_operational_boundary(
     def reject_differently(study: optuna.Study) -> None:
         if study.study_name == "a":
             raise StudySchemaMismatchError("schema mismatch")
-        raise StudyStorageUnavailableError("storage unavailable")
+        raise secondary_error
 
     monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
 
-    with pytest.raises(PhaseSweepError, match="multiple unsafe studies") as exc_info:
+    with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
         _preflight_existing_studies(experiment, preloaded_studies=studies)
-    assert type(exc_info.value) is PhaseSweepError
-
-    def reject_with_bug(study: optuna.Study) -> None:
-        if study.study_name == "a":
-            raise StudySchemaMismatchError("schema mismatch")
-        raise RuntimeError("injected implementation bug")
-
-    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_with_bug)
-    with pytest.raises(RuntimeError, match="multiple unsafe studies") as exc_info:
-        _preflight_existing_studies(experiment, preloaded_studies=studies)
-    assert not isinstance(exc_info.value, PhaseSweepError)
+    assert isinstance(exc_info.value, PhaseSweepError) is operational
+    if operational:
+        assert type(exc_info.value) is PhaseSweepError
 
 
 def test_populated_legacy_study_reaps_orphan_before_schema_error(tmp_path: Path) -> None:
@@ -1151,18 +1163,11 @@ def test_reaper_reports_storage_failures_after_cleanup(
     monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)
 
     if failure_site == "outcome":
-        real_set_user_attr = optuna.Trial.set_user_attr
-
-        def fail_outcome(
-            active_trial: optuna.Trial,
-            key: str,
-            value: object,
-        ) -> None:
-            if key == TRIAL_OUTCOME_ATTR:
-                raise RuntimeError("storage write failed")
-            real_set_user_attr(active_trial, key, value)
-
-        monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_outcome)
+        patch_rejected_trial_user_attr(
+            monkeypatch,
+            TRIAL_OUTCOME_ATTR,
+            "storage write failed",
+        )
     elif failure_site == "ledger":
         monkeypatch.setattr(
             study,

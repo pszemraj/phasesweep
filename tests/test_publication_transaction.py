@@ -59,7 +59,24 @@ from phasesweep.engine.state import (
 )
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
-from tests.conftest import make_experiment, temporary_umask, write_trainer, write_yaml
+from tests.conftest import (
+    make_experiment,
+    patch_directory_fsync_failure,
+    patch_path_method_failure,
+    temporary_umask,
+    write_trainer,
+    write_yaml,
+)
+
+
+def _fail_terminal_generation_state(original: Callable, error: BaseException):
+    def flaky_state(owner, **kwargs: object):
+        if kwargs.get("state") == "failed":
+            raise error
+        return original(owner, **kwargs)
+
+    return flaky_state
+
 
 _TRAINER_BODY = """
 import argparse
@@ -341,14 +358,7 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     """
     experiment = _stored_experiment(tmp_path)
 
-    real_fsync = os.fsync
-
-    def flaky_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("simulated directory fsync failure")
-        real_fsync(fd)
-
-    monkeypatch.setattr("phasesweep.runtime.files.os.fsync", flaky_fsync)
+    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
 
     winners = run_experiment(experiment)
 
@@ -842,14 +852,12 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pointer = tmp_path / "last_successful_generation.yaml"
-    real_stat = Path.stat
-
-    def deny_stat(path: Path, *args: object, **kwargs: object):
-        if path == pointer:
-            raise PermissionError("permission denied")
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", deny_stat)
+    patch_path_method_failure(
+        monkeypatch,
+        pointer,
+        "stat",
+        PermissionError("permission denied"),
+    )
 
     verdict = _unresolvable_pointer(pointer, "experiment 'x'")
 
@@ -1331,13 +1339,15 @@ def test_suite_state_write_failure_preserves_cancellation(
 
     original_state = engine_run._write_suite_generation_state
 
-    def flaky_state(suite_arg, **kwargs: object):
-        if kwargs.get("state") == "failed":
-            raise OSError("simulated suite state persistence failure")
-        return original_state(suite_arg, **kwargs)
-
     monkeypatch.setattr(engine_run, "_run_experiment_outcome", cancel)
-    monkeypatch.setattr(engine_run, "_write_suite_generation_state", flaky_state)
+    monkeypatch.setattr(
+        engine_run,
+        "_write_suite_generation_state",
+        _fail_terminal_generation_state(
+            original_state,
+            OSError("simulated suite state persistence failure"),
+        ),
+    )
 
     with (
         caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"),
@@ -1741,12 +1751,11 @@ def test_experiment_state_write_failure_preserves_primary_error(
     )
     original = engine_run._write_generation_state
 
-    def flaky_state(experiment_arg, **kwargs: object):
-        if kwargs.get("state") == "failed":
-            raise SystemExit("simulated persistence interruption")
-        return original(experiment_arg, **kwargs)
-
-    monkeypatch.setattr(engine_run, "_write_generation_state", flaky_state)
+    monkeypatch.setattr(
+        engine_run,
+        "_write_generation_state",
+        _fail_terminal_generation_state(original, SystemExit("simulated persistence interruption")),
+    )
 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
