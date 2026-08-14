@@ -1438,7 +1438,7 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
 
 
 def _published_summary_path_for(
-    experiment: Experiment,
+    config: Experiment | Suite,
     published_generation_id: str | None,
 ) -> Path | None:
     """Resolve the authoritative summary path from an already-captured published id.
@@ -1450,7 +1450,8 @@ def _published_summary_path_for(
     last-success id instead of re-reading the pointer (review v0.5.15 /
     blocker 3).
 
-    :param Experiment experiment: Experiment config with artifact root details.
+    :param Experiment | Suite config: Experiment or suite config with artifact
+        root details.
     :param str | None published_generation_id: Already-resolved
         :func:`_last_successful_generation_id` result (or ``None``).
     :return Path | None: The generation-scoped summary path when
@@ -1458,11 +1459,17 @@ def _published_summary_path_for(
         path when no generation has ever been published; ``None`` when a
         generation exists but none has completed successfully yet.
     """
+    if isinstance(config, Suite):
+        if published_generation_id is not None:
+            return _suite_generation_summary_path(config, published_generation_id)
+        if _suite_generation_path(config).is_file():
+            return None
+        return _suite_summary_path(config)
     if published_generation_id is not None:
-        return _generation_summary_path(experiment, published_generation_id)
-    if _generation_path(experiment).is_file():
+        return _generation_summary_path(config, published_generation_id)
+    if _generation_path(config).is_file():
         return None
-    return _summary_path(experiment)
+    return _summary_path(config)
 
 
 def _published_promotion_decision_path(
@@ -1872,32 +1879,6 @@ def _validate_suite_summary_integrity(
                     f"study {name!r} exposed winner for phase {item['name']!r} does "
                     "not match any verified component summary"
                 )
-
-
-def _published_suite_summary_path_for(
-    suite: Suite,
-    published_generation_id: str | None,
-) -> Path | None:
-    """Resolve the authoritative suite summary from an already-captured published id.
-
-    Takes the caller's already-resolved suite last-success id instead of
-    re-reading the pointer, so a caller that has already made a decision from
-    one resolution (e.g. the CLI's publication-integrity check) cannot then
-    render a summary belonging to a different one.
-
-    :param Suite suite: Suite config with artifact root details.
-    :param str | None published_generation_id: Already-resolved suite
-        last-success id, or ``None`` when none validated.
-    :return Path | None: The generation-scoped suite summary path when
-        ``published_generation_id`` is given; the legacy compatibility summary
-        path when no suite generation has ever been published; ``None`` when a
-        suite generation exists but none has completed successfully yet.
-    """
-    if published_generation_id is not None:
-        return _suite_generation_summary_path(suite, published_generation_id)
-    if _suite_generation_path(suite).is_file():
-        return None
-    return _suite_summary_path(suite)
 
 
 def _suite_log_path(suite: Suite) -> Path:

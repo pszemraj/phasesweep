@@ -53,7 +53,7 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
     _experiment_dir,
     _generation_summary_path,
-    _published_suite_summary_path_for,
+    _published_summary_path_for,
     _published_winner_path_for,
     _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
@@ -621,7 +621,7 @@ def _show_suite_winners(suite: Suite) -> None:
             str(publication.error),
             _suite_dir(suite),
         )
-    summary_path = _published_suite_summary_path_for(suite, publication.generation_id)
+    summary_path = _published_summary_path_for(suite, publication.generation_id)
     if summary_path is None or not summary_path.is_file():
         click.echo("(no successful suite result yet)")
         return
