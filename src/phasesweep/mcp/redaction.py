@@ -12,8 +12,9 @@ from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.read import ResultContext
-from phasesweep.engine.state import PublicationState, _winner_source_or_default
+from phasesweep.engine.state import _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
+from phasesweep.mcp.snapshots import McpPublicationState
 
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
@@ -71,7 +72,7 @@ def winners_payload(
     metric: dict[str, Any],
     declared_phases: list[str],
     result_source: ResultSource,
-    publication_integrity: PublicationState,
+    publication_integrity: McpPublicationState,
     run_id: str | None = None,
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
@@ -103,11 +104,11 @@ def winners_payload(
         published under, in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
-    :param PublicationState publication_integrity: Whether the experiment's
+    :param McpPublicationState publication_integrity: Whether the experiment's
         last-success pointer is valid, absent, names a generation that no
         longer validates, or cannot be validated as this user. An empty winner
-        list has different remedies under ``"absent"``, ``"failed"``, and
-        ``"permission_denied"``.
+        list has different remedies under ``"absent"``, ``"failed"``,
+        ``"permission_denied"``, and ``"unknown"``.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
@@ -212,7 +213,7 @@ def status_payload(
     published one -- ``False`` for a pinned read of a failed-publication
     generation, even though its winners still show.
 
-    ``publication_integrity`` carries the four-state verdict through unchanged
+    ``publication_integrity`` carries the five-state MCP verdict through unchanged
     (review v0.5.18 / finding F4). The accompanying ``publication_error`` is
     deliberately *not* forwarded: the enum is what an agent must branch on,
     and the free-text detail belongs to the operator-facing CLI, which is the

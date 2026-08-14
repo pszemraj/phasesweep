@@ -34,7 +34,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import generation_id_source, read_status, read_winners
 from phasesweep.engine.guards import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
-from phasesweep.engine.state import PublicationState, Winner, WinnerSourceKind, _load_winner
+from phasesweep.engine.state import Winner, WinnerSourceKind, _load_winner
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger
@@ -73,6 +73,7 @@ from phasesweep.mcp.runs import (
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
+    McpPublicationState,
     RunResultSnapshot,
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
@@ -205,7 +206,7 @@ PhaseName = Annotated[
     Field(description="Phase name from the experiment config.", pattern=SAFE_NAME_JSON_PATTERN),
 ]
 PublicationIntegrity = Annotated[
-    PublicationState,
+    McpPublicationState,
     Field(
         description=(
             "Whether this experiment's recorded publication still validates. 'ok': it does. "
@@ -217,7 +218,9 @@ PublicationIntegrity = Annotated[
             "publication pointer past the corrupt result and nothing reports it afterwards. "
             "'permission_denied': the publication may be healthy, but this user cannot "
             "validate its owner-only evidence; expose no winners and ask the operator to "
-            "re-read it as the publishing user or restore read permission."
+            "re-read it as the publishing user or restore read permission. 'unknown': the "
+            "terminal placeholder could not inspect publication state; expose no winners "
+            "and report the run's snapshot-unavailable failure."
         )
     ),
 ]
@@ -1419,7 +1422,7 @@ class PhaseSweepMCP:
             )
             winner_views = (
                 []
-                if status["publication_integrity"] in {"failed", "permission_denied"}
+                if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}
                 else snapshot.winner_views()
             )
         else:
@@ -1444,10 +1447,10 @@ class PhaseSweepMCP:
                 generation_id=status["represented_generation_id"],
                 phase_names=status["result_phase_plan"],
             )
-            if status["publication_integrity"] in {"failed", "permission_denied"}:
+            if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []
         represented_generation_id: str | None = status["represented_generation_id"]
-        publication_integrity: PublicationState = status["publication_integrity"]
+        publication_integrity: McpPublicationState = status["publication_integrity"]
         authority_handle = handle
         authority_unreadable = False
         if authority_handle is None and represented_generation_id is not None:

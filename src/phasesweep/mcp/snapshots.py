@@ -27,6 +27,8 @@ from phasesweep.evidence.models import _ObjectiveEvidenceFields
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+McpPublicationState = PublicationState | Literal["unknown"]
+"""Engine publication verdict plus the MCP snapshot-unavailable state."""
 
 
 class _SnapshotModel(BaseModel):
@@ -99,7 +101,7 @@ class StatusSnapshot(_SnapshotModel):
     published_generation_id: str | None = None
     represented_generation_id: str | None = None
     is_published: bool = False
-    publication_integrity: PublicationState = "absent"
+    publication_integrity: McpPublicationState = "absent"
     """Publication verdict at capture time.
 
     Defaults to ``"absent"`` so snapshots frozen before this field existed
@@ -306,10 +308,11 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
             published_generation_id=None,
             represented_generation_id=None,
             is_published=False,
-            # Nothing was read from disk here, so no publication was resolved:
-            # report the same verdict a never-published tree does rather than
-            # implying this placeholder inspected one.
-            publication_integrity="absent",
+            # Nothing was read from disk here. Calling that "absent" would
+            # falsely assert no publication exists and tell agents there is no
+            # operator problem; this placeholder can only report that the
+            # publication verdict is unknown.
+            publication_integrity="unknown",
             # No summary was read either, so these labels are the config's own
             # and no drift verdict was reached.
             result_context="current_config",

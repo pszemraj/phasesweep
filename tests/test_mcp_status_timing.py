@@ -532,16 +532,19 @@ def test_terminal_run_snapshot_failure_returns_structured_unavailable_results(
     awaited = asyncio.run(app.await_run("r1"))
 
     assert status["result_source"] == "terminal_snapshot_unavailable"
+    assert status["publication_integrity"] == "unknown"
     assert status["run"]["state"] == "succeeded"
     assert status["run"]["failure"]["code"] == "result_snapshot_unavailable"
     assert status["run"]["failure"]["actor"] == "operator"
     assert status["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["publication_integrity"] == "unknown"
     assert winners["winner_count"] == 0
     assert winners["failure"]["code"] == "result_snapshot_unavailable"
     assert awaited["reason"] == "terminal"
     assert awaited["changed"] is False
     assert awaited["result_source"] == "terminal_snapshot_unavailable"
+    assert awaited["publication_integrity"] == "unknown"
     assert awaited["run"]["failure"]["code"] == "result_snapshot_unavailable"
 
 
