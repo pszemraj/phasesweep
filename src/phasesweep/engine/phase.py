@@ -33,6 +33,7 @@ from phasesweep.engine.guards import (
     _register_active_attempt,
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
+    _validate_environment_cohort,
     _validate_study_direction,
     _validate_study_schema,
     _validate_trial_target,
@@ -426,6 +427,7 @@ def _run_phase(
         _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
+        _validate_environment_cohort(study, environment_identity.digest)
         policy_state = _load_phase_policy_state(study)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
         _validate_trial_target(study, phase)
@@ -780,6 +782,12 @@ def _run_phase(
         if abort["flag"]:
             raise optuna.TrialPruned("phase aborted")
 
+        # Stamp the environment as the first durable fact of allocation. Even
+        # a failure while creating lifecycle/registry metadata must remain in
+        # the study's known semantic cohort on the next invocation.
+        trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment_identity.digest)
+        trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(environment_identity.names))
+
         sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
         overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
 
@@ -836,12 +844,6 @@ def _run_phase(
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-        # Recorded at allocation so failed trials carry their environment too:
-        # a phase whose every trial died under a broken CUDA stack is only
-        # diagnosable if the failures name the environment they ran under.
-        trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment_identity.digest)
-        trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(environment_identity.names))
-
         # GPU lease covers only subprocess lifetime, not extraction (#2).
         try:
             with gpu_pool.acquire(deadline=optimize_deadline) as gpu_assignment:

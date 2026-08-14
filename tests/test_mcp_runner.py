@@ -18,7 +18,9 @@ from pathlib import Path
 import optuna
 import pytest
 import yaml
+from click.testing import CliRunner
 
+from phasesweep.cli import cli as cli_main
 from phasesweep.config import Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
@@ -1357,10 +1359,9 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 ) -> None:
     """A sweep with no MCP-visible outcome is not a clean exit.
 
-    The engine's own result is untouched, but with no status.json the run
-    derives ``running`` forever and keeps its launch concurrency slot, so the
-    runner reports the missing evidence in its exit code instead of claiming an
-    outcome it cannot show (PR #5 review / reviewer 2 pass 2, blocker 6).
+    The required precommit snapshot write now fails the publication itself.
+    The process entry point converts this propagated error to a nonzero exit;
+    an in-process invocation sees the original error and no pointer advances.
     """
     config_path, config_sha256 = _constant_trial_config(tmp_path, "no_status")
 
@@ -1380,29 +1381,154 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
         experiment_id="no_status",
     )
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
-        assert (
-            runner_main(
-                runner_argv(
-                    store,
-                    run_id=run_id,
-                    config=config_path,
-                    config_sha256=config_sha256,
-                    experiment_id="no_status",
-                    started_at=started_at,
-                ),
-                cwd=tmp_path,
-            )
-            == 1
+    with (
+        caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"),
+        pytest.raises(OSError, match="simulated persistent status write failure"),
+    ):
+        runner_main(
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="no_status",
+                started_at=started_at,
+            ),
+            cwd=tmp_path,
         )
 
     assert not store.status_path(run_id).exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
-    assert _last_successful_generation_id(load_config(config_path)) == run_id
+    assert _last_successful_generation_id(load_config(config_path)) is None
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
     assert store.state(make_run_handle(run_id=run_id, experiment_id="no_status")) == "running"
+
+
+@pytest.mark.parametrize(
+    ("crash_boundary", "expected_exit"),
+    (("before_pointer", 72), ("after_pointer", 73)),
+)
+def test_recover_run_reconciles_hard_exit_around_publication_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+    expected_exit: int,
+) -> None:
+    """A hard exit cannot separate a publication from its frozen MCP result."""
+    config_path, config_sha256 = _constant_trial_config(tmp_path, crash_boundary)
+    store = RunStore(tmp_path / "state")
+    run_id = f"hard-exit-{crash_boundary.replace('_', '-')}"
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id=crash_boundary,
+    )
+    with open_private_text(store.config_snapshot_path(run_id), "x") as output:
+        output.write(config_path.read_text())
+
+    if crash_boundary == "before_pointer":
+        original_prepare = mcp_runner._RunnerPublicationHook.prepare
+
+        def exit_after_prepare(
+            self: mcp_runner._RunnerPublicationHook,
+            *,
+            experiment: Experiment,
+            generation_id: str,
+            winners: dict[str, Winner],
+        ) -> None:
+            original_prepare(
+                self,
+                experiment=experiment,
+                generation_id=generation_id,
+                winners=winners,
+            )
+            os._exit(expected_exit)
+
+        monkeypatch.setattr(
+            mcp_runner._RunnerPublicationHook,
+            "prepare",
+            exit_after_prepare,
+        )
+    else:
+
+        def exit_before_commit_receipt(
+            _self: mcp_runner._RunnerPublicationHook,
+            *,
+            generation_id: str,
+        ) -> None:
+            assert generation_id == run_id
+            os._exit(expected_exit)
+
+        monkeypatch.setattr(
+            mcp_runner._RunnerPublicationHook,
+            "committed",
+            exit_before_commit_receipt,
+        )
+
+    child = os.fork()
+    if child == 0:
+        mcp_runner.main(
+            [
+                *runner_argv(
+                    store,
+                    run_id=run_id,
+                    config=config_path,
+                    config_sha256=config_sha256,
+                    experiment_id=crash_boundary,
+                    started_at=started_at,
+                ),
+                "--cwd",
+                str(tmp_path),
+            ]
+        )
+        os._exit(0)
+    _pid, wait_status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(wait_status) == expected_exit
+
+    prepared = json.loads(store.status_path(run_id).read_text())
+    assert prepared["result_snapshot_state"] == "pending"
+    assert prepared["result_publication_state"] == "prepared"
+    assert prepared["result_publication_generation_id"] == run_id
+    experiment = load_config(config_path)
+    assert _last_successful_generation_id(experiment) == (
+        run_id if crash_boundary == "after_pointer" else None
+    )
+
+    command = [
+        "mcp",
+        "recover-run",
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--run-id",
+        run_id,
+    ]
+    dry_run = CliRunner().invoke(cli_main, command)
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "prepared" in dry_run.output
+    recovered = CliRunner().invoke(cli_main, [*command, "--confirm"])
+    assert recovered.exit_code == 0, recovered.output
+
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    snapshot = terminal["result_snapshot"]
+    assert snapshot["status"]["represented_generation_id"] == run_id
+    assert snapshot["winners"][0]["metric"] == 0.5
+    if crash_boundary == "after_pointer":
+        assert terminal["returncode"] == 0
+        assert terminal["result_publication_state"] == "committed"
+        assert snapshot["status"]["is_published"] is True
+        assert snapshot["status"]["published_generation_id"] == run_id
+    else:
+        assert terminal["returncode"] == 1
+        assert terminal["error_class"] == "PublicationNotCommitted"
+        assert "result_publication_state" not in terminal
+        assert snapshot["status"]["is_published"] is False
+        assert _last_successful_generation_id(experiment) is None
 
 
 def test_runner_refuses_to_persist_handle_without_linux_process_identity(

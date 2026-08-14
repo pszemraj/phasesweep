@@ -525,9 +525,38 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert payload["digest"] == identity.digest
     assert payload["inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
+    assert payload["passthrough_env"] == []
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
     assert sorted(payload["env"]) == list(identity.names)
+
+
+def test_passthrough_value_rotation_preserves_semantic_environment_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    experiment = make_experiment(execution=execution)
+
+    monkeypatch.setenv("WANDB_API_KEY", "first-secret")
+    first = _environment_identity(experiment)
+    monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
+    second = _environment_identity(experiment)
+
+    assert first.digest == second.digest
+    assert first.values["WANDB_API_KEY"] == "first-secret"
+    assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:
+    execution = ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    first = _environment_identity(
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-a"})
+    )
+    second = _environment_identity(
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-b"})
+    )
+
+    assert first.digest != second.digest
 
 
 def test_launch_trial_writes_no_environment_json_by_default(

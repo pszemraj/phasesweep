@@ -28,6 +28,7 @@ from phasesweep.engine.read import (
     read_winners,
 )
 from phasesweep.engine.run import (
+    PublicationHook,
     TerminalReport,
     config_status,
     run_config,
@@ -49,6 +50,7 @@ __all__ = [
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
     "PromotionError",
+    "PublicationHook",
     "PublicationAccessError",
     "PublicationCommitError",
     "PublicationIntegrityError",

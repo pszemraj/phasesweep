@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import IO, Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -24,7 +25,6 @@ from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     ensure_private_dir,
-    fsync_directory,
     open_directory_fd,
     open_private_text,
     private_atomic_write_text,
@@ -40,6 +40,7 @@ RunLaunchState = Literal["launching", "spawned"]
 
 __all__ = [
     "ProcessIdentity",
+    "PreparedRun",
     "RunHandle",
     "RunLaunchState",
     "RunState",
@@ -47,6 +48,8 @@ __all__ = [
     "identity_from_earlier_boot",
     "write_status_file",
 ]
+
+log = logging.getLogger("phasesweep.mcp.runs")
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -63,7 +66,77 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".status.json",
     ".config.yaml",
     ".log",
+    ".launch.lock",
 )
+
+
+def _strict_fsync_directory(path: Path) -> None:
+    """Fsync one private directory and propagate any durability failure.
+
+    :param Path path: Private directory whose entries must be durable.
+    """
+    directory_fd = open_directory_fd(path, create=False, private_final=True)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _strict_atomic_create_text(path: Path, text: str) -> None:
+    """Atomically create one private file without replacing an existing identity.
+
+    :param Path path: Destination path to create exclusively.
+    :param str text: Complete UTF-8 contents to publish.
+    :raises FileExistsError: If ``path`` already exists.
+    """
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    parent_fd = -1
+    published = False
+    try:
+        with open_private_text(temporary, "x") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        parent_fd = open_directory_fd(path.parent, create=False, private_final=True)
+        os.link(
+            temporary.name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        published = True
+        os.unlink(temporary.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        if parent_fd >= 0:
+            if published:
+                with contextlib.suppress(OSError):
+                    os.unlink(path.name, dir_fd=parent_fd)
+            with contextlib.suppress(OSError):
+                os.unlink(temporary.name, dir_fd=parent_fd)
+            with contextlib.suppress(OSError):
+                os.fsync(parent_fd)
+        else:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _strict_unlink(path: Path) -> None:
+    """Unlink one private file and durably record its removal.
+
+    :param Path path: File to unlink.
+    """
+    directory_fd = open_directory_fd(path.parent, create=False, private_final=True)
+    try:
+        os.unlink(path.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -142,6 +215,27 @@ class RunHandle:
     # Boot that pid/pid_starttime belong to; None off-Linux and in handles
     # written before boot ids were recorded.
     boot_id: str | None = None
+
+
+@dataclass
+class PreparedRun:
+    """Owned pre-spawn launch preparation and its inherited kernel lease."""
+
+    handle: RunHandle
+    config_snapshot_path: Path
+    lease: IO[str]
+
+    @property
+    def lease_fd(self) -> int:
+        """Return the descriptor inherited by the blocked runner.
+
+        :return int: Open launch-lease file descriptor.
+        """
+        return self.lease.fileno()
+
+    def close(self) -> None:
+        """Release this server process's copy of the launch lease."""
+        self.lease.close()
 
 
 class RunStore:
@@ -265,15 +359,107 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
+    def launch_lease_path(self, run_id: str) -> Path:
+        """Path to the kernel-backed lease for a prepared launch.
+
+        :param str run_id: Run id whose preparation lease should be returned.
+        :return Path: Private launch-lease path.
+        """
+        return self._logs_dir / f"{run_id}.launch.lock"
+
+    def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
+        """Reserve and durably prepare one run without spawning a process.
+
+        :param RunHandle handle: Launching-state handle to prepare.
+        :param bytes config_bytes: Exact verified configuration bytes for the runner.
+        :return PreparedRun: Owned preparation whose lease must cross ``Popen``.
+        :raises ValueError: If ``handle`` is not a pre-spawn handle.
+        """
+        if handle.launch_state != "launching":
+            raise ValueError("a launch preparation requires a launching-state handle")
+        config_text = config_bytes.decode("utf-8")
+        lease_path = self.launch_lease_path(handle.run_id)
+        snapshot_path = self.config_snapshot_path(handle.run_id)
+        created: list[Path] = []
+        lease: IO[str] | None = None
+        try:
+            _strict_atomic_create_text(lease_path, "")
+            created.append(lease_path)
+            lease = try_lock_file(lease_path)
+            if lease is None:
+                raise RuntimeError(f"new launch lease for run {handle.run_id!r} is already held")
+            _strict_atomic_create_text(snapshot_path, config_text)
+            created.append(snapshot_path)
+            self.create(handle)
+            created.append(self._runs_dir / f"{handle.run_id}.json")
+            return PreparedRun(handle=handle, config_snapshot_path=snapshot_path, lease=lease)
+        except BaseException as exc:
+            if lease is not None:
+                lease.close()
+            cleanup_failed = False
+            for path in reversed([path for path in created if path != lease_path]):
+                try:
+                    _strict_unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+                    log.exception("failed to roll back pre-spawn artifact %s", path)
+            unpublished_survivor = not isinstance(exc, FileExistsError) and any(
+                path.exists() or path.is_symlink()
+                for path in (
+                    snapshot_path,
+                    self._runs_dir / f"{handle.run_id}.json",
+                )
+            )
+            if lease_path in created and not cleanup_failed and not unpublished_survivor:
+                try:
+                    _strict_unlink(lease_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.exception("failed to roll back pre-spawn artifact %s", lease_path)
+            raise
+
+    def finish_launch_preparation(self, preparation: PreparedRun) -> None:
+        """Best-effort remove a launch lease after the spawn outcome is durable.
+
+        :param PreparedRun preparation: Preparation returned by :meth:`prepare_launch`.
+        """
+        try:
+            preparation.close()
+        except OSError:
+            log.warning(
+                "could not close completed launch lease for run %s",
+                preparation.handle.run_id,
+                exc_info=True,
+            )
+        self.remove_launch_lease(preparation.handle.run_id)
+
+    def remove_launch_lease(self, run_id: str) -> None:
+        """Best-effort remove a completed launch lease sidecar.
+
+        :param str run_id: Run whose durable spawned identity supersedes the lease.
+        """
+        try:
+            _strict_unlink(self.launch_lease_path(run_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning(
+                "could not remove completed launch lease for run %s",
+                run_id,
+                exc_info=True,
+            )
+
     def create(self, handle: RunHandle) -> None:
-        """Exclusively claim and persist a new run identity."""
+        """Atomically claim and strictly persist a new run identity.
+
+        :param RunHandle handle: Complete handle to publish without replacement.
+        """
         target = self._runs_dir / f"{handle.run_id}.json"
-        payload = json.dumps(asdict(handle), indent=2)
-        with open_private_text(target, "x") as output:
-            output.write(payload + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        fsync_directory(target.parent)
+        payload = json.dumps(asdict(handle), indent=2) + "\n"
+        _strict_atomic_create_text(target, payload)
 
     def update(self, handle: RunHandle) -> None:
         """Persist the one legal launching-to-spawned identity transition.
@@ -306,6 +492,7 @@ class RunStore:
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
         private_atomic_write_text(target, payload + "\n")
+        _strict_fsync_directory(target.parent)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -370,6 +557,7 @@ class RunStore:
                 self.log_path(run_id),
                 self.cleanup_uncertain_path(run_id),
                 self.cleanup_recovery_path(run_id),
+                self.launch_lease_path(run_id),
             )
         )
 
@@ -431,32 +619,40 @@ class RunStore:
         return handles, unreadable
 
     def is_pre_spawn_orphan(self, run_id: str) -> bool:
-        """Return whether only a pre-handle config snapshot exists for ``run_id``.
+        """Return whether ``run_id`` is a provably abandoned preparation.
 
-        Launch writes the config snapshot before exclusively creating the
-        handle, and never spawns until both succeed. A snapshot with no handle
-        and no log, status, or cleanup evidence is therefore provably
-        pre-spawn and may be cleared by operator recovery. Any other shape is
-        ambiguous and remains fail-closed.
+        Legacy launches are recoverable only when their config snapshot is the
+        sole evidence. Transactional launches also carry a kernel lease across
+        ``Popen``. A free lease plus either no handle or a valid launching
+        handle proves that no runner can still cross the acknowledgement
+        boundary; a child that was created inherits and holds the lease until
+        it has durably replaced the handle with its process identity or exits.
 
         :param str run_id: Candidate orphan run identity.
-        :return bool: Whether the sole evidence is one valid private snapshot.
+        :return bool: Whether the preparation is safe to remove automatically.
         """
-        handle_path = self._runs_dir / f"{run_id}.json"
-        if (
-            not SAFE_NAME_PATTERN.fullmatch(run_id)
-            or handle_path.exists()
-            or handle_path.is_symlink()
-        ):
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
+        lease_path = self.launch_lease_path(run_id)
+        if lease_path.is_file() and not lease_path.is_symlink():
+            lease = self._claim_abandoned_launch_lease(run_id)
+            if lease is None:
+                return False
+            lease.close()
+            return True
+
+        handle_path = self._runs_dir / f"{run_id}.json"
         snapshot = self.config_snapshot_path(run_id)
-        other_evidence = (
+        terminal_evidence = (
             self.status_path(run_id),
-            self.log_path(run_id),
             self.cleanup_uncertain_path(run_id),
             self.cleanup_recovery_path(run_id),
         )
-        if any(path.exists() or path.is_symlink() for path in other_evidence):
+        if any(path.exists() or path.is_symlink() for path in terminal_evidence):
+            return False
+        if handle_path.exists() or handle_path.is_symlink():
+            return False
+        if self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
             return False
         directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
         try:
@@ -468,20 +664,62 @@ class RunStore:
             os.close(directory_fd)
         return True
 
+    def _claim_abandoned_launch_lease(self, run_id: str) -> IO[str] | None:
+        """Lock and revalidate one transactional pre-spawn preparation.
+
+        :param str run_id: Candidate prepared run identity.
+        :return IO[str] | None: Held lease when the preparation is abandoned.
+        """
+        lease_path = self.launch_lease_path(run_id)
+        if not lease_path.is_file() or lease_path.is_symlink():
+            return None
+        try:
+            lease = try_lock_file(lease_path)
+        except (OSError, UnsafePrivatePathError):
+            return None
+        if lease is None:
+            return None
+        handle_path = self._runs_dir / f"{run_id}.json"
+        handle = self.get(run_id)
+        terminal_evidence = (
+            self.status_path(run_id),
+            self.cleanup_uncertain_path(run_id),
+            self.cleanup_recovery_path(run_id),
+        )
+        invalid = any(path.exists() or path.is_symlink() for path in terminal_evidence)
+        if handle_path.exists() or handle_path.is_symlink():
+            invalid = invalid or handle is None or handle.launch_state != "launching"
+        if invalid:
+            lease.close()
+            return None
+        return lease
+
     def clear_pre_spawn_orphan(self, run_id: str) -> None:
-        """Remove one revalidated pre-spawn orphan snapshot durably.
+        """Remove one revalidated pre-spawn preparation durably.
 
         :param str run_id: Orphan identity previously reported by launch.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
         """
-        if not self.is_pre_spawn_orphan(run_id):
-            raise ValueError(f"run {run_id!r} is not a config-snapshot-only pre-spawn orphan")
-        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+        lease: IO[str] | None = None
+        if self.launch_lease_path(run_id).is_file():
+            lease = self._claim_abandoned_launch_lease(run_id)
+            if lease is None:
+                raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+        elif not self.is_pre_spawn_orphan(run_id):
+            raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+        paths = (
+            self._runs_dir / f"{run_id}.json",
+            self.config_snapshot_path(run_id),
+            self.log_path(run_id),
+            self.launch_lease_path(run_id),
+        )
         try:
-            os.unlink(self.config_snapshot_path(run_id).name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    _strict_unlink(path)
         finally:
-            os.close(directory_fd)
+            if lease is not None:
+                lease.close()
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.
@@ -927,6 +1165,21 @@ class RunStore:
             payload.get("result_snapshot"), dict
         ):
             return None
+        result_publication_state = payload.get("result_publication_state")
+        result_publication_generation_id = payload.get("result_publication_generation_id")
+        if (result_publication_state is None) != (result_publication_generation_id is None):
+            return None
+        if result_publication_state is not None:
+            if result_publication_state not in {"prepared", "committed"}:
+                return None
+            if (
+                not isinstance(result_publication_generation_id, str)
+                or not SAFE_NAME_PATTERN.fullmatch(result_publication_generation_id)
+                or not isinstance(payload.get("result_snapshot"), dict)
+            ):
+                return None
+            if result_publication_state == "prepared" and result_snapshot_state != "pending":
+                return None
         result_snapshot_error = payload.get("result_snapshot_error")
         if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
             return None

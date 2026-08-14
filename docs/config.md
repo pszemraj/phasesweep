@@ -22,7 +22,15 @@ String values inside `trainer_config` may contain `{trial_dir}`, `{trial_id}`, `
 
 The MCP API reports the configured extractor's guarantees through explicit [objective-evidence assurance fields](mcp.md#objective-evidence-assurance).
 
-`execution` fixes the trainer's working directory and ambient-environment inheritance. Its effective cwd and inheritance contract join the fingerprint; ambient values do not, so put values that change trial meaning in top-level `env`. Narrow inheritance when unrelated host variables or secrets should not reach trainers. The [runtime output contract](runtime.md#output-layout) explains recorded environment identities and drift warnings.
+`execution` fixes the trainer's working directory and ambient-environment boundary. `inherit_env` selects semantic ambient inputs; `passthrough_env` adds credential or transport values that reach the trainer but may rotate without changing a persistent study's cohort. Top-level `env` values are always semantic and fingerprinted, even when their key is also listed as pass-through. Before a persistent top-up allocates a trial, the current semantic environment digest must match every existing trial. The default `inherit_env: all` therefore treats ordinary ambient churn as meaningful and can refuse a later top-up; for reusable studies, start a new experiment identity with a bounded name list and classify tokens explicitly, for example:
+
+```yaml
+execution:
+  inherit_env: [DATASET_REV, TOKENIZER_REV]
+  passthrough_env: [WANDB_API_KEY, HF_TOKEN]
+```
+
+Adding or changing that classification is itself a semantic config edit, so an already-populated study keeps its original contract. Populated legacy studies whose trials have no environment digest are not adopted; archive/delete them or use a new experiment name. The [runtime output contract](runtime.md#output-layout) explains the recorded identity.
 
 For CLI runs, relative workdirs, execution directories, and file-backed storage paths resolve from the invocation directory, not the config file's directory. Relative command paths resolve from the trainer's effective cwd. Run a relative-path config from one stable directory; changing cwd can select a different artifact tree, study, or trainer. MCP runs apply stricter [path and working-directory rules](mcp.md#paths-and-the-working-directory).
 
@@ -99,7 +107,7 @@ The command in `trial_command` is the training or evaluation program for one tri
 - Read the complete YAML at `{config_path}` in the default mode, or parse the explicitly selected compatibility [override format](#override-formats).
 - Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary. `report_objective(...)` creates missing parent directories when the envelope uses a nested trial-relative path.
 - Exit nonzero when the trial failed and should be recorded as failed.
-- When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name.
+- When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name. Configure the evidence source's explicit `base_url`, and point the trainer at the same deployment (for example through fingerprinted top-level `env.WANDB_BASE_URL`).
 - When writing a `json_envelope` directly, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into it. `report_objective(...)` fills these fields automatically. PhaseSweep verifies all three before accepting the objective.
 
 PhaseSweep composes the configured environment, then injects trial identity, evidence-path, trainer-input digest, W&B identity, and GPU-isolation values as applicable. The [config reference](config_reference.yaml) lists every reserved variable and its meaning; the [GPU runtime contract](runtime.md#concurrency-model) covers device visibility and locking.
@@ -165,7 +173,7 @@ Overrides apply from inherited winners through contract values and phase-fixed v
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, and evaluation policy. Every envelope must declare a checkpoint and step; their values are bound only when the extractor config declares `checkpoint` or `expected_step`. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID`; human-readable display names do not participate in evidence correlation.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, and evaluation policy. Every envelope must declare a checkpoint and step; their values are bound only when the extractor config declares `checkpoint` or `expected_step`. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID` and an explicit, fingerprinted `base_url`; human-readable display names and ambient `WANDB_BASE_URL` do not participate in evidence correlation. Authentication still comes from the W&B SDK environment/configuration, so `WANDB_API_KEY` can rotate through `execution.passthrough_env`.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 

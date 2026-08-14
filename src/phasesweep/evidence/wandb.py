@@ -45,6 +45,7 @@ class WandbSetupError(RuntimeError):
 
 def poll_wandb_summary(
     *,
+    base_url: str,
     entity: str,
     project: str,
     run_id: str,
@@ -55,6 +56,7 @@ def poll_wandb_summary(
 ) -> dict[str, Any]:
     """Poll W&B until a terminal run summary is available.
 
+    :param str base_url: Explicit W&B API endpoint for this evidence source.
     :param str entity: W&B entity or team name.
     :param str project: W&B project name.
     :param str run_id: Immutable W&B run id assigned to this trial attempt.
@@ -92,7 +94,10 @@ def poll_wandb_summary(
         # setup error — later ones are transient and must not abort a poll
         # the budget could still absorb (review v0.5.17 / finding D).
         try:
-            api = Api(timeout=max(1, ceil(remaining)))
+            api = Api(
+                overrides={"base_url": base_url},
+                timeout=max(1, ceil(remaining)),
+            )
         except Exception as exc:  # noqa: BLE001 - classified into the typed error model
             if not api_constructed:
                 raise WandbSetupError(run_id, str(exc)) from exc

@@ -51,7 +51,7 @@ def fake_wandb(monkeypatch: pytest.MonkeyPatch):
         if api_class is None:
 
             class Api:
-                def __init__(self, timeout=None):
+                def __init__(self, overrides=None, timeout=None):
                     timeouts.append(timeout)
                     self._inner = _FakeApi(run_for_path)
 
@@ -456,6 +456,7 @@ def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):
 
     source = provenance["source"]
     assert source["kind"] == "wandb"
+    assert source["base_url"] == "https://api.wandb.ai"
     assert source["entity"] == "me"
     assert source["project"] == "proj"
     assert source["run_id"] == "attempt-test"
@@ -485,6 +486,31 @@ def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
     assert run_extractor(ctx, cfg) == pytest.approx(0.123)
     assert paths == ["me/proj/attempt-test"]
     assert timeouts == [1]
+
+
+def test_wandb_extractor_uses_explicit_normalized_endpoint(fake_wandb, tmp_path) -> None:
+    constructed: list[tuple[dict[str, str] | None, int | None]] = []
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructed.append((overrides, timeout))
+
+        def run(self, _path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        base_url="https://wandb.example.test///",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
+    assert cfg.base_url == "https://wandb.example.test"
+    assert constructed == [({"base_url": "https://wandb.example.test"}, 1)]
 
 
 def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.MonkeyPatch):
@@ -622,7 +648,7 @@ def test_wandb_api_constructor_failure_is_typed_extractor_error(fake_wandb, tmp_
     """
 
     class Api:
-        def __init__(self, timeout=None):
+        def __init__(self, overrides=None, timeout=None):
             raise RuntimeError("credential loader exploded during Api construction")
 
     fake_wandb(api_class=Api)
@@ -653,7 +679,7 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
     constructions = {"count": 0}
 
     class Api:
-        def __init__(self, timeout=None):
+        def __init__(self, overrides=None, timeout=None):
             constructions["count"] += 1
             if constructions["count"] == 2:
                 raise ConnectionError("transient network blip during Api construction")

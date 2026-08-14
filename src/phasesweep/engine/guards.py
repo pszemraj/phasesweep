@@ -49,6 +49,7 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
@@ -65,7 +66,7 @@ from phasesweep.engine.state import (
     _suite_dir,
     _trial_dir_for,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
@@ -434,14 +435,16 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     from two directories is two different execution contexts and must not
     share a study. An unconfigured cwd contributes the resolved invocation
     directory because that is where the trainer actually runs. Ambient
-    variable *values* are never hashed — they may hold secrets and are not
-    declared semantic; put semantic values in ``env``, which is fingerprinted.
+    Ambient variable *values* are enforced through the trial environment
+    cohort rather than embedded in this config digest. Pass-through names and
+    their classification are config semantics, but their credential values
+    may rotate. Put fixed semantic values in ``env``, which is fingerprinted.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
     contract = experiment.execution.inherit_env
-    return {
+    identity = {
         "cwd": str(
             Path(experiment.execution.cwd).expanduser().resolve()
             if experiment.execution.cwd is not None
@@ -449,6 +452,9 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
         ),
         "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
     }
+    if experiment.execution.passthrough_env:
+        identity["passthrough_env"] = sorted(experiment.execution.passthrough_env)
+    return identity
 
 
 def _semantic_payload_digest(payload: object) -> str:
@@ -1842,40 +1848,42 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
 
-# Warn-once keys for :func:`_warn_unbounded_environment_inheritance`; preflight
-# runs again on the run's failure path, and a suite drives it once per study.
-_FULL_ENV_INHERITANCE_WARNED: set[str] = set()
+def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> None:
+    """Refuse to allocate into a different or unknown semantic environment cohort.
 
-
-def _warn_unbounded_environment_inheritance(experiment: Experiment) -> None:
-    """Warn once when a persisted study inherits the whole ambient environment.
-
-    ``inherit_env: all`` makes every ambient variable an implicit input to
-    trials that outlive this process. Their values are never fingerprinted (and
-    must not be — they hold secrets), so a later top-up under a drifted shell
-    writes into the same study under the same fingerprint, and only the
-    recorded environment digest distinguishes them (review v0.5.18 / finding
-    F3). In-memory studies keep nothing to drift against, so they stay quiet.
-
-    :param Experiment experiment: Parsed experiment whose contract and storage
-        are inspected.
+    :param optuna.Study study: Existing study whose trials define the cohort.
+    :param str current_digest: Semantic environment digest for this invocation.
+    :raises StudySchemaMismatchError: A populated legacy study has a trial with
+        no usable environment identity.
+    :raises StudyFingerprintMismatchError: Recorded trials belong to another
+        semantic environment cohort.
     """
-    if experiment.execution.inherit_env != "all":
+    trials = study.get_trials(deepcopy=False)
+    if not trials:
         return
-    if experiment.storage is None or storage_is_in_memory(experiment.storage):
-        return
-    if experiment.experiment in _FULL_ENV_INHERITANCE_WARNED:
-        return
-    _FULL_ENV_INHERITANCE_WARNED.add(experiment.experiment)
-    log.warning(
-        "[%s] execution.inherit_env='all' with persistent storage: trials persist "
-        "beyond this process while inheriting every ambient variable, so a later "
-        "resume or top-up under a drifted environment reuses the same study and "
-        "fingerprint. Declare an explicit execution.inherit_env list (and put "
-        "meaning-changing values in env, which is fingerprinted) to bound what "
-        "trials can silently depend on.",
-        experiment.experiment,
-    )
+    missing = [
+        trial.number
+        for trial in trials
+        if not isinstance(trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str)
+        or not trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
+    ]
+    if missing:
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} contains populated legacy trial(s) without a "
+            f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
+            "which environment cohort owns those results. Use a new experiment name, or "
+            "archive/delete the legacy study before running again."
+        )
+    recorded = {trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] for trial in trials}
+    if recorded != {current_digest}:
+        rendered = ", ".join(sorted(digest[:12] for digest in recorded))
+        raise StudyFingerprintMismatchError(
+            f"Study {study.study_name!r} contains trial(s) from semantic trainer "
+            f"environment cohort(s) [{rendered}], but this invocation composes "
+            f"{current_digest[:12]}. No trial was allocated. Restore the original "
+            "semantic environment, classify rotating credentials under "
+            "execution.passthrough_env, or use a new experiment name."
+        )
 
 
 def _artifact_root_identity(experiment: Experiment) -> str:
@@ -3224,7 +3232,7 @@ def _preflight_existing_studies(
     :raises RuntimeError: Multiple studies failed and at least one error is an
         unexpected implementation failure that must retain traceback reporting.
     """
-    _warn_unbounded_environment_inheritance(experiment)
+    current_environment_digest = _environment_identity(experiment).digest
     report = cleanup_report or _PreflightCleanupReport()
     # Discovery, root checks, and claims happen in ONE strict pass, and its
     # study objects are the ones every later step operates on: an invocation
@@ -3291,6 +3299,7 @@ def _preflight_existing_studies(
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
             if reached:
+                _validate_environment_cohort(study, current_environment_digest)
                 _validate_trial_target(study, phase)
         except Exception as exc:
             errors.append(exc)
@@ -3303,6 +3312,8 @@ def _preflight_existing_studies(
         )
         if all(isinstance(error, StudySchemaMismatchError) for error in errors):
             raise StudySchemaMismatchError(message) from first
+        if all(isinstance(error, StudyFingerprintMismatchError) for error in errors):
+            raise StudyFingerprintMismatchError(message) from first
         if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
             raise StudyStorageUnavailableError(message) from first
         if all(isinstance(error, TrialTargetRegressionError) for error in errors):

@@ -63,7 +63,9 @@ flowchart TD
     more -->|yes| phase
     more -->|no| summary["write generation summary"]
     summary --> publish["_publish_generation validates result graph"]
-    publish --> pointer["commit last_successful_generation pointer"]
+    publish --> sidecar["optional hook: prepare frozen MCP result"]
+    sidecar --> pointer["commit last_successful_generation pointer"]
+    pointer --> receipt["optional hook: record MCP commit receipt"]
 ```
 
 For suites, each executed component experiment completes this publication sequence before suite promotion is evaluated. After the declared-study loop completes, the engine validates and publishes the suite summary through its own last-success pointer.

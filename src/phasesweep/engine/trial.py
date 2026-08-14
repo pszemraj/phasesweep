@@ -119,8 +119,9 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
 
     ``inherit_env: all`` preserves the historical full-inheritance behavior.
     ``none`` starts from the minimal base; a list adds exactly the named
-    ambient variables on top of that base. Configured ``experiment.env``
-    values always apply last (review v0.5.17 / blocker 4).
+    semantic ambient variables on top of that base. ``passthrough_env`` adds
+    credential/transport variables to either narrowed contract. Configured
+    ``experiment.env`` values always apply last (review v0.5.17 / blocker 4).
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, str]: The composed trainer environment.
@@ -132,6 +133,7 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
         names = list(_BASE_INHERITED_ENV)
         if isinstance(contract, list):
             names.extend(contract)
+        names.extend(experiment.execution.passthrough_env)
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     return env
@@ -153,12 +155,13 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
 
 @dataclass(frozen=True)
 class EnvironmentIdentity:
-    """Identity of the exact environment a trial subprocess receives.
+    """Semantic identity of the base environment a trainer receives.
 
-    ``values`` exists so one composition serves both the launch and the
-    opt-in ``environment.json`` record; it holds secrets (``HF_TOKEN``,
-    ``AWS_*``, ...) and must never be persisted or logged outside the
-    owner-only record ``execution.record_env`` enables.
+    ``digest`` excludes explicitly classified ``passthrough_env`` values so
+    credentials can rotate without contaminating a persistent study. ``values``
+    remains the full composed mapping used for launch and the opt-in
+    ``environment.json`` record; it can hold secrets and must never be persisted
+    or logged outside that owner-only record.
     """
 
     digest: str
@@ -167,12 +170,13 @@ class EnvironmentIdentity:
 
 
 def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
-    """Fingerprint the environment :func:`_trainer_environment` composes.
+    """Fingerprint the semantic part of the composed trainer environment.
 
-    Two trials run under materially different environments (a rotated
-    ``HF_TOKEN``, a different ``PYTHONHASHSEED``, another CUDA stack) are
-    otherwise indistinguishable in the ledger, and a winner gives no clue
-    which environment produced it (review v0.5.18 / finding F3).
+    Values named by ``execution.passthrough_env`` are deliberately excluded:
+    they are credentials or transport inputs allowed to rotate between
+    invocations. Every other inherited value is semantic and must remain in
+    one cohort for persistent-study reuse. Configured ``experiment.env``
+    entries are always semantic even if they reuse a pass-through name.
 
     The digest is the SHA-256 of the compact JSON encoding of the
     ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
@@ -181,21 +185,21 @@ def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
     would collide, while JSON string quoting keeps the encoding injective.
     Sorting makes the digest independent of mapping order.
 
-    This digest is deliberately NOT part of any semantic fingerprint: an
-    environment change must not invalidate a resumable study or block a
-    top-up. Divergence is reported by the selection and winner-load warnings
-    instead.
+    The digest is stored on every allocated trial and checked against every
+    populated persistent study before another trial is allocated. The values
+    themselves never enter config metadata.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return EnvironmentIdentity: Digest, sorted variable names, and the
         composed name-to-value mapping the digest covers.
     """
     env = _trainer_environment(experiment)
-    items = sorted(env.items())
+    passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
+    items = sorted((name, value) for name, value in env.items() if name not in passthrough)
     encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return EnvironmentIdentity(
         digest=hashlib.sha256(encoded).hexdigest(),
-        names=tuple(name for name, _ in items),
+        names=tuple(sorted(env)),
         values=env,
     )
 
@@ -214,9 +218,9 @@ def _record_trainer_environment(
     the file is hardened: the trial directory itself stays operator-trusted, so
     logs and evidence remain readable by ordinary tooling.
 
-    The recorded mapping is exactly the digest's preimage — the contract-composed
-    environment before the per-trial ``PHASESWEEP_*`` and GPU bindings, which
-    vary by trial and are recoverable from the trial directory itself.
+    The recorded mapping is the full contract-composed environment before the
+    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` names the
+    values excluded from the accompanying semantic digest.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param EnvironmentIdentity identity: Identity of the composed environment.
@@ -230,6 +234,7 @@ def _record_trainer_environment(
     payload = {
         "digest": identity.digest,
         "inherit_env": _inherit_env_contract(experiment),
+        "passthrough_env": sorted(experiment.execution.passthrough_env),
         "env": identity.values,
     }
     private_atomic_write_text(

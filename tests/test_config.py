@@ -158,6 +158,26 @@ def test_execution_accepts_named_inherit_list() -> None:
     assert ExecutionContext().inherit_env == "all"
 
 
+@pytest.mark.parametrize(
+    ("passthrough_env", "message"),
+    [
+        ([""], "nonempty and unpadded"),
+        ([" HF_TOKEN"], "nonempty and unpadded"),
+        (["HF_TOKEN", "HF_TOKEN"], "must be unique"),
+    ],
+)
+def test_execution_passthrough_env_names_validated(
+    passthrough_env: list[str], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ExecutionContext(passthrough_env=passthrough_env)
+
+
+def test_execution_rejects_ambiguous_environment_classification() -> None:
+    with pytest.raises(ValidationError, match="must not overlap"):
+        ExecutionContext(inherit_env=["HF_TOKEN"], passthrough_env=["HF_TOKEN"])
+
+
 def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> None:
     """``defaults.execution`` reaches studies that omit it; a study that
     declares its own block replaces the default *wholesale* rather than

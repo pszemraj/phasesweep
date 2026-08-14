@@ -21,20 +21,22 @@ import os
 import shutil
 import signal
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
 import yaml
 
 import phasesweep.engine.run as engine_run
+import phasesweep.engine.state as engine_state
 from phasesweep import load_config, run_experiment
-from phasesweep.config import IntParam, Phase, Sampler, Suite
+from phasesweep.config import Experiment, IntParam, Phase, Sampler, Suite
 from phasesweep.engine import (
     NoFeasibleTrialError,
     PublicationCommitError,
     PublicationIntegrityError,
     TerminalReport,
+    Winner,
     generation_id_source,
     read_status,
     read_winner,
@@ -49,6 +51,7 @@ from phasesweep.engine.state import (
     _generation_winner_path,
     _last_successful_generation_id,
     _last_successful_generation_path,
+    _last_successful_suite_generation_path,
     _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
     _suite_generation_path,
@@ -149,6 +152,15 @@ def _suite_record_state(suite: Suite, generation_id: str) -> str | None:
     """Read one suite generation's immutable record ``state`` label."""
     payload = yaml.safe_load(_suite_generation_record_path(suite, generation_id).read_text())
     return payload.get("state") if isinstance(payload, dict) else None
+
+
+def _reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
+    """Update a test publication pointer to authenticate ``summary_path``'s exact bytes."""
+    pointer = yaml.safe_load(pointer_path.read_text())
+    content = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(content)
+    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
 
 
 # --------------------------------------------------------------------------
@@ -257,6 +269,67 @@ def test_pointer_commit_failure_keeps_prior_publication(
     assert _record_state(experiment, second_generation) == "publication_failed"
     assert _current_pointer_state(experiment) == "publication_failed"
     assert _last_successful_generation_id(experiment) == first_generation
+
+
+def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: Path) -> None:
+    """A detached-run snapshot that cannot become durable must block publication."""
+    experiment = _stored_experiment(tmp_path)
+    prepared_generation: str | None = None
+
+    class FailingHook:
+        def prepare(
+            self,
+            *,
+            experiment: Experiment,
+            generation_id: str,
+            winners: Mapping[str, Winner],
+        ) -> None:
+            nonlocal prepared_generation
+            prepared_generation = generation_id
+            assert set(winners) == {"p"}
+            assert _last_successful_generation_id(experiment) is None
+            raise OSError("simulated detached snapshot persistence failure")
+
+        def committed(self, *, generation_id: str) -> None:
+            raise AssertionError(f"uncommitted generation was notified: {generation_id}")
+
+    with pytest.raises(OSError, match="detached snapshot persistence failure"):
+        run_experiment(experiment, publication_hook=FailingHook())
+
+    assert prepared_generation is not None
+    assert _last_successful_generation_id(experiment) is None
+    assert _record_state(experiment, prepared_generation) == "publication_failed"
+
+
+def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) -> None:
+    """Postcommit notification observes the pointer and cannot downgrade success."""
+    experiment = _stored_experiment(tmp_path)
+    events: list[str] = []
+
+    class ObservingHook:
+        def prepare(
+            self,
+            *,
+            experiment: Experiment,
+            generation_id: str,
+            winners: Mapping[str, Winner],
+        ) -> None:
+            assert set(winners) == {"p"}
+            assert _last_successful_generation_id(experiment) is None
+            events.append(f"prepared:{generation_id}")
+
+        def committed(self, *, generation_id: str) -> None:
+            assert _last_successful_generation_id(experiment) == generation_id
+            events.append(f"committed:{generation_id}")
+            raise KeyboardInterrupt("simulated postcommit interruption")
+
+    winners = run_experiment(experiment, publication_hook=ObservingHook())
+
+    assert set(winners) == {"p"}
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    assert events == [f"prepared:{generation_id}", f"committed:{generation_id}"]
+    assert _record_state(experiment, generation_id) == "published"
 
 
 # --------------------------------------------------------------------------
@@ -450,9 +523,10 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
     original_validate = engine_run._validate_generation_publishable
 
-    def validate_then_signal(*args: object, **kwargs: object) -> None:
-        original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
+        summary_bytes = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
+        return summary_bytes
 
     monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
 
@@ -520,11 +594,12 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
     original_validate = engine_run._validate_generation_publishable
     signalled = {"done": False}
 
-    def validate_then_signal(*args: object, **kwargs: object) -> None:
-        original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
+        summary_bytes = original_validate(*args, **kwargs)
         if not signalled["done"]:
             signalled["done"] = True
             os.kill(os.getpid(), signal.SIGTERM)
+        return summary_bytes
 
     monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
 
@@ -708,6 +783,7 @@ def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> No
     for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
         summary.pop(key, None)
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
     assert _last_successful_generation_id(experiment) == generation_id
     assert read_winner(experiment, "p") is not None
@@ -831,6 +907,97 @@ def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path
     assert status["publication_integrity"] == "ok"
     assert "publication_error" not in status
     assert status["published_generation_id"] == generation_id
+
+
+def test_experiment_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
+    """The commit record stores the byte length and SHA-256 of the validated summary."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary = _generation_summary_path(experiment, generation_id).read_bytes()
+    pointer = yaml.safe_load(_last_successful_generation_path(experiment).read_text())
+    assert pointer["summary_size_bytes"] == len(summary)
+    assert pointer["summary_sha256"] == hashlib.sha256(summary).hexdigest()
+
+
+def test_summary_digest_is_checked_before_the_summary_is_parsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pointer-backed summary with wrong bytes is rejected before YAML sees them."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    original = summary_path.read_bytes()
+    tampered = original.replace(b"experiment:", b"experimenT:", 1)
+    assert len(tampered) == len(original)
+    summary_path.write_bytes(tampered)
+
+    parsed_summary_bytes = False
+    original_safe_load = engine_state.yaml.safe_load
+
+    def track_safe_load(stream):  # noqa: ANN001, ANN202
+        nonlocal parsed_summary_bytes
+        if isinstance(stream, bytes):
+            parsed_summary_bytes = True
+        return original_safe_load(stream)
+
+    monkeypatch.setattr(engine_state.yaml, "safe_load", track_safe_load)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "digest" in pointer.error
+    assert parsed_summary_bytes is False
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint"],
+)
+def test_summary_semantics_are_pointer_anchored_and_cross_checked(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    """Historical plan, metric/evidence, and config identity cannot self-authenticate."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    if tamper == "phase_plan":
+        summary["phase_plan"][0]["name"] = "q"
+        semantic_error = "phase plan"
+    elif tamper == "metric_goal":
+        summary["metric"]["goal"] = "maximize"
+        semantic_error = "metric semantics"
+    elif tamper == "objective_evidence":
+        evidence = summary["metric"]["objective_evidence"]
+        flag = next(key for key, value in evidence.items() if type(value) is bool)
+        evidence[flag] = not evidence[flag]
+        semantic_error = "metric semantics"
+    else:
+        summary["config_fingerprint"] = "0" * 64
+        semantic_error = "config fingerprint"
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "summary" in pointer.error.lower()
+
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert semantic_error in pointer.error
 
 
 def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: Path) -> None:
@@ -970,6 +1137,53 @@ def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     assert pointer.state == "failed"
     assert pointer.generation_id == generation_id
     assert pointer.error is not None
+
+
+def test_suite_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
+    """Suite commits carry the same exact-byte summary identity as experiments."""
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
+    assert generation_id is not None
+
+    summary = _suite_generation_summary_path(suite, generation_id).read_bytes()
+    payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
+    assert payload["summary_size_bytes"] == len(summary)
+    assert payload["summary_sha256"] == hashlib.sha256(summary).hexdigest()
+
+
+@pytest.mark.parametrize("tamper", ["generation_id", "summary_path"])
+def test_suite_component_map_is_pointer_anchored_and_cross_checked(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    """Component generation identities and summary locations cannot be rewritten silently."""
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    generation_id = pointer.generation_id
+    assert generation_id is not None
+
+    summary_path = _suite_generation_summary_path(suite, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    record = summary["studies"][0]
+    if tamper == "generation_id":
+        record["experiment_generation_id"] = "different-generation"
+    else:
+        record["component_summary_path"] = f"{record['component_summary_path']}.other"
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
+
+    pointer_path = _last_successful_suite_generation_path(suite)
+    _reanchor_summary_pointer(pointer_path, summary_path)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "component summary" in pointer.error
 
 
 def test_suite_publication_pointer_reports_absent_before_anything_publishes(
@@ -1643,6 +1857,7 @@ def test_generation_published_before_provenance_files_existed_stays_valid(
         item for item in summary["artifacts"] if item["kind"] in ("winner", "promotion")
     ]
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
     # Files present but unlisted: the manifest no longer covers the namespace.
     assert _last_successful_generation_id(experiment) is None

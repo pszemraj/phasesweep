@@ -23,6 +23,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.server as mcp_server
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
@@ -58,6 +59,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
+    PUBLICATION_POINTER_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     _attempts_dir,
     _experiment_dir,
@@ -733,7 +735,9 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         dry_run: bool,
         terminal_callback,
         generation_id: str,
+        publication_hook: object,
     ) -> None:
+        del publication_hook
         assert generation_id == run_id
         calls.append((config_obj.experiment, from_phase, dry_run))
         _validate_artifact_root_binding(config_obj, claim_fresh=True)
@@ -859,6 +863,9 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert failure["code"] == "result_snapshot_unavailable"
     assert failure["cause"] == terminal["failure"]
     assert app.status(run_id=handle.run_id)["run"]["failure"] == failure
+    assert not store.launch_lease_path(handle.run_id).exists()
+    patch_popen_capture(monkeypatch)
+    assert app.launch("srv")["state"] == "running"
 
 
 def test_launch_terminates_real_runner_when_log_context_exit_fails(
@@ -879,11 +886,25 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
         if path.suffix == ".log":
             raise OSError("injected log context exit failure")
 
-    def sleeping_popen(_cmd: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
+    def sleeping_popen(cmd: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
         proc = real_popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             **kwargs,
         )
+        run_id = cmd[cmd.index("--run-id") + 1]
+        pending = store.get(run_id)
+        assert pending is not None
+        store.update(
+            replace(
+                pending,
+                pid=proc.pid,
+                pgid=proc.pid,
+                pid_starttime=read_proc_starttime(proc.pid),
+                boot_id=read_boot_id(),
+                launch_state="spawned",
+            )
+        )
+        os.write(int(cmd[cmd.index("--launch-ready-fd") + 1]), b"R")
         spawned.append(proc)
         return proc
 
@@ -1022,6 +1043,125 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
     assert store.live_runs() == [pending]
 
 
+def test_restarted_server_reaps_abandoned_transaction_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server crash before Popen leaves a provably removable preparation."""
+    config = _config(tmp_path)
+    _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    abandoned_id = "srv-abandoned-preparation"
+    pending = make_run_handle(
+        run_id=abandoned_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    preparation = store.prepare_launch(pending, config.read_bytes())
+    preparation.close()  # Simulate the launching server disappearing before Popen.
+
+    restarted_store = RunStore(registry.state_dir)
+    restarted = PhaseSweepMCP(registry, restarted_store)
+    monkeypatch.setattr(restarted_store, "new_run_id", lambda _experiment_id: "srv-retry")
+    patch_popen_capture(monkeypatch)
+
+    result = restarted.launch("srv")
+
+    assert result["run_id"] == "srv-retry"
+    assert restarted_store.get(abandoned_id) is None
+    assert not restarted_store.config_snapshot_path(abandoned_id).exists()
+    assert not restarted_store.launch_lease_path(abandoned_id).exists()
+
+
+def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that never publishes a receipt never receives permission to work."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    class UnreadyProc:
+        pid = os.getppid()
+
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError, match="did not persist its launch receipt"):
+        app.launch("srv")
+
+    (failed,) = store.list_handles()
+    assert store.state(failed) == "failed"
+    assert not store.launch_lease_path(failed.run_id).exists()
+    patch_popen_capture(monkeypatch)
+    assert app.launch("srv")["state"] == "running"
+
+
+def test_acknowledgement_write_failure_terminates_receipted_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable receipt alone cannot let the child cross the work boundary."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+    real_write = os.write
+
+    def fail_ack(fd: int, data: bytes) -> int:
+        if data == b"A":
+            raise OSError("injected acknowledgement failure")
+        return real_write(fd, data)
+
+    def confirm_cleanup(
+        pid: int | None,
+        starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, starttime, pgid))
+        return True
+
+    monkeypatch.setattr(mcp_server.os, "write", fail_ack)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", confirm_cleanup)
+
+    with pytest.raises(OSError, match="acknowledgement"):
+        app.launch("srv")
+
+    (handle,) = store.list_handles()
+    assert handle.launch_state == "spawned"
+    assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
+    assert store.state(handle) == "failed"
+    assert not store.launch_lease_path(handle.run_id).exists()
+
+
+def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Lease sidecar cleanup is non-authoritative after an acknowledged receipt."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    real_unlink = mcp_runs._strict_unlink
+
+    def fail_lease_unlink(path: Path) -> None:
+        if path.suffix == ".lock":
+            raise OSError("injected lease cleanup failure")
+        real_unlink(path)
+
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", fail_lease_unlink)
+    caplog.set_level(logging.WARNING, logger="phasesweep.mcp.runs")
+
+    result = app.launch("srv")
+
+    assert result["state"] == "running"
+    assert "could not remove completed launch lease" in caplog.text
+    assert store.launch_lease_path(result["run_id"]).is_file()
+
+
 def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
@@ -1074,7 +1214,7 @@ def test_launch_refuses_runner_without_linux_process_identity(
 
     handles = store.list_handles()
     assert len(handles) == 1
-    assert handles[0].launch_state == "launching"
+    assert handles[0].launch_state == "spawned"
     assert store.state(handles[0]) == expected_state
     assert store.recovery_required(handles[0]) is (not cleanup_confirmed)
     assert bool(store.cleanup_uncertain(handles[0])) is (not cleanup_confirmed)
@@ -1114,7 +1254,7 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     assert terminated == [(spawned.pid, spawned.pid_starttime, spawned.pgid)]
     pending = store.get(spawned.run_id)
     assert pending is not None
-    assert pending.launch_state == "launching"
+    assert pending.launch_state == "spawned"
     assert store.state(pending) == "failed"
 
 
@@ -2272,13 +2412,22 @@ def _represent_legacy_generation(experiment: Experiment, generation_id: str) -> 
     )
     summary_path = _generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(
-        yaml.safe_dump({"experiment": experiment.experiment, "generation_id": generation_id})
-    )
+    summary_bytes = yaml.safe_dump(
+        {"experiment": experiment.experiment, "generation_id": generation_id}
+    ).encode("utf-8")
+    summary_path.write_bytes(summary_bytes)
     pointer = _last_successful_generation_path(experiment)
     pointer.parent.mkdir(parents=True, exist_ok=True)
     pointer.write_text(
-        yaml.safe_dump({"experiment": experiment.experiment, "generation_id": generation_id})
+        yaml.safe_dump(
+            {
+                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                "experiment": experiment.experiment,
+                "generation_id": generation_id,
+                "summary_size_bytes": len(summary_bytes),
+                "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+            }
+        )
     )
 
 
@@ -2797,8 +2946,9 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
         dry_run: bool,
         terminal_callback,
         generation_id: str,
+        publication_hook: object,
     ) -> None:
-        del config_obj, from_phase, dry_run
+        del config_obj, from_phase, dry_run, publication_hook
         terminal_callback(
             TerminalReport(
                 generation_id=generation_id,

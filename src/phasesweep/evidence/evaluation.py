@@ -421,6 +421,7 @@ def _extract_wandb(
     """
     try:
         summary = poll_wandb_summary(
+            base_url=cfg.base_url,
             entity=cfg.entity,
             project=cfg.project,
             run_id=ctx.attempt_id,
@@ -463,6 +464,7 @@ def _extract_wandb(
     if provenance is not None:
         provenance["source"] = {
             "kind": "wandb",
+            "base_url": cfg.base_url,
             "entity": cfg.entity,
             "project": cfg.project,
             "run_id": ctx.attempt_id,
@@ -729,6 +731,7 @@ def _wandb_summary_required(
     """
     try:
         summary = poll_wandb_summary(
+            base_url=gate.base_url,
             entity=gate.entity,
             project=gate.project,
             run_id=ctx.attempt_id,

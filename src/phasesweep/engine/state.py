@@ -17,8 +17,9 @@ import optuna
 import yaml
 
 from phasesweep._metadata import __version__
-from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.config import Experiment, Metric, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationIntegrityError,
@@ -128,9 +129,9 @@ class Winner:
     # remote summary subset (review v0.5.17 / finding F). None for dry-run
     # placeholders and winners persisted before the record existed.
     objective_provenance: dict[str, Any] | None = None
-    # Identity of the environment the winning trial actually ran under
-    # (review v0.5.18 / finding F3): the SHA-256 of that trial's composed
-    # trainer environment, plus the ``inherit_env`` contract that produced it.
+    # Identity of the semantic environment the winning trial ran under: the
+    # SHA-256 of its composed trainer environment after explicitly classified
+    # ``passthrough_env`` values are removed, plus the ``inherit_env`` contract.
     # Variable NAMES stay on the trial attrs — the winner file keeps the
     # compact identity. None for dry-run placeholders, for winners persisted
     # before the record existed, and for trials that predate it.
@@ -195,11 +196,11 @@ OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
 # SHA-256; the generated file itself remains the evidence.
 TRAINER_INPUT_ATTR = "phasesweep_trainer_input"
 TRAINER_INPUT_SCHEMA_VERSION = 1
-# SHA-256 of the exact trainer environment this trial's subprocess received
-# (review v0.5.18 / finding F3). Written at allocation, so failed trials carry
-# it too. Ambient VALUES are never stored here — the digest identifies the
-# environment, the names attr says which variables it contained, and raw values
-# land only in the opt-in owner-only per-trial ``environment.json``.
+# SHA-256 of the semantic trainer environment, excluding values explicitly
+# classified under ``execution.passthrough_env``. Written at allocation, so
+# failed trials carry it too. Ambient VALUES are never stored here; the names
+# attr lists the complete base environment (including pass-through names), and
+# raw values land only in the opt-in owner-only ``environment.json``.
 TRAINER_ENV_DIGEST_ATTR = "phasesweep_trainer_env_digest"
 # Sorted list of the variable NAMES in that environment: diagnostic, and
 # non-sensitive by construction.
@@ -412,6 +413,7 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 2
 SUITE_SUMMARY_SCHEMA_VERSION = 3
+PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time
 # (review v0.5.18 / finding F6). The summary used to keep only the config
 # *fingerprint*, so once the operator edited or lost the YAML the digest could
@@ -1057,6 +1059,7 @@ def _validate_generation_provenance_files(
     if set(listed_files) != _MANIFEST_GENERATION_FILE_KINDS:
         raise fail("summary lists only part of the generation provenance record")
 
+    contents: dict[str, bytes] = {}
     digests: dict[str, str] = {}
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         try:
@@ -1070,30 +1073,21 @@ def _validate_generation_provenance_files(
         digest = hashlib.sha256(content).hexdigest()
         if digest != listed_files[kind]["sha256"]:
             raise fail(f"{kind} artifact does not match its recorded hash")
+        contents[kind] = content
         digests[kind] = digest
 
-    snapshot_path = generation_dir / GENERATION_CONFIG_SNAPSHOT_FILENAME
     try:
-        snapshot = yaml.safe_load(snapshot_path.read_text())
-    except PermissionError as exc:
-        raise permission_fail(
-            _unreadable_artifact_permission_detail("config_snapshot artifact")
-        ) from exc
-    except (OSError, yaml.YAMLError) as exc:
+        snapshot = yaml.safe_load(contents["config_snapshot"])
+    except yaml.YAMLError as exc:
         raise fail("config_snapshot artifact is not parseable") from exc
     if not isinstance(snapshot, Mapping):
         raise fail("config_snapshot artifact is not a mapping")
     if snapshot.get("experiment") != summary.get("experiment"):
         raise fail("config_snapshot artifact names a different experiment")
 
-    record_path = generation_dir / GENERATION_REPRODUCIBILITY_FILENAME
     try:
-        record = json.loads(record_path.read_text())
-    except PermissionError as exc:
-        raise permission_fail(
-            _unreadable_artifact_permission_detail("reproducibility artifact")
-        ) from exc
-    except (OSError, ValueError) as exc:
+        record = json.loads(contents["reproducibility"])
+    except ValueError as exc:
         raise fail("reproducibility artifact is not parseable") from exc
     if not isinstance(record, Mapping):
         raise fail("reproducibility artifact is not a mapping")
@@ -1108,6 +1102,37 @@ def _validate_generation_provenance_files(
     ):
         raise fail("reproducibility artifact does not anchor the config snapshot it published")
 
+    if summary.get("config_fingerprint") != record.get("config_fingerprint"):
+        raise fail("summary config fingerprint disagrees with the reproducibility artifact")
+
+    snapshot_phases = snapshot.get("phases")
+    if not isinstance(snapshot_phases, list) or any(
+        not isinstance(phase, Mapping) or not isinstance(phase.get("name"), str)
+        for phase in snapshot_phases
+    ):
+        raise fail("config_snapshot artifact has a malformed phase plan")
+    expected_phase_plan = [
+        {"name": phase["name"], "comment": phase.get("comment")} for phase in snapshot_phases
+    ]
+    if summary.get("phase_plan") != expected_phase_plan:
+        raise fail("summary phase plan disagrees with the config_snapshot artifact")
+
+    try:
+        snapshot_metric = Metric.model_validate(snapshot.get("metric"))
+    except ValueError as exc:
+        raise fail("config_snapshot artifact has malformed metric semantics") from exc
+    if summary.get("metric") != _metric_semantics_payload(snapshot_metric):
+        raise fail("summary metric semantics disagree with the config_snapshot artifact")
+
+
+@dataclass(frozen=True)
+class _PointerTarget:
+    """Validated summary identity carried by one last-success pointer."""
+
+    generation_id: str
+    summary_size_bytes: int
+    summary_sha256: str
+
 
 def _read_pointer_target(
     pointer_path: Path,
@@ -1115,14 +1140,14 @@ def _read_pointer_target(
     id_key: str,
     owner_key: str,
     owner_name: str,
-) -> str | None:
+) -> _PointerTarget | None:
     """Read one last-success pointer's target id, validating the pointer itself.
 
     :param Path pointer_path: Pointer YAML file to read.
     :param str id_key: Payload key holding the target generation id.
     :param str owner_key: Payload key naming the owning experiment or suite.
     :param str owner_name: Expected owner name the pointer must record.
-    :return str | None: A safe-name target id owned by ``owner_name``, or
+    :return _PointerTarget | None: A safe-name target and exact summary-byte identity, or
         ``None`` when the pointer is missing, unreadable, malformed, names
         another owner, or carries an unsafe id.
     :raises PublicationAccessError: The pointer cannot be read by the current user.
@@ -1135,12 +1160,30 @@ def _read_pointer_target(
         ) from exc
     except (OSError, yaml.YAMLError):
         return None
-    if not isinstance(payload, dict) or payload.get(owner_key) != owner_name:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != PUBLICATION_POINTER_SCHEMA_VERSION
+        or payload.get(owner_key) != owner_name
+    ):
         return None
     target_id = payload.get(id_key)
     if not isinstance(target_id, str) or not SAFE_NAME_PATTERN.fullmatch(target_id):
         return None
-    return target_id
+    summary_size_bytes = payload.get("summary_size_bytes")
+    summary_sha256 = payload.get("summary_sha256")
+    if (
+        type(summary_size_bytes) is not int
+        or summary_size_bytes < 0
+        or not isinstance(summary_sha256, str)
+        or len(summary_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in summary_sha256)
+    ):
+        return None
+    return _PointerTarget(
+        generation_id=target_id,
+        summary_size_bytes=summary_size_bytes,
+        summary_sha256=summary_sha256,
+    )
 
 
 def _read_pointer_target_summary(
@@ -1150,6 +1193,8 @@ def _read_pointer_target_summary(
     target_id: str,
     owner_key: str,
     owner_name: str,
+    expected_size_bytes: int | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     """Read a pointer target's own immutable summary and confirm its identity.
 
@@ -1170,17 +1215,32 @@ def _read_pointer_target_summary(
     :param str target_id: Generation id the summary must name.
     :param str owner_key: Summary key naming the owning experiment or suite.
     :param str owner_name: Expected owner name the summary must carry.
+    :param int | None expected_size_bytes: Pointer-recorded exact summary byte length.
+    :param str | None expected_sha256: Pointer-recorded SHA-256 of the exact summary bytes.
     :return dict[str, Any] | None: The parsed summary when readable and
         correctly named; ``None`` otherwise.
     :raises PublicationAccessError: The summary cannot be read by the current user.
+    :raises PublicationIntegrityError: The summary bytes disagree with either pointer anchor.
     """
     try:
-        summary = yaml.safe_load(summary_path.read_text())
+        content = summary_path.read_bytes()
     except PermissionError as exc:
         raise PublicationAccessError(
             _unreadable_artifact_permission_detail("generation summary")
         ) from exc
-    except (OSError, yaml.YAMLError):
+    except OSError:
+        return None
+    if expected_size_bytes is not None and len(content) != expected_size_bytes:
+        raise PublicationIntegrityError(
+            "Generation summary byte length does not match the last-success pointer."
+        )
+    if expected_sha256 is not None and hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise PublicationIntegrityError(
+            "Generation summary digest does not match the last-success pointer."
+        )
+    try:
+        summary = yaml.safe_load(content)
+    except yaml.YAMLError:
         return None
     if (
         isinstance(summary, dict)
@@ -1216,6 +1276,8 @@ class PublicationPointer:
     when ``absent`` or when the pointer itself is the unreadable part."""
     error: str | None
     """Validation diagnostic for ``failed`` and ``permission_denied`` states."""
+    summary: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
+    """Exact pointer-authenticated parsed summary, for consumers that need its fields."""
 
 
 def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
@@ -1298,7 +1360,7 @@ def _resolve_publication_pointer(
     """
     pointer_path = _last_successful_generation_path(experiment)
     try:
-        generation_id = _read_pointer_target(
+        target = _read_pointer_target(
             pointer_path,
             id_key="generation_id",
             owner_key="experiment",
@@ -1306,8 +1368,9 @@ def _resolve_publication_pointer(
         )
     except PublicationAccessError as exc:
         return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
-    if generation_id is None:
+    if target is None:
         return _unresolvable_pointer(pointer_path, f"experiment {experiment.experiment!r}")
+    generation_id = target.generation_id
     try:
         summary = _read_pointer_target_summary(
             _generation_summary_path(experiment, generation_id),
@@ -1315,11 +1378,17 @@ def _resolve_publication_pointer(
             target_id=generation_id,
             owner_key="experiment",
             owner_name=experiment.experiment,
+            expected_size_bytes=target.summary_size_bytes,
+            expected_sha256=target.summary_sha256,
         )
     except PublicationAccessError as exc:
         return PublicationPointer(
             state="permission_denied", generation_id=generation_id, error=str(exc)
         )
+    except PublicationIntegrityError as exc:
+        if raise_on_manifest_error:
+            raise
+        return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
     if summary is None:
         return PublicationPointer(
             state="failed",
@@ -1351,7 +1420,7 @@ def _resolve_publication_pointer(
                 return PublicationPointer(
                     state="failed", generation_id=generation_id, error=str(exc)
                 )
-    return PublicationPointer(state="ok", generation_id=generation_id, error=None)
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None, summary=summary)
 
 
 def _last_successful_generation_id(
@@ -1605,7 +1674,7 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
     """
     pointer_path = _last_successful_suite_generation_path(suite)
     try:
-        generation_id = _read_pointer_target(
+        target = _read_pointer_target(
             pointer_path,
             id_key="suite_generation_id",
             owner_key="suite",
@@ -1613,8 +1682,9 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
         )
     except PublicationAccessError as exc:
         return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
-    if generation_id is None:
+    if target is None:
         return _unresolvable_pointer(pointer_path, f"suite {suite.suite!r}")
+    generation_id = target.generation_id
     try:
         summary = _read_pointer_target_summary(
             _suite_generation_summary_path(suite, generation_id),
@@ -1622,11 +1692,15 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
             target_id=generation_id,
             owner_key="suite",
             owner_name=suite.suite,
+            expected_size_bytes=target.summary_size_bytes,
+            expected_sha256=target.summary_sha256,
         )
     except PublicationAccessError as exc:
         return PublicationPointer(
             state="permission_denied", generation_id=generation_id, error=str(exc)
         )
+    except PublicationIntegrityError as exc:
+        return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
     if summary is None:
         return PublicationPointer(
             state="failed",
@@ -1669,7 +1743,7 @@ def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
                 exc_info=True,
             )
             return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
-    return PublicationPointer(state="ok", generation_id=generation_id, error=None)
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None, summary=summary)
 
 
 def _validate_suite_summary_integrity(
@@ -1896,8 +1970,9 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     :param Path path: Destination YAML path to replace.
     :param Any payload: YAML-serializable value to write.
     """
-    with atomic_text_writer(path) as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
+    text = yaml.safe_dump(payload, sort_keys=False)
+    with atomic_text_writer(path, newline="") as handle:
+        handle.write(text)
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
@@ -2142,12 +2217,11 @@ def _warn_environment_drift(
 ) -> None:
     """Warn once when an inherited winner was produced under another environment.
 
-    The environment digest is deliberately outside the semantic fingerprint —
-    an ambient change must not invalidate a study or block a top-up — so this
-    warning is the only signal that a ``--from-phase`` resume is building on a
-    result produced under a different trainer environment (review v0.5.18 /
-    finding F3). Winners without a recorded digest predate the record and are
-    left alone.
+    Persistent-study preflight separately refuses a top-up across semantic
+    environment cohorts. ``--from-phase`` deliberately skips this phase, so no
+    trial is allocated into that study; this warning tells the operator that a
+    later phase is building on a winner from another cohort. Winners without a
+    recorded digest predate the record and are left alone.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was loaded, used in the warn-once key.
@@ -2195,11 +2269,10 @@ def _load_winner(
     (a) the stored winner has no fingerprint at all (legacy or hand-edited),
     or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
 
-    A recorded trainer-environment digest that disagrees with this process's
-    environment is a warning, not a refusal: the environment is outside the
-    semantic fingerprint by design (see :func:`_warn_environment_drift`).
-    Winners written before those fields existed load with them set to
-    ``None``.
+    A recorded semantic environment digest that disagrees with this process is
+    a warning on this explicit skipped-phase path; ordinary study top-ups are
+    refused before allocation (see :func:`_warn_environment_drift`). Winners
+    written before those fields existed load with it set to ``None``.
 
     Args:
         experiment: Parsed experiment config.

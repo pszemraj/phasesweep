@@ -176,19 +176,21 @@
 # This field is outside semantic fingerprints; allow_incomplete_on_timeout remains a per-phase opt-in.
 
 # env: dict[str, str] = {}
-# Applied over the ambient variables selected by execution.inherit_env. PhaseSweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial. A json_envelope metric also receives `PHASESWEEP_OBJECTIVE_PATH`, the absolute destination resolved from its configured path; other extractor types remove any ambient value with that name.
+# Applied over the ambient variables selected by execution.inherit_env and execution.passthrough_env. Configured values are always semantic, even when a key also appears in passthrough_env. PhaseSweep then overwrites `PHASESWEEP_TRIAL_DIR`, `PHASESWEEP_TRIAL_ID`, `PHASESWEEP_PHASE`, `PHASESWEEP_RUN_NAME`, `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, `PHASESWEEP_OVERRIDES_SHA256`, and `WANDB_RUN_ID` for every trial. A json_envelope metric also receives `PHASESWEEP_OBJECTIVE_PATH`, the absolute destination resolved from its configured path; other extractor types remove any ambient value with that name.
 # The historically named PHASESWEEP_OVERRIDES_SHA256 is the digest of the exact PhaseSweep-written trainer input: the complete trainer_config.yaml in default mode, overrides.json in JSON compatibility mode, or overrides_resolved.json in a CLI compatibility mode.
 # WANDB_RUN_ID equals the immutable attempt ID; W&B extractors and gates query that ID instead of a display name.
 # An active GPU assignment also overwrites CUDA_VISIBLE_DEVICES. If any assigned token is numeric, CUDA_DEVICE_ORDER is forced to PCI_BUS_ID so the trainer uses the physical card covered by the nvidia-smi-derived host lock; UUID/MIG-only assignments preserve an explicitly configured order.
 
 # execution: ExecutionContext = {}
-# Explicit trainer execution contract; `cwd` and `inherit_env` join the semantic fingerprint, so changing either invalidates resumable studies (`record_env` does not - it changes only what is written). ExecutionContext keys:
+# Explicit trainer execution contract; `cwd`, `inherit_env`, and the passthrough_env classification join the semantic fingerprint, so changing any of them invalidates populated resumable studies (`record_env` does not - it changes only what is written). ExecutionContext keys:
 #   cwd: str | None = null
 #   Trainer working directory, resolved (expanduser + resolve) at launch; the resolved path must be a directory or the trial fails. Null uses the orchestrator's invocation directory, whose resolved path still joins the semantic fingerprint and is frozen into each generation config snapshot. When set for an MCP catalog entry, the path must be absolute.
 #   inherit_env: Literal["all", "none"] | list[str] = "all"
-#   Ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds variables that exist in the parent environment to that base set. Missing names are omitted, not errors. List names must be nonempty, unpadded, and unique. `env` entries apply on top afterwards, and only the contract is fingerprinted - ambient values are never hashed.
+#   Semantic ambient variables the trainer inherits. "all" copies the full parent environment; "none" keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, and TZ; a list of names adds variables that exist in the parent environment to that base set. Missing names are omitted, not errors. List names must be nonempty, unpadded, and unique. Before allocating a trial in a populated persistent study, PhaseSweep requires the current semantic values to match every recorded trial's cohort digest.
+#   passthrough_env: list[str] = []
+#   Ambient credential or transport variables inherited in addition to a narrowed inherit_env contract. Their values are excluded from the semantic cohort digest so tokens may rotate, while their sorted names and classification remain fingerprinted. Names must be nonempty, unpadded, unique, and must not overlap a list-valued inherit_env. A same-named top-level env entry remains semantic and cannot be exempted here.
 #   record_env: bool = false
-#   Write the composed base environment to `environment.json` before PhaseSweep's per-trial and GPU variables are injected (digest, inherit_env contract, and every base name-value pair). Off by default because those values include secrets; the file is owner-only (0600). Independently of this flag, every trial records that base environment's SHA-256 digest and sorted names as trial attributes, and the winner records the digest plus the contract; neither the digest nor any value joins a semantic fingerprint.
+#   Write the composed base environment to `environment.json` before PhaseSweep's per-trial and GPU variables are injected (semantic digest, inherit_env and passthrough_env contracts, and every base name-value pair). Off by default because those values include secrets; the file is owner-only (0600). Independently of this flag, every trial records the semantic environment's SHA-256 digest plus all sorted base names as trial attributes, and the winner records the digest plus inherit_env; pass-through values are not persisted in study attributes.
 
 # SEARCH PARAMETER OBJECTS
 # A search_space value must use exactly one discriminator shape.
@@ -239,6 +241,8 @@
 # `first` stops matching at the first numeric match; every mode still reads the whole file so the frozen evidence digest covers all of it.
 
 # type: Literal["wandb"] (required)
+# base_url: str = "https://api.wandb.ai"
+# Explicit W&B API endpoint. Trailing slashes are removed. The normalized endpoint is fingerprinted and passed directly to the public API; WANDB_BASE_URL is not used to choose the evidence source.
 # entity: str (required)
 # project: str (required)
 # Both must be nonempty and slash-free; they address the W&B API path directly.
@@ -283,6 +287,8 @@
 # Exactly 64 hexadecimal characters; normalized to lowercase. The path must exist and be a file.
 
 # type: Literal["wandb_summary_required"] (required)
+# base_url: str = "https://api.wandb.ai"
+# Explicit W&B API endpoint, with the same normalization and identity contract as the W&B extractor.
 # entity: str (required)
 # project: str (required)
 # Both must be nonempty and slash-free; they address the W&B API path directly.
@@ -380,7 +386,7 @@
 # If omitted, inherits defaults.timeout_seconds_per_run; explicit null clears that default and disables the per-study run deadline.
 
 # execution: ExecutionContext | None = null
-# If omitted, inherits defaults.execution; a non-null value replaces the default wholesale (no per-key merge), while explicit null resets to the built-in contract ({cwd: null, inherit_env: "all", record_env: false}).
+# If omitted, inherits defaults.execution; a non-null value replaces the default wholesale (no per-key merge), while explicit null resets to the built-in contract ({cwd: null, inherit_env: "all", passthrough_env: [], record_env: false}).
 
 # promotion: Promotion | None = null
 # Compares this study's final exposed phase winner with the selected prior-study winner. Uses the Promotion contract above.

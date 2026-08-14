@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import read_boot_id, read_proc_starttime
@@ -80,6 +82,137 @@ def test_create_refuses_existing_identity_without_replacement(tmp_path: Path) ->
         store.create(second)
 
     assert store.get("exp-1") == first
+
+
+def test_create_serializes_before_reserving_the_final_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serialization error cannot publish an empty or partial handle."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-serialization")
+
+    def fail_serialization(*_args: object, **_kwargs: object) -> str:
+        raise TypeError("injected serialization failure")
+
+    monkeypatch.setattr(mcp_runs.json, "dumps", fail_serialization)
+
+    with pytest.raises(TypeError, match="serialization"):
+        store.create(handle)
+
+    assert not store.handle_exists(handle.run_id)
+    assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure_kind", ["file", "directory"])
+def test_create_fsync_failure_rolls_back_the_reserved_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """A failed file or directory fsync leaves no final run reservation."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id=f"exp-fsync-{failure_kind}")
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_selected_fsync(fd: int) -> None:
+        nonlocal failed
+        is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        if not failed and is_directory is (failure_kind == "directory"):
+            failed = True
+            raise OSError(f"injected {failure_kind} fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(mcp_runs.os, "fsync", fail_selected_fsync)
+
+    with pytest.raises(OSError, match=f"{failure_kind} fsync"):
+        store.create(handle)
+
+    assert failed
+    assert not store.handle_exists(handle.run_id)
+    assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
+    store.create(handle)
+    assert store.get(handle.run_id) == handle
+
+
+@pytest.mark.parametrize("failing_create", [1, 2, 3])
+def test_prepare_launch_rolls_back_each_create_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_create: int,
+) -> None:
+    """Lease, snapshot, and handle create failures leave no capacity reservation."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id=f"exp-create-{failing_create}", launch_state="launching")
+    real_create = mcp_runs._strict_atomic_create_text
+    calls = 0
+
+    def fail_one_create(path: Path, text: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failing_create:
+            raise OSError(f"injected create {failing_create} failure")
+        real_create(path, text)
+
+    monkeypatch.setattr(mcp_runs, "_strict_atomic_create_text", fail_one_create)
+
+    with pytest.raises(OSError, match=f"create {failing_create}"):
+        store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert store.get(handle.run_id) is None
+    assert not store.config_snapshot_path(handle.run_id).exists()
+    assert not store.launch_lease_path(handle.run_id).exists()
+
+
+def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient rollback failure retains the proof needed for retry cleanup."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-cleanup", launch_state="launching")
+    real_unlink = mcp_runs._strict_unlink
+    real_create = store.create
+    failed = False
+
+    def fail_handle_create(_handle: object) -> None:
+        raise OSError("injected handle create failure")
+
+    def fail_snapshot_cleanup(path: Path) -> None:
+        nonlocal failed
+        if path == store.config_snapshot_path(handle.run_id) and not failed:
+            failed = True
+            raise OSError("injected pre-spawn cleanup failure")
+        real_unlink(path)
+
+    monkeypatch.setattr(store, "create", fail_handle_create)
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", fail_snapshot_cleanup)
+    with pytest.raises(OSError, match="handle create"):
+        store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert failed
+    assert store.launch_lease_path(handle.run_id).is_file()
+    monkeypatch.setattr(store, "create", real_create)
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", real_unlink)
+    assert store.is_pre_spawn_orphan(handle.run_id)
+    store.clear_pre_spawn_orphan(handle.run_id)
+    assert not store.run_evidence_exists(handle.run_id)
+
+
+def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
+    tmp_path: Path,
+) -> None:
+    """The inherited lease closes the Popen-before-receipt recovery race."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-lease", launch_state="launching")
+    preparation = store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert not store.is_pre_spawn_orphan(handle.run_id)
+    preparation.close()
+    assert store.is_pre_spawn_orphan(handle.run_id)
+    store.clear_pre_spawn_orphan(handle.run_id)
+    assert not store.run_evidence_exists(handle.run_id)
 
 
 def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
@@ -419,6 +552,27 @@ def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) 
         {"run_id": "exp-1", "returncode": 0, "error_class": 3},
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "complete"},
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_publication_state": "prepared",
+        },
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_snapshot_state": "pending",
+            "result_snapshot": {},
+            "result_publication_state": "unknown",
+            "result_publication_generation_id": "exp-1",
+        },
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_snapshot_state": "complete",
+            "result_snapshot": {},
+            "result_publication_state": "prepared",
+            "result_publication_generation_id": "exp-1",
+        },
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": "attempt-1"},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": [""]},

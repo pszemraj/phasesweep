@@ -52,6 +52,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     PHASE_ABORT_ATTR,
     PHASE_DECISION_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
@@ -905,17 +906,19 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
         run_experiment(experiment(3))
 
     study = optuna.load_study(study_name="t::p", storage=storage)
+    cohort_digest = study.trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     for sequence in (3, 4):
         study.add_trial(
             optuna.trial.create_trial(
                 state=optuna.trial.TrialState.FAIL,
                 user_attrs={
+                    TRAINER_ENV_DIGEST_ATTR: cohort_digest,
                     TRIAL_OUTCOME_ATTR: {
                         "schema_version": 1,
                         "sequence": sequence,
                         "outcome": "failure",
                         "cause": "simulated external terminal row",
-                    }
+                    },
                 },
             )
         )

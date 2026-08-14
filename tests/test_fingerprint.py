@@ -30,6 +30,7 @@ from phasesweep.config import (
     StudySpec,
     Suite,
     SuiteDefaults,
+    WandbExtractor,
 )
 from phasesweep.engine import (
     ArtifactRootConflictError,
@@ -38,6 +39,7 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     RunRequestError,
     SamplerContinuationUnsupportedError,
+    StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
@@ -626,6 +628,162 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _phase_fingerprint(reordered, reordered.phases[0], {}) == _phase_fingerprint(
         ordered, ordered.phases[0], {}
     )
+
+    passthrough_a = make_experiment(
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["HF_TOKEN"])
+    )
+    passthrough_b = make_experiment(
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    )
+    assert _phase_fingerprint(passthrough_a, passthrough_a.phases[0], {}) != _phase_fingerprint(
+        passthrough_b, passthrough_b.phases[0], {}
+    )
+
+
+def _with_trial_target(experiment: Experiment, n_trials: int) -> Experiment:
+    phase = experiment.phases[0].model_copy(update={"n_trials": n_trials})
+    return experiment.model_copy(update={"phases": [phase]})
+
+
+def _environment_cohort_experiment(
+    tmp_path: Path,
+    trainer: Path,
+    execution: ExecutionContext,
+) -> Experiment:
+    return make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        execution=execution,
+        n_trials=1,
+    )
+
+
+def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+    with pytest.raises(StudyFingerprintMismatchError, match="No trial was allocated"):
+        run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+
+
+def test_identical_semantic_environment_resumes_persistent_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+
+    run_experiment(experiment)
+    run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+
+
+def test_passthrough_token_rotation_resumes_persistent_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+    )
+    monkeypatch.setenv("WANDB_API_KEY", "first-secret")
+    run_experiment(experiment)
+
+    monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
+    run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+
+
+def test_populated_study_without_environment_identity_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+    assert experiment.storage is not None
+    with sqlite3.connect(experiment.storage.removeprefix("sqlite:///")) as connection:
+        connection.execute(
+            "DELETE FROM trial_user_attributes WHERE key = ?",
+            (TRAINER_ENV_DIGEST_ATTR,),
+        )
+
+    with pytest.raises(StudySchemaMismatchError, match="cannot guess.*environment cohort"):
+        run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+
+
+def test_wandb_base_endpoint_change_rejects_topup_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def poll_summary(**kwargs: object) -> dict[str, float]:
+        calls.append(str(kwargs["base_url"]))
+        return {"eval/loss": 0.5}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_summary)
+    trainer = write_trainer(tmp_path, "print('trainer complete')")
+
+    def experiment_for(base_url: str, n_trials: int) -> Experiment:
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / 'studies.db'}",
+            trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
+            execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+            n_trials=n_trials,
+            metric=Metric(
+                extractor=WandbExtractor(
+                    type="wandb",
+                    base_url=base_url,
+                    entity="team",
+                    project="project",
+                    metric_key="eval/loss",
+                )
+            ),
+        )
+
+    first = experiment_for("https://wandb-a.example.test", 1)
+    run_experiment(first)
+    assert calls == ["https://wandb-a.example.test"]
+
+    second = experiment_for("https://wandb-b.example.test", 2)
+    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+        run_experiment(second)
+
+    study = optuna.load_study(study_name="t::p", storage=first.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert calls == ["https://wandb-a.example.test"]
 
 
 def test_suite_fingerprint_includes_effective_invocation_cwd(
@@ -1308,7 +1466,7 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     patch_path_method_failure(
         monkeypatch,
         snapshot,
-        "read_text",
+        "read_bytes",
         PermissionError("permission denied"),
     )
     with pytest.raises(ArtifactRootRebindError) as publication_info:
@@ -2081,7 +2239,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
         run_experiment(experiment)
 
 
-def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
+def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> None:
     """Legacy skipped winners still need matching fingerprints and provenance."""
 
     def strip_fingerprint(data: dict) -> str:
@@ -2120,11 +2278,12 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
 
         generation_id = _last_successful_generation_id(exp)
         assert generation_id is not None
-        summary_path = _generation_summary_path(exp, generation_id)
-        summary = yaml.safe_load(summary_path.read_text())
-        for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
-            summary.pop(key, None)
-        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+        # Exercise the pre-generation compatibility reader directly. Modern
+        # pointer-backed runs authenticate the complete summary and winner
+        # manifest before this record-level validation is reached.
+        _last_successful_generation_path(exp).unlink()
+        _generation_path(exp).unlink()
 
         arch_winner_path = _published_winner_path(exp, "arch")
         assert arch_winner_path is not None
@@ -2132,10 +2291,8 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
         match = mutate(data)
         arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
-        shutil.rmtree(_phase_dir(exp, "lr"))
-
         with pytest.raises(RuntimeError, match=match):
-            run_experiment(exp, from_phase="lr")
+            _load_winner(exp, exp.phases[0], {})
 
 
 def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) -> None:

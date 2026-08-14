@@ -16,6 +16,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import select
 import subprocess
 import sys
 import time
@@ -64,6 +65,7 @@ from phasesweep.mcp.redaction import (
 from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
+    PreparedRun,
     RunHandle,
     RunState,
     RunStore,
@@ -76,7 +78,7 @@ from phasesweep.mcp.snapshots import (
     parse_result_snapshot,
 )
 from phasesweep.mcp.time import parse_utc_iso
-from phasesweep.runtime.files import ensure_private_dir, fsync_directory, open_private_text
+from phasesweep.runtime.files import ensure_private_dir, open_private_text
 from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
@@ -105,6 +107,9 @@ AWAIT_MAX_TIMEOUT_SECONDS = 600
 # default-length wait rechecks run state several times mid-wait instead of only
 # at entry and at the deadline.
 AWAIT_RECHECK_SECONDS = 5
+_RUNNER_READY_TIMEOUT_SECONDS = 10.0
+_RUNNER_READY_BYTE = b"R"
+_RUNNER_ACK_BYTE = b"A"
 
 
 class _SpawnBookkeepingError(Exception):
@@ -325,6 +330,9 @@ def _runner_protocol_argv(
     state_dir: Path,
     experiment_id: str,
     started_at: str,
+    launch_ready_fd: int | None = None,
+    launch_ack_fd: int | None = None,
+    launch_lease_fd: int | None = None,
 ) -> list[str]:
     """Build the required detached-runner protocol arguments.
 
@@ -339,9 +347,12 @@ def _runner_protocol_argv(
     :param Path state_dir: MCP state directory containing the run store.
     :param str experiment_id: Catalog experiment identifier.
     :param str started_at: Claimed launch timestamp.
+    :param int | None launch_ready_fd: Child pipe used to report a durable process identity.
+    :param int | None launch_ack_fd: Child pipe blocking work until server acknowledgement.
+    :param int | None launch_lease_fd: Inherited preparation lease closed after acknowledgement.
     :return list[str]: Runner arguments without interpreter prefix, cwd, or optional grants.
     """
-    return [
+    argv = [
         "--run-id",
         run_id,
         "--config",
@@ -357,6 +368,13 @@ def _runner_protocol_argv(
         "--started-at",
         started_at,
     ]
+    if launch_ready_fd is not None:
+        argv += ["--launch-ready-fd", str(launch_ready_fd)]
+    if launch_ack_fd is not None:
+        argv += ["--launch-ack-fd", str(launch_ack_fd)]
+    if launch_lease_fd is not None:
+        argv += ["--launch-lease-fd", str(launch_lease_fd)]
+    return argv
 
 
 class _ToolPayload(BaseModel):
@@ -1530,6 +1548,8 @@ class PhaseSweepMCP:
         terminal_status = self._runs.recorded_terminal_status(handle)
         if terminal_status is None:
             return None
+        if terminal_status.get("result_snapshot_state") == "pending":
+            return None
         snapshot = parse_result_snapshot(terminal_status)
         if snapshot is not None:
             return snapshot
@@ -1541,7 +1561,11 @@ class PhaseSweepMCP:
         latest_status = self._runs.recorded_terminal_status(handle)
         if latest_status is not None:
             terminal_status = latest_status
-            snapshot = parse_result_snapshot(terminal_status)
+            snapshot = (
+                None
+                if terminal_status.get("result_snapshot_state") == "pending"
+                else parse_result_snapshot(terminal_status)
+            )
             if snapshot is not None:
                 return snapshot
         finalization_state = terminal_status.get("result_snapshot_state")
@@ -1595,6 +1619,23 @@ class PhaseSweepMCP:
                 if not acquired:
                     raise LaunchInProgressError()
                 handles, unreadable = self._runs.launch_inventory()
+                abandoned = {
+                    handle.run_id
+                    for handle in handles
+                    if self._runs.launch_lease_path(handle.run_id).is_file()
+                    and self._runs.is_pre_spawn_orphan(handle.run_id)
+                }
+                abandoned.update(
+                    identity.removeprefix("run:")
+                    for identity in unreadable
+                    if identity.startswith("run:")
+                    and self._runs.launch_lease_path(identity.removeprefix("run:")).is_file()
+                    and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                )
+                for abandoned_run_id in sorted(abandoned):
+                    self._runs.clear_pre_spawn_orphan(abandoned_run_id)
+                if abandoned:
+                    handles, unreadable = self._runs.launch_inventory()
                 if unreadable:
                     recoverable = sorted(
                         identity.removeprefix("run:")
@@ -1619,30 +1660,22 @@ class PhaseSweepMCP:
                         blocking_run_ids,
                     )
                 config_bytes = self._current_config_bytes(reg)
+                preparation: PreparedRun | None = None
                 for _ in range(10):
                     run_id = self._runs.new_run_id(reg.id)
                     pending = self._pending_handle(reg, run_id)
                     try:
-                        config_snapshot_path = self._snapshot_config(reg, run_id, config_bytes)
+                        preparation = self._runs.prepare_launch(pending, config_bytes)
                     except FileExistsError:
                         continue
-                    try:
-                        self._runs.create(pending)
-                    except FileExistsError:
-                        with contextlib.suppress(OSError):
-                            config_snapshot_path.unlink()
-                        continue
-                    except Exception:
-                        with contextlib.suppress(OSError):
-                            config_snapshot_path.unlink()
-                        raise
                     break
                 else:
                     raise RuntimeError("failed to mint an unused MCP run id")
+                assert preparation is not None
                 resolved["run_id"] = run_id
                 handle: RunHandle | None = None
                 try:
-                    handle = self._spawn(reg, from_phase, pending, config_snapshot_path)
+                    handle = self._spawn(reg, from_phase, preparation)
                     if handle.pid_starttime is None:
                         raise RuntimeError(
                             "spawned runner has no Linux /proc start time; refused launch because "
@@ -1666,6 +1699,8 @@ class PhaseSweepMCP:
                         error_class=type(launch_exc).__name__,
                     )
                     raise
+                finally:
+                    self._runs.finish_launch_preparation(preparation)
                 assert handle is not None
             result = {"run_id": handle.run_id, "experiment_id": experiment_id, "state": "running"}
         except Exception as exc:
@@ -1841,37 +1876,6 @@ class PhaseSweepMCP:
                     reason="has no compatible winner for the current config",
                 ) from None
 
-    def _snapshot_config(
-        self,
-        reg: RegisteredExperiment,
-        run_id: str,
-        data: bytes,
-    ) -> Path:
-        """Exclusively create the immutable config snapshot before publishing its run.
-
-        :param RegisteredExperiment reg: Registered experiment whose config should be snapshotted.
-        :param str run_id: Run id whose snapshot path should be used.
-        :param bytes data: Already-verified config bytes.
-        :return Path: Written config snapshot path consumed by the detached runner.
-        :raises FileExistsError: If that run id's snapshot path is already
-            taken, so the caller can mint another id.
-        :raises RuntimeError: If the snapshot could not be written durably for
-            any other reason.
-        """
-        snapshot_path = self._runs.config_snapshot_path(run_id)
-        try:
-            with open_private_text(snapshot_path, "x") as output:
-                output.write(data.decode("utf-8"))
-                output.flush()
-                os.fsync(output.fileno())
-            fsync_directory(snapshot_path.parent)
-        except FileExistsError:
-            raise
-        except OSError as exc:
-            log.info("cannot snapshot config for experiment=%s run=%s: %s", reg.id, run_id, exc)
-            raise RuntimeError("failed to create run config snapshot") from None
-        return snapshot_path
-
     @staticmethod
     def _current_config_bytes(reg: RegisteredExperiment) -> bytes:
         """Read a cataloged config only when it still matches startup validation.
@@ -2016,23 +2020,25 @@ class PhaseSweepMCP:
         self,
         reg: RegisteredExperiment,
         from_phase: str | None,
-        pending: RunHandle,
-        config_snapshot_path: Path,
+        preparation: PreparedRun,
     ) -> RunHandle:
-        """Spawn the detached runner process for one registered experiment.
+        """Spawn a blocked runner and acknowledge its durable process receipt.
 
         :param RegisteredExperiment reg: Registered experiment to run.
         :param str | None from_phase: Optional phase to resume from.
-        :param RunHandle pending: Pre-spawn persisted handle.
-        :param Path config_snapshot_path: Config snapshot path consumed by the runner.
+        :param PreparedRun preparation: Durable preparation and inherited launch lease.
         :raises OSError: The log or detached runner cannot be opened before spawn.
         :raises _SpawnBookkeepingError: Post-spawn identity bookkeeping fails; the
             exception records whether cleanup of the spawned process group was confirmed.
-        :return RunHandle: Unsaved run handle for the spawned runner.
+        :return RunHandle: Runner-validated spawned handle.
         """
+        pending = preparation.handle
         run_id = pending.run_id
+        config_snapshot_path = preparation.config_snapshot_path
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
+        ready_read, ready_write = os.pipe()
+        ack_read, ack_write = os.pipe()
         cmd = [
             sys.executable,
             # -P: never prepend the cwd or script dir to sys.path. -s: no
@@ -2050,6 +2056,9 @@ class PhaseSweepMCP:
                 state_dir=self._registry.state_dir,
                 experiment_id=reg.id,
                 started_at=pending.started_at,
+                launch_ready_fd=ready_write,
+                launch_ack_fd=ack_read,
+                launch_lease_fd=preparation.lease_fd,
             ),
             # The runner chdirs here itself once its identity is durable; see
             # the trust-boundary note below for why Popen must not do it.
@@ -2093,7 +2102,12 @@ class PhaseSweepMCP:
                     start_new_session=True,  # own session/pgid; survives restart; signal as a group
                     cwd=str(spawn_cwd),
                     env=_runner_env(),
+                    pass_fds=(ready_write, ack_read, preparation.lease_fd),
                 )
+                os.close(ready_write)
+                ready_write = -1
+                os.close(ack_read)
+                ack_read = -1
                 # Build the minimum usable identity before log close, /proc,
                 # boot-id, or handle enrichment can fail. start_new_session=True
                 # makes the child the group leader, so pgid == pid without a
@@ -2115,6 +2129,31 @@ class PhaseSweepMCP:
                 handle = replace(handle, pid_starttime=pid_starttime)
                 boot_id = read_boot_id()
                 handle = replace(handle, boot_id=boot_id)
+                if handle.pid_starttime is None:
+                    raise RuntimeError(
+                        "spawned runner has no Linux /proc start time; refused launch because "
+                        "later cancellation could not distinguish PID reuse"
+                    )
+                readable, _, _ = select.select(
+                    [ready_read],
+                    [],
+                    [],
+                    _RUNNER_READY_TIMEOUT_SECONDS,
+                )
+                ready = os.read(ready_read, 1) if readable else b""
+                if ready != _RUNNER_READY_BYTE:
+                    raise RuntimeError(
+                        "detached runner did not persist its launch receipt before launch"
+                    )
+                persisted = self._runs.get(run_id)
+                if persisted != handle:
+                    raise RuntimeError("detached runner launch receipt did not match its process")
+            if os.write(ack_write, _RUNNER_ACK_BYTE) != len(_RUNNER_ACK_BYTE):
+                raise RuntimeError("could not acknowledge the detached runner launch")
+            acknowledged_fd = ack_write
+            ack_write = -1
+            with contextlib.suppress(OSError):
+                os.close(acknowledged_fd)
         except BaseException as exc:
             if proc is None:
                 # Opening the log or Popen itself failed: no child exists.
@@ -2137,6 +2176,11 @@ class PhaseSweepMCP:
                 exc,
                 cleanup_confirmed=cleanup_confirmed,
             ) from exc
+        finally:
+            for fd in (ready_read, ready_write, ack_read, ack_write):
+                if fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
         assert handle is not None
         return handle
 

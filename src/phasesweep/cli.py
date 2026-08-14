@@ -52,7 +52,6 @@ from phasesweep.engine.guards import (
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
     _experiment_dir,
-    _generation_summary_path,
     _published_summary_path_for,
     _published_winner_path_for,
     _resolve_publication_pointer,
@@ -72,7 +71,11 @@ from phasesweep.mcp.registry import (
 )
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
+from phasesweep.mcp.snapshots import (
+    finalize_result_snapshot,
+    mark_result_snapshot_published,
+    parse_result_snapshot,
+)
 from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
@@ -622,11 +625,19 @@ def _show_suite_winners(suite: Suite) -> None:
             _suite_dir(suite),
         )
     summary_path = _published_summary_path_for(suite, publication.generation_id)
-    if summary_path is None or not summary_path.is_file():
+    if publication.generation_id is not None:
+        summary = publication.summary
+    elif summary_path is not None and summary_path.is_file():
+        try:
+            summary = yaml.safe_load(summary_path.read_text())
+        except (OSError, yaml.YAMLError):
+            summary = None
+    else:
+        summary = None
+    if summary_path is None or summary is None:
         click.echo("(no successful suite result yet)")
         return
     try:
-        summary = yaml.safe_load(summary_path.read_text())
         if not isinstance(summary, dict):
             raise TypeError("summary must be a mapping")
         studies = summary["studies"]
@@ -715,12 +726,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     generation_id = publication.generation_id
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if generation_id is not None:
-        try:
-            summary = yaml.safe_load(
-                _generation_summary_path(experiment, generation_id).read_text()
-            )
-        except (OSError, yaml.YAMLError):
-            summary = None
+        summary = publication.summary
         if isinstance(summary, dict):
             stored_plan = summary.get("phase_plan")
             if isinstance(stored_plan, list) and all(
@@ -902,8 +908,8 @@ def _catalog_error_text(exc: CatalogError) -> str:
     name="recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for MCP cleanup uncertainty or failed terminal-result "
-        "finalization. --confirm performs the reported cleanup and stored-snapshot actions."
+        "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
+        "terminal-result finalization. --confirm performs the reported actions."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -923,14 +929,15 @@ def _catalog_error_text(exc: CatalogError) -> str:
     help="Perform the reported cleanup and stored terminal-result actions.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover cleanup uncertainty or finalize an already-captured result snapshot.
+    """Recover cleanup, interrupted publication, or result finalization.
 
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
     :raises click.ClickException: If the host is not a supported MCP host, the state
         directory or run id is unknown, the launch outcome is still unresolved, no
-        immutable terminal snapshot exists, runner identity cannot rule out PID
+        immutable terminal snapshot exists, an interrupted publication cannot
+        be reconciled from its pointer, runner identity cannot rule out PID
         reuse, the runner still appears live, the run config snapshot is missing or
         does not match its recorded digest, no trial-level cleanup evidence can be
         confirmed, or study recovery fails with a ``RuntimeError``.
@@ -1001,6 +1008,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     cleanup_recovery_needed = cleanup_recovery_required or runner_without_status
     stored_snapshot = (
         parse_result_snapshot(terminal_status) if terminal_status is not None else None
+    )
+    prepared_publication_generation = (
+        terminal_status.get("result_publication_generation_id")
+        if terminal_status is not None
+        and terminal_status.get("result_publication_state") == "prepared"
+        else None
     )
     snapshot_unavailable = (
         terminal_status is not None and stored_snapshot is None
@@ -1075,6 +1088,20 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 )
             ):
                 raise click.ClickException("runner process-group cleanup is still uncertain")
+
+            publication_recovery_action: str | None = None
+            if isinstance(prepared_publication_generation, str):
+                publication = _resolve_publication_pointer(config)
+                if publication.generation_id == prepared_publication_generation:
+                    publication_recovery_action = "commit"
+                elif publication.state == "absent" or publication.generation_id is not None:
+                    publication_recovery_action = "abort"
+                else:
+                    raise click.ClickException(
+                        "the prepared run result cannot be reconciled because the "
+                        "last-success pointer is unreadable or malformed. Restore that "
+                        "pointer before retrying recovery."
+                    )
 
             reaped = 0
             (
@@ -1197,7 +1224,20 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                         "cleanup-uncertain terminal trial(s)"
                     )
                 if snapshot_finalize_needed:
-                    actions.append("finalize the stored terminal snapshot with cleanup evidence")
+                    if publication_recovery_action == "commit":
+                        actions.append(
+                            "bind the prepared snapshot to its committed publication and "
+                            "finalize it with cleanup evidence"
+                        )
+                    elif publication_recovery_action == "abort":
+                        actions.append(
+                            "record the prepared generation as unpublished and finalize its "
+                            "stored snapshot"
+                        )
+                    else:
+                        actions.append(
+                            "finalize the stored terminal snapshot with cleanup evidence"
+                        )
                 elif snapshot_unavailable:
                     actions.append("record that the historical terminal snapshot is unavailable")
                 click.echo(
@@ -1260,6 +1300,22 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 terminal_status["result_snapshot_state"] = "failed"
                 terminal_status["result_snapshot_error"] = "InterruptedFinalization"
                 write_status_file(store.status_path(run_id), terminal_status)
+
+            if publication_recovery_action is not None:
+                assert terminal_status is not None
+                assert stored_snapshot is not None
+                if publication_recovery_action == "commit":
+                    assert isinstance(prepared_publication_generation, str)
+                    terminal_status["result_snapshot"] = mark_result_snapshot_published(
+                        stored_snapshot.model_dump(mode="json"),
+                        generation_id=prepared_publication_generation,
+                    )
+                    terminal_status["result_publication_state"] = "committed"
+                else:
+                    terminal_status["returncode"] = 1
+                    terminal_status["error_class"] = "PublicationNotCommitted"
+                    terminal_status.pop("result_publication_state", None)
+                    terminal_status.pop("result_publication_generation_id", None)
 
             if snapshot_finalize_needed:
                 _finalize_stored_terminal_result_snapshot(

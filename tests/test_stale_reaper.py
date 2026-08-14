@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
-import logging
 import os
 import signal
 import subprocess
@@ -20,7 +19,6 @@ import pytest
 import yaml
 
 from phasesweep.config import (
-    ExecutionContext,
     Experiment,
     IntParam,
     LogRegexExtractor,
@@ -57,6 +55,8 @@ from phasesweep.engine.state import (
     PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _attempts_dir,
@@ -64,7 +64,7 @@ from phasesweep.engine.state import (
     _generation_path,
     _trial_dir_for,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import canonical_storage_identity
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
@@ -263,6 +263,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     )
 
     _stamp_artifact_root(study, exp)
+    identity = _environment_identity(exp)
+    t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
+    t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
 
     # Will raise on fingerprint mismatch, but reap must have run first.
     with pytest.raises(RuntimeError, match="different phase config"):
@@ -348,6 +351,9 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
 
         experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
+        identity = _environment_identity(experiment)
+        trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
+        trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
         run_experiment(experiment)
 
         marker = next(
@@ -1195,6 +1201,9 @@ def _fabricate_stale_running_trial(
     _stamp_artifact_root(study, experiment)
     _validate_artifact_root_binding(experiment, claim_fresh=True)
     trial = study.ask()
+    identity = _environment_identity(experiment)
+    trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
+    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
     trial_dir = _trial_dir_for(
         experiment,
         phase_name,
@@ -1843,44 +1852,6 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert winners["p"].metric == pytest.approx(0.5)
     assert launched.exists()
     assert not list(attempts_dir.glob("*.json"))
-
-
-@pytest.mark.parametrize(
-    ("execution", "persistent", "expected_warnings"),
-    [
-        pytest.param(None, True, 1, id="full-inheritance-persistent"),
-        pytest.param(
-            ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
-            True,
-            0,
-            id="narrowed-contract-persistent",
-        ),
-        pytest.param(None, False, 0, id="full-inheritance-in-memory"),
-    ],
-)
-def test_preflight_warns_once_about_unbounded_env_on_persistent_storage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    execution: ExecutionContext | None,
-    persistent: bool,
-    expected_warnings: int,
-) -> None:
-    """Persisted trials plus ``inherit_env: all`` means ambient drift is unrecorded."""
-    monkeypatch.setattr("phasesweep.engine.guards._FULL_ENV_INHERITANCE_WARNED", set())
-    experiment = make_experiment(
-        experiment="envdrift",
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}" if persistent else None,
-        execution=execution,
-    )
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.guards"):
-        for _ in range(2):
-            _preflight_existing_studies(experiment)
-
-    warnings = [r for r in caplog.records if "inherit_env" in r.getMessage()]
-    assert len(warnings) == expected_warnings
 
 
 def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:

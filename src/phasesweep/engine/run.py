@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 import optuna
@@ -52,6 +53,7 @@ from phasesweep.engine.selection import (
 from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PHASE_FINGERPRINT_ATTR,
+    PUBLICATION_POINTER_SCHEMA_VERSION,
     SUITE_SUMMARY_SCHEMA_VERSION,
     Winner,
     _experiment_dir,
@@ -123,6 +125,37 @@ class TerminalReport:
     cleanup_error: BaseException | None = None
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
+
+
+class PublicationHook(Protocol):
+    """Required sidecar transaction around an experiment publication commit.
+
+    Detached MCP runs use this boundary to persist their exact frozen result
+    before the experiment's last-success pointer can advance. Ordinary engine
+    callers omit the hook and retain the normal single-filesystem transaction.
+    """
+
+    def prepare(
+        self,
+        *,
+        experiment: Experiment,
+        generation_id: str,
+        winners: Mapping[str, Winner],
+    ) -> None:
+        """Durably prepare sidecar state before the publication pointer advances.
+
+        :param Experiment experiment: Exact experiment configuration being published.
+        :param str generation_id: Generation whose validated result is ready to commit.
+        :param Mapping[str, Winner] winners: Engine-selected winners for that generation.
+        """
+        ...
+
+    def committed(self, *, generation_id: str) -> None:
+        """Record that the publication pointer advanced to the prepared generation.
+
+        :param str generation_id: Generation whose pointer commit completed.
+        """
+        ...
 
 
 def _terminal_report_from_cleanup(
@@ -260,6 +293,7 @@ def run_experiment(
     from_phase: str | None = None,
     dry_run: bool = False,
     terminal_callback: Callable[[TerminalReport], None] | None = None,
+    publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
 ) -> dict[str, Winner]:
     """Run all phases in order, returning a map of phase name to Winner.
@@ -287,6 +321,8 @@ def run_experiment(
             phase but launch no subprocesses; no summary is written.
         terminal_callback: Optional synchronous callback invoked with the
             structured terminal report while the experiment lock is still held.
+        publication_hook: Optional required precommit/postcommit sidecar used by
+            detached runners to make their frozen result durable with publication.
         generation_id: Optional caller-owned invocation identity. Detached MCP
             runs use their run id; direct callers receive a generated identity.
             Supplied values must contain only alphanumerics, underscores, and dashes.
@@ -324,6 +360,7 @@ def run_experiment(
         experiment,
         from_phase=from_phase,
         terminal_callback=terminal_callback,
+        publication_hook=publication_hook,
         generation_id=generation_id,
     )
     return dict(outcome.winners)
@@ -334,6 +371,7 @@ def _run_experiment_outcome(
     *,
     from_phase: str | None = None,
     terminal_callback: Callable[[TerminalReport], None] | None = None,
+    publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
 ) -> ExperimentRunOutcome:
     """Run all phases and bind the winners to their published generation identity.
@@ -347,6 +385,8 @@ def _run_experiment_outcome(
     :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
     :param Callable[[TerminalReport], None] | None terminal_callback: Optional
         diagnostic callback; see :func:`run_experiment`.
+    :param PublicationHook | None publication_hook: Optional required
+        publication sidecar; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
     :return ExperimentRunOutcome: Winners bound to the publishing generation id.
     :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
@@ -463,6 +503,7 @@ def _run_experiment_outcome(
                 generation_id=generation_id,
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
+                publication_hook=publication_hook,
             )
             terminal_report = _terminal_report_from_cleanup(
                 generation_id,
@@ -589,6 +630,7 @@ def _run_experiment_inner(
     generation_id: str | None,
     preloaded_winners: dict[str, Winner] | None = None,
     run_deadline: float | None = None,
+    publication_hook: PublicationHook | None = None,
 ) -> dict[str, Winner]:
     """Sequential phase loop assuming locks/signal handlers are already set up.
 
@@ -604,6 +646,7 @@ def _run_experiment_inner(
         run_deadline: Optional precomputed whole-run monotonic deadline. Preflight
             passes this through so validation and stale cleanup consume the same
             invocation budget as trial execution.
+        publication_hook: Optional required sidecar around publication commit.
 
     Returns:
         Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
@@ -751,7 +794,13 @@ def _run_experiment_inner(
         "artifacts": _generation_artifact_manifest(experiment, generation_id),
     }
     _write_yaml_atomic(summary_path, summary)
-    _publish_generation(experiment, generation_id, from_phase=from_phase)
+    _publish_generation(
+        experiment,
+        generation_id,
+        from_phase=from_phase,
+        winners=winners,
+        publication_hook=publication_hook,
+    )
     log.info("Wrote %s", summary_path)
 
     return winners
@@ -1221,7 +1270,7 @@ def _validate_publishable_summary(
     id_key: str,
     id_value: str,
     label: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bytes]:
     """Parse back one generation's own immutable summary before its publication commit.
 
     Shared pre-commit validation core (item A, review v0.5.15) for
@@ -1242,10 +1291,11 @@ def _validate_publishable_summary(
         ``"Suite generation"``).
     :raises PublicationCommitError: The summary cannot be read back as a correctly
         named mapping; the last-success pointer must not advance to it.
-    :return dict[str, Any]: The parsed summary payload.
+    :return tuple[dict[str, Any], bytes]: Parsed summary and the exact bytes validated.
     """
     try:
-        summary = yaml.safe_load(summary_path.read_text())
+        summary_bytes = summary_path.read_bytes()
+        summary = yaml.safe_load(summary_bytes)
     except (OSError, yaml.YAMLError) as exc:
         raise PublicationCommitError(
             f"{label} {id_value!r} summary could not be read back; "
@@ -1260,10 +1310,10 @@ def _validate_publishable_summary(
             f"{label} {id_value!r} summary failed publication validation; "
             "refusing to advance the last-success pointer."
         )
-    return summary
+    return summary, summary_bytes
 
 
-def _validate_generation_publishable(experiment: Experiment, generation_id: str) -> None:
+def _validate_generation_publishable(experiment: Experiment, generation_id: str) -> bytes:
     """Validate a generation's complete result manifest before its publication commit.
 
     Checks the generation's immutable summary names this exact experiment and
@@ -1285,8 +1335,9 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
         or does not name this generation.
     :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
+    :return bytes: Exact summary bytes whose manifest was validated.
     """
-    summary = _validate_publishable_summary(
+    summary, summary_bytes = _validate_publishable_summary(
         summary_path=_generation_summary_path(experiment, generation_id),
         owner_key="experiment",
         owner_value=experiment.experiment,
@@ -1299,6 +1350,7 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
         generation_id,
         summary,
     )
+    return summary_bytes
 
 
 def _publish_generation(
@@ -1306,6 +1358,8 @@ def _publish_generation(
     generation_id: str,
     *,
     from_phase: str | None,
+    winners: Mapping[str, Winner],
+    publication_hook: PublicationHook | None,
 ) -> None:
     """Publish a generation as the experiment's last successful result.
 
@@ -1317,9 +1371,11 @@ def _publish_generation(
     2. Pre-commit validation (:func:`_validate_generation_publishable`, item
        A): parse this generation's own summary and winner files back and
        confirm they name themselves correctly.
-    3. Commit ``last_successful_generation.yaml`` atomically -- the single
-       authoritative publication event. Nothing fallible may run before this
-       line that could leave a half-committed pointer.
+    3. When supplied, require the detached runner's sidecar hook to durably
+       prepare its frozen result.
+    4. Commit ``last_successful_generation.yaml`` atomically -- the single
+       authoritative publication event. Failures in either preceding step
+       leave the prior pointer untouched.
 
     If step 2 or 3 raises, the immutable per-generation record is written
     once with state ``"publication_failed"`` (+ ``error_class``), the current
@@ -1329,10 +1385,11 @@ def _publish_generation(
     (:func:`_persist_terminal_failure`): a secondary failure while writing it
     is logged, never substituted for the primary error.
 
-    Once step 3 has committed, nothing after it may fail the run:
+    Once step 4 has committed, nothing after it may fail the run:
 
-    4. Write the immutable per-generation record once, state ``"published"``.
-    5. Best-effort, diagnostic-only: drive the current pointer to
+    5. Best-effort, notify the prepared sidecar that the pointer committed.
+    6. Write the immutable per-generation record once, state ``"published"``.
+    7. Best-effort, diagnostic-only: drive the current pointer to
        ``"published"``, then refresh the legacy compatibility projections
        (root ``winner.yaml`` / ``promotion.yaml`` / ``summary.yaml``; review
        v0.5.15 / item D). These are post-commit caches for humans and legacy
@@ -1341,7 +1398,7 @@ def _publish_generation(
        :func:`phasesweep.engine.state._published_winner_path_for`), so a
        failure projecting them never affects what callers actually see.
 
-    Steps 4 and 5 each independently log and swallow their own failure so one
+    Steps 5 through 7 each independently log and swallow their own failure so one
     cannot prevent the other from running.
 
     The whole transaction runs inside an
@@ -1358,15 +1415,30 @@ def _publish_generation(
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.
     :param str | None from_phase: Resume point recorded on the lifecycle state.
-    :raises Exception: Whatever step 2 or step 3 raised, after best-effort
+    :param Mapping[str, Winner] winners: Engine-selected winners to hand to a
+        required publication sidecar.
+    :param PublicationHook | None publication_hook: Optional detached-run sidecar.
+    :raises Exception: Whatever steps 2 through 4 raised, after best-effort
         "publication_failed" bookkeeping.
     """
     with absorb_shutdown_signals() as absorbed:
         try:
-            _validate_generation_publishable(experiment, generation_id)
+            summary_bytes = _validate_generation_publishable(experiment, generation_id)
+            if publication_hook is not None:
+                publication_hook.prepare(
+                    experiment=experiment,
+                    generation_id=generation_id,
+                    winners=MappingProxyType(dict(winners)),
+                )
             _write_yaml_atomic(
                 _last_successful_generation_path(experiment),
-                {"experiment": experiment.experiment, "generation_id": generation_id},
+                {
+                    "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                    "experiment": experiment.experiment,
+                    "generation_id": generation_id,
+                    "summary_size_bytes": len(summary_bytes),
+                    "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+                },
             )
         except BaseException as exc:
             error_class = type(exc).__name__
@@ -1382,8 +1454,15 @@ def _publish_generation(
             )
             raise
 
+        if publication_hook is not None:
+            _log_on_failure(
+                lambda: publication_hook.committed(generation_id=generation_id),
+                "failed to record the detached-run publication receipt after the "
+                "last-success pointer committed; the prepared snapshot remains recoverable",
+            )
+
         def _write_published_record() -> None:
-            """Step 4: write the immutable per-generation record once, state ``published``."""
+            """Step 6: write the immutable per-generation record once, state ``published``."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
@@ -1399,7 +1478,7 @@ def _publish_generation(
         )
 
         def _refresh_published_pointer_and_projections() -> None:
-            """Step 5: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
+            """Step 7: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
@@ -1631,10 +1710,16 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             # committed suite publication.
             with absorb_shutdown_signals() as absorbed:
                 try:
-                    _validate_suite_generation_publishable(suite, generation_id)
+                    summary_bytes = _validate_suite_generation_publishable(suite, generation_id)
                     _write_yaml_atomic(
                         _last_successful_suite_generation_path(suite),
-                        {"suite": suite.suite, "suite_generation_id": generation_id},
+                        {
+                            "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                            "suite": suite.suite,
+                            "suite_generation_id": generation_id,
+                            "summary_size_bytes": len(summary_bytes),
+                            "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+                        },
                     )
                 except BaseException as exc:
                     error_class = type(exc).__name__
@@ -1738,7 +1823,7 @@ def _claim_suite_generation(suite: Suite) -> str:
     raise RuntimeError("Could not mint an unused suite generation id after 10 attempts.")
 
 
-def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> None:
+def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> bytes:
     """Validate a suite generation's summary and component references before its commit.
 
     Suite mirror of :func:`_validate_generation_publishable` (review v0.5.16
@@ -1757,8 +1842,9 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         does not name this suite generation.
     :raises PublicationAccessError: A component artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A component manifest fails validation.
+    :return bytes: Exact suite-summary bytes whose component graph was validated.
     """
-    summary = _validate_publishable_summary(
+    summary, summary_bytes = _validate_publishable_summary(
         summary_path=_suite_generation_summary_path(suite, generation_id),
         owner_key="suite",
         owner_value=suite.suite,
@@ -1835,6 +1921,7 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         raise
     except PublicationIntegrityError as exc:
         raise _fail(str(exc)) from exc
+    return summary_bytes
 
 
 def _write_suite_generation_state(

@@ -660,7 +660,15 @@ def read_status(
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
     published_config_matches_current: bool | None = None
-    summary_payload = _read_summary_payload(summary_path)
+    summary_payload: Mapping[str, Any] | None
+    if (
+        publication.state == "ok"
+        and represented_generation_id == publication.generation_id
+        and publication.summary is not None
+    ):
+        summary_payload = publication.summary
+    else:
+        summary_payload = _read_summary_payload(summary_path)
     if summary_payload is not None:
         stored_plan = _summary_phase_plan(summary_payload)
         if stored_plan is not None:

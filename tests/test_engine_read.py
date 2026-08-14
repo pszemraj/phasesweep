@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import optuna
@@ -9,6 +10,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
+import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
 from phasesweep.config import (
     Experiment,
@@ -24,11 +26,13 @@ from phasesweep.config import (
 from phasesweep.engine import read_status, read_winner, read_winners
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import (
+    PUBLICATION_POINTER_SCHEMA_VERSION,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
+    _resolve_publication_pointer,
     _winner_path,
 )
 from tests.conftest import make_experiment, write_trainer
@@ -303,14 +307,22 @@ def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: 
     blocker 3). The record is written too, purely as the informational,
     post-commit artifact real publications also produce.
     """
-    _last_successful_generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
-    _last_successful_generation_path(exp).write_text(
-        yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
-    )
     summary_path = _generation_summary_path(exp, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(
         yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
+    )
+    summary = summary_path.read_bytes()
+    _last_successful_generation_path(exp).write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                "experiment": exp.experiment,
+                "generation_id": generation_id,
+                "summary_size_bytes": len(summary),
+                "summary_sha256": hashlib.sha256(summary).hexdigest(),
+            }
+        )
     )
     record_path = _generation_record_path(exp, generation_id)
     record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -775,6 +787,34 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     )
     assert winner.phase == "p"
     assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
+
+
+def test_read_status_reuses_the_pointer_authenticated_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status snapshot never reopens summary bytes after authenticating its pointer."""
+    experiment = _drift_experiment(tmp_path)
+    run_experiment(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    assert publication.state == "ok"
+    generation_id = publication.generation_id
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary_path.write_bytes(summary_path.read_bytes() + b"\n# changed after resolution\n")
+    monkeypatch.setattr(engine_read, "_resolve_publication_pointer", lambda _exp: publication)
+
+    def unexpected_reread(_path: Path | None):
+        raise AssertionError("authenticated summary was reopened")
+
+    monkeypatch.setattr(engine_read, "_read_summary_payload", unexpected_reread)
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert status["result_phase_plan"] == ["p"]
+    assert status["metric"]["name"] == "x"
+    assert _resolve_publication_pointer(experiment).state == "failed"
 
 
 def test_result_phase_plan_falls_back_to_the_current_config_for_a_planless_summary(

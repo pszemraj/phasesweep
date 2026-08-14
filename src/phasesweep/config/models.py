@@ -468,9 +468,19 @@ class ExecutionContext(_Frozen):
             "'none' starts from a minimal documented base (PATH, HOME, LANG, "
             "LC_ALL, TMPDIR, USER, LOGNAME, TZ). A list inherits the base "
             "plus exactly the named variables. Configured `env` values are "
-            "always applied on top and are always fingerprinted; the "
-            "inherit contract (mode/names, not ambient values) is "
-            "fingerprinted too."
+            "always applied on top and are always semantic. In persistent "
+            "studies, inherited values outside `passthrough_env` must match "
+            "the existing trial cohort before another trial is allocated."
+        ),
+    )
+    passthrough_env: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ambient credential or transport variables that may rotate without "
+            "changing a persistent study's semantic environment cohort. These "
+            "names are inherited in addition to a narrowed `inherit_env` contract, "
+            "but their values are excluded from the cohort digest. Their sorted "
+            "names and classification remain part of the config fingerprint."
         ),
     )
     record_env: bool = Field(
@@ -482,8 +492,9 @@ class ExecutionContext(_Frozen):
             "secrets; the file is created owner-only (0600), unlike the rest "
             "of the trial directory. Every trial always records the "
             "environment's SHA-256 digest and its variable NAMES as study "
-            "attributes regardless of this flag, and neither the digest nor "
-            "the values join any semantic fingerprint."
+            "attributes regardless of this flag. The digest covers semantic "
+            "values only; pass-through values are never persisted in study "
+            "attributes."
         ),
     )
 
@@ -494,12 +505,22 @@ class ExecutionContext(_Frozen):
         :raises ValueError: A listed variable name is empty or padded.
         :return ExecutionContext: Self, unchanged.
         """
+        named_contracts = {"passthrough_env": self.passthrough_env}
         if isinstance(self.inherit_env, list):
-            bad = [name for name in self.inherit_env if not name or name != name.strip()]
+            named_contracts["inherit_env"] = self.inherit_env
+        for label, names in named_contracts.items():
+            bad = [name for name in names if not name or name != name.strip()]
             if bad:
-                raise ValueError(f"inherit_env names must be nonempty and unpadded: {bad!r}")
-            if len(set(self.inherit_env)) != len(self.inherit_env):
-                raise ValueError("inherit_env names must be unique.")
+                raise ValueError(f"{label} names must be nonempty and unpadded: {bad!r}")
+            if len(set(names)) != len(names):
+                raise ValueError(f"{label} names must be unique.")
+        if isinstance(self.inherit_env, list):
+            overlap = sorted(set(self.inherit_env) & set(self.passthrough_env))
+            if overlap:
+                raise ValueError(
+                    "inherit_env and passthrough_env must not overlap; classify each "
+                    f"ambient variable once: {overlap!r}"
+                )
         return self
 
 

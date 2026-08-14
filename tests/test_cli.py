@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -42,6 +43,9 @@ from phasesweep.engine.run import run_suite
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    PUBLICATION_POINTER_SCHEMA_VERSION,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
@@ -401,8 +405,17 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
     summary = _generation_summary_path(experiment, "successful")
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text("experiment: t\ngeneration_id: successful\n")
+    summary_bytes = summary.read_bytes()
     _last_successful_generation_path(experiment).write_text(
-        "experiment: t\ngeneration_id: successful\n"
+        yaml.safe_dump(
+            {
+                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                "experiment": "t",
+                "generation_id": "successful",
+                "summary_size_bytes": len(summary_bytes),
+                "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+            }
+        )
     )
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
@@ -1469,6 +1482,9 @@ def test_rebind_workdir_adopts_a_legacy_study_with_an_interrupted_attempt(
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     study.set_user_attr(TRIAL_TARGET_ATTR, 2)
     trial = study.ask()
+    prior_attrs = study.trials[0].user_attrs
+    trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, prior_attrs[TRAINER_ENV_DIGEST_ATTR])
+    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, prior_attrs[TRAINER_ENV_NAMES_ATTR])
     trial_dir = _experiment_dir(experiment_a) / "p" / "trial_00001__interrupted"
     trial_dir.mkdir(parents=True)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))

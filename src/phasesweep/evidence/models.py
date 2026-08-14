@@ -166,10 +166,25 @@ class LogRegexExtractor(_TrialFilePathModel):
 class _WandbSummarySource(_Frozen):
     """Shared location and polling contract for one W&B run summary."""
 
+    base_url: str = Field(default="https://api.wandb.ai", min_length=1)
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
     poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
     timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalize_base_url(cls, value: str) -> str:
+        """Normalize the endpoint spelling used by the W&B public API.
+
+        :param str value: Configured W&B API base URL.
+        :raises ValueError: The value consists only of slashes.
+        :return str: Base URL without trailing slashes.
+        """
+        normalized = value.rstrip("/")
+        if not normalized:
+            raise ValueError("W&B base_url must contain a non-slash endpoint.")
+        return normalized
 
 
 class WandbExtractor(_WandbSummarySource):

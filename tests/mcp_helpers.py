@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -17,7 +18,7 @@ from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
 from phasesweep.runtime import process as runtime_process
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.process import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
 
@@ -322,6 +323,43 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         assert kwargs.get("stderr") is subprocess.STDOUT
         assert kwargs.get("start_new_session") is True
         assert stdout is not None and not getattr(stdout, "closed", True)
+        ready_fd = int(cmd[cmd.index("--launch-ready-fd") + 1])
+        ack_fd = int(cmd[cmd.index("--launch-ack-fd") + 1])
+        lease_fd = int(cmd[cmd.index("--launch-lease-fd") + 1])
+        inherited = kwargs.get("pass_fds")
+        assert isinstance(inherited, tuple)
+        assert ready_fd in inherited
+        assert ack_fd in inherited
+        assert lease_fd in inherited
+        ack_reader = os.dup(ack_fd)
+        pending_store = RunStore(Path(cmd[cmd.index("--state-dir") + 1]))
+        run_id = cmd[cmd.index("--run-id") + 1]
+        pending = pending_store.get(run_id)
+        assert pending is not None
+        pending_store.update(
+            RunHandle(
+                run_id=run_id,
+                experiment_id=pending.experiment_id,
+                config_sha256=pending.config_sha256,
+                pid=DummyProc.pid,
+                pgid=DummyProc.pid,
+                pid_starttime=read_proc_starttime(DummyProc.pid),
+                started_at=pending.started_at,
+                launch_state="spawned",
+                allow_cancel=pending.allow_cancel,
+                visible_params_at_launch=pending.visible_params_at_launch,
+                boot_id=read_boot_id(),
+            )
+        )
+        os.write(ready_fd, b"R")
+
+        def consume_ack() -> None:
+            try:
+                os.read(ack_reader, 1)
+            finally:
+                os.close(ack_reader)
+
+        threading.Thread(target=consume_ack, daemon=True).start()
         captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env")

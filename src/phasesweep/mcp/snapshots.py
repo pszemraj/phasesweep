@@ -452,6 +452,37 @@ def capture_result_snapshot(
     return snapshot.model_dump(mode="json")
 
 
+def mark_result_snapshot_published(
+    snapshot: Mapping[str, object],
+    *,
+    generation_id: str,
+) -> dict[str, Any]:
+    """Bind a prepared result snapshot to its completed publication commit.
+
+    Detached MCP runs capture and persist their exact generation before the
+    engine advances the last-success pointer. Once that pointer commits, this
+    transition updates only the frozen publication relationship; it never
+    rereads shared study state or reconstructs winner facts.
+
+    :param Mapping[str, object] snapshot: Snapshot prepared under the experiment lock.
+    :param str generation_id: Generation whose last-success pointer just committed.
+    :return dict[str, Any]: Validated snapshot recording the committed publication.
+    :raises RuntimeError: If the snapshot represents another generation or was
+        captured without that generation's summary.
+    :raises ValidationError: If ``snapshot`` is not a valid :class:`RunResultSnapshot`.
+    """
+    parsed = RunResultSnapshot.model_validate(snapshot)
+    status = parsed.status
+    if status.represented_generation_id != generation_id:
+        raise RuntimeError("prepared result snapshot represents a different generation")
+    if not status.summary_present:
+        raise RuntimeError("prepared result snapshot has no generation summary")
+    status.published_generation_id = generation_id
+    status.is_published = True
+    status.publication_integrity = "ok"
+    return parsed.model_dump(mode="json")
+
+
 def finalize_result_snapshot(
     snapshot: Mapping[str, object],
     *,
