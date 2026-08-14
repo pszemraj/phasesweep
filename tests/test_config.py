@@ -20,10 +20,11 @@ from phasesweep.config import (
 from tests.conftest import write_yaml
 
 
-def test_inherit_must_be_prior(tmp_path):
-    cfg = tmp_path / "exp.yaml"
-    cfg.write_text(
-        """
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(
+            """
 experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
@@ -40,16 +41,12 @@ phases:
   - name: b
     n_trials: 1
     search_space: { y: { type: float, low: 0.0, high: 1.0 } }
-"""
-    )
-    with pytest.raises(ValueError, match="inherits from 'b'"):
-        load_experiment(cfg)
-
-
-def test_constraint_requires_bound(tmp_path):
-    cfg = tmp_path / "exp.yaml"
-    cfg.write_text(
-        """
+""",
+            "inherits from 'b'",
+            id="inherit-must-reference-prior-phase",
+        ),
+        pytest.param(
+            """
 experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
@@ -65,16 +62,12 @@ phases:
   - name: a
     n_trials: 1
     search_space: { x: { type: float, low: 0, high: 1 } }
-"""
-    )
-    with pytest.raises(ValueError, match="must define at least one"):
-        load_experiment(cfg)
-
-
-def test_metric_constraint_name_collision(tmp_path):
-    cfg = tmp_path / "exp.yaml"
-    cfg.write_text(
-        """
+""",
+            "must define at least one",
+            id="constraint-requires-bound",
+        ),
+        pytest.param(
+            """
 experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
@@ -92,9 +85,20 @@ phases:
   - name: a
     n_trials: 1
     search_space: { x: { type: float, low: 0, high: 1 } }
-"""
-    )
-    with pytest.raises(ValueError, match="distinct"):
+""",
+            "distinct",
+            id="metric-constraint-name-collision",
+        ),
+    ],
+)
+def test_invalid_experiment_relationships(
+    tmp_path: Path,
+    body: str,
+    match: str,
+) -> None:
+    cfg = tmp_path / "exp.yaml"
+    cfg.write_text(body)
+    with pytest.raises(ValueError, match=match):
         load_experiment(cfg)
 
 

@@ -384,12 +384,12 @@ def test_validate_rejects_invalid_json_file_fixed_override(
         load_experiment(p)
 
 
-def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
-    """Contract-supplied values are composed into the same artifact and checked too."""
-    p = _override_yaml(
-        tmp_path,
-        "json_file",
-        """
+@pytest.mark.parametrize(
+    ("override_format", "body"),
+    [
+        pytest.param(
+            "json_file",
+            """
         contracts:
           frozen:
             fixed_overrides:
@@ -399,10 +399,31 @@ def test_validate_rejects_unserializable_json_file_contract_override(tmp_path):
             n_trials: 1
             contracts: [frozen]
         """,
-    )
-
+            id="json-file",
+        ),
+        pytest.param(
+            "argparse",
+            "        contracts:\n"
+            "          frozen:\n"
+            "            fixed_overrides:\n"
+            "              knob: {1: x}\n"
+            "        phases:\n"
+            "          - name: t\n"
+            "            n_trials: 1\n"
+            "            contracts: [frozen]\n",
+            id="argparse",
+        ),
+    ],
+)
+def test_validate_rejects_unrenderable_contract_override(
+    tmp_path: Path,
+    override_format: str,
+    body: str,
+) -> None:
+    """Contract values must serialize through the selected trainer-input format."""
+    config = _override_yaml(tmp_path, override_format, body)
     with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
-        load_experiment(p)
+        load_experiment(config)
 
 
 # ``knob`` holds a value with no faithful argparse wire form in every case:
@@ -435,25 +456,6 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
     )
 
     with pytest.raises(ValidationError, match=expected):
-        load_experiment(p)
-
-
-def test_validate_rejects_unrenderable_argparse_contract_override(tmp_path):
-    """Contract-supplied values compose into the same command line and are checked too."""
-    p = _override_yaml(
-        tmp_path,
-        "argparse",
-        "        contracts:\n"
-        "          frozen:\n"
-        "            fixed_overrides:\n"
-        "              knob: {1: x}\n"
-        "        phases:\n"
-        "          - name: t\n"
-        "            n_trials: 1\n"
-        "            contracts: [frozen]\n",
-    )
-
-    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
         load_experiment(p)
 
 

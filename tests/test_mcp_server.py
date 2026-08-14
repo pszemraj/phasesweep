@@ -2862,10 +2862,25 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
         app.launch("srv")
 
 
-def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("catalog_allows_cancel", "run_allows_cancel"),
+    [
+        pytest.param(False, True, id="catalog-denies-cancel"),
+        pytest.param(True, False, id="launch-snapshot-denies-cancel"),
+    ],
+)
+def test_cancel_requires_catalog_and_launch_time_permission(
+    tmp_path: Path,
+    catalog_allows_cancel: bool,
+    run_allows_cancel: bool,
+) -> None:
+    """Cancellation remains denied when either authority source forbids it."""
     config = _config(tmp_path)
+    allowed = ALLOW_SIDE_EFFECTS
+    if not catalog_allows_cancel:
+        allowed = {"launch": True, "cancel": False, "from_phase": True}
     app, registry, store = make_mcp_app(
-        _catalog(tmp_path, config, allow={"launch": True, "cancel": False, "from_phase": True}),
+        _catalog(tmp_path, config, allow=allowed),
     )
     reg = registry.get("srv")
     run_id = "srv-denied"
@@ -2874,25 +2889,7 @@ def test_cancel_permission_denied_before_signalling(tmp_path: Path) -> None:
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
-            allow_cancel=True,
-        )
-    )
-
-    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
-        app.cancel(run_id)
-
-
-def test_cancel_cannot_be_enabled_after_launch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-launch-denied-cancel"
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            allow_cancel=False,
+            allow_cancel=run_allows_cancel,
         )
     )
 
@@ -4370,13 +4367,34 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     assert store.live_runs() == []
 
 
-def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
+@pytest.mark.parametrize(
+    ("snapshot_suffix", "terminal_without_evidence", "expected_message"),
+    [
+        pytest.param(
+            b"",
+            True,
+            "could not confirm any trial-level cleanup evidence",
+            id="terminal-uncertainty-without-trial-evidence",
+        ),
+        pytest.param(
+            b"\n# drifted\n",
+            False,
+            "run snapshot hash mismatch",
+            id="snapshot-hash-mismatch",
+        ),
+    ],
+)
+def test_operator_recovery_refuses_unverifiable_run(
     tmp_path: Path,
+    snapshot_suffix: bytes,
+    terminal_without_evidence: bool,
+    expected_message: str,
 ) -> None:
+    """Recovery refuses missing cleanup evidence and altered launch snapshots."""
     config = _config(tmp_path)
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    run_id = "srv-terminal-no-evidence"
+    run_id = "srv-unverifiable-recovery"
     handle = make_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
@@ -4385,14 +4403,17 @@ def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
         starttime=111,
     )
     store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    write_run_status(
-        store,
-        run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + snapshot_suffix)
+    if terminal_without_evidence:
+        write_run_status(
+            store,
+            run_id,
+            returncode=1,
+            error_class="UnsafeProcessCleanupError",
+            cleanup_confirmed=False,
+        )
+    else:
+        store.mark_cleanup_uncertain(handle)
 
     result = CliRunner().invoke(
         cli_main,
@@ -4408,41 +4429,8 @@ def test_operator_recovery_refuses_terminal_uncertainty_without_trial_evidence(
     )
 
     assert result.exit_code != 0
-    assert "could not confirm any trial-level cleanup evidence" in result.output
+    assert expected_message in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert store.state(handle) == "running"
-
-
-def test_operator_recovery_refuses_snapshot_hash_mismatch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-bad-snapshot"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=999999,
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + b"\n# drifted\n")
-    store.mark_cleanup_uncertain(handle)
-
-    result = CliRunner().invoke(
-        cli_main,
-        [
-            "mcp",
-            "recover-run",
-            "--state-dir",
-            str(registry.state_dir),
-            "--run-id",
-            run_id,
-            "--confirm",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "run snapshot hash mismatch" in result.output
-    assert store.cleanup_uncertain_path(run_id).is_file()
-    assert not store.cleanup_recovery_path(run_id).exists()
+    if not terminal_without_evidence:
+        assert store.cleanup_uncertain_path(run_id).is_file()

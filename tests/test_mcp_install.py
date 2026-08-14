@@ -182,16 +182,6 @@ def test_json_member_edits_survive_a_string_colliding_with_the_float_placeholder
     }
 
 
-@pytest.mark.parametrize("token", [b"Infinity", b"-Infinity", b"NaN"])
-def test_merge_json_member_still_rejects_nonfinite_constants(tmp_path, token):
-    path = tmp_path / "mcp.json"
-    original = b'{"threshold":' + token + b',"mcpServers":{}}\n'
-    path.write_bytes(original)
-
-    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "skipped"
-    assert path.read_bytes() == original
-
-
 def test_json_member_edits_preserve_crlf(tmp_path):
     path = tmp_path / "mcp.json"
     path.write_bytes(b'{\r\n  "theme": "dark",\r\n  "mcpServers": {}\r\n}\r\n')
@@ -218,20 +208,58 @@ def test_merge_json_member_preserves_literal_unicode(tmp_path):
     assert "\\u00e9" not in text
 
 
-def test_merge_json_member_skips_commented_config(tmp_path):
-    path = tmp_path / "opencode.json"
-    original = '{\n  // my settings\n  "mcp": {}\n}\n'
+@pytest.mark.parametrize(
+    ("path_name", "key", "original", "expected"),
+    [
+        pytest.param(
+            "opencode.json",
+            "mcp",
+            '{\n  // my settings\n  "mcp": {}\n}\n',
+            "skipped",
+            id="commented-config",
+        ),
+        pytest.param(
+            "mcp.json",
+            "mcpServers",
+            '{"mcpServers": {"phasesweep": {"command": "custom"}}}\n',
+            "conflict",
+            id="unmanaged-member-conflict",
+        ),
+    ],
+)
+def test_merge_json_member_preserves_uneditable_config(
+    tmp_path, path_name, key, original, expected
+):
+    path = tmp_path / path_name
     path.write_text(original)
-    assert merge_json_member(path, "mcp", "phasesweep", ENTRY) == "skipped"
+
+    assert merge_json_member(path, key, "phasesweep", ENTRY) == expected
     assert path.read_text() == original
 
 
 @pytest.mark.parametrize(
     "original",
     [
-        b'{"theme":"first","theme":"second","mcpServers":{}}\n',
-        b'{"threshold":1e400,"mcpServers":{}}\n',
-        b'{"threshold":NaN,"mcpServers":{}}\n',
+        pytest.param(
+            b'{"theme":"first","theme":"second","mcpServers":{}}\n',
+            id="duplicate-key",
+        ),
+        pytest.param(
+            b'{"threshold":1e400,"mcpServers":{}}\n',
+            id="overflow-number",
+        ),
+        pytest.param(
+            b'{"threshold":NaN,"mcpServers":{}}\n',
+            id="nan-constant",
+        ),
+        pytest.param(
+            b'{"threshold":Infinity,"mcpServers":{}}\n',
+            id="positive-infinity-constant",
+        ),
+        pytest.param(
+            b'{"threshold":-Infinity,"mcpServers":{}}\n',
+            id="negative-infinity-constant",
+        ),
     ],
 )
 def test_merge_json_member_rejects_ambiguous_or_nonfinite_json(tmp_path, original):
@@ -630,71 +658,50 @@ def _configured_catalog(tmp_path):
     return catalog
 
 
-def test_check_install_reports_healthy_path_launcher(fake_home, tmp_path, capsys):
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param("healthy", id="healthy-path-launcher"),
+        pytest.param("missing", id="missing-executable"),
+        pytest.param("non-executable", id="non-executable-file"),
+        pytest.param("missing-shebang", id="missing-shebang-interpreter"),
+    ],
+)
+def test_check_install_reports_launcher_states(fake_home, tmp_path, capsys, state):
     project = tmp_path / "proj"
     project.mkdir()
     script = _executable(tmp_path)
+    if state == "missing":
+        script.unlink()
+    elif state == "non-executable":
+        script.chmod(0o644)
+    elif state == "missing-shebang":
+        script.write_text("#!/missing/environment/bin/python\n")
     claude = _target(project, "claude")
     _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
-
-    code = installer.check_install(project, ["claude"])
-
-    output = capsys.readouterr().out
-    assert code == 0
-    assert str(script) in output
-    assert "every configured phasesweep MCP launcher resolves" in output
-
-
-def test_check_install_reports_missing_executable_with_repair_guidance(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    missing = tmp_path / "gone" / "phasesweep-mcp"
-    claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(missing), _configured_catalog(tmp_path)))
 
     code = installer.check_install(project, ["claude"])
 
     captured = capsys.readouterr()
-    assert code == 1
-    assert "missing" in captured.out
-    assert "no longer exists" in captured.out
-    assert "correct conda environment" in captured.out
-    assert "need attention" in captured.err
-
-
-def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    script = _executable(tmp_path)
-    script.chmod(0o644)
-    claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
-
-    code = installer.check_install(project, ["claude"])
-
-    output = capsys.readouterr().out
-    assert code == 1
-    assert "not-executable" in output
-    assert "not executable" in output
-
-
-def test_check_install_reports_launcher_with_missing_shebang_interpreter(
-    fake_home, tmp_path, capsys
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    script = _executable(tmp_path)
-    script.write_text("#!/missing/environment/bin/python\n")
-    claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
-
-    code = installer.check_install(project, ["claude"])
-
-    output = capsys.readouterr().out
-    assert code == 1
-    assert "not-launchable" in output
-    assert "missing or non-executable interpreter" in output
-    assert "recreate that environment" in output
+    if state == "healthy":
+        assert code == 0
+        assert str(script) in captured.out
+        assert "every configured phasesweep MCP launcher resolves" in captured.out
+    elif state == "missing":
+        assert code == 1
+        assert "missing" in captured.out
+        assert "no longer exists" in captured.out
+        assert "correct conda environment" in captured.out
+        assert "need attention" in captured.err
+    elif state == "non-executable":
+        assert code == 1
+        assert "not-executable" in captured.out
+        assert "not executable" in captured.out
+    else:
+        assert code == 1
+        assert "not-launchable" in captured.out
+        assert "missing or non-executable interpreter" in captured.out
+        assert "recreate that environment" in captured.out
 
 
 def test_check_install_reports_missing_catalog(fake_home, tmp_path, capsys):
@@ -822,11 +829,22 @@ def test_check_install_never_mutates_the_config_it_reports_on(
     assert "recognized legacy launcher form" not in reports["healthy"]
 
 
-def test_check_install_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
+@pytest.mark.parametrize("operation", ["check", "install"], ids=["check-install", "install"])
+def test_rejects_unknown_agent_id(fake_home, tmp_path, capsys, operation):
     project = tmp_path / "proj"
     project.mkdir()
 
-    code = installer.check_install(project, ["unknown"])
+    if operation == "check":
+        code = installer.check_install(project, ["unknown"])
+    else:
+        code = installer.run(
+            "install",
+            project,
+            _write_valid_catalog(project),
+            ["unknown"],
+            "mcp",
+            yes=True,
+        )
 
     assert code == 2
     assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
@@ -1378,57 +1396,46 @@ def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, ca
     assert "ok" in output
 
 
-def test_installer_returns_failure_when_post_install_verification_is_not_ok(
-    fake_home, tmp_path, capsys, monkeypatch
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-    target = _target(project, "claude")
-
-    monkeypatch.setattr(
-        installer,
-        "_check_target_launcher",
-        lambda _target, _project: installer.LauncherCheck(
-            target.mcp.path,
-            None,
-            (),
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_code", "attention"),
+    [
+        pytest.param(
             "missing",
             "written entry could not be verified",
+            1,
+            True,
+            id="missing-entry-needs-attention",
         ),
-    )
-
-    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
-
-    captured = capsys.readouterr()
-    assert code == 1
-    assert "missing" in captured.out
-    assert "written entry could not be verified" in captured.out
-    assert "1 step(s) need manual attention" in captured.err
-
-
-def test_installer_verification_uses_the_check_install_attention_predicate(
-    fake_home, tmp_path, capsys, monkeypatch
+        pytest.param("unmanaged", None, 0, False, id="unmanaged-entry-is-accepted"),
+    ],
+)
+def test_installer_verification_uses_check_install_attention_predicate(
+    fake_home, tmp_path, capsys, monkeypatch, status, detail, expected_code, attention
 ):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
     target = _target(project, "claude")
-    # Statuses `check-install` accepts must not make `install` disagree with it.
+
     monkeypatch.setattr(
         installer,
         "_check_target_launcher",
         lambda _target, _project: installer.LauncherCheck(
-            target.mcp.path, None, (), "unmanaged", None
+            target.mcp.path, None, (), status, detail
         ),
     )
 
     code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
 
     captured = capsys.readouterr()
-    assert code == 0
-    assert "unmanaged" in captured.out
-    assert "need manual attention" not in captured.err
+    assert code == expected_code
+    assert status in captured.out
+    if detail is not None:
+        assert detail in captured.out
+    if attention:
+        assert "1 step(s) need manual attention" in captured.err
+    else:
+        assert "need manual attention" not in captured.err
 
 
 def test_installer_verifies_launchers_when_an_earlier_step_needed_attention(
@@ -1584,17 +1591,6 @@ def test_installer_reports_write_error_without_calling_it_a_race(
     assert code == 1
     assert "config could not be written" in output
     assert "config changed before it could be replaced" not in output
-
-
-def test_installer_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-
-    code = installer.run("install", project, catalog, ["unknown"], "mcp", yes=True)
-
-    assert code == 2
-    assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
 
 
 def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path, capsys):

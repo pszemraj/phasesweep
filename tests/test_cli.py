@@ -1777,23 +1777,36 @@ def test_cli_boundary_rejects_uncompilable_suite_for_every_config_command(
     assert "OK:" not in captured.out
 
 
-def test_cli_boundary_reports_expected_run_failure_without_traceback(
+@pytest.mark.parametrize(
+    ("verbose", "expects_traceback"),
+    [
+        pytest.param(False, False, id="concise"),
+        pytest.param(True, True, id="verbose"),
+    ],
+)
+def test_cli_boundary_reports_expected_run_failure(
+    verbose: bool,
+    expects_traceback: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """An expected operational failure exits 1 with its message and no traceback."""
+    """Expected failures gain a traceback only when verbose logging is active."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    argv = ["run", str(config_path)]
+    if verbose:
+        argv.append("-v")
+    exit_code = _invoke_cli_boundary(argv, monkeypatch, debug=verbose)
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "no feasible trial in phase 'depth'" in captured.err
-    assert "Traceback" not in captured.err
-    assert "Traceback" not in captured.out
+    assert ("Traceback" in captured.err) is expects_traceback
+    if not verbose:
+        assert "Traceback" not in captured.out
 
 
 @pytest.mark.parametrize(
@@ -1846,24 +1859,6 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     assert "PHASESWEEP_LOCK_DIR must be an absolute path" in captured.err
     assert "Traceback" not in captured.err
     assert "internal error" not in captured.err
-
-
-def test_cli_boundary_adds_traceback_for_expected_failure_when_verbose(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``-v`` keeps the one-line diagnostic and adds the traceback behind it."""
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
-
-    exit_code = _invoke_cli_boundary(["run", str(config_path), "-v"], monkeypatch, debug=True)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "no feasible trial in phase 'depth'" in captured.err
-    assert "Traceback" in captured.err
 
 
 def test_cli_boundary_reports_unexpected_failure_as_internal_error(

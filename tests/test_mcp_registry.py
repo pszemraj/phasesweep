@@ -76,6 +76,20 @@ def _catalog(
     )
 
 
+def _assert_catalog_rejected(
+    tmp_path: Path,
+    catalog_body: str,
+    match: str,
+) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog = _write(
+        tmp_path / "catalog.yaml",
+        catalog_body.format(state=tmp_path / "state", config=config),
+    )
+    with pytest.raises(CatalogError, match=match):
+        Registry.load(catalog)
+
+
 def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
     registry = Registry.load(_catalog(tmp_path, config))
@@ -360,23 +374,32 @@ def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "catalog_body",
+    ("catalog_body", "match"),
     [
-        """
+        pytest.param(
+            """
         state_dir: {state}
         state_dir: {state}/other
         experiments:
           - id: reg_ok
             config: {config}
         """,
-        """
+            "duplicate key",
+            id="duplicate-top-level-key",
+        ),
+        pytest.param(
+            """
         state_dir: {state}
         experiments:
           - id: reg_ok
             config: {config}
             config: {config}
         """,
-        """
+            "duplicate key",
+            id="duplicate-entry-key",
+        ),
+        pytest.param(
+            """
         state_dir: {state}
         experiments:
           - id: reg_ok
@@ -385,18 +408,47 @@ def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
               launch: false
               launch: true
         """,
+            "duplicate key",
+            id="duplicate-allow-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        extra: true
+        experiments:
+          - id: reg_ok
+            config: {config}
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-top-level-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            cancle: false
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-entry-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            allow:
+              from-phase: false
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-allow-key",
+        ),
     ],
-    ids=["top_level", "entry", "allow"],
 )
-def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    catalog = _write(
-        tmp_path / "catalog.yaml",
-        catalog_body.format(state=tmp_path / "state", config=config),
-    )
-
-    with pytest.raises(CatalogError, match="duplicate key"):
-        Registry.load(catalog)
+def test_invalid_catalog_keys_rejected(tmp_path: Path, catalog_body: str, match: str) -> None:
+    _assert_catalog_rejected(tmp_path, catalog_body, match)
 
 
 def test_suite_config_rejected(tmp_path: Path) -> None:
@@ -469,44 +521,6 @@ def test_persistent_sqlite_uri_file_storage_allowed(tmp_path: Path) -> None:
     registry = Registry.load(_catalog(tmp_path, config))
 
     assert registry.get("reg_ok").experiment.storage == storage.strip('"')
-
-
-@pytest.mark.parametrize(
-    "catalog_body",
-    [
-        """
-        state_dir: {state}
-        extra: true
-        experiments:
-          - id: reg_ok
-            config: {config}
-        """,
-        """
-        state_dir: {state}
-        experiments:
-          - id: reg_ok
-            config: {config}
-            cancle: false
-        """,
-        """
-        state_dir: {state}
-        experiments:
-          - id: reg_ok
-            config: {config}
-            allow:
-              from-phase: false
-        """,
-    ],
-    ids=["top_level", "entry", "allow"],
-)
-def test_unknown_catalog_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    catalog = _write(
-        tmp_path / "catalog.yaml",
-        catalog_body.format(state=tmp_path / "state", config=config),
-    )
-    with pytest.raises(CatalogError, match="Extra inputs are not permitted"):
-        Registry.load(catalog)
 
 
 def test_config_not_found_rejected(tmp_path: Path) -> None:

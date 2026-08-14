@@ -64,6 +64,19 @@ def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> No
     assert Path(experiment.workdir) == output.parent / "runs"
 
 
+def _assert_starter_destination_round_trip(output: Path) -> Path:
+    """Render and initialize ``output``, then return its decoded work directory."""
+    runs_dir = output.parent / "runs"
+    rendered = yaml.safe_load(_starter_experiment_text(output))
+    assert rendered["workdir"] == str(runs_dir)
+    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
+
+    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    return Path(load_experiment(output).workdir)
+
+
 def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     """Rendered paths must survive YAML decoding byte-for-byte.
 
@@ -75,19 +88,11 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     project = tmp_path / "\U0001f680 sweeps"
     project.mkdir()
     output = project / "experiment.yaml"
-
-    rendered = yaml.safe_load(_starter_experiment_text(output))
     runs_dir = output.parent / "runs"
-    assert rendered["workdir"] == str(runs_dir)
-    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
-
-    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
-
-    assert result.exit_code == 0, result.output
-    experiment = load_experiment(output)
+    workdir = _assert_starter_destination_round_trip(output)
     # Lone surrogates raise UnicodeEncodeError here; a real path does not.
-    Path(experiment.workdir).mkdir(parents=True)
-    assert Path(experiment.workdir) == runs_dir
+    workdir.mkdir(parents=True)
+    assert workdir == runs_dir
 
 
 def test_init_renders_destinations_containing_placeholder_literals(tmp_path: Path) -> None:
@@ -101,16 +106,7 @@ def test_init_renders_destinations_containing_placeholder_literals(tmp_path: Pat
     output = project / "experiment.yaml"
     runs_dir = project / "runs"
 
-    rendered = yaml.safe_load(_starter_experiment_text(output))
-
-    assert rendered["workdir"] == str(runs_dir)
-    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
-
-    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
-
-    assert result.exit_code == 0, result.output
-    experiment = load_experiment(output)
-    assert Path(experiment.workdir) == runs_dir
+    assert _assert_starter_destination_round_trip(output) == runs_dir
 
 
 def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
