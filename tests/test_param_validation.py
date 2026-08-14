@@ -119,11 +119,11 @@ def test_sampler_rejects_negative_n_startup_trials():
         Sampler(type="tpe", n_startup_trials=-1)
 
 
-def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
-    """`phasesweep validate` must catch CMA-ES + categorical, not first trial."""
-    p = write_yaml(
-        tmp_path,
-        """
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(
+            """
         experiment: t
         trial_command: "echo {overrides}"
         override_format: argparse
@@ -137,9 +137,37 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
             sampler: { type: cmaes }
             search_space:
               model: { type: categorical, choices: ["a", "b"] }
-        """,
-    )
-    with pytest.raises(ValidationError, match="cmaes.*does not support categorical"):
+            """,
+            "cmaes.*does not support categorical",
+            id="cmaes-categorical",
+        ),
+        pytest.param(
+            """
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides: { lr: 0.001 }
+            search_space:
+              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
+            """,
+            "both fixed_overrides and search_space",
+            id="fixed-and-sampled-collision",
+        ),
+    ],
+)
+def test_validate_rejects_incompatible_phase_settings(
+    tmp_path: Path, body: str, match: str
+) -> None:
+    """Validation rejects incompatible sampler and parameter declarations."""
+    p = write_yaml(tmp_path, body)
+    with pytest.raises(ValidationError, match=match):
         load_experiment(p)
 
 
@@ -330,30 +358,6 @@ def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> No
                 n_trials=11,
             )
         )
-
-
-def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
-    """A key cannot be both fixed_overrides and search_space in the same phase."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides: { lr: 0.001 }
-            search_space:
-              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-        """,
-    )
-    with pytest.raises(ValidationError, match="both fixed_overrides and search_space"):
-        load_experiment(p)
 
 
 def test_find_prefix_collisions() -> None:

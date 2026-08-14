@@ -301,23 +301,57 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "storage",
+    ("storage", "error_match"),
     [
-        '"sqlite:///relative.db"',
-        '"sqlite+pysqlite:///relative.db"',
-        '"sqlite:///file:relative.db?mode=rwc&uri=true"',
-        '"journal:///relative.journal"',
-        '"journal://"',
-        '"journal:///"',
+        pytest.param('"sqlite:///relative.db"', "absolute .*storage path", id="relative-sqlite"),
+        pytest.param(
+            '"sqlite+pysqlite:///relative.db"',
+            "absolute .*storage path",
+            id="relative-sqlite-driver",
+        ),
+        pytest.param(
+            '"sqlite:///file:relative.db?mode=rwc&uri=true"',
+            "absolute .*storage path",
+            id="relative-sqlite-uri",
+        ),
+        pytest.param(
+            '"journal:///relative.journal"',
+            "absolute .*storage path",
+            id="relative-journal",
+        ),
+        pytest.param('"journal://"', "absolute .*storage path", id="empty-journal-url"),
+        pytest.param('"journal:///"', "absolute .*storage path", id="empty-journal-path"),
+        pytest.param('"sqlite://"', "storage must be persistent", id="empty-sqlite-url"),
+        pytest.param('"sqlite:///:memory:"', "storage must be persistent", id="sqlite-memory"),
+        pytest.param(
+            '"sqlite+pysqlite:///:memory:"',
+            "storage must be persistent",
+            id="sqlite-driver-memory",
+        ),
+        pytest.param(
+            '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+            "storage must be persistent",
+            id="sqlite-uri-memory",
+        ),
+        pytest.param(
+            '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+            "storage must be persistent",
+            id="sqlite-driver-uri-memory",
+        ),
+        pytest.param('":memory:"', "storage must be persistent", id="memory-shorthand"),
     ],
 )
-def test_relative_file_storage_rejected_for_mcp(tmp_path: Path, storage: str) -> None:
+def test_nonpersistent_storage_rejected_for_mcp(
+    tmp_path: Path,
+    storage: str,
+    error_match: str,
+) -> None:
     config = _write(
         tmp_path / "exp.yaml",
         _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
     )
 
-    with pytest.raises(CatalogError, match="absolute .*storage path"):
+    with pytest.raises(CatalogError, match=error_match):
         Registry.load(_catalog(tmp_path, config))
 
 
@@ -460,26 +494,6 @@ def test_suite_config_rejected(tmp_path: Path) -> None:
 def test_missing_storage_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
     with pytest.raises(CatalogError, match="storage"):
-        Registry.load(_catalog(tmp_path, config))
-
-
-@pytest.mark.parametrize(
-    "storage",
-    [
-        '"sqlite://"',
-        '"sqlite:///:memory:"',
-        '"sqlite+pysqlite:///:memory:"',
-        '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-        '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-        '":memory:"',
-    ],
-)
-def test_in_memory_storage_urls_rejected(tmp_path: Path, storage: str) -> None:
-    config = _write(
-        tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
-    )
-    with pytest.raises(CatalogError, match="storage must be persistent"):
         Registry.load(_catalog(tmp_path, config))
 
 

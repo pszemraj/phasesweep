@@ -223,10 +223,11 @@ def test_yaml_file_is_the_default_and_requires_config_path(tmp_path: Path) -> No
         load_experiment(invalid)
 
 
-def test_yaml_file_validation_rejects_unusable_base_path(tmp_path: Path) -> None:
-    config = write_yaml(
-        tmp_path,
-        """
+@pytest.mark.parametrize(
+    ("body", "error_match"),
+    [
+        pytest.param(
+            """
         experiment: bad_base
         trial_command: "python train.py {config_path}"
         trainer_config:
@@ -241,16 +242,11 @@ def test_yaml_file_validation_rejects_unusable_base_path(tmp_path: Path) -> None
             search_space:
               model.depth: {type: int, low: 4, high: 8}
         """,
-    )
-
-    with pytest.raises(ValidationError, match=r"trainer_config path 'model'.*not a mapping"):
-        load_experiment(config)
-
-
-def test_yaml_file_rejects_nonportable_yaml_values_at_config_load(tmp_path: Path) -> None:
-    config = write_yaml(
-        tmp_path,
-        """
+            r"trainer_config path 'model'.*not a mapping",
+            id="sampled-path-crosses-scalar-base",
+        ),
+        pytest.param(
+            """
         experiment: bad_value
         trial_command: "python train.py {config_path}"
         trainer_config:
@@ -261,9 +257,19 @@ def test_yaml_file_rejects_nonportable_yaml_values_at_config_load(tmp_path: Path
           extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
         phases: [{name: p, n_trials: 1}]
         """,
-    )
+            r"trainer_config.cutoff.*type date",
+            id="nonportable-yaml-date",
+        ),
+    ],
+)
+def test_yaml_file_rejects_invalid_trainer_config(
+    tmp_path: Path,
+    body: str,
+    error_match: str,
+) -> None:
+    config = write_yaml(tmp_path, body)
 
-    with pytest.raises(ValidationError, match=r"trainer_config.cutoff.*type date"):
+    with pytest.raises(ValidationError, match=error_match):
         load_experiment(config)
 
 

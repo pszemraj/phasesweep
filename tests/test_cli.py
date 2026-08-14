@@ -1195,34 +1195,46 @@ def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> No
     assert not _artifact_root_binding_path(untouched).exists()
 
 
-def test_rebind_workdir_refuses_a_stale_copy_missing_trial_evidence(
+@pytest.mark.parametrize(
+    "refusal_case",
+    [
+        pytest.param("stale-copy-missing-trial-evidence", id="stale-copy-missing-trial-evidence"),
+        pytest.param("running-trial", id="running-trial"),
+    ],
+)
+def test_rebind_workdir_refuses_unsafe_copied_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    refusal_case: str,
 ) -> None:
-    """A copy taken before the ledger advanced is not the same artifact tree.
-
-    Its publication still validates, so only the per-trial evidence check sees
-    that the next run would select a trial whose artifacts exist solely in the
-    source tree (re-review v0.5.19 / blocker B2).
-    """
+    """Rebind refuses copied trees with stale evidence or a live trial."""
     config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
     experiment_a = load_experiment(config_a)
     run_experiment(experiment_a)
-    shutil.copytree(workdir_a, workdir_b)
-    topped_up = experiment_a.model_copy(
-        update={"phases": [experiment_a.phases[0].model_copy(update={"n_trials": 2})]}
-    )
-    run_experiment(topped_up)
+
+    if refusal_case == "stale-copy-missing-trial-evidence":
+        shutil.copytree(workdir_a, workdir_b)
+        topped_up = experiment_a.model_copy(
+            update={"phases": [experiment_a.phases[0].model_copy(update={"n_trials": 2})]}
+        )
+        run_experiment(topped_up)
+    else:
+        assert experiment_a.storage is not None
+        optuna.load_study(study_name="t::p", storage=experiment_a.storage).ask()
+        shutil.copytree(workdir_a, workdir_b)
 
     exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
-    assert "trial 1" in captured.err
-    assert str(workdir_b) in captured.err
-    assert "stale copy" in captured.err
+    if refusal_case == "stale-copy-missing-trial-evidence":
+        assert "trial 1" in captured.err
+        assert str(workdir_b) in captured.err
+        assert "stale copy" in captured.err
+    else:
+        assert "RUNNING trial" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
@@ -1255,33 +1267,6 @@ def test_rebind_workdir_refuses_a_copy_missing_generated_trainer_input(
     assert "Traceback" not in captured.err
     assert "trainer_config.yaml" in captured.err
     assert "recorded generated trainer input" in captured.err
-    study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
-    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
-
-
-def test_rebind_workdir_refuses_while_a_trial_is_still_running(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """An interrupted attempt has to be recovered before its tree moves.
-
-    Recovery reads the absolute trial path the attempt persisted, so it can
-    only run against the root that attempt started under.
-    """
-    config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
-    experiment_a = load_experiment(config_a)
-    run_experiment(experiment_a)
-    assert experiment_a.storage is not None
-    optuna.load_study(study_name="t::p", storage=experiment_a.storage).ask()
-    shutil.copytree(workdir_a, workdir_b)
-
-    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "Traceback" not in captured.err
-    assert "RUNNING trial" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
