@@ -448,6 +448,30 @@ def leaf_name(path: Path) -> str:
     return leaf
 
 
+def _validate_private_owner_mode(
+    path: Path,
+    info: os.stat_result,
+    *,
+    kind: str,
+    expected_mode: int,
+) -> None:
+    """Validate the owner and exact permission mode of an opened private entry.
+
+    :param Path path: Display path used in an unsafe-entry diagnostic.
+    :param os.stat_result info: Metadata read from the already-open entry.
+    :param str kind: Human-readable entry kind used in the diagnostic.
+    :param int expected_mode: Required exact permission bits.
+    :raises UnsafePrivatePathError: If ownership or permissions are unsafe.
+    """
+    mode = stat.S_IMODE(info.st_mode)
+    euid = os.geteuid()
+    if info.st_uid != euid or mode != expected_mode:
+        raise UnsafePrivatePathError(
+            f"Private {kind} {path} must be owned by uid {euid} with mode "
+            f"{expected_mode:04o}; found uid {info.st_uid} and mode {mode:04o}."
+        )
+
+
 def _validate_private_dir_info(path: Path, info: os.stat_result) -> None:
     """Validate that an opened directory is owner-only, without modifying it.
 
@@ -458,15 +482,14 @@ def _validate_private_dir_info(path: Path, info: os.stat_result) -> None:
     :raises UnsafePrivatePathError: If the entry is not a directory, or is
         not owned by the current effective uid with mode ``0700``.
     """
-    mode = stat.S_IMODE(info.st_mode)
-    euid = os.geteuid()
     if not stat.S_ISDIR(info.st_mode):
         raise UnsafePrivatePathError(f"Private directory {path} is not a directory.")
-    if info.st_uid != euid or mode != PRIVATE_DIR_MODE:
-        raise UnsafePrivatePathError(
-            f"Private directory {path} must be owned by uid {euid} with mode 0700; "
-            f"found uid {info.st_uid} and mode {mode:04o}."
-        )
+    _validate_private_owner_mode(
+        path,
+        info,
+        kind="directory",
+        expected_mode=PRIVATE_DIR_MODE,
+    )
 
 
 def open_directory_fd(
@@ -665,15 +688,14 @@ def _validate_private_file_info(path: Path, info: os.stat_result) -> None:
         inode), or is not owned by the current effective uid with mode
         ``0600``.
     """
-    mode = stat.S_IMODE(info.st_mode)
-    euid = os.geteuid()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise UnsafePrivatePathError(f"Private file {path} must be one regular file.")
-    if info.st_uid != euid or mode != PRIVATE_FILE_MODE:
-        raise UnsafePrivatePathError(
-            f"Private file {path} must be owned by uid {euid} with mode 0600; "
-            f"found uid {info.st_uid} and mode {mode:04o}."
-        )
+    _validate_private_owner_mode(
+        path,
+        info,
+        kind="file",
+        expected_mode=PRIVATE_FILE_MODE,
+    )
 
 
 def _validate_private_destination(parent_fd: int, leaf: str, path: Path) -> None:
