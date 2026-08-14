@@ -14,14 +14,12 @@ from pathlib import Path
 
 import pytest
 
+import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.process import is_pid_zombie, read_boot_id, read_proc_starttime
+from phasesweep.runtime.process import read_boot_id, read_proc_starttime
+from tests.conftest import file_mode, is_pid_zombie
 from tests.mcp_helpers import make_run_handle, write_run_status
-
-
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
 
 
 def _earlier_boot_id() -> str:
@@ -38,9 +36,16 @@ def _earlier_boot_id() -> str:
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1")
+    handle = make_run_handle(
+        run_id="exp-1",
+        allow_cancel=True,
+        visible_params_at_launch=["lr", "depth"],
+    )
     store.create(handle)
     assert store.get("exp-1") == handle
+    persisted = json.loads((tmp_path / "state" / "runs" / "exp-1.json").read_text())
+    assert persisted["allow_cancel"] is True
+    assert persisted["visible_params_at_launch"] == ["lr", "depth"]
     assert store.get("missing") is None
 
 
@@ -79,6 +84,137 @@ def test_create_refuses_existing_identity_without_replacement(tmp_path: Path) ->
     assert store.get("exp-1") == first
 
 
+def test_create_serializes_before_reserving_the_final_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serialization error cannot publish an empty or partial handle."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-serialization")
+
+    def fail_serialization(*_args: object, **_kwargs: object) -> str:
+        raise TypeError("injected serialization failure")
+
+    monkeypatch.setattr(mcp_runs.json, "dumps", fail_serialization)
+
+    with pytest.raises(TypeError, match="serialization"):
+        store.create(handle)
+
+    assert not store.handle_exists(handle.run_id)
+    assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure_kind", ["file", "directory"])
+def test_create_fsync_failure_rolls_back_the_reserved_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """A failed file or directory fsync leaves no final run reservation."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id=f"exp-fsync-{failure_kind}")
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_selected_fsync(fd: int) -> None:
+        nonlocal failed
+        is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        if not failed and is_directory is (failure_kind == "directory"):
+            failed = True
+            raise OSError(f"injected {failure_kind} fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(mcp_runs.os, "fsync", fail_selected_fsync)
+
+    with pytest.raises(OSError, match=f"{failure_kind} fsync"):
+        store.create(handle)
+
+    assert failed
+    assert not store.handle_exists(handle.run_id)
+    assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
+    store.create(handle)
+    assert store.get(handle.run_id) == handle
+
+
+@pytest.mark.parametrize("failing_create", [1, 2, 3])
+def test_prepare_launch_rolls_back_each_create_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_create: int,
+) -> None:
+    """Lease, snapshot, and handle create failures leave no capacity reservation."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id=f"exp-create-{failing_create}", launch_state="launching")
+    real_create = mcp_runs._strict_atomic_create_text
+    calls = 0
+
+    def fail_one_create(path: Path, text: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failing_create:
+            raise OSError(f"injected create {failing_create} failure")
+        real_create(path, text)
+
+    monkeypatch.setattr(mcp_runs, "_strict_atomic_create_text", fail_one_create)
+
+    with pytest.raises(OSError, match=f"create {failing_create}"):
+        store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert store.get(handle.run_id) is None
+    assert not store.config_snapshot_path(handle.run_id).exists()
+    assert not store.launch_lease_path(handle.run_id).exists()
+
+
+def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient rollback failure retains the proof needed for retry cleanup."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-cleanup", launch_state="launching")
+    real_unlink = mcp_runs._strict_unlink
+    real_create = store.create
+    failed = False
+
+    def fail_handle_create(_handle: object) -> None:
+        raise OSError("injected handle create failure")
+
+    def fail_snapshot_cleanup(path: Path) -> None:
+        nonlocal failed
+        if path == store.config_snapshot_path(handle.run_id) and not failed:
+            failed = True
+            raise OSError("injected pre-spawn cleanup failure")
+        real_unlink(path)
+
+    monkeypatch.setattr(store, "create", fail_handle_create)
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", fail_snapshot_cleanup)
+    with pytest.raises(OSError, match="handle create"):
+        store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert failed
+    assert store.launch_lease_path(handle.run_id).is_file()
+    monkeypatch.setattr(store, "create", real_create)
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", real_unlink)
+    assert store.is_pre_spawn_orphan(handle.run_id)
+    store.clear_pre_spawn_orphan(handle.run_id)
+    assert not store.run_evidence_exists(handle.run_id)
+
+
+def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
+    tmp_path: Path,
+) -> None:
+    """The inherited lease closes the Popen-before-receipt recovery race."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-lease", launch_state="launching")
+    preparation = store.prepare_launch(handle, b"experiment: exp\n")
+
+    assert not store.is_pre_spawn_orphan(handle.run_id)
+    preparation.close()
+    assert store.is_pre_spawn_orphan(handle.run_id)
+    store.clear_pre_spawn_orphan(handle.run_id)
+    assert not store.run_evidence_exists(handle.run_id)
+
+
 def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(run_id="exp-1", launch_state="launching")
@@ -97,8 +233,30 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
     assert store.get("exp-1") == spawned
     with pytest.raises(ValueError, match="immutable field"):
         store.update(replace(spawned, experiment_id="other"))
+    with pytest.raises(ValueError, match="immutable field"):
+        store.update(replace(spawned, visible_params_at_launch="all"))
     with pytest.raises(ValueError, match="launching-to-spawned"):
         store.update(replace(spawned, pid=os.getppid(), pgid=os.getppid()))
+
+
+def test_legacy_handle_missing_launch_authority_loads_fail_closed(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    payload = asdict(
+        make_run_handle(
+            run_id="exp-legacy",
+            allow_cancel=True,
+            visible_params_at_launch="all",
+        )
+    )
+    payload.pop("allow_cancel")
+    payload.pop("visible_params_at_launch")
+    (tmp_path / "state" / "runs" / "exp-legacy.json").write_text(json.dumps(payload))
+
+    loaded = store.get("exp-legacy")
+
+    assert loaded is not None
+    assert loaded.allow_cancel is False
+    assert loaded.visible_params_at_launch is None
 
 
 def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path: Path) -> None:
@@ -123,12 +281,12 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     finally:
         os.umask(old_umask)
 
-    assert _mode(tmp_path / "state") == 0o700
-    assert _mode(tmp_path / "state" / "runs") == 0o700
-    assert _mode(tmp_path / "state" / "logs") == 0o700
-    assert _mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
-    assert _mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
-    assert _mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
+    assert file_mode(tmp_path / "state") == 0o700
+    assert file_mode(tmp_path / "state" / "runs") == 0o700
+    assert file_mode(tmp_path / "state" / "logs") == 0o700
+    assert file_mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
+    assert file_mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
+    assert file_mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
 
 
 def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: Path) -> None:
@@ -142,13 +300,13 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     state_dir = tmp_path / "state"
     RunStore(state_dir)
     before_modes = {
-        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+        path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     }
 
     RunStore.open_existing(state_dir)
 
     assert {
-        path: _mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
+        path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     } == before_modes
 
 
@@ -182,6 +340,20 @@ def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     assert {h.run_id for h in store.list_handles()} == {"exp-1", "exp-2"}
 
 
+def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    store.create(make_run_handle(run_id="exp-valid"))
+    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    store.log_path("broken").write_text("runner may still exist\n")
+    store.config_snapshot_path("exp-orphan").write_text("experiment: orphan\n")
+    store.status_path("exp-orphan").write_text("{}\n")
+
+    handles, unreadable_records = store.launch_inventory()
+
+    assert [handle.run_id for handle in handles] == ["exp-valid"]
+    assert unreadable_records == {"run:broken", "run:exp-orphan"}
+
+
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
@@ -212,6 +384,11 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
         ("started_at", "2026-07-17T12:00:00"),
         ("boot_id", ""),
         ("boot_id", 12345),
+        ("visible_params_at_launch", "some"),
+        ("visible_params_at_launch", [""]),
+        ("visible_params_at_launch", ["lr", "lr"]),
+        ("visible_params_at_launch", ["lr", 1]),
+        ("visible_params_at_launch", {"lr": True}),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
@@ -375,9 +552,38 @@ def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) 
         {"run_id": "exp-1", "returncode": 0, "error_class": 3},
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "complete"},
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_publication_state": "prepared",
+        },
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_snapshot_state": "pending",
+            "result_snapshot": {},
+            "result_publication_state": "unknown",
+            "result_publication_generation_id": "exp-1",
+        },
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "result_snapshot_state": "complete",
+            "result_snapshot": {},
+            "result_publication_state": "prepared",
+            "result_publication_generation_id": "exp-1",
+        },
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": "attempt-1"},
         {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": [""]},
+        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_generations": []},
+        {
+            "run_id": "exp-1",
+            "returncode": 0,
+            "recovered_attempt_generations": {"attempt-1": ""},
+        },
+        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": "attempt-1"},
+        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": [""]},
     ],
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
@@ -729,6 +935,67 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
     )
 
     assert store.state(handle) == "running"
+
+
+def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        recovered_attempt_ids=["runner-match", "runner-other"],
+        recovered_attempt_generations={
+            "runner-match": handle.run_id,
+            "runner-other": "other-run",
+        },
+    )
+    store.cleanup_recovery_path(handle.run_id).write_text(
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": ["operator-match"],
+                "reaped_attempt_locations": {
+                    "operator-match": {
+                        "phase": "p",
+                        "trial_number": 3,
+                        "generation_id": handle.run_id,
+                    },
+                    "not-authorized": {
+                        "phase": "p",
+                        "trial_number": 4,
+                        "generation_id": handle.run_id,
+                    },
+                },
+            }
+        )
+    )
+
+    attempt_ids, locations = store.cleanup_recovered_attempt_evidence(handle)
+
+    assert attempt_ids == {"runner-match", "operator-match"}
+    assert locations == {"operator-match": ("p", 3, handle.run_id)}
+
+    # Optional runner evidence may be persisted as null by an older or partial
+    # writer; the operator record remains independently usable.
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        recovered_attempt_ids=None,
+        recovered_attempt_generations={"runner-match": handle.run_id},
+    )
+    attempt_ids, locations = store.cleanup_recovered_attempt_evidence(handle)
+    assert attempt_ids == {"operator-match"}
+    assert locations == {"operator-match": ("p", 3, handle.run_id)}
 
 
 def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:

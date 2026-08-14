@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -29,6 +29,11 @@ class FloatParam(_Frozen):
 
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
+
+        Raises:
+            ValueError: ``low`` or ``high`` is non-finite, ``low > high``,
+                ``log`` is set with ``low <= 0``, ``step`` is non-finite or
+                ``<= 0``, or ``log`` and ``step`` are combined.
 
         """
         _require_finite("float param low", self.low)
@@ -62,6 +67,11 @@ class IntParam(_Frozen):
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
 
+        Raises:
+            ValueError: ``low > high``, ``log`` is set with ``low <= 0``,
+                ``step <= 0``, or ``log`` is combined with ``step != 1`` (which
+                Optuna's ``IntDistribution`` rejects at construction time).
+
         """
         if self.low > self.high:
             raise ValueError(f"int param: low ({self.low}) > high ({self.high})")
@@ -85,7 +95,7 @@ class CategoricalParam(_Frozen):
     @field_validator("choices")
     @classmethod
     def _choices_are_unique_optuna_scalars(cls, choices: list[Any]) -> list[Any]:
-        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and duplicates.
+        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and equal choices.
 
         Optuna keeps a duplicated choice verbatim — ``CategoricalDistribution([1, 1, 2])``
         has three choices and ``GridSampler`` enumerates three points — so
@@ -93,23 +103,35 @@ class CategoricalParam(_Frozen):
         still report the grid complete (review v0.5.17 / finding C). Duplicates
         also silently double a choice's sampling weight under TPE/random.
 
-        Uniqueness is type-aware: ``1``, ``1.0``, and ``true`` are three
-        different overrides on the wire even though Python calls them equal, so
-        the identity key is ``(type name, repr)`` rather than the value itself.
+        Uniqueness is by plain Python equality, across types, because that is
+        the comparison Optuna itself uses. ``CategoricalDistribution.
+        to_internal_repr`` locates a sampled value with ``choices.index(value)``,
+        i.e. by ``==``, when it records ``FrozenTrial.params``. So choices that
+        are distinct objects but compare equal — ``1``/``1.0``/``True``,
+        ``0``/``False``, ``0.0``/``-0.0`` — all collapse onto the *first* equal
+        choice the moment the trial is recorded. The trainer still receives the
+        live suggested value, but the published winner, the inherited overrides
+        of every child phase, and TPE's own history are rebuilt from the
+        collapsed ``params``: a phase that ran ``--x true`` publishes a winner
+        claiming ``x: 1``. Rejecting equal choices at config load is what makes
+        every accepted choice round-trip identically (PR #5 review / reviewer 2,
+        blocker 1).
 
         Args:
             choices: The candidate choices list pre-validation.
 
         Returns:
-            The same list, unchanged. Raises ``ValueError`` if any element is
-            not an Optuna-compatible scalar, is a non-finite float, or repeats
-            an earlier choice.
+            The same list, unchanged.
+
+        Raises:
+            ValueError: An element is not an Optuna-compatible scalar
+                (``None``/``bool``/``int``/``float``/``str``), is a non-finite
+                float, or compares equal to an earlier choice.
 
         """
         # Optuna only accepts None|bool|int|float|str as categorical choices.
         # Anything else (lists, dicts, custom objects) fails at suggest time.
         allowed = (str, int, float, bool, type(None))
-        first_index: dict[tuple[str, str], int] = {}
         for index, c in enumerate(choices):
             if not isinstance(c, allowed):
                 raise ValueError(
@@ -119,29 +141,99 @@ class CategoricalParam(_Frozen):
                 )
             if isinstance(c, float) and not math.isfinite(c):
                 raise ValueError(f"categorical float choices must be finite; got {c!r}")
-            identity = (type(c).__name__, repr(c))
-            if identity in first_index:
-                raise ValueError(
-                    f"categorical choices must be unique; {c!r} appears at index "
-                    f"{first_index[identity]} and index {index}. A repeated choice "
-                    "inflates grid cardinality (the phase runs an extra trial on an "
-                    "assignment it already evaluated, yet still reports a complete "
-                    "grid) and doubles that value's sampling weight. Uniqueness is "
-                    "type-aware: 1, 1.0, and true remain three distinct choices."
-                )
-            first_index[identity] = index
+            # Pairwise ``==`` rather than a hash/identity key: equal objects of
+            # different types (1 vs 1.0 vs True) are exactly the collision
+            # Optuna's index lookup cannot distinguish, and this also holds if
+            # a choice type ever stops being hashable.
+            for earlier_index in range(index):
+                earlier = choices[earlier_index]
+                if c == earlier:
+                    raise ValueError(
+                        "categorical choices must remain distinguishable after "
+                        f"Optuna persistence; {c!r} at index {index} compares equal "
+                        f"to {earlier!r} at index {earlier_index}. Optuna records a "
+                        "sampled value as its `==` index into choices, so equal "
+                        "choices collapse onto the first of them in "
+                        "FrozenTrial.params, the published winner, and every "
+                        "inherited override. A repeat also inflates grid "
+                        "cardinality (the phase runs an extra trial on an "
+                        "assignment it already evaluated, yet still reports a "
+                        "complete grid) and doubles that value's sampling weight."
+                    )
         return choices
 
 
-SearchParam = FloatParam | IntParam | CategoricalParam
+SearchParam = Annotated[
+    FloatParam | IntParam | CategoricalParam,
+    Field(discriminator="type"),
+]
+
+
+# Samplers whose suggestions depend on process-local RNG/optimizer state that
+# Optuna storage does not persist. `phasesweep.engine.guards.
+# _validate_sampler_continuation` refuses to resume one of these mid-target, so
+# each trial target must be run in a single invocation.
+NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})
+# Samplers that draw randomly and therefore need an explicit seed to make a
+# durable study reproducible. `grid` is excluded: it enumerates a fixed matrix.
+STOCHASTIC_SAMPLERS = frozenset({"tpe", "random", "cmaes"})
 
 
 class Sampler(_Frozen):
     """Optuna sampler configuration."""
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
-    seed: int | None = None
+    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     n_startup_trials: int = Field(default=10, ge=0)  # tpe only
+    acknowledge_nonresumable: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge that this sampler's trial target must run in one "
+            "invocation. TPE and CMA-ES suggestions depend on process-local "
+            "state Optuna storage does not persist, so PhaseSweep refuses to "
+            "resume such a phase mid-target. Required for sampler.type 'tpe' "
+            "or 'cmaes' on persistent storage; rejected for 'grid' and "
+            "'random', which resume safely."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_acknowledgement_applies(self) -> Sampler:
+        """Reject an acknowledgement of a restriction this sampler does not impose.
+
+        :raises ValueError: ``acknowledge_nonresumable`` is set for a sampler
+            type outside :data:`NON_RESUMABLE_SAMPLERS`.
+        :return Sampler: Self, unchanged.
+        """
+        if self.acknowledge_nonresumable and self.type not in NON_RESUMABLE_SAMPLERS:
+            raise ValueError(
+                f"sampler.acknowledge_nonresumable is set for sampler.type={self.type!r}, "
+                "which resumes safely: PhaseSweep reattaches it to an existing study and "
+                "tops the study up. Only "
+                f"{sorted(NON_RESUMABLE_SAMPLERS)} carry the run-the-target-in-one-invocation "
+                "contract this flag acknowledges. Remove acknowledge_nonresumable."
+            )
+        return self
+
+
+def sampler_capability_line(phase: Phase) -> str:
+    """Render the one-line resume/reproduce contract disclosed for ``phase``.
+
+    Shared by ``phasesweep validate`` and ``phasesweep run --dry-run`` so both
+    surfaces state the same contract in the same words before any trial runs.
+
+    :param Phase phase: Phase whose sampler capability is described.
+    :return str: One line naming the phase, sampler type, seed, and capability.
+    """
+    sampler = phase.sampler
+    seed = "" if sampler.seed is None else f" seed={sampler.seed}"
+    if sampler.type in NON_RESUMABLE_SAMPLERS:
+        capability = "non-resumable: run each target in one invocation"
+    elif sampler.seed is None:
+        capability = "resumable"
+    else:
+        capability = "resumable, reproducible"
+    return f"phase {phase.name!r}: sampler={sampler.type}{seed} ({capability})"
 
 
 def _validate_sampler_search_space(phase: Phase) -> None:
@@ -151,6 +243,15 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
+    * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
+      hard dependency, but a declared dependency is not an enforced one: an
+      environment can lose it (partial install, manual uninstall, a checkout
+      run without installing). Without this preflight the failure surfaces
+      inside ``optuna.samplers.CmaEsSampler`` during ``_build_sampler``, i.e.
+      after the generation is claimed, the experiment lock is held, and earlier
+      phases have already burned GPU time — and with an Optuna-internal message
+      instead of an install hint. This is an environment check, not a
+      closed-contract type check; do not "simplify" it away.
     * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
       not enumerate log-spaced values.
     * Grid sampler with float param missing ``step``.
@@ -164,6 +265,13 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     only truthful while those lists are duplicate-free. Categorical duplicates
     are rejected by :class:`CategoricalParam` and float collapse by
     :func:`grid_search_space`, both before this product is taken.
+
+    :param Phase phase: Phase whose sampler and search space are checked together.
+    :raises ValueError: If the CMA-ES sampler is paired with categorical params or
+        the ``cmaes`` package is not importable, if the grid sampler cannot
+        enumerate a parameter (raised by :func:`grid_search_space`), or if
+        ``n_trials`` exceeds the grid cardinality or does not equal it without
+        ``allow_partial_grid``.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
@@ -255,7 +363,7 @@ def grid_search_space(
                     f"log-scale int param {name!r}."
                 )
             grid[name] = list(range(param.low, param.high + 1, param.step))
-        elif isinstance(param, FloatParam):
+        else:
             if param.log:
                 raise ValueError(
                     f"Phase {phase_name!r}: grid sampler does not support "
@@ -283,8 +391,6 @@ def grid_search_space(
                     "a multiplier — so adjacent grid points differ by more than 1e-12."
                 )
             grid[name] = values
-        else:  # pragma: no cover
-            raise ValueError(f"Unhandled param type for grid: {param!r}")
     return grid
 
 
@@ -298,18 +404,12 @@ def _placeholder_value_for(param: SearchParam) -> Any:
         For ``FloatParam`` the interval midpoint; for ``IntParam`` the
         integer midpoint; for ``CategoricalParam`` the first listed choice.
 
-    Raises:
-        ValueError: Unrecognised parameter subclass (defensive; the union is
-            closed in practice).
-
     """
     if isinstance(param, FloatParam):
         return (param.low + param.high) / 2
     if isinstance(param, IntParam):
         return (param.low + param.high) // 2
-    if isinstance(param, CategoricalParam):
-        return param.choices[0]
-    raise ValueError(f"Unhandled param: {param!r}")  # pragma: no cover
+    return param.choices[0]
 
 
 def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:

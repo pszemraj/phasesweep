@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -21,13 +22,13 @@ from phasesweep.mcp.server import (
     DEFAULT_LIST_LIMIT,
     PROMPT_RUN_AND_MONITOR,
     TOOL_AWAIT_RUN,
-    TOOL_CANCEL_SWEEP,
+    TOOL_CANCEL_RUN,
     TOOL_GET_LATEST_RUN,
-    TOOL_GET_STATUS,
-    TOOL_GET_WINNERS,
-    TOOL_LAUNCH_SWEEP,
+    TOOL_GET_RUN_RESULTS,
+    TOOL_GET_RUN_STATUS,
+    TOOL_INSPECT_EXPERIMENT,
+    TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
-    TOOL_VALIDATE_CONFIG,
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
@@ -39,6 +40,12 @@ from tests.mcp_helpers import (
 )
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+# Hard ceilings for the monitoring loops below. Both are far above the real
+# cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
+# tool dispatch), so they only trip on a regression that would otherwise hang
+# pytest indefinitely instead of failing.
+MONITOR_DEADLINE_SECONDS = 300.0
+DISPATCH_DEADLINE_SECONDS = 30.0
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -53,7 +60,7 @@ experiment: e2e_lm
 storage: sqlite:///{tmp_path}/phases.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
-trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "{sys.executable} {trainer} {{overrides}}"
 override_format: argparse
 metric:
   name: eval_loss
@@ -72,7 +79,7 @@ phases:
   - name: lr
     inherits: [depth]
     n_trials: 3
-    sampler: {{ type: tpe, seed: 0 }}
+    sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
@@ -114,17 +121,36 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        while True:
+        # Bounded: a run that never reaches a terminal state must fail this
+        # test with the last state it reported, not hang pytest forever.
+        deadline = time.monotonic() + MONITOR_DEADLINE_SECONDS
+        state = "unobserved"
+        while state not in {"succeeded", "failed", "cancelled"}:
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"run {run_id} never reached a terminal state within "
+                    f"{MONITOR_DEADLINE_SECONDS}s; last state {state!r}; log:\n"
+                    f"{store.log_path(run_id).read_text()}"
+                )
             awaited = asyncio.run(app.await_run(run_id))
             state = awaited["run"]["state"]
-            if state in {"succeeded", "failed", "cancelled"}:
-                break
         log = store.log_path(run_id).read_text()
         assert state == "succeeded", f"run ended {state}; log:\n{log}"
 
         winners = app.winners(run_id=run_id)
         assert winners["result_source"] == "frozen_run_snapshot"
         assert "objective_evidence" in winners["metric"]
+        # A frozen run reports its own recorded semantics, and they match the
+        # config it executed - the drift disclosure is silent here because
+        # there is nothing to disclose (review v0.5.16 / blocker 4).
+        assert winners["result_context"] == "represented_generation"
+        assert winners["published_config_matches_current"] is True
+        assert awaited["result_phase_plan"] == ["depth", "lr"]
+        assert awaited["published_config_matches_current"] is True
+        # The historical phase plan is read from the generation summary, whose
+        # per-phase records carry composed overrides; only names may cross into
+        # a tool payload.
+        assert "effective_overrides" not in json.dumps([winners, awaited], default=str)
         phases = winners["phases"]
         assert phases  # winners were actually produced
         assert [p["phase"] for p in phases] == ["depth", "lr"]
@@ -225,7 +251,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
         with pytest.raises(Exception, match="max_concurrent_runs=1") as exc_info:
             app.launch("slowb")
         assert run_a in str(exc_info.value)
-        assert "phasesweep_await_run" in str(exc_info.value)
+        assert "await_run" in str(exc_info.value)
         # Freeing the slot lets the other experiment launch.
         assert app.cancel(run_a)["state"] == "cancelled"
         result = app.launch("slowb")
@@ -267,20 +293,12 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     unlock_file(regrab)
 
 
-def test_status_and_cancel_error_paths(tmp_path: Path) -> None:
+def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
     with pytest.raises(Exception, match="unknown run id"):
-        app.status(run_id="nope-123")
-    with pytest.raises(Exception, match="unknown run id"):
         app.cancel("nope-123")
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.status()
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        app.status(experiment_id="e2e_lm", run_id="nope-123")
-    # No run launched yet: experiment-level status reports no live run.
-    assert app.status(experiment_id="e2e_lm")["run"] is None
 
 
 def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
@@ -294,74 +312,78 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.instructions == agent_prompt_text(strip=True)
-    assert "unchanged relaunches do not need another validation call" in initialization.instructions
-    assert "reason: recovery_required" in initialization.instructions
-    assert "do not claim convergence, trends, robustness" in initialization.instructions
+    for safety_contract in (
+        "When `recovery_required` is true, stop",
+        "When `publication_integrity` is `failed`, stop",
+        "`result_context` is `represented_generation`",
+        "Never edit an experiment config yourself",
+        "Never open raw datasets",
+    ):
+        assert safety_contract in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
-        TOOL_VALIDATE_CONFIG,
+        TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
-        TOOL_GET_STATUS,
+        TOOL_GET_RUN_STATUS,
         TOOL_AWAIT_RUN,
-        TOOL_GET_WINNERS,
-        TOOL_LAUNCH_SWEEP,
-        TOOL_CANCEL_SWEEP,
+        TOOL_GET_RUN_RESULTS,
+        TOOL_LAUNCH_RUN,
+        TOOL_CANCEL_RUN,
     }
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     assert all(t.outputSchema for t in tools)
+    descriptions = {t.name: t.description for t in tools}
+    for tool_name, safety_contracts in {
+        TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
+        TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
+        TOOL_GET_RUN_STATUS: ("stop if recovery_required",),
+        TOOL_AWAIT_RUN: ("stop immediately for recovery_required",),
+    }.items():
+        for safety_contract in safety_contracts:
+            assert safety_contract in descriptions[tool_name]
+    listed = server._tool_manager.get_tool(TOOL_LIST_EXPERIMENTS).fn()
+    assert listed.next_action == TOOL_INSPECT_EXPERIMENT
+    latest = asyncio.run(
+        server._tool_manager.get_tool(TOOL_GET_LATEST_RUN).fn(experiment_id="e2e_lm")
+    )
+    assert latest.next_action is None
     for tool_name in (
-        TOOL_VALIDATE_CONFIG,
+        TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
-        TOOL_GET_STATUS,
+        TOOL_GET_RUN_STATUS,
         TOOL_AWAIT_RUN,
-        TOOL_GET_WINNERS,
-        TOOL_LAUNCH_SWEEP,
-        TOOL_CANCEL_SWEEP,
+        TOOL_GET_RUN_RESULTS,
+        TOOL_LAUNCH_RUN,
+        TOOL_CANCEL_RUN,
     ):
         assert server._tool_manager.get_tool(tool_name).is_async is True
-
-    descriptions = {t.name: t.description for t in tools}
-    assert (
-        "unchanged relaunches do not need another validation call"
-        in descriptions[TOOL_VALIDATE_CONFIG]
-    )
-    assert "terminal-attempt targets" in descriptions[TOOL_VALIDATE_CONFIG]
-    assert "independently re-checks config identity" in descriptions[TOOL_LAUNCH_SWEEP]
-    assert "If found=false" in descriptions[TOOL_GET_LATEST_RUN]
-    assert "run.recovery_required" in descriptions[TOOL_GET_STATUS]
-    assert "reason is recovery_required" in descriptions[TOOL_AWAIT_RUN]
-    assert "reason is terminal" in descriptions[TOOL_AWAIT_RUN]
-    assert "reason is phase_completed" in descriptions[TOOL_AWAIT_RUN]
-    assert "changed may still be true" in descriptions[TOOL_AWAIT_RUN]
-    assert "not search ranges or non-winning trial history" in descriptions[TOOL_GET_WINNERS]
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
     # could not call the tools. Lock the shapes in.
     schemas = {t.name: t.inputSchema for t in tools}
     assert all(schema.get("additionalProperties") is False for schema in schemas.values())
-    assert sorted(schemas[TOOL_LAUNCH_SWEEP]["properties"]) == ["experiment_id", "from_phase"]
-    assert schemas[TOOL_LAUNCH_SWEEP]["required"] == ["experiment_id"]
-    assert (
-        schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
-    )
-    assert schemas[TOOL_LAUNCH_SWEEP]["properties"]["experiment_id"]["description"]
-    assert sorted(schemas[TOOL_GET_STATUS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_STATUS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_STATUS]
-    assert sorted(schemas[TOOL_GET_WINNERS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_WINNERS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_WINNERS]
-    assert schemas[TOOL_CANCEL_SWEEP]["required"] == ["run_id"]
+    assert sorted(schemas[TOOL_LAUNCH_RUN]["properties"]) == ["experiment_id", "from_phase"]
+    assert schemas[TOOL_LAUNCH_RUN]["required"] == ["experiment_id"]
+    assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["description"]
+    assert sorted(schemas[TOOL_GET_RUN_STATUS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_RUN_STATUS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_RUN_STATUS]
+    assert sorted(schemas[TOOL_GET_RUN_RESULTS]["properties"]) == ["experiment_id", "run_id"]
+    assert schemas[TOOL_GET_RUN_RESULTS].get("required") is None  # both optional
+    assert "oneOf" in schemas[TOOL_GET_RUN_RESULTS]
+    assert schemas[TOOL_CANCEL_RUN]["required"] == ["run_id"]
     assert schemas[TOOL_AWAIT_RUN]["required"] == ["run_id"]
     assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
     timeout_schema = schemas[TOOL_AWAIT_RUN]["properties"]["timeout_seconds"]
+    assert AWAIT_DEFAULT_TIMEOUT_SECONDS == 20
     assert timeout_schema["default"] == AWAIT_DEFAULT_TIMEOUT_SECONDS
     assert timeout_schema["minimum"] == AWAIT_MIN_TIMEOUT_SECONDS
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
-    assert schemas[TOOL_VALIDATE_CONFIG]["required"] == ["experiment_id"]
+    assert schemas[TOOL_INSPECT_EXPERIMENT]["required"] == ["experiment_id"]
     assert schemas[TOOL_GET_LATEST_RUN]["required"] == ["experiment_id"]
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
@@ -371,27 +393,36 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
     assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
-    assert annotations[TOOL_LAUNCH_SWEEP].readOnlyHint is False
-    assert annotations[TOOL_LAUNCH_SWEEP].destructiveHint is True
-    assert annotations[TOOL_LAUNCH_SWEEP].openWorldHint is True
-    assert annotations[TOOL_CANCEL_SWEEP].destructiveHint is True
-    assert annotations[TOOL_CANCEL_SWEEP].idempotentHint is True
+    assert annotations[TOOL_LAUNCH_RUN].readOnlyHint is False
+    assert annotations[TOOL_LAUNCH_RUN].destructiveHint is True
+    assert annotations[TOOL_LAUNCH_RUN].openWorldHint is True
+    assert annotations[TOOL_CANCEL_RUN].destructiveHint is True
+    assert annotations[TOOL_CANCEL_RUN].idempotentHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
+    assert all("next_action" in schema["properties"] for schema in output_schemas.values())
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "recovery_required" in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["enum"]
-    assert (
-        "changed may still be true"
-        in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["description"]
-    )
     assert "experiments" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "next_cursor" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "total_count" in output_schemas[TOOL_LIST_EXPERIMENTS]["properties"]
     assert "found" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
     assert "run" in output_schemas[TOOL_GET_LATEST_RUN]["properties"]
-    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_WINNERS])
-    assert "params" in json.dumps(output_schemas[TOOL_GET_WINNERS])
+    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
+    assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    # Both result surfaces disclose which config labeled the result they show.
+    results_properties = output_schemas[TOOL_GET_RUN_RESULTS]["properties"]
+    status_properties = output_schemas[TOOL_GET_RUN_STATUS]["properties"]
+    assert "result_context" in results_properties
+    assert "published_config_matches_current" in results_properties
+    assert results_properties["result_source"]["description"]
+    assert "represented_generation_id" in results_properties
+    assert "result_context" in status_properties
+    assert "published_config_matches_current" in status_properties
+    assert status_properties["result_source"]["description"]
+    assert "result_phase_plan" in status_properties
 
     resources = asyncio.run(server.list_resources())
     assert {str(resource.uri) for resource in resources} == {CATALOG_RESOURCE_URI}
@@ -402,20 +433,42 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     prompts = asyncio.run(server.list_prompts())
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
-    assert "phasesweep_launch_sweep" in str(prompt)
-    assert "target or label columns" in str(prompt)
+    assert "<redacted>" in str(prompt)
 
 
-@pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_SWEEP, TOOL_LAUNCH_SWEEP])
+def test_inspect_experiment_never_chains_to_launch_run(tmp_path: Path) -> None:
+    """Only the user authorizes a launch, so inspection must not propose one."""
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from phasesweep.mcp.server import build_server
+
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"e2e_lm": _chained_config(tmp_path)},
+        allow=ALLOW_SIDE_EFFECTS,
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+    server = build_server(app)
+
+    inspected = asyncio.run(
+        server._tool_manager.get_tool(TOOL_INSPECT_EXPERIMENT).fn(experiment_id="e2e_lm")
+    )
+
+    assert inspected.capabilities.launch is True  # launching is catalog-permitted
+    assert inspected.next_action is None  # and still not suggested
+
+
+@pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN])
 def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocking_tool: str
 ) -> None:
-    """The real SDK dispatch must keep await responsive during blocking work."""
+    """The real SDK dispatch keeps await responsive under a manual clock."""
     pytest.importorskip("mcp")
     from mcp import types
 
     from phasesweep.mcp.server import build_server
-    from phasesweep.mcp.time import utc_now_iso
+    from phasesweep.runtime.time import utc_now_iso
 
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
@@ -434,13 +487,41 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         }
     )
 
+    class ManualClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.blocking_started = threading.Event()
+            self.release_blocking = threading.Event()
+
+        def block(self, seconds: float) -> None:
+            self.blocking_started.set()
+            if not self.release_blocking.wait(timeout=1.0):
+                raise AssertionError("blocking MCP call monopolized the event loop")
+            self.now += seconds
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = ManualClock()
+
     async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
         del timeout_seconds
-        await asyncio.sleep(0.02)
+        # Bounded: if the blocking tool never reaches its blocking section the
+        # regression must surface as a failure, not as a pytest hang.
+        deadline = time.monotonic() + DISPATCH_DEADLINE_SECONDS
+        while not clock.blocking_started.is_set():
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"{blocking_tool} never entered its blocking section within "
+                    f"{DISPATCH_DEADLINE_SECONDS}s; last observed run state "
+                    f"{awaited['run']['state']!r}, manual clock at {clock.now}"
+                )
+            await asyncio.sleep(0)
+        clock.advance(0.02)
         return awaited
 
     def blocking_cancel(run_id: str) -> dict:
-        time.sleep(0.3)
+        clock.block(0.3)
         return {
             "run_id": run_id,
             "state": "cancelled",
@@ -450,11 +531,11 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     def blocking_launch(experiment_id: str, from_phase: str | None = None) -> dict:
         del from_phase
-        time.sleep(0.3)
+        clock.block(0.3)
         return {"run_id": "r2", "experiment_id": experiment_id, "state": "running"}
 
     monkeypatch.setattr(app, "await_run", quick_await)
-    if blocking_tool == TOOL_CANCEL_SWEEP:
+    if blocking_tool == TOOL_CANCEL_RUN:
         monkeypatch.setattr(app, "cancel", blocking_cancel)
         blocking_arguments = {"run_id": "r1"}
     else:
@@ -476,11 +557,13 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     )
 
     async def dispatch_concurrently() -> tuple[float, object, object]:
-        started = time.perf_counter()
+        started = clock.now
         await_task = asyncio.create_task(handler(await_request))
         blocking_task = asyncio.create_task(handler(blocking_request))
         await_result = await await_task
-        await_elapsed = time.perf_counter() - started
+        await_elapsed = clock.now - started
+        assert not blocking_task.done()
+        clock.release_blocking.set()
         blocking_result = await blocking_task
         return await_elapsed, await_result.root, blocking_result.root
 
@@ -507,7 +590,7 @@ def test_fastmcp_tool_errors_are_is_error_results(
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name=TOOL_VALIDATE_CONFIG,
+            name=TOOL_INSPECT_EXPERIMENT,
             arguments={"experiment_id": "missing"},
         )
     )
@@ -528,7 +611,7 @@ def test_fastmcp_tool_errors_are_is_error_results(
         handler(
             types.CallToolRequest(
                 params=types.CallToolRequestParams(
-                    name=TOOL_VALIDATE_CONFIG,
+                    name=TOOL_INSPECT_EXPERIMENT,
                     arguments={"experiment_id": "e2e_lm"},
                 )
             )
@@ -554,7 +637,7 @@ def test_fastmcp_rejects_extra_tool_arguments(tmp_path: Path) -> None:
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     req = types.CallToolRequest(
         params=types.CallToolRequestParams(
-            name=TOOL_VALIDATE_CONFIG,
+            name=TOOL_INSPECT_EXPERIMENT,
             arguments={"experiment_id": "e2e_lm", "unexpected": True},
         )
     )

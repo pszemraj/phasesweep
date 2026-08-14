@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt PhaseSweep JSON overrides to the upstream decoder trainer's YAML configs."""
+"""Run the decoder trainer and publish a final-checkpoint objective."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import contextlib
 import hashlib
 import importlib.util
-import json
 import math
 import os
 import subprocess
@@ -17,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from phasesweep import report_objective
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "upstream"
@@ -30,32 +31,12 @@ def _resolve_repo_path(path: str | Path) -> Path:
     return (REPO_ROOT / candidate).resolve()
 
 
-def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
-    """Return ``base`` updated recursively with ``override`` values."""
-    merged = dict(base)
-    for key, value in override.items():
-        old_value = merged.get(key)
-        if isinstance(old_value, dict) and isinstance(value, Mapping):
-            merged[key] = _deep_merge(old_value, value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _read_yaml_mapping(path: Path) -> dict[str, Any]:
-    """Read a YAML file and require a top-level mapping."""
-    data = yaml.safe_load(path.read_text())
+def _read_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
+    """Read a complete trainer YAML and hash the exact PhaseSweep bytes."""
+    raw = path.read_bytes()
+    data = yaml.safe_load(raw)
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
-    return data
-
-
-def _read_json_mapping(path: Path) -> tuple[dict[str, Any], str]:
-    """Read a JSON mapping and hash the exact bytes supplied by PhaseSweep."""
-    raw = path.read_bytes()
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must contain a JSON object")
     return data, hashlib.sha256(raw).hexdigest()
 
 
@@ -159,29 +140,8 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
     }
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically publish one JSON artifact in its destination directory.
-
-    Deliberately stdlib-only. The envelope is a contract about the *bytes* a
-    trainer writes, so any trainer in any language can satisfy it; importing a
-    phasesweep helper here would make this example a worse template than the
-    contract it demonstrates.
-    """
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _write_result(
-    trial_dir: Path,
-    overrides_sha256: str,
+    config_sha256: str,
     metric_record: Mapping[str, Any],
 ) -> None:
     """Write an attempt-scoped final-checkpoint result artifact."""
@@ -204,33 +164,19 @@ def _write_result(
     if not isinstance(device_type, str) or not device_type:
         raise ValueError(f"Final evaluation is missing its device type: {metric_record!r}")
 
-    generation_id = os.environ.get("PHASESWEEP_GENERATION_ID")
-    attempt_id = os.environ.get("PHASESWEEP_ATTEMPT_ID")
-    expected_overrides_sha256 = os.environ.get("PHASESWEEP_OVERRIDES_SHA256")
-    if not generation_id or not attempt_id:
-        raise ValueError("PhaseSweep generation and attempt IDs are required for result evidence")
-    if not expected_overrides_sha256 or overrides_sha256 != expected_overrides_sha256:
-        raise ValueError("Resolved overrides do not match this PhaseSweep attempt")
+    expected_config_sha256 = os.environ.get("PHASESWEEP_OVERRIDES_SHA256")
+    if not expected_config_sha256 or config_sha256 != expected_config_sha256:
+        raise ValueError("Trainer config does not match this PhaseSweep attempt")
 
-    result = {
-        "attempt_id": attempt_id,
-        "evaluation": {
-            "checkpoint": "final.pt",
-            "policy": "final_checkpoint",
-            "step": step,
-        },
-        "generation_id": generation_id,
-        "objective": {
-            "name": "val_loss",
-            "split": "validation",
-            "value": float(val_loss),
-        },
-        "overrides_sha256": overrides_sha256,
-        "runtime": {"device_type": device_type},
-        "schema_version": 1,
-        "status": "complete",
-    }
-    _atomic_write_json(trial_dir / "result.json", result)
+    report_objective(
+        float(val_loss),
+        name="val_loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="final.pt",
+        step=step,
+        extra={"runtime": {"device_type": device_type}},
+    )
 
 
 def _run_template(template_root: Path, config_path: Path) -> None:
@@ -257,36 +203,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("DECODER_TEMPLATE_ROOT", str(DEFAULT_TEMPLATE_ROOT)),
         help="Path to a decoder-pytorch-template checkout.",
     )
-    parser.add_argument("--base-config", required=True, help="Base YAML config for the trainer.")
     parser.add_argument(
-        "--overrides-path",
+        "--config",
         required=True,
-        help="PhaseSweep overrides JSON generated with override_format: json_file.",
+        help="Complete per-trial trainer YAML generated by PhaseSweep.",
     )
-    parser.add_argument("--trial-dir", required=True, help="PhaseSweep trial directory.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Compose a trial config, run the trainer, and write ``result.json``."""
+    """Run one complete trainer config, evaluate its checkpoint, and publish."""
     args = build_parser().parse_args(argv)
 
     template_root = _resolve_repo_path(args.template_root)
-    base_config = _read_yaml_mapping(_resolve_repo_path(args.base_config))
-    overrides, overrides_sha256 = _read_json_mapping(Path(args.overrides_path))
-    trial_dir = Path(args.trial_dir).resolve()
-    trial_dir.mkdir(parents=True, exist_ok=True)
+    config_path = Path(args.config).resolve()
+    config, config_sha256 = _read_yaml_mapping(config_path)
+    configured_run_dir = config.get("run_dir")
+    if not isinstance(configured_run_dir, str) or not configured_run_dir:
+        raise ValueError(f"{config_path} must define a nonempty string run_dir")
+    trainer_run_dir = Path(configured_run_dir)
+    if not trainer_run_dir.is_absolute():
+        trainer_run_dir = template_root / trainer_run_dir
 
-    trainer_run_dir = trial_dir / "trainer"
-    composed = _deep_merge(base_config, overrides)
-    composed["run_dir"] = str(trainer_run_dir)
-
-    generated_config = trial_dir / "decoder_config.yaml"
-    generated_config.write_text(yaml.safe_dump(composed, sort_keys=True))
-
-    _run_template(template_root, generated_config)
+    _run_template(template_root, config_path)
     metric_record = _evaluate_final_checkpoint(template_root, trainer_run_dir)
-    _write_result(trial_dir, overrides_sha256, metric_record)
+    _write_result(config_sha256, metric_record)
     return 0
 
 

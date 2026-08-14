@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import optuna
@@ -9,6 +10,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
+import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
 from phasesweep.config import (
     Experiment,
@@ -22,12 +24,15 @@ from phasesweep.config import (
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
+from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import (
+    PUBLICATION_POINTER_SCHEMA_VERSION,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
+    _resolve_publication_pointer,
     _winner_path,
 )
 from tests.conftest import make_experiment, write_trainer
@@ -39,6 +44,7 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
         workdir=tmp_path / "wd",
         storage=storage,
         trial_command="python x.py {overrides}",
+        override_format="argparse",
         metric=Metric(
             name="loss",
             goal="minimize",
@@ -48,6 +54,9 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
             Phase(
                 name="p",
                 n_trials=1,
+                # Seeded random keeps this helper usable with persistent storage,
+                # which rejects an unseeded stochastic sampler.
+                sampler=Sampler(type="random", seed=0),
                 search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
             )
         ],
@@ -180,22 +189,59 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     assert status["phases"][0]["trial_data_available"] is True
 
 
-def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:
+def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = tmp_path / "phases.db"
     storage = f"sqlite:///{db}"
-    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
-        lambda trial: 1.0, n_trials=1
-    )
-    exp = _experiment(tmp_path, storage=f"{storage}?timeout=30")
+    study = optuna.create_study(study_name="read_t::p", storage=storage)
+    study.optimize(lambda trial: 1.0, n_trials=50)
+    exp = _experiment(tmp_path, storage=storage)
+    real_connect = engine_optuna.sqlite3.connect
+    transferred_rows: list[int] = []
+
+    class CursorProxy:
+        def __init__(self, cursor) -> None:
+            self._cursor = cursor
+
+        def fetchall(self):
+            rows = self._cursor.fetchall()
+            transferred_rows.append(len(rows))
+            return rows
+
+    class ConnectionProxy:
+        def __init__(self, connection) -> None:
+            self._connection = connection
+
+        def execute(self, *args: object, **kwargs: object):
+            return CursorProxy(self._connection.execute(*args, **kwargs))
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def observed_connect(*args: object, **kwargs: object):
+        return ConnectionProxy(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(engine_optuna.sqlite3, "connect", observed_connect)
 
     status = read_status(exp)
 
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+    assert status["phases"][0]["trials"] == {"COMPLETE": 50}
+    assert transferred_rows == [1]
 
 
-def test_read_status_counts_sqlite_trials_with_uri_filename(tmp_path: Path) -> None:
-    db = tmp_path / "uri.db"
-    storage = f"sqlite:///file:{db}?mode=rwc&uri=true"
+@pytest.mark.parametrize(
+    ("database_name", "storage_template"),
+    [
+        pytest.param("phases.db", "sqlite:///{db}?timeout=30", id="url-options"),
+        pytest.param("uri.db", "sqlite:///file:{db}?mode=rwc&uri=true", id="uri-filename"),
+    ],
+)
+def test_read_status_counts_sqlite_trials_with_storage_url_variants(
+    tmp_path: Path, database_name: str, storage_template: str
+) -> None:
+    db = tmp_path / database_name
+    storage = storage_template.format(db=db)
     optuna.create_study(study_name="read_t::p", storage=storage).optimize(
         lambda trial: 1.0, n_trials=1
     )
@@ -204,6 +250,51 @@ def test_read_status_counts_sqlite_trials_with_uri_filename(tmp_path: Path) -> N
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_read_status_reports_running_attempts_from_the_counted_snapshot(
+    tmp_path: Path, backend: str
+) -> None:
+    """Every backend reports RUNNING identities beside the counts they explain.
+
+    The MCP terminal snapshot reconciles RUNNING rows against cleanup evidence
+    and must not reread a study to learn which rows those are (PR #5 review /
+    reviewer 2, blocker 6), so this comes from the same tolerant read.
+    """
+    path = tmp_path / f"phases.{backend}"
+    exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
+    study = optuna.create_study(
+        study_name="read_t::p",
+        storage=engine_optuna._resolve_storage(exp.storage) or exp.storage,
+    )
+    study.optimize(lambda trial: 1.0, n_trials=1)
+    running = study.ask()
+    running.set_user_attr("phasesweep_generation_id", "gen-1")
+    running.set_user_attr("phasesweep_attempt_id", "attempt-1")
+    study.ask()
+
+    phase = read_status(exp)["phases"][0]
+
+    assert phase["trial_data_available"] is True
+    assert phase["trials"] == {"COMPLETE": 1, "RUNNING": 2}
+    assert phase["running_attempts"] == [
+        {"trial_number": 1, "generation_id": "gen-1", "attempt_id": "attempt-1"},
+        {"trial_number": 2, "generation_id": None, "attempt_id": None},
+    ]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
+    tmp_path: Path, backend: str
+) -> None:
+    """Unread trial data reports no RUNNING identities, not an empty list."""
+    exp = _experiment(tmp_path, storage=f"{backend}:///{tmp_path}/missing.{backend}")
+
+    phase = read_status(exp)["phases"][0]
+
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
 
 
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
@@ -216,14 +307,22 @@ def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: 
     blocker 3). The record is written too, purely as the informational,
     post-commit artifact real publications also produce.
     """
-    _last_successful_generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
-    _last_successful_generation_path(exp).write_text(
-        yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
-    )
     summary_path = _generation_summary_path(exp, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(
         yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
+    )
+    summary = summary_path.read_bytes()
+    _last_successful_generation_path(exp).write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
+                "experiment": exp.experiment,
+                "generation_id": generation_id,
+                "summary_size_bytes": len(summary),
+                "summary_sha256": hashlib.sha256(summary).hexdigest(),
+            }
+        )
     )
     record_path = _generation_record_path(exp, generation_id)
     record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +438,94 @@ def test_read_status_pinned_read_of_unpublished_generation_is_not_marked_publish
     assert status["is_published"] is False
     # The orphaned generation's own winner is still readable pinned.
     assert status["phases"][0]["winner_present"] is True
+
+
+def test_read_status_legacy_workdir_without_generation_metadata_is_published(
+    tmp_path: Path,
+) -> None:
+    """A pre-generation workdir's ``winner.yaml`` is the publication, so say so.
+
+    Legacy layouts have no ``generation.yaml`` and therefore no pointer
+    identity to compare, which used to report ``is_published: False`` right
+    next to a real winner path -- an upgrading operator read "never
+    published" about a published result. The three identity fields stay
+    ``None`` (there is genuinely no generation id to report; none is
+    fabricated) while ``is_published`` follows the winner actually on disk.
+    """
+    exp = _experiment(tmp_path)
+    legacy_winner = _winner_path(exp, "p")
+    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
+    legacy_winner.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 2,
+                "metric": {"loss": 0.3, "goal": "minimize"},
+                "params": {"lr": 0.003},
+                "effective_overrides": {"lr": 0.003},
+                "completion": {"incomplete": False},
+            }
+        )
+    )
+    assert not _generation_path(exp).exists()
+
+    status = read_status(exp)
+
+    assert status["current_generation_id"] is None
+    assert status["published_generation_id"] is None
+    assert status["represented_generation_id"] is None
+    assert status["is_published"] is True
+    assert status["publication_integrity"] == "ok"
+    assert status["phases"][0]["winner_present"] is True
+
+    # The path-bearing CLI/suite view derives from the same read and must not
+    # contradict its own winner path either.
+    cli_status = experiment_status(exp)
+    assert cli_status["is_published"] is True
+    assert cli_status["phases"][0]["winner"] == str(legacy_winner)
+
+
+def test_read_status_untouched_workdir_is_not_published(tmp_path: Path) -> None:
+    """No generation metadata *and* no legacy winner is still "nothing published"."""
+    exp = _experiment(tmp_path)
+
+    status = read_status(exp)
+
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+
+
+def test_read_status_unpublished_generation_is_not_published(tmp_path: Path) -> None:
+    """A generation-aware workdir that never published keeps ``is_published: False``.
+
+    The legacy fallback must not leak into layouts that *do* carry generation
+    metadata: once ``generation.yaml`` exists, a stale compatibility
+    ``winner.yaml`` is not authoritative.
+    """
+    exp = _experiment(tmp_path)
+    _generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
+    _generation_path(exp).write_text(yaml.safe_dump({"generation_id": "generation-running"}))
+    legacy_winner = _winner_path(exp, "p")
+    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
+    legacy_winner.write_text(
+        yaml.safe_dump(
+            {
+                "phase": "p",
+                "trial_number": 2,
+                "metric": {"loss": 0.3, "goal": "minimize"},
+                "params": {"lr": 0.003},
+                "effective_overrides": {"lr": 0.003},
+                "completion": {"incomplete": False},
+            }
+        )
+    )
+
+    status = read_status(exp)
+
+    assert status["current_generation_id"] == "generation-running"
+    assert status["published_generation_id"] is None
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
 
 
 @pytest.mark.parametrize(
@@ -461,6 +648,7 @@ def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
         workdir=tmp_path / "wd",
         storage=f"sqlite:///{tmp_path / 'drift.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             name="x",
             goal="minimize",
@@ -552,4 +740,112 @@ def test_read_status_without_any_publication_uses_current_config(tmp_path: Path)
     status = read_status(experiment)
     assert status["result_context"] == "current_config"
     assert status["published_config_matches_current"] is None
+    assert status["result_phase_plan"] == ["p"]
     assert status["metric"]["name"] == "x"
+
+
+def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path) -> None:
+    """A phase renamed after publication must not hide the published winner.
+
+    ``phases`` stays the *current* config's progress view -- a run would have
+    to produce a winner for ``q`` -- while ``result_phase_plan`` reports the
+    plan the publication actually used, so a reader can enumerate it instead
+    of concluding the publication is empty (review v0.5.16 / blocker 4).
+    """
+    published = _drift_experiment(tmp_path)
+    run_experiment(published)
+
+    renamed = _drift_experiment(
+        tmp_path,
+        phases=[
+            Phase(
+                name="q",
+                n_trials=1,
+                comment="renamed phase",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+        ],
+    )
+
+    status = read_status(renamed)
+    assert status["is_published"] is True
+    assert status["result_phase_plan"] == ["p"]
+    assert status["published_config_matches_current"] is False
+    assert [phase["phase"] for phase in status["phases"]] == ["q"]
+    assert status["phases"][0]["winner_present"] is False
+
+    generation_id = status["represented_generation_id"]
+    # The declared-phase default is unchanged: the CLI resume/progress readers
+    # that depend on it keep asking about the phases configured today.
+    assert read_winners(renamed, generation_id=generation_id) == []
+
+    (winner,) = read_winners(
+        renamed,
+        generation_id=generation_id,
+        phase_names=status["result_phase_plan"],
+    )
+    assert winner.phase == "p"
+    assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
+
+
+def test_read_status_reuses_the_pointer_authenticated_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status snapshot never reopens summary bytes after authenticating its pointer."""
+    experiment = _drift_experiment(tmp_path)
+    run_experiment(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    assert publication.state == "ok"
+    generation_id = publication.generation_id
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary_path.write_bytes(summary_path.read_bytes() + b"\n# changed after resolution\n")
+    monkeypatch.setattr(engine_read, "_resolve_publication_pointer", lambda _exp: publication)
+
+    def unexpected_reread(_path: Path | None):
+        raise AssertionError("authenticated summary was reopened")
+
+    monkeypatch.setattr(engine_read, "_read_summary_payload", unexpected_reread)
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert status["result_phase_plan"] == ["p"]
+    assert status["metric"]["name"] == "x"
+    assert _resolve_publication_pointer(experiment).state == "failed"
+
+
+def test_result_phase_plan_falls_back_to_the_current_config_for_a_planless_summary(
+    tmp_path: Path,
+) -> None:
+    """A summary that records no plan leaves the current config describing it.
+
+    Pre-manifest layouts published a summary with no ``phase_plan`` at all;
+    the only phase names such a tree can be read under are the configured
+    ones, and that fallback must survive.
+    """
+    exp = _experiment(tmp_path)
+    _mark_generation_published(exp, "generation-planless", "p")
+
+    status = read_status(exp)
+
+    assert status["is_published"] is True
+    assert status["result_context"] == "current_config"
+    assert status["result_phase_plan"] == ["p"]
+
+
+@pytest.mark.parametrize("unsafe_name", ["../escape", "", "phases/p"])
+def test_read_winners_refuses_phase_names_that_are_not_path_components(
+    tmp_path: Path, unsafe_name: str
+) -> None:
+    """Explicit plans become path segments, so they are validated like config names.
+
+    Plans parsed off disk are filtered before they reach here, so this guards
+    the remaining way an unsafe name could arrive: a caller passing one.
+    """
+    exp = _experiment(tmp_path)
+
+    with pytest.raises(ValueError, match="phase name"):
+        read_winners(exp, phase_names=[unsafe_name])

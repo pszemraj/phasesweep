@@ -1,0 +1,54 @@
+# Runnable PhaseSweep starter. The human owns this file: review trainer commands,
+# paths, search spaces, and permissions before launching real workloads.
+experiment: phasesweep_starter
+storage: __PHASESWEEP_STORAGE__
+provenance:
+  revision: "phasesweep-starter-v1"
+workdir: __PHASESWEEP_WORKDIR__
+execution:
+  # Keep the portable base environment without sweeping in shell credentials
+  # or unrelated ambient values as persistent study semantics.
+  inherit_env: none
+
+# This trainer ships inside the installed PhaseSweep package. Replace it with
+# your own command after the local smoke test.
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+# This is the trainer's ordinary base configuration. PhaseSweep copies it for
+# every trial, applies inherited/fixed/sampled dotted-path values, and passes
+# the complete generated YAML to trial_command via {config_path}.
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
+
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
+
+phases:
+  - name: depth
+    comment: "Compare two model depths before tuning the learning rate."
+    n_trials: 2
+    sampler: { type: grid }
+    search_space:
+      model.n_layers: { type: categorical, choices: [6, 8] }
+
+  - name: learning_rate
+    comment: "Keep the winning depth fixed and compare two learning rates."
+    inherits: [depth]
+    n_trials: 2
+    sampler: { type: grid }
+    search_space:
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }

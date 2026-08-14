@@ -1,13 +1,25 @@
 """Sweep execution engine API."""
 
 from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
+    ArtifactRootRebindError,
     ExperimentLockBusyError,
+    LegacyArtifactRootMigrationRequiredError,
+    PhaseSweepError,
+    PromotionError,
+    PublicationAccessError,
+    PublicationCommitError,
+    PublicationIntegrityError,
+    RunRequestError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrialEvidenceMissingError,
     TrialTargetRegressionError,
+    WinnerIntegrityError,
 )
 from phasesweep.engine.read import (
     PhaseWinnerView,
@@ -16,6 +28,7 @@ from phasesweep.engine.read import (
     read_winners,
 )
 from phasesweep.engine.run import (
+    PublicationHook,
     TerminalReport,
     config_status,
     run_config,
@@ -23,24 +36,38 @@ from phasesweep.engine.run import (
     run_suite,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import Winner, generation_id_source
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
+    "ActiveAttemptPersistenceError",
+    "ArtifactRootConflictError",
+    "ArtifactRootRebindError",
     "ExperimentLockBusyError",
+    "LegacyArtifactRootMigrationRequiredError",
     "NoFeasibleTrialError",
+    "PhaseSweepError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
+    "PromotionError",
+    "PublicationHook",
+    "PublicationAccessError",
+    "PublicationCommitError",
+    "PublicationIntegrityError",
+    "RunRequestError",
     "SamplerContinuationUnsupportedError",
     "StudyContextConflictError",
     "StudyFingerprintMismatchError",
     "StudySchemaMismatchError",
     "StudyStorageUnavailableError",
     "TerminalReport",
+    "TrialEvidenceMissingError",
     "TrialTargetRegressionError",
     "UnsafeProcessCleanupError",
     "Winner",
+    "WinnerIntegrityError",
     "config_status",
+    "generation_id_source",
     "read_status",
     "read_winner",
     "read_winners",

@@ -11,7 +11,7 @@ import pytest
 
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import WinnerSource
-from phasesweep.mcp.redaction import winners_payload
+from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.server import PhaseSweepMCP
@@ -36,6 +36,7 @@ def _winners_payload(
         metric={"name": "loss", "goal": "minimize"},
         declared_phases=["p"],
         result_source="current_shared_study",
+        publication_integrity="ok",
         visible_params=visible_params,  # type: ignore[arg-type]
     )
 
@@ -64,6 +65,7 @@ env:
 phases:
   - name: p
     n_trials: 1
+    sampler: {{ type: random, seed: 0 }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
@@ -225,6 +227,25 @@ def test_winners_payload_applies_visible_params_policy(
     assert phase["params_redacted"] is redacted
 
 
+@pytest.mark.parametrize(
+    ("launch_policy", "current_policy", "expected"),
+    [
+        ("none", "all", "none"),
+        ("all", "none", "none"),
+        ("all", ["lr"], ["lr"]),
+        (["lr", "depth"], "all", ["lr", "depth"]),
+        (["lr", "depth"], ["depth", "dropout"], ["depth"]),
+        ([], "all", []),
+    ],
+)
+def test_visible_params_intersection_never_broadens_either_policy(
+    launch_policy: object,
+    current_policy: object,
+    expected: object,
+) -> None:
+    assert intersect_visible_params(launch_policy, current_policy) == expected  # type: ignore[arg-type]
+
+
 def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     payload = winners_payload(
         "exp",
@@ -249,14 +270,35 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
         metric={"name": "loss", "goal": "minimize"},
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
+        publication_integrity="ok",
         run_id="exp-run",
         represented_generation_id="generation-new",
+        result_context="represented_generation",
+        published_config_matches_current=False,
     )
 
     assert payload["run_id"] == "exp-run"
     assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["represented_generation_id"] == "generation-new"
+    # Completeness is measured against the plan the caller supplied, which for
+    # a published result is that generation's own (review v0.5.16 / blocker 4).
     assert payload["declared_phase_count"] == 2
     assert payload["winner_count"] == 1
     assert payload["missing_phases"] == ["p2"]
     assert payload["all_phases_have_winners"] is False
     assert payload["phases"][0]["winner_generation"] == "prior_generation"
+    assert payload["result_context"] == "represented_generation"
+    assert payload["published_config_matches_current"] is False
+
+
+def test_winners_payload_defaults_claim_no_historical_provenance() -> None:
+    """An undisclosed provenance reads as unknown, never as "no drift".
+
+    The defaults exist for callers that have no represented generation to
+    describe (nothing published), so they must not assert that the current
+    config produced the result or that it still matches.
+    """
+    payload = _winners_payload("exp", [])
+
+    assert payload["result_context"] == "current_config"
+    assert payload["published_config_matches_current"] is None

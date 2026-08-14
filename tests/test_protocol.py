@@ -9,8 +9,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from phasesweep import load_config, run_config
-from phasesweep.cli import main as cli_main
+from phasesweep import load_config, load_experiment, run_config
+from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     ArtifactSizeGate,
     Contract,
@@ -21,11 +21,20 @@ from phasesweep.config import (
     Metric,
     Phase,
     RequiredFileGate,
+    Sampler,
     Sha256Gate,
     Suite,
 )
-from phasesweep.engine import read_winner, run_experiment
+from phasesweep.engine import (
+    PhaseSweepError,
+    PromotionError,
+    RunRequestError,
+    read_status,
+    read_winner,
+    run_experiment,
+)
 from phasesweep.engine.run import ExperimentRunOutcome
+from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
 from phasesweep.engine.state import (
     Winner,
     _generation_path,
@@ -40,6 +49,7 @@ from phasesweep.mcp.redaction import winners_payload
 from tests.conftest import (
     make_experiment,
     make_trial_context,
+    patch_path_method_failure,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -74,6 +84,7 @@ def test_contract_fixed_overrides_and_gates_apply_to_trial(tmp_path: Path) -> No
         experiment="contract_test",
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -104,6 +115,7 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
@@ -151,6 +163,7 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
         metric={"name": "objective", "goal": "minimize"},
         declared_phases=["candidate"],
         result_source="current_shared_study",
+        publication_integrity="ok",
     )["phases"][0]
     assert "trial_number" not in agent_phase
     assert agent_phase["winner_source"] == {
@@ -188,12 +201,62 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     assert summary["phases"][1]["promotion"] == decision
 
 
+def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: Path) -> None:
+    """A baseline clone resolves its artifact under the recorded source phase."""
+    trainer = _write_score_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    baseline = Phase(
+        name="baseline",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        fixed_overrides={"score": 1.0},
+        search_space={},
+    )
+    initial = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[baseline],
+    )
+    baseline_winner = run_experiment(initial)["baseline"]
+
+    extended = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[
+            baseline,
+            Phase(
+                name="candidate",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                fixed_overrides={"score": 0.95},
+                search_space={},
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "min_delta": 0.1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+        ],
+    )
+    candidate_winner = run_experiment(extended)["candidate"]
+
+    assert candidate_winner.source is not None
+    assert candidate_winner.source.phase == "baseline"
+    assert candidate_winner.generation_id == baseline_winner.generation_id
+    assert read_status(extended)["publication_integrity"] == "ok"
+
+
 def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     """``requires_gates: false`` records gate failures without failing the trial."""
     trainer = _write_score_trainer(tmp_path)
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
@@ -223,6 +286,28 @@ def test_promotion_can_treat_failed_gates_as_advisory(tmp_path: Path) -> None:
     assert winners["candidate"].gates[0]["passed"] is False
 
 
+def test_phase_promotion_stop_is_an_expected_operational_failure(tmp_path: Path) -> None:
+    """A configured phase stop is a normal failed run, not an internal bug."""
+    trainer = _write_score_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[
+            Phase(name="baseline", n_trials=1, fixed_overrides={"score": 1.0}),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 2.0},
+                promotion={"min_delta_vs": "baseline", "min_delta": 0.5, "on_fail": "stop"},
+            ),
+        ],
+    )
+
+    with pytest.raises(PromotionError, match="Phase 'candidate' failed promotion"):
+        run_experiment(experiment)
+
+
 def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
     p = write_yaml(
         tmp_path,
@@ -232,6 +317,7 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         provenance: {{revision: test-fixture-v1}}
         workdir: {tmp_path}/runs
         trial_command: "python train.py {{overrides}}"
+        override_format: argparse
         metric:
           name: objective
           goal: minimize
@@ -239,10 +325,12 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
         phases:
           - name: baseline
             n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
             fixed_overrides:
               model.depth: 2
           - name: candidate
             n_trials: 1
+            sampler: {{ type: random, seed: 1 }}
             fixed_overrides:
               model.width: 128
             promotion:
@@ -252,6 +340,74 @@ def test_phase_promotion_requires_prior_baseline(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="promotion references 'typo'.*prior phase"):
         load_config(p)
+
+
+def test_phase_promotion_runtime_reports_unknown_baseline(tmp_path: Path) -> None:
+    """Runtime corruption reports the missing selector instead of a bare KeyError."""
+    experiment = make_experiment(workdir=tmp_path)
+    phase_data = experiment.phases[0].model_dump()
+    phase_data["promotion"] = {"min_delta_vs": "missing"}
+    phase = Phase.model_validate(phase_data)
+    candidate = Winner(
+        trial_number=0,
+        params={},
+        effective_overrides={},
+        metric=1.0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"unknown min_delta_vs baseline 'missing'.*available prior phase winners: none",
+    ) as exc_info:
+        _apply_promotion(experiment, phase, candidate, {})
+    assert not isinstance(exc_info.value, PhaseSweepError)
+
+
+def test_suite_promotion_stop_is_an_expected_operational_failure(tmp_path: Path) -> None:
+    """A configured suite stop is a normal failed run, not an internal bug."""
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            """
+            suite: stop_suite
+            defaults:
+              trial_command: "echo {overrides}"
+              override_format: argparse
+              metric:
+                extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
+            studies:
+              - name: baseline
+                phases:
+                  - {name: eval, n_trials: 1}
+              - name: candidate
+                promotion: {min_delta_vs: baseline, min_delta: 0.5, on_fail: stop}
+                phases:
+                  - {name: eval, n_trials: 1}
+            """,
+        )
+    )
+    assert isinstance(config, Suite)
+    baseline = Winner(trial_number=0, params={}, effective_overrides={}, metric=1.0)
+    candidate = Winner(trial_number=1, params={}, effective_overrides={}, metric=0.75)
+    candidate_spec = config.studies[1]
+
+    with pytest.raises(PromotionError, match="unknown baseline study 'baseline'"):
+        _apply_study_promotion(
+            suite=config,
+            study_name=candidate_spec.name,
+            experiment=config.experiment_for_study(candidate_spec),
+            study_winners={"eval": candidate},
+            prior_results={},
+        )
+
+    with pytest.raises(PromotionError, match="failed promotion against 'baseline.eval'"):
+        _apply_study_promotion(
+            suite=config,
+            study_name=candidate_spec.name,
+            experiment=config.experiment_for_study(candidate_spec),
+            study_winners={"eval": candidate},
+            prior_results={"baseline": {"eval": baseline}},
+        )
 
 
 def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
@@ -264,6 +420,7 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -353,6 +510,46 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     ).is_dir()
 
 
+def test_suite_dependency_on_skipped_promotion_is_an_expected_failure(tmp_path: Path) -> None:
+    """A downstream dependency omitted by ``on_fail: skip`` is a policy outcome."""
+    trainer = _write_score_trainer(tmp_path)
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            f"""
+            suite: skipped_dependency
+            defaults:
+              workdir: {tmp_path}/runs
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)'}}
+            studies:
+              - name: baseline
+                phases:
+                  - name: eval
+                    n_trials: 1
+                    fixed_overrides: {{score: 1.0}}
+              - name: candidate
+                promotion: {{min_delta_vs: baseline, min_delta: 0.5, on_fail: skip}}
+                phases:
+                  - name: eval
+                    n_trials: 1
+                    fixed_overrides: {{score: 2.0}}
+              - name: downstream
+                depends_on: [candidate]
+                phases:
+                  - {{name: eval, n_trials: 1}}
+            """,
+        )
+    )
+
+    with pytest.raises(PromotionError, match="dependency 'candidate' did not complete"):
+        run_config(config)
+
+
 def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path) -> None:
     trainer = _write_score_trainer(tmp_path)
     experiment = make_experiment(
@@ -360,24 +557,32 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[
             Phase(
                 name="baseline",
                 n_trials=1,
                 fixed_overrides={"score": 1.0},
+                sampler=Sampler(type="random", seed=0),
                 search_space={},
             ),
             Phase(
                 name="candidate",
                 n_trials=1,
                 fixed_overrides={"score": 2.0},
+                sampler=Sampler(type="random", seed=0),
                 search_space={},
                 promotion={
                     "min_delta_vs": "baseline",
                     "on_fail": "continue_baseline",
                 },
             ),
-            Phase(name="later", n_trials=1, search_space={}),
+            Phase(
+                name="later",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={},
+            ),
         ],
     )
     run_experiment(experiment)
@@ -408,6 +613,7 @@ def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Pat
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -439,6 +645,7 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -454,6 +661,8 @@ def test_suite_config_runs_dry_without_artifacts(tmp_path: Path) -> None:
 
     config = load_config(p)
     assert isinstance(config, Suite)
+    with pytest.raises(RunRequestError, match="only supported for single experiment configs"):
+        run_config(config, from_phase="p", dry_run=True)
     winners = run_config(config, dry_run=True)
 
     assert "ablation_a" in winners
@@ -468,6 +677,7 @@ def test_suite_study_provenance_inherits_replaces_and_clears(tmp_path: Path) -> 
             suite: provenance_suite
             defaults:
               trial_command: "echo"
+              override_format: argparse
               provenance: {revision: default-v1}
               metric:
                 name: x
@@ -505,6 +715,7 @@ def test_failed_suite_rerun_preserves_previous_summary(
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -602,6 +813,7 @@ def test_contract_keys_cannot_be_resampled() -> None:
         Experiment(
             experiment="bad_contract",
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),
@@ -678,58 +890,49 @@ def test_sha256_gate_streams_file_without_read_bytes(
     assert results[0].passed is True
 
 
-def test_file_metadata_gate_io_failures_are_failed_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("gate_kind", "path_method", "error_detail"),
+    [
+        pytest.param("sha256", "open", "could not read model.bin", id="sha256-open"),
+        pytest.param("artifact_size", "stat", "could not inspect model.bin", id="size-stat"),
+    ],
+)
+def test_file_gate_io_failures_are_failed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_kind: str,
+    path_method: str,
+    error_detail: str,
 ) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"payload")
-    digest = hashlib.sha256(b"payload").hexdigest()
-    original_open = Path.open
+    patch_path_method_failure(
+        monkeypatch,
+        model_path,
+        path_method,
+        OSError("artifact metadata unavailable"),
+    )
 
-    def fail_model_open(self: Path, *args: object, **kwargs: object):
-        if self == model_path:
-            raise OSError("artifact became unreadable")
-        return original_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fail_model_open)
-
+    if gate_kind == "sha256":
+        gate = Sha256Gate(
+            type="sha256",
+            path="model.bin",
+            sha256=hashlib.sha256(b"payload").hexdigest(),
+        )
+    else:
+        gate = ArtifactSizeGate(
+            type="artifact_size",
+            source="file",
+            path="model.bin",
+            max_bytes=1024,
+        )
     result = evaluate_gates(
         make_trial_context(tmp_path),
-        [Sha256Gate(type="sha256", path="model.bin", sha256=digest)],
+        [gate],
     )[0]
 
     assert result.passed is False
-    assert "could not read model.bin" in result.detail
-
-
-def test_artifact_size_io_failure_is_failed_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    model_path = tmp_path / "model.bin"
-    model_path.write_bytes(b"payload")
-    original_stat = Path.stat
-
-    def fail_model_stat(self: Path, *args: object, **kwargs: object):
-        if self == model_path:
-            raise OSError("artifact metadata unavailable")
-        return original_stat(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", fail_model_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                source="file",
-                path="model.bin",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert "could not inspect model.bin" in result.detail
+    assert error_detail in result.detail
 
 
 def test_json_equals_gate_requires_matching_json_type(tmp_path: Path) -> None:
@@ -749,6 +952,70 @@ def test_json_equals_gate_requires_matching_json_type(tmp_path: Path) -> None:
     assert [result.passed for result in results] == [True, False, False]
     assert "bool" in results[1].detail
     assert "float" in results[2].detail
+
+
+def _json_equals_gate_yaml(value_literal: str) -> str:
+    """Return an experiment body whose only gate compares against ``value_literal``."""
+    return f"""
+    experiment: t
+    storage: ":memory:"
+    provenance: {{revision: test-fixture-v1}}
+    trial_command: "echo {{overrides}}"
+    override_format: argparse
+    metric:
+      name: loss
+      goal: minimize
+      extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
+    phases:
+      - name: a
+        n_trials: 1
+        search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
+        gates:
+          - type: json_equals
+            path: result.json
+            key: k
+            value: {value_literal}
+    """
+
+
+@pytest.mark.parametrize(
+    ("value_literal", "message"),
+    [
+        ("2024-01-01", "must be a JSON scalar"),
+        ("{1: x}", "must be a JSON scalar"),
+        ("[1, 2]", "must be a JSON scalar"),
+        (".nan", "must be finite"),
+        (".inf", "must be finite"),
+    ],
+    ids=["yaml_date", "mapping", "sequence", "nan", "inf"],
+)
+def test_json_equals_gate_rejects_non_json_scalars(
+    tmp_path: Path, value_literal: str, message: str
+) -> None:
+    """Non-JSON gate values fail at load, not silently at every trial.
+
+    The YAML loader is a ``SafeLoader`` subclass, so an unquoted ``2024-01-01``
+    arrives as a ``datetime.date`` and an inline ``{1: x}`` keeps its int key.
+    Neither can appear in parsed JSON, so such a gate could never pass — while
+    the phase fingerprint, which hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, renders it identically to the quoted
+    string or string-keyed mapping that *can* pass. Two configs disagreeing on
+    feasibility would share one study (PR #5 review / reviewer 2, blocker 4).
+    """
+    path = write_yaml(tmp_path, _json_equals_gate_yaml(value_literal))
+
+    with pytest.raises(ValueError, match=message) as excinfo:
+        load_experiment(path)
+
+    # The error must locate the offending gate, not just the experiment.
+    assert "phases.0.gates.0.json_equals.value" in str(excinfo.value)
+
+
+def test_json_equals_gate_accepts_quoted_date(tmp_path: Path) -> None:
+    """The documented fix for a rejected YAML date is to quote it."""
+    experiment = load_experiment(write_yaml(tmp_path, _json_equals_gate_yaml("'2024-01-01'")))
+
+    assert experiment.phases[0].gates[0].value == "2024-01-01"
 
 
 def test_artifact_size_gate_reports_bad_sources(tmp_path: Path) -> None:

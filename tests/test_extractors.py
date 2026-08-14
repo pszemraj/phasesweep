@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 import types
 from dataclasses import replace
 
@@ -10,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.config import (
+    ArtifactSizeGate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
@@ -17,8 +19,8 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.evidence import ExtractorError, run_extractor
-from phasesweep.evidence.evaluation import extractor_config_fingerprint
+from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
+from phasesweep.evidence.evaluation import DeadlineExceededError, extractor_config_fingerprint
 from tests.conftest import make_trial_context
 
 
@@ -38,23 +40,27 @@ class _FakeApi:
 
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake ``wandb.apis.public.Api`` backed by a supplied run callable."""
+    """Install a fake ``wandb.apis.public.Api`` implementation."""
 
-    def install(run_for_path):
+    def install(run_for_path=None, *, api_class=None):  # noqa: ANN001, ANN202
         wandb_mod = types.ModuleType("wandb")
         apis_mod = types.ModuleType("wandb.apis")
         public_mod = types.ModuleType("wandb.apis.public")
         timeouts: list[int | None] = []
 
-        class Api:
-            def __init__(self, timeout=None):
-                timeouts.append(timeout)
-                self._inner = _FakeApi(run_for_path)
+        if api_class is None:
 
-            def run(self, path):
-                return self._inner.run(path)
+            class Api:
+                def __init__(self, overrides=None, timeout=None):
+                    timeouts.append(timeout)
+                    self._inner = _FakeApi(run_for_path)
 
-        public_mod.Api = Api
+                def run(self, path):
+                    return self._inner.run(path)
+
+            api_class = Api
+
+        public_mod.Api = api_class
         wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
         apis_mod.public = public_mod  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
@@ -63,6 +69,32 @@ def fake_wandb(monkeypatch: pytest.MonkeyPatch):
         return timeouts
 
     return install
+
+
+def _assert_log_regex_provenance(
+    tmp_path,
+    text: str,
+    cases: list[tuple[str, float, int, int]],
+) -> None:
+    """Run log-regex selection cases and assert their source provenance."""
+    raw = text.encode("utf-8")
+    (tmp_path / "stdout.log").write_bytes(raw)
+
+    for select, expected_value, expected_line, expected_count in cases:
+        cfg = LogRegexExtractor(
+            type="log_regex",
+            file="stdout.log",
+            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
+            select=select,
+        )
+        provenance: dict = {}
+        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+        assert value == expected_value, select
+        source = provenance["source"]
+        assert source["sha256"] == hashlib.sha256(raw).hexdigest(), select
+        assert source["size_bytes"] == len(raw), select
+        assert source["matched_line"] == expected_line, select
+        assert source["match_count"] == expected_count, select
 
 
 def test_json_basic(tmp_path):
@@ -238,7 +270,7 @@ def test_json_envelope_rejects_mismatched_provenance(tmp_path, path, value, matc
 
 
 def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
-    bad_paths = ["/tmp/result.json", "../result.json", ""]
+    bad_paths = ["/tmp/result.json", "../result.json", "", ".", "result\0.json"]
     bad_keys = ["", ".x", "x."]
 
     for bad_path in bad_paths:
@@ -248,6 +280,14 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     for bad_key in bad_keys:
         with pytest.raises(ValidationError, match="JSON key"):
             JsonEqualsGate(type="json_equals", path="result.json", key=bad_key, value=1)
+
+    with pytest.raises(ValidationError, match="valid only with source=directory"):
+        ArtifactSizeGate(type="artifact_size", source="file", path=".", max_bytes=1)
+
+    assert (
+        ArtifactSizeGate(type="artifact_size", source="directory", path=".", min_bytes=0).path
+        == "."
+    )
 
 
 def test_log_regex_selects_last_or_min_value(tmp_path):
@@ -371,62 +411,33 @@ def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
 
 
 def test_provenance_log_regex_records_selected_line_and_whole_file_digest(tmp_path):
-    text = "eval_loss=1.0\neval_loss=0.5\neval_loss=0.7\n"
-    raw = text.encode("utf-8")
-    (tmp_path / "stdout.log").write_bytes(raw)
-
-    for select, expected_value, expected_line, expected_count in [
-        ("min", 0.5, 2, 3),
-        ("last", 0.7, 3, 3),
-        # "first" stops matching at line 1 but must still digest the whole file.
-        ("first", 1.0, 1, 1),
-    ]:
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
-            select=select,
-        )
-        provenance: dict = {}
-        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
-        assert value == expected_value, select
-        source = provenance["source"]
-        assert source["sha256"] == hashlib.sha256(raw).hexdigest(), select
-        assert source["size_bytes"] == len(raw), select
-        assert source["matched_line"] == expected_line, select
-        assert source["match_count"] == expected_count, select
+    _assert_log_regex_provenance(
+        tmp_path,
+        "eval_loss=1.0\neval_loss=0.5\neval_loss=0.7\n",
+        [
+            ("min", 0.5, 2, 3),
+            ("last", 0.7, 3, 3),
+            # "first" stops matching at line 1 but must still digest the whole file.
+            ("first", 1.0, 1, 1),
+        ],
+    )
 
 
 def test_log_regex_splits_carriage_return_progress_lines(tmp_path):
     """Lone carriage returns are line boundaries, matching the historical
     text-mode universal-newline reader — tqdm-style progress logs separate
     updates with bare "\\r" (review v0.5.17 / finding F follow-up)."""
-    text = "eval_loss=2.5\reval_loss=1.9\reval_loss=2.1\nfinal eval_loss=2.2\r\n"
-    raw = text.encode("utf-8")
-    (tmp_path / "stdout.log").write_bytes(raw)
-
-    for select, expected_value, expected_line, expected_count in [
-        # 1.9 sits mid-"\r"-run: only reachable when "\r" splits lines.
-        ("min", 1.9, 2, 4),
-        ("max", 2.5, 1, 4),
-        ("last", 2.2, 4, 4),
-        ("first", 2.5, 1, 1),
-    ]:
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
-            select=select,
-        )
-        provenance: dict = {}
-        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
-        assert value == expected_value, select
-        source = provenance["source"]
-        # The digest still covers the exact on-disk bytes, "\r"s included.
-        assert source["sha256"] == hashlib.sha256(raw).hexdigest(), select
-        assert source["size_bytes"] == len(raw), select
-        assert source["matched_line"] == expected_line, select
-        assert source["match_count"] == expected_count, select
+    _assert_log_regex_provenance(
+        tmp_path,
+        "eval_loss=2.5\reval_loss=1.9\reval_loss=2.1\nfinal eval_loss=2.2\r\n",
+        [
+            # 1.9 sits mid-"\r"-run: only reachable when "\r" splits lines.
+            ("min", 1.9, 2, 4),
+            ("max", 2.5, 1, 4),
+            ("last", 2.2, 4, 4),
+            ("first", 2.5, 1, 1),
+        ],
+    )
 
 
 def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):
@@ -445,6 +456,7 @@ def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):
 
     source = provenance["source"]
     assert source["kind"] == "wandb"
+    assert source["base_url"] == "https://api.wandb.ai"
     assert source["entity"] == "me"
     assert source["project"] == "proj"
     assert source["run_id"] == "attempt-test"
@@ -474,6 +486,31 @@ def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
     assert run_extractor(ctx, cfg) == pytest.approx(0.123)
     assert paths == ["me/proj/attempt-test"]
     assert timeouts == [1]
+
+
+def test_wandb_extractor_uses_explicit_normalized_endpoint(fake_wandb, tmp_path) -> None:
+    constructed: list[tuple[dict[str, str] | None, int | None]] = []
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructed.append((overrides, timeout))
+
+        def run(self, _path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        base_url="https://wandb.example.test///",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
+    assert cfg.base_url == "https://wandb.example.test"
+    assert constructed == [({"base_url": "https://wandb.example.test"}, 1)]
 
 
 def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.MonkeyPatch):
@@ -602,29 +639,19 @@ def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wand
     assert seen == ["new-attempt"]
 
 
-def test_wandb_api_constructor_failure_is_typed_extractor_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-):
+def test_wandb_api_constructor_failure_is_typed_extractor_error(fake_wandb, tmp_path):
     """A credential/settings failure in ``Api(...)`` must not escape the error model.
 
     Construction used to happen outside the polling ``try`` block, so an
     exception there surfaced as an arbitrary exception instead of a typed
     extractor failure (review v0.5.17 / finding D).
     """
-    wandb_mod = types.ModuleType("wandb")
-    apis_mod = types.ModuleType("wandb.apis")
-    public_mod = types.ModuleType("wandb.apis.public")
 
     class Api:
-        def __init__(self, timeout=None):
+        def __init__(self, overrides=None, timeout=None):
             raise RuntimeError("credential loader exploded during Api construction")
 
-    public_mod.Api = Api
-    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
-    apis_mod.public = public_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+    fake_wandb(api_class=Api)
 
     cfg = WandbExtractor(
         type="wandb",
@@ -640,7 +667,7 @@ def test_wandb_api_constructor_failure_is_typed_extractor_error(
 
 
 def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    fake_wandb, monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
     """A mid-poll ``Api(...)`` failure is transient, not a setup error.
 
@@ -649,13 +676,10 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
     constructor failure must be retried like any other poll error instead of
     aborting the wait with most of the budget unspent.
     """
-    wandb_mod = types.ModuleType("wandb")
-    apis_mod = types.ModuleType("wandb.apis")
-    public_mod = types.ModuleType("wandb.apis.public")
     constructions = {"count": 0}
 
     class Api:
-        def __init__(self, timeout=None):
+        def __init__(self, overrides=None, timeout=None):
             constructions["count"] += 1
             if constructions["count"] == 2:
                 raise ConnectionError("transient network blip during Api construction")
@@ -665,12 +689,7 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
                 return _FakeRun(state="running", summary={})
             return _FakeRun(state="finished", summary={"eval/loss": 0.123})
 
-    public_mod.Api = Api
-    wandb_mod.apis = apis_mod  # type: ignore[attr-defined]
-    apis_mod.public = public_mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis", apis_mod)
-    monkeypatch.setitem(sys.modules, "wandb.apis.public", public_mod)
+    fake_wandb(api_class=Api)
 
     clock = {"now": 0.0}
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
@@ -735,7 +754,7 @@ def test_wandb_extractor_poll_budget_is_capped_by_phase_deadline(fake_wandb, tmp
     )
 
     started = _time.monotonic()
-    with pytest.raises(ExtractorError):
+    with pytest.raises(DeadlineExceededError):
         run_extractor(
             make_trial_context(tmp_path),
             cfg,
@@ -759,7 +778,106 @@ def test_wandb_extractor_rejects_expired_deadline_before_polling(fake_wandb, tmp
         timeout_seconds=60,
     )
 
-    with pytest.raises(ExtractorError, match="wallclock deadline exceeded"):
+    with pytest.raises(DeadlineExceededError, match="wallclock deadline exceeded"):
         run_extractor(make_trial_context(tmp_path), cfg, deadline=0.0)
 
     assert timeouts == []
+
+
+def test_gate_results_mark_only_deadline_caused_failures(fake_wandb, tmp_path):
+    """Gate failures carry a causal deadline marker, not an elapsed-clock guess."""
+    fake_wandb(lambda _path: (_ for _ in ()).throw(ConnectionError("unreachable")))
+    ctx = make_trial_context(tmp_path)
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        entity="team",
+        project="proj",
+        keys=["eval/loss"],
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    capped = evaluate_gates(ctx, [gate], deadline=time.monotonic() + 0.05)[0]
+    expired = evaluate_gates(
+        ctx,
+        [JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)],
+        deadline=0.0,
+    )[0]
+    ordinary = evaluate_gates(
+        ctx,
+        [JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)],
+    )[0]
+
+    assert capped.deadline_exhausted is True
+    assert expired.deadline_exhausted is True
+    assert ordinary.deadline_exhausted is False
+
+
+def test_deadline_capped_extractor_error_keeps_underlying_diagnostic(fake_wandb, tmp_path):
+    """A deadline-attributed W&B failure must still name the real error.
+
+    The rewrap that blames an exhausted budget used to discard the extractor's
+    own message, so an expired API key or a wrong entity/project surfaced to the
+    operator as a pure timeout: they would raise ``timeout_seconds`` and rerun
+    into the identical failure forever.
+    """
+    fake_wandb(lambda _path: (_ for _ in ()).throw(ConnectionError("401 unauthorized")))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=60,
+    )
+
+    with pytest.raises(DeadlineExceededError) as excinfo:
+        run_extractor(
+            make_trial_context(tmp_path),
+            cfg,
+            deadline=time.monotonic() + 0.05,
+        )
+
+    message = str(excinfo.value)
+    # Both halves must survive: the causal attribution the engine keys off, and
+    # the diagnostic that says more budget would not have helped.
+    assert "deadline exhausted" in message
+    assert "401 unauthorized" in message
+    assert "eval/loss" in message
+    # trial.py records ``f"metric extractor: {exc}"`` verbatim as failure_reason,
+    # so the message above is exactly what lands in the Optuna user attrs.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ExtractorError)
+    assert "401 unauthorized" in str(cause)
+
+
+class _UnregisteredGate:
+    """Stand-in for a ``Gate`` union member with no ``_GATE_DISPATCH`` entry."""
+
+    type = "unregistered"
+
+    def __repr__(self) -> str:
+        return "_UnregisteredGate()"
+
+
+@pytest.mark.parametrize("deadline", [None, 0.0, "future"])
+def test_unregistered_gate_type_fails_instead_of_raising(tmp_path, deadline):
+    """An unhandled gate type degrades to one failing gate, never a KeyError.
+
+    A bare ``_GATE_DISPATCH[type(gate)]`` lookup raises ``KeyError``, which is
+    not an ``ExtractorError`` and is not in Optuna's ``catch=`` tuple, so it
+    would escape the objective and abort the entire phase and run mid-sweep.
+    """
+    ctx = make_trial_context(tmp_path)
+    resolved = time.monotonic() + 5.0 if deadline == "future" else deadline
+    known = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
+
+    results = evaluate_gates(ctx, [_UnregisteredGate(), known], deadline=resolved)  # type: ignore[list-item]
+
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert results[0].gate_type == "_UnregisteredGate"
+    assert "unknown gate" in results[0].detail
+    # Evaluation continues past the unknown gate rather than aborting the trial.
+    assert results[1].gate_type == "json_equals"
+    assert results[1].passed is False

@@ -12,17 +12,20 @@ import optuna
 import pytest
 import yaml
 
+from phasesweep.engine.guards import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.state import _generation_winner_path, _winner_path
+from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
+    AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     AWAIT_RECHECK_SECONDS,
     _run_elapsed_seconds,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from phasesweep.mcp.time import utc_now_iso
+from phasesweep.runtime.time import utc_now_iso
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -137,6 +140,42 @@ def test_status_reports_progress_fields(tmp_path: Path) -> None:
     assert phase["trial_data_available"] is True
 
 
+def test_status_floors_inconsistent_historical_terminal_count() -> None:
+    """A partial snapshot cannot expose a negative pre-run trial count."""
+    status = {
+        "current_generation_id": "generation-current",
+        "published_generation_id": None,
+        "represented_generation_id": "generation-current",
+        "is_published": False,
+        "publication_integrity": "absent",
+        "result_context": "current_config",
+        "published_config_matches_current": None,
+        "result_phase_plan": ["p"],
+        "metric": {"name": "loss", "goal": "minimize"},
+        "summary_present": False,
+        "phases": [
+            {
+                "phase": "p",
+                "n_trials": 3,
+                "trials": {"COMPLETE": 1},
+                "generation_trials": {"COMPLETE": 2},
+                "winner_present": False,
+                "trial_data_available": True,
+            }
+        ],
+    }
+
+    payload = status_payload(
+        "srv",
+        status,
+        None,
+        result_source="current_shared_study",
+        elapsed_seconds=None,
+    )
+
+    assert payload["phases"][0]["terminal_trials_before_run"] == 0
+
+
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
@@ -146,6 +185,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         storage=experiment.storage,
     )
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     winner_path = _winner_path(experiment, "p")
     winner_path.parent.mkdir(parents=True, exist_ok=True)
     winner_path.write_text(
@@ -232,11 +272,12 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
 
 def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
     """Replace await_run's deadline clock and recheck sleep with a manual clock."""
-    clock = {"now": 0.0, "sleeps": 0.0}
+    clock = {"now": 0.0, "sleeps": 0.0, "pauses": 0.0}
 
     async def advance(seconds: float) -> None:
         clock["now"] += seconds
         clock["sleeps"] += seconds
+        clock["pauses"] += 1
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
     monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
@@ -279,6 +320,23 @@ def test_await_run_times_out_with_unchanged_status(
     assert result["changed"] is False
     assert result["run"]["state"] == "running"
     assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
+
+
+def test_await_run_rechecks_mid_wait_at_the_default_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = _fake_clock(monkeypatch)
+
+    result = asyncio.run(app.await_run("r1"))
+
+    assert result["reason"] == "timeout"
+    assert clock["sleeps"] == pytest.approx(AWAIT_DEFAULT_TIMEOUT_SECONDS)
+    # The recheck cadence must divide the default wait into more than one pause,
+    # otherwise status is only read at entry and at the deadline.
+    assert AWAIT_RECHECK_SECONDS < AWAIT_DEFAULT_TIMEOUT_SECONDS
+    assert clock["pauses"] == AWAIT_DEFAULT_TIMEOUT_SECONDS / AWAIT_RECHECK_SECONDS
+    assert clock["pauses"] > 1
 
 
 def test_await_run_reports_failed_trial_progress_at_timeout(
@@ -347,6 +405,66 @@ def test_await_run_clamps_timeout(
     assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
+def _await_with_timed_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    read_seconds: float,
+) -> tuple[dict[str, object], list[float], float]:
+    """Run one minimum-timeout wait against a manually timed status reader."""
+    app, _registry, _store = _app_with_run(tmp_path)
+    clock = {"now": 0.0}
+    read_starts: list[float] = []
+    real_read = app._read_status_target
+
+    def timed_read(**kwargs):
+        read_starts.append(clock["now"])
+        result = real_read(**kwargs)
+        clock["now"] += read_seconds
+        return result
+
+    async def advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr(app, "_read_status_target", timed_read)
+
+    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
+    return result, read_starts, clock["now"]
+
+
+@pytest.mark.parametrize(
+    ("read_seconds", "expected_elapsed", "expect_single_read"),
+    [
+        pytest.param(0.2, AWAIT_MIN_TIMEOUT_SECONDS, False, id="reserve-final-status-read"),
+        pytest.param(2.6, AWAIT_MIN_TIMEOUT_SECONDS, True, id="wait-remaining-budget"),
+        pytest.param(6.1, 6.1, True, id="in-progress-read-crosses-deadline"),
+    ],
+)
+def test_await_run_read_timeout_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_seconds: float,
+    expected_elapsed: float,
+    expect_single_read: bool,
+) -> None:
+    """Do not return early, but do not claim a blocking read can be preempted."""
+    result, read_starts, elapsed = _await_with_timed_reads(
+        tmp_path,
+        monkeypatch,
+        read_seconds=read_seconds,
+    )
+
+    assert result["reason"] == "timeout"
+    if expect_single_read:
+        assert read_starts == [0.0]
+    else:
+        assert len(read_starts) > 1
+        assert max(read_starts) < AWAIT_MIN_TIMEOUT_SECONDS
+    assert elapsed == pytest.approx(expected_elapsed)
+
+
 def test_await_run_returns_when_phase_gains_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,6 +474,7 @@ def test_await_run_returns_when_phase_gains_winner(
 
     async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
         winner = _generation_winner_path(experiment, "r1", experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")
@@ -413,16 +532,19 @@ def test_terminal_run_snapshot_failure_returns_structured_unavailable_results(
     awaited = asyncio.run(app.await_run("r1"))
 
     assert status["result_source"] == "terminal_snapshot_unavailable"
+    assert status["publication_integrity"] == "unknown"
     assert status["run"]["state"] == "succeeded"
     assert status["run"]["failure"]["code"] == "result_snapshot_unavailable"
     assert status["run"]["failure"]["actor"] == "operator"
     assert status["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["publication_integrity"] == "unknown"
     assert winners["winner_count"] == 0
     assert winners["failure"]["code"] == "result_snapshot_unavailable"
     assert awaited["reason"] == "terminal"
     assert awaited["changed"] is False
     assert awaited["result_source"] == "terminal_snapshot_unavailable"
+    assert awaited["publication_integrity"] == "unknown"
     assert awaited["run"]["failure"]["code"] == "result_snapshot_unavailable"
 
 

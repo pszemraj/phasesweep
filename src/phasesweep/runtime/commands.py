@@ -7,51 +7,87 @@ injection or misparse from shell metacharacters in paths or categorical values.
 from __future__ import annotations
 
 import json
+import math
+import re
 import shlex
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+import yaml
+
+_CliOverrideFormat = Literal["argparse", "hydra"]
 
 
-def _stringify(value: Any) -> str:
-    """Render a Python value into the canonical scalar form for trial commands.
+class _OverrideValueError(TypeError):
+    """A value outside the scalar/list CLI override contract."""
 
-    Args:
-        value: Any scalar, list, or tuple sampled by Optuna or read from
-            ``fixed_overrides``.
+    def __init__(self, fmt: _CliOverrideFormat, value: Any, position: str) -> None:
+        """Describe the exact nested value the selected CLI wire cannot render.
 
-    Returns:
-        A string representation: ``"true"``/``"false"`` for ``bool``;
-        ``"[a,b,c]"`` for list/tuple; ``str(value)`` otherwise.
+        :param _CliOverrideFormat fmt: Selected CLI override grammar.
+        :param Any value: Unsupported value encountered while rendering.
+        :param str position: Nested list position used in the diagnostic.
+        """
+        self.value = value
+        self.position = position
+        where = f" at position {position}" if position else ""
+        super().__init__(
+            f"override_format={fmt!r} supports null, booleans, integers, finite "
+            f"floats, strings, and lists of those; got{where} "
+            f"{type(value).__name__}: {value!r}. Use the default "
+            "override_format='yaml_file' for structured trainer configuration, "
+            "or explicit override_format='json_file' for an overrides-only file."
+        )
 
-    """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_stringify(v) for v in value) + "]"
-    return str(value)
 
+def _render_override_value(
+    value: Any,
+    fmt: _CliOverrideFormat,
+    *,
+    position: str = "",
+    _ancestors: set[int] | None = None,
+) -> str:
+    """Render one value using the scalar/list CLI override contract.
 
-def _stringify_hydra(value: Any) -> str:
-    """Render a value for Hydra/OmegaConf override grammar.
-
-    :param Any value: Scalar or list-like value to render.
-    :raises TypeError: If the value cannot be represented by the supported grammar.
-    :return str: Hydra-compatible representation of the value.
+    :param Any value: Scalar or recursively list-like override value.
+    :param _CliOverrideFormat fmt: Target CLI override grammar.
+    :param str position: Nested list position used in diagnostics.
+    :param set[int] | None _ancestors: Internal recursive-container guard.
+    :raises _OverrideValueError: If a value has no faithful CLI wire form.
+    :return str: Canonical value text for ``fmt``.
     """
     if value is None:
-        return "null"
+        return "None" if fmt == "argparse" else "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
     if isinstance(value, str):
-        return json.dumps(value)
+        return value if fmt == "argparse" else json.dumps(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return str(value)
+        raise _OverrideValueError(fmt, value, position)
     if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_stringify_hydra(v) for v in value) + "]"
-    raise TypeError(
-        "override_format='hydra' supports scalar values and lists only; "
-        f"got {type(value).__name__}. Use override_format='json_file' for structured values."
-    )
+        ancestors = set() if _ancestors is None else _ancestors
+        if id(value) in ancestors:
+            raise _OverrideValueError(fmt, value, position)
+        ancestors.add(id(value))
+        try:
+            rendered = (
+                _render_override_value(
+                    item,
+                    fmt,
+                    position=f"{position}[{index}]",
+                    _ancestors=ancestors,
+                )
+                for index, item in enumerate(value)
+            )
+            return "[" + ",".join(rendered) + "]"
+        finally:
+            ancestors.remove(id(value))
+    raise _OverrideValueError(fmt, value, position)
 
 
 def format_hydra(overrides: dict[str, Any]) -> str:
@@ -63,10 +99,14 @@ def format_hydra(overrides: dict[str, Any]) -> str:
     Returns:
         A single space-separated string of shell-quoted ``key=value`` tokens.
 
+    Raises:
+        TypeError: A value is outside the shared CLI override contract (see
+            :func:`_render_override_value`).
+
     """
     parts: list[str] = []
     for k, v in overrides.items():
-        parts.append(shlex.quote(f"{k}={_stringify_hydra(v)}"))
+        parts.append(shlex.quote(f"{k}={_render_override_value(v, 'hydra')}"))
     return " ".join(parts)
 
 
@@ -80,11 +120,16 @@ def format_argparse(overrides: dict[str, Any]) -> str:
         A single space-separated string of shell-quoted ``--key`` ``value``
         token pairs.
 
+    Raises:
+        TypeError: A value is outside the shared CLI override contract (see
+            :func:`_render_override_value`). Statically-known override values
+            are already rejected at config load; this covers anything else.
+
     """
     parts: list[str] = []
     for k, v in overrides.items():
         parts.append(shlex.quote(f"--{k}"))
-        parts.append(shlex.quote(_stringify(v)))
+        parts.append(shlex.quote(_render_override_value(v, "argparse")))
     return " ".join(parts)
 
 
@@ -114,16 +159,21 @@ def dump_overrides_json(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 
-def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
-    """Write a JSON overrides file with dotted keys expanded into nested dicts.
+def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
+    """Serialize JSON-file overrides after expanding dotted keys.
 
     Args:
         overrides: Mapping from override key (may contain dots) to value.
-        trial_dir: Per-trial directory; the file is written as
-            ``<trial_dir>/overrides.json``.
 
     Returns:
-        The path to the written ``overrides.json`` file.
+        The exact UTF-8 text for ``overrides.json``.
+
+    Raises:
+        ValueError: A dotted key collides with an existing scalar or would
+            replace a nested object built by another key, or the payload
+            contains a non-finite float.
+        TypeError: The payload contains a value the strict encoder cannot
+            represent.
 
     """
     nested: dict[str, Any] = {}
@@ -138,8 +188,217 @@ def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
         if parts[-1] in cur and isinstance(cur[parts[-1]], dict):
             raise ValueError(f"Cannot expand override {k!r}: it would replace a nested object.")
         cur[parts[-1]] = v
+    return dump_overrides_json(nested)
+
+
+def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
+    """Write a JSON overrides file with dotted keys expanded into nested dicts.
+
+    Args:
+        overrides: Mapping from override key (may contain dots) to value.
+        trial_dir: Per-trial directory; the file is written as
+            ``<trial_dir>/overrides.json``.
+
+    Returns:
+        The path to the written ``overrides.json`` file.
+
+    Raises:
+        ValueError: A dotted key collides with an existing scalar or would
+            replace a nested object built by another key, or the payload
+            contains a non-finite float.
+        TypeError: The payload contains a value the strict encoder cannot
+            represent.
+
+    """
     path = trial_dir / "overrides.json"
-    path.write_text(dump_overrides_json(nested))
+    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
+    return path
+
+
+def compose_trainer_config(
+    trainer_config: dict[str, Any], overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply dotted PhaseSweep overrides to a complete trainer configuration.
+
+    A dotted key descends through mappings, creating missing mappings as needed.
+    The final segment replaces the base value at that exact path, including a
+    complete mapping or list. Descending through an existing non-mapping is an
+    error because there is no unambiguous YAML result.
+
+    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
+    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
+    :raises ValueError: An override path must descend through a non-mapping value.
+    :return dict[str, Any]: Deep-copied complete configuration for one trial.
+    """
+    composed = deepcopy(trainer_config)
+    for key, value in overrides.items():
+        current = composed
+        parts = key.split(".")
+        for index, part in enumerate(parts[:-1]):
+            existing = current.get(part)
+            if existing is None and part not in current:
+                child: dict[str, Any] = {}
+                current[part] = child
+                current = child
+                continue
+            if not isinstance(existing, dict):
+                prefix = ".".join(parts[: index + 1])
+                raise ValueError(
+                    f"Cannot apply override {key!r}: trainer_config path {prefix!r} "
+                    f"is {type(existing).__name__}, not a mapping."
+                )
+            current = existing
+        current[parts[-1]] = deepcopy(value)
+    return composed
+
+
+def _substitute_trainer_config_placeholders(value: Any, substitutions: dict[str, str]) -> Any:
+    """Expand PhaseSweep runtime placeholders inside trainer-config strings.
+
+    Each source string is scanned once so placeholder-like text inside a real
+    replacement value (for example, a workdir containing ``{phase}``) remains
+    literal instead of being substituted again.
+
+    :param Any value: Configuration subtree to copy and expand.
+    :param dict[str, str] substitutions: Literal placeholder-to-value mapping.
+    :return Any: Expanded copy of ``value``.
+    """
+    if isinstance(value, str):
+        pattern = "|".join(re.escape(placeholder) for placeholder in substitutions)
+        if not pattern:
+            return value
+        return re.sub(pattern, lambda match: substitutions[match.group(0)], value)
+    if isinstance(value, list):
+        return [_substitute_trainer_config_placeholders(item, substitutions) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _substitute_trainer_config_placeholders(item, substitutions)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _validate_trainer_config_value(
+    value: Any,
+    *,
+    position: str = "trainer_config",
+    _ancestors: set[int] | None = None,
+) -> None:
+    """Require deterministic, portable values in a generated trainer YAML.
+
+    :param Any value: Value to validate recursively.
+    :param str position: Human-readable path used in diagnostics.
+    :param set[int] | None _ancestors: Internal recursive-container guard.
+    :raises TypeError: A mapping key is not a string or a value is outside the
+        normal YAML configuration scalar/list/mapping domain.
+    :raises ValueError: A float is non-finite or a container is recursive.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ValueError(f"{position} must be finite; got {value!r}.")
+
+    if not isinstance(value, (dict, list)):
+        raise TypeError(
+            f"{position} has unsupported type {type(value).__name__}: {value!r}. "
+            "Use strings, booleans, integers, finite floats, null, lists, and "
+            "string-keyed mappings; quote YAML dates or timestamps to keep them strings."
+        )
+
+    ancestors = set() if _ancestors is None else _ancestors
+    if id(value) in ancestors:
+        raise ValueError(f"{position} contains a recursive YAML container.")
+    ancestors.add(id(value))
+    try:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"{position} has non-string mapping key {key!r} "
+                        f"({type(key).__name__}). Trainer config keys must be strings."
+                    )
+                child_position = f"{position}.{key}" if position else key
+                _validate_trainer_config_value(
+                    item,
+                    position=child_position,
+                    _ancestors=ancestors,
+                )
+        else:
+            for index, item in enumerate(value):
+                _validate_trainer_config_value(
+                    item,
+                    position=f"{position}[{index}]",
+                    _ancestors=ancestors,
+                )
+    finally:
+        ancestors.remove(id(value))
+
+
+def dump_trainer_config_yaml(payload: dict[str, Any]) -> str:
+    """Serialize one complete trainer config to deterministic safe YAML.
+
+    :param dict[str, Any] payload: Fully composed trainer configuration.
+    :raises TypeError: The payload contains an unsupported value or mapping key.
+    :raises ValueError: The payload contains a non-finite float or recursive container.
+    :return str: Canonical YAML text with keys sorted at every mapping level.
+    """
+    _validate_trainer_config_value(payload)
+    return yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
+
+
+def dump_trial_trainer_config_yaml(
+    trainer_config: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> str:
+    """Serialize the complete trainer YAML consumed by one trial.
+
+    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
+    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
+    :param dict[str, str] | None substitutions: Runtime placeholders expanded
+        recursively in base-config string values before overrides are applied.
+    :raises TypeError: The complete config contains an unsupported YAML value.
+    :raises ValueError: Override composition or YAML validation fails.
+    :return str: Exact UTF-8 text for ``trainer_config.yaml``.
+    """
+    base = (
+        trainer_config
+        if not substitutions
+        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
+    )
+    return dump_trainer_config_yaml(compose_trainer_config(base, overrides))
+
+
+def write_trainer_config_yaml(
+    trainer_config: dict[str, Any],
+    overrides: dict[str, Any],
+    trial_dir: Path,
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> Path:
+    """Materialize the complete trainer YAML consumed by one trial.
+
+    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
+    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
+    :param Path trial_dir: Per-trial directory receiving ``trainer_config.yaml``.
+    :param dict[str, str] | None substitutions: Runtime placeholders expanded
+        recursively in base-config string values before overrides are applied.
+    :raises TypeError: The complete config contains an unsupported YAML value.
+    :raises ValueError: Override composition or YAML validation fails.
+    :return Path: Path to the generated complete trainer config.
+    """
+    path = trial_dir / "trainer_config.yaml"
+    path.write_text(
+        dump_trial_trainer_config_yaml(
+            trainer_config,
+            overrides,
+            substitutions=substitutions,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -152,51 +411,100 @@ def render_command(
     trial_id: int,
     phase: str,
     run_name: str,
+    trainer_config: dict[str, Any] | None = None,
     write_files: bool = True,
+    materialized_input_path: Path | None = None,
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
-    Path-like substitutions (``{trial_dir}``, ``{overrides_path}``) are
-    shell-quoted.
+    Path-like substitutions (``{trial_dir}``, ``{config_path}``,
+    ``{overrides_path}``) are shell-quoted.
 
     Args:
         template: The user's ``trial_command`` template with ``{...}``
-            placeholders. Supported keys: ``overrides``, ``overrides_path``,
-            ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
+            placeholders. Supported keys: ``config_path``, ``overrides``,
+            ``overrides_path``, ``trial_dir``, ``trial_id``, ``phase``,
+            ``run_name``.
         overrides: The composed overrides for this trial.
-        fmt: One of ``"argparse"``, ``"hydra"``, ``"json_file"``.
+        fmt: One of ``"yaml_file"``, ``"argparse"``, ``"json_file"``,
+            ``"hydra"``.
         trial_dir: Per-trial directory used for ``{trial_dir}`` and for the
             ``overrides.json`` file when ``fmt == "json_file"``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
         phase: Phase name, used for ``{phase}``.
         run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
             identifier used for ``{run_name}``.
+        trainer_config: Base trainer configuration embedded in the PhaseSweep
+            YAML. Used only by ``yaml_file``.
         write_files: When ``False``, render paths without writing
-            ``overrides.json``. Used by dry-run previews so they are
-            filesystem-pure.
+            ``trainer_config.yaml`` or ``overrides.json``. Used by dry-run
+            previews so they are filesystem-pure.
+        materialized_input_path: Exact generated input already written by the
+            launch path. When supplied for a file mode, command rendering uses
+            this path without serializing or rewriting the input.
 
     Returns:
         The fully rendered, shell-ready command string.
 
     Raises:
-        ValueError: If ``fmt`` is not one of the three supported formats.
+        ValueError: If ``fmt`` is not one of the four supported formats, or a
+            dotted override cannot be composed into ``trainer_config``.
+        TypeError: A configured value cannot be represented by the selected
+            command or generated-file format.
+        OSError: ``write_files`` is true and a generated trainer input cannot
+            be written.
 
     """
-    if fmt == "hydra":
-        overrides_str = format_hydra(overrides)
+    config_path = ""
+    if fmt == "yaml_file":
+        base = {} if trainer_config is None else trainer_config
+        config_substitutions = {
+            "{trial_dir}": str(trial_dir),
+            "{trial_id}": str(trial_id),
+            "{phase}": phase,
+            "{run_name}": run_name,
+        }
+        if materialized_input_path is not None:
+            config_path = str(materialized_input_path)
+        elif write_files:
+            config_path = str(
+                write_trainer_config_yaml(
+                    base,
+                    overrides,
+                    trial_dir,
+                    substitutions=config_substitutions,
+                )
+            )
+        else:
+            # Dry-run and config validation remain filesystem-pure while still
+            # exercising the exact composition and serializer used at launch.
+            expanded_base = _substitute_trainer_config_placeholders(base, config_substitutions)
+            payload = compose_trainer_config(expanded_base, overrides)
+            dump_trainer_config_yaml(payload)
+            config_path = str(trial_dir / "trainer_config.yaml")
+        overrides_str = ""
         overrides_path = ""
     elif fmt == "argparse":
         overrides_str = format_argparse(overrides)
         overrides_path = ""
     elif fmt == "json_file":
         overrides_str = ""
-        overrides_path = str(
-            write_json_file(overrides, trial_dir) if write_files else trial_dir / "overrides.json"
-        )
+        if materialized_input_path is not None:
+            overrides_path = str(materialized_input_path)
+        else:
+            overrides_path = str(
+                write_json_file(overrides, trial_dir)
+                if write_files
+                else trial_dir / "overrides.json"
+            )
+    elif fmt == "hydra":
+        overrides_str = format_hydra(overrides)
+        overrides_path = ""
     else:
         raise ValueError(f"Unknown override_format: {fmt}")
 
     return template.format(
+        config_path=shlex.quote(config_path) if config_path else "",
         overrides=overrides_str,
         overrides_path=shlex.quote(overrides_path) if overrides_path else "",
         trial_dir=shlex.quote(str(trial_dir)),

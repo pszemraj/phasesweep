@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
+import shlex
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
-from phasesweep.config import ExecutionContext
-from phasesweep.engine.trial import TrialExecutionError, launch_trial
+from phasesweep.config import ExecutionContext, JsonEnvelopeExtractor, Metric
+from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
 from phasesweep.runtime.process import ProcessResult
 from tests.conftest import make_experiment
 
@@ -21,9 +26,13 @@ def _capture_launch_env(
     *,
     experiment_env: dict[str, str] | None = None,
     execution: ExecutionContext | None = None,
+    metric: Metric | None = None,
     gpu_id: int | str | None = 2,
-) -> dict[str, str]:
-    captured: dict[str, str] = {}
+    gpu_lease_fds: tuple[int, ...] = (),
+    experiment_kwargs: dict[str, Any] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
 
     def fake_run_supervised(
         _cmd: str,
@@ -35,11 +44,14 @@ def _capture_launch_env(
         trial_dir: Path,
         attempt_id: str,
         cwd: str | None = None,
+        gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
         captured.update(env)
+        captured["command"] = _cmd
         captured["run_supervised_attempt_id"] = attempt_id
         if cwd is not None:
             captured["run_supervised_cwd"] = cwd
+        captured["gpu_lease_fds"] = gpu_lease_fds
         return ProcessResult(
             return_code=0,
             timed_out=False,
@@ -48,18 +60,87 @@ def _capture_launch_env(
         )
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
-    launch_trial(
-        experiment=make_experiment(env=experiment_env, execution=execution),
+    executed = launch_trial(
+        experiment=make_experiment(
+            env=experiment_env,
+            execution=execution,
+            metric=metric,
+            **(experiment_kwargs or {}),
+        ),
         phase_name="p",
         trial_id=0,
         generation_id="generation-test",
         attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
-        overrides={},
+        overrides={} if overrides is None else overrides,
         timeout_seconds=None,
         gpu_id=gpu_id,
+        gpu_lease_fds=gpu_lease_fds,
     )
+    captured["trainer_input"] = executed.trainer_input
     return captured
+
+
+def test_launch_trial_forwards_gpu_lease_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trainer supervisor inherits the descriptors backing its GPU assignment."""
+    env = _capture_launch_env(tmp_path, monkeypatch, gpu_lease_fds=(17, 23))
+
+    assert env["gpu_lease_fds"] == (17, 23)
+
+
+def test_launch_trial_writes_command_as_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-ASCII trial paths do not depend on the process locale."""
+    command_encoding: list[str | None] = []
+    real_write_text = Path.write_text
+
+    def capture_encoding(path: Path, text: str, *, encoding: str | None = None) -> int:
+        if path.name == "command.txt":
+            command_encoding.append(encoding)
+        return real_write_text(path, text, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", capture_encoding)
+    _capture_launch_env(tmp_path / "tríäl", monkeypatch)
+
+    assert command_encoding == ["utf-8"]
+
+
+def test_launch_trial_injects_configured_objective_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metric = Metric(
+        name="eval_loss",
+        extractor=JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="reports/objective.json",
+            objective_name="eval_loss",
+            split="validation",
+            policy="final_checkpoint",
+        ),
+    )
+
+    env = _capture_launch_env(tmp_path, monkeypatch, metric=metric)
+
+    assert env["PHASESWEEP_OBJECTIVE_PATH"] == str(
+        tmp_path / "trial_0" / "reports" / "objective.json"
+    )
+
+
+def test_launch_trial_drops_ambient_objective_path_for_non_envelope_extractor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/not-this-trial.json")
+
+    env = _capture_launch_env(tmp_path, monkeypatch)
+
+    assert "PHASESWEEP_OBJECTIVE_PATH" not in env
 
 
 @pytest.mark.parametrize(
@@ -70,8 +151,15 @@ def _capture_launch_env(
             {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
             2,
             "2",
+            "PCI_BUS_ID",
+            id="numeric-forces-lock-compatible-order",
+        ),
+        pytest.param(
+            {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+            "GPU-deadbeef",
+            "GPU-deadbeef",
             "FASTEST_FIRST",
-            id="operator-device-order",
+            id="uuid-preserves-operator-device-order",
         ),
         pytest.param(
             None,
@@ -107,6 +195,58 @@ def test_launch_trial_cuda_environment(
     assert env["run_supervised_attempt_id"] == "attempt-test"
 
 
+def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default boundary gives the trainer one complete, identity-bound YAML."""
+    trial_dir = tmp_path / "trial_0"
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={
+            "trial_command": "python train.py --config {config_path}",
+            "override_format": "yaml_file",
+            "trainer_config": {
+                "model": {"depth": 4, "width": 128},
+                "output_dir": "{trial_dir}/outputs",
+            },
+        },
+        overrides={"model.depth": 8, "run_label": "{trial_dir}"},
+    )
+
+    config_path = trial_dir / "trainer_config.yaml"
+    assert yaml.safe_load(config_path.read_text()) == {
+        "model": {"depth": 8, "width": 128},
+        "output_dir": f"{trial_dir}/outputs",
+        # Runtime placeholders are a base-config feature. Sampled and fixed
+        # string values remain literal trainer data.
+        "run_label": "{trial_dir}",
+    }
+    assert shlex.split(captured["command"]) == [
+        "python",
+        "train.py",
+        "--config",
+        str(config_path),
+    ]
+    assert (
+        captured["PHASESWEEP_OVERRIDES_SHA256"]
+        == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    )
+    assert captured["trainer_input"] == {
+        "schema_version": 1,
+        "format": "yaml_file",
+        "filename": "trainer_config.yaml",
+        "size_bytes": config_path.stat().st_size,
+        "sha256": captured["PHASESWEEP_OVERRIDES_SHA256"],
+    }
+    assert json.loads((trial_dir / "overrides_resolved.json").read_text()) == {
+        "model.depth": 8,
+        "run_label": "{trial_dir}",
+    }
+
+
 def test_launch_trial_inherit_env_all_passes_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -131,6 +271,135 @@ def test_launch_trial_inherit_env_none_filters_ambient(
     assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
     assert env["KEEP_ME"] == "explicit"
     assert env["PATH"] == os.environ["PATH"]
+
+
+@pytest.mark.parametrize("ambient_visibility", ["", "-1", "3"])
+def test_launch_trial_narrow_env_drops_ambient_cuda_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_visibility: str,
+) -> None:
+    """Ambient GPU visibility is an unfingerprinted semantic input under a strict contract.
+
+    Two operators running the identical config from differently-exported
+    shells must not write CPU-trained and GPU-trained evaluations into one
+    study under one semantic fingerprint. Note the composed path never leaves
+    a disable sentinel here with ``gpu_id=None``: the GPU pool pins sentinels
+    and passes them as the assigned token (next test).
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_visibility)
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(inherit_env="none"),
+        gpu_id=None,
+    )
+
+    assert "CUDA_VISIBLE_DEVICES" not in env
+
+
+@pytest.mark.parametrize("sentinel", ["", "-1"])
+def test_launch_trial_pool_pinned_sentinel_binds_visibility_under_strict_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
+    """A pool-pinned disable sentinel reaches the trainer despite ``inherit_env: none``.
+
+    The pool leases nothing *because* the sentinel says CUDA is off; handing
+    the trial an unbound environment instead would silently re-expose every
+    host GPU with zero host locks held.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", sentinel)
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(inherit_env="none"),
+        gpu_id=sentinel,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == sentinel
+
+
+@pytest.mark.parametrize(
+    ("ambient_visibility", "experiment_env", "execution"),
+    [
+        pytest.param("-1", None, None, id="inherit-all"),
+        pytest.param(
+            "-1",
+            None,
+            ExecutionContext(inherit_env=["CUDA_VISIBLE_DEVICES"]),
+            id="inherit-explicit-list",
+        ),
+        pytest.param(
+            "7",
+            {"CUDA_VISIBLE_DEVICES": "-1"},
+            ExecutionContext(inherit_env="none"),
+            id="configured-under-strict-contract",
+        ),
+    ],
+)
+def test_launch_trial_cuda_visibility_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_visibility: str,
+    experiment_env: dict[str, str] | None,
+    execution: ExecutionContext | None,
+) -> None:
+    """The environment contract forwards or replaces ambient CUDA visibility."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_visibility)
+
+    env = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        experiment_env=experiment_env,
+        execution=execution,
+        gpu_id=None,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
+
+
+def test_launch_trial_warns_once_when_ambient_visibility_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dropping ambient visibility with no device leased is reported, not silent."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        for _ in range(2):
+            _capture_launch_env(
+                tmp_path,
+                monkeypatch,
+                execution=ExecutionContext(inherit_env="none"),
+                gpu_id=None,
+            )
+
+    warnings = [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
+    assert len(warnings) == 1
+    assert "env.CUDA_VISIBLE_DEVICES" in warnings[0].getMessage()
+
+
+def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An assigned device already binds visibility and holds a lock."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        env = _capture_launch_env(
+            tmp_path,
+            monkeypatch,
+            execution=ExecutionContext(inherit_env="none"),
+            gpu_id=2,
+        )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
 
 
 def test_launch_trial_inherit_env_list_adds_exactly_named(
@@ -176,3 +445,124 @@ def test_launch_trial_missing_execution_cwd_fails_loudly(
             monkeypatch,
             execution=ExecutionContext(cwd=str(tmp_path / "does_not_exist")),
         )
+
+
+def test_environment_identity_digest_ignores_mapping_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The digest identifies the environment's content, not its insertion order."""
+    monkeypatch.delenv("PHASESWEEP_TEST_AMBIENT_SECRET", raising=False)
+    forward = _environment_identity(
+        make_experiment(
+            env={"ALPHA": "1", "BETA": "2"},
+            execution=ExecutionContext(inherit_env="none"),
+        )
+    )
+    reversed_order = _environment_identity(
+        make_experiment(
+            env={"BETA": "2", "ALPHA": "1"},
+            execution=ExecutionContext(inherit_env="none"),
+        )
+    )
+
+    assert forward.digest == reversed_order.digest
+    assert len(forward.digest) == 64
+
+
+def test_environment_identity_digest_tracks_values_and_name_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different values — and differently-split name/value pairs — are different environments."""
+    monkeypatch.delenv("PHASESWEEP_TEST_AMBIENT_SECRET", raising=False)
+
+    def identity_for(env: dict[str, str]) -> str:
+        return _environment_identity(
+            make_experiment(env=env, execution=ExecutionContext(inherit_env="none"))
+        ).digest
+
+    assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
+    # An injective encoding must not let a name/value boundary shift produce
+    # one digest: "A" -> "B=1" and "A=B" -> "1" are different environments.
+    assert identity_for({"A": "B=1"}) != identity_for({"A=B": "1"})
+
+
+def test_environment_identity_names_are_sorted_and_hold_no_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names are the diagnostic surface; values stay inside the digest only."""
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    identity = _environment_identity(
+        make_experiment(
+            env={"ZULU": "z-secret", "ALPHA": "a-secret"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+        )
+    )
+
+    assert list(identity.names) == sorted(identity.names)
+    assert {"ALPHA", "ZULU", "PHASESWEEP_TEST_TOKEN"} <= set(identity.names)
+    assert not {"a-secret", "z-secret", "ambient-secret"} & set(identity.names)
+
+
+def test_launch_trial_records_private_environment_json_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``record_env: true`` persists the exact environment, owner-only (0600)."""
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    execution = ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"], record_env=True)
+    _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        experiment_env={"CONFIGURED": "value"},
+        execution=execution,
+    )
+
+    path = tmp_path / "trial_0" / "environment.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    identity = _environment_identity(
+        make_experiment(env={"CONFIGURED": "value"}, execution=execution)
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert payload["digest"] == identity.digest
+    assert payload["inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
+    assert payload["passthrough_env"] == []
+    assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
+    assert payload["env"]["CONFIGURED"] == "value"
+    assert sorted(payload["env"]) == list(identity.names)
+
+
+def test_passthrough_value_rotation_preserves_semantic_environment_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    experiment = make_experiment(execution=execution)
+
+    monkeypatch.setenv("WANDB_API_KEY", "first-secret")
+    first = _environment_identity(experiment)
+    monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
+    second = _environment_identity(experiment)
+
+    assert first.digest == second.digest
+    assert first.values["WANDB_API_KEY"] == "first-secret"
+    assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:
+    execution = ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    first = _environment_identity(
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-a"})
+    )
+    second = _environment_identity(
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-b"})
+    )
+
+    assert first.digest != second.digest
+
+
+def test_launch_trial_writes_no_environment_json_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Values are secrets: nothing is written unless the operator opts in."""
+    _capture_launch_env(tmp_path, monkeypatch)
+
+    assert not (tmp_path / "trial_0" / "environment.json").exists()

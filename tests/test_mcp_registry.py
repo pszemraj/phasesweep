@@ -24,11 +24,13 @@ def _experiment_yaml(tmp_path: Path, *, name: str = "reg_ok", with_storage: bool
     phases = """\
   - name: warmup
     n_trials: 2
+    sampler: { type: random, seed: 0 }
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
   - name: tune
     inherits: [warmup]
     n_trials: 3
+    sampler: { type: random, seed: 1 }
     search_space:
       wd: { type: float, low: 0.0, high: 0.3 }
 """
@@ -41,6 +43,7 @@ def _suite_yaml(tmp_path: Path) -> str:
         defaults:
           workdir: {tmp_path}/runs
           trial_command: "echo {{overrides}}"
+          override_format: argparse
           metric:
             name: x
             goal: minimize
@@ -71,6 +74,20 @@ def _catalog(
         cwd=cwd,
         max_concurrent_runs=max_concurrent_runs,
     )
+
+
+def _assert_catalog_rejected(
+    tmp_path: Path,
+    catalog_body: str,
+    match: str,
+) -> None:
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    catalog = _write(
+        tmp_path / "catalog.yaml",
+        catalog_body.format(state=tmp_path / "state", config=config),
+    )
+    with pytest.raises(CatalogError, match=match):
+        Registry.load(catalog)
 
 
 def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None:
@@ -133,6 +150,7 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
     reg = registry.get("reg_ok")
     assert reg.config_path == config.resolve()
     assert reg.cwd == config.resolve().parent
+    assert reg.experiment.execution.cwd == str(config.resolve().parent)
     assert len(reg.config_sha256) == 64
     assert reg.phase_names == ["warmup", "tune"]
     assert not reg.allow_launch
@@ -153,7 +171,14 @@ def test_get_returns_registered_experiment_with_internal_fields(tmp_path: Path) 
 def test_checked_in_catalog_loads(
     catalog_path: str,
     experiment_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        "phasesweep.mcp.registry._prepare_state_dir",
+        lambda _base, _configured: state_dir,
+    )
     registry = Registry.load(REPO / catalog_path)
 
     entry = registry.get(experiment_id)
@@ -199,6 +224,7 @@ def test_catalog_cwd_resolves_against_catalog_file(tmp_path: Path) -> None:
     reg = Registry.load(catalog).get("reg_ok")
 
     assert reg.cwd == run_cwd.resolve()
+    assert reg.experiment.execution.cwd == str(run_cwd.resolve())
 
 
 def test_catalog_cwd_must_exist(tmp_path: Path) -> None:
@@ -275,23 +301,57 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "storage",
+    ("storage", "error_match"),
     [
-        '"sqlite:///relative.db"',
-        '"sqlite+pysqlite:///relative.db"',
-        '"sqlite:///file:relative.db?mode=rwc&uri=true"',
-        '"journal:///relative.journal"',
-        '"journal://"',
-        '"journal:///"',
+        pytest.param('"sqlite:///relative.db"', "absolute .*storage path", id="relative-sqlite"),
+        pytest.param(
+            '"sqlite+pysqlite:///relative.db"',
+            "absolute .*storage path",
+            id="relative-sqlite-driver",
+        ),
+        pytest.param(
+            '"sqlite:///file:relative.db?mode=rwc&uri=true"',
+            "absolute .*storage path",
+            id="relative-sqlite-uri",
+        ),
+        pytest.param(
+            '"journal:///relative.journal"',
+            "absolute .*storage path",
+            id="relative-journal",
+        ),
+        pytest.param('"journal://"', "absolute .*storage path", id="empty-journal-url"),
+        pytest.param('"journal:///"', "absolute .*storage path", id="empty-journal-path"),
+        pytest.param('"sqlite://"', "storage must be persistent", id="empty-sqlite-url"),
+        pytest.param('"sqlite:///:memory:"', "storage must be persistent", id="sqlite-memory"),
+        pytest.param(
+            '"sqlite+pysqlite:///:memory:"',
+            "storage must be persistent",
+            id="sqlite-driver-memory",
+        ),
+        pytest.param(
+            '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+            "storage must be persistent",
+            id="sqlite-uri-memory",
+        ),
+        pytest.param(
+            '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
+            "storage must be persistent",
+            id="sqlite-driver-uri-memory",
+        ),
+        pytest.param('":memory:"', "storage must be persistent", id="memory-shorthand"),
     ],
 )
-def test_relative_file_storage_rejected_for_mcp(tmp_path: Path, storage: str) -> None:
+def test_nonpersistent_storage_rejected_for_mcp(
+    tmp_path: Path,
+    storage: str,
+    error_match: str,
+) -> None:
     config = _write(
         tmp_path / "exp.yaml",
         _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
     )
 
-    with pytest.raises(CatalogError, match="absolute .*storage path"):
+    with pytest.raises(CatalogError, match=error_match):
         Registry.load(_catalog(tmp_path, config))
 
 
@@ -330,10 +390,7 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     ("old", "new"),
     [
         ("goal: minimize", "goal: sideways"),
-        (
-            "n_trials: 2\n    search_space:",
-            "n_trials: 2\n    sampler: { type: nope }\n    search_space:",
-        ),
+        ("sampler: { type: random, seed: 0 }", "sampler: { type: nope }"),
     ],
     ids=["invalid_goal", "unknown_sampler"],
 )
@@ -351,23 +408,32 @@ def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "catalog_body",
+    ("catalog_body", "match"),
     [
-        """
+        pytest.param(
+            """
         state_dir: {state}
         state_dir: {state}/other
         experiments:
           - id: reg_ok
             config: {config}
         """,
-        """
+            "duplicate key",
+            id="duplicate-top-level-key",
+        ),
+        pytest.param(
+            """
         state_dir: {state}
         experiments:
           - id: reg_ok
             config: {config}
             config: {config}
         """,
-        """
+            "duplicate key",
+            id="duplicate-entry-key",
+        ),
+        pytest.param(
+            """
         state_dir: {state}
         experiments:
           - id: reg_ok
@@ -376,18 +442,47 @@ def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
               launch: false
               launch: true
         """,
+            "duplicate key",
+            id="duplicate-allow-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        extra: true
+        experiments:
+          - id: reg_ok
+            config: {config}
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-top-level-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            cancle: false
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-entry-key",
+        ),
+        pytest.param(
+            """
+        state_dir: {state}
+        experiments:
+          - id: reg_ok
+            config: {config}
+            allow:
+              from-phase: false
+        """,
+            "Extra inputs are not permitted",
+            id="unknown-allow-key",
+        ),
     ],
-    ids=["top_level", "entry", "allow"],
 )
-def test_duplicate_catalog_yaml_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    catalog = _write(
-        tmp_path / "catalog.yaml",
-        catalog_body.format(state=tmp_path / "state", config=config),
-    )
-
-    with pytest.raises(CatalogError, match="duplicate key"):
-        Registry.load(catalog)
+def test_invalid_catalog_keys_rejected(tmp_path: Path, catalog_body: str, match: str) -> None:
+    _assert_catalog_rejected(tmp_path, catalog_body, match)
 
 
 def test_suite_config_rejected(tmp_path: Path) -> None:
@@ -399,26 +494,6 @@ def test_suite_config_rejected(tmp_path: Path) -> None:
 def test_missing_storage_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
     with pytest.raises(CatalogError, match="storage"):
-        Registry.load(_catalog(tmp_path, config))
-
-
-@pytest.mark.parametrize(
-    "storage",
-    [
-        '"sqlite://"',
-        '"sqlite:///:memory:"',
-        '"sqlite+pysqlite:///:memory:"',
-        '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-        '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-        '":memory:"',
-    ],
-)
-def test_in_memory_storage_urls_rejected(tmp_path: Path, storage: str) -> None:
-    config = _write(
-        tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
-    )
-    with pytest.raises(CatalogError, match="storage must be persistent"):
         Registry.load(_catalog(tmp_path, config))
 
 
@@ -460,44 +535,6 @@ def test_persistent_sqlite_uri_file_storage_allowed(tmp_path: Path) -> None:
     registry = Registry.load(_catalog(tmp_path, config))
 
     assert registry.get("reg_ok").experiment.storage == storage.strip('"')
-
-
-@pytest.mark.parametrize(
-    "catalog_body",
-    [
-        """
-        state_dir: {state}
-        extra: true
-        experiments:
-          - id: reg_ok
-            config: {config}
-        """,
-        """
-        state_dir: {state}
-        experiments:
-          - id: reg_ok
-            config: {config}
-            cancle: false
-        """,
-        """
-        state_dir: {state}
-        experiments:
-          - id: reg_ok
-            config: {config}
-            allow:
-              from-phase: false
-        """,
-    ],
-    ids=["top_level", "entry", "allow"],
-)
-def test_unknown_catalog_keys_rejected(tmp_path: Path, catalog_body: str) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    catalog = _write(
-        tmp_path / "catalog.yaml",
-        catalog_body.format(state=tmp_path / "state", config=config),
-    )
-    with pytest.raises(CatalogError, match="Extra inputs are not permitted"):
-        Registry.load(catalog)
 
 
 def test_config_not_found_rejected(tmp_path: Path) -> None:

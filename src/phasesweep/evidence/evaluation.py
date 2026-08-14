@@ -7,7 +7,6 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +30,9 @@ from phasesweep.evidence.wandb import (
     WandbSetupError,
     poll_wandb_summary,
 )
+from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.time import utc_now_iso
 
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
@@ -76,6 +77,14 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance (review v0.5.17 / finding F).
+    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
+        file under ``trial_dir``.
+    :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
+        failing segment as the argument.
+    :raises OSError: If the resolved file exists but cannot be read.
+    :raises UnicodeDecodeError: If the file bytes are not valid UTF-8.
+    :raises ValueError: If the contents are not strict JSON (malformed document,
+        duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
     target = trial_dir / relative_path
@@ -111,6 +120,10 @@ class ExtractorError(RuntimeError):
 
     The phase runner catches this and marks the trial as failed.
     """
+
+
+class DeadlineExceededError(ExtractorError):
+    """Raised when the phase/run deadline directly prevents extraction."""
 
 
 @dataclass(frozen=True)
@@ -408,6 +421,7 @@ def _extract_wandb(
     """
     try:
         summary = poll_wandb_summary(
+            base_url=cfg.base_url,
             entity=cfg.entity,
             project=cfg.project,
             run_id=ctx.attempt_id,
@@ -419,7 +433,7 @@ def _extract_wandb(
         raise ExtractorError(
             "W&B extractor requested but the 'wandb' package is not installed. "
             "Install the wandb extra for the same distribution, for example: "
-            'python -m pip install "phasesweep[wandb] @ '
+            'pip install "phasesweep[wandb] @ '
             'git+https://github.com/pszemraj/phasesweep.git"'
         ) from exc
     except WandbSetupError as exc:
@@ -450,6 +464,7 @@ def _extract_wandb(
     if provenance is not None:
         provenance["source"] = {
             "kind": "wandb",
+            "base_url": cfg.base_url,
             "entity": cfg.entity,
             "project": cfg.project,
             "run_id": ctx.attempt_id,
@@ -457,17 +472,9 @@ def _extract_wandb(
             # terminal state raises WandbRunTerminalError above.
             "run_state": "finished",
             "summary": {cfg.metric_key: summary[cfg.metric_key]},
-            "retrieved_at": _utc_now_iso(),
+            "retrieved_at": utc_now_iso(timespec="seconds"),
         }
     return value
-
-
-def _utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string.
-
-    :return str: Second-resolution UTC timestamp for provenance records.
-    """
-    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 _DISPATCH: dict[type, Callable[[TrialContext, Any, dict[str, Any] | None], float]] = {
@@ -542,12 +549,41 @@ def run_extractor(
         )
     remaining = _remaining_budget_seconds(deadline)
     if remaining is not None and remaining <= 0.0:
-        raise ExtractorError("Phase/run wallclock deadline exceeded before evidence extraction.")
+        raise DeadlineExceededError(
+            "Phase/run wallclock deadline exceeded before evidence extraction."
+        )
+    deadline_capped = (
+        remaining is not None
+        and isinstance(cfg, WandbExtractor)
+        and remaining < cfg.timeout_seconds
+    )
     if remaining is not None and isinstance(cfg, WandbExtractor):
         cfg = cfg.model_copy(update={"timeout_seconds": min(cfg.timeout_seconds, remaining)})
-    value = fn(ctx, cfg, provenance)
+    try:
+        value = fn(ctx, cfg, provenance)
+    except ExtractorError as exc:
+        # Attribution here is deliberately optimistic: a capped timeout that
+        # expires is blamed on the deadline even though the run's summary might
+        # never have arrived under the full timeout either. Distinguishing the
+        # two would require re-polling past the deadline, which is exactly what
+        # the budget forbids, so a genuinely missing run that happens to be
+        # capped is reported as deadline exhaustion.
+        #
+        # The extractor's own diagnostic is appended verbatim rather than
+        # replaced: the capped poll may have been failing all along for a
+        # reason no extra budget would fix (expired API key, wrong
+        # entity/project), and that detail — which already embeds
+        # WandbPollTimeout.last_error — is the only thing that stops an
+        # operator from raising timeout_seconds and rerunning into the same
+        # wall.
+        if deadline_capped and isinstance(exc.__cause__, WandbPollTimeout):
+            raise DeadlineExceededError(
+                "Phase/run wallclock deadline exhausted while polling W&B evidence. "
+                f"Underlying extractor error: {exc}"
+            ) from exc
+        raise
     if provenance is not None:
-        provenance["recorded_at"] = _utc_now_iso()
+        provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value
 
 
@@ -558,6 +594,7 @@ class GateResult:
     gate_type: str
     passed: bool
     detail: str
+    deadline_exhausted: bool = False
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
@@ -669,27 +706,32 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     try:
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
-        hasher = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                hasher.update(chunk)
+        digest = file_sha256(path)
     except OSError as exc:
         return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
-    digest = hasher.hexdigest()
     if digest == gate.sha256:
         return GateResult(gate.type, True, f"{gate.path} sha256 matched")
     return GateResult(gate.type, False, f"{gate.path} sha256 {digest} != {gate.sha256}")
 
 
-def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -> GateResult:
+def _wandb_summary_required(
+    ctx: TrialContext,
+    gate: WandbSummaryRequiredGate,
+    *,
+    deadline_capped: bool = False,
+) -> GateResult:
     """Check that a finished W&B run summary contains required keys.
 
     :param TrialContext ctx: Trial context containing the immutable W&B run id.
     :param WandbSummaryRequiredGate gate: Gate config for W&B lookup and keys.
+    :param bool deadline_capped: Whether the phase/run deadline shortened this
+        gate's polling timeout; a timeout failure is then attributed to
+        deadline exhaustion rather than to missing evidence.
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
         summary = poll_wandb_summary(
+            base_url=gate.base_url,
             entity=gate.entity,
             project=gate.project,
             run_id=ctx.attempt_id,
@@ -711,7 +753,12 @@ def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -
         detail = f"W&B run {ctx.attempt_id!r} not ready within {gate.timeout_seconds}s"
         if exc.last_error is not None:
             detail += f"; last error: {exc.last_error}"
-        return GateResult(gate.type, False, detail)
+        return GateResult(
+            gate.type,
+            False,
+            detail,
+            deadline_exhausted=deadline_capped,
+        )
 
     missing = [key for key in gate.keys if key not in summary]
     if not missing:
@@ -719,7 +766,10 @@ def _wandb_summary_required(ctx: TrialContext, gate: WandbSummaryRequiredGate) -
     return GateResult(gate.type, False, f"W&B summary missing {missing}")
 
 
-_GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
+# Single registry of handled gate types. Signatures are not uniform — the W&B
+# gate additionally accepts the ``deadline_capped`` keyword — so the value type
+# is left open rather than pinned to the two-positional-argument shape.
+_GATE_DISPATCH: dict[type, Callable[..., GateResult]] = {
     RequiredFileGate: _required_file,
     JsonEqualsGate: _json_equals,
     JsonScalarBoundGate: _json_scalar_bound,
@@ -748,10 +798,16 @@ def evaluate_gates(
     results: list[GateResult] = []
     for gate in gates:
         fn = _GATE_DISPATCH.get(type(gate))
-        if fn is None:  # pragma: no cover - closed union
+        if fn is None:
+            # Unreachable from config today (``Gate`` is a closed pydantic
+            # union whose every member is registered above), but a new member
+            # added without a dispatch entry must degrade to one failing gate
+            # rather than raise a KeyError that escapes the objective and
+            # aborts the whole phase mid-sweep.
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
         remaining = _remaining_budget_seconds(deadline)
+        deadline_capped = False
         if remaining is not None:
             if remaining <= 0.0:
                 results.append(
@@ -759,12 +815,19 @@ def evaluate_gates(
                         gate.type,
                         False,
                         "phase/run wallclock deadline exceeded before this gate ran",
+                        deadline_exhausted=True,
                     )
                 )
                 continue
             if isinstance(gate, WandbSummaryRequiredGate):
+                deadline_capped = remaining < gate.timeout_seconds
                 gate = gate.model_copy(
                     update={"timeout_seconds": min(gate.timeout_seconds, remaining)}
                 )
-        results.append(fn(ctx, gate))
+        if isinstance(gate, WandbSummaryRequiredGate):
+            # Dispatched through the table like every other gate; only the
+            # extra deadline-attribution keyword is specific to this one.
+            results.append(fn(ctx, gate, deadline_capped=deadline_capped))
+        else:
+            results.append(fn(ctx, gate))
     return results

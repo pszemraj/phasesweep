@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import json
+import logging
 import shutil
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,22 +21,56 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
+    JsonEqualsGate,
     LogRegexExtractor,
     Metric,
     Phase,
+    Promotion,
     Sampler,
+    StudySpec,
+    Suite,
+    SuiteDefaults,
+    WandbExtractor,
 )
 from phasesweep.engine import (
+    ArtifactRootConflictError,
+    ArtifactRootRebindError,
+    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
+    RunRequestError,
     SamplerContinuationUnsupportedError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
     TrialTargetRegressionError,
+    WinnerIntegrityError,
+    read_status,
+    read_winner,
     read_winners,
 )
-from phasesweep.engine.guards import FINGERPRINT_SCHEMA_VERSION, _phase_fingerprint
+from phasesweep.engine.guards import (
+    FINGERPRINT_SCHEMA_VERSION,
+    _artifact_root_rebind_entries,
+    _ArtifactRootRebindPlan,
+    _phase_fingerprint,
+    _register_active_attempt,
+    _validate_artifact_root_binding,
+    _validate_artifact_root_binding_for_rebind,
+    _validate_artifact_root_destination,
+)
+from phasesweep.engine.optuna import _sqlite_study_exists
 from phasesweep.engine.run import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    ATTEMPT_ID_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
+    _artifact_root_binding_path,
+    _attempts_dir,
+    _experiment_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
@@ -47,7 +84,18 @@ from phasesweep.engine.state import (
     _summary_path,
     _winner_path,
 )
-from tests.conftest import make_experiment, write_constant_trainer, write_trainer, write_yaml
+from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.runtime.files import atomic_text_writer
+from phasesweep.runtime.process import write_attempt_lifecycle
+from tests.conftest import (
+    assert_published_winner_evidence_local,
+    drop_artifact_root_binding,
+    make_experiment,
+    patch_path_method_failure,
+    write_constant_trainer,
+    write_trainer,
+    write_yaml,
+)
 
 
 def _two_phase_experiment(
@@ -70,6 +118,9 @@ def _two_phase_experiment(
         Phase(
             name="arch",
             n_trials=arch_n_trials,
+            # Seeded random keeps this helper valid with persistent storage,
+            # which rejects an unseeded stochastic sampler.
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=arch_low, high=arch_high)},
             fixed_overrides=arch_fixed_overrides or {},
         ),
@@ -77,6 +128,7 @@ def _two_phase_experiment(
             name="lr",
             inherits=["arch"],
             n_trials=1,
+            sampler=Sampler(type="random", seed=1),
             search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
         ),
     ]
@@ -84,7 +136,75 @@ def _two_phase_experiment(
         workdir=str(workdir),
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=phases,
+    )
+
+
+def _promotion_chain_experiment(
+    *,
+    workdir: Path,
+    trainer: Path,
+    storage: str,
+    on_fail: str,
+    arch_n_trials: int = 1,
+) -> Experiment:
+    """Build an arch --promotion baseline--> mid experiment with no inheritance edge.
+
+    ``mid`` depends on ``arch`` only through ``promotion.min_delta_vs``, which
+    config validation requires to name a *prior* phase rather than an inherited
+    one. The constant trainer makes the delta exactly zero, so the first run
+    promotes (``improvement >= min_delta``) and both phases publish a winner.
+
+    :param Path workdir: Artifact root for the experiment.
+    :param Path trainer: Trainer script invoked by every trial.
+    :param str storage: Optuna storage URL; persistent so studies outlive a run.
+    :param str on_fail: Promotion ``on_fail`` policy for ``mid``.
+    :param int arch_n_trials: Trial target for ``arch``; raise it to request a top-up.
+    :return Experiment: Two-phase experiment linked by a promotion baseline.
+    """
+    return make_experiment(
+        workdir=str(workdir),
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=arch_n_trials,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"depth": IntParam(type="int", low=1, high=4)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(
+                    min_delta_vs="arch",
+                    min_delta=0.0,
+                    requires_gates=False,
+                    on_fail=on_fail,  # type: ignore[arg-type]
+                ),
+            ),
+        ],
+    )
+
+
+def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
+    """Build a stand-in study exposing only what the top-up guard reads.
+
+    :param int completed: Number of terminal trials the study reports.
+    :param str | None fingerprint: Bound phase fingerprint, or ``None`` for a
+        study that has not been bound to a published winner yet.
+    :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
+        surface :func:`_reject_bound_descendant_topups` uses.
+    """
+    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE) for _ in range(completed)]
+    return SimpleNamespace(
+        user_attrs={} if fingerprint is None else {"phasesweep_fingerprint": fingerprint},
+        get_trials=lambda *, deepcopy: trials,
     )
 
 
@@ -100,7 +220,8 @@ experiment: fp_test
 storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+trial_command: "python {trainer} {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -132,6 +253,16 @@ def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="Persistent storage requires.*provenance"):
         Experiment.model_validate(payload)
+
+
+@pytest.mark.parametrize("storage", [":memory:", "sqlite://", "sqlite:///:memory:"])
+def test_in_memory_storage_does_not_require_provenance(storage: str) -> None:
+    payload = make_experiment().model_dump()
+    payload["storage"] = storage
+
+    experiment = Experiment.model_validate(payload)
+
+    assert experiment.provenance == {}
 
 
 def test_late_child_fingerprint_failure_preserves_last_successful_results(
@@ -214,6 +345,7 @@ def test_fingerprint_changes_when_parent_winner_changes():
     exp = Experiment(
         experiment="t",
         trial_command="echo {overrides}",
+        override_format="argparse",
         metric=Metric(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
         ),
@@ -259,6 +391,7 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
         experiment: t
         workdir: {tmp_path}/runs
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -300,6 +433,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -311,6 +445,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             Experiment(
                 experiment="t",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -346,6 +481,22 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             lambda: (
                 make_experiment(provenance={"revision": "trainer-v1"}),
                 make_experiment(provenance={"revision": "trainer-v2"}),
+            ),
+            False,
+        ),
+        (
+            "trainer_config",
+            lambda: (
+                make_experiment(
+                    trial_command="echo {config_path}",
+                    override_format="yaml_file",
+                    trainer_config={"model": {"depth": 4}},
+                ),
+                make_experiment(
+                    trial_command="echo {config_path}",
+                    override_format="yaml_file",
+                    trainer_config={"model": {"depth": 8}},
+                ),
             ),
             False,
         ),
@@ -415,6 +566,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
 
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The trainer's cwd and env-inheritance contract are semantic inputs.
 
@@ -425,6 +577,12 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     default block.
     """
     from phasesweep.engine.guards import _experiment_semantic_fingerprint, _phase_semantic_payload
+
+    invocation_a = tmp_path / "invocation-a"
+    invocation_b = tmp_path / "invocation-b"
+    invocation_a.mkdir()
+    invocation_b.mkdir()
+    monkeypatch.chdir(invocation_a)
 
     variants = {
         "unbound": make_experiment(),
@@ -439,6 +597,18 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     # Writing the default block out longhand is not a semantic edit.
     assert experiment_fps["unbound"] == experiment_fps["explicit_default"]
     assert phase_fps["unbound"] == phase_fps["explicit_default"]
+
+    monkeypatch.chdir(invocation_b)
+    second_invocation = make_experiment()
+    assert _experiment_semantic_fingerprint(second_invocation) != experiment_fps["unbound"]
+    assert (
+        _phase_fingerprint(second_invocation, second_invocation.phases[0], {})
+        != phase_fps["unbound"]
+    )
+
+    explicit_first = make_experiment(execution=ExecutionContext(cwd=str(invocation_a)))
+    assert _experiment_semantic_fingerprint(explicit_first) == experiment_fps["unbound"]
+    assert _phase_fingerprint(explicit_first, explicit_first.phases[0], {}) == phase_fps["unbound"]
 
     distinct = ["unbound", "cwd", "inherit_none", "inherit_names"]
     assert len({experiment_fps[name] for name in distinct}) == len(distinct)
@@ -458,6 +628,251 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _phase_fingerprint(reordered, reordered.phases[0], {}) == _phase_fingerprint(
         ordered, ordered.phases[0], {}
     )
+
+    passthrough_a = make_experiment(
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["HF_TOKEN"])
+    )
+    passthrough_b = make_experiment(
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
+    )
+    assert _phase_fingerprint(passthrough_a, passthrough_a.phases[0], {}) != _phase_fingerprint(
+        passthrough_b, passthrough_b.phases[0], {}
+    )
+
+
+def _with_trial_target(experiment: Experiment, n_trials: int) -> Experiment:
+    phase = experiment.phases[0].model_copy(update={"n_trials": n_trials})
+    return experiment.model_copy(update={"phases": [phase]})
+
+
+def _environment_cohort_experiment(
+    tmp_path: Path,
+    trainer: Path,
+    execution: ExecutionContext,
+) -> Experiment:
+    return make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        execution=execution,
+        n_trials=1,
+    )
+
+
+def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+    with pytest.raises(StudyFingerprintMismatchError, match="No trial was allocated"):
+        run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+
+
+def test_identical_semantic_environment_resumes_persistent_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+
+    run_experiment(experiment)
+    run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+
+
+def test_passthrough_token_rotation_resumes_persistent_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+    )
+    monkeypatch.setenv("WANDB_API_KEY", "first-secret")
+    run_experiment(experiment)
+
+    monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
+    run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+
+
+def test_populated_study_without_environment_identity_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path,
+        trainer,
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+    assert experiment.storage is not None
+    with sqlite3.connect(experiment.storage.removeprefix("sqlite:///")) as connection:
+        connection.execute(
+            "DELETE FROM trial_user_attributes WHERE key = ?",
+            (TRAINER_ENV_DIGEST_ATTR,),
+        )
+
+    with pytest.raises(StudySchemaMismatchError, match="cannot guess.*environment cohort"):
+        run_experiment(_with_trial_target(experiment, 2))
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+
+
+def test_wandb_base_endpoint_change_rejects_topup_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def poll_summary(**kwargs: object) -> dict[str, float]:
+        calls.append(str(kwargs["base_url"]))
+        return {"eval/loss": 0.5}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_summary)
+    trainer = write_trainer(tmp_path, "print('trainer complete')")
+
+    def experiment_for(base_url: str, n_trials: int) -> Experiment:
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / 'studies.db'}",
+            trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
+            execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+            n_trials=n_trials,
+            metric=Metric(
+                extractor=WandbExtractor(
+                    type="wandb",
+                    base_url=base_url,
+                    entity="team",
+                    project="project",
+                    metric_key="eval/loss",
+                )
+            ),
+        )
+
+    first = experiment_for("https://wandb-a.example.test", 1)
+    run_experiment(first)
+    assert calls == ["https://wandb-a.example.test"]
+
+    second = experiment_for("https://wandb-b.example.test", 2)
+    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+        run_experiment(second)
+
+    study = optuna.load_study(study_name="t::p", storage=first.storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert calls == ["https://wandb-a.example.test"]
+
+
+def test_suite_fingerprint_includes_effective_invocation_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suite cannot compile the same relative trainer command from two code trees."""
+    base = make_experiment()
+    suite = Suite(
+        suite="identity",
+        defaults=SuiteDefaults(
+            workdir=base.workdir,
+            trial_command=base.trial_command,
+            override_format=base.override_format,
+            metric=base.metric,
+        ),
+        studies=[StudySpec(name="study", phases=base.phases)],
+    )
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    from phasesweep.engine.guards import _suite_fingerprint
+
+    monkeypatch.chdir(first)
+    first_fingerprint = _suite_fingerprint(suite)
+    monkeypatch.chdir(second)
+
+    assert _suite_fingerprint(suite) != first_fingerprint
+
+
+def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
+    """Toggling the acknowledgement must not move the phase fingerprint.
+
+    The flag never changes what a trial samples or means — on persistent
+    storage its legal value is fully determined by ``sampler.type`` — so
+    acknowledging an existing study's sampler (review v0.5.18 / finding F7)
+    must not invalidate that study.
+    """
+    from phasesweep.engine.guards import _phase_semantic_payload
+
+    plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
+    acknowledged = make_experiment(
+        sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
+    )
+    assert _phase_fingerprint(plain, plain.phases[0], {}) == _phase_fingerprint(
+        acknowledged, acknowledged.phases[0], {}
+    )
+    payload = _phase_semantic_payload(acknowledged, acknowledged.phases[0], {})
+    assert "acknowledge_nonresumable" not in payload["phase"]["sampler"]
+    # The semantic sampler fields still move the fingerprint.
+    reseeded = make_experiment(sampler=Sampler(type="tpe", seed=1, acknowledge_nonresumable=True))
+    assert _phase_fingerprint(acknowledged, acknowledged.phases[0], {}) != _phase_fingerprint(
+        reseeded, reseeded.phases[0], {}
+    )
+
+
+def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
+    """A json_equals gate value's *type* is semantic, so it must be in the digest.
+
+    ``_json_equals`` compares with ``type(actual) is type(gate.value)``, so
+    ``1``, ``"1"``, ``true``, and ``1.0`` accept four disjoint JSON documents.
+    The fingerprint hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, which preserves that distinction only for
+    values strict JSON can hold — which is why ``JsonEqualsGate.value`` is
+    restricted to a strict JSON-scalar union (PR #5 review / reviewer 2,
+    blocker 4). Anything it now rejects (a YAML date, an int-keyed mapping)
+    would have collapsed onto a colliding twin here.
+    """
+
+    def fingerprint_for(value: bool | int | float | str | None) -> str:
+        experiment = make_experiment(
+            gates=[JsonEqualsGate(type="json_equals", path="result.json", key="k", value=value)]
+        )
+        return _phase_fingerprint(experiment, experiment.phases[0], {})
+
+    fingerprints = {
+        "int": fingerprint_for(1),
+        "str": fingerprint_for("1"),
+        "bool": fingerprint_for(True),
+        "float": fingerprint_for(1.0),
+        "null": fingerprint_for(None),
+    }
+
+    assert len(set(fingerprints.values())) == len(fingerprints), fingerprints
+    # The gate participates at all: dropping it is also an edit.
+    ungated = make_experiment()
+    assert _phase_fingerprint(ungated, ungated.phases[0], {}) not in set(fingerprints.values())
 
 
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
@@ -480,6 +895,7 @@ storage: sqlite:///{db}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
+override_format: argparse
 metric:
   name: eval_loss
   goal: minimize
@@ -506,13 +922,16 @@ phases:
 @pytest.mark.parametrize(
     ("sampler", "search_space"),
     [
+        # These cases exist to exercise the stateful samplers on persistent
+        # storage, which requires the config-level non-resumable acknowledgement;
+        # the acknowledgement does not weaken the runtime continuation guard.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
             {"x": IntParam(type="int", low=0, high=10)},
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0),
+            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
             {
                 "x": FloatParam(type="float", low=0.0, high=1.0),
                 "y": FloatParam(type="float", low=0.0, high=1.0),
@@ -545,6 +964,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -575,13 +995,16 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
 @pytest.mark.parametrize(
     ("sampler", "search_space"),
     [
+        # These cases exist to exercise the stateful samplers on persistent
+        # storage, which requires the config-level non-resumable acknowledgement;
+        # the acknowledgement does not weaken the runtime continuation guard.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10),
+            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
             {"x": IntParam(type="int", low=0, high=10)},
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0),
+            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
             {
                 "x": FloatParam(type="float", low=0.0, high=1.0),
                 "y": FloatParam(type="float", low=0.0, high=1.0),
@@ -603,6 +1026,7 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     first = run_experiment(experiment)
@@ -628,6 +1052,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
         workdir=tmp_path / "runs",
         storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         phases=[phase],
     )
     winners = run_experiment(experiment)
@@ -673,6 +1098,65 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     assert {path: path.read_bytes() for path in protected_paths} == before
 
 
+@pytest.mark.parametrize("on_fail", ["skip", "stop", "continue_baseline"])
+def test_promotion_baseline_top_up_is_rejected_before_bound_chain_mutation(
+    tmp_path: Path, on_fail: str
+) -> None:
+    """A bound promotion dependent makes an upstream top-up a preflight refusal.
+
+    Unguarded, every ``on_fail`` policy mutated ``arch`` first and then failed
+    differently against the new baseline winner: ``stop`` raised mid-run,
+    ``continue_baseline`` republished the baseline's overrides under ``mid``
+    (breaking any bound study inheriting it), and ``skip`` - the worst - still
+    *succeeded*, publishing a generation containing only ``arch`` and advancing
+    the last-success pointer past the previously published ``mid`` winner
+    (PR #5 review / reviewer 2 pass 2, blocker 2). The refusal must land before
+    any of that, and it is unconditional - the guard refuses the top-up rather
+    than predicting whether the new baseline would flip the decision - so a
+    constant trainer pins it.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _promotion_chain_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+        on_fail=on_fail,
+    )
+    winners = run_experiment(experiment)
+    assert set(winners) == {"arch", "mid"}
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    protected_paths = [
+        _summary_path(experiment),
+        _last_successful_generation_path(experiment),
+        _generation_summary_path(experiment, published),
+        _generation_record_path(experiment, published),
+        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+        *(
+            _generation_winner_path(experiment, published, phase.name)
+            for phase in experiment.phases
+        ),
+    ]
+    before = {path: path.read_bytes() for path in protected_paths}
+    parent_before = optuna.load_study(study_name="t::arch", storage=storage).trials
+
+    topped_up = _promotion_chain_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        storage=storage,
+        on_fail=on_fail,
+        arch_n_trials=4,
+    )
+    with pytest.raises(RuntimeError, match="promotion baseline.*new experiment name"):
+        run_experiment(topped_up)
+
+    parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
+    assert len(parent_after) == len(parent_before) == 1
+    assert _last_successful_generation_id(topped_up) == published
+    assert {path: path.read_bytes() for path in protected_paths} == before
+
+
 def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     """A grandchild study binds its ancestor even when the middle study is absent."""
     experiment = make_experiment(
@@ -700,12 +1184,890 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
         )
 
 
+def test_upstream_top_up_detects_a_bound_promotion_baseline_dependent() -> None:
+    """A promotion baseline binds its dependent study with no inheritance edge.
+
+    ``promotion.min_delta_vs`` only has to name a prior phase, so this graph is
+    legal and the dependency is invisible to an inherits-only closure
+    (PR #5 review / reviewer 2 pass 2, blocker 2).
+    """
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="skip"),
+            ),
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"study/studies \['mid'\] are already bound to its published winner "
+        r"via a promotion baseline\.",
+    ):
+        _reject_bound_descendant_topups(
+            experiment,
+            from_phase=None,
+            existing_studies={
+                "arch": _fake_top_up_study(completed=1),
+                "mid": _fake_top_up_study(fingerprint="bound-mid"),
+            },
+        )
+
+
+def test_upstream_top_up_reaches_a_bound_grandchild_through_a_promotion_baseline() -> None:
+    """Mixed promotion/inheritance edges compose, even with no study in between."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(
+                    min_delta_vs="arch", min_delta=0.0, on_fail="continue_baseline"
+                ),
+            ),
+            Phase(name="final", inherits=["mid"], n_trials=1, search_space={}),
+        ]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"study/studies \['final'\] are already bound to its published winner "
+        r"via inheritance and a promotion baseline\.",
+    ):
+        _reject_bound_descendant_topups(
+            experiment,
+            from_phase=None,
+            existing_studies={
+                "arch": _fake_top_up_study(completed=1),
+                "final": _fake_top_up_study(fingerprint="bound-final"),
+            },
+        )
+
+
+def test_promotion_baseline_dependent_does_not_block_a_completed_upstream_phase() -> None:
+    """The guard still only fires for a phase that actually has top-up trials left."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                search_space={"depth": IntParam(type="int", low=1, high=2)},
+            ),
+            Phase(
+                name="mid",
+                n_trials=1,
+                search_space={},
+                fixed_overrides={"width": 8},
+                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="stop"),
+            ),
+        ]
+    )
+
+    _reject_bound_descendant_topups(
+        experiment,
+        from_phase=None,
+        existing_studies={
+            "arch": _fake_top_up_study(completed=2),
+            "mid": _fake_top_up_study(fingerprint="bound-mid"),
+        },
+    )
+
+
+def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
+    """Snapshot every file under an experiment namespace for byte-identity checks.
+
+    :param Path root: Experiment artifact namespace to snapshot.
+    :return dict[str, bytes]: Relative path to file content for every regular file.
+    """
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
+    """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
+    run_experiment(bound)
+    bound_root = _experiment_dir(bound)
+    before = _artifact_tree_bytes(bound_root)
+    assert before
+
+    for phase in bound.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+
+    moved = bound.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    with pytest.raises(ArtifactRootConflictError) as excinfo:
+        run_experiment(moved)
+
+    message = str(excinfo.value)
+    assert str(bound_root) in message
+    assert str(_experiment_dir(moved)) in message
+    assert "rebind-workdir" in message
+    assert _artifact_tree_bytes(bound_root) == before
+    for phase in bound.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+
+
+def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> None:
+    """An equal binding is a no-op: ordinary resume and top-up still work."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    topped_up = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    run_experiment(topped_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+    assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
+
+
+def test_binding_claim_ignores_its_atomic_staging_file(tmp_path: Path) -> None:
+    """A concurrent binding reader must not misclassify the writer's temp file."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    binding_path = _artifact_root_binding_path(experiment)
+    with atomic_text_writer(binding_path) as staged:
+        staging = list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
+        assert len(staging) == 1
+
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        staged.write(binding_path.read_text(encoding="utf-8"))
+
+    assert binding_path.is_file()
+    assert not list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
+
+
+def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
+    """A note or OS metadata file does not turn a fresh root into a legacy tree."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    root = _experiment_dir(experiment)
+    root.mkdir(parents=True)
+    (root / ".DS_Store").write_bytes(b"metadata")
+    (root / "notes.md").write_text("operator notes\n", encoding="utf-8")
+
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
+
+    assert _artifact_root_binding_path(experiment).is_file()
+
+
+def test_unbound_known_phasesweep_state_names_the_blocking_entry(tmp_path: Path) -> None:
+    """Known engine state still requires explicit adoption and is identifiable."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+    )
+    (_experiment_dir(experiment) / "generations").mkdir(parents=True)
+
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match="'generations'"):
+        _validate_artifact_root_binding(experiment, claim_fresh=True)
+
+    assert not _artifact_root_binding_path(experiment).exists()
+
+
+def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
+    """One tree cannot mix publication files from one DB with counts from another."""
+    trainer = write_constant_trainer(tmp_path)
+    workdir = tmp_path / "runs"
+
+    def _experiment(database: str) -> Experiment:
+        return make_experiment(
+            workdir=workdir,
+            storage=f"sqlite:///{tmp_path / database}",
+            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+            override_format="argparse",
+            n_trials=1,
+        )
+
+    owner = _experiment("owner.db")
+    run_experiment(owner)
+    published = _last_successful_generation_id(owner)
+    assert published is not None
+    generation_dir = _experiment_dir(owner) / "generations"
+    generations_before = {path.name for path in generation_dir.iterdir()}
+    binding = json.loads(_artifact_root_binding_path(owner).read_text())
+    assert set(binding) == {"schema_version", "experiment", "artifact_root", "storage_key"}
+    assert len(binding["storage_key"]) == 64
+    assert all(character in "0123456789abcdef" for character in binding["storage_key"])
+
+    foreign = _experiment("foreign.db")
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        run_experiment(foreign)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_status(foreign)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winner(foreign, "p")
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winner(foreign, "p", generation_id=published)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_winners(foreign)
+
+    assert not (tmp_path / "foreign.db").exists()
+    assert _last_successful_generation_id(owner) == published
+    assert {path.name for path in generation_dir.iterdir()} == generations_before
+    owner_status = read_status(owner)
+    assert owner_status["publication_integrity"] == "ok"
+    assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
+
+
+def test_unreadable_artifact_root_binding_never_recommends_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permission denial is not evidence of a foreign ledger or authority to rebind."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    binding_path = _artifact_root_binding_path(experiment)
+    binding_before = binding_path.read_bytes()
+    original_read_text = Path.read_text
+    patch_path_method_failure(
+        monkeypatch,
+        binding_path,
+        "read_text",
+        PermissionError("permission denied"),
+    )
+
+    with pytest.raises(ArtifactRootConflictError) as read_info:
+        read_status(experiment)
+    with pytest.raises(ArtifactRootRebindError) as rebind_info:
+        _validate_artifact_root_binding_for_rebind(
+            _ArtifactRootRebindPlan(
+                experiment=experiment,
+                destination=str(_experiment_dir(experiment).resolve()),
+                entries=(),
+            )
+        )
+
+    read_message = str(read_info.value)
+    assert "current user" in read_message
+    assert "permission denied" in read_message
+    assert "different storage ledger" not in read_message
+    assert "do not run rebind-workdir" in read_message
+    assert "refusing to rebind" in str(rebind_info.value)
+    assert binding_path.read_bytes() == binding_before
+
+    monkeypatch.setattr(Path, "read_text", original_read_text)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    snapshot = _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
+
+    patch_path_method_failure(
+        monkeypatch,
+        snapshot,
+        "read_bytes",
+        PermissionError("permission denied"),
+    )
+    with pytest.raises(ArtifactRootRebindError) as publication_info:
+        _validate_artifact_root_destination(
+            experiment,
+            _artifact_root_rebind_entries(experiment),
+        )
+    publication_message = str(publication_info.value)
+    assert "cannot be validated as the current user" in publication_message
+    assert "refusing to rebind" in publication_message
+    assert "Move the complete artifact tree" not in publication_message
+
+
+@pytest.mark.parametrize(
+    ("owner_storage", "offered_storage", "secrets"),
+    [
+        (
+            "postgresql://user@host/db?password=FIRSTSECRET",
+            "postgresql://user@host/db?password=SECONDSECRET",
+            ("FIRSTSECRET", "SECONDSECRET"),
+        ),
+        (
+            "postgresql://user@host/db?access_token=FIRST-TOKEN",
+            "postgresql://user@host/db?access_token=SECOND-TOKEN",
+            ("FIRST-TOKEN", "SECOND-TOKEN"),
+        ),
+        (
+            "postgresql://user@host/db?sslpassword=FIRST-SECRET",
+            "postgresql://user@host/db?sslpassword=SECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
+        (
+            "postgresql://user@host/db?client_secret=FIRST-SECRET",
+            "postgresql://user@host/db?client_secret=SECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
+        (
+            "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DFIRST-PWD%3BUID%3Duser",
+            "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BPWD%3DSECOND-PWD%3BUID%3Duser",
+            ("FIRST-PWD", "SECOND-PWD"),
+        ),
+        (
+            "mssql+pyodbc:///?odbc_connect="
+            "DRIVER%3D%7BODBC%20Driver%2017%20for%20SQL%20Server%7D%3B"
+            "SERVER%3Ddb.internal%3BDATABASE%3Dstudies%3BEncrypt%3Dyes%3B"
+            "ClientSecret%3DFIRST-SECRET",
+            "mssql+pyodbc:///?odbc_connect="
+            "database%3Dstudies%3Bserver%3Ddb.internal%3B"
+            "DRIVER%3D%7BODBC%20Driver%2018%20for%20SQL%20Server%7D%3B"
+            "Encrypt%3Dno%3Bclient_secret%3DSECOND-SECRET",
+            ("FIRST-SECRET", "SECOND-SECRET"),
+        ),
+    ],
+    ids=[
+        "password",
+        "access-token",
+        "sslpassword",
+        "client-secret",
+        "nested-odbc-connect",
+        "equivalent-nested-odbc-spelling",
+    ],
+)
+def test_artifact_root_binding_survives_rdb_query_credential_rotation(
+    tmp_path: Path,
+    owner_storage: str,
+    offered_storage: str,
+    secrets: tuple[str, str],
+) -> None:
+    """Credential rotation retains root ownership without publishing secrets."""
+
+    def external_experiment(storage: str) -> Experiment:
+        placeholder = make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / 'placeholder.db'}",
+        )
+        return placeholder.model_copy(
+            update={
+                "storage": storage,
+                "allow_external_rdb_single_host": True,
+            }
+        )
+
+    owner = external_experiment(owner_storage)
+    offered = external_experiment(offered_storage)
+    _validate_artifact_root_binding(owner, claim_fresh=True)
+
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in _experiment_dir(owner).rglob("*")
+        if path.is_file()
+    )
+    for secret in secrets:
+        assert secret not in artifact_text
+
+    binding_path = _artifact_root_binding_path(owner)
+    binding_before = binding_path.read_bytes()
+    _validate_artifact_root_binding(offered, claim_fresh=False)
+    _validate_artifact_root_binding_for_rebind(
+        _ArtifactRootRebindPlan(
+            experiment=offered,
+            destination=str(_experiment_dir(offered).resolve()),
+            entries=(),
+        )
+    )
+    assert binding_path.read_bytes() == binding_before
+
+
+def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same relative URL from another cwd cannot reinterpret one tree."""
+    trainer = write_constant_trainer(tmp_path)
+    registration_cwd = tmp_path / "registration"
+    foreign_cwd = tmp_path / "foreign"
+    registration_cwd.mkdir()
+    foreign_cwd.mkdir()
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="sqlite:///ledger.db",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    monkeypatch.chdir(registration_cwd)
+    run_experiment(experiment)
+    binding_path = _artifact_root_binding_path(experiment)
+    binding_before = binding_path.read_bytes()
+    generation_before = _last_successful_generation_id(experiment)
+
+    monkeypatch.chdir(foreign_cwd)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        run_experiment(experiment)
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+        read_status(experiment)
+
+    assert not (foreign_cwd / "ledger.db").exists()
+    assert binding_path.read_bytes() == binding_before
+    assert _last_successful_generation_id(experiment) == generation_before
+
+
+def test_retargeted_experiment_symlink_is_rejected_before_claim(
+    tmp_path: Path,
+) -> None:
+    """A stable configured spelling does not hide a different physical root."""
+    trainer = write_constant_trainer(tmp_path)
+    original_parent = tmp_path / "original"
+    workdir = tmp_path / "runs"
+    original_root = original_parent / "t"
+    retargeted_root = tmp_path / "physical-b"
+    original_parent.mkdir()
+    workdir.mkdir()
+    retargeted_root.mkdir()
+    owner = make_experiment(
+        workdir=original_parent,
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(owner)
+    original_binding = _artifact_root_binding_path(owner).read_bytes()
+
+    experiment_link = workdir / "t"
+    experiment_link.symlink_to(original_root, target_is_directory=True)
+    experiment_link.unlink()
+    experiment_link.symlink_to(retargeted_root, target_is_directory=True)
+    retargeted = owner.model_copy(update={"workdir": str(workdir)})
+    with pytest.raises(ArtifactRootConflictError, match="publishes into artifact root"):
+        run_experiment(retargeted)
+
+    assert list(retargeted_root.iterdir()) == []
+    assert (original_root / "artifact_root_binding.json").read_bytes() == original_binding
+
+
+def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
+    """An empty study is claimed by the first run that sees it: no evidence can be stranded."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+    assert (
+        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
+    )
+
+    run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
+
+
+def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path) -> None:
+    """An empty Optuna namespace cannot silently override the configured goal."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    experiment = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+    study = optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+
+    with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
+        run_experiment(experiment)
+
+    assert study.get_trials(deepcopy=False) == []
+
+
+def test_populated_unbound_study_refuses_the_run_instead_of_adopting_it(tmp_path: Path) -> None:
+    """A pre-binding study with results is migrated explicitly, never adopted.
+
+    Adopting it would bind whichever workdir happened to run first, so a
+    second workdir could publish the same study's winner into a second tree
+    that both report as intact (re-review v0.5.19 / blocker B1).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    root = _experiment_dir(experiment)
+    assert_published_winner_evidence_local(root)
+    drop_artifact_root_binding(storage, "t::p")
+
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError) as excinfo:
+        run_experiment(experiment)
+
+    message = str(excinfo.value)
+    assert "rebind-workdir" in message
+    assert "nothing was published" in message.lower()
+    assert (
+        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
+    )
+    # The refusal is not allowed to cost the tree its existing publication.
+    assert _last_successful_generation_id(experiment) is not None
+    assert_published_winner_evidence_local(root)
+
+
+def _unbound_two_phase_studies(
+    experiment: Experiment,
+    storage: str,
+    *,
+    bound_root: str,
+    arch_trials: int,
+) -> None:
+    """Create the ``arch``/``lr`` studies with a deliberate mixed binding state.
+
+    ``arch`` is left unbound (optionally populated) and ``lr`` is bound to
+    ``bound_root``, so an invocation offering a third root finds one claimable
+    study before the one that refuses it.
+
+    :param Experiment experiment: Two-phase experiment naming the studies.
+    :param str storage: Persistent storage URL both studies live in.
+    :param str bound_root: Artifact root recorded on the ``lr`` study.
+    :param int arch_trials: COMPLETE trials to seed into the ``arch`` study.
+    """
+    arch = optuna.create_study(
+        study_name=f"{experiment.experiment}::arch", storage=storage, direction="minimize"
+    )
+    for _ in range(arch_trials):
+        arch.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    lr = optuna.create_study(
+        study_name=f"{experiment.experiment}::lr", storage=storage, direction="minimize"
+    )
+    lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
+
+
+@pytest.mark.parametrize(
+    ("arch_trials", "expected"),
+    [
+        (0, ArtifactRootConflictError),
+        (1, LegacyArtifactRootMigrationRequiredError),
+    ],
+)
+def test_refused_multi_phase_binding_claims_nothing(
+    tmp_path: Path,
+    arch_trials: int,
+    expected: type[Exception],
+) -> None:
+    """A refused run must not leave an earlier phase bound to the rejected root.
+
+    Claiming inside the check loop bound every phase examined before the
+    conflicting one, so the tree the operator was told nothing happened to
+    already had a binding pointing at it (re-review v0.5.19 / blocker B3).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
+    offered = _two_phase_experiment(workdir=tmp_path / "runs_b", trainer=trainer, storage=storage)
+    _unbound_two_phase_studies(
+        bound, storage, bound_root=str(_experiment_dir(bound)), arch_trials=arch_trials
+    )
+
+    with pytest.raises(expected):
+        run_experiment(offered)
+
+    arch = optuna.load_study(study_name="t::arch", storage=storage)
+    lr = optuna.load_study(study_name="t::lr", storage=storage)
+    assert ARTIFACT_ROOT_ATTR not in arch.user_attrs
+    assert lr.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(bound))
+
+
+def test_unreadable_study_blocks_binding_for_its_siblings_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that aborts in preflight must not leave a binding behind.
+
+    The unreadable study aborts the run either way - as unconfirmed cleanup,
+    with the storage failure chained beneath it - so claiming the readable
+    studies would invent a binding for an invocation that never ran a trial
+    (re-review v0.5.19 / blocker B3).
+    """
+    import phasesweep.engine.guards as guards
+
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
+    for phase in experiment.phases:
+        optuna.create_study(study_name=f"t::{phase.name}", storage=storage, direction="minimize")
+    real_loader = guards._load_existing_phase_study
+
+    def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
+        if phase.name == "lr":
+            raise RuntimeError("storage went away")
+        return real_loader(exp, phase)
+
+    monkeypatch.setattr(guards, "_load_existing_phase_study", _fail_for_lr)
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
+
+    for phase in experiment.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Collect an exception plus everything reachable through its chain.
+
+    :param BaseException error: Exception raised by the code under test.
+    :return list[BaseException]: ``error`` and every distinct exception
+        reachable through ``__cause__``/``__context__``.
+    """
+    collected: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if any(current is seen for seen in collected):
+            continue
+        collected.append(current)
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    return collected
+
+
+def _fabricate_interrupted_attempt(
+    experiment: Experiment,
+    storage: str,
+    *,
+    attempt_id: str,
+) -> tuple[str, int, Path]:
+    """Leave one phase study holding a stale RUNNING trial with a registry entry.
+
+    Reproduces an orchestrator that died between allocating an attempt and
+    launching its trainer: the trial stays RUNNING, its durable lifecycle says
+    ``allocated``, and the experiment-level registry still lists it. That is
+    exactly the state recovery is allowed to repair - and must refuse to touch
+    from a wrong-root invocation.
+
+    :param Experiment experiment: Experiment owning the artifact tree and study.
+    :param str storage: Persistent storage URL backing the phase study.
+    :param str attempt_id: Immutable attempt identity to persist everywhere.
+    :return tuple[str, int, Path]: Study name, stale trial number, registry entry path.
+    """
+    phase_name = experiment.phases[0].name
+    study_name = f"{experiment.experiment}::{phase_name}"
+    study = optuna.load_study(study_name=study_name, storage=storage)
+    trial = study.ask()
+    trial_dir = _phase_dir(experiment, phase_name) / f"trial_{trial.number:05d}__stale"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase_name,
+        study_name=study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="g-stale",
+    )
+    return study_name, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"
+
+
+def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path) -> None:
+    """A read that fails once must abort the run, not be retried into recovery.
+
+    Reviewer repro (PR #5 review / reviewer 2, issue 1): discovery swallowed
+    the storage failure, the main preflight loop re-read the study, the second
+    read succeeded, and stale-trial reaping then mutated a study whose
+    artifact-root binding had never been checked - a wrong-root invocation
+    silently failing the bound tree's RUNNING trial. Discovery is now the only
+    read, so the failure escalates and nothing in either tree is touched. The
+    unpatched second invocation pins the same refusal for the ordinary
+    wrong-root case: it conflicts before the registry scan can reap anything.
+    """
+    import phasesweep.engine.guards as guards
+
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment_a = make_experiment(
+        workdir=tmp_path / "runs_a",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment_a)
+    root_a = str(_experiment_dir(experiment_a))
+    study_name, stale_number, entry_path = _fabricate_interrupted_attempt(
+        experiment_a, storage, attempt_id="stale-attempt-1"
+    )
+    assert entry_path.is_file()
+
+    experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    real_loader = guards._load_existing_phase_study
+    calls = {"count": 0}
+
+    def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("transient storage failure")
+        return real_loader(exp, phase)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(guards, "_load_existing_phase_study", _fail_first_read)
+        with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+            run_experiment(experiment_b)
+
+    assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
+    chain = _exception_chain(excinfo.value)
+    assert any(isinstance(error, StudyStorageUnavailableError) for error in chain)
+    # The storage failure must stay the reported cause: a later, luckier read
+    # producing a root conflict would mean discovery ran twice.
+    assert not any(isinstance(error, ArtifactRootConflictError) for error in chain)
+
+    after_transient = optuna.load_study(study_name=study_name, storage=storage)
+    assert (
+        after_transient.get_trials(deepcopy=False)[stale_number].state
+        == optuna.trial.TrialState.RUNNING
+    )
+    assert entry_path.is_file()
+    assert after_transient.user_attrs[ARTIFACT_ROOT_ATTR] == root_a
+
+    # Same wrong-root invocation, no injected failure: the conflict is raised
+    # before the registry scan, so the stale attempt survives untouched here too.
+    with pytest.raises(ArtifactRootConflictError):
+        run_experiment(experiment_b)
+
+    after_conflict = optuna.load_study(study_name=study_name, storage=storage)
+    assert (
+        after_conflict.get_trials(deepcopy=False)[stale_number].state
+        == optuna.trial.TrialState.RUNNING
+    )
+    assert entry_path.is_file()
+    assert after_conflict.user_attrs[ARTIFACT_ROOT_ATTR] == root_a
+
+
+def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) -> None:
+    """An unreadable database is never reported as study absence.
+
+    A briefly locked file collapsing into "no such study" would skip the
+    artifact-root check for a study that becomes readable one call later
+    (PR #5 review / reviewer 2, issue 1).
+    """
+    trainer = write_constant_trainer(tmp_path)
+    db_path = tmp_path / "studies.db"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db_path}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    phase = experiment.phases[0]
+    assert _sqlite_study_exists(experiment, phase) is True
+
+    # BEGIN EXCLUSIVE holds the write lock until this connection closes, and
+    # the probe connects with timeout=0.1, so the refusal is deterministic.
+    locker = sqlite3.connect(db_path, isolation_level=None, timeout=10)
+    try:
+        locker.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(StudyStorageUnavailableError):
+            _sqlite_study_exists(experiment, phase)
+    finally:
+        locker.close()
+
+    assert _sqlite_study_exists(experiment, phase) is True
+
+
+def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: Path) -> None:
+    """Missing file and schema-less file are the only two absence verdicts."""
+    trainer = write_constant_trainer(tmp_path)
+    trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+
+    never_created = make_experiment(
+        workdir=tmp_path / "runs_missing",
+        storage=f"sqlite:///{tmp_path / 'never-created.db'}",
+        trial_command=trial_command,
+        n_trials=1,
+    )
+    assert not (tmp_path / "never-created.db").exists()
+    assert _sqlite_study_exists(never_created, never_created.phases[0]) is False
+
+    schemaless_path = tmp_path / "schemaless.db"
+    sqlite3.connect(schemaless_path).close()
+    assert schemaless_path.exists()
+    schemaless = make_experiment(
+        workdir=tmp_path / "runs_schemaless",
+        storage=f"sqlite:///{schemaless_path}",
+        trial_command=trial_command,
+        n_trials=1,
+    )
+    assert _sqlite_study_exists(schemaless, schemaless.phases[0]) is False
+
+
+def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
+    """Nothing persists to conflict, so an in-memory run stays workdir-mobile."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs_a",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    moved = experiment.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    run_experiment(moved)
+
+    assert _last_successful_generation_id(experiment) is not None
+    assert _last_successful_generation_id(moved) is not None
+
+
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
         n_trials=1,
     )
     generation_id = "fixed-generation"
@@ -717,7 +2079,7 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
     ]
     before = {path: path.read_bytes() for path in protected}
 
-    with pytest.raises(RuntimeError, match="already exists; refusing to overwrite history"):
+    with pytest.raises(RunRequestError, match="already exists; refusing to overwrite history"):
         run_experiment(experiment, generation_id=generation_id)
 
     assert {path: path.read_bytes() for path in protected} == before
@@ -753,6 +2115,7 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     exp = make_experiment(
         workdir=str(tmp_path / "runs"),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
     )
     run_experiment(exp)
 
@@ -889,8 +2252,9 @@ def test_fresh_run_preflight_consumes_run_deadline(
         *,
         cleanup_report: object,
         from_phase: str | None,
+        preloaded_studies: object,
     ) -> dict[str, optuna.Study]:
-        del cleanup_report, from_phase
+        del cleanup_report, from_phase, preloaded_studies
         clock["now"] += 2.0
         return {}
 
@@ -905,7 +2269,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
         run_experiment(experiment)
 
 
-def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
+def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> None:
     """Legacy skipped winners still need matching fingerprints and provenance."""
 
     def strip_fingerprint(data: dict) -> str:
@@ -944,11 +2308,12 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
 
         generation_id = _last_successful_generation_id(exp)
         assert generation_id is not None
-        summary_path = _generation_summary_path(exp, generation_id)
-        summary = yaml.safe_load(summary_path.read_text())
-        for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
-            summary.pop(key, None)
-        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+        # Exercise the pre-generation compatibility reader directly. Modern
+        # pointer-backed runs authenticate the complete summary and winner
+        # manifest before this record-level validation is reached.
+        _last_successful_generation_path(exp).unlink()
+        _generation_path(exp).unlink()
 
         arch_winner_path = _published_winner_path(exp, "arch")
         assert arch_winner_path is not None
@@ -956,10 +2321,8 @@ def test_from_phase_refuses_incompatible_winner_yaml(tmp_path: Path) -> None:
         match = mutate(data)
         arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
-        shutil.rmtree(_phase_dir(exp, "lr"))
-
         with pytest.raises(RuntimeError, match=match):
-            run_experiment(exp, from_phase="lr")
+            _load_winner(exp, exp.phases[0], {})
 
 
 def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) -> None:
@@ -989,7 +2352,7 @@ def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{"trial_number": 0, "metric": {"objective":')
 
-    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
         _load_winner(exp, exp.phases[0], {})
 
 
@@ -1018,8 +2381,109 @@ def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None
         )
     )
 
-    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
         _load_winner(exp, exp.phases[0], {})
+
+
+def test_winner_and_trial_attrs_record_trainer_environment_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every trial records which environment produced it; the winner keeps the digest.
+
+    Names are diagnostic and persisted; values are secrets and never leave the
+    process (review v0.5.18 / finding F3).
+    """
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    trainer = write_constant_trainer(tmp_path)
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        env={"PHASESWEEP_TEST_SECRET": "config-secret"},
+        execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+        n_trials=1,
+    )
+
+    run_experiment(exp)
+
+    identity = _environment_identity(exp)
+    data = yaml.safe_load(_winner_path(exp, "p").read_text())
+    assert data["trainer_env_digest"] == identity.digest
+    assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
+
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    attrs = study.get_trials(deepcopy=False)[0].user_attrs
+    names = attrs[TRAINER_ENV_NAMES_ATTR]
+    assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
+    assert names == sorted(names) == list(identity.names)
+    assert {"PHASESWEEP_TEST_SECRET", "PHASESWEEP_TEST_TOKEN"} <= set(names)
+    serialized = json.dumps(attrs, default=str)
+    assert "config-secret" not in serialized
+    assert "ambient-secret" not in serialized
+
+
+def _environment_free_winner_payload(exp: Experiment) -> dict:
+    """Build a valid winner payload that predates environment identity fields."""
+    return {
+        "phase": "p",
+        "metric": {exp.metric.name: 0.5, "goal": exp.metric.goal},
+        "trial_number": 0,
+        "params": {"x": 1},
+        "effective_overrides": {"x": 1},
+        "constraints": {},
+        "gates": [],
+        "completion": {"incomplete": False},
+        "generation_id": "generation-test",
+        "attempt_id": "attempt-test",
+        "winner_source": {
+            "kind": "phase_trial",
+            "phase": "p",
+            "trial_number": 0,
+            "generation_id": "generation-test",
+            "attempt_id": "attempt-test",
+            "study": None,
+        },
+        "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
+    }
+
+
+def test_load_winner_accepts_records_without_environment_identity(tmp_path: Path) -> None:
+    """Pre-existing artifact trees stay loadable; the new fields default to None."""
+    exp = make_experiment(workdir=tmp_path / "runs")
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(_environment_free_winner_payload(exp), sort_keys=False))
+
+    winner = _load_winner(exp, exp.phases[0], {})
+
+    assert winner.trainer_env_digest is None
+    assert winner.trainer_inherit_env is None
+
+
+@pytest.mark.parametrize("diverged", [True, False])
+def test_load_winner_warns_once_on_inherited_environment_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    diverged: bool,
+) -> None:
+    """Inheriting a winner produced under a different environment is reported once."""
+    monkeypatch.setattr("phasesweep.engine.state._ENVIRONMENT_DRIFT_WARNED", set())
+    exp = make_experiment(workdir=tmp_path / "runs")
+    payload = _environment_free_winner_payload(exp)
+    payload["trainer_env_digest"] = "0" * 64 if diverged else _environment_identity(exp).digest
+    payload["trainer_inherit_env"] = "all"
+    path = _winner_path(exp, "p")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.state"):
+        for _ in range(2):
+            _load_winner(exp, exp.phases[0], {})
+
+    warnings = [r for r in caplog.records if "environment" in r.getMessage()]
+    assert len(warnings) == (1 if diverged else 0)
 
 
 def test_save_winner_replace_failure_preserves_existing_file(
@@ -1071,6 +2535,7 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
             experiment="t",
             workdir=str(tmp_path / "wd"),
             trial_command="echo {overrides}",
+            override_format="argparse",
             metric=Metric(
                 extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
             ),

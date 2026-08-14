@@ -11,8 +11,10 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
+from phasesweep.mcp.snapshots import McpPublicationState
 
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
@@ -21,6 +23,26 @@ ResultSource: TypeAlias = Literal[
 ]
 
 _TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
+
+
+def intersect_visible_params(
+    launch_policy: VisibleParamsPolicy,
+    current_policy: VisibleParamsPolicy,
+) -> VisibleParamsPolicy:
+    """Return the non-escalating intersection of two visibility policies.
+
+    :param VisibleParamsPolicy launch_policy: Visibility authorized when the run launched.
+    :param VisibleParamsPolicy current_policy: Visibility authorized by the current catalog.
+    :return VisibleParamsPolicy: Policy no broader than either input.
+    """
+    if launch_policy == "none" or current_policy == "none":
+        return "none"
+    if launch_policy == "all":
+        return current_policy
+    if current_policy == "all":
+        return launch_policy
+    current_keys = set(current_policy)
+    return [key for key in launch_policy if key in current_keys]
 
 
 def _visible_winner_params(
@@ -50,26 +72,53 @@ def winners_payload(
     metric: dict[str, Any],
     declared_phases: list[str],
     result_source: ResultSource,
+    publication_integrity: McpPublicationState,
     run_id: str | None = None,
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
+    result_context: ResultContext = "current_config",
+    published_config_matches_current: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the ``get_winners`` payload from path-free phase-winner views.
+    """Build the ``get_run_results`` payload from path-free phase-winner views.
 
     MCP output exposes sampled ``params`` only, and values are redacted unless
     the catalog explicitly allows them. ``effective_overrides`` can include
     config-authored fixed or inherited values, so it is intentionally kept out
     of agent-visible tool results.
 
+    A published result is *historical evidence*: ``metric`` and
+    ``declared_phases`` must describe the generation the winners came from, not
+    whatever the config says today (review v0.5.16 / blocker 4). Callers are
+    responsible for sourcing both from the represented generation;
+    ``result_context`` and ``published_config_matches_current`` then tell the
+    agent which config those labels came from and whether it still matches the
+    one a further run would execute. Visibility policy is unaffected: the
+    *current* policy still decides which historical values are redacted, it
+    just never relabels them.
+
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
-    :param dict[str, Any] metric: Optimization metric and objective-evidence assurance.
-    :param list[str] declared_phases: All phase names in execution order.
+    :param dict[str, Any] metric: Optimization metric and objective-evidence
+        assurance the represented generation recorded.
+    :param list[str] declared_phases: Phase plan the represented generation
+        published under, in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
+    :param McpPublicationState publication_integrity: Whether the experiment's
+        last-success pointer is valid, absent, names a generation that no
+        longer validates, or cannot be validated as this user. An empty winner
+        list has different remedies under ``"absent"``, ``"failed"``,
+        ``"permission_denied"``, and ``"unknown"``.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
+    :param ResultContext result_context: Whether ``metric``/``declared_phases``
+        are the represented generation's own recorded semantics or the current
+        config's (the latter when nothing is published, or for a pre-manifest
+        legacy layout that recorded none).
+    :param bool | None published_config_matches_current: Whether the represented
+        generation's recorded config fingerprint matches the config this read
+        was interpreted through; ``None`` when undeterminable.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     winner_phases = {view.phase for view in views}
@@ -124,6 +173,10 @@ def winners_payload(
         "experiment_id": experiment_id,
         "run_id": run_id,
         "result_source": result_source,
+        "represented_generation_id": represented_generation_id,
+        "publication_integrity": publication_integrity,
+        "result_context": result_context,
+        "published_config_matches_current": published_config_matches_current,
         "metric": metric,
         "declared_phase_count": len(declared_phases),
         "winner_count": len(views),
@@ -141,7 +194,7 @@ def status_payload(
     result_source: ResultSource,
     elapsed_seconds: int | None,
 ) -> dict[str, Any]:
-    """Build the ``get_status`` payload from the path-free read_status dict.
+    """Build the ``get_run_status`` payload from the path-free read_status dict.
 
     ``status`` is the read_status output (already path-free). ``run`` is the
     process-level state for a specific run_id, or None for an experiment-level
@@ -159,6 +212,20 @@ def status_payload(
     ``is_published`` says whether the represented generation is the actual
     published one -- ``False`` for a pinned read of a failed-publication
     generation, even though its winners still show.
+
+    ``publication_integrity`` carries the five-state MCP verdict through unchanged
+    (review v0.5.18 / finding F4). The accompanying ``publication_error`` is
+    deliberately *not* forwarded: the enum is what an agent must branch on,
+    and the free-text detail belongs to the operator-facing CLI, which is the
+    surface trusted with local specifics.
+
+    ``result_context``, ``published_config_matches_current`` and
+    ``result_phase_plan`` are forwarded rather than dropped (review v0.5.16 /
+    blocker 4). The ``phases`` list describes the *current* config's phases --
+    what a further run would execute -- so under a config edited since
+    publication it can legitimately show no winners beside ``is_published:
+    true``. Without these three the agent had no way to tell that apart from an
+    empty publication.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
@@ -181,7 +248,10 @@ def status_payload(
         terminal_trials_this_run = (
             generation_counts["COMPLETE"] + generation_counts["PRUNED"] + generation_counts["FAIL"]
         )
-        terminal_trials_before_run = terminal_trials_total - terminal_trials_this_run
+        terminal_trials_before_run = max(
+            0,
+            terminal_trials_total - terminal_trials_this_run,
+        )
         target_terminal_trials = int(phase["n_trials"])
         phases.append(
             {
@@ -207,6 +277,10 @@ def status_payload(
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
+        "publication_integrity": status["publication_integrity"],
+        "result_context": status["result_context"],
+        "published_config_matches_current": status["published_config_matches_current"],
+        "result_phase_plan": status["result_phase_plan"],
         "metric": status["metric"],
         "phases": phases,
         "summary_present": status["summary_present"],

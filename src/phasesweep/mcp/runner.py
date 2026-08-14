@@ -16,17 +16,28 @@ after every import has run and this runner's identity is durable.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
+import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict
 
 from phasesweep.config import Experiment
-from phasesweep.engine import NoFeasibleTrialError, TerminalReport, run_experiment
+from phasesweep.engine import (
+    NoFeasibleTrialError,
+    PublicationHook,
+    TerminalReport,
+    Winner,
+    run_experiment,
+)
 from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
     ExperimentLockBusyError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
@@ -42,18 +53,21 @@ from phasesweep.mcp.snapshots import (
     capture_pre_generation_result_snapshot,
     capture_result_snapshot,
     finalize_result_snapshot,
+    mark_result_snapshot_published,
 )
-from phasesweep.mcp.time import utc_now_iso
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
+    absorb_shutdown_signals,
     defer_shutdown_signals,
     install_signal_handlers,
     read_boot_id,
     read_proc_starttime,
 )
+from phasesweep.runtime.time import utc_now_iso
 
 FailureCode: TypeAlias = Literal[
     "fingerprint_mismatch",
+    "artifact_root_conflict",
     "study_schema_mismatch",
     "storage_unavailable",
     "sampler_continuation_unsupported",
@@ -66,6 +80,9 @@ FailureCode: TypeAlias = Literal[
     "result_snapshot_unavailable",
     "internal_error",
 ]
+
+_LAUNCH_READY_BYTE = b"R"
+_LAUNCH_ACK_BYTE = b"A"
 FailureStage: TypeAlias = Literal["preflight", "execution", "cleanup"]
 FailureActor: TypeAlias = Literal["agent", "operator"]
 
@@ -118,6 +135,24 @@ def _base_failure_payload(
                 "this experiment's consistency lock."
             ),
         }
+    if isinstance(error, ArtifactRootConflictError):
+        # Not a fingerprint problem: the study is healthy but is not provably
+        # this workdir's, and the fingerprint remediation (new experiment name
+        # / archive the study) would destroy the binding's value. The wording
+        # covers the subclass too: a study that predates the binding records no
+        # root at all, so "the workdir its studies are bound to" would name
+        # nothing (re-review v0.5.19 / blocker B1).
+        return {
+            "code": "artifact_root_conflict",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to run this experiment from the workdir that owns its "
+                "artifact tree, or to relocate/restore that tree and run "
+                "`phasesweep rebind-workdir` against it before retrying."
+            ),
+        }
     if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
         return {
             "code": "fingerprint_mismatch",
@@ -148,6 +183,26 @@ def _base_failure_payload(
             "actor": "operator",
             "remediation": (
                 "Ask the operator to restore the configured study storage, then start a new run."
+            ),
+        }
+    if isinstance(error, ActiveAttemptPersistenceError):
+        # The unavailable workdir still fits the storage category, but this
+        # pre-launch refusal is recorded as a terminal fatal trial and durable
+        # phase abort at the accepted target. MCP experiments use persistent
+        # storage, so restoring write access does not make the unchanged config
+        # retryable: recovery must explicitly schedule a higher supported
+        # target or start a new experiment. Nothing was launched, so there is
+        # no process cleanup step (PR #5 re-review, P1).
+        return {
+            "code": "storage_unavailable",
+            "stage": failure_stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to restore write access to the experiment workdir, then "
+                "increase the affected phase's n_trials above the failed run's accepted "
+                "target when sampler continuation is supported, or use a new experiment "
+                "name, before starting another run."
             ),
         }
     if isinstance(error, SamplerContinuationUnsupportedError):
@@ -222,22 +277,15 @@ def _safe_failure_payload(
     error: BaseException,
     *,
     stage: str | None,
-    cause: BaseException | None = None,
 ) -> dict[str, object]:
-    """Map an error and optional secondary cause to one stable agent failure.
+    """Map an error to one stable agent failure.
 
     :param BaseException error: Primary exception to classify.
     :param str | None stage: Stage forwarded to :func:`_base_failure_payload`
-        for both ``error`` and, when present, ``cause``.
-    :param BaseException | None cause: Secondary exception distinct from
-        ``error``; when given, its own classified payload is nested under
-        the returned payload's ``"cause"`` key.
-    :return dict[str, object]: The primary failure payload, with a nested
-        ``cause`` payload added when ``cause`` is given and is not ``error``.
+        for ``error``.
+    :return dict[str, object]: The validated primary failure payload.
     """
     payload = _base_failure_payload(error, stage=stage)
-    if cause is not None and cause is not error:
-        payload["cause"] = _base_failure_payload(cause, stage=stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
@@ -259,6 +307,10 @@ def _cleanup_failure_payload(
     cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
     payload = _base_failure_payload(cleanup, stage="cleanup")
     if not isinstance(primary, ProcessCleanupUncertainError):
+        # ``cause`` is diagnostic history, not a second action contract. It
+        # intentionally retains the primary failure's own actor/retryability
+        # (for example, a user cancellation) while the authoritative outer
+        # cleanup_uncertain verdict blocks every relaunch pending recovery.
         payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
@@ -296,23 +348,188 @@ def _terminal_failure_payload(
     return _safe_failure_payload(error, stage=stage)
 
 
+# Backoff between terminal status write attempts. This runs on the exit path
+# of an already-finished sweep, so the whole retry budget stays well under a
+# second: it exists to ride out a momentary ENOSPC/EIO/EINTR, not to wait out
+# an operator repairing the filesystem.
+_STATUS_WRITE_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.25)
+
+
+def _write_status_file_with_retry(
+    status_path: Path,
+    payload: dict,
+    *,
+    attempts: int = 3,
+) -> None:
+    """Write one terminal status record, retrying only transient persistence errors.
+
+    Only :class:`OSError` is retried (PR #5 review / reviewer 2 pass 2, blocker
+    6). A serialization error is a defect of the payload, not of the
+    filesystem: retrying it cannot succeed, and the caller depends on seeing it
+    immediately so it can downgrade the record to a serializable one.
+
+    :param Path status_path: Destination ``status.json`` path for the run.
+    :param dict payload: JSON-serializable terminal status payload.
+    :param int attempts: Total attempts, including the first; must be at least one.
+    :raises OSError: The final attempt's persistence failure, once the retry
+        budget is exhausted.
+    :raises Exception: Any non-:class:`OSError` failure, from the first attempt
+        and without retrying.
+    """
+    log = logging.getLogger("phasesweep.mcp.runner")
+    for attempt in range(attempts):
+        try:
+            write_status_file(status_path, payload)
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            backoff = _STATUS_WRITE_BACKOFF_SECONDS[
+                min(attempt, len(_STATUS_WRITE_BACKOFF_SECONDS) - 1)
+            ]
+            log.warning(
+                "failed to persist terminal status (attempt %d of %d); retrying in %.2fs",
+                attempt + 1,
+                attempts,
+                backoff,
+                exc_info=True,
+            )
+            time.sleep(backoff)
+        else:
+            return
+
+
+class _RunnerPublicationHook(PublicationHook):
+    """Durably bridge the engine publication pointer to one MCP run snapshot."""
+
+    def __init__(self, status_path: Path, status: dict[str, object]) -> None:
+        """Create an empty publication transaction for one detached run.
+
+        :param Path status_path: Durable MCP status file for the run.
+        :param dict[str, object] status: Shared terminal-status facts.
+        """
+        self._status_path = status_path
+        self._status = status
+        self.snapshot: dict[str, object] | None = None
+        self.state: Literal["prepared", "committed"] | None = None
+        self.generation_id: str | None = None
+
+    def prepare(
+        self,
+        *,
+        experiment: Experiment,
+        generation_id: str,
+        winners: Mapping[str, Winner],
+    ) -> None:
+        """Persist the exact run result before the last-success pointer advances.
+
+        :param Experiment experiment: Executed frozen experiment configuration.
+        :param str generation_id: Generation ready for publication.
+        :param Mapping[str, Winner] winners: Engine-selected generation winners.
+        :raises Exception: If capture, validation, or durable persistence fails.
+        """
+        snapshot = capture_result_snapshot(
+            experiment,
+            generation_id=generation_id,
+            engine_winners=winners,
+        )
+        prepared = {
+            **self._status,
+            "result_snapshot_state": "pending",
+            "result_snapshot": snapshot,
+            "result_publication_state": "prepared",
+            "result_publication_generation_id": generation_id,
+        }
+        _write_status_file_with_retry(self._status_path, prepared)
+        self.snapshot = snapshot
+        self.state = "prepared"
+        self.generation_id = generation_id
+        self._status["result_publication_state"] = "prepared"
+        self._status["result_publication_generation_id"] = generation_id
+
+    def committed(self, *, generation_id: str) -> None:
+        """Record that the last-success pointer committed the prepared result.
+
+        The in-memory transition happens before the durable write. If that
+        write fails, the runner's terminal write retries the committed state;
+        if the process hard-exits first, recovery compares the durable
+        prepared generation with the authenticated last-success pointer.
+
+        :param str generation_id: Generation whose pointer commit completed.
+        :raises RuntimeError: If no matching prepared snapshot exists.
+        :raises OSError: If the committed receipt cannot be persisted.
+        """
+        if self.state != "prepared" or self.snapshot is None or self.generation_id != generation_id:
+            raise RuntimeError("publication commit has no matching prepared run snapshot")
+        committed = mark_result_snapshot_published(
+            self.snapshot,
+            generation_id=generation_id,
+        )
+        self.snapshot = committed
+        self.state = "committed"
+        self._status["result_publication_state"] = "committed"
+        self._status["result_publication_generation_id"] = generation_id
+        _write_status_file_with_retry(
+            self._status_path,
+            {
+                **self._status,
+                "result_snapshot_state": "pending",
+                "result_snapshot": committed,
+            },
+        )
+
+    def clear_uncommitted_marker(self) -> None:
+        """Remove a normally reported preparation whose pointer never committed."""
+        if self.state != "prepared":
+            return
+        self._status.pop("result_publication_state", None)
+        self._status.pop("result_publication_generation_id", None)
+        self.state = None
+        self.generation_id = None
+
+
 def _write_status(
     status_path: Path,
     payload: dict,
     *,
     result_snapshot: dict | None,
     result_snapshot_error: str | None,
-) -> None:
+) -> bool:
     """Persist terminal evidence and its already-captured result snapshot.
+
+    Nothing raises out of the persistence work itself, by design: this runs
+    from ``main``'s ``finally`` with the run's own exception possibly in
+    flight, so raising a persistence error would mask the run's primary exit
+    (PR #5 review / reviewer 2 pass 2, blocker 6). The failure is reported
+    through the return value instead, which ``main`` turns into a nonzero exit
+    code on the otherwise-successful path. A shutdown signal deferred by the
+    window below is still delivered at its exit, after the terminal record is
+    durable; that is the run's own cancellation, not a persistence error.
+
+    Every write is monotonic: state only ever moves toward more evidence.
+    A ``complete`` transition that cannot be persisted leaves the durable
+    ``pending`` record and its embedded snapshot in place rather than
+    downgrading it to ``failed`` - a dead runner with a pending record is
+    finalized by ``phasesweep mcp recover-run``, whereas ``failed`` is
+    permanent.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
     :param dict payload: Status payload containing run id, return code, and error class.
     :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
     :param str | None result_snapshot_error: Capture error class when no snapshot exists.
+    :return bool: Whether durable terminal evidence exists, i.e. some record
+        (``pending``, ``complete``, or ``failed``) reached disk. ``False`` only
+        when nothing could be persisted at all.
+    :raises RuntimeError: Raised and handled in-process when no snapshot was
+        captured; it never reaches the caller, because a missing snapshot is
+        recorded as ``result_snapshot_state="failed"`` instead of failing the
+        already-durable terminal evidence.
     """
+    log = logging.getLogger("phasesweep.mcp.runner")
     # A catchable shutdown may arrive after the durable pending write. Defer it
     # until the complete/failed replacement is durable so cancellation cannot
-    # strand an otherwise terminal run in the intermediate state.
+    # strand an otherwise terminal run in the intermediate state. This window
+    # is also the checkpoint that services a shutdown absorbed by the terminal
+    # snapshot capture (see ``capture_terminal``).
     with defer_shutdown_signals():
         terminal = {
             **payload,
@@ -322,10 +539,31 @@ def _write_status(
         if result_snapshot is not None:
             terminal["result_snapshot"] = result_snapshot
         try:
-            write_status_file(status_path, terminal)
-        except Exception:  # noqa: BLE001 - terminal evidence must not mask the run's exit
-            logging.getLogger("phasesweep.mcp.runner").exception("failed to write status.json")
-            return
+            _write_status_file_with_retry(status_path, terminal)
+        except OSError:
+            # The engine outcome is already fixed; only the MCP-side terminal
+            # record is missing, so the run derives "running" until an operator
+            # recovers it. Report that upward instead of exiting zero.
+            log.exception(
+                "failed to persist terminal status.json after every retry; the sweep's own "
+                "outcome is unaffected but this run has no terminal MCP evidence"
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - terminal evidence must not mask the run's exit
+            # Not a persistence failure: the captured snapshot cannot be
+            # serialized at all. Record the minimal terminal evidence without
+            # it rather than returning with no status file, which would leave
+            # the run deriving "running" forever.
+            log.exception("failed to write status.json with the captured result snapshot")
+            terminal.pop("result_snapshot", None)
+            terminal["result_snapshot_state"] = "failed"
+            terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
+            try:
+                _write_status_file_with_retry(status_path, terminal)
+            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+                log.exception("failed to write status.json without the result snapshot")
+                return False
+            return True
 
         try:
             if result_snapshot is None:
@@ -337,27 +575,34 @@ def _write_status(
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to finalize terminal result snapshot"
-            )
+            log.exception("failed to finalize terminal result snapshot")
         else:
             terminal["result_snapshot_state"] = "complete"
 
         try:
-            write_status_file(status_path, terminal)
-        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
-            logging.getLogger("phasesweep.mcp.runner").exception(
-                "failed to finalize result snapshot state in status.json"
+            _write_status_file_with_retry(status_path, terminal)
+        except OSError:
+            # Deliberately no downgrade write here: the durable pending record
+            # still holds the raw snapshot, and a dead runner with a pending
+            # record is exactly what `recover-run` finalizes. Replacing it with
+            # "failed" would trade a recoverable state for a permanent one -
+            # and the same OSError would most likely defeat that write too.
+            log.exception(
+                "failed to persist the finalized result snapshot state after every retry; "
+                "the durable pending record still holds the captured snapshot and remains "
+                "recoverable with `phasesweep mcp recover-run`"
             )
+            return True
+        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
+            log.exception("failed to finalize result snapshot state in status.json")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = type(exc).__name__
             try:
-                write_status_file(status_path, terminal)
+                _write_status_file_with_retry(status_path, terminal)
             except Exception:  # noqa: BLE001 - no further persistence fallback is available
-                logging.getLogger("phasesweep.mcp.runner").exception(
-                    "failed to persist result snapshot finalization failure"
-                )
+                log.exception("failed to persist result snapshot finalization failure")
+        return True
 
 
 def _persist_spawned_handle(
@@ -377,6 +622,9 @@ def _persist_spawned_handle(
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
     :param bool allow_cancel: Cancel permission frozen at launch time.
+    :raises RuntimeError: If Linux ``/proc`` start time is unavailable, so the
+        handle could not be made PID-reuse safe, or the server never created a
+        pending handle for ``run_id``.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -387,6 +635,9 @@ def _persist_spawned_handle(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux "
             "/proc start time is unavailable"
         )
+    pending = store.get(run_id)
+    if pending is None:
+        raise RuntimeError(f"cannot persist runner identity for unknown run {run_id!r}")
     store.update(
         RunHandle(
             run_id=run_id,
@@ -398,6 +649,7 @@ def _persist_spawned_handle(
             started_at=started_at,
             launch_state="spawned",
             allow_cancel=allow_cancel,
+            visible_params_at_launch=pending.visible_params_at_launch,
             # Binds pid/pid_starttime to this boot: after a reboot the pair can
             # name an unrelated process, and a reader that knows the boot
             # differs can rule the runner dead without signalling anything.
@@ -406,21 +658,55 @@ def _persist_spawned_handle(
     )
 
 
-def _resolve_under(base: Path, path: Path) -> Path:
-    """Resolve a server-supplied path the way the project directory would have.
+def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> None:
+    """Report a durable process receipt and block until the server acknowledges it.
 
-    :param Path base: Experiment project directory passed as ``--cwd``.
-    :param Path path: Path argument received from the server.
-    :return Path: ``path`` unchanged when absolute, otherwise joined onto ``base``.
+    :param int ready_fd: Pipe descriptor receiving the runner-ready byte.
+    :param int ack_fd: Pipe descriptor supplying the server acknowledgement.
+    :param int lease_fd: Inherited lease proving a child exists before its receipt.
+    :raises RuntimeError: If either half of the launch handshake is unavailable.
     """
-    return path if path.is_absolute() else base / path
+    try:
+        if os.write(ready_fd, _LAUNCH_READY_BYTE) != len(_LAUNCH_READY_BYTE):
+            raise RuntimeError("could not report the durable MCP launch receipt")
+    except OSError as exc:
+        raise RuntimeError("could not report the durable MCP launch receipt") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(ready_fd)
+        with contextlib.suppress(OSError):
+            os.close(lease_fd)
+    try:
+        acknowledgement = os.read(ack_fd, len(_LAUNCH_ACK_BYTE))
+    except OSError as exc:
+        raise RuntimeError("could not receive the MCP launch acknowledgement") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(ack_fd)
+    if acknowledgement != _LAUNCH_ACK_BYTE:
+        raise RuntimeError("MCP server exited before acknowledging the runner launch")
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json.
 
     :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
-    :return int: Process exit code, zero on successful sweep completion.
+    :return int: Process exit code: zero when the sweep completed and its
+        terminal evidence is durable, and ``1`` when the sweep itself completed
+        but no status.json record could be persisted at all - the run has no
+        MCP-visible outcome, so exiting zero would claim one it cannot show.
+    :raises RuntimeError: The per-run config snapshot could not be read or did
+        not match its recorded hash.
+    :raises PhaseSweepShutdown: The run was cancelled; re-raised after the
+        cancellation cause is recorded in status.json. Also raised on an
+        otherwise-successful run when a shutdown absorbed during the terminal
+        snapshot capture is serviced at the terminal status write: status.json
+        then records the engine's own successful outcome and this process exits
+        with the POSIX signalled code.
+    :raises ProcessCleanupUncertainError: Child-process cleanup could not be
+        confirmed; re-raised after status.json records the uncertainty.
+    :raises BaseException: Whatever the handle write or engine run raised,
+        re-raised after its terminal cause reaches status.json.
     """
     parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)
@@ -430,21 +716,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--started-at", required=True)
+    parser.add_argument("--launch-ready-fd", type=int)
+    parser.add_argument("--launch-ack-fd", type=int)
+    parser.add_argument("--launch-lease-fd", type=int)
     # The catalog entry's frozen working directory. The process does not start
     # there (see the module docstring), so it is an explicit argument.
     parser.add_argument("--cwd", required=True, type=Path)
     parser.add_argument("--allow-cancel", action="store_true")
     parser.add_argument("--from-phase", default=None)
     args = parser.parse_args(argv)
+    launch_fds = (args.launch_ready_fd, args.launch_ack_fd, args.launch_lease_fd)
+    if any(fd is None for fd in launch_fds) and any(fd is not None for fd in launch_fds):
+        parser.error(
+            "--launch-ready-fd, --launch-ack-fd, and --launch-lease-fd must be supplied together"
+        )
 
-    # This process starts in the server's state directory, so a relative path
-    # argument would no longer mean what it meant when the child inherited the
-    # project directory as its cwd. Bind every path to --cwd instead, before
-    # anything reads or writes.
+    # The server supplies absolute paths because this process starts in the
+    # server-owned state directory rather than the experiment directory.
     project_cwd = args.cwd.expanduser()
-    config_path = _resolve_under(project_cwd, args.config)
-    status_path = _resolve_under(project_cwd, args.status_path)
-    state_dir = _resolve_under(project_cwd, args.state_dir)
+    config_path = args.config
+    status_path = args.status_path
+    state_dir = args.state_dir
 
     # This process's stdout/stderr are the server-redirected run log. Log to
     # stderr; never print to stdout here. (The engine's own run.log under the
@@ -474,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
     result_snapshot_error: str | None = None
     terminal_report: TerminalReport | None = None
     config: Experiment | None = None
+    status_persisted = False
+    publication_hook = _RunnerPublicationHook(status_path, status)
     try:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
@@ -486,6 +780,19 @@ def main(argv: list[str] | None = None) -> int:
             started_at=args.started_at,
             allow_cancel=args.allow_cancel,
         )
+        if (
+            args.launch_ready_fd is not None
+            and args.launch_ack_fd is not None
+            and args.launch_lease_fd is not None
+        ):
+            try:
+                _complete_launch_handshake(
+                    args.launch_ready_fd,
+                    args.launch_ack_fd,
+                    args.launch_lease_fd,
+                )
+            finally:
+                RunStore(state_dir).remove_launch_lease(args.run_id)
         # Only now enter the experiment's project directory: every import has
         # already resolved against the trusted interpreter path, and this
         # runner's PID/PGID are durable, so anything the project directory
@@ -502,30 +809,56 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(str(exc)) from exc
 
         def capture_terminal(report: TerminalReport) -> None:
-            """Capture immutable results while ``run_experiment`` still owns its lock.
+            """Capture terminal cleanup facts and any unpublished failure result.
+
+            A successful publication already has a durable prepared snapshot
+            through :class:`_RunnerPublicationHook`; this callback adopts that
+            exact object. A failure before publication captures its generation
+            here while the engine still owns the experiment lock.
+
+            The engine invokes terminal callbacks through a diagnostic
+            boundary that consumes :class:`BaseException`. Absorbing shutdown
+            signals keeps cancellation pending until ``_write_status`` makes
+            the terminal record durable instead of letting a signal vanish in
+            that boundary.
 
             :param TerminalReport report: Engine outcome and cleanup evidence.
             """
             nonlocal result_snapshot, result_snapshot_error, terminal_report
-            terminal_report = report
-            status["cleanup_confirmed"] = report.cleanup_confirmed
-            status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
-            if report.primary_error is not None:
-                status["failure"] = _terminal_failure_payload(
-                    report.primary_error,
-                    stage=report.failure_stage,
-                    cleanup_confirmed=report.cleanup_confirmed,
+            with absorb_shutdown_signals() as absorbed:
+                terminal_report = report
+                status["cleanup_confirmed"] = report.cleanup_confirmed
+                status["recovered_attempt_ids"] = sorted(report.recovered_attempt_ids)
+                status["recovered_attempt_generations"] = dict(
+                    sorted(report.recovered_attempt_generations.items())
                 )
-            try:
-                result_snapshot = capture_result_snapshot(
-                    config,
-                    generation_id=report.generation_id,
-                    engine_winners=report.winners,
-                )
-            except Exception as exc:  # noqa: BLE001 - preserve the engine's terminal cause
-                result_snapshot_error = type(exc).__name__
-                logging.getLogger("phasesweep.mcp.runner").exception(
-                    "failed to capture terminal result snapshot under the experiment lock"
+                status["uncertain_attempt_ids"] = sorted(report.uncertain_attempt_ids)
+                if report.primary_error is not None:
+                    status["failure"] = _terminal_failure_payload(
+                        report.primary_error,
+                        stage=report.failure_stage,
+                        cleanup_confirmed=report.cleanup_confirmed,
+                    )
+                if publication_hook.snapshot is not None:
+                    result_snapshot = dict(publication_hook.snapshot)
+                else:
+                    try:
+                        result_snapshot = capture_result_snapshot(
+                            config,
+                            generation_id=report.generation_id,
+                            engine_winners=report.winners,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - preserve engine terminal cause
+                        result_snapshot_error = type(exc).__name__
+                        logging.getLogger("phasesweep.mcp.runner").exception(
+                            "failed to capture terminal result snapshot under the experiment lock"
+                        )
+            if absorbed.signum is not None:
+                logging.getLogger("phasesweep.mcp.runner").warning(
+                    "shutdown signal %d arrived while the terminal result snapshot was being "
+                    "captured; it was held until the snapshot was safe and will be honored "
+                    "once terminal status is durable",
+                    absorbed.signum,
                 )
 
         run_experiment(
@@ -534,6 +867,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=False,
             terminal_callback=capture_terminal,
             generation_id=args.run_id,
+            publication_hook=publication_hook,
         )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1
@@ -578,6 +912,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise
     finally:
+        if publication_hook.snapshot is not None and result_snapshot is None:
+            result_snapshot = dict(publication_hook.snapshot)
+        if publication_hook.state == "prepared" and status["returncode"] != 0:
+            # The runner survived long enough to report that preparation did
+            # not commit. Remove the transient recovery marker from the final
+            # record; a hard exit before this write intentionally leaves the
+            # durable marker for recover-run to reconcile against the pointer.
+            publication_hook.clear_uncommitted_marker()
         if result_snapshot is None and terminal_report is None and config is not None:
             try:
                 result_snapshot = capture_pre_generation_result_snapshot(config)
@@ -585,13 +927,17 @@ def main(argv: list[str] | None = None) -> int:
                 result_snapshot_error = type(exc).__name__
             else:
                 status["generation_unavailable_reason"] = "engine_generation_not_claimed"
-        _write_status(
+        status_persisted = _write_status(
             status_path,
             status,
             result_snapshot=result_snapshot,
             result_snapshot_error=result_snapshot_error,
         )
-    return 0
+    # Only reachable on the success path; every failure path re-raises above.
+    # A sweep whose terminal evidence never reached disk is not a clean exit:
+    # the server would see no status.json, derive "running" indefinitely, and
+    # keep this run's concurrency slot until an operator recovers it.
+    return 0 if status_persisted else 1
 
 
 if __name__ == "__main__":

@@ -11,12 +11,15 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
+from phasesweep.engine.errors import PhaseSweepError, PromotionError, TrialEvidenceMissingError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_INPUT_ATTR,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -44,13 +47,23 @@ class SelectedTrial:
     # extracted (review v0.5.17 / finding F); None for trials persisted
     # before the record existed.
     objective_provenance: dict[str, Any] | None = None
+    # Digest of the trainer environment this trial ran under (review v0.5.18 /
+    # finding F3); None for trials persisted before the record existed.
+    trainer_env_digest: str | None = None
+    # Versioned identity of the exact generated input consumed by the trainer.
+    trainer_input: dict[str, Any] | None = None
 
 
-class NoFeasibleTrialError(RuntimeError):
+class NoFeasibleTrialError(PhaseSweepError):
     """Raised when no trial in a completed phase satisfies all constraints."""
 
 
-def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
+def select_winner(
+    study: optuna.Study,
+    experiment: Experiment,
+    *,
+    phase_name: str | None = None,
+) -> SelectedTrial:
     """Pick the best feasible completed trial from a phase study.
 
     Rules:
@@ -67,11 +80,19 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
     number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
     way to know a config's meaningful resolution, so it does not guess one.
 
+    Comparability is checked but never enforced: if the compared trials span
+    more than one trainer-environment digest — a top-up ran under a different
+    environment — the ranking mixes environments, and that is reported once
+    per selection (review v0.5.18 / finding F3). It is not an error, because
+    the environment is deliberately outside the semantic fingerprint.
+
     Args:
         study: Optuna study for the phase whose winner we want.
         experiment: Parsed experiment config. Provides the optimization goal
             (minimize/maximize) and the constraint definitions used to filter
             trials.
+        phase_name: Phase label used in the environment-divergence warning;
+            defaults to the study name when the caller has no phase context.
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
@@ -125,6 +146,8 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
             "Check stdout/stderr logs in the phase's trial_* directories."
         )
 
+    _warn_mixed_environments(survivors, phase_name=phase_name, study=study)
+
     best_value = (
         min(_trial_value(t) for t in survivors)
         if minimize
@@ -141,25 +164,48 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
     assert selected_value is not None  # same invariant
     raw_gates = best.user_attrs.get(GATES_ATTR)
     gates: list[dict[str, Any]] = []
-    if isinstance(raw_gates, str) and raw_gates:
+    if raw_gates is not None:
+        if not isinstance(raw_gates, str) or not raw_gates:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {GATES_ATTR!r} evidence."
+            )
         try:
             parsed_gates = json.loads(raw_gates)
-        except json.JSONDecodeError:
-            pass
-        else:
-            if isinstance(parsed_gates, list):
-                gates = [item for item in parsed_gates if isinstance(item, dict)]
+        except json.JSONDecodeError as exc:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has corrupt {GATES_ATTR!r} JSON evidence."
+            ) from exc
+        if not isinstance(parsed_gates, list) or any(
+            not isinstance(item, dict) or type(item.get("passed")) is not bool
+            for item in parsed_gates
+        ):
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {GATES_ATTR!r} evidence."
+            )
+        gates = parsed_gates
 
     provenance: dict[str, Any] | None = None
     raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
-    if isinstance(raw_provenance, str) and raw_provenance:
+    if raw_provenance is not None:
+        if not isinstance(raw_provenance, str) or not raw_provenance:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+            )
         try:
             parsed_provenance = json.loads(raw_provenance)
-        except json.JSONDecodeError:
-            pass
-        else:
-            if isinstance(parsed_provenance, dict):
-                provenance = parsed_provenance
+        except json.JSONDecodeError as exc:
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has corrupt "
+                f"{OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
+            ) from exc
+        if not isinstance(parsed_provenance, dict):
+            raise TrialEvidenceMissingError(
+                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
+            )
+        provenance = parsed_provenance
+
+    env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
+    raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)
 
     return SelectedTrial(
         trial_number=best.number,
@@ -170,6 +216,43 @@ def select_winner(study: optuna.Study, experiment: Experiment) -> SelectedTrial:
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
         objective_provenance=provenance,
+        trainer_env_digest=env_digest if isinstance(env_digest, str) and env_digest else None,
+        trainer_input=(dict(raw_trainer_input) if isinstance(raw_trainer_input, dict) else None),
+    )
+
+
+def _warn_mixed_environments(
+    survivors: list[optuna.trial.FrozenTrial],
+    *,
+    phase_name: str | None,
+    study: optuna.Study,
+) -> None:
+    """Warn once when the compared trials did not all run under one environment.
+
+    :param list[optuna.trial.FrozenTrial] survivors: Feasible completed trials
+        that form the comparison set for this selection.
+    :param str | None phase_name: Phase label supplied by the caller; the study
+        name is used when it is ``None``.
+    :param optuna.Study study: Study the survivors came from, read only for its
+        name and only when a divergence is being reported.
+    """
+    digests = {
+        digest
+        for trial in survivors
+        if isinstance(digest := trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str) and digest
+    }
+    if len(digests) < 2:
+        return
+    log.warning(
+        "[%s] comparing %d candidate trials that ran under %d distinct trainer "
+        "environments (digests %s). A top-up ran under a different environment, so this "
+        "ranking mixes environments; the environment is outside the study fingerprint by "
+        "design. Re-run the phase under one environment if the difference can move the "
+        "metric.",
+        phase_name or study.study_name,
+        len(survivors),
+        len(digests),
+        ", ".join(sorted(digest[:12] for digest in digests)),
     )
 
 
@@ -237,6 +320,14 @@ def _clone_winner_from_baseline(
             if baseline.objective_provenance is not None
             else None
         ),
+        # The exposed result IS the baseline's trial, so it keeps the baseline's
+        # environment identity rather than the candidate phase's.
+        trainer_env_digest=baseline.trainer_env_digest,
+        trainer_inherit_env=(
+            list(baseline.trainer_inherit_env)
+            if isinstance(baseline.trainer_inherit_env, list)
+            else baseline.trainer_inherit_env
+        ),
         source=WinnerSource(
             kind=source_kind,
             phase=baseline_source.phase,
@@ -287,6 +378,78 @@ def _evaluate_promotion_rule(
     return promoted, improvement, gates_passed, reason
 
 
+def _promotion_decision_payload(
+    *,
+    phase_name: str,
+    baseline_label: str,
+    candidate: Winner,
+    baseline: Winner,
+    promotion: Promotion,
+    improvement: float | None,
+    gates_passed: bool,
+    promoted: bool,
+    study_name: str | None = None,
+    reason: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Build the shared persisted promotion-decision fields.
+
+    :param str phase_name: Candidate phase exposed by the decision.
+    :param str baseline_label: Phase or study selector naming the baseline.
+    :param Winner candidate: Candidate winner evaluated for promotion.
+    :param Winner baseline: Baseline winner used for comparison.
+    :param Promotion promotion: Applied promotion rule.
+    :param float | None improvement: Computed metric improvement.
+    :param bool gates_passed: Whether the candidate's gates passed.
+    :param bool promoted: Whether the candidate met the rule.
+    :param str | None study_name: Optional suite study owning the decision.
+    :param str | None reason: Optional phase-level decision reason.
+    :param str | None message: Optional phase-level diagnostic.
+    :return dict[str, Any]: Persistable promotion decision.
+    """
+    action = "promote" if promoted else promotion.on_fail
+    payload: dict[str, Any] = {
+        "phase": phase_name,
+        "baseline": baseline_label,
+        "candidate_trial_number": candidate.trial_number,
+        "candidate_generation_id": candidate.generation_id,
+        "candidate_attempt_id": candidate.attempt_id,
+        "baseline_trial_number": baseline.trial_number,
+        "baseline_generation_id": baseline.generation_id,
+        "baseline_attempt_id": baseline.attempt_id,
+        "exposed_trial_number": (
+            candidate.trial_number
+            if action == "promote"
+            else baseline.trial_number
+            if action == "continue_baseline"
+            else None
+        ),
+        "exposed_source": (
+            "candidate"
+            if action == "promote"
+            else "baseline"
+            if action == "continue_baseline"
+            else None
+        ),
+        "candidate_metric": candidate.metric,
+        "baseline_metric": baseline.metric,
+        "min_delta": promotion.min_delta,
+        "improvement": improvement,
+        "requires_gates": promotion.requires_gates,
+        "gates_passed": gates_passed,
+        "promoted": promoted,
+        "on_fail": promotion.on_fail,
+        "action": action,
+    }
+    if study_name is not None:
+        payload["study"] = study_name
+    if reason is not None:
+        payload["reason"] = reason
+    if message:
+        payload["message"] = message
+    return payload
+
+
 def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     """Return the compact winner payload used in run summaries.
 
@@ -316,12 +479,21 @@ def _apply_promotion(
     :param dict[str, Winner] winners: Winners from previous phases.
     :return tuple[Winner | None, dict[str, Any] | None]: Exposed winner and
         promotion audit payload, or ``None`` values when no rule applies.
+    :raises RuntimeError: The rule's ``min_delta_vs`` names a phase with no
+        winner among ``winners``.
     """
     promotion = phase.promotion
     if promotion is None:
         return candidate, None
 
-    baseline = winners[promotion.min_delta_vs]
+    try:
+        baseline = winners[promotion.min_delta_vs]
+    except KeyError:
+        available = ", ".join(repr(name) for name in sorted(winners)) or "none"
+        raise RuntimeError(
+            f"Phase {phase.name!r} promotion references unknown min_delta_vs baseline "
+            f"{promotion.min_delta_vs!r}; available prior phase winners: {available}."
+        ) from None
     promoted, improvement, gates_passed, reason = _evaluate_promotion_rule(
         goal=experiment.metric.goal,
         promotion=promotion,
@@ -339,51 +511,18 @@ def _apply_promotion(
             f"vs {promotion.min_delta_vs!r} is below min_delta {promotion.min_delta:g}."
         )
 
-    action = (
-        "promote"
-        if promoted
-        else "continue_baseline"
-        if promotion.on_fail == "continue_baseline"
-        else promotion.on_fail
+    decision = _promotion_decision_payload(
+        phase_name=phase.name,
+        baseline_label=promotion.min_delta_vs,
+        candidate=candidate,
+        baseline=baseline,
+        promotion=promotion,
+        improvement=improvement,
+        gates_passed=gates_passed,
+        promoted=promoted,
+        reason=reason,
+        message=message,
     )
-    exposed_trial_number = (
-        candidate.trial_number
-        if action == "promote"
-        else baseline.trial_number
-        if action == "continue_baseline"
-        else None
-    )
-    exposed_source = (
-        "candidate"
-        if action == "promote"
-        else "baseline"
-        if action == "continue_baseline"
-        else None
-    )
-    decision: dict[str, Any] = {
-        "phase": phase.name,
-        "baseline": promotion.min_delta_vs,
-        "candidate_trial_number": candidate.trial_number,
-        "candidate_generation_id": candidate.generation_id,
-        "candidate_attempt_id": candidate.attempt_id,
-        "baseline_trial_number": baseline.trial_number,
-        "baseline_generation_id": baseline.generation_id,
-        "baseline_attempt_id": baseline.attempt_id,
-        "exposed_trial_number": exposed_trial_number,
-        "exposed_source": exposed_source,
-        "candidate_metric": candidate.metric,
-        "baseline_metric": baseline.metric,
-        "min_delta": promotion.min_delta,
-        "improvement": improvement,
-        "requires_gates": promotion.requires_gates,
-        "gates_passed": gates_passed,
-        "promoted": promoted,
-        "on_fail": promotion.on_fail,
-        "action": action,
-        "reason": reason,
-    }
-    if message:
-        decision["message"] = message
 
     if promoted:
         assert improvement is not None
@@ -430,13 +569,17 @@ def _study_phase_winner(
     :param str selector: Baseline selector, either a study name or
         ``"study.phase"``.
     :return tuple[str, Winner]: Resolved baseline label and winner.
+    :raises PromotionError: The selector names a baseline study or phase that
+        was not exposed by the preceding suite decisions.
+    :raises RuntimeError: ``results`` contains a baseline study with no winners,
+        which violates the suite runner's internal result invariant.
     """
     if "." in selector:
         baseline_study, phase_name = selector.split(".", 1)
     else:
         baseline_study, phase_name = selector, ""
     if baseline_study not in results:
-        raise RuntimeError(
+        raise PromotionError(
             f"Study {study_name!r} promotion references unknown baseline study {baseline_study!r}."
         )
     study_winners = results[baseline_study]
@@ -444,7 +587,7 @@ def _study_phase_winner(
         raise RuntimeError(f"Baseline study {baseline_study!r} has no winners.")
     if phase_name:
         if phase_name not in study_winners:
-            raise RuntimeError(
+            raise PromotionError(
                 f"Study {study_name!r} promotion references missing baseline phase {selector!r}."
             )
         return baseline_study, study_winners[phase_name]
@@ -471,6 +614,10 @@ def _apply_study_promotion(
         studies in the suite.
     :return tuple[dict[str, Winner] | None, dict[str, Any] | None]: Exposed
         study winners and promotion decision payload.
+    :raises PromotionError: The rule failed with ``on_fail: stop`` or its
+        baseline selector was not exposed by preceding suite decisions.
+    :raises RuntimeError: The current study produced no winner, which violates
+        the suite runner's internal result invariant.
     """
     study_spec = next(study for study in suite.studies if study.name == study_name)
     promotion = study_spec.promotion
@@ -494,40 +641,17 @@ def _apply_study_promotion(
         baseline=baseline,
     )
 
-    decision: dict[str, Any] = {
-        "study": study_name,
-        "phase": final_phase,
-        "baseline": baseline_label,
-        "candidate_trial_number": candidate.trial_number,
-        "candidate_generation_id": candidate.generation_id,
-        "candidate_attempt_id": candidate.attempt_id,
-        "baseline_trial_number": baseline.trial_number,
-        "baseline_generation_id": baseline.generation_id,
-        "baseline_attempt_id": baseline.attempt_id,
-        "candidate_metric": candidate.metric,
-        "baseline_metric": baseline.metric,
-        "min_delta": promotion.min_delta,
-        "improvement": improvement,
-        "requires_gates": promotion.requires_gates,
-        "gates_passed": gates_passed,
-        "promoted": promoted,
-        "on_fail": promotion.on_fail,
-        "action": "promote" if promoted else promotion.on_fail,
-        "exposed_source": (
-            "candidate"
-            if promoted
-            else "baseline"
-            if promotion.on_fail == "continue_baseline"
-            else None
-        ),
-        "exposed_trial_number": (
-            candidate.trial_number
-            if promoted
-            else baseline.trial_number
-            if promotion.on_fail == "continue_baseline"
-            else None
-        ),
-    }
+    decision = _promotion_decision_payload(
+        phase_name=final_phase,
+        baseline_label=baseline_label,
+        candidate=candidate,
+        baseline=baseline,
+        promotion=promotion,
+        improvement=improvement,
+        gates_passed=gates_passed,
+        promoted=promoted,
+        study_name=study_name,
+    )
     if promoted:
         log.info(
             "suite=%s study=%s PROMOTED improvement=%s baseline=%s min_delta=%g",
@@ -545,7 +669,7 @@ def _apply_study_promotion(
         f"gates_passed={gates_passed}."
     )
     if promotion.on_fail == "stop":
-        raise RuntimeError(message)
+        raise PromotionError(message)
     if promotion.on_fail == "skip":
         log.warning("%s Skipping this study for downstream dependencies.", message)
         return None, decision

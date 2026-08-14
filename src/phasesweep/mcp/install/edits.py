@@ -6,9 +6,10 @@ read-modify-write transaction:
 
 - JSON member edits: parse the whole document, change one member under one
   container key, and re-serialize with the file's detected indentation and
-  newline style. Key order is retained, but whitespace and finite-number spellings may change.
-  Duplicate keys, non-finite/overflowing numbers, comments, and JSON5 are
-  never modified; the caller gets ``"skipped"`` and prints a manual snippet.
+  newline style. Key order and every number's source spelling are retained,
+  but whitespace may change. Duplicate keys, non-finite/overflowing numbers,
+  comments, and JSON5 are never modified; the caller gets ``"skipped"`` and
+  prints a manual snippet.
 - Marker-fenced text blocks: replace-or-append a block between start/end
   marker lines, leaving every byte outside the markers alone. Removal restores
   the original bytes (including newline style) and leaves the file in place;
@@ -24,7 +25,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import stat
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -34,6 +34,7 @@ from typing import IO, Literal, TypeAlias
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
     UnsafePrivatePathError,
+    _new_exclusive_temp_fd,
     absolute_path,
     leaf_name,
     lock_dir,
@@ -51,14 +52,35 @@ Action: TypeAlias = Literal[
     "skipped",
     "conflict",
     "error",
+    "write-error",
+    "durability-error",
     "lock-error",
     "removed",
     "not-found",
 ]
-AtomicWriteResult: TypeAlias = Literal["written", "stale", "error"]
+AtomicWriteResult: TypeAlias = Literal["written", "stale", "write-error", "durability-error"]
 MemberPredicate: TypeAlias = Callable[[object], bool]
 
 _INDENT_PATTERN = re.compile(r"^([ \t]+)\S", re.MULTILINE)
+
+# Placeholder prefix reserved while an edited document is serialized. It is
+# lengthened deterministically when the document already contains it, so no
+# randomness is needed to keep a client's own strings from colliding with it.
+_RAW_FLOAT_PREFIX = "phasesweep_raw_float_"
+_RAW_FLOAT_PREFIX_ATTEMPTS = 8
+
+
+class _RawFloat(str):
+    """One parsed JSON float carried as its exact source token.
+
+    A whole-document ``json.dumps`` re-spells numbers Python round-trips
+    differently (``1e2`` to ``100.0``, ``1.50`` to ``1.5``), rewriting values
+    the installer has no business touching. Parsing an existing config's floats
+    into this ``str`` subclass keeps their source tokens so
+    :func:`_dump_json_preserving_floats` can write them back verbatim.
+    """
+
+    __slots__ = ()
 
 
 @dataclass(frozen=True)
@@ -228,25 +250,6 @@ def _snapshot_matches(parent_fd: int, leaf: str, expected: _TextSnapshot) -> boo
     return current.stat_token == expected.stat_token and current.raw == expected.raw
 
 
-def _new_temporary_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
-    """Create an umask-governed temporary file relative to ``parent_fd``.
-
-    :param int parent_fd: Open descriptor for the target's parent directory.
-    :param str leaf: Destination filename used to make the temporary name recognizable.
-    :param int mode: Requested creation mode, subject to the process umask.
-    :return tuple[int, str]: Open descriptor and temporary filename.
-    :raises FileExistsError: If ten random temporary names all collide.
-    """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
-    for _ in range(10):
-        temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
-        try:
-            return os.open(temporary, flags, mode, dir_fd=parent_fd), temporary
-        except FileExistsError:
-            continue
-    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
-
-
 def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> AtomicWriteResult:
     """Atomically replace ``path`` with UTF-8 ``text`` in the same directory.
 
@@ -259,7 +262,9 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
     :param str text: Complete replacement contents.
     :param _TextSnapshot expected: Snapshot that must still match before replace.
     :return AtomicWriteResult: ``written`` on success, ``stale`` when the
-        target changed since it was read, or ``error`` when replacement failed.
+        target changed since it was read, ``write-error`` when replacement failed
+        before commit, or ``durability-error`` when the replacement committed
+        but syncing its parent directory failed.
     """
     parent_fd = -1
     temporary: str | None = None
@@ -272,7 +277,7 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
         )
         leaf = leaf_name(path)
         create_mode = expected.mode if expected.mode is not None else 0o666
-        fd, temporary = _new_temporary_fd(parent_fd, leaf, create_mode)
+        fd, temporary = _new_exclusive_temp_fd(parent_fd, leaf, create_mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             if expected.mode is not None:
                 os.fchmod(handle.fileno(), expected.mode)
@@ -283,10 +288,13 @@ def _atomic_write_text(path: Path, text: str, *, expected: _TextSnapshot) -> Ato
             return "stale"
         os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = None
-        os.fsync(parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            return "durability-error"
         return "written"
     except (OSError, UnsafePrivatePathError):
-        return "error"
+        return "write-error"
     finally:
         if temporary is not None and parent_fd >= 0:
             with contextlib.suppress(OSError):
@@ -336,6 +344,68 @@ def _dump_json(
         "\n", newline
     )
     return text + newline if trailing_newline else text
+
+
+def _placeholder_value(value: object, tokens: list[str], prefix: str) -> object:
+    """Replace every raw float token in one parsed JSON value with a placeholder.
+
+    :param object value: Parsed value, possibly containing :class:`_RawFloat` leaves.
+    :param list[str] tokens: Accumulator receiving each raw token in placement order.
+    :param str prefix: Placeholder prefix reserved for this serialization.
+    :return object: Equivalent value whose floats are placeholder strings.
+    """
+    if isinstance(value, _RawFloat):
+        tokens.append(str(value))
+        return f"{prefix}{len(tokens) - 1}__"
+    if isinstance(value, dict):
+        return {key: _placeholder_value(item, tokens, prefix) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_placeholder_value(item, tokens, prefix) for item in value]
+    return value
+
+
+def _dump_json_preserving_floats(
+    data: dict[str, object],
+    *,
+    indent: str,
+    newline: str,
+    trailing_newline: bool,
+) -> str:
+    """Serialize an edited existing document without re-spelling its numbers.
+
+    Every :class:`_RawFloat` leaf is serialized as a reserved placeholder string
+    and then substituted back as its source token, so values the installer did
+    not touch survive byte for byte. The prefix is only accepted once the
+    serialized text contains exactly one occurrence per float, which proves no
+    string in the document collides with it.
+
+    :param dict[str, object] data: Edited document to serialize.
+    :param str indent: Indentation unit to apply.
+    :param str newline: Newline convention to apply.
+    :param bool trailing_newline: Whether the output should end with a newline.
+    :return str: Serialized JSON text.
+    :raises ValueError: If no collision-free placeholder prefix was found.
+    """
+    prefix = _RAW_FLOAT_PREFIX
+    for _ in range(_RAW_FLOAT_PREFIX_ATTEMPTS):
+        tokens: list[str] = []
+        placeholder = {
+            key: _placeholder_value(value, tokens, prefix) for key, value in data.items()
+        }
+        text = _dump_json(
+            placeholder,
+            indent=indent,
+            newline=newline,
+            trailing_newline=trailing_newline,
+        )
+        if not tokens:
+            return text
+        if text.count(prefix) == len(tokens):
+            for index, token in enumerate(tokens):
+                text = text.replace(f'"{prefix}{index}__"', token, 1)
+            return text
+        prefix += "_"
+    raise ValueError("no collision-free raw float placeholder prefix for this document")
 
 
 def manual_json_snippet(container_key: str, member_key: str, entry: dict[str, object]) -> str:
@@ -397,7 +467,11 @@ def _edit_json_member(
             return write_result
 
         try:
-            data = strict_json_loads(text, finite_floats=True) if text.strip() else {}
+            data = (
+                strict_json_loads(text, finite_floats=True, parse_float=_RawFloat)
+                if text.strip()
+                else {}
+            )
         except ValueError:
             return "skipped"
         if not isinstance(data, dict):
@@ -426,7 +500,7 @@ def _edit_json_member(
         if dry_run:
             return action
         try:
-            updated = _dump_json(
+            updated = _dump_json_preserving_floats(
                 data,
                 indent=_detected_indent(text),
                 newline=_detected_newline(text),

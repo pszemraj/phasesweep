@@ -30,17 +30,23 @@ import subprocess
 import threading
 import time
 from collections.abc import Generator, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
 from phasesweep.config.models import GpuPolicy
+from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
+_MIG_UUID_INVENTORY = re.compile(r"\(UUID:\s*(MIG-[^)]+)\)", re.IGNORECASE)
+
+
+class GpuLeaseTimeoutError(TimeoutError):
+    """Raised only when a GPU lease wait exhausts its wallclock deadline."""
 
 
 @dataclass(frozen=True)
@@ -48,10 +54,12 @@ class GpuDevice:
     """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem.
 
     ``visible_token`` is what the trainer sees in ``CUDA_VISIBLE_DEVICES``.
+    GPU/MIG prefixes are replaced with the inventory's canonical spelling;
+    numeric indices keep the operator's ordinal.
     ``lock_token`` is the canonical physical-device identity the host lock keys
     on — normally the GPU UUID resolved from a numeric index at pool
-    construction. It defaults to the visible token, so a device built without
-    resolution locks exactly as it did before (review v0.5.17 / blocker 6).
+    construction. It defaults to the visible token, while pool construction
+    resolves every UUID spelling to the inventory's canonical identity.
     """
 
     visible_token: str
@@ -78,11 +86,18 @@ class GpuDevice:
         return f"{normalized[:48]}_{digest}"
 
 
+@dataclass(frozen=True)
+class GpuAssignment:
+    """Trainer visibility plus descriptors transferred to its trusted guardian."""
+
+    visible_devices: str | None
+    lease_fds: tuple[int, ...]
+
+
 @dataclass
 class _HostGpuLease:
     """Host-wide flock handle for one CUDA device token."""
 
-    device: GpuDevice
     handle: IO[str]
 
 
@@ -95,24 +110,13 @@ class _GpuAcquisition:
     visible_devices: str
 
 
-def _coerce_device(device: GpuDevice | int | str) -> GpuDevice:
-    """Normalize a CUDA device token into :class:`GpuDevice`.
-
-    :param GpuDevice | int | str device: CUDA device token to normalize.
-    :return GpuDevice: Existing device instance or a device wrapping the stringified token.
-    """
-    if isinstance(device, GpuDevice):
-        return device
-    return GpuDevice(str(device))
-
-
-def _gpu_lock_path(device: GpuDevice | int | str) -> Path:
+def _gpu_lock_path(device: GpuDevice) -> Path:
     """Return the host-wide lock file for a CUDA device token.
 
-    :param GpuDevice | int | str device: CUDA device token.
+    :param GpuDevice device: Canonical CUDA device identity.
     :return Path: Host-wide lock file path for ``device``.
     """
-    return lock_dir() / f"gpu_{_coerce_device(device).lock_name}.lock"
+    return lock_dir() / f"gpu_{device.lock_name}.lock"
 
 
 def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
@@ -124,18 +128,31 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
     handle = try_lock_file(_gpu_lock_path(device))
     if handle is None:
         return None
-    handle.seek(0)
-    handle.truncate()
-    handle.write(f"{os.getpid()}\n")
-    handle.flush()
-    return _HostGpuLease(device=device, handle=handle)
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+    except BaseException:
+        # The flock is already held; failing to stamp the pid must not leak a
+        # locked handle that would exclude every other run from this GPU.
+        unlock_file(handle)
+        raise
+    return _HostGpuLease(handle=handle)
 
 
 def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
-    """Release a host-wide GPU lock."""
+    """Close this process's lease copy without unlocking guardian copies.
+
+    ``flock(LOCK_UN)`` operates on the shared open-file description and would
+    release the supervisor guardian's inherited lock too. Closing only our descriptor
+    keeps the lock alive after an orchestrator crash or uncertain cleanup,
+    until the guardian exits with the trainer.
+    """
     if lease is None:
         return
-    unlock_file(lease.handle)
+    with suppress(OSError):
+        lease.handle.close()
 
 
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
@@ -182,6 +199,27 @@ def _detect_gpu_uuid_map() -> dict[str, str]:
     return _detect_gpu_inventory()[1]
 
 
+def _detect_mig_uuid_set() -> set[str]:
+    """Return MIG instance UUIDs reported by ``nvidia-smi -L``.
+
+    :return set[str]: Canonical ``MIG-...`` identities, empty when the probe
+        is unavailable or reports none.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if out.returncode != 0:
+            return set()
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return set()
+    return {match.group(1) for match in _MIG_UUID_INVENTORY.finditer(out.stdout)}
+
+
 def _nvidia_driver_reports_gpus() -> bool:
     """Return whether the NVIDIA kernel driver lists any GPUs on this host.
 
@@ -198,21 +236,28 @@ def _nvidia_driver_reports_gpus() -> bool:
         return False
 
 
-_FULL_GPU_UUID_LENGTH = len("GPU-") + 36
+def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
+    """Reject device tokens that cannot syntactically name a CUDA device.
 
+    CUDA silently exposes no device for a token that is neither a numeric
+    index nor a ``GPU-``/``MIG-`` identity, so accepting one would hand a
+    trial an empty visibility set while the real GPUs sit unlocked — the
+    opaque-token equivalent of a nonexistent numeric index, which already
+    fails closed in :func:`_resolve_lock_identities`.
 
-def _is_abbreviated_gpu_uuid(token: str) -> bool:
-    """Return whether ``token`` is a shortened ``GPU-`` UUID prefix.
-
-    CUDA accepts unambiguous UUID prefixes in ``CUDA_VISIBLE_DEVICES``, so a
-    ``GPU-`` token shorter than a full canonical UUID names the same card as
-    its full spelling and needs resolution before locking (review v0.5.17
-    gap hunt). Full-length tokens are treated as already canonical.
-
-    :param str token: Configured CUDA device token.
-    :return bool: ``True`` for a shortened ``GPU-`` UUID prefix.
+    :param list[GpuDevice] devices: Devices built from configured or ambient tokens.
+    :raises GpuConfigurationError: A token is neither numeric nor ``GPU-``/``MIG-`` shaped.
     """
-    return token.startswith("GPU-") and len(token) < _FULL_GPU_UUID_LENGTH
+    for device in devices:
+        token = device.visible_token
+        if token.isdigit() or token[:4].upper() in ("GPU-", "MIG-"):
+            continue
+        raise GpuConfigurationError(
+            f"CUDA device token {token!r} is not a numeric index, GPU- UUID, or "
+            "MIG- instance ID. CUDA would expose no device for it while phasesweep "
+            "holds no lock for any real GPU. Fix gpu_ids, gpu_devices, or "
+            "CUDA_VISIBLE_DEVICES."
+        )
 
 
 def _resolve_lock_identities(
@@ -220,100 +265,125 @@ def _resolve_lock_identities(
     *,
     uuid_map: dict[str, str] | None = None,
 ) -> list[GpuDevice]:
+    """Bind each device to its canonical physical GPU and drop alias duplicates.
+
+    :param list[GpuDevice] devices: Devices built from configured, ambient, or
+        detected tokens.
+    :param dict[str, str] | None uuid_map: Already-probed index-to-UUID map,
+        when available.
+    :raises GpuConfigurationError: Propagated from
+        :func:`_bind_lock_identities` when the tokens cannot be validated.
+    :return list[GpuDevice]: The devices from :func:`_bind_lock_identities`, deduplicated by lock
+        identity so one physical device is never leased twice in one pool.
+    """
+    return _dedupe_by_lock_identity(_bind_lock_identities(devices, uuid_map=uuid_map))
+
+
+def _bind_lock_identities(
+    devices: list[GpuDevice],
+    *,
+    uuid_map: dict[str, str] | None = None,
+    mig_uuids: set[str] | None = None,
+) -> list[GpuDevice]:
     """Bind each device to the canonical physical GPU its host lock keys on.
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
     same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two (review v0.5.17 / blocker 6). Abbreviated
-    ``GPU-`` UUID prefixes — which CUDA accepts when unambiguous — resolve to
-    the full UUID the same way (review v0.5.17 gap hunt). Full opaque tokens
-    (``GPU-...`` UUIDs, ``MIG-...`` instances) are already canonical and lock on
-    themselves; phasesweep does not bind a MIG instance to its parent device.
+    one host lock instead of two (review v0.5.17 / blocker 6). Every ``GPU-``
+    token, including a full-length or lowercase spelling, resolves through the
+    readable inventory; abbreviated UUID prefixes resolve only when exactly one
+    card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
+    This both canonicalizes case and rejects a UUID that CUDA would turn into an
+    empty visibility set while phasesweep held no real-device lock.
 
-    Args:
-        devices: Devices built from configured, ambient, or detected tokens.
-        uuid_map: Already-probed index-to-UUID map, when available.
+    Binding is kept separate from deduplication so a caller that must fail
+    closed on aliasing can see which tokens collapsed onto one card before they
+    are silently dropped (:func:`_require_distinct_whole_node_devices`). Every
+    token fails closed when its required ``nvidia-smi`` inventory cannot be
+    read: accepting an unverified index or UUID could expose no CUDA device or
+    split the host lock namespace between index and UUID spellings.
 
-    Returns:
-        The same devices with ``lock_token`` populated, deduplicated by lock
-        identity so one physical device is never leased twice in one pool.
-
-    Raises:
-        RuntimeError: ``nvidia-smi`` cannot be read *and* the token set mixes
-            numeric indices with opaque tokens (phasesweep cannot tell whether
-            they name the same card), or a configured numeric index is absent
-            from a readable index-to-UUID map (the device does not exist).
-
+    :param list[GpuDevice] devices: Devices built from configured, ambient, or
+        detected tokens.
+    :param dict[str, str] | None uuid_map: Already-probed index-to-UUID map,
+        when available.
+    :param set[str] | None mig_uuids: Already-probed MIG instance identities,
+        when available.
+    :raises GpuConfigurationError: A token is neither a numeric index nor a
+            ``GPU-``/``MIG-`` identity (see :func:`_validate_device_token_shapes`),
+            ``nvidia-smi`` cannot validate an opaque token, or a configured
+            numeric/UUID identity is absent from the readable inventory.
+    :return list[GpuDevice]: The same devices, in order, with ``lock_token``
+        populated where a canonical identity could be resolved. No device is dropped.
     """
+    _validate_device_token_shapes(devices)
     numeric = [device for device in devices if device.visible_token.isdigit()]
-    abbreviated = [device for device in devices if _is_abbreviated_gpu_uuid(device.visible_token)]
-    if not numeric and not abbreviated:
-        # Full opaque token sets are already canonical: no probe, no ambiguity.
-        return _dedupe_by_lock_identity(devices)
+    gpu_tokens = [device for device in devices if device.visible_token[:4].upper() == "GPU-"]
+    mig_tokens = [device for device in devices if device.visible_token[:4].upper() == "MIG-"]
 
-    if uuid_map is None:
+    if uuid_map is None and (numeric or gpu_tokens):
         uuid_map = _detect_gpu_uuid_map()
-    if not uuid_map:
-        opaque = [device.visible_token for device in devices if not device.visible_token.isdigit()]
-        if numeric and opaque:
-            raise RuntimeError(
-                "Cannot resolve canonical GPU identity: this device set mixes numeric "
-                f"indices ({[device.visible_token for device in numeric]}) with opaque "
-                f"tokens ({opaque}), and nvidia-smi could not be read, so phasesweep "
-                "cannot tell whether they name the same physical GPU and could "
-                "double-book it. Use one convention for every device on this host "
-                "(all indices or all UUID/MIG tokens), or fix nvidia-smi."
-            )
-        if abbreviated:
-            log.warning(
-                "nvidia-smi UUID resolution is unavailable; abbreviated GPU UUID "
-                "prefix(es) %s lock on the prefix spelling and would not exclude a "
-                "concurrent run using the full UUID for the same card. Use full "
-                "UUIDs, or fix nvidia-smi.",
-                [device.visible_token for device in abbreviated],
-            )
-            return _dedupe_by_lock_identity(devices)
-        # No map and one consistent spelling: indices remain their own identity,
-        # which still collides with itself across runs on this host — but NOT
-        # with a concurrent run whose nvidia-smi probe succeeded and locked the
-        # UUID form. Lock-identity resolution must succeed or fail the same way
-        # for every orchestrator on a host (watch systemd/cron units with a
-        # minimal PATH), so make the degradation loud instead of silent.
-        log.warning(
-            "nvidia-smi index-to-UUID resolution is unavailable; GPU host locks for %s "
-            "fall back to index-form names. A concurrent run that CAN resolve UUIDs "
-            "would lock the same cards under different names and could double-book "
-            "them. Fix nvidia-smi (PATH, driver) for every orchestrator on this host.",
-            [device.visible_token for device in numeric],
+    uuid_map = uuid_map or {}
+    if mig_uuids is None and mig_tokens:
+        mig_uuids = _detect_mig_uuid_set()
+    mig_uuids = mig_uuids or set()
+    if mig_tokens and not mig_uuids:
+        raise GpuConfigurationError(
+            "Cannot validate configured MIG token(s) "
+            f"{[device.visible_token for device in mig_tokens]} because nvidia-smi -L "
+            "reported no usable MIG inventory. Fix nvidia-smi or the configured "
+            "gpu_devices/CUDA_VISIBLE_DEVICES value."
         )
-        return _dedupe_by_lock_identity(devices)
+    if not uuid_map:
+        if gpu_tokens:
+            raise GpuConfigurationError(
+                "Cannot validate configured GPU UUID token(s) "
+                f"{[device.visible_token for device in gpu_tokens]} because nvidia-smi "
+                "reported no usable GPU UUID inventory. Fix nvidia-smi or the configured "
+                "gpu_devices/CUDA_VISIBLE_DEVICES value."
+            )
+        if numeric:
+            raise GpuConfigurationError(
+                "Cannot validate configured CUDA device index token(s) "
+                f"{[device.visible_token for device in numeric]} because nvidia-smi "
+                "reported no usable index-to-UUID inventory. Accepting index-form locks "
+                "would not exclude a concurrent UUID-form lock for the same card. Fix "
+                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value."
+            )
 
     resolved: list[GpuDevice] = []
     for device in devices:
         token = device.visible_token
-        if not token.isdigit():
-            # Canonicalize an abbreviated UUID prefix to the full UUID when
-            # the readable map matches exactly one device; ambiguous or
-            # unmatched prefixes stay their own identity.
-            if _is_abbreviated_gpu_uuid(token):
-                matches = [
-                    uuid for uuid in uuid_map.values() if uuid.lower().startswith(token.lower())
-                ]
-                if len(matches) == 1:
-                    resolved.append(GpuDevice(visible_token=token, lock_token=matches[0]))
-                    continue
-            resolved.append(device)
+        if token[:4].upper() == "GPU-":
+            matches = [uuid for uuid in uuid_map.values() if uuid.lower().startswith(token.lower())]
+            if len(matches) != 1:
+                detail = "matches multiple devices" if matches else "matches no device"
+                raise GpuConfigurationError(
+                    f"Configured CUDA GPU UUID token {token!r} {detail} in the nvidia-smi "
+                    "inventory. Fix gpu_devices or CUDA_VISIBLE_DEVICES."
+                )
+            resolved.append(GpuDevice(visible_token=matches[0], lock_token=matches[0]))
+            continue
+        if token[:4].upper() == "MIG-":
+            matches = [uuid for uuid in mig_uuids if uuid.lower().startswith(token.lower())]
+            if len(matches) != 1:
+                detail = "matches multiple devices" if matches else "matches no device"
+                raise GpuConfigurationError(
+                    f"Configured CUDA MIG token {token!r} {detail} in the nvidia-smi "
+                    "inventory. Fix gpu_devices or CUDA_VISIBLE_DEVICES."
+                )
+            resolved.append(GpuDevice(visible_token=matches[0], lock_token=matches[0]))
             continue
         uuid = uuid_map.get(token)
         if uuid is None:
-            raise RuntimeError(
+            raise GpuConfigurationError(
                 f"Configured CUDA device index {token} does not exist on this host, or "
                 f"nvidia-smi reported no usable GPU/MIG UUID for it (resolvable indices: "
                 f"{sorted(uuid_map, key=int)}). Fix gpu_ids, gpu_devices, or "
                 "CUDA_VISIBLE_DEVICES."
             )
         resolved.append(GpuDevice(visible_token=token, lock_token=uuid))
-    return _dedupe_by_lock_identity(resolved)
+    return resolved
 
 
 def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
@@ -338,17 +408,85 @@ def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
     return unique
 
 
+def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDevice]) -> None:
+    """Fail closed when a whole-node device set collapses to fewer physical GPUs.
+
+    Under ``gpu_policy='whole_node'`` the configured token list *declares* the
+    trainer's world size, and that declared count is what the phase fingerprint
+    records (``whole_node_device_count``). Deduplication is therefore not a
+    convenience here: dropping an aliased token would run a 1-GPU world under a
+    2-GPU study identity, and the two runs would be indistinguishable afterwards
+    (PR #5 review / reviewer 2, blocker 2). ``single_per_trial`` is unaffected —
+    there the list is a pool whose size is pure throughput, so dedupe with a
+    warning stays correct.
+
+    Only *actual* collapses are reported. A collapse is visible either as a
+    token that :func:`_normalize_devices` removed (an exact repeat, or an empty
+    token) or as two bound devices sharing one ``lock_identity``. Failed
+    inventory resolution raises before this check.
+
+    :param list[str] requested: Stripped device tokens exactly as configured,
+        before normalization dropped anything.
+    :param list[GpuDevice] bound: Normalized devices with lock identities bound
+        but not yet deduplicated.
+    :raises GpuConfigurationError: The configured tokens name fewer distinct physical
+        GPUs than the declared world size.
+    """
+    mig_devices = [device for device in bound if device.lock_identity[:4].upper() == "MIG-"]
+    if mig_devices and len(bound) > 1:
+        raise GpuConfigurationError(
+            "gpu_policy='whole_node' cannot declare a multi-device world containing "
+            "MIG tokens. CUDA's enumerated device count depends on the driver version "
+            "and permits at most one compute instance per GPU instance, while the MIG "
+            "UUID inventory does not identify those parent GPU instances here. Configure "
+            "exactly one MIG token, or use full-GPU tokens for a multi-device world."
+        )
+
+    aliases: list[str] = []
+    first_by_identity: dict[str, str] = {}
+    for device in bound:
+        first = first_by_identity.get(device.lock_identity)
+        if first is None:
+            first_by_identity[device.lock_identity] = device.visible_token
+            continue
+        aliases.append(
+            f"{device.visible_token!r} names the same physical GPU as {first!r} "
+            f"(identity {device.lock_identity!r})"
+        )
+    repeats = sorted({token for token in requested if requested.count(token) > 1})
+    effective = len(first_by_identity)
+    if effective == len(requested):
+        return
+    detail = "; ".join(aliases + ([f"token(s) {repeats} appear more than once"] if repeats else []))
+    raise GpuConfigurationError(
+        f"gpu_policy='whole_node' declares {len(requested)} CUDA device token(s) "
+        f"({requested}) but they resolve to only {effective} distinct physical "
+        f"GPU(s): {detail or 'an empty token was dropped'}. The phase fingerprint "
+        "records the declared count as the trainer's world size, so leasing fewer "
+        "devices would silently run a smaller world under a larger study identity. "
+        "List one distinct GPU per world-size slot, or use "
+        "gpu_policy='single_per_trial' if this list is a pool rather than a world."
+    )
+
+
 class GpuPool:
     """Thread-safe pool of CUDA-visible device tokens.
 
     Usage:
         pool = GpuPool.create(n_jobs=4)
         with pool.acquire() as gpu_device:
-            env["CUDA_VISIBLE_DEVICES"] = gpu_device if gpu_device is not None else ""
+            if gpu_device is not None:
+                env["CUDA_VISIBLE_DEVICES"] = gpu_device
             run_trial(...)
     """
 
-    def __init__(self, devices: list[GpuDevice], *, whole_node: bool = False) -> None:
+    def __init__(
+        self,
+        devices: list[GpuDevice],
+        *,
+        whole_node: bool = False,
+        pinned_visible_devices: str | None = None,
+    ) -> None:
         """Build a pool from a fixed list of CUDA device tokens.
 
         Args:
@@ -358,6 +496,13 @@ class GpuPool:
                 construction path that handles auto-detection and policy.
             whole_node: Whether each acquisition leases all devices as one
                 comma-joined CUDA_VISIBLE_DEVICES assignment.
+            pinned_visible_devices: CUDA_VISIBLE_DEVICES value every
+                acquisition yields when ``devices`` is empty. Set when the
+                pool leases nothing *because* a configured or ambient disable
+                sentinel (``""``/``-1``) says CUDA is off: the sentinel must
+                reach the trial environment even under a narrowed
+                ``inherit_env`` contract, or the trainer would see every host
+                GPU while phasesweep holds zero GPU locks.
 
         """
         self._devices = devices
@@ -365,6 +510,7 @@ class GpuPool:
         self._whole_node_in_use = False
         self._available: list[GpuDevice] = []
         self._condition = threading.Condition()
+        self._pinned_visible_devices = pinned_visible_devices
 
         if devices:
             self._available = list(devices)
@@ -377,71 +523,166 @@ class GpuPool:
         explicit_devices: list[str] | None = None,
         allow_no_gpu: bool = False,
         policy: GpuPolicy = "single_per_trial",
+        cuda_visible_devices: str | None = None,
     ) -> GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
 
-        Args:
-            n_jobs: number of parallel trials.
-            explicit_ids: GPU indices from YAML config. If ``None``, auto-detect
+        :param int n_jobs: Number of parallel trials.
+        :param list[int] | None explicit_ids: GPU indices from YAML config. If
+                ``None``, auto-detect
                 visible devices even for ``n_jobs == 1`` so independent
                 single-job phasesweep processes do not double-book cuda:0.
-            explicit_devices: Opaque CUDA_VISIBLE_DEVICES tokens from YAML config,
-                such as GPU UUIDs or MIG instance IDs. Mutually exclusive with
-                ``explicit_ids``.
-            allow_no_gpu: if ``True``, run without CUDA isolation when no numeric
-                GPU IDs can be resolved. Parallel CPU-only sweeps need this opt-in.
-            policy: CUDA visibility policy. ``single_per_trial`` leases one
+        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens from
+                YAML config. Mutually exclusive with ``explicit_ids``.
+        :param bool allow_no_gpu: If ``True``, run without CUDA isolation when no numeric
+                GPU IDs can be resolved. Parallel auto-detected CPU-only sweeps
+                need this opt-in; an explicit CUDA-disable value does not.
+        :param GpuPolicy policy: CUDA visibility policy. ``single_per_trial`` leases one
                 token per trial. ``whole_node`` leases all tokens for one trial
                 and exposes them comma-joined. ``none`` disables CUDA isolation
                 and GPU locks.
-
-        Returns:
-            A configured :class:`GpuPool`. The pool is "active" (hands out
-            non-``None`` IDs) iff a GPU list is in play.
-
-        Raises:
-            RuntimeError: No GPUs are visible and ``n_jobs > 1`` without
-                ``allow_no_gpu``, or the configured device tokens cannot be
-                resolved to canonical physical devices (see
-                :func:`_resolve_lock_identities`).
-
+        :param str | None cuda_visible_devices: Configured trainer-environment override for
+                ``CUDA_VISIBLE_DEVICES``. When omitted, the ambient value is used.
+        :raises GpuConfigurationError: No GPUs are visible and ``n_jobs > 1`` without
+                ``allow_no_gpu``; the NVIDIA driver reports hardware that
+                ``nvidia-smi`` cannot enumerate without ``allow_no_gpu``; the
+                configured or ambient device tokens cannot be resolved to canonical
+                physical devices (see :func:`_bind_lock_identities`), or
+                ``policy='whole_node'`` and the configured tokens collapse to
+                fewer physical GPUs than the declared world size (see
+                :func:`_require_distinct_whole_node_devices`).
+        :return GpuPool: A configured pool. The pool leases devices iff a GPU
+            list is in play; an inactive pool built from a CUDA-disable
+            sentinel still yields that sentinel so trials inherit the
+            disable (see ``pinned_visible_devices``).
         """
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")
             return cls(devices=[])
 
-        # Explicit IDs always win, even at n_jobs==1.
-        if explicit_ids is not None:
-            devices = _resolve_lock_identities(_normalize_devices(explicit_ids))
-            _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
-            return cls(devices=devices, whole_node=policy == "whole_node")
-        if explicit_devices is not None:
-            devices = _resolve_lock_identities(_normalize_devices(explicit_devices))
+        # Explicit configuration always wins, even at n_jobs==1.
+        explicit = explicit_ids if explicit_ids is not None else explicit_devices
+        if explicit is not None:
+            bound = _bind_lock_identities(_normalize_devices(explicit))
+            if policy == "whole_node":
+                # Config validation rejects exactly-repeated tokens, but physical
+                # aliasing (index vs UUID for one card) can only be seen once
+                # nvidia-smi has been probed — which happens here, after the
+                # no-op-republish early return in the phase runner. Fail closed
+                # rather than lease a smaller world than the fingerprint claims.
+                _require_distinct_whole_node_devices(
+                    [str(token).strip() for token in explicit], bound
+                )
+            devices = _dedupe_by_lock_identity(bound)
             _log_pool_size(n_jobs, [device.visible_token for device in devices], "configured")
             return cls(devices=devices, whole_node=policy == "whole_node")
 
-        user_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        ambient_cvd = cuda_visible_devices is None and "CUDA_VISIBLE_DEVICES" in os.environ
+        user_cvd = (
+            cuda_visible_devices
+            if cuda_visible_devices is not None
+            else os.environ.get("CUDA_VISIBLE_DEVICES")
+        )
         detected_uuid_map: dict[str, str] | None = None
+        ambient_inventory_failure = False
         if user_cvd is not None:
-            devices = _devices_from_cuda_visible_devices(user_cvd)
+            try:
+                devices = _devices_from_cuda_visible_devices(user_cvd)
+            except GpuConfigurationError:
+                if not ambient_cvd:
+                    raise
+                log.warning(
+                    "Ambient CUDA_VISIBLE_DEVICES=%r mixes the '-1' disable sentinel "
+                    "with device tokens; treating it as empty visibility and pinning "
+                    "CUDA_VISIBLE_DEVICES='' for trial processes.",
+                    user_cvd,
+                )
+                devices = []
+                user_cvd = ""
         else:
             detected_ids, detected_uuid_map = _detect_gpu_inventory()
             devices = _normalize_devices(detected_ids)
-        if not devices:
-            if n_jobs <= 1:
-                if _nvidia_driver_reports_gpus():
-                    # The kernel driver knows about GPUs, so the empty probe is
-                    # a broken nvidia-smi, not a CPU-only host: this phase will
-                    # run with no CUDA_VISIBLE_DEVICES binding and hold zero
-                    # GPU host locks while real cards sit on the host
-                    # (review v0.5.17 gap hunt).
+        if user_cvd is not None and not devices and not _is_cuda_disable_value(user_cvd):
+            if not ambient_cvd:
+                raise GpuConfigurationError(
+                    f"Configured CUDA_VISIBLE_DEVICES value {user_cvd!r} is not the empty "
+                    "string, '-1', or a comma-separated device list."
+                )
+            log.warning(
+                "Ambient CUDA_VISIBLE_DEVICES=%r does not name a device or a supported "
+                "disable sentinel; treating it as empty visibility and pinning "
+                "CUDA_VISIBLE_DEVICES='' for trial processes.",
+                user_cvd,
+            )
+            user_cvd = ""
+        if devices:
+            inventory_dependent_tokens = all(
+                device.visible_token.isdigit()
+                or device.visible_token[:4].upper() in {"GPU-", "MIG-"}
+                for device in devices
+            )
+            try:
+                devices = _resolve_lock_identities(devices, uuid_map=detected_uuid_map)
+            except GpuConfigurationError:
+                if not ambient_cvd:
+                    raise
+                ambient_inventory_failure = inventory_dependent_tokens
+                if not ambient_inventory_failure:
                     log.warning(
-                        "nvidia-smi detected no GPUs but /proc/driver/nvidia/gpus lists "
-                        "hardware; running WITHOUT CUDA isolation or GPU host locks. Fix "
-                        "nvidia-smi or set gpu_ids/gpu_devices explicitly."
+                        "Ambient CUDA_VISIBLE_DEVICES=%r cannot be resolved against the local "
+                        "GPU inventory; treating it as empty visibility and pinning "
+                        "CUDA_VISIBLE_DEVICES='' for trial processes.",
+                        user_cvd,
+                        exc_info=True,
+                    )
+                devices = []
+                user_cvd = ""
+        if not devices:
+            # A configured or ambient sentinel ("" / "-1") is a decision, not
+            # an absence: pin it so trial environments actually receive the
+            # disable even when a narrowed inherit_env drops the ambient value.
+            pinned = user_cvd.strip() if user_cvd is not None else None
+            if (pinned is None or ambient_inventory_failure) and _nvidia_driver_reports_gpus():
+                message = (
+                    "nvidia-smi could not enumerate GPUs, but "
+                    "/proc/driver/nvidia/gpus reports hardware. PhaseSweep cannot "
+                    "derive canonical device locks, so launching with unrestricted "
+                    "CUDA visibility could double-book the host. Fix nvidia-smi or "
+                    "set gpu_ids/gpu_devices explicitly"
+                )
+                if not allow_no_gpu:
+                    raise GpuConfigurationError(
+                        f"{message}; set allow_no_gpu_isolation: true only to accept "
+                        "running without GPU host locks."
+                    )
+                if pinned == "":
+                    log.warning(
+                        "%s; pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
+                        "allow_no_gpu_isolation: true is set.",
+                        message,
                     )
                 else:
-                    log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
+                    log.warning(
+                        "%s; running without CUDA isolation because "
+                        "allow_no_gpu_isolation: true is set.",
+                        message,
+                    )
+                return cls(devices=[], pinned_visible_devices=pinned)
+            if pinned is not None:
+                if ambient_inventory_failure:
+                    log.warning(
+                        "Ambient CUDA_VISIBLE_DEVICES cannot be resolved, but the NVIDIA "
+                        "driver reports no GPUs; pinning CUDA_VISIBLE_DEVICES='' for trial "
+                        "processes."
+                    )
+                log.info(
+                    "CUDA_VISIBLE_DEVICES exposes no devices; phase will pin "
+                    "CUDA_VISIBLE_DEVICES=%r in trial environments without GPU host locks.",
+                    pinned,
+                )
+                return cls(devices=[], pinned_visible_devices=pinned)
+            if n_jobs <= 1:
+                log.info("No GPUs detected; single-job phase will run without CUDA isolation.")
                 return cls(devices=[])
             if allow_no_gpu:
                 log.warning(
@@ -450,12 +691,11 @@ class GpuPool:
                     n_jobs,
                 )
                 return cls(devices=[])
-            raise RuntimeError(
+            raise GpuConfigurationError(
                 f"n_jobs={n_jobs} but no GPUs detected. Set gpu_ids or gpu_devices "
                 "explicitly in the phase config, or set allow_no_gpu_isolation: true "
                 "if this is an intentional CPU-only parallel sweep."
             )
-        devices = _resolve_lock_identities(devices, uuid_map=detected_uuid_map)
         _log_pool_size(n_jobs, [device.visible_token for device in devices], "available")
         return cls(devices=devices, whole_node=policy == "whole_node")
 
@@ -464,12 +704,14 @@ class GpuPool:
 
         :param float | None deadline: Optional ``time.monotonic()`` deadline.
         :return float | None: Remaining seconds, or ``None`` when no deadline is active.
+        :raises GpuLeaseTimeoutError: The deadline has already passed, so
+            waiting further would overrun the phase/run wallclock budget.
         """
         if deadline is None:
             return None
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
-            raise TimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
+            raise GpuLeaseTimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
         return remaining
 
     def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
@@ -497,25 +739,31 @@ class GpuPool:
                 candidates = list(self._available)
                 self._available.clear()
 
-            remaining_devices: list[GpuDevice] = []
-            for index, device in enumerate(candidates):
-                lease = _try_host_gpu_lease(device)
-                if lease is not None:
-                    remaining_devices.extend(candidates[index + 1 :])
-                    with self._condition:
-                        self._available.extend(remaining_devices)
-                        self._condition.notify_all()
-                    log.debug("GPU %s host lease acquired", device.visible_token)
-                    return _GpuAcquisition(
-                        devices=[device],
-                        leases=[lease],
-                        visible_devices=device.visible_token,
-                    )
-                remaining_devices.append(device)
-
-            with self._condition:
-                self._available.extend(remaining_devices)
-                self._condition.notify_all()
+            # This thread owns every candidate until it hands them back. A
+            # lock-layer failure that skipped the hand-back would shrink the
+            # pool permanently: later acquires would block forever (or report
+            # a lease timeout that phase attribution mistakes for wallclock
+            # exhaustion), so the hand-back must survive any exception.
+            acquired: _GpuAcquisition | None = None
+            try:
+                for device in candidates:
+                    lease = _try_host_gpu_lease(device)
+                    if lease is not None:
+                        log.debug("GPU %s host lease acquired", device.visible_token)
+                        acquired = _GpuAcquisition(
+                            devices=[device],
+                            leases=[lease],
+                            visible_devices=device.visible_token,
+                        )
+                        break
+            finally:
+                leased = None if acquired is None else acquired.devices[0]
+                give_back = [device for device in candidates if device is not leased]
+                with self._condition:
+                    self._available.extend(give_back)
+                    self._condition.notify_all()
+            if acquired is not None:
+                return acquired
             remaining_seconds = self._remaining_seconds(deadline)
             time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
 
@@ -535,14 +783,26 @@ class GpuPool:
                     self._condition.wait(timeout=wait_seconds)
                 self._whole_node_in_use = True
 
+            # ``_whole_node_in_use`` is already claimed: a lock-layer failure
+            # that left it set (or leaked partial leases) would deadlock every
+            # later acquisition, so failures must roll both back.
             leases: list[_HostGpuLease] = []
+            all_leased = True
             try:
                 for device in self._devices:
                     lease = _try_host_gpu_lease(device)
                     if lease is None:
-                        raise TimeoutError
+                        all_leased = False
+                        break
                     leases.append(lease)
-            except TimeoutError:
+            except BaseException:
+                for lease in leases:
+                    _release_host_gpu_lease(lease)
+                with self._condition:
+                    self._whole_node_in_use = False
+                    self._condition.notify_all()
+                raise
+            if not all_leased:
                 for lease in leases:
                     _release_host_gpu_lease(lease)
                 with self._condition:
@@ -594,23 +854,36 @@ class GpuPool:
             self._condition.notify()
 
     @contextmanager
-    def acquire(self, *, deadline: float | None = None) -> Generator[str | None, None, None]:
-        """Block until a GPU is available, yield its CUDA-visible token, release on exit.
+    def acquire(self, *, deadline: float | None = None) -> Generator[GpuAssignment, None, None]:
+        """Block until a GPU is available and yield its visibility plus lease FDs.
 
         Args:
             deadline: Optional ``time.monotonic()`` deadline for the wait.
 
         Yields:
-            The CUDA_VISIBLE_DEVICES token for this critical section, or ``None`` when the
-            pool is inactive.
+            A :class:`GpuAssignment` carrying the CUDA visibility token (the
+            pinned disable sentinel for explicit CPU isolation, or ``None``
+            for an inactive pool) and the host-lock descriptors the trainer
+            must inherit so exclusion survives an orchestrator hard exit.
 
         Raises:
-            TimeoutError: ``deadline`` expired before a GPU could be leased.
+            GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
 
         """
         acquired = self._acquire(deadline=deadline)
         try:
-            yield None if acquired is None else acquired.visible_devices
+            yield GpuAssignment(
+                visible_devices=(
+                    acquired.visible_devices
+                    if acquired is not None
+                    else self._pinned_visible_devices
+                ),
+                lease_fds=(
+                    tuple(lease.handle.fileno() for lease in acquired.leases)
+                    if acquired is not None
+                    else ()
+                ),
+            )
         finally:
             self._release(acquired)
 
@@ -636,15 +909,28 @@ def _devices_from_cuda_visible_devices(value: str) -> list[GpuDevice]:
     """Parse CUDA_VISIBLE_DEVICES as opaque tokens.
 
     :param str value: Comma-separated CUDA visibility value to parse.
-    :raises RuntimeError: If ``-1`` is mixed with visible device tokens.
+    :raises GpuConfigurationError: If ``-1`` is mixed with visible device tokens.
     :return list[GpuDevice]: Parsed, deduplicated devices, or an empty list for ``-1``.
     """
     raw = [token.strip() for token in value.split(",") if token.strip()]
     if raw == ["-1"]:
         return []
     if "-1" in raw:
-        raise RuntimeError("CUDA_VISIBLE_DEVICES=-1 cannot be mixed with visible device tokens.")
+        raise GpuConfigurationError(
+            "CUDA_VISIBLE_DEVICES=-1 cannot be mixed with visible device tokens."
+        )
     return _normalize_devices(raw)
+
+
+def _is_cuda_disable_value(value: str) -> bool:
+    """Return whether a visibility string is an empty or ``-1`` sentinel.
+
+    :param str value: CUDA visibility string to classify.
+    :return bool: Whether ``value`` disables CUDA device visibility.
+    """
+    if not value.strip():
+        return True
+    return [token.strip() for token in value.split(",") if token.strip()] == ["-1"]
 
 
 def _log_pool_size(n_jobs: int, tokens: list[str], source: str) -> None:

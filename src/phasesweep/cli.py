@@ -7,52 +7,93 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import sys
+import traceback
+from collections.abc import Callable, Iterator
+from importlib import resources
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
 import click
 import yaml
 
-from phasesweep.config import Experiment, Suite, load_config
-from phasesweep.engine import config_status, read_status, run_config
+from phasesweep.config import ConfigError, Experiment, Suite, load_config
+from phasesweep.config.search import sampler_capability_line
+from phasesweep.engine import (
+    PhaseSweepError,
+    PublicationAccessError,
+    PublicationIntegrityError,
+    config_status,
+    run_config,
+)
 from phasesweep.engine.guards import (
+    _apply_artifact_root_rebind,
     _experiment_lock,
     _experiment_semantic_fingerprint,
+    _inspect_active_attempts,
     _inspect_cleanup_uncertain_trials,
     _inspect_stale_running_trials,
-    _previously_recovered_uncertain_trial_count,
+    _plan_artifact_root_rebinds,
+    _preflight_active_attempts,
+    _PreflightCleanupReport,
+    _previously_recovered_attempt_locations,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
+    _retire_active_attempt,
     _suite_fingerprint,
+    _suite_lock,
+    _validate_artifact_root_binding,
+    _validate_suite_artifact_root_rebind,
 )
 from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.state import (
-    _generation_summary_path,
-    _last_successful_generation_id,
-    _published_suite_summary_path,
+    _experiment_dir,
+    _published_summary_path_for,
     _published_winner_path_for,
+    _resolve_publication_pointer,
+    _resolve_suite_publication_pointer,
+    _suite_dir,
 )
+from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import agent_ids
-from phasesweep.mcp.registry import CatalogCheckReport, Registry, check_catalog
+from phasesweep.mcp.registry import (
+    CatalogCheckReport,
+    Registry,
+    check_catalog,
+    require_linux_mcp_host,
+)
 from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.mcp.snapshots import finalize_result_snapshot, parse_result_snapshot
-from phasesweep.mcp.time import utc_now_iso
+from phasesweep.mcp.snapshots import (
+    finalize_result_snapshot,
+    mark_result_snapshot_published,
+    parse_result_snapshot,
+)
+from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
     is_same_live_process,
     kill_stale_group,
-    read_proc_starttime,
 )
+from phasesweep.runtime.time import utc_now_iso
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
+
+# Exit taxonomy for the process-level boundary in main(). Commands that already
+# choose an exit status keep it; these are the codes the boundary itself uses.
+_USAGE_EXIT = 2  # bad input: config or arguments
+_FAILURE_EXIT = 1  # the run itself failed
+_INTERNAL_EXIT = 70  # sysexits EX_SOFTWARE: a phasesweep bug
+_ABORT_EXIT = 130  # 128 + SIGINT
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -83,11 +124,261 @@ def _configure_logging(verbose: bool) -> None:
     help="Phase-chained hyperparameter sweeps driven by a YAML file.",
 )
 @click.version_option(package_name="phasesweep")
-def main() -> None:
+def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
-@main.command(
+def main() -> None:
+    """Run the CLI behind a process-level error boundary.
+
+    The console entry point, so every failure reaches the operator as a
+    diagnostic rather than a traceback. Click runs in ``standalone_mode=False``
+    so its exceptions surface here instead of being converted inside Click;
+    it still returns the exit status for ``ctx.exit()`` paths, and commands
+    that call ``sys.exit`` themselves raise ``SystemExit``, which is a
+    ``BaseException`` and passes through untouched.
+
+    :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
+        ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
+        bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
+        Click chose.
+    """
+    try:
+        status = cli.main(standalone_mode=False)
+    except click.ClickException as exc:
+        # Includes UsageError, which already carries exit code 2.
+        exc.show()
+        sys.exit(exc.exit_code)
+    except (click.Abort, KeyboardInterrupt):
+        click.echo("Aborted.", err=True)
+        sys.exit(_ABORT_EXIT)
+    except ConfigError as exc:
+        click.echo(f"phasesweep: {exc}", err=True)
+        sys.exit(_USAGE_EXIT)
+    except PhaseSweepError as exc:
+        click.echo(f"phasesweep: {exc}", err=True)
+        # -v (see _configure_logging) means the operator asked for internals.
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            traceback.print_exc()
+        sys.exit(_FAILURE_EXIT)
+    except OSError as exc:
+        click.echo(f"phasesweep: operational error: {exc}", err=True)
+        sys.exit(_FAILURE_EXIT)
+    except Exception:  # noqa: BLE001 - the boundary's purpose is to report bugs
+        click.echo("phasesweep: internal error — please report this traceback.", err=True)
+        traceback.print_exc()
+        sys.exit(_INTERNAL_EXIT)
+    sys.exit(status if isinstance(status, int) else 0)
+
+
+def _load_cli_config(path: Path) -> Experiment | Suite:
+    """Load and fully validate a CLI config with path-aware diagnostics.
+
+    :param Path path: Config file supplied to a CLI command.
+    :return Experiment | Suite: Validated config. Every suite study has also
+        been compiled into an experiment to validate its resolved defaults.
+    :raises ConfigError: The file cannot be parsed, fails model validation, or
+        contains a suite study that cannot compile into an experiment.
+    """
+    from pydantic import ValidationError
+
+    try:
+        config = load_config(path)
+        if isinstance(config, Suite):
+            for study in config.studies:
+                config.experiment_for_study(study)
+        return config
+    except ConfigError:
+        raise
+    except (ValidationError, ValueError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+
+
+def _starter_experiment_text(target: Path) -> str:
+    """Render the packaged starter config with target-local absolute paths.
+
+    :param Path target: Absolute destination for the starter YAML.
+    :return str: Rendered annotated YAML text.
+    """
+    template = (
+        resources.files("phasesweep")
+        .joinpath("templates", "starter_experiment.yaml")
+        .read_text(encoding="utf-8")
+    )
+    runs_dir = target.parent / "runs"
+    storage_path = quote(str(runs_dir / "phases.db"), safe="/")
+    # JSON and YAML double-quoted scalars share escaping for valid Unicode.
+    # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
+    # pairs; the SQLite URI percent-encodes its path for unambiguous URL parsing.
+    replacements = {
+        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir), ensure_ascii=False),
+        "__PHASESWEEP_STORAGE__": json.dumps(
+            f"sqlite:///file:{storage_path}?uri=true", ensure_ascii=False
+        ),
+    }
+    # Substitute every placeholder in one pass. Sequential str.replace calls
+    # rescan text a previous call already inserted, so a destination path that
+    # contains a placeholder literal would silently corrupt the rendered config.
+    pattern = re.compile("|".join(re.escape(placeholder) for placeholder in replacements))
+    return pattern.sub(lambda match: replacements[match.group(0)], template)
+
+
+@contextlib.contextmanager
+def _staged_text(destination: Path, text: str) -> Iterator[Path]:
+    """Write and fsync text beside a destination without publishing it.
+
+    :param Path destination: Eventual destination used to locate and name the staging file.
+    :param str text: Complete UTF-8 text to stage.
+    :raises FileExistsError: If ten randomized staging names collide.
+    :return Iterator[Path]: Staging path, removed when the context exits.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged: Path | None = None
+    try:
+        handle = None
+        for _ in range(10):
+            candidate = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {destination}")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield staged
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+
+
+def _publish_staged_text(
+    destination: Path,
+    text: str,
+    *,
+    validate: Callable[[Path], object] | None = None,
+) -> bool:
+    """Stage, optionally validate, and exclusively publish a text file.
+
+    :param Path destination: Destination that must not already exist.
+    :param str text: Complete UTF-8 text to publish.
+    :param Callable[[Path], object] | None validate: Optional staged-file validator.
+    :return bool: True when published, or False if another writer won the destination race.
+    """
+    with _staged_text(destination, text) as staged:
+        if validate is not None:
+            validate(staged)
+        try:
+            os.link(staged, destination)
+        except FileExistsError:
+            return False
+        fsync_directory(destination.parent)
+    return True
+
+
+@cli.command(
+    context_settings=CONTEXT_SETTINGS,
+    help="Write a runnable two-phase starter experiment without overwriting files.",
+    short_help="Create a starter experiment.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("experiment.yaml"),
+    show_default=True,
+    help="Starter YAML destination.",
+)
+def init(output: Path) -> None:
+    """Write an annotated starter experiment and print the review commands.
+
+    :param Path output: Destination YAML path; existing paths are never replaced.
+    :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
+        file or symlink, including when it appears between the check and the
+        atomic publication; with code 1 when staging or publishing fails with
+        an ``OSError`` such as a permission, disk-space, or hard-link error.
+    """
+    expanded = output.expanduser()
+    target = expanded.absolute()
+    if target.exists() or target.is_symlink():
+        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+        raise click.exceptions.Exit(2)
+    text = _starter_experiment_text(target)
+    try:
+        if not _publish_staged_text(target, text):
+            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+            raise click.exceptions.Exit(2)
+    except OSError as exc:
+        # `phasesweep init` is the first command a new user runs; an unwritable
+        # directory or a filesystem without hard links must report one line, not
+        # a traceback.
+        click.echo(f"phasesweep init: cannot write {target}: {exc}", err=True)
+        raise click.exceptions.Exit(1) from None
+
+    # Quote the expanded path, never the raw option value: shell quoting
+    # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
+    # different (nonexistent) file than the one just written.
+    config_arg = shlex.quote(str(expanded))
+    click.echo(f"Wrote starter experiment to {target}")
+    click.echo("\nNext:")
+    click.echo(f"  phasesweep validate {config_arg}")
+    click.echo(f"  phasesweep run {config_arg} --dry-run")
+    click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
+
+
+@cli.command(
+    "report-objective",
+    context_settings=CONTEXT_SETTINGS,
+    help="Publish a JSON-envelope objective from inside a PhaseSweep trial.",
+    short_help="Publish this trial's objective.",
+)
+@click.argument("value", type=float)
+@click.option("--name", required=True, help="Objective name declared by the extractor.")
+@click.option("--split", required=True, help="Evaluated data split.")
+@click.option("--policy", required=True, help="Evaluation policy, such as final_checkpoint.")
+@click.option("--checkpoint", required=True, help="Checkpoint identity for this evaluation.")
+@click.option("--step", required=True, type=click.IntRange(min=0), help="Evaluation step.")
+def report_objective_cmd(
+    value: float,
+    name: str,
+    split: str,
+    policy: str,
+    checkpoint: str,
+    step: int,
+) -> None:
+    """Publish one objective through the trainer-side reporting API.
+
+    :param float value: Finite objective value.
+    :param str name: Configured objective name.
+    :param str split: Evaluated data split.
+    :param str policy: Evaluation policy.
+    :param str checkpoint: Checkpoint identity.
+    :param int step: Non-negative evaluation step.
+    :raises click.BadParameter: If the objective metadata is invalid.
+    :raises click.ClickException: If the PhaseSweep trial environment is absent.
+    """
+    try:
+        destination = report_objective(
+            value,
+            name=name,
+            split=split,
+            policy=policy,
+            checkpoint=checkpoint,
+            step=step,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="objective") from exc
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Wrote objective to {destination}")
+
+
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Run every phase in a phasesweep experiment config. Use --from-phase to skip earlier "
@@ -130,7 +421,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     # codes remain structured throughout startup, including dry-run previews.
     # run_experiment() repeats this idempotently for direct library callers.
     install_signal_handlers()
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if from_phase is not None:
         if isinstance(config, Suite):
             click.echo("--from-phase is only supported for single experiment configs.", err=True)
@@ -142,7 +433,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     run_config(config, from_phase=from_phase, dry_run=dry_run)
 
 
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Validate a phasesweep experiment or suite config without launching any trials.",
     short_help="Validate a config file.",
@@ -150,7 +441,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
     """Validate ``config_path`` without running anything."""
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if isinstance(config, Experiment):
         click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
         _render_experiment_phases(config)
@@ -164,7 +455,7 @@ def validate(config_path: Path) -> None:
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
-    """Render phase summaries for ``validate``.
+    """Render phase summaries and sampler capability lines for ``validate``.
 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
@@ -175,6 +466,10 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         click.echo(
             f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}{contracts}"
         )
+        # Capability disclosure (review v0.5.18 / finding F7): state the
+        # resume/reproduce contract before a trial runs, not after an
+        # interrupted operator hits the runtime continuation guard.
+        click.echo(f"{indent}    {sampler_capability_line(p)}")
         _render_phase_comment(p.comment, prefix=f"{indent}    # ")
 
 
@@ -189,7 +484,103 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
             click.echo(f"{prefix}{line}")
 
 
-@main.command(
+def _publication_integrity_error(
+    subject: str,
+    detail: str,
+    namespace_root: Path,
+) -> PublicationIntegrityError:
+    """Build the one diagnostic every corrupt-publication read surface reports.
+
+    Carries the validation failure *and* the reason not to re-run (review
+    v0.5.18 / finding F4): a successful re-run publishes a new generation, the
+    last-success pointer advances past the corrupt one, and nothing reports
+    the corruption afterwards. The immutable namespace is still on disk until
+    then, so inspecting or restoring it first is the whole remedy.
+
+    :param str subject: Experiment or suite the corrupt publication belongs to.
+    :param str detail: Validation error explaining why it no longer validates.
+        Punctuated here rather than at the raising site, since validators
+        return bare reason clauses.
+    :param Path namespace_root: Artifact root holding the generation namespaces
+        the operator must inspect.
+    :return PublicationIntegrityError: Complete single-line operator diagnostic.
+    """
+    detail = detail.rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail = f"{detail}."
+    return PublicationIntegrityError(
+        f"{subject} records a publication that no longer validates: {detail} "
+        f"Do not run anything over this tree until you have inspected or restored the "
+        f"generation namespace under {namespace_root} -- a successful run would advance the "
+        "last-success pointer past the corrupt generation and nothing would report it again."
+    )
+
+
+def _publication_access_error(subject: str, detail: str) -> PublicationAccessError:
+    """Build the diagnostic for a publication this user cannot validate.
+
+    :param str subject: Experiment or suite the publication belongs to.
+    :param str detail: Path-free permission diagnostic from the validator.
+    :return PublicationAccessError: Complete single-line operator diagnostic.
+    """
+    detail = detail.rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail = f"{detail}."
+    return PublicationAccessError(
+        f"{subject} records a publication that cannot be validated as the current user: "
+        f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
+        "the publication as the publishing user or restore read permission before launching "
+        "another run; rebind-workdir is not a permission-repair command."
+    )
+
+
+def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
+    """Escalate an unusable publication verdict to its typed operator error.
+
+    Reads the status payload that was just rendered rather than re-resolving
+    the pointer, so the exit status can never disagree with what the operator
+    was shown. A suite payload is checked at both levels: its own suite
+    last-success pointer first — mirroring :func:`_show_suite_winners`, so the
+    two surfaces name the same subject for the same tree (re-review v0.5.19 /
+    observation N2) — and then one embedded study at a time, since a corrupt
+    component publication is a corrupt suite result too.
+
+    :param dict[str, Any] payload: ``config_status`` payload already rendered.
+    :raises PublicationAccessError: Publication validation was denied by permissions.
+    :raises PublicationIntegrityError: A reported publication no longer validates.
+    """
+    if payload.get("kind") == "suite":
+        if payload.get("publication_integrity") == "permission_denied":
+            raise _publication_access_error(
+                f"Suite {str(payload.get('suite'))!r}",
+                str(payload.get("publication_error")),
+            )
+        if payload.get("publication_integrity") == "failed":
+            raise _publication_integrity_error(
+                f"Suite {str(payload.get('suite'))!r}",
+                str(payload.get("publication_error")),
+                Path(str(payload.get("workdir"))),
+            )
+        studies = payload.get("studies")
+        for study in studies if isinstance(studies, list) else []:
+            if isinstance(study, dict) and isinstance(study.get("status"), dict):
+                _raise_on_failed_publication(study["status"])
+        return
+    if payload.get("publication_integrity") == "permission_denied":
+        raise _publication_access_error(
+            f"Experiment {str(payload.get('experiment'))!r}",
+            str(payload.get("publication_error")),
+        )
+    if payload.get("publication_integrity") != "failed":
+        return
+    raise _publication_integrity_error(
+        f"Experiment {str(payload.get('experiment'))!r}",
+        str(payload.get("publication_error")),
+        Path(str(payload.get("workdir"))),
+    )
+
+
+@cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
     help=(
@@ -201,7 +592,7 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
     """Print winner files referenced by ``config_path``."""
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     if isinstance(config, Suite):
         _show_suite_winners(config)
         return
@@ -209,13 +600,44 @@ def show_winners(config_path: Path) -> None:
 
 
 def _show_suite_winners(suite: Suite) -> None:
-    """Print the authoritative exposed winners from the last successful suite run."""
-    summary_path = _published_suite_summary_path(suite)
-    if summary_path is None or not summary_path.is_file():
+    """Print the authoritative exposed winners from the last successful suite run.
+
+    :param Suite suite: Compiled suite whose published summary is rendered.
+    :raises PublicationAccessError: This user cannot validate the published suite.
+    :raises PublicationIntegrityError: The suite last-success pointer names a
+        suite generation that no longer validates. Reported as corruption
+        rather than as "no successful suite result yet", which is what a suite
+        that has genuinely never published reports (review v0.5.18 / finding F4).
+    :raises click.ClickException: If the published summary cannot be read, or its
+        study, phase, or annotation records are malformed; raw component-experiment
+        winners are never substituted for it.
+    """
+    publication = _resolve_suite_publication_pointer(suite)
+    if publication.state == "permission_denied":
+        raise _publication_access_error(
+            f"Suite {suite.suite!r}",
+            str(publication.error),
+        )
+    if publication.state == "failed":
+        raise _publication_integrity_error(
+            f"Suite {suite.suite!r}",
+            str(publication.error),
+            _suite_dir(suite),
+        )
+    summary_path = _published_summary_path_for(suite, publication.generation_id)
+    if publication.generation_id is not None:
+        summary = publication.summary
+    elif summary_path is not None and summary_path.is_file():
+        try:
+            summary = yaml.safe_load(summary_path.read_text())
+        except (OSError, yaml.YAMLError):
+            summary = None
+    else:
+        summary = None
+    if summary_path is None or summary is None:
         click.echo("(no successful suite result yet)")
         return
     try:
-        summary = yaml.safe_load(summary_path.read_text())
         if not isinstance(summary, dict):
             raise TypeError("summary must be a mapping")
         studies = summary["studies"]
@@ -280,16 +702,31 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     v0.5.16 / blocker 4): old evidence must never be decorated with the
     current config's annotations, and a config that has drifted since
     publication is labeled historical instead of silently reinterpreted.
+
+    :param Experiment experiment: Experiment whose published winners are rendered.
+    :raises PublicationAccessError: This user cannot validate the publication.
+    :raises PublicationIntegrityError: The last-success pointer names a
+        generation that no longer validates. Nothing is rendered in that case:
+        printing "(no winner yet)" beside a corrupt publication reads as a
+        phase that simply has not run (review v0.5.18 / finding F4).
     """
-    generation_id = _last_successful_generation_id(experiment)
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    publication = _resolve_publication_pointer(experiment)
+    if publication.state == "permission_denied":
+        raise _publication_access_error(
+            f"Experiment {experiment.experiment!r}",
+            str(publication.error),
+        )
+    if publication.state == "failed":
+        raise _publication_integrity_error(
+            f"Experiment {experiment.experiment!r}",
+            str(publication.error),
+            _experiment_dir(experiment),
+        )
+    generation_id = publication.generation_id
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if generation_id is not None:
-        try:
-            summary = yaml.safe_load(
-                _generation_summary_path(experiment, generation_id).read_text()
-            )
-        except (OSError, yaml.YAMLError):
-            summary = None
+        summary = publication.summary
         if isinstance(summary, dict):
             stored_plan = summary.get("phase_plan")
             if isinstance(stored_plan, list) and all(
@@ -325,54 +762,124 @@ def _show_experiment_winners(experiment: Experiment) -> None:
             _render_phase_comment(comment, prefix="# ")
 
 
-def _with_generation_identity(payload: dict, experiment: Experiment) -> dict:
-    """Insert explicit generation identity into a status payload.
-
-    ``config_status`` (engine.run) reports cumulative, all-time trial counts
-    and the published winner path but never names which generation is
-    "current" (most recent; may be failed or in-progress), "published" (the
-    validated last-success pointer backing the winner files), or
-    "represented" (the generation whose winner facts this payload actually
-    shows) - the same identity split :func:`phasesweep.engine.read.read_status`
-    defines for MCP callers. This mirrors that split onto the CLI's status
-    view via one ``read_status`` call (which itself resolves each pointer
-    exactly once) without duplicating engine.run's trial-count logic: after a
-    failed rerun, ``current_generation_id`` and ``published_generation_id``
-    differ and both are shown explicitly, alongside ``represented_generation_id``
-    and ``is_published``.
-
-    :param dict payload: Status payload produced by :func:`config_status` for an experiment.
-    :param Experiment experiment: Same experiment config the payload describes.
-    :return dict: Payload with the generation-identity fields inserted before ``phases``.
-    """
-    identity = read_status(experiment)
-    enriched = dict(payload)
-    phases = enriched.pop("phases", None)
-    enriched["current_generation_id"] = identity["current_generation_id"]
-    enriched["published_generation_id"] = identity["published_generation_id"]
-    enriched["represented_generation_id"] = identity["represented_generation_id"]
-    enriched["is_published"] = identity["is_published"]
-    if phases is not None:
-        enriched["phases"] = phases
-    return enriched
-
-
-@main.command(
+@cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Print read-only trial counts and phase state for a phasesweep experiment or suite.",
     short_help="Print read-only run status.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def status(config_path: Path) -> None:
-    """Print read-only run status for ``config_path``."""
-    config = load_config(config_path)
+    """Print read-only run status for ``config_path``.
+
+    The payload is printed first and in full even when it reports a corrupt
+    publication: the operator needs the trial counts and generation identity
+    to decide what to inspect, and the boundary's one-line diagnostic follows
+    on stderr (review v0.5.18 / finding F4).
+
+    :param Path config_path: Experiment or suite YAML file to inspect.
+    :raises PublicationAccessError: The reported publication cannot be
+        validated as the current user.
+    :raises PublicationIntegrityError: The reported publication - or, for a
+        suite, its own suite-level publication or any component study's - no
+        longer validates.
+    """
+    config = _load_cli_config(config_path)
     payload = config_status(config)
-    if isinstance(config, Experiment):
-        payload = _with_generation_identity(payload, config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+    _raise_on_failed_publication(payload)
 
 
-@main.group(
+@cli.command(
+    name="rebind-workdir",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Point this config's persistent phase studies at the workdir it now declares, after "
+        "you have already moved the experiment's complete artifact tree there. Verifies at the "
+        "destination that every trial in the study ledger still has its evidence directory, "
+        "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
+        "publication validates; refuses relocating a published suite. Also the migration path "
+        "for a study that predates artifact-root binding: point the config at that study's "
+        "original tree - there, an interrupted RUNNING trial whose persisted paths already "
+        "lie under that tree is allowed through, and the next ordinary run recovers it. "
+        "Updates both the tree-to-storage record and study-side bindings; writes nothing "
+        "unless every check passes."
+    ),
+    short_help="Rebind studies to a moved artifact tree.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+def rebind_workdir(config_path: Path) -> None:
+    """Move each phase study's artifact-root binding to the configured workdir.
+
+    Each persistent phase study is bound to the one artifact root it publishes
+    into, so an ordinary run against a different ``workdir`` is refused rather
+    than allowed to produce a second, divergent publication tree. This command
+    is the operator's explicit statement that the tree itself was relocated,
+    and the only way a study that predates the binding is adopted at all. It is
+    a rebind, never a move: PhaseSweep does not copy, delete, or verify the
+    original tree.
+
+    What it verifies at the destination, per experiment: the namespace exists;
+    every trial the study ledger holds still has its evidence directory there,
+    which is what rejects a stale copy taken before the ledger advanced; no
+    trial is ``RUNNING`` and no attempt registry entry is unresolved, because
+    recovery follows the absolute paths those attempts persisted; and, when the
+    studies record completed trials, the recorded publication validates. A
+    suite that published a suite generation is refused outright - suite
+    summaries record absolute component paths that do not survive relocation.
+
+    The one ``RUNNING`` exception is adoption in place: when a pre-binding
+    study's interrupted trial persisted paths that already resolve exactly
+    under the offered workdir - proof the destination is the original root,
+    not a copy - the binding is written with the trial (and its registry
+    entry) left as-is, and the next ordinary run recovers it through the
+    standard stale-attempt protocol. That protocol, not a manual Optuna
+    ``tell(FAIL)``, is what records the durable failure outcome the study
+    schema requires.
+
+    The destination's reverse root-to-storage binding is updated before the
+    study attrs so an interrupted rebind converges on retry. No trial,
+    publication, or attempt metadata is rewritten, so the refusals remain
+    broader than the cases PhaseSweep can repair (re-review v0.5.19 / blocker
+    B2; see the tracked relocation TODO in ``docs/development.md``).
+
+    :param Path config_path: Path to the experiment or suite YAML file whose
+        ``workdir`` already names the artifact tree these studies own.
+    :raises ArtifactRootRebindError: Storage is in-memory, every existing study
+        is unbound and empty, a study cannot be read, or a destination fails
+        any of the checks above; validation refusals write nothing. A later
+        apply-time failure can follow an earlier suite component already being
+        rebound, because the per-study storage updates are not one transaction.
+    :raises ExperimentLockBusyError: Another orchestrator owns one of the
+        experiment (or suite) consistency locks.
+    """
+    config = _load_cli_config(config_path)
+    experiments = (
+        [config.experiment_for_study(study) for study in config.studies]
+        if isinstance(config, Suite)
+        else [config]
+    )
+    with contextlib.ExitStack() as locks:
+        # Every lock is held across validation AND application so no other
+        # orchestrator can run, publish, or bind between the two halves. The
+        # locks are non-blocking, so contention reports busy rather than
+        # deadlocking on acquisition order.
+        if isinstance(config, Suite):
+            locks.enter_context(_suite_lock(config))
+        for experiment in experiments:
+            locks.enter_context(_experiment_lock(experiment))
+        plans = _plan_artifact_root_rebinds(experiments)
+        if isinstance(config, Suite):
+            # Suite-level publication state is validated after the per-study
+            # plans and before any of them is applied, so a suite refusal still
+            # leaves every component binding exactly as it was.
+            _validate_suite_artifact_root_rebind(config, plans)
+        for plan in plans:
+            for study_name, previous, destination in _apply_artifact_root_rebind(plan):
+                origin = previous if previous is not None else "(unbound)"
+                click.echo(f"{study_name}: {origin} -> {destination}")
+
+
+@cli.group(
     context_settings=CONTEXT_SETTINGS,
     help="Manage the optional MCP server and coding-agent integrations.",
     short_help="Manage the MCP server and agent integrations.",
@@ -381,12 +888,28 @@ def mcp() -> None:
     """Run MCP operator commands."""
 
 
+def _catalog_error_text(exc: CatalogError) -> str:
+    """Render a catalog error together with its actionable fix.
+
+    ``CatalogError`` carries the remediation in ``suggestion``; formatting the
+    exception alone silently drops it and leaves the operator with a diagnosis
+    but no instruction. Matches the ``fix:`` line ``mcp check`` prints per
+    entry. Operator-facing: messages and suggestions may include paths.
+
+    :param CatalogError exc: Raised catalog error to render.
+    :return str: Message, plus a trailing ``fix:`` line when a suggestion exists.
+    """
+    if exc.suggestion:
+        return f"{exc}\nfix: {exc.suggestion}"
+    return str(exc)
+
+
 @mcp.command(
     name="recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for MCP cleanup uncertainty or failed terminal-result "
-        "finalization. --confirm performs the reported cleanup and stored-snapshot actions."
+        "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
+        "terminal-result finalization. --confirm performs the reported actions."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -406,29 +929,52 @@ def mcp() -> None:
     help="Perform the reported cleanup and stored terminal-result actions.",
 )
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
-    """Recover cleanup uncertainty or finalize an already-captured result snapshot.
+    """Recover cleanup, interrupted publication, or result finalization.
 
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
+    :raises click.ClickException: If the host is not a supported MCP host, the state
+        directory or run id is unknown, the launch outcome is still unresolved, no
+        immutable terminal snapshot exists, an interrupted publication cannot
+        be reconciled from its pointer, runner identity cannot rule out PID
+        reuse, the runner still appears live, the run config snapshot is missing or
+        does not match its recorded digest, no trial-level cleanup evidence can be
+        confirmed, or study recovery fails with a ``RuntimeError``.
     """
     state_dir = state_dir.expanduser().resolve()
-    if not sys.platform.startswith("linux"):
-        raise click.ClickException(
-            "MCP recovery is supported only on Linux because safe process cleanup "
-            "requires /proc process identities"
-        )
-    if read_proc_starttime(os.getpid()) is None:
-        raise click.ClickException(
-            "MCP recovery cannot read this process's Linux /proc start time; "
-            "mount /proc with process stat access before retrying"
-        )
+    try:
+        require_linux_mcp_host()
+    except CatalogError as exc:
+        raise click.ClickException(_catalog_error_text(exc)) from None
     try:
         store = RunStore.open_existing(state_dir)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from None
     handle = store.get(run_id)
     if handle is None:
+        with store.launch_lock() as acquired:
+            if not acquired:
+                raise click.ClickException(
+                    "another MCP launch is in progress; wait for it to finish and retry"
+                )
+            if store.is_pre_spawn_orphan(run_id):
+                if not confirm:
+                    click.echo(
+                        f"Recovery preflight for {run_id}: would remove the orphaned config "
+                        "snapshot left before any runner could spawn. Re-run with --confirm "
+                        "to perform that action."
+                    )
+                    return
+                try:
+                    store.clear_pre_spawn_orphan(run_id)
+                except ValueError as exc:
+                    raise click.ClickException(str(exc)) from None
+                click.echo(
+                    f"Removed pre-spawn orphan config snapshot for {run_id}; no runner or "
+                    "trainer was launched under that identity."
+                )
+                return
         raise click.ClickException(f"unknown run id: {run_id}")
     terminal_status = store.recorded_terminal_status(handle)
     if handle.launch_state == "launching" and terminal_status is None:
@@ -463,6 +1009,12 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     stored_snapshot = (
         parse_result_snapshot(terminal_status) if terminal_status is not None else None
     )
+    prepared_publication_generation = (
+        terminal_status.get("result_publication_generation_id")
+        if terminal_status is not None
+        and terminal_status.get("result_publication_state") == "prepared"
+        else None
+    )
     snapshot_unavailable = (
         terminal_status is not None and stored_snapshot is None
     ) or runner_without_status
@@ -496,7 +1048,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             "recovery because PID reuse cannot be ruled out"
         )
     if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise click.ClickException("runner still appears live; use phasesweep_cancel_sweep first")
+        raise click.ClickException("runner still appears live; use cancel_run first")
     snapshot = store.config_snapshot_path(run_id)
     if not snapshot.is_file():
         raise click.ClickException(f"run config snapshot is missing: {snapshot}")
@@ -523,9 +1075,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 and not earlier_boot
                 and is_same_live_process(identity.pid, identity.pid_starttime)
             ):
-                raise click.ClickException(
-                    "runner still appears live; use phasesweep_cancel_sweep first"
-                )
+                raise click.ClickException("runner still appears live; use cancel_run first")
             if (
                 cleanup_recovery_needed
                 and confirm
@@ -539,13 +1089,52 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             ):
                 raise click.ClickException("runner process-group cleanup is still uncertain")
 
+            publication_recovery_action: str | None = None
+            if isinstance(prepared_publication_generation, str):
+                publication = _resolve_publication_pointer(config)
+                if publication.generation_id == prepared_publication_generation:
+                    publication_recovery_action = "commit"
+                elif publication.state == "absent" or publication.generation_id is not None:
+                    publication_recovery_action = "abort"
+                else:
+                    raise click.ClickException(
+                        "the prepared run result cannot be reconciled because the "
+                        "last-success pointer is unreadable or malformed. Restore that "
+                        "pointer before retrying recovery."
+                    )
+
             reaped = 0
-            reaped_attempt_ids = store.cleanup_recovered_attempt_ids(handle)
-            persisted_reaped_attempts = len(reaped_attempt_ids)
+            (
+                reaped_attempt_ids,
+                reaped_attempt_locations,
+            ) = store.cleanup_recovered_attempt_evidence(handle)
+            causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
+            inspected_attempt_ids: set[str] = set()
+            inspected_attempt_generations: dict[str, str] = {}
+            inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
+            registered_recovery_attempt_ids: set[str] = set()
+            registered_attempts_reconciled = 0
             cleanup_recovered = 0
-            previously_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
+                if confirm:
+                    active_report = _PreflightCleanupReport()
+                    registered_attempts = _preflight_active_attempts(
+                        config,
+                        active_report,
+                        retain_recovery_evidence=True,
+                    )
+                    registered_evidence = active_report.recovered_attempt_generations
+                    registered_recovery_attempt_ids.update(active_report.recovered_attempt_ids)
+                else:
+                    registered_attempts = _inspect_active_attempts(config)
+                    registered_evidence = registered_attempts
+                registered_attempts_reconciled = len(registered_attempts)
+                reaped_attempt_ids.update(
+                    attempt_id
+                    for attempt_id, generation_id in registered_evidence.items()
+                    if generation_id == run_id or attempt_id in causal_attempt_ids
+                )
                 for phase in config.phases:
                     study = _load_existing_phase_study(config, phase)
                     if study is None:
@@ -557,27 +1146,57 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     # trial-level evidence on retry (review v0.5.17 gap hunt).
                     # Read before the fresh pass below, which appends to the
                     # same ledger.
-                    previously_recovered += _previously_recovered_uncertain_trial_count(
-                        study, run_id
+                    previously_recovered = _previously_recovered_attempt_locations(
+                        study,
+                        phase.name,
+                        run_id,
+                        causal_attempt_ids=causal_attempt_ids,
                     )
+                    reaped_attempt_ids.update(previously_recovered)
+                    reaped_attempt_locations.update(previously_recovered)
                     if confirm:
                         cleanup_recovered += _recover_cleanup_uncertain_trials(
                             study,
                             config,
                             phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
                         )
                         reaped += _reap_stale_trials(
                             study,
                             config,
                             phase.name,
-                            recovered_attempt_ids=reaped_attempt_ids,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
                         )
                     else:
-                        cleanup_recovered += _inspect_cleanup_uncertain_trials(study)
-                        reaped += _inspect_stale_running_trials(study, config, phase.name)
-            cleanup_evidence_count = (
-                persisted_reaped_attempts + reaped + cleanup_recovered + previously_recovered
-            )
+                        cleanup_recovered += _inspect_cleanup_uncertain_trials(
+                            study,
+                            phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
+                        )
+                        reaped += _inspect_stale_running_trials(
+                            study,
+                            config,
+                            phase.name,
+                            recovered_attempt_ids=inspected_attempt_ids,
+                            recovered_attempt_generations=inspected_attempt_generations,
+                            recovered_attempt_locations=inspected_attempt_locations,
+                        )
+                for attempt_id in inspected_attempt_ids:
+                    if (
+                        inspected_attempt_generations.get(attempt_id) == run_id
+                        or attempt_id in causal_attempt_ids
+                    ):
+                        reaped_attempt_ids.add(attempt_id)
+                        location = inspected_attempt_locations.get(attempt_id)
+                        if location is not None:
+                            reaped_attempt_locations[attempt_id] = location
+            cleanup_evidence_count = len(reaped_attempt_ids)
             if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
                 if inspected_studies == 0:
                     detail = (
@@ -600,11 +1219,25 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 if cleanup_recovery_needed:
                     actions.append(
                         "attempt runner process-group cleanup, "
+                        f"reconcile {registered_attempts_reconciled} registered attempt(s), "
                         f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
                         "cleanup-uncertain terminal trial(s)"
                     )
                 if snapshot_finalize_needed:
-                    actions.append("finalize the stored terminal snapshot with cleanup evidence")
+                    if publication_recovery_action == "commit":
+                        actions.append(
+                            "bind the prepared snapshot to its committed publication and "
+                            "finalize it with cleanup evidence"
+                        )
+                    elif publication_recovery_action == "abort":
+                        actions.append(
+                            "record the prepared generation as unpublished and finalize its "
+                            "stored snapshot"
+                        )
+                    else:
+                        actions.append(
+                            "finalize the stored terminal snapshot with cleanup evidence"
+                        )
                 elif snapshot_unavailable:
                     actions.append("record that the historical terminal snapshot is unavailable")
                 click.echo(
@@ -632,17 +1265,34 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     "recovered_at": utc_now_iso(),
                     "cleanup_confirmed": True,
                     "reaped_running_trials": reaped,
+                    "registered_attempts_reconciled": registered_attempts_reconciled,
                     "reaped_attempt_ids": sorted(reaped_attempt_ids),
+                    "reaped_attempt_locations": {
+                        attempt_id: {
+                            "phase": phase_name,
+                            "trial_number": trial_number,
+                            "generation_id": generation_id,
+                        }
+                        for attempt_id, (
+                            phase_name,
+                            trial_number,
+                            generation_id,
+                        ) in sorted(reaped_attempt_locations.items())
+                    },
                     "cleanup_uncertain_terminal_trials": cleanup_recovered,
                 }
                 private_atomic_write_text(
                     store.cleanup_recovery_path(run_id),
                     json.dumps(payload, indent=2) + "\n",
                 )
+                for attempt_id in registered_recovery_attempt_ids:
+                    _retire_active_attempt(config, attempt_id)
                 store.clear_cleanup_uncertain(handle)
                 click.echo(
-                    f"Cleared cleanup uncertainty for {run_id}; reaped {reaped} stale trial(s) "
-                    f"and confirmed {cleanup_recovered} cleanup-uncertain trial(s)."
+                    f"Cleared cleanup uncertainty for {run_id}; reconciled "
+                    f"{registered_attempts_reconciled} registered attempt(s), reaped {reaped} "
+                    f"stale trial(s), and confirmed {cleanup_recovered} cleanup-uncertain "
+                    "trial(s)."
                 )
 
             if snapshot_recovery_required and stored_snapshot is None:
@@ -651,12 +1301,29 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                 terminal_status["result_snapshot_error"] = "InterruptedFinalization"
                 write_status_file(store.status_path(run_id), terminal_status)
 
+            if publication_recovery_action is not None:
+                assert terminal_status is not None
+                assert stored_snapshot is not None
+                if publication_recovery_action == "commit":
+                    assert isinstance(prepared_publication_generation, str)
+                    terminal_status["result_snapshot"] = mark_result_snapshot_published(
+                        stored_snapshot.model_dump(mode="json"),
+                        generation_id=prepared_publication_generation,
+                    )
+                    terminal_status["result_publication_state"] = "committed"
+                else:
+                    terminal_status["returncode"] = 1
+                    terminal_status["error_class"] = "PublicationNotCommitted"
+                    terminal_status.pop("result_publication_state", None)
+                    terminal_status.pop("result_publication_generation_id", None)
+
             if snapshot_finalize_needed:
                 _finalize_stored_terminal_result_snapshot(
                     store,
                     run_id,
                     terminal_status,
                     confirmed_attempt_ids=reaped_attempt_ids,
+                    confirmed_attempt_locations=reaped_attempt_locations,
                 )
 
                 click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
@@ -675,6 +1342,7 @@ def _finalize_stored_terminal_result_snapshot(
     terminal_status: dict,
     *,
     confirmed_attempt_ids: set[str],
+    confirmed_attempt_locations: dict[str, tuple[str, int, str]],
 ) -> None:
     """Finalize and persist a snapshot captured before the experiment lock was released.
 
@@ -682,6 +1350,8 @@ def _finalize_stored_terminal_result_snapshot(
     :param str run_id: Run whose stored terminal snapshot should be finalized.
     :param dict terminal_status: Validated terminal process status to enrich.
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
+    :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Exact
+        phase, trial, and generation locators for reconciled attempts.
     :raises click.ClickException: If the stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -698,6 +1368,7 @@ def _finalize_stored_terminal_result_snapshot(
         terminal_status["result_snapshot"] = finalize_result_snapshot(
             raw_snapshot,
             confirmed_attempt_ids=confirmed_attempt_ids,
+            confirmed_attempt_locations=confirmed_attempt_locations,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
@@ -773,7 +1444,7 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
     try:
         report = check_catalog(catalog)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp check: {exc}", err=True)
+        click.echo(f"phasesweep mcp check: {_catalog_error_text(exc)}", err=True)
         ctx.exit(2)
     _echo_catalog_report(report)
     if not report.ok:
@@ -849,6 +1520,9 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
+    :raises FileExistsError: If ten randomized staging names all collide beside
+        ``output``; handled by this function's own ``OSError`` branch, which reports
+        the failure and returns ``False`` rather than propagating.
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():
@@ -859,49 +1533,21 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
         )
         return False
 
-    staged: Path | None = None
     try:
         text = scaffold_catalog_text(output, from_configs)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        handle = None
-        for _ in range(10):
-            candidate = output.with_name(f".{output.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                handle = candidate.open("x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {output}")
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-
-        Registry.load(staged)
-        try:
-            os.link(staged, output)
-        except FileExistsError:
+        if not _publish_staged_text(output, text, validate=Registry.load):
             click.echo(
-                f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
-                "Pass -o to choose another name.",
+                f"phasesweep mcp init-catalog: {output} already exists; refusing to "
+                "overwrite. Pass -o to choose another name.",
                 err=True,
             )
             return False
-        fsync_directory(output.parent)
     except CatalogError as exc:
-        click.echo(f"phasesweep mcp init-catalog: {exc}", err=True)
-        if exc.suggestion:
-            click.echo(f"fix: {exc.suggestion}", err=True)
+        click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False
     except OSError as exc:
         click.echo(f"phasesweep mcp init-catalog: cannot write {output}: {exc}", err=True)
         return False
-    finally:
-        if staged is not None:
-            with contextlib.suppress(OSError):
-                staged.unlink()
     click.echo(f"wrote {output}")
     return True
 
@@ -959,17 +1605,6 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 @click.option(
     "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
 )
-@click.option(
-    "--launcher",
-    type=click.Choice(["path", "uvx"]),
-    default="path",
-    show_default=True,
-    help=(
-        "'path' pins the absolute phasesweep-mcp executable from this environment; 'uvx' "
-        "writes a pinned `uvx --from phasesweep[mcp]==<version>` launcher that survives "
-        "moving or recreating that environment (requires uvx on PATH)."
-    ),
-)
 @click.pass_context
 def install(
     ctx: click.Context,
@@ -980,7 +1615,6 @@ def install(
     yes: bool,
     allow_user_scope: bool,
     dry_run: bool,
-    launcher: str,
 ) -> None:
     """Install phasesweep MCP and instructions integrations for coding agents.
 
@@ -996,17 +1630,15 @@ def install(
     :param bool yes: Skip every confirmation prompt.
     :param bool allow_user_scope: Acknowledge unattended user-scoped MCP config writes.
     :param bool dry_run: Preview installer verdicts without changing client files.
-    :param str launcher: ``path`` (absolute executable) or ``uvx`` (pinned
-        version launcher) for the written MCP server command (review
-        v0.5.15 / item G).
     """
     project = project_dir.resolve()
     catalog_path: Path | None = None
+    report: CatalogCheckReport | None = None
     if integration != "instructions":
         if importlib.util.find_spec("mcp") is None:
             click.echo(
                 "phasesweep mcp install: MCP support is not installed; install with "
-                "`pip install 'phasesweep[mcp]'`; no client config was touched.",
+                f"`{MCP_EXTRA_INSTALL_COMMAND}`; no client config was touched.",
                 err=True,
             )
             ctx.exit(2)
@@ -1025,7 +1657,7 @@ def install(
         try:
             report = check_catalog(catalog_path)
         except CatalogError as exc:
-            click.echo(f"phasesweep mcp install: {exc}", err=True)
+            click.echo(f"phasesweep mcp install: {_catalog_error_text(exc)}", err=True)
             ctx.exit(2)
         if not report.ok:
             _echo_catalog_report(report)
@@ -1045,7 +1677,7 @@ def install(
             yes,
             dry_run,
             allow_user_scope,
-            launcher=launcher,  # type: ignore[arg-type]
+            catalog_report=report,
         )
     )
 
@@ -1122,7 +1754,7 @@ def uninstall(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Verify each coding agent's configured phasesweep MCP launcher still resolves: the "
-        "absolute executable exists and is executable, or (uvx mode) 'uvx' is on PATH. "
+        "absolute executable exists and is executable, and the configured catalog is readable. "
         "Read-only; prints repair guidance for anything broken."
     ),
     short_help="Verify configured MCP launchers.",

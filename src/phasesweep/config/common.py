@@ -13,7 +13,10 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 class _Frozen(BaseModel):
     """Base for all config models: frozen + reject unknown keys."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Config values can contain storage credentials and environment secrets.
+    # Pydantic normally repeats the rejected input in ValidationError text,
+    # which would leak those values through CLI diagnostics.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
 def _require_finite(label: str, value: float) -> None:
@@ -131,24 +134,15 @@ def _validate_override_key(key: object, *, label: str) -> None:
             )
 
 
-def _key_parts(key: str) -> tuple[str, ...]:
-    """Split a validated dotted override key into path components.
-
-    :param str key: Validated dotted override key.
-    :return tuple[str, ...]: Dot-separated path components.
-    """
-    return tuple(key.split("."))
-
-
 def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
     """Return pairs ``(short, long)`` where ``short`` is a strict path-prefix of ``long``.
 
     Two keys collide when one's dot-path is a strict prefix of the other's.
 
     Examples:
-        * ``model`` and ``model.depth`` collide — argparse/Hydra renders
-          contradictory flags or ``model=llama model.depth=16``, and ``json_file``
-          cannot represent both a scalar and a nested object at the same key.
+        * ``model`` and ``model.depth`` collide — CLI formats render
+          contradictory arguments, and dotted override composition cannot represent both a
+          scalar and a nested object at the same key.
         * ``model.depth`` and ``model.depths`` do **not** collide (different
           siblings, same depth).
         * ``a.b.c`` and ``a.b.c.d`` do collide.
@@ -164,7 +158,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
         path-prefix of ``long``. Empty list when no collisions are present.
 
     """
-    parts_by_key = {key: _key_parts(key) for key in keys}
+    parts_by_key = {key: tuple(key.split(".")) for key in keys}
     seen: set[tuple[str, str]] = set()
 
     items = list(parts_by_key.items())

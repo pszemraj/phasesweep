@@ -15,7 +15,6 @@ configured catalog path still resolve.
 
 from __future__ import annotations
 
-import importlib.metadata
 import os
 import shlex
 import shutil
@@ -24,7 +23,7 @@ import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Literal, TypeAlias
 
 import click
@@ -46,18 +45,18 @@ from phasesweep.mcp.install.edits import (
 from phasesweep.mcp.install.targets import (
     MARKDOWN_END,
     MARKDOWN_START,
-    PACKAGE_NAME,
     SERVER_NAME,
     TOML_END,
     TOML_START,
     AgentTarget,
-    Launcher,
     _entry_argv,
+    _is_absolute_phasesweep_command,
     agent_targets,
     codex_toml_content,
     is_managed_mcp_entry,
     mcp_entry,
 )
+from phasesweep.mcp.registry import CatalogCheckReport
 from phasesweep.runtime.json import strict_json_loads
 
 Mode = Literal["install", "uninstall"]
@@ -71,6 +70,25 @@ _LOCK_UNAVAILABLE_NOTE = (
     "installer lock unavailable; ensure the phasesweep lock directory is writable and "
     "PHASESWEEP_LOCK_DIR, if set, names an existing safe directory"
 )
+
+
+def _write_failure_note(result: str, *, subject: str = "config") -> str | None:
+    """Describe an installer write failure without misclassifying its timing.
+
+    :param str result: Atomic write result returned by the edit primitive.
+    :param str subject: User-facing name of the file being changed.
+    :return str | None: Failure detail, or ``None`` after a successful write.
+    """
+    if result == "written":
+        return None
+    if result == "stale":
+        return f"{subject} changed before it could be replaced"
+    if result == "durability-error":
+        return (
+            f"{subject} was replaced, but syncing its parent directory failed; "
+            "the edit is visible, but crash durability could not be confirmed"
+        )
+    return f"{subject} could not be written"
 
 
 @dataclass(frozen=True)
@@ -91,82 +109,54 @@ class StepResult:
         return self.action is None or self.action in _OK_ACTIONS
 
 
+def _which_on_absolute_path(command: str) -> str | None:
+    """Look ``command`` up on the absolute ``PATH`` entries only.
+
+    ``PATH`` may carry relative entries -- ``.``, a bare ``bin``, or an empty
+    field, which POSIX reads as the current directory. Resolving through them
+    would make the answer an accident of the directory the caller happened to
+    run from, so they are dropped: a relative-only ``PATH`` resolves nothing
+    here rather than falling back to the unfiltered ``PATH``.
+
+    :param str command: Bare program name to look up.
+    :return str | None: Absolute path to the resolved executable, or ``None``
+        when no absolute ``PATH`` entry provides one.
+    """
+    if PurePath(command).name != command:
+        return None
+    entries = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and PurePath(entry).is_absolute()
+    ]
+    if not entries:
+        return None
+    return shutil.which(command, path=os.pathsep.join(entries))
+
+
 def resolve_server_command() -> str:
     """Resolve the ``phasesweep-mcp`` executable clients should launch.
 
     Prefer the script beside the running interpreter so ``conda run`` and
     explicit environment executables cannot be redirected by an unrelated
-    ``PATH`` entry.
+    ``PATH`` entry. The ``PATH`` fallback consults only absolute ``PATH``
+    entries (:func:`_which_on_absolute_path`), so the pinned command is never
+    an artifact of the working directory the install ran from.
 
     :return str: Absolute path to an executable ``phasesweep-mcp`` script.
-    :raises FileNotFoundError: If neither the active environment nor ``PATH``
-        contains a launchable script.
+    :raises FileNotFoundError: If neither the active environment nor the
+        absolute ``PATH`` entries contain a launchable script.
     """
-    sibling = Path(sys.executable).parent / "phasesweep-mcp"
-    if sibling.is_file() and os.access(sibling, os.X_OK):
-        return str(sibling.absolute())
-    found = shutil.which("phasesweep-mcp")
+    if sys.executable:
+        sibling = Path(sys.executable).parent / "phasesweep-mcp"
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            return str(sibling.absolute())
+    found = _which_on_absolute_path("phasesweep-mcp")
     if found:
         return str(Path(found).absolute())
     raise FileNotFoundError(
         "cannot find an executable phasesweep-mcp in the active Python environment or PATH"
     )
-
-
-def _is_unpublishable_version(version: str) -> bool:
-    """Return whether a version names a build no package index can serve.
-
-    Local segments (``1.0.0+local``) are never uploadable, ``.dev`` releases
-    describe an unreleased snapshot, and ``0.0.0`` is the placeholder version
-    build backends emit when they cannot derive one. Deliberately plain string
-    matching: this only has to recognize what an editable or source-tree
-    install of *this* package produces, which is not worth a ``packaging``
-    dependency (review v0.5.16).
-
-    :param str version: Version reported by ``importlib.metadata``.
-    :return bool: True when pinning this version could never resolve remotely.
-    """
-    return "+" in version or ".dev" in version or version == "0.0.0"
-
-
-def resolve_uvx_launcher() -> tuple[str, list[str]]:
-    """Resolve the pinned ``uvx`` launcher for the installed phasesweep version.
-
-    An alternative to :func:`resolve_server_command` (review v0.5.15 / item G):
-    instead of binding an absolute path in the current environment, this pins
-    a ``uvx --from phasesweep[mcp]==<version> phasesweep-mcp`` invocation that
-    ``uvx`` resolves fresh at launch time, so it keeps working after this
-    environment is moved or recreated. Requires ``uvx`` on ``PATH`` now (the
-    client may run on a different ``PATH`` later, but this is still the
-    earliest useful check) and a publishable installed version to pin. Whether
-    that version is actually on an index is never checked: this command does
-    not reach the network (review v0.5.16).
-
-    :return tuple[str, list[str]]: ``"uvx"`` and its argv prefix before ``--catalog``.
-    :raises FileNotFoundError: If ``uvx`` is not on ``PATH``.
-    :raises LookupError: If the running phasesweep is not an installed
-        distribution with a resolvable version (e.g. an unbuilt source
-        checkout), or reports a local/dev version no index could serve.
-    """
-    if shutil.which("uvx") is None:
-        raise FileNotFoundError(
-            "cannot find 'uvx' on PATH; install uv (https://docs.astral.sh/uv/) or omit "
-            "--launcher uvx"
-        )
-    try:
-        version = importlib.metadata.version(PACKAGE_NAME)
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise LookupError(
-            "phasesweep is not an installed distribution, so there is no version to pin; "
-            "install it normally or omit --launcher uvx"
-        ) from exc
-    if _is_unpublishable_version(version):
-        raise LookupError(
-            f"the installed phasesweep version {version} is a local or development build, "
-            "which uvx cannot resolve from a package index; for a development checkout omit "
-            "--launcher uvx to pin this environment's absolute phasesweep-mcp path instead"
-        )
-    return "uvx", ["--from", f"{PACKAGE_NAME}[mcp]=={version}", "phasesweep-mcp"]
 
 
 def _resolved_project_path(path: Path, project: Path) -> Path | None:
@@ -202,25 +192,17 @@ def _apply_toml_mcp(
     command: str,
     catalog: Path | None,
     dry_run: bool,
-    launcher_args: Sequence[str] = (),
 ) -> StepResult:
     """Apply one Codex TOML edit as a locked, semantically checked transaction.
 
     :param Path path: Codex config path.
     :param Mode mode: ``install`` or ``uninstall``.
-    :param str command: Launcher executable: an absolute path (default mode)
-        or ``"uvx"`` (pinned uvx launcher mode).
+    :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path for installs.
     :param bool dry_run: Compute the verdict without committing the candidate.
-    :param Sequence[str] launcher_args: Extra argv before ``--catalog``; empty
-        for the default mode, the pinned uvx invocation otherwise.
     :return StepResult: Safe edit or manual-attention verdict.
     """
-    content = (
-        codex_toml_content(command, catalog, launcher_args=launcher_args)
-        if catalog is not None
-        else ""
-    )
+    content = codex_toml_content(command, catalog) if catalog is not None else ""
 
     with _locked_editable_text(path) as loaded:
         if isinstance(loaded, _EditLockUnavailable):
@@ -301,11 +283,11 @@ def _apply_toml_mcp(
                 return StepResult("mcp", path, "removed")
             write_result = _atomic_write_text(path, candidate, expected=loaded)
             action: Action = "removed" if write_result == "written" else "error"
-            note = None if action == "removed" else "config changed before it could be replaced"
+            note = _write_failure_note(write_result)
             return StepResult("mcp", path, action, note=note)
 
         assert catalog is not None  # narrowed by the install-only guard above
-        expected = mcp_entry("stdio", command, catalog, launcher_args=launcher_args)
+        expected = mcp_entry("stdio", command, catalog)
         if span is None and current is not None:
             return StepResult(
                 "mcp",
@@ -362,7 +344,7 @@ def _apply_toml_mcp(
         action = (
             ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
-        note = None if action != "error" else "config changed before it could be replaced"
+        note = None if action != "error" else _write_failure_note(write_result)
         return StepResult("mcp", path, action, note=note)
 
 
@@ -373,19 +355,15 @@ def _apply_mcp(
     catalog: Path | None,
     project: Path,
     dry_run: bool,
-    launcher_args: Sequence[str] = (),
 ) -> StepResult:
     """Apply or remove the MCP server entry for one target.
 
     :param AgentTarget target: Client being configured.
     :param Mode mode: ``install`` or ``uninstall``.
-    :param str command: Launcher executable: an absolute ``phasesweep-mcp``
-        path (default mode), or ``"uvx"`` (pinned uvx launcher mode).
+    :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path | None catalog: Absolute catalog path; required for install.
     :param Path project: Project root that must contain project-scoped writes.
     :param bool dry_run: Compute the edit verdict without changing client files.
-    :param Sequence[str] launcher_args: Extra argv before ``--catalog``; empty
-        for the default mode, the pinned uvx invocation otherwise.
     :return StepResult: Edit verdict with a manual snippet on skips.
     """
     spec = target.mcp
@@ -412,7 +390,7 @@ def _apply_mcp(
     if spec.format == "toml":
         if edit_path.exists() and not edit_path.is_file():
             return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-        result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run, launcher_args)
+        result = _apply_toml_mcp(edit_path, mode, command, catalog, dry_run)
         return StepResult(
             result.integration,
             spec.path,
@@ -438,6 +416,8 @@ def _apply_mcp(
                 "error",
                 note="config changed before it could be replaced",
             )
+        if action in {"write-error", "durability-error"}:
+            return StepResult("mcp", spec.path, "error", note=_write_failure_note(action))
         if action == "skipped":
             note = "config is not strict JSON; remove the entry manually"
         elif action == "conflict":
@@ -450,7 +430,7 @@ def _apply_mcp(
     assert catalog is not None
     if edit_path.exists() and not edit_path.is_file():
         return StepResult("mcp", spec.path, "error", note="config path is not a regular file")
-    entry = mcp_entry(spec.style, command, catalog, launcher_args=launcher_args)
+    entry = mcp_entry(spec.style, command, catalog)
     managed = partial(is_managed_mcp_entry, spec.style)
     action = merge_json_member(
         edit_path,
@@ -469,6 +449,16 @@ def _apply_mcp(
             "error",
             note=(
                 "config changed before it could be replaced; merge this manually:\n"
+                f"{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
+            ),
+        )
+    if action in {"write-error", "durability-error"}:
+        return StepResult(
+            "mcp",
+            spec.path,
+            "error",
+            note=(
+                f"{_write_failure_note(action)}; merge this manually:\n"
                 f"{manual_json_snippet(spec.key, SERVER_NAME, entry)}"
             ),
         )
@@ -536,6 +526,69 @@ def _owned_instruction_content(owners: set[str], prompt: str) -> str:
     return f"{owner_line}\n{prompt}"
 
 
+def _valid_instruction_owner_ids(edit_path: Path, project: Path) -> set[str]:
+    """Return agent ids whose instructions target resolves to one shared file.
+
+    :param Path edit_path: Resolved instructions file being inspected or edited.
+    :param Path project: Project root used to resolve all supported targets.
+    :return set[str]: Valid owner ids for the shared instructions path.
+    """
+    valid_owner_ids: set[str] = set()
+    for candidate_target in agent_targets(project):
+        candidate_path = candidate_target.instructions_path
+        if candidate_path is None:
+            continue
+        try:
+            if candidate_path.resolve(strict=False) == edit_path:
+                valid_owner_ids.add(candidate_target.id)
+        except (OSError, RuntimeError):
+            continue
+    return valid_owner_ids
+
+
+def _instruction_plan_note(target: AgentTarget, project: Path, mode: Mode) -> str | None:
+    """Describe existing shared ownership and prompt replacement before applying.
+
+    :param AgentTarget target: Selected integration target.
+    :param Path project: Project root anchoring the instructions path.
+    :param Mode mode: Planned installer action.
+    :return str | None: Shared-owner plan note, when a readable managed block exists.
+    """
+    path = target.instructions_path
+    if path is None:
+        return None
+    edit_path = _resolved_project_path(path, project)
+    if edit_path is None:
+        return None
+    snapshot = _read_editable_text(edit_path)
+    if snapshot is None or not snapshot.existed:
+        return None
+    try:
+        block = _read_instruction_block(
+            snapshot.text,
+            _valid_instruction_owner_ids(edit_path, project),
+        )
+    except ValueError as exc:
+        return (
+            "instructions markers are incomplete or repeated; apply will refuse this file "
+            f"({exc}). Restore one complete PhaseSweep marker block or remove the broken "
+            "block manually, then retry"
+        )
+    if block is None:
+        return (
+            "instructions block has missing or invalid ownership metadata; apply will refuse "
+            "this file. Restore a PHASESWEEP_OWNERS line naming the installed client owners, "
+            "or remove the marker block manually, then retry"
+        )
+    owners, installed_prompt = block
+    if not owners:
+        return None
+    owner_text = ", ".join(sorted(owners))
+    if mode == "install" and installed_prompt != agent_prompt_text():
+        return f"shared block prompt will update for existing owners: {owner_text}"
+    return f"shared block currently owned by: {owner_text}"
+
+
 def _apply_instructions(
     target: AgentTarget,
     mode: Mode,
@@ -564,16 +617,7 @@ def _apply_instructions(
             "error",
             note="refusing instructions path that resolves outside the project",
         )
-    valid_owner_ids: set[str] = set()
-    for candidate_target in agent_targets(project):
-        candidate_path = candidate_target.instructions_path
-        if candidate_path is None:
-            continue
-        try:
-            if candidate_path.resolve(strict=False) == edit_path:
-                valid_owner_ids.add(candidate_target.id)
-        except (OSError, RuntimeError):
-            continue
+    valid_owner_ids = _valid_instruction_owner_ids(edit_path, project)
     with _locked_editable_text(edit_path) as loaded:
         if isinstance(loaded, _EditLockUnavailable):
             return StepResult(
@@ -608,7 +652,11 @@ def _apply_instructions(
                 "instructions",
                 path,
                 "error",
-                note="instructions block has missing or invalid ownership metadata",
+                note=(
+                    "instructions block has missing or invalid ownership metadata; restore a "
+                    "PHASESWEEP_OWNERS line naming the installed client owners, or remove the "
+                    "marker block manually, then retry"
+                ),
             )
         owners, installed_prompt = block
         if mode == "uninstall":
@@ -632,7 +680,7 @@ def _apply_instructions(
                 retained_note = (
                     f"retained for: {', '.join(sorted(owners))}"
                     if action != "error"
-                    else "instructions changed before they could be replaced"
+                    else _write_failure_note(write_result, subject="instructions")
                 )
                 return StepResult("instructions", path, action, note=retained_note)
             removal_candidate = removed_marked_text(
@@ -647,7 +695,11 @@ def _apply_instructions(
                 return StepResult("instructions", path, "removed")
             write_result = _atomic_write_text(edit_path, removal_candidate, expected=loaded)
             action = "removed" if write_result == "written" else "error"
-            removal_note = None if action == "removed" else "instructions changed before removal"
+            removal_note = (
+                None
+                if action == "removed"
+                else _write_failure_note(write_result, subject="instructions")
+            )
             return StepResult("instructions", path, action, note=removal_note)
 
         owners.add(target.id)
@@ -672,7 +724,7 @@ def _apply_instructions(
             ("updated" if loaded.existed else "created") if write_result == "written" else "error"
         )
         install_note = (
-            None if action != "error" else "instructions changed before they could be replaced"
+            None if action != "error" else _write_failure_note(write_result, subject="instructions")
         )
         return StepResult("instructions", path, action, note=install_note)
 
@@ -780,21 +832,115 @@ def _integrations(integration: Literal["mcp", "instructions", "all"]) -> tuple[I
     return (integration,)
 
 
+def _mcp_plan_note(
+    target: AgentTarget,
+    command: str,
+    catalog: Path | None,
+    project: Path,
+    mode: Mode,
+) -> str:
+    """Describe the MCP entry already on disk and what installing will do to it.
+
+    Answers the only question the plan cannot leave to the post-apply verdicts:
+    whether confirming rewrites an entry that is already there. Classification
+    reuses :func:`_check_target_launcher`, the same read-only reader
+    ``check-install`` and the post-install verification section use, so the
+    pre-confirmation plan cannot disagree with them about the same on-disk
+    state.
+
+    :param AgentTarget target: Client whose MCP config the plan would edit.
+    :param str command: Absolute ``phasesweep-mcp`` executable to be pinned.
+    :param Path | None catalog: Absolute catalog path the installed entry will
+        pass; required for an install plan.
+    :param Path project: Project root anchoring project-scoped config paths.
+    :param Mode mode: Planned installer action.
+    :return str: Plan note, possibly spanning several lines.
+    """
+    check = _check_target_launcher(target, project)
+    if check.status == "not-configured":
+        return (
+            "no existing phasesweep entry; installing creates one"
+            if mode == "install"
+            else "no managed phasesweep entry; uninstall changes nothing"
+        )
+    if check.status == "unmanaged":
+        return (
+            "an existing phasesweep entry is not a shape this installer owns; it will be left "
+            + ("untouched and printed for manual merge" if mode == "install" else "untouched")
+        )
+    if check.status == "unreadable" or check.executable is None:
+        detail = f" ({check.detail})" if check.detail else ""
+        return (
+            "the config cannot be safely inspected; apply will refuse this target and leave "
+            f"it untouched{detail}"
+        )
+    current = shlex.join([check.executable, *check.args])
+    if mode == "uninstall":
+        return f"managed entry WILL BE REMOVED\nentry: {current}"
+    assert catalog is not None
+    planned = shlex.join([command, "--catalog", str(catalog)])
+    if current == planned:
+        return "an existing phasesweep entry already matches this plan; it stays unchanged"
+    shape = (
+        "an existing phasesweep entry"
+        if _is_absolute_phasesweep_command(check.executable)
+        else "a recognized legacy launcher entry"
+    )
+    return (
+        f"{shape} WILL BE REWRITTEN to this environment's pinned executable\n"
+        f"from: {current}\n"
+        f"to:   {planned}"
+    )
+
+
+def _echo_plan_note(note: str) -> None:
+    """Print one plan note under its integration line, indenting continuations.
+
+    :param str note: Note text, possibly spanning several lines.
+    """
+    first, *rest = note.splitlines()
+    click.echo(f"    {'':<13} note: {first}")
+    for line in rest:
+        click.echo(f"    {'':<13}       {line}")
+
+
 def _print_plan(
     targets: Sequence[AgentTarget],
     integrations: tuple[Integration, ...],
     mode: Mode,
     dry_run: bool,
+    *,
+    project: Path,
+    catalog: Path | None,
+    command: str,
+    catalog_report: CatalogCheckReport | None,
 ) -> None:
     """Print what will be written or removed before touching anything.
+
+    MCP installs additionally state, per target, whether an entry is already
+    configured and whether confirming rewrites it, so an operator never learns
+    of a rewrite only from the verdicts printed after confirming.
 
     :param Sequence[AgentTarget] targets: Selected agent targets.
     :param tuple[Integration, ...] integrations: Integrations to apply.
     :param Mode mode: ``install`` or ``uninstall``.
     :param bool dry_run: Whether this plan will only compute edit verdicts.
+    :param Path project: Project root anchoring shared instructions paths.
+    :param Path | None catalog: Validated catalog used by MCP installs.
+    :param str command: Resolved launcher executable for MCP installs.
+    :param CatalogCheckReport | None catalog_report: Validated experiment permissions summary.
     """
     prefix = "Dry-run " if dry_run else ""
     click.echo(f"\n{prefix}{'install' if mode == 'install' else 'uninstall'} plan:")
+    if mode == "install" and "mcp" in integrations:
+        assert catalog is not None
+        click.echo(f"  catalog      {catalog}")
+        if catalog_report is not None:
+            click.echo(f"  experiments  {len(catalog_report.entries)}")
+            for entry in catalog_report.entries:
+                actions = ", ".join(entry.actions) if entry.actions else "read-only"
+                click.echo(f"    {entry.experiment_id}: {actions}")
+        click.echo(f"  launcher     {command}")
     for target in targets:
         click.echo(f"  {target.display_name}")
         for integration in integrations:
@@ -807,9 +953,35 @@ def _print_plan(
             if path is None:
                 click.echo(f"    {integration:<13} (not supported)")
                 continue
-            click.echo(f"    {integration:<13} {path}")
+            scope = " [user scope]" if integration == "mcp" and target.mcp.scope == "user" else ""
+            display_path = path
+            if integration == "mcp":
+                if target.mcp.scope == "project":
+                    resolved_path = _resolved_project_path(path, project)
+                else:
+                    try:
+                        resolved_path = path.resolve(strict=False)
+                    except (OSError, RuntimeError):
+                        resolved_path = None
+                if resolved_path is not None:
+                    display_path = resolved_path
+            click.echo(f"    {integration:<13} {display_path}{scope}")
             if notice and mode == "install":
-                click.echo(f"    {'':<13} note: {notice}")
+                _echo_plan_note(notice)
+            if integration == "mcp":
+                _echo_plan_note(
+                    _mcp_plan_note(
+                        target,
+                        command,
+                        catalog,
+                        project,
+                        mode,
+                    )
+                )
+            if integration == "instructions":
+                shared_note = _instruction_plan_note(target, project, mode)
+                if shared_note:
+                    _echo_plan_note(shared_note)
     click.echo("")
 
 
@@ -822,7 +994,7 @@ def run(
     yes: bool,
     dry_run: bool = False,
     allow_user_scope: bool = False,
-    launcher: Launcher = "path",
+    catalog_report: CatalogCheckReport | None = None,
 ) -> int:
     """Run the installer or uninstaller end to end.
 
@@ -835,21 +1007,35 @@ def run(
     :param bool yes: Skip every confirmation prompt.
     :param bool dry_run: Report planned edit verdicts without changing client files.
     :param bool allow_user_scope: Explicitly authorize unattended user-scoped MCP writes.
-    :param Launcher launcher: ``"path"`` (default) pins the absolute
-        ``phasesweep-mcp`` executable in the running environment; ``"uvx"``
-        (review v0.5.15 / item G) instead writes a pinned ``uvx --from
-        phasesweep[mcp]==<version> phasesweep-mcp`` launcher that survives
-        that environment being moved or recreated. Ignored for ``uninstall``.
+    :param CatalogCheckReport | None catalog_report: Validated entries summarized in the plan.
     :return int: ``0`` when every step succeeded, ``1`` when any step needs
         manual attention, ``2`` when nothing was selected or confirmed.
+    :raises ValueError: If an MCP install is requested without a validated
+        catalog path.
     """
     if mode == "install" and integration != "instructions" and catalog is None:
         raise ValueError("installing MCP entries requires a validated catalog path")
+    integrations = _integrations(integration)
+    command = ""
+    if mode == "install" and "mcp" in integrations:
+        try:
+            command = resolve_server_command()
+        except FileNotFoundError as exc:
+            click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
+            return 1
     targets = _select_targets(project, agent_ids, mode, yes)
     if targets is None:
         return 2
-    integrations = _integrations(integration)
-    _print_plan(targets, integrations, mode, dry_run)
+    _print_plan(
+        targets,
+        integrations,
+        mode,
+        dry_run,
+        project=project,
+        catalog=catalog,
+        command=command,
+        catalog_report=catalog_report,
+    )
     user_scoped_targets = [
         target for target in targets if "mcp" in integrations and target.mcp.scope == "user"
     ]
@@ -866,25 +1052,16 @@ def run(
         click.echo("cancelled; no client files were changed.")
         return 2
 
-    command = ""
-    launcher_args: tuple[str, ...] = ()
-    if mode == "install" and "mcp" in integrations:
-        try:
-            if launcher == "uvx":
-                command, launcher_args_list = resolve_uvx_launcher()
-                launcher_args = tuple(launcher_args_list)
-            else:
-                command = resolve_server_command()
-        except (FileNotFoundError, LookupError) as exc:
-            click.echo(f"phasesweep mcp install: {exc}; no client config was touched.", err=True)
-            return 1
     attention = 0
+    # Targets whose MCP step already reported a problem; verification re-reads the
+    # same config and must not count that one problem a second time.
+    mcp_needs_attention: set[str] = set()
     instruction_dry_run_state: dict[Path, str] | None = {} if dry_run else None
     for target in targets:
         click.echo(f"  {target.display_name}")
         for kind in integrations:
             if kind == "mcp":
-                result = _apply_mcp(target, mode, command, catalog, project, dry_run, launcher_args)
+                result = _apply_mcp(target, mode, command, catalog, project, dry_run)
             else:
                 result = _apply_instructions(
                     target,
@@ -909,6 +1086,24 @@ def run(
                     click.echo(f"      {line}")
             if not result.ok:
                 attention += 1
+                if kind == "mcp":
+                    mcp_needs_attention.add(target.id)
+    # Verification runs regardless of earlier per-step failures: a run where one
+    # target failed is exactly where the remaining targets' launchers most need
+    # checking. It is reported for every selected target, but only adds to
+    # `attention` (and so to the exit code) for a problem no earlier step already
+    # counted, using the same needs-attention predicate as `check_install` so both
+    # commands reach the same verdict on the same on-disk state.
+    if mode == "install" and not dry_run and "mcp" in integrations:
+        click.echo("\nverification:")
+        for target in targets:
+            verification = _check_target_launcher(target, project)
+            click.echo(f"  {target.display_name:<20} {verification.status}")
+            if verification.detail:
+                for line in verification.detail.splitlines():
+                    click.echo(f"    {line}")
+            if not verification.ok and target.id not in mcp_needs_attention:
+                attention += 1
     click.echo("")
     if attention:
         click.echo(
@@ -920,9 +1115,10 @@ def run(
         click.echo("dry run complete; no client files were changed.")
         return 0
     if mode == "install":
-        click.echo(
-            "done. Restart your MCP client, then ask your agent to list phasesweep experiments."
-        )
+        click.echo("done.")
+        click.echo("Restart the selected client(s), then ask:")
+        click.echo("List the available PhaseSweep experiments and their permitted actions.")
+        click.echo("Do not launch anything.")
     else:
         click.echo("done. Restart your MCP client to drop the phasesweep server.")
     return 0
@@ -930,12 +1126,13 @@ def run(
 
 # --- check-install: read-only verification (review v0.5.15 / item G) ---
 
-# User-facing status semantics live in docs/mcp_setup.md#4-verify.
+# User-facing status semantics live in docs/mcp_setup.md#verification-and-maintenance.
 # `_CHECK_ATTENTION_STATUSES` is the implementation's needs-attention set.
 CheckStatus: TypeAlias = Literal[
     "ok",
     "missing",
     "not-executable",
+    "not-launchable",
     "catalog-missing",
     "unmanaged",
     "not-configured",
@@ -943,13 +1140,15 @@ CheckStatus: TypeAlias = Literal[
 ]
 
 _CHECK_ATTENTION_STATUSES: frozenset[str] = frozenset(
-    {"missing", "not-executable", "catalog-missing", "unreadable"}
+    {"missing", "not-executable", "not-launchable", "catalog-missing", "unreadable"}
 )
 
-# Attached to an otherwise ok uvx entry: `uvx` being on PATH says nothing about
-# whether the pinned requirement still resolves, and check-install is offline.
-_UVX_PIN_UNVERIFIED_NOTE = (
-    "pinned package resolvability is not verified offline; the client resolves it at launch"
+# A legacy pinned-launcher entry that resolves here still resolves its launcher from
+# whatever PATH the client is started with, so `ok` alone would overstate the check.
+_LEGACY_LAUNCHER_NOTE = (
+    "recognized legacy launcher form, not the pinned absolute phasesweep-mcp executable; it "
+    "resolved from this shell's PATH, but the client may launch with a different one; rerun "
+    "`phasesweep mcp install` to pin this environment's executable"
 )
 
 
@@ -967,8 +1166,9 @@ class LauncherCheck:
     def ok(self) -> bool:
         """Whether this check needs no further operator action.
 
-        :return bool: True unless the launcher is missing, not executable, its
-            catalog is missing, or the config is unreadable.
+        :return bool: True unless the launcher is missing, not executable or
+            not launchable through its shebang, its catalog is missing, or the
+            config is unreadable.
         """
         return self.status not in _CHECK_ATTENTION_STATUSES
 
@@ -976,26 +1176,54 @@ class LauncherCheck:
 def _probe_launcher_executable(command: str) -> tuple[CheckStatus, str | None]:
     """Probe whether one configured launcher executable actually resolves.
 
-    :param str command: Launcher executable token: ``"uvx"`` or an absolute path.
+    A bare program name is resolved against the absolute ``PATH`` entries only,
+    so the same entry cannot check out from one working directory and fail from
+    another.
+
+    :param str command: Configured launcher executable: an absolute path for
+        entries this version writes, or a bare program name for the legacy
+        pinned entries earlier versions wrote.
     :return tuple[CheckStatus, str | None]: ``("ok", None)``, or a status
         needing attention with actionable repair guidance.
     """
-    if command == "uvx":
-        if shutil.which("uvx") is None:
-            return "missing", (
-                "'uvx' is not on PATH; install uv (https://docs.astral.sh/uv/) so this pinned "
-                "launcher can run, or run `phasesweep mcp install` again without --launcher uvx"
-            )
-        return "ok", None
     path = Path(command)
+    if not path.is_absolute():
+        # Only the legacy pinned entry shape reaches here; it names a program the client
+        # resolves from PATH, so resolve it the same way rather than against cwd. Relative
+        # PATH entries are deliberately ignored, so the verdict never depends on where
+        # check-install was run from.
+        resolved = _which_on_absolute_path(command)
+        if resolved is None:
+            return "missing", (
+                f"{command} is not on PATH; rerun `phasesweep mcp install` to replace this "
+                "legacy entry with an absolute launcher path (--dry-run previews the repair)"
+            )
+        path = Path(resolved)
     if not path.is_file():
         return "missing", (
             f"{command} no longer exists; rerun `phasesweep mcp install` from the correct "
-            "Python environment (--dry-run previews the repair), or reinstall with "
-            "--launcher uvx for a pinned launcher that survives moving this environment"
+            "conda environment (--dry-run previews the repair)"
         )
     if not os.access(path, os.X_OK):
         return "not-executable", f"{command} exists but is not executable; check its permissions"
+    try:
+        with path.open("rb") as launcher:
+            first_line = launcher.readline(4097)
+    except OSError as exc:
+        return "not-launchable", f"{command} cannot be inspected ({exc}); check its permissions"
+    if first_line.startswith(b"#!"):
+        try:
+            shebang = shlex.split(first_line[2:].decode("utf-8").strip())
+        except (UnicodeError, ValueError):
+            return "not-launchable", f"{command} has an invalid interpreter line; reinstall it"
+        interpreter = Path(shebang[0]) if shebang else None
+        if interpreter is None or not interpreter.is_absolute():
+            return "not-launchable", f"{command} has an invalid interpreter line; reinstall it"
+        if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+            return "not-launchable", (
+                f"{command} names missing or non-executable interpreter {interpreter}; "
+                "recreate that environment and rerun `phasesweep mcp install`"
+            )
     return "ok", None
 
 
@@ -1004,19 +1232,13 @@ def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | N
 
     A launcher that starts fine still fails at handshake time when its catalog
     was moved, renamed, or deleted, so ``check-install`` inspects the argument
-    as well as the executable (review v0.5.16). Every managed shape ends in
-    ``--catalog <absolute path>``; anything else is a shape this function does
-    not own and is reported rather than guessed at.
+    as well as the executable (review v0.5.16). The caller has already verified
+    that every managed shape ends in ``--catalog <absolute path>``.
 
     :param Sequence[str] args: Configured launcher argv after the executable.
     :return tuple[CheckStatus, str | None]: ``("ok", None)``, or
         ``("catalog-missing", ...)`` with actionable repair guidance.
     """
-    if len(args) < 2 or args[-2] != "--catalog":
-        return "catalog-missing", (
-            "the configured entry passes no --catalog argument; rerun "
-            "`phasesweep mcp install --catalog PATH` with the catalog this client should use"
-        )
     catalog = args[-1]
     path = Path(catalog)
     if not path.is_file() or not os.access(path, os.R_OK):
@@ -1028,22 +1250,46 @@ def _probe_configured_catalog(args: Sequence[str]) -> tuple[CheckStatus, str | N
     return "ok", None
 
 
-def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
+def _check_target_launcher(target: AgentTarget, project: Path) -> LauncherCheck:
     """Read one target's configured phasesweep MCP entry and probe it.
 
-    Read-only counterpart to :func:`_apply_mcp`: recognizes entries written by
-    either launcher mode, reports an entry this installer does not own as
+    Read-only counterpart to :func:`_apply_mcp`: recognizes every entry shape
+    :func:`is_managed_mcp_entry` owns (including the legacy pinned-uvx entries
+    earlier versions wrote), reports an entry this installer does not own as
     ``unmanaged`` without probing it, and never edits the client file. Probes
     both the launcher executable and the configured ``--catalog`` path, the
-    executable first because it fails earlier at launch.
+    executable first because it fails earlier at launch. A legacy entry that
+    passes both probes stays ``ok`` but carries
+    :data:`_LEGACY_LAUNCHER_NOTE`, because resolving its launcher here says
+    nothing about the PATH the client will launch with.
 
     :param AgentTarget target: Client to inspect.
+    :param Path project: Project root that must contain project-scoped configs.
     :return LauncherCheck: Verification outcome for this target.
     """
     spec = target.mcp
-    try:
-        edit_path = spec.path.resolve(strict=False)
-    except (OSError, RuntimeError):
+    if spec.scope == "project":
+        edit_path = _resolved_project_path(spec.path, project)
+        if edit_path is None:
+            return LauncherCheck(
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "refusing project config path that resolves outside the project",
+            )
+    else:
+        try:
+            edit_path = spec.path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return LauncherCheck(
+                spec.path,
+                None,
+                (),
+                "unreadable",
+                "config path could not be resolved",
+            )
+    if edit_path is None:
         return LauncherCheck(
             spec.path,
             None,
@@ -1055,21 +1301,21 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     snapshot = _read_editable_text(edit_path)
     if snapshot is None:
         return LauncherCheck(
-            spec.path,
+            edit_path,
             None,
             (),
             "unreadable",
             "config path is not a readable regular UTF-8 file",
         )
     if not snapshot.existed or not snapshot.text.strip():
-        return LauncherCheck(spec.path, None, (), "not-configured")
+        return LauncherCheck(edit_path, None, (), "not-configured")
 
     if spec.format == "toml":
         try:
             parsed = tomllib.loads(snapshot.text)
         except tomllib.TOMLDecodeError as exc:
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1077,10 +1323,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         entry = _toml_mcp_entry(parsed)
         if entry is None:
-            return LauncherCheck(spec.path, None, (), "not-configured")
+            return LauncherCheck(edit_path, None, (), "not-configured")
         if not is_managed_mcp_entry("stdio", entry) or not isinstance(entry, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unmanaged",
@@ -1094,7 +1340,7 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             data = strict_json_loads(snapshot.text, finite_floats=True)
         except ValueError:
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1102,7 +1348,7 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
             )
         if not isinstance(data, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unreadable",
@@ -1111,10 +1357,10 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
         container = data.get(spec.key)
         member = container.get(SERVER_NAME) if isinstance(container, dict) else None
         if member is None:
-            return LauncherCheck(spec.path, None, (), "not-configured")
+            return LauncherCheck(edit_path, None, (), "not-configured")
         if not is_managed_mcp_entry(spec.style, member) or not isinstance(member, dict):
             return LauncherCheck(
-                spec.path,
+                edit_path,
                 None,
                 (),
                 "unmanaged",
@@ -1127,9 +1373,9 @@ def _check_target_launcher(target: AgentTarget) -> LauncherCheck:
     status, detail = _probe_launcher_executable(command)
     if status == "ok":
         status, detail = _probe_configured_catalog(args)
-        if status == "ok" and command == "uvx":
-            detail = _UVX_PIN_UNVERIFIED_NOTE
-    return LauncherCheck(spec.path, command, tuple(args), status, detail)
+        if status == "ok" and not _is_absolute_phasesweep_command(command):
+            detail = _LEGACY_LAUNCHER_NOTE
+    return LauncherCheck(edit_path, command, tuple(args), status, detail)
 
 
 def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
@@ -1137,12 +1383,12 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
 
     Read-only counterpart to ``install``/``uninstall`` (review v0.5.15 / item
     G): for every selected target, inspects whatever phasesweep MCP entry is
-    already on disk (written by either launcher mode, or by hand), reports
-    whether it is installer-managed, whether its launcher executable resolves,
-    and whether the ``--catalog`` path it passes is still a readable file, then
-    prints repair guidance for anything broken. Never edits a client file and
-    never reaches the network, so a pinned uvx requirement is reported as
-    unverified rather than resolved (review v0.5.16).
+    already on disk, reports
+    whether it is installer-managed, whether its launcher executable and
+    shebang interpreter resolve, and whether the ``--catalog`` path it passes
+    is still a readable file, then prints repair guidance for anything broken.
+    Never edits a client file, executes a configured launcher, or reaches the
+    network.
 
     :param Path project: Project root anchoring project-scoped paths.
     :param Sequence[str] | None agent_ids: Explicit target ids, or ``None`` to
@@ -1161,16 +1407,19 @@ def check_install(project: Path, agent_ids: Sequence[str] | None = None) -> int:
     attention = 0
     configured = 0
     for target in targets:
-        result = _check_target_launcher(target)
+        result = _check_target_launcher(target, project)
         click.echo(f"  {target.display_name}")
+        if result.config_path is not None:
+            click.echo(f"    config        {result.config_path}")
         if result.status == "not-configured":
             click.echo(f"    mcp           {result.status:<13}")
             continue
         configured += 1
         if result.status == "unmanaged":
             click.echo(f"    mcp           unmanaged     {result.config_path}")
+        elif result.executable is None:
+            click.echo(f"    mcp           {result.status:<13}")
         else:
-            assert result.executable is not None
             invocation = shlex.join([result.executable, *result.args])
             click.echo(f"    mcp           {result.status:<13} {invocation}")
         if result.detail:

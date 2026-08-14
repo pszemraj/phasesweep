@@ -19,9 +19,10 @@ package from the trainer's ``PYTHONPATH``, or a trainer-composed
 ``sitecustomize``, and it starts in ~30ms instead of paying phasesweep's
 package-import cost. Only after this process durably persists
 ``process_identity.json`` does it send the trainer's shell command and full
-environment to the supervisor as a framed JSON payload; the supervisor then
-``execve``s ``/bin/sh -c cmd`` under that environment, replacing itself as
-the same PID/process group already registered here.
+environment to the supervisor as a framed JSON payload. The supervisor stays
+outside the trainer's process group as a trusted GPU-lease guardian; its
+blocked child becomes the recorded process-group leader before executing
+``/bin/sh -c cmd``.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
+_GUARDIAN_EXIT_TIMEOUT_SECONDS = (
+    _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
+)
 # With the -I -S stdlib-only launch (review v0.5.15 / blocker 1), supervisor
 # startup no longer pays phasesweep's package-import cost (~0.55s pre-fix) —
 # real-world readiness lands in ~30ms. 10s stays generous headroom for a
@@ -682,21 +686,23 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
             absorbed.signum = drained
 
 
-def _register(proc: subprocess.Popen) -> int:
+def _register(proc: subprocess.Popen, *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
     Args:
         proc: The ``Popen`` object returned by a just-completed ``Popen()`` call.
+        pgid: Explicit child process group guarded by ``proc``. When omitted,
+            register ``proc``'s own process group.
 
     Returns:
         The process-group ID (``pgid``) the subprocess was registered under.
         Callers store this for later ``_unregister`` and signal targeting.
 
     """
-    pgid = os.getpgid(proc.pid)
+    resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
-        _active_children[pgid] = proc
-    return pgid
+        _active_children[resolved_pgid] = proc
+    return resolved_pgid
 
 
 def _unregister(pgid: int) -> None:
@@ -774,6 +780,31 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     except ChildProcessError:
         pass  # Already reaped elsewhere (e.g. a concurrent wait()).
     return cleanup_confirmed
+
+
+def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
+    """Bound the in-band wait for the post-root lease guardian.
+
+    The guardian deliberately remains alive after SIGKILL when it cannot prove
+    the trainer group is gone, retaining inherited GPU lease descriptors. The
+    orchestrator must not wait for that fail-closed lease holder forever: it
+    returns cleanup uncertainty so the phase aborts without scheduling more
+    work, while the detached guardian continues protecting the device.
+
+    :param subprocess.Popen proc: Guardian process whose trainer root already exited.
+    :return bool: Whether the guardian exited inside its cleanup allowance.
+    """
+    try:
+        proc.wait(timeout=_GUARDIAN_EXIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        log.error(
+            "Lease guardian PID %d did not finish descendant cleanup within %.1fs; "
+            "returning cleanup uncertainty while it retains the GPU lease",
+            proc.pid,
+            _GUARDIAN_EXIT_TIMEOUT_SECONDS,
+        )
+        return False
+    return True
 
 
 def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
@@ -930,7 +961,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
 
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 1
-_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "exited"})
+_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
 
 
 @dataclass(frozen=True)
@@ -939,16 +970,14 @@ class AttemptLifecycle:
 
     Closes the two recovery windows the transient identity file could not
     represent (review v0.5.17 / blocker 2): ``allocated`` says a durable
-    Optuna ``RUNNING`` trial exists but no process was ever created (the
-    worker may still be queued for a GPU), and ``exited`` says the supervised
-    process group is confirmed gone even though evidence extraction and the
-    Optuna terminal commit may not have happened yet. Recovery can then fail
-    such trials safely instead of treating both states as unverifiable
-    cleanup uncertainty.
+    Optuna ``RUNNING`` trial exists but no process launch was attempted (the
+    worker may still be queued for a GPU), ``launching`` is committed before
+    ``Popen`` so a failed identity write cannot masquerade as that pre-launch
+    state, and ``exited`` says the supervised process group is confirmed gone
+    even though evidence extraction and the Optuna terminal commit may not
+    have happened yet.
     """
 
-    schema_version: int
-    attempt_id: str
     state: str
     return_code: int | None
     cleanup_confirmed: bool | None
@@ -968,7 +997,7 @@ def write_attempt_lifecycle(
         trial_dir: Per-trial directory (attempt-scoped, so states from
             different attempts can never collide).
         attempt_id: Immutable attempt identity binding the record.
-        state: One of ``"allocated"`` or ``"exited"``.
+        state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
         return_code: Root return code; only meaningful for ``"exited"``.
         cleanup_confirmed: Whether the whole process group was confirmed
             gone; only meaningful for ``"exited"``.
@@ -1045,8 +1074,6 @@ def read_attempt_lifecycle(
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
     return AttemptLifecycle(
-        schema_version=schema_version,
-        attempt_id=expected_attempt_id,
         state=state,
         return_code=return_code,
         cleanup_confirmed=cleanup_confirmed,
@@ -1142,12 +1169,37 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
+    """Read one fixed-size pipe frame without exceeding ``deadline``.
+
+    :param int fd: Pipe descriptor to read.
+    :param int size: Required frame size in bytes.
+    :param float deadline: Absolute ``time.monotonic`` deadline.
+    :return bytes | None: Complete frame, or ``None`` on timeout or early EOF.
+    """
+    import time
+
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+        if not readable:
+            return None
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _spawn_blocked_supervisor(
     *,
     stdout: IO[str],
     stderr: IO[str],
     deadline: float | None = None,
-) -> tuple[subprocess.Popen, int, int]:
+    gpu_lease_fds: Collection[int] = (),
+) -> tuple[subprocess.Popen, int, int, int]:
     """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
     Launches the stdlib-only ``phasesweep.runtime.supervisor`` script
@@ -1155,7 +1207,8 @@ def _spawn_blocked_supervisor(
     ``python -I -S`` with a minimal sanitized environment — see
     :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
     acknowledgement pipe. Blocks (via ``select``) until the supervisor
-    signals readiness or ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
+    forks a blocked trainer session and reports that child's PID, or
+    ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
     capped by the remaining launch ``deadline`` when one is given (review
     v0.5.16 / blocker 6), so a slow supervisor startup can never outlive the
     trial's own wallclock budget. Then registers the new process group. On
@@ -1170,13 +1223,22 @@ def _spawn_blocked_supervisor(
             expires during the readiness wait, the spawn is aborted and
             :class:`_LaunchDeadlineExpired` is raised so the caller reports a
             timeout instead of a generic launch failure.
+        gpu_lease_fds: Open host GPU-lock descriptors deliberately inherited
+            by the trusted supervisor guardian so the kernel lease outlives an
+            orchestrator hard exit. The guardian does not pass them to the
+            trainer child.
 
     Returns:
-        A ``(proc, pgid, ack_write)`` tuple: the supervisor's ``Popen`` handle,
-        its registered process-group id, and the write end of the
-        acknowledgement pipe. The caller owns ``ack_write`` and must send the
-        framed launch payload (see :func:`_encode_launch_payload`) and close
-        it once the trial's process identity is durably persisted.
+        A ``(proc, pgid, ack_write, status_read)`` tuple: the guardian's
+        ``Popen`` handle, the trainer's registered process-group id, the write
+        end of the acknowledgement pipe, and the read end of the guardian
+        status pipe. The caller owns both descriptors. It must send the framed
+        launch payload (see :func:`_encode_launch_payload`) and close
+        ``ack_write`` once the trainer identity is durably persisted.
+        ``status_read`` yields ``b"X"`` as soon as the trainer root exits and
+        then ``b"D"`` when the guardian had to reap descendants, otherwise
+        EOF. Waiting for descendant cleanup after ``b"X"`` is outside the
+        trainer wallclock budget.
 
     Raises:
         _LaunchDeadlineExpired: The launch deadline expired before the
@@ -1207,7 +1269,7 @@ def _spawn_blocked_supervisor(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
-            pass_fds=(ready_write, ack_read),
+            pass_fds=(ready_write, ack_read, *gpu_lease_fds),
         )
         closed_fd = ready_write
         ready_write = -1
@@ -1216,28 +1278,32 @@ def _spawn_blocked_supervisor(
         ack_read = -1
         os.close(closed_fd)
 
-        pgid = _register(proc)
-        ready_timeout = _SUPERVISOR_READY_TIMEOUT_SECONDS
+        ready_deadline = time.monotonic() + _SUPERVISOR_READY_TIMEOUT_SECONDS
         if deadline is not None:
-            ready_timeout = min(ready_timeout, max(0.0, deadline - time.monotonic()))
-        readable, _, _ = select.select(
-            [ready_read],
-            [],
-            [],
-            ready_timeout,
+            ready_deadline = min(ready_deadline, deadline)
+        ready_frame = _read_pipe_frame(
+            ready_read,
+            1 + _supervisor._READY_PID_WIDTH,
+            deadline=ready_deadline,
         )
-        if not readable and deadline is not None and time.monotonic() >= deadline:
+        if ready_frame is None and deadline is not None and time.monotonic() >= deadline:
             raise _LaunchDeadlineExpired(
                 "trial launch deadline expired while waiting for the supervisor",
                 pid=proc.pid,
             )
-        # Written by phasesweep.runtime.supervisor.main's os.write(ready_fd, b"R").
-        if not readable or os.read(ready_read, 1) != b"R":
+        if ready_frame is None or not ready_frame.startswith(b"R"):
             raise RuntimeError("trial supervisor did not become ready before launch")
-        closed_fd = ready_read
+        try:
+            trainer_pid = int(ready_frame[1:].decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("trial supervisor reported an invalid trainer PID") from exc
+        if trainer_pid <= 0:
+            raise RuntimeError("trial supervisor reported an invalid trainer PID")
+        pgid = trainer_pid
+        _register(proc, pgid=pgid)
+        status_read = ready_read
         ready_read = -1
-        os.close(closed_fd)
-        return proc, pgid, ack_write
+        return proc, pgid, ack_write, status_read
     except Exception as exc:
         if ack_write >= 0:
             closed_fd = ack_write
@@ -1264,6 +1330,7 @@ def run_supervised(
     trial_dir: Path,
     attempt_id: str,
     cwd: str | None = None,
+    gpu_lease_fds: Collection[int] = (),
 ) -> ProcessResult:
     """Launch a shell command in its own process group with full lifecycle management.
 
@@ -1272,8 +1339,9 @@ def run_supervised(
     supervisor waits on an inherited acknowledgement pipe while the parent
     atomically persists ``process_identity.json``. Only after the identity is
     durable does the parent send the trainer command and full trainer
-    environment to the supervisor as a framed JSON payload, which the
-    supervisor then execs the trainer command under. If the parent dies
+    environment to the supervisor as a framed JSON payload. The supervisor
+    then stays alive outside the trainer's process group as a lease guardian
+    while a descriptor-scrubbed child executes the trainer command. If the parent dies
     before delivering that payload, pipe EOF makes the supervisor exit
     without starting training.
 
@@ -1291,12 +1359,18 @@ def run_supervised(
     capped to the remaining budget, the deadline is re-checked after
     identity persistence and *before* the trainer payload crosses the ack
     pipe — an expired deadline aborts the blocked supervisor and returns a
-    timeout without ever starting the trainer — and the final ``proc.wait``
-    uses the recomputed remainder, never the original duration. Cleanup
-    grace after a timeout is explicitly post-deadline time.
+    timeout without ever starting the trainer — and the wait for the trainer
+    root uses the recomputed remainder, never the original duration. Cleanup
+    grace after a timeout or an in-budget root exit is explicitly
+    post-deadline time.
+
+    Once the supervisor is spawned, launch failures — an expired deadline, a
+    failed identity write, a failed payload delivery — never propagate: the
+    group is terminated and the failure is reported through the returned
+    :class:`ProcessResult`.
 
     Args:
-        cmd: Shell command string the acknowledged supervisor execs with ``/bin/sh``.
+        cmd: Shell command string the acknowledged supervisor runs with ``/bin/sh``.
         env: Full process environment for the subprocess.
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
@@ -1308,12 +1382,22 @@ def run_supervised(
             exec'ing the trainer, delivered over the ack pipe with the rest
             of the launch payload (review v0.5.17 / blocker 4). ``None``
             keeps the invocation cwd.
+        gpu_lease_fds: Open host GPU-lock descriptors inherited by the trusted
+            supervisor guardian, not its trainer child. The orchestrator
+            closes only its copies; the guardian retains each lock until the
+            entire trainer process group is gone even if trainer code closes
+            every unknown descriptor or its root shell exits before a worker.
 
     Returns:
         :class:`ProcessResult` capturing return code, wall-clock duration,
         timeout flag, ``failure_reason`` (set on timeout or descendant
         survival), and ``cleanup_confirmed`` (``False`` when SIGKILL did not
         confirm the group is gone).
+
+    Raises:
+        RuntimeError: The supervisor never signalled readiness, or signalled an
+            unexpected byte, so no process group was ever created.
+        OSError: The supervisor process or its pipes could not be created.
 
     """
     import time
@@ -1339,18 +1423,30 @@ def run_supervised(
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     ack_write: int | None = None
+    status_read: int | None = None
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
 
     try:
         with defer_shutdown_signals(), _launch_lock:
-            proc, pgid, ack_write = _spawn_blocked_supervisor(
+            # Advance durably before Popen. Without this boundary, a spawned
+            # supervisor whose identity write and cleanup both fail is
+            # indistinguishable on recovery from a worker killed while still
+            # queued for a GPU (both otherwise leave ``allocated`` and no
+            # process_identity.json).
+            write_attempt_lifecycle(
+                trial_dir,
+                attempt_id=attempt_id,
+                state="launching",
+            )
+            proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
                 stdout=stdout,
                 stderr=stderr,
                 deadline=deadline,
+                gpu_lease_fds=gpu_lease_fds,
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,
-                pid=proc.pid,
+                pid=pgid,
                 pgid=pgid,
             )
             _write_process_identity(identity_path, identity)
@@ -1361,7 +1457,7 @@ def run_supervised(
                 # v0.5.16 / blocker 6).
                 raise _LaunchDeadlineExpired(
                     "trial launch deadline expired before the trainer payload was delivered",
-                    pid=proc.pid,
+                    pid=pgid,
                 )
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
@@ -1372,6 +1468,9 @@ def run_supervised(
     except _LaunchDeadlineExpired as exc:
         if ack_write is not None:
             os.close(ack_write)
+        if status_read is not None:
+            os.close(status_read)
+            status_read = None
         cleanup_confirmed = exc.cleanup_confirmed
         pid = exc.pid
         return_code = -9
@@ -1379,7 +1478,7 @@ def run_supervised(
             # Raised at the pre-payload recheck: the supervisor is still
             # blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
-            pid = proc.pid
+            pid = pgid if pgid is not None else proc.pid
             if proc.returncode is not None:
                 return_code = proc.returncode
         if cleanup_confirmed:
@@ -1400,6 +1499,9 @@ def run_supervised(
     except Exception as exc:
         if ack_write is not None:
             os.close(ack_write)
+        if status_read is not None:
+            os.close(status_read)
+            status_read = None
         if proc is None:
             raise
         target_pgid = pgid if pgid is not None else proc.pid
@@ -1426,7 +1528,7 @@ def run_supervised(
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
             timed_out=False,
-            pid=proc.pid,
+            pid=pgid if pgid is not None else proc.pid,
             duration_seconds=duration,
             failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
@@ -1434,28 +1536,60 @@ def run_supervised(
 
     assert proc is not None
     assert pgid is not None
+    assert status_read is not None
 
     timed_out = False
     failure_reason: str | None = None
     cleanup_confirmed = True
 
     try:
-        try:
-            # Recompute the remainder: the original duration would silently
-            # extend the budget by however long launch bookkeeping took
-            # (review v0.5.16 / blocker 6).
-            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+        root_status: bytes | None
+        if deadline is None:
+            root_status = os.read(status_read, 1)
+        else:
+            root_status = _read_pipe_frame(status_read, 1, deadline=deadline)
+        if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
             failure_reason = f"timeout after {timeout}s"
-            log.warning("Trial PID %d (pgid %d) timed out — terminating group", proc.pid, pgid)
+            log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
+            # The trainer root exited within its budget. Descendant cleanup is
+            # lifecycle teardown, so the guardian's SIGTERM/SIGKILL grace must
+            # not retroactively turn this into a wallclock timeout.
+            guardian_exited = _wait_for_guardian_exit(proc)
+            guardian_status = None
+            if guardian_exited:
+                guardian_status = (
+                    os.read(status_read, 1)
+                    if root_status == _supervisor._TRAINER_ROOT_EXITED
+                    else root_status
+                )
+                os.close(status_read)
+                status_read = None
+            else:
+                cleanup_confirmed = False
+                failure_reason = (
+                    f"trainer root exited, but lease guardian {proc.pid} could not "
+                    "confirm descendant cleanup within its bounded allowance"
+                )
+            if guardian_status == _supervisor._DESCENDANTS_REAPED:
+                failure_reason = (
+                    f"root process exited with code {proc.returncode}, "
+                    f"but process group {pgid} still had live descendants"
+                )
+                log.warning(
+                    "Trial PID %d exited with code %s but process group %d "
+                    "still had live descendants; the lease guardian terminated them",
+                    pgid,
+                    proc.returncode,
+                    pgid,
+                )
             # Root process exited normally. That is not sufficient — the trial
             # is only clean once the entire process group is gone. A common
             # pathological case: `python launcher.py &` exits immediately while
             # the training worker stays alive holding GPU memory.
-            if _process_group_alive(pgid):
+            if failure_reason is None and _process_group_alive(pgid):
                 failure_reason = (
                     f"root process exited with code {proc.returncode}, "
                     f"but process group {pgid} still had live descendants"
@@ -1463,13 +1597,15 @@ def run_supervised(
                 log.warning(
                     "Trial PID %d exited with code %s but process group %d "
                     "still has live descendants — terminating group",
-                    proc.pid,
+                    pgid,
                     proc.returncode,
                     pgid,
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
 
     finally:
+        if status_read is not None:
+            os.close(status_read)
         _unregister(pgid)
 
     # The identity record is deliberately RETAINED on clean exit (review
@@ -1490,7 +1626,7 @@ def run_supervised(
     return ProcessResult(
         return_code=proc.returncode if proc.returncode is not None else -9,
         timed_out=timed_out,
-        pid=proc.pid,
+        pid=pgid,
         duration_seconds=duration,
         failure_reason=failure_reason,
         cleanup_confirmed=cleanup_confirmed,
@@ -1511,6 +1647,46 @@ class _ProcStat:
     starttime: int
 
 
+@dataclass(frozen=True)
+class _GroupMemberScan:
+    """One procfs group scan with the evidence needed for a safe death verdict."""
+
+    pids: tuple[int, ...]
+    complete: bool
+    all_members_terminal: bool
+
+
+def _read_proc_stat_result(proc_entry: Path) -> tuple[_ProcStat | None, bool]:
+    """Read one proc stat and distinguish disappearance from unreadability.
+
+    :param Path proc_entry: ``/proc/<pid>`` directory to inspect.
+    :return tuple: Parsed stat plus ``True`` when the read was conclusive.
+        A vanished PID is conclusively absent; permission, I/O, or parse
+        failures are incomplete evidence.
+    """
+    try:
+        data = (proc_entry / "stat").read_bytes()
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None, False
+    rest = data[rparen + 1 :].strip().split()
+    if len(rest) < 20:
+        return None, False
+    try:
+        stat = _ProcStat(
+            state=rest[0].decode("ascii"),
+            pgrp=int(rest[2]),
+            starttime=int(rest[19]),
+        )
+    except (UnicodeDecodeError, ValueError):
+        return None, False
+    return stat, True
+
+
 def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     """Parse the proc stat fields phasesweep uses for liveness checks.
 
@@ -1518,20 +1694,8 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     :return _ProcStat | None: Parsed state, process group, and starttime, or ``None`` when
         unreadable.
     """
-    try:
-        data = (proc_entry / "stat").read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
-    rparen = data.rfind(b")")
-    if rparen < 0:
-        return None
-    rest = data[rparen + 1 :].strip().split()
-    if len(rest) < 20:
-        return None
-    try:
-        return _ProcStat(state=rest[0].decode("ascii"), pgrp=int(rest[2]), starttime=int(rest[19]))
-    except (UnicodeDecodeError, ValueError):
-        return None
+    stat, _complete = _read_proc_stat_result(proc_entry)
+    return stat
 
 
 def read_proc_starttime(pid: int) -> int | None:
@@ -1571,58 +1735,6 @@ def is_pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # exists but owned by another user
-
-
-def is_same_process(pid: int, saved_starttime: int | None) -> bool:
-    """Check whether `pid` is the same process that recorded `saved_starttime`.
-
-    When no starttime was recorded, this falls back to a PID-alive check. When
-    a starttime was recorded but the current proc entry is unreadable, identity
-    is unknown and this fails closed instead of treating the PID as a match.
-
-    Args:
-        pid: PID read from a stale ``trial_dir/pid`` file.
-        saved_starttime: Starttime read from the matching ``pid_starttime``
-            file, or ``None`` if unavailable.
-
-    Returns:
-        ``True`` if ``pid`` is alive AND (no saved starttime, OR the current
-        ``/proc`` starttime matches the saved value). ``False`` if the PID is
-        dead, has been reused by an unrelated process, or cannot be verified.
-
-    """
-    if not is_pid_alive(pid):
-        return False
-    if saved_starttime is None:
-        # No starttime to verify — fall back to alive-only (best effort).
-        return True
-    current_starttime = read_proc_starttime(pid)
-    if current_starttime is None:
-        return False
-    return current_starttime == saved_starttime
-
-
-def is_pid_zombie(pid: int) -> bool:
-    """Return whether ``pid`` is a zombie (exited but not yet reaped by its parent).
-
-    A zombie still answers ``kill(pid, 0)`` because it occupies the PID table,
-    so :func:`is_pid_alive` and :func:`is_same_process` both report it as alive.
-    For a liveness decision it is effectively dead — it holds no resources and
-    is doing no work. This reads ``/proc/<pid>/stat`` (state is the first field
-    after the ``)`` that closes ``comm``) and returns ``True`` only for state
-    ``Z``. On non-Linux (no ``/proc``) it returns ``False``, preserving the
-    legacy alive-only semantics used elsewhere.
-
-    Args:
-        pid: Process ID to probe.
-
-    Returns:
-        ``True`` if the process exists and is a zombie; ``False`` if it is live,
-        gone, or undeterminable (non-Linux).
-
-    """
-    stat = _read_proc_stat(Path("/proc") / str(pid))
-    return stat is not None and stat.state == "Z"
 
 
 def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
@@ -1862,7 +1974,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
             log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
-        members[pgid] = set(_group_member_pids(pgid))
+        members[pgid] = set(_group_member_pids(pgid).pids)
         pending.append(pgid)
 
     deadline = time.monotonic() + grace_seconds
@@ -1903,7 +2015,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
                 confirmed[pgid] = True
         survivors = still_alive
         if survivors:
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     for pgid in survivors:
         log.error("Process group %d still appears alive after SIGKILL", pgid)
@@ -1985,41 +2097,89 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     if not proc_root.exists():
         return True
     if member_pids is None:
-        return _member_pids_alive(pgid, _group_member_pids(pgid))
+        scan = _group_member_pids(pgid)
+        if _member_pids_alive(pgid, scan.pids):
+            return True
+        if not scan.complete:
+            return True
+        if scan.all_members_terminal:
+            return False
+        # killpg proved the group existed, but a complete scan found no stable
+        # inspectable member. Re-check the kernel verdict; continued existence
+        # is uncertainty, not proof of death.
+        return _process_group_exists(pgid)
     if _member_pids_alive(pgid, member_pids):
         return True
-    refreshed = set(_group_member_pids(pgid))
+    scan = _group_member_pids(pgid)
+    refreshed = set(scan.pids)
     member_pids.clear()
     member_pids.update(refreshed)
-    return _member_pids_alive(pgid, member_pids)
+    if _member_pids_alive(pgid, member_pids):
+        return True
+    if not scan.complete:
+        return True
+    if scan.all_members_terminal:
+        return False
+    return _process_group_exists(pgid)
 
 
-def _group_member_pids(pgid: int) -> list[int]:
-    """Return current ``/proc`` PIDs that belong to process group ``pgid``.
+def _group_member_pids(pgid: int) -> _GroupMemberScan:
+    """Return current ``/proc`` members plus scan completeness.
 
     :param int pgid: Process-group ID to find under ``/proc``.
-    :return list[int]: PIDs currently reporting membership in ``pgid``.
+    :return _GroupMemberScan: PIDs reporting membership, whether every proc
+        entry was inspectable, and whether all observed members were zombies
+        or exited.
     """
     proc_root = Path("/proc")
     if not proc_root.exists():
-        return []
+        return _GroupMemberScan(pids=(), complete=False, all_members_terminal=False)
     member_pids: list[int] = []
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        stat = _read_proc_stat(entry)
-        if stat is None:
-            continue
-        if stat.pgrp == pgid:
-            member_pids.append(int(entry.name))
-    return member_pids
+    all_members_terminal = True
+    complete = True
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            stat, conclusive = _read_proc_stat_result(entry)
+            pid = int(entry.name)
+            if not conclusive:
+                # Hardened procfs mounts commonly hide processes owned by
+                # other users. An unreadable host-global entry is irrelevant
+                # when the kernel can still prove it belongs to another group;
+                # only a possibly-matching entry makes this scan incomplete.
+                try:
+                    unreadable_pgid = os.getpgid(pid)
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                if unreadable_pgid != pgid:
+                    continue
+                member_pids.append(pid)
+                complete = False
+                all_members_terminal = False
+                continue
+            if stat is None or stat.pgrp != pgid:
+                continue
+            member_pids.append(pid)
+            if stat.state not in {"Z", "X"}:
+                all_members_terminal = False
+    except OSError:
+        complete = False
+    return _GroupMemberScan(
+        pids=tuple(member_pids),
+        complete=complete,
+        all_members_terminal=bool(member_pids) and all_members_terminal,
+    )
 
 
-def _member_pids_alive(pgid: int, member_pids: set[int] | list[int]) -> bool:
+def _member_pids_alive(pgid: int, member_pids: Collection[int]) -> bool:
     """Return whether any known member PID is still live and in ``pgid``.
 
     :param int pgid: Process-group ID each PID must still belong to.
-    :param set[int] | list[int] member_pids: Candidate member PIDs to inspect.
+    :param Collection[int] member_pids: Candidate member PIDs to inspect.
     :return bool: ``True`` when any candidate is a live, non-zombie member.
     """
     for pid in member_pids:

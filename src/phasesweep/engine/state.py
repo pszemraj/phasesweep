@@ -5,9 +5,10 @@ from __future__ import annotations
 import contextlib
 import csv
 import hashlib
+import json
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -15,10 +16,22 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import optuna
 import yaml
 
-from phasesweep.config import Experiment, Phase, Suite
+from phasesweep._metadata import __version__
+from phasesweep.config import Experiment, Metric, Phase, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.engine.errors import StudyFingerprintMismatchError
-from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.engine.errors import (
+    PublicationAccessError,
+    PublicationIntegrityError,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
+from phasesweep.runtime.files import (
+    atomic_text_writer,
+    file_sha256,
+    fsync_directory,
+    private_atomic_write_text,
+)
 
 if TYPE_CHECKING:
     from phasesweep.engine.read import PhaseWinnerView
@@ -26,6 +39,9 @@ if TYPE_CHECKING:
 log = logging.getLogger("phasesweep.engine.state")
 
 WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+
+PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
+"""Verdict on a last-success pointer, including inaccessible validation evidence."""
 
 
 @dataclass(frozen=True)
@@ -47,8 +63,8 @@ def _parse_winner_source(
 
     Shared by :func:`_load_winner` (state.py) and
     :func:`phasesweep.engine.read.read_winner`, which differ only in what they
-    do when this raises: the former re-raises as a strict ``RuntimeError``, the
-    latter treats the winner as absent. Callers must validate ``source_kind``
+    do when this raises: the former wraps it as :class:`WinnerIntegrityError`,
+    while the latter treats the winner as absent. Callers must validate ``source_kind``
     against :data:`WinnerSourceKind` themselves before calling this, since each
     site fails differently on an invalid kind.
 
@@ -113,6 +129,14 @@ class Winner:
     # remote summary subset (review v0.5.17 / finding F). None for dry-run
     # placeholders and winners persisted before the record existed.
     objective_provenance: dict[str, Any] | None = None
+    # Identity of the semantic environment the winning trial ran under: the
+    # SHA-256 of its composed trainer environment after explicitly classified
+    # ``passthrough_env`` values are removed, plus the ``inherit_env`` contract.
+    # Variable NAMES stay on the trial attrs — the winner file keeps the
+    # compact identity. None for dry-run placeholders, for winners persisted
+    # before the record existed, and for trials that predate it.
+    trainer_env_digest: str | None = None
+    trainer_inherit_env: str | list[str] | None = None
 
 
 def _winner_source_or_default(
@@ -157,17 +181,44 @@ PHASE_ABORT_ATTR = "phasesweep_phase_abort"
 # later failures form the new recovery streak.
 PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
+# Terminal decision recorded before selecting/publishing a winner from an
+# intentionally incomplete timeout. It makes selection crash-replayable
+# without silently scheduling the trial slots the timeout deliberately left.
+PHASE_DECISION_ATTR = "phasesweep_phase_decision"
+PHASE_DECISION_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance (review v0.5.17 /
 # finding F); written when metric extraction succeeds.
 OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
+# Versioned identity of the exact generated input consumed by the trainer.
+# The record stores only format, trial-relative filename, byte length, and
+# SHA-256; the generated file itself remains the evidence.
+TRAINER_INPUT_ATTR = "phasesweep_trainer_input"
+TRAINER_INPUT_SCHEMA_VERSION = 1
+# SHA-256 of the semantic trainer environment, excluding values explicitly
+# classified under ``execution.passthrough_env``. Written at allocation, so
+# failed trials carry it too. Ambient VALUES are never stored here; the names
+# attr lists the complete base environment (including pass-through names), and
+# raw values land only in the opt-in owner-only ``environment.json``.
+TRAINER_ENV_DIGEST_ATTR = "phasesweep_trainer_env_digest"
+# Sorted list of the variable NAMES in that environment: diagnostic, and
+# non-sensitive by construction.
+TRAINER_ENV_NAMES_ATTR = "phasesweep_trainer_env_names"
 RETURN_CODE_ATTR = "phasesweep_return_code"
 DURATION_ATTR = "phasesweep_duration_s"
 OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# Study-level binding from a persistent study to the one artifact root it
+# publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string
+# (review v0.5.19 / finding F5). ``workdir`` is deliberately outside every
+# semantic fingerprint so a tree stays movable, which without this binding let
+# one study back two divergent publication roots. Claimed on first contact and
+# moved only by ``phasesweep rebind-workdir``; the ``_v1`` suffix leaves room
+# for a future binding payload that is not a bare path string.
+ARTIFACT_ROOT_ATTR = "phasesweep_artifact_root_v1"
 CONSTRAINT_PREFIX = "constraint:"
 
 
@@ -233,6 +284,8 @@ def _trial_dir_for(
     :param str | None generation_id: Current engine invocation id.
     :param str | None attempt_id: Current subprocess attempt id.
     :return Path: Directory for the trial artifacts.
+    :raises ValueError: Exactly one of ``generation_id`` and ``attempt_id`` was
+        supplied; a uniquely scoped directory needs both.
     """
     if generation_id is None and attempt_id is None:
         return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
@@ -256,6 +309,15 @@ def _attempts_dir(experiment: Experiment) -> Path:
     :return Path: Directory containing active-attempt registry entries.
     """
     return _experiment_dir(experiment) / "attempts"
+
+
+def _artifact_root_binding_path(experiment: Experiment) -> Path:
+    """Return the reverse artifact-root-to-storage ownership record.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :return Path: Root binding JSON path inside the experiment namespace.
+    """
+    return _experiment_dir(experiment) / "artifact_root_binding.json"
 
 
 def _generation_path(experiment: Experiment) -> Path:
@@ -296,6 +358,15 @@ def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
     return _generation_dir(experiment, generation_id) / "generation.yaml"
 
 
+# A generation's summary is written only as the last step of a successful run,
+# so its presence is what separates a published generation from a claim-time
+# namespace whose run never got that far. Named once because manifest
+# validation reasons about that distinction for *another* generation's
+# namespace, where the helper below cannot be used (PR #5 review / reviewer 2,
+# blocker 7).
+GENERATION_SUMMARY_FILENAME = "summary.yaml"
+
+
 def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's summary path.
 
@@ -303,7 +374,7 @@ def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path
     :param str generation_id: Immutable generation namespace identifier.
     :return Path: Path to the generation's summary YAML file.
     """
-    return _generation_dir(experiment, generation_id) / "summary.yaml"
+    return _generation_dir(experiment, generation_id) / GENERATION_SUMMARY_FILENAME
 
 
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
@@ -342,18 +413,214 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 2
 SUITE_SUMMARY_SCHEMA_VERSION = 3
+PUBLICATION_POINTER_SCHEMA_VERSION = 2
+# Provenance files frozen into every generation namespace at claim time
+# (review v0.5.18 / finding F6). The summary used to keep only the config
+# *fingerprint*, so once the operator edited or lost the YAML the digest could
+# prove a mismatch but could not reconstruct the search spaces, fixed
+# overrides, contracts, env, or trial command behind a published winner.
+GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
+GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
+# Version 2 added ``generation_id_source`` (PR #5 review / P2 missing-handle
+# authority): "caller" marks a generation whose identity -- and therefore
+# launch authority -- was granted by an external launcher, durably enough to
+# survive the loss of that launcher's own state directory.
+REPRODUCIBILITY_SCHEMA_VERSION = 2
+
+GenerationIdSource = Literal["caller", "engine"]
+"""Who supplied a generation's identity: an external launcher, or the engine."""
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
+# Manifest kinds that name a file in the generation namespace root rather than
+# a phase. Their entries carry ``path`` instead of ``phase``; a generation
+# published before finding F6 lists neither kind and holds neither file, which
+# is exactly what keeps it valid under the same "listed if and only if
+# present" invariant.
+_GENERATION_FILE_FILENAMES = {
+    "config_snapshot": GENERATION_CONFIG_SNAPSHOT_FILENAME,
+    "reproducibility": GENERATION_REPRODUCIBILITY_FILENAME,
+}
+_MANIFEST_GENERATION_FILE_KINDS = frozenset(_GENERATION_FILE_FILENAMES)
 
 
-def _file_sha256(path: Path) -> str:
-    """Return the SHA-256 hex digest of one file's bytes.
+def _generation_config_snapshot_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's canonical config snapshot path.
 
-    :param Path path: File to hash.
-    :return str: 64-character hex digest.
-    :raises OSError: The file cannot be read.
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's owner-only ``config.snapshot.yaml``.
     """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return _generation_dir(experiment, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
+
+
+def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
+    """Return one generation's shareable reproducibility-record path.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param str generation_id: Immutable generation namespace identifier.
+    :return Path: Path to the generation's ``reproducibility.json``.
+    """
+    return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
+
+
+def _phase_config_fingerprint(phase: Phase) -> str:
+    """Hash one phase's configured semantics, independent of any winner.
+
+    This is exactly the per-phase element
+    :func:`phasesweep.engine.guards._experiment_semantic_fingerprint` folds
+    into its own digest, hashed on its own so a reproducibility record can
+    localize *which* phase's configuration differs between two generations.
+    It is deliberately not ``winner.yaml``'s ``phase_fingerprint``, which
+    additionally binds each inherited winner's effective overrides and
+    therefore cannot exist before any phase has run.
+
+    :param Phase phase: Phase whose configured semantics are hashed.
+    :return str: SHA-256 hex digest (64 characters) of the canonicalised payload.
+    """
+    # Deferred: ``engine.guards`` imports this module, so a module-level import
+    # here would be circular (same pattern as :func:`_load_winner`).
+    from phasesweep.engine.guards import (
+        EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        _semantic_payload_digest,
+        _semantic_phase_dump,
+    )
+
+    payload = {
+        "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        "name": phase.name,
+        **_semantic_phase_dump(phase),
+    }
+    return _semantic_payload_digest(payload)
+
+
+def _write_generation_provenance(
+    experiment: Experiment,
+    generation_id: str,
+    *,
+    caller_owned_id: bool,
+) -> None:
+    """Freeze the configuration and provenance that produced one generation.
+
+    Written at claim time, immediately after the namespace is created and
+    before any lifecycle state exists, so a generation that later fails still
+    records what configuration ran (review v0.5.18 / finding F6). Two files
+    land side by side:
+
+    * ``config.snapshot.yaml`` -- the canonicalized effective config rendered
+      as YAML. It is the engine's execution view, *not* a copy of the
+      operator's file: key order is normalized, defaults are materialized,
+      comments are not preserved, and an omitted ``execution.cwd`` is frozen
+      as the resolved invocation directory the trainer inherited. Because
+      ``env:`` may hold secrets it is written owner-only (0600) through the
+      private atomic writer, even though its directory is deliberately
+      operator-readable (see the trust-boundary note in ``docs/runtime.md``).
+    * ``reproducibility.json`` -- an ordinary umask-governed artifact that is
+      safe to read and share: versions, the semantic fingerprints, the
+      operator-declared ``provenance`` mapping (public by design), and the
+      SHA-256 of the snapshot's bytes. Digests, never values: no env values,
+      no ambient values, and nothing from the snapshot's contents beyond its
+      digest.
+
+    Both files are picked up by :func:`_generation_artifact_manifest` and are
+    therefore hash-covered by the publication manifest.
+
+    ``reproducibility.json`` also records ``generation_id_source``: whether the
+    generation's identity was supplied by an external launcher (``"caller"``)
+    or minted by the engine (``"engine"``). A launcher that grants an identity
+    also freezes that run's authority (e.g. the MCP server's winner-visibility
+    grant) in its own state; recording the grant's *existence* here, in the
+    artifact tree the results live in, lets readers detect that frozen
+    authority is unaccounted for even after the launcher's state directory is
+    deleted or replaced (PR #5 review / P2 missing-handle authority).
+
+    :param Experiment experiment: Experiment whose configuration is frozen.
+    :param str generation_id: Freshly claimed generation namespace to write into.
+    :param bool caller_owned_id: Whether ``generation_id`` was supplied by the
+        caller rather than minted by the engine.
+    :raises OSError: Either file could not be written; the claim must fail
+        rather than run a generation whose configuration is unrecorded.
+    :raises phasesweep.runtime.files.UnsafePrivatePathError: Something already
+        occupies the snapshot path and is not a private, unshared regular file.
+    :raises yaml.YAMLError: The canonicalized config could not be serialized.
+    """
+    # Deferred for the same reason as in :func:`_phase_config_fingerprint`.
+    from phasesweep.engine.guards import (
+        EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+        FINGERPRINT_SCHEMA_VERSION,
+        _execution_identity,
+        _experiment_semantic_fingerprint,
+    )
+
+    snapshot_path = _generation_config_snapshot_path(experiment, generation_id)
+    snapshot = experiment.model_dump(mode="json")
+    snapshot["execution"]["cwd"] = _execution_identity(experiment)["cwd"]
+    private_atomic_write_text(
+        snapshot_path,
+        yaml.safe_dump(snapshot, sort_keys=False),
+        require_private_dir=False,
+    )
+    _write_json_atomic(
+        _generation_reproducibility_path(experiment, generation_id),
+        {
+            "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
+            "experiment": experiment.experiment,
+            "generation_id": generation_id,
+            "generation_id_source": "caller" if caller_owned_id else "engine",
+            "phasesweep_version": __version__,
+            "schema_versions": {
+                "reproducibility": REPRODUCIBILITY_SCHEMA_VERSION,
+                "generation_summary": GENERATION_SUMMARY_SCHEMA_VERSION,
+                "study_storage": STUDY_SCHEMA_VERSION,
+                "experiment_fingerprint": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+                "phase_fingerprint": FINGERPRINT_SCHEMA_VERSION,
+            },
+            "config_fingerprint": _experiment_semantic_fingerprint(experiment),
+            "phase_config_fingerprints": [
+                {"name": phase.name, "sha256": _phase_config_fingerprint(phase)}
+                for phase in experiment.phases
+            ],
+            "provenance": dict(sorted(experiment.provenance.items())),
+            "config_snapshot": {
+                "path": GENERATION_CONFIG_SNAPSHOT_FILENAME,
+                "sha256": file_sha256(snapshot_path),
+            },
+        },
+    )
+
+
+def generation_id_source(experiment: Experiment, generation_id: str) -> GenerationIdSource | None:
+    """Return who supplied one generation's identity, or ``None`` when unrecorded.
+
+    Reads the ``generation_id_source`` field frozen into the generation's
+    ``reproducibility.json`` at claim time. ``"caller"`` means an external
+    launcher granted the identity and holds that run's frozen authority record;
+    a reader that cannot load that record must not substitute mutable current
+    policy for it (PR #5 review / P2 missing-handle authority). ``None`` covers
+    every record that does not positively answer the question: no
+    reproducibility file (generations claimed before the file existed), a
+    pre-version-2 record without the field, or an unreadable/malformed file.
+    ``None`` deliberately does not fail closed -- absence is the normal state
+    of every legacy tree, and tampering with the file inside the artifact tree
+    is already surfaced as a failed publication by the manifest check (and a
+    writer there could read the winner files directly anyway).
+
+    :param Experiment experiment: Experiment whose artifact tree holds the generation.
+    :param str generation_id: Generation namespace identifier to look up.
+    :return GenerationIdSource | None: ``"caller"``, ``"engine"``, or ``None``
+        when no valid record answers.
+    """
+    if not SAFE_NAME_PATTERN.fullmatch(generation_id):
+        return None
+    try:
+        payload = json.loads(
+            _generation_reproducibility_path(experiment, generation_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    source = payload.get("generation_id_source")
+    return cast("GenerationIdSource", source) if source in ("caller", "engine") else None
 
 
 def _generation_artifact_manifest(
@@ -367,13 +634,25 @@ def _generation_artifact_manifest(
     phase). The namespace is exclusively claimed by this invocation, so
     everything present is this run's own output.
 
+    The namespace-root provenance files written at claim time
+    (:func:`_write_generation_provenance`) are listed first, under entries
+    that carry ``path`` instead of ``phase``. They are absent -- and so
+    unlisted -- in generations published before finding F6.
+
     :param Experiment experiment: Experiment whose generation is summarized.
     :param str generation_id: Immutable generation namespace to scan.
-    :return list[dict[str, str]]: One ``{"kind", "phase", "sha256"}`` entry
-        per winner/promotion artifact, ordered by phase then kind.
+    :return list[dict[str, str]]: One ``{"kind", "path", "sha256"}`` entry per
+        namespace-root provenance file, then one ``{"kind", "phase",
+        "sha256"}`` entry per winner/promotion artifact ordered by phase then
+        kind.
     """
-    phases_dir = _generation_dir(experiment, generation_id) / "phases"
+    generation_dir = _generation_dir(experiment, generation_id)
     items: list[dict[str, str]] = []
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        artifact = generation_dir / filename
+        if artifact.is_file():
+            items.append({"kind": kind, "path": filename, "sha256": file_sha256(artifact)})
+    phases_dir = generation_dir / "phases"
     if not phases_dir.is_dir():
         return items
     for phase_dir in sorted(phases_dir.iterdir()):
@@ -383,9 +662,32 @@ def _generation_artifact_manifest(
             artifact = phase_dir / _ARTIFACT_FILENAMES[kind]
             if artifact.is_file():
                 items.append(
-                    {"kind": kind, "phase": phase_dir.name, "sha256": _file_sha256(artifact)}
+                    {"kind": kind, "phase": phase_dir.name, "sha256": file_sha256(artifact)}
                 )
     return items
+
+
+def _unreadable_artifact_permission_detail(subject: str) -> str:
+    """Build the manifest-failure detail for an artifact this user may not read.
+
+    A permission denial is not corruption, and reporting it as corruption sends
+    the operator to inspect or restore a namespace that is perfectly healthy
+    (re-review v0.5.19 / observation N1). Every generation's
+    ``config.snapshot.yaml`` is owner-only, so a second operator reading a
+    sound tree hits exactly this case; the verdict still fails closed -- an
+    unvalidatable publication may not be reported as published -- but the
+    remedy named is the publishing user, not the restore procedure.
+
+    :param str subject: Artifact that could not be read, named by role
+        (e.g. ``"config_snapshot artifact"``), never by path.
+    :return str: Bare reason clause for the caller's manifest-validation error.
+    """
+    return (
+        f"{subject} is not readable as this user (permission denied): validation cannot run "
+        "without it, and a generation's config.snapshot.yaml is deliberately owner-only, so "
+        "only the publishing user can fully validate this tree -- re-read it as that user "
+        "before treating this publication as corrupt"
+    )
 
 
 def _validate_generation_manifest(
@@ -402,21 +704,51 @@ def _validate_generation_manifest(
     manifest does not list. Runs both pre-commit (before the last-success
     pointer may advance) and on every read before a pointer target is trusted.
 
+    The manifest covers two kinds of artifact: phase-scoped winners and
+    promotion decisions (``kind`` + ``phase``), and the namespace-root
+    provenance files frozen at claim time (``kind`` + ``path``; see
+    :func:`_validate_generation_provenance_files`, review v0.5.18 / finding
+    F6). Both obey the same listed-if-and-only-if-present rule, which is what
+    keeps a generation published before either existed valid without a schema
+    bump.
+
+    A winner carried forward from an earlier generation additionally has that
+    generation resolved in this same tree
+    (:func:`_validate_winner_source_generation`, PR #5 review / reviewer 2,
+    blocker 7): the cited namespace holds the evidence behind the number, so a
+    publication whose source generation is absent - or which disagrees with the
+    winner that source published - is not a result this tree can stand behind.
+
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
-        only for error text; ownership is checked by the caller).
+        for error text and to tell a carried-forward winner from a local one;
+        ownership is checked by the caller).
     :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :raises RuntimeError: The manifest is missing, malformed, or any artifact
-        is absent, altered, unparsable, or inconsistent with the summary.
+    :raises PublicationAccessError: An artifact cannot be read by the current user.
+    :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
+        absent, altered, unparsable, or inconsistent with the summary, or a
+        winner cites a source generation this tree does not hold.
     """
 
-    def _fail(reason: str) -> RuntimeError:
+    def _fail(reason: str) -> PublicationIntegrityError:
         """Build one uniformly labeled manifest-validation error.
 
         :param str reason: Specific validation failure being reported.
-        :return RuntimeError: Error naming the generation and the reason.
+        :return PublicationIntegrityError: Error naming the generation and reason.
         """
-        return RuntimeError(f"Generation {generation_id!r} manifest validation failed: {reason}")
+        return PublicationIntegrityError(
+            f"Generation {generation_id!r} manifest validation failed: {reason}"
+        )
+
+    def _permission_fail(reason: str) -> PublicationAccessError:
+        """Build a permission-specific manifest-validation error.
+
+        :param str reason: Permission failure being reported.
+        :return PublicationAccessError: Error naming the generation and reason.
+        """
+        return PublicationAccessError(
+            f"Generation {generation_id!r} manifest validation could not run: {reason}"
+        )
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
@@ -432,18 +764,31 @@ def _validate_generation_manifest(
     if not isinstance(raw_artifacts, list):
         raise _fail("summary has no artifact manifest")
     listed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    listed_files: dict[str, Mapping[str, Any]] = {}
     for entry in raw_artifacts:
-        if (
-            not isinstance(entry, Mapping)
-            or entry.get("kind") not in _MANIFEST_ARTIFACT_KINDS
-            or not isinstance(entry.get("phase"), str)
-            or not isinstance(entry.get("sha256"), str)
-        ):
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("sha256"), str):
             raise _fail("summary artifact entry is malformed")
-        key = (str(entry["kind"]), str(entry["phase"]))
+        kind = entry.get("kind")
+        if kind in _MANIFEST_GENERATION_FILE_KINDS:
+            if entry.get("path") != _GENERATION_FILE_FILENAMES[str(kind)]:
+                raise _fail(f"{kind} manifest entry names an unexpected path")
+            if str(kind) in listed_files:
+                raise _fail(f"duplicate artifact entry for {kind}")
+            listed_files[str(kind)] = entry
+            continue
+        if kind not in _MANIFEST_ARTIFACT_KINDS or not isinstance(entry.get("phase"), str):
+            raise _fail("summary artifact entry is malformed")
+        key = (str(kind), str(entry["phase"]))
         if key in listed:
             raise _fail(f"duplicate artifact entry for {key}")
         listed[key] = entry
+    _validate_generation_provenance_files(
+        generation_dir,
+        summary,
+        listed_files,
+        _fail,
+        _permission_fail,
+    )
 
     raw_phases = summary.get("phases")
     if not isinstance(raw_phases, list):
@@ -479,6 +824,10 @@ def _validate_generation_manifest(
         artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
         try:
             content = artifact_path.read_bytes()
+        except PermissionError as exc:
+            raise _permission_fail(
+                _unreadable_artifact_permission_detail(f"{kind} artifact for phase {name!r}")
+            ) from exc
         except OSError as exc:
             raise _fail(f"{kind} artifact for phase {name!r} is missing or unreadable") from exc
         if hashlib.sha256(content).hexdigest() != entry["sha256"]:
@@ -517,6 +866,15 @@ def _validate_generation_manifest(
                         f"winner for phase {name!r} has a winner_source "
                         f"that disagrees with its {id_field}"
                     )
+            _validate_winner_source_generation(
+                generation_dir,
+                generation_id,
+                name,
+                source.get("phase"),
+                payload,
+                _fail,
+                _permission_fail,
+            )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
         elif name in decision_items:
@@ -538,24 +896,242 @@ def _validate_generation_manifest(
                     )
 
 
-def _generation_manifest_is_valid(
+def _validate_winner_source_generation(
     generation_dir: Path,
     generation_id: str,
+    phase_name: str,
+    source_phase: object,
+    payload: Mapping[str, Any],
+    fail: Callable[[str], PublicationIntegrityError],
+    permission_fail: Callable[[str], PublicationAccessError],
+) -> None:
+    """Require a carried-forward winner's source generation to exist in this tree.
+
+    A winner's own ``generation_id`` may legitimately name an earlier
+    generation - a top-up that reselects an existing trial, or a ``--from-phase``
+    resume that reuses a validated parent winner - and the manifest deliberately
+    checks that field for well-formedness only. That left the whole
+    cross-generation claim unverified: a published winner could cite a
+    generation that exists only in some *other* artifact tree, or no tree at
+    all, and the publication still validated as ``ok`` (PR #5 review /
+    reviewer 2, blocker 7). The cited namespace is where the evidence behind
+    that number lives, so it has to resolve here.
+
+    Deviating deliberately from a blanket "the source must also hold a winner
+    record for this phase": a crash between trial completion and publication
+    leaves a claim-time namespace - provenance files, no summary - whose trials
+    a later top-up legitimately publishes first, citing that crashed
+    generation. Requiring a winner record there would make ordinary crash
+    recovery permanently unpublishable. So the record is required exactly when
+    the source generation itself published (it has a summary); an unpublished
+    source needs only to exist. Directory existence alone already enforces the
+    same-tree invariant, and the summary carve-out still catches a published
+    source that lost its winner record.
+
+    :param Path generation_dir: The publishing generation's namespace directory.
+    :param str generation_id: The publishing generation's own id.
+    :param str phase_name: Phase exposing the winner being validated.
+    :param object source_phase: Recorded phase that owns the source winner artifact.
+    :param Mapping[str, Any] payload: Parsed winner artifact, whose
+        ``generation_id``/``attempt_id``/``trial_number`` the caller has
+        already checked for well-formedness and internal agreement.
+    :param Callable[[str], PublicationIntegrityError] fail: Builder for the caller's
+        uniformly labeled manifest-validation error.
+    :param Callable[[str], PublicationAccessError] permission_fail: Builder for
+        a permission-specific validation error.
+    :raises PublicationAccessError: The source winner cannot be read by the current user.
+    :raises PublicationIntegrityError: Whatever ``fail`` builds, when the cited source
+        generation is unsafely named, absent from this tree, or published a
+        winner record for this phase that disagrees with the carried winner.
+    """
+    source_generation = payload["generation_id"]
+    if source_generation == generation_id:
+        return
+    if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
+        raise fail(f"winner for phase {phase_name!r} has no valid winner_source phase")
+    if not SAFE_NAME_PATTERN.fullmatch(source_generation):
+        # A corrupt or hostile winner could otherwise steer the lookups below
+        # out of the generations root with a traversal component.
+        raise fail(
+            f"winner for phase {phase_name!r} cites source generation "
+            f"{source_generation!r}, which is not a valid generation name"
+        )
+    source_dir = generation_dir.parent / source_generation
+    if not source_dir.is_dir():
+        raise fail(
+            f"winner for phase {phase_name!r} cites source generation "
+            f"{source_generation!r} which does not exist in this tree"
+        )
+    source_winner_path = source_dir / "phases" / source_phase / _ARTIFACT_FILENAMES["winner"]
+    if not source_winner_path.is_file():
+        if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
+            raise fail(
+                f"winner for phase {phase_name!r} cites source generation "
+                f"{source_generation!r}, which published but holds no winner record "
+                f"for source phase {source_phase!r}"
+            )
+        # Unpublished source namespace: the crash-recovery case above.
+        return
+    try:
+        content = source_winner_path.read_bytes()
+    except PermissionError as exc:
+        raise permission_fail(
+            _unreadable_artifact_permission_detail(
+                f"source generation {source_generation!r} winner artifact for phase "
+                f"{source_phase!r}"
+            )
+        ) from exc
+    except OSError as exc:
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{source_phase!r} is missing or unreadable"
+        ) from exc
+    try:
+        source_payload = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{source_phase!r} is not parseable"
+        ) from exc
+    if not isinstance(source_payload, Mapping):
+        raise fail(
+            f"source generation {source_generation!r} winner artifact for phase "
+            f"{source_phase!r} is not a mapping"
+        )
+    expected = {
+        "phase": source_phase,
+        "trial_number": payload.get("trial_number"),
+        "generation_id": source_generation,
+        "attempt_id": payload.get("attempt_id"),
+    }
+    for field_name, expected_value in expected.items():
+        if source_payload.get(field_name) != expected_value:
+            raise fail(
+                f"winner for phase {phase_name!r} disagrees with the winner recorded by its "
+                f"source generation {source_generation!r} on {field_name}"
+            )
+
+
+def _validate_generation_provenance_files(
+    generation_dir: Path,
     summary: Mapping[str, Any],
-) -> bool:
-    """Validate a generation manifest before trusting its publication pointer.
+    listed_files: Mapping[str, Mapping[str, Any]],
+    fail: Callable[[str], PublicationIntegrityError],
+    permission_fail: Callable[[str], PublicationAccessError],
+) -> None:
+    """Validate a generation's claim-time provenance files against its manifest.
+
+    Extends the manifest invariant -- every listed artifact exists and hashes
+    to its recorded content, and the namespace holds nothing the manifest does
+    not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``
+    (review v0.5.18 / finding F6). The two are all-or-nothing: they are
+    written together at claim time, so a manifest that lists one without the
+    other has been edited. A generation published before those files existed
+    lists neither and holds neither, which passes every check here unchanged.
+
+    Note that the snapshot is owner-only, so a reader who cannot read it
+    cannot validate the publication at all -- the same fail-closed outcome as
+    any other unreadable manifest-listed artifact. A permission denial is
+    reported as its own reason rather than as "missing or unreadable"
+    (:func:`_unreadable_artifact_permission_detail`, re-review v0.5.19 /
+    observation N1): a second operator on a healthy tree hits it routinely,
+    and the remedy is the publishing user, not a namespace restore.
 
     :param Path generation_dir: The generation's immutable namespace directory.
-    :param str generation_id: Generation id the summary claims.
-    :param Mapping[str, Any] summary: Parsed generation summary payload.
-    :return bool: Whether the manifest currently validates.
+    :param Mapping[str, Any] summary: Parsed generation summary payload, whose
+        identity the reproducibility record must agree with.
+    :param Mapping[str, Mapping[str, Any]] listed_files: Manifest entries for
+        the namespace-root provenance files, keyed by kind.
+    :param Callable[[str], PublicationIntegrityError] fail: Builder for the caller's
+        uniformly labeled manifest-validation error.
+    :param Callable[[str], PublicationAccessError] permission_fail: Builder for
+        a permission-specific validation error.
+    :raises PublicationAccessError: A provenance file cannot be read by the current user.
+    :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
+        listed without its partner, is absent, unreadable, altered,
+        unparsable, or disagrees with the summary's own identity.
     """
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        if (generation_dir / filename).is_file() and kind not in listed_files:
+            raise fail(f"namespace contains an unlisted {kind} artifact")
+    if not listed_files:
+        return
+    if set(listed_files) != _MANIFEST_GENERATION_FILE_KINDS:
+        raise fail("summary lists only part of the generation provenance record")
+
+    contents: dict[str, bytes] = {}
+    digests: dict[str, str] = {}
+    for kind, filename in _GENERATION_FILE_FILENAMES.items():
+        try:
+            content = (generation_dir / filename).read_bytes()
+        except PermissionError as exc:
+            raise permission_fail(
+                _unreadable_artifact_permission_detail(f"{kind} artifact")
+            ) from exc
+        except OSError as exc:
+            raise fail(f"{kind} artifact is missing or unreadable") from exc
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != listed_files[kind]["sha256"]:
+            raise fail(f"{kind} artifact does not match its recorded hash")
+        contents[kind] = content
+        digests[kind] = digest
+
     try:
-        _validate_generation_manifest(generation_dir, generation_id, summary)
-    except RuntimeError as exc:
-        log.warning("%s", exc)
-        return False
-    return True
+        snapshot = yaml.safe_load(contents["config_snapshot"])
+    except yaml.YAMLError as exc:
+        raise fail("config_snapshot artifact is not parseable") from exc
+    if not isinstance(snapshot, Mapping):
+        raise fail("config_snapshot artifact is not a mapping")
+    if snapshot.get("experiment") != summary.get("experiment"):
+        raise fail("config_snapshot artifact names a different experiment")
+
+    try:
+        record = json.loads(contents["reproducibility"])
+    except ValueError as exc:
+        raise fail("reproducibility artifact is not parseable") from exc
+    if not isinstance(record, Mapping):
+        raise fail("reproducibility artifact is not a mapping")
+    recorded_identity = (record.get("experiment"), record.get("generation_id"))
+    if recorded_identity != (summary.get("experiment"), summary.get("generation_id")):
+        raise fail("reproducibility artifact names a different generation")
+    recorded_snapshot = record.get("config_snapshot")
+    if (
+        not isinstance(recorded_snapshot, Mapping)
+        or recorded_snapshot.get("path") != GENERATION_CONFIG_SNAPSHOT_FILENAME
+        or recorded_snapshot.get("sha256") != digests["config_snapshot"]
+    ):
+        raise fail("reproducibility artifact does not anchor the config snapshot it published")
+
+    if summary.get("config_fingerprint") != record.get("config_fingerprint"):
+        raise fail("summary config fingerprint disagrees with the reproducibility artifact")
+
+    snapshot_phases = snapshot.get("phases")
+    if not isinstance(snapshot_phases, list) or any(
+        not isinstance(phase, Mapping) or not isinstance(phase.get("name"), str)
+        for phase in snapshot_phases
+    ):
+        raise fail("config_snapshot artifact has a malformed phase plan")
+    expected_phase_plan = [
+        {"name": phase["name"], "comment": phase.get("comment")} for phase in snapshot_phases
+    ]
+    if summary.get("phase_plan") != expected_phase_plan:
+        raise fail("summary phase plan disagrees with the config_snapshot artifact")
+
+    try:
+        snapshot_metric = Metric.model_validate(snapshot.get("metric"))
+    except ValueError as exc:
+        raise fail("config_snapshot artifact has malformed metric semantics") from exc
+    if summary.get("metric") != _metric_semantics_payload(snapshot_metric):
+        raise fail("summary metric semantics disagree with the config_snapshot artifact")
+
+
+@dataclass(frozen=True)
+class _PointerTarget:
+    """Validated summary identity carried by one last-success pointer."""
+
+    generation_id: str
+    summary_size_bytes: int
+    summary_sha256: str
 
 
 def _read_pointer_target(
@@ -564,27 +1140,50 @@ def _read_pointer_target(
     id_key: str,
     owner_key: str,
     owner_name: str,
-) -> str | None:
+) -> _PointerTarget | None:
     """Read one last-success pointer's target id, validating the pointer itself.
 
     :param Path pointer_path: Pointer YAML file to read.
     :param str id_key: Payload key holding the target generation id.
     :param str owner_key: Payload key naming the owning experiment or suite.
     :param str owner_name: Expected owner name the pointer must record.
-    :return str | None: A safe-name target id owned by ``owner_name``, or
+    :return _PointerTarget | None: A safe-name target and exact summary-byte identity, or
         ``None`` when the pointer is missing, unreadable, malformed, names
         another owner, or carries an unsafe id.
+    :raises PublicationAccessError: The pointer cannot be read by the current user.
     """
     try:
         payload = yaml.safe_load(pointer_path.read_text())
+    except PermissionError as exc:
+        raise PublicationAccessError(
+            _unreadable_artifact_permission_detail("last-success pointer")
+        ) from exc
     except (OSError, yaml.YAMLError):
         return None
-    if not isinstance(payload, dict) or payload.get(owner_key) != owner_name:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != PUBLICATION_POINTER_SCHEMA_VERSION
+        or payload.get(owner_key) != owner_name
+    ):
         return None
     target_id = payload.get(id_key)
     if not isinstance(target_id, str) or not SAFE_NAME_PATTERN.fullmatch(target_id):
         return None
-    return target_id
+    summary_size_bytes = payload.get("summary_size_bytes")
+    summary_sha256 = payload.get("summary_sha256")
+    if (
+        type(summary_size_bytes) is not int
+        or summary_size_bytes < 0
+        or not isinstance(summary_sha256, str)
+        or len(summary_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in summary_sha256)
+    ):
+        return None
+    return _PointerTarget(
+        generation_id=target_id,
+        summary_size_bytes=summary_size_bytes,
+        summary_sha256=summary_sha256,
+    )
 
 
 def _read_pointer_target_summary(
@@ -594,6 +1193,8 @@ def _read_pointer_target_summary(
     target_id: str,
     owner_key: str,
     owner_name: str,
+    expected_size_bytes: int | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     """Read a pointer target's own immutable summary and confirm its identity.
 
@@ -605,7 +1206,7 @@ def _read_pointer_target_summary(
     fails closed on the pointer target's own immutable *summary*: it must
     parse as a mapping naming this exact owner and id. Callers holding a
     schema-versioned summary additionally validate the complete artifact
-    manifest (:func:`_generation_manifest_is_valid`; review v0.5.16 /
+    manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
     blocker 3) — this helper only performs the identity gate common to
     experiment and suite pointers.
 
@@ -614,12 +1215,32 @@ def _read_pointer_target_summary(
     :param str target_id: Generation id the summary must name.
     :param str owner_key: Summary key naming the owning experiment or suite.
     :param str owner_name: Expected owner name the summary must carry.
+    :param int | None expected_size_bytes: Pointer-recorded exact summary byte length.
+    :param str | None expected_sha256: Pointer-recorded SHA-256 of the exact summary bytes.
     :return dict[str, Any] | None: The parsed summary when readable and
         correctly named; ``None`` otherwise.
+    :raises PublicationAccessError: The summary cannot be read by the current user.
+    :raises PublicationIntegrityError: The summary bytes disagree with either pointer anchor.
     """
     try:
-        summary = yaml.safe_load(summary_path.read_text())
-    except (OSError, yaml.YAMLError):
+        content = summary_path.read_bytes()
+    except PermissionError as exc:
+        raise PublicationAccessError(
+            _unreadable_artifact_permission_detail("generation summary")
+        ) from exc
+    except OSError:
+        return None
+    if expected_size_bytes is not None and len(content) != expected_size_bytes:
+        raise PublicationIntegrityError(
+            "Generation summary byte length does not match the last-success pointer."
+        )
+    if expected_sha256 is not None and hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise PublicationIntegrityError(
+            "Generation summary digest does not match the last-success pointer."
+        )
+    try:
+        summary = yaml.safe_load(content)
+    except yaml.YAMLError:
         return None
     if (
         isinstance(summary, dict)
@@ -630,67 +1251,210 @@ def _read_pointer_target_summary(
     return None
 
 
-def _last_successful_generation_id(
+@dataclass(frozen=True)
+class PublicationPointer:
+    """Four-state resolution of one last-success publication pointer.
+
+    "Nothing was ever published" and "the recorded publication no longer
+    validates" are different operational facts with opposite remedies, and
+    collapsing both into ``None`` made a corrupt result tree indistinguishable
+    from a fresh one (review v0.5.18 / finding F4). The reporting surfaces
+    resolve through this type; path-construction helpers keep the boolean
+    :func:`_last_successful_generation_id` view, since all non-``ok`` states
+    mean the same thing to them: nothing may be read as published.
+
+    ``error`` is deliberately path-free: it names artifacts by role rather than
+    location, so any reporting surface could quote it safely -- though the MCP
+    layer forwards only the ``publication_integrity`` enum and leaves the
+    free-text detail to the operator-facing CLI.
+    """
+
+    state: PublicationState
+    generation_id: str | None
+    """Pointer target id: the published generation when ``ok``, the generation
+    whose validation failed when ``failed`` or ``permission_denied``, ``None``
+    when ``absent`` or when the pointer itself is the unreadable part."""
+    error: str | None
+    """Validation diagnostic for ``failed`` and ``permission_denied`` states."""
+    summary: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
+    """Exact pointer-authenticated parsed summary, for consumers that need its fields."""
+
+
+def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
+    """Classify a pointer whose own payload could not be resolved to a target.
+
+    A pointer file is written once, atomically, after its target validates, so
+    a file that exists but does not name a target this owner published is
+    tampering or corruption -- not an owner that has published nothing.
+
+    :param Path pointer_path: Last-success pointer whose read just failed.
+    :param str owner_label: Human-readable owner for the diagnostic text.
+    :return PublicationPointer: ``absent`` when no pointer file exists,
+        ``permission_denied`` when this user cannot inspect it, and ``failed``
+        when it otherwise exists but cannot be resolved.
+    """
+    try:
+        pointer_path.stat()
+    except FileNotFoundError:
+        return PublicationPointer(state="absent", generation_id=None, error=None)
+    except PermissionError:
+        return PublicationPointer(
+            state="permission_denied",
+            generation_id=None,
+            error=_unreadable_artifact_permission_detail("last-success pointer"),
+        )
+    except OSError:
+        pass
+    return PublicationPointer(
+        state="failed",
+        generation_id=None,
+        error=(
+            f"The last-success pointer for {owner_label} is unreadable, malformed, "
+            "or does not name a generation this owner published."
+        ),
+    )
+
+
+def _resolve_publication_pointer(
     experiment: Experiment,
     *,
     raise_on_manifest_error: bool = False,
-) -> str | None:
-    """Read and validate the last-success pointer, failing closed on mismatch.
+) -> PublicationPointer:
+    """Resolve the last-success pointer to its four-state validation verdict.
 
     The pointer is authoritative only when its target's own immutable summary
     parses and names this exact experiment and generation (review v0.5.15 /
     blocker 3) -- not when the per-generation lifecycle record says so, since
     that record is now written *after* this pointer commits and would
     otherwise create a crash window where a committed publication reads as
-    nothing-published. A malformed, tampered, or missing target is treated as
-    "nothing published" rather than trusted for path construction or result
-    reads.
+    nothing-published.
 
     For schema-versioned summaries the target's complete artifact manifest is
-    additionally validated -- every listed winner/promotion artifact must
-    exist, hash to its recorded content, and cross-check against the summary
-    (review v0.5.16 / blocker 3). Validation runs on every authoritative read:
+    additionally validated -- every listed winner/promotion artifact plus the
+    claim-time provenance files must exist, hash to their recorded content,
+    and cross-check against the summary (review v0.5.16 / blocker 3, review
+    v0.5.18 / finding F6). Validation runs on every authoritative read:
     generation directories are write-once by PhaseSweep convention, but the
     filesystem does not enforce immutability and a long-lived reader must
     notice later corruption or operator edits. Pre-manifest legacy summaries
     keep the identity-only gate.
 
+    Every validation refusal resolves to an unusable state, never ``absent``:
+    structural or content failures become ``failed``, while an actual
+    permission denial becomes ``permission_denied``. The pointer's existence
+    is durable evidence that this tree once held a result, and a caller told
+    "nothing published" could otherwise re-run over it and advance the pointer
+    past evidence that still needs operator attention.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param bool raise_on_manifest_error: Re-raise a versioned publication's
+        manifest error for an actionable resume failure instead of reporting
+        it as an unusable verdict, as read-only status APIs require. Only the
+        manifest branch raises; every other failure resolves to ``failed`` or
+        ``permission_denied``.
+    :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
+        manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
+        the target's artifact manifest does not validate.
+    :return PublicationPointer: The publication verdict for this experiment.
+    """
+    pointer_path = _last_successful_generation_path(experiment)
+    try:
+        target = _read_pointer_target(
+            pointer_path,
+            id_key="generation_id",
+            owner_key="experiment",
+            owner_name=experiment.experiment,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
+    if target is None:
+        return _unresolvable_pointer(pointer_path, f"experiment {experiment.experiment!r}")
+    generation_id = target.generation_id
+    try:
+        summary = _read_pointer_target_summary(
+            _generation_summary_path(experiment, generation_id),
+            id_key="generation_id",
+            target_id=generation_id,
+            owner_key="experiment",
+            owner_name=experiment.experiment,
+            expected_size_bytes=target.summary_size_bytes,
+            expected_sha256=target.summary_sha256,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(
+            state="permission_denied", generation_id=generation_id, error=str(exc)
+        )
+    except PublicationIntegrityError as exc:
+        if raise_on_manifest_error:
+            raise
+        return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
+    if summary is None:
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Generation {generation_id!r} summary is missing, unreadable, or does not "
+                f"name experiment {experiment.experiment!r} and this generation."
+            ),
+        )
+    if "schema_version" in summary:
+        generation_dir = _generation_dir(experiment, generation_id)
+        if raise_on_manifest_error:
+            _validate_generation_manifest(generation_dir, generation_id, summary)
+        else:
+            # A versioned summary must validate its complete artifact manifest
+            # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
+            # the identity-only gate above; see docs/config.md's upgrade notes.
+            try:
+                _validate_generation_manifest(generation_dir, generation_id, summary)
+            except PublicationAccessError as exc:
+                log.warning("%s", exc)
+                return PublicationPointer(
+                    state="permission_denied",
+                    generation_id=generation_id,
+                    error=str(exc),
+                )
+            except PublicationIntegrityError as exc:
+                log.warning("%s", exc)
+                return PublicationPointer(
+                    state="failed", generation_id=generation_id, error=str(exc)
+                )
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None, summary=summary)
+
+
+def _last_successful_generation_id(
+    experiment: Experiment,
+    *,
+    raise_on_manifest_error: bool = False,
+) -> str | None:
+    """Return the last-success generation id, failing closed on any invalidity.
+
+    The boolean-blind view of :func:`_resolve_publication_pointer`, kept for
+    the path-construction and resume callers to which "never published" and
+    "published but corrupt" mean the same thing: nothing here may be read as
+    published. Every caller that *reports* publication state to an operator or
+    agent must use the four-state resolver instead (review v0.5.18 / finding
+    F4).
+
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a versioned publication's
         manifest error for an actionable resume failure instead of returning
         ``None`` as read-only status APIs require.
+    :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
+        manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
+        the target's artifact manifest does not validate.
     :return str | None: The last-successful generation id, or ``None`` if the
         pointer or its target summary is missing, unreadable, malformed,
         unsafely named, owned by another experiment, or fails manifest
         validation.
     """
-    generation_id = _read_pointer_target(
-        _last_successful_generation_path(experiment),
-        id_key="generation_id",
-        owner_key="experiment",
-        owner_name=experiment.experiment,
+    pointer = _resolve_publication_pointer(
+        experiment,
+        raise_on_manifest_error=raise_on_manifest_error,
     )
-    if generation_id is None:
-        return None
-    summary = _read_pointer_target_summary(
-        _generation_summary_path(experiment, generation_id),
-        id_key="generation_id",
-        target_id=generation_id,
-        owner_key="experiment",
-        owner_name=experiment.experiment,
-    )
-    if summary is None:
-        return None
-    if "schema_version" in summary:
-        generation_dir = _generation_dir(experiment, generation_id)
-        if raise_on_manifest_error:
-            _validate_generation_manifest(generation_dir, generation_id, summary)
-        elif not _generation_manifest_is_valid(generation_dir, generation_id, summary):
-            # A versioned summary must validate its complete artifact manifest
-            # (review v0.5.16 / blocker 3). Pre-manifest legacy summaries keep
-            # the identity-only gate above; see docs/config.md's upgrade notes.
-            return None
-    return generation_id
+    return pointer.generation_id if pointer.state == "ok" else None
 
 
 def _published_winner_path_for(
@@ -743,7 +1507,7 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
 
 
 def _published_summary_path_for(
-    experiment: Experiment,
+    config: Experiment | Suite,
     published_generation_id: str | None,
 ) -> Path | None:
     """Resolve the authoritative summary path from an already-captured published id.
@@ -755,7 +1519,8 @@ def _published_summary_path_for(
     last-success id instead of re-reading the pointer (review v0.5.15 /
     blocker 3).
 
-    :param Experiment experiment: Experiment config with artifact root details.
+    :param Experiment | Suite config: Experiment or suite config with artifact
+        root details.
     :param str | None published_generation_id: Already-resolved
         :func:`_last_successful_generation_id` result (or ``None``).
     :return Path | None: The generation-scoped summary path when
@@ -763,11 +1528,17 @@ def _published_summary_path_for(
         path when no generation has ever been published; ``None`` when a
         generation exists but none has completed successfully yet.
     """
+    if isinstance(config, Suite):
+        if published_generation_id is not None:
+            return _suite_generation_summary_path(config, published_generation_id)
+        if _suite_generation_path(config).is_file():
+            return None
+        return _suite_summary_path(config)
     if published_generation_id is not None:
-        return _generation_summary_path(experiment, published_generation_id)
-    if _generation_path(experiment).is_file():
+        return _generation_summary_path(config, published_generation_id)
+    if _generation_path(config).is_file():
         return None
-    return _summary_path(experiment)
+    return _summary_path(config)
 
 
 def _published_promotion_decision_path(
@@ -887,39 +1658,68 @@ def _last_successful_suite_generation_path(suite: Suite) -> Path:
     return _suite_dir(suite) / "last_successful_suite_generation.yaml"
 
 
-def _last_successful_suite_generation_id(suite: Suite) -> str | None:
-    """Read and validate the suite last-success pointer, failing closed on mismatch.
+def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:
+    """Resolve the suite last-success pointer to its four-state validation verdict.
 
-    Applies the same artifact-validating protocol as
-    :func:`_last_successful_generation_id`: the pointer is authoritative only
-    when its target's own immutable summary parses and names this exact suite
-    and suite generation (review v0.5.15 / blocker 3), not when the
-    per-suite-generation lifecycle record says so.
+    Suite mirror of :func:`_resolve_publication_pointer`, including its rule
+    that validation refusals resolve to ``failed`` or ``permission_denied``
+    rather than ``absent``. The pointer is authoritative only when its target's
+    own immutable summary parses and names this exact suite and suite generation
+    (review v0.5.15 / blocker 3), not when the per-suite-generation lifecycle
+    record says so, and a schema-current summary must additionally anchor its
+    winner facts to the hash-covered component summaries it recorded.
 
     :param Suite suite: Suite config with artifact root details.
-    :return str | None: The last-successful suite generation id, or ``None``
-        when the pointer or its target summary fails validation.
+    :return PublicationPointer: The publication verdict for this suite.
     """
-    generation_id = _read_pointer_target(
-        _last_successful_suite_generation_path(suite),
-        id_key="suite_generation_id",
-        owner_key="suite",
-        owner_name=suite.suite,
-    )
-    if generation_id is None:
-        return None
-    summary = _read_pointer_target_summary(
-        _suite_generation_summary_path(suite, generation_id),
-        id_key="suite_generation_id",
-        target_id=generation_id,
-        owner_key="suite",
-        owner_name=suite.suite,
-    )
+    pointer_path = _last_successful_suite_generation_path(suite)
+    try:
+        target = _read_pointer_target(
+            pointer_path,
+            id_key="suite_generation_id",
+            owner_key="suite",
+            owner_name=suite.suite,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
+    if target is None:
+        return _unresolvable_pointer(pointer_path, f"suite {suite.suite!r}")
+    generation_id = target.generation_id
+    try:
+        summary = _read_pointer_target_summary(
+            _suite_generation_summary_path(suite, generation_id),
+            id_key="suite_generation_id",
+            target_id=generation_id,
+            owner_key="suite",
+            owner_name=suite.suite,
+            expected_size_bytes=target.summary_size_bytes,
+            expected_sha256=target.summary_sha256,
+        )
+    except PublicationAccessError as exc:
+        return PublicationPointer(
+            state="permission_denied", generation_id=generation_id, error=str(exc)
+        )
+    except PublicationIntegrityError as exc:
+        return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
     if summary is None:
-        return None
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Suite generation {generation_id!r} summary is missing, unreadable, or does "
+                f"not name suite {suite.suite!r} and this suite generation."
+            ),
+        )
     if summary.get("schema_version") not in (None, 1, 2, SUITE_SUMMARY_SCHEMA_VERSION):
         # A summary from a newer schema must not be silently misread.
-        return None
+        return PublicationPointer(
+            state="failed",
+            generation_id=generation_id,
+            error=(
+                f"Suite generation {generation_id!r} summary declares unsupported "
+                f"schema_version {summary.get('schema_version')!r}."
+            ),
+        )
     if summary.get("schema_version") == SUITE_SUMMARY_SCHEMA_VERSION:
         # The summary's own winner facts must be anchored to the hash-covered
         # component artifacts it recorded at publication, so an edited or
@@ -930,13 +1730,20 @@ def _last_successful_suite_generation_id(suite: Suite) -> str | None:
         # summaries keep the identity-only gate above.
         try:
             _validate_suite_summary_integrity(generation_id, summary)
-        except RuntimeError:
+        except PublicationAccessError as exc:
+            log.warning("Suite last-success pointer target could not be validated as this user")
+            return PublicationPointer(
+                state="permission_denied",
+                generation_id=generation_id,
+                error=str(exc),
+            )
+        except PublicationIntegrityError as exc:
             log.warning(
                 "Suite last-success pointer target failed integrity validation",
                 exc_info=True,
             )
-            return None
-    return generation_id
+            return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
+    return PublicationPointer(state="ok", generation_id=generation_id, error=None, summary=summary)
 
 
 def _validate_suite_summary_integrity(
@@ -964,19 +1771,30 @@ def _validate_suite_summary_integrity(
 
     :param str generation_id: Suite generation id, used for error text.
     :param Mapping[str, Any] summary: Parsed suite summary payload.
-    :raises RuntimeError: A study record is malformed, a component summary is
+    :raises PublicationAccessError: A component summary cannot be read by the current user.
+    :raises PublicationIntegrityError: A study record is malformed, a component summary is
         missing, altered, or misidentified, or an exposed winner is not
         anchored to any verified component summary.
     """
 
-    def _fail(reason: str) -> RuntimeError:
+    def _fail(reason: str) -> PublicationIntegrityError:
         """Build one uniformly labeled suite-integrity error.
 
         :param str reason: Specific validation failure being reported.
-        :return RuntimeError: Error naming the suite generation and the reason.
+        :return PublicationIntegrityError: Error naming the suite generation and reason.
         """
-        return RuntimeError(
+        return PublicationIntegrityError(
             f"Suite generation {generation_id!r} summary integrity validation failed: {reason}"
+        )
+
+    def _permission_fail(reason: str) -> PublicationAccessError:
+        """Build a permission-specific suite-validation error.
+
+        :param str reason: Permission failure being reported.
+        :return PublicationAccessError: Error naming the suite generation and reason.
+        """
+        return PublicationAccessError(
+            f"Suite generation {generation_id!r} summary validation could not run: {reason}"
         )
 
     records = summary.get("studies")
@@ -1007,7 +1825,7 @@ def _validate_suite_summary_integrity(
         :param str phase_name: Source component phase that produced the winner.
         :param bool include_exposure_metadata: Include completion, source, and
             promotion fields when the suite exposes its own component winner.
-        :raises RuntimeError: If the winner payload cannot be represented as safe YAML.
+        :raises PublicationIntegrityError: The winner payload cannot be represented as safe YAML.
         :return tuple[str, str]: Source phase plus canonical winner payload.
         """
         fields = full_fields if include_exposure_metadata else evidence_fields
@@ -1045,6 +1863,10 @@ def _validate_suite_summary_integrity(
             )
         try:
             content = target.read_bytes()
+        except PermissionError as exc:
+            raise _permission_fail(
+                _unreadable_artifact_permission_detail(f"study {name!r} component summary")
+            ) from exc
         except OSError as exc:
             raise _fail(f"study {name!r} component summary is missing or unreadable") from exc
         if hashlib.sha256(content).hexdigest() != recorded_sha:
@@ -1133,23 +1955,6 @@ def _validate_suite_summary_integrity(
                 )
 
 
-def _published_suite_summary_path(suite: Suite) -> Path | None:
-    """Return the authoritative last-success suite summary, with legacy fallback.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path | None: The generation-scoped suite summary path when a
-        validated last-success pointer exists; the legacy compatibility summary
-        path when no suite generation has ever been published; ``None`` when a
-        suite generation exists but none has completed successfully yet.
-    """
-    generation_id = _last_successful_suite_generation_id(suite)
-    if generation_id is not None:
-        return _suite_generation_summary_path(suite, generation_id)
-    if _suite_generation_path(suite).is_file():
-        return None
-    return _suite_summary_path(suite)
-
-
 def _suite_log_path(suite: Suite) -> Path:
     """Path to a suite-level run log.
 
@@ -1165,8 +1970,21 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     :param Path path: Destination YAML path to replace.
     :param Any payload: YAML-serializable value to write.
     """
+    text = yaml.safe_dump(payload, sort_keys=False)
+    with atomic_text_writer(path, newline="") as handle:
+        handle.write(text)
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Atomically write a JSON document to ``path`` with the artifact-tree mode.
+
+    :param Path path: Destination JSON path to replace.
+    :param Any payload: JSON-serializable value to write.
+    :raises TypeError: ``payload`` is not JSON-serializable.
+    :raises OSError: The document could not be staged, written, or renamed.
+    """
     with atomic_text_writer(path) as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
@@ -1292,6 +2110,11 @@ def _save_winner(
     winners always carry a fingerprint by construction in ``_run_phase``;
     placeholder winners (dry-run skip) are never saved.
 
+    ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
+    produced the winning trial (review v0.5.18 / finding F3). Both are
+    ``None`` on winners selected from trials that predate the record; neither
+    ever carries ambient variable values.
+
     Args:
         experiment: Parsed experiment config; supplies the metric name used
             in the persisted payload.
@@ -1310,6 +2133,8 @@ def _save_winner(
         **_winner_common_payload(winner, phase_name),
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
+        "trainer_env_digest": winner.trainer_env_digest,
+        "trainer_inherit_env": winner.trainer_inherit_env,
     }
     _write_yaml_atomic(path, payload)
 
@@ -1379,6 +2204,54 @@ def _save_promotion_decision(
     _write_yaml_atomic(path, decision)
 
 
+# Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
+# same winner twice (preflight, then the run itself) and a suite can inherit it
+# across studies; the operator needs the divergence once, not once per read.
+_ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
+
+
+def _warn_environment_drift(
+    experiment: Experiment,
+    phase_name: str,
+    stored_digest: str | None,
+) -> None:
+    """Warn once when an inherited winner was produced under another environment.
+
+    Persistent-study preflight separately refuses a top-up across semantic
+    environment cohorts. ``--from-phase`` deliberately skips this phase, so no
+    trial is allocated into that study; this warning tells the operator that a
+    later phase is building on a winner from another cohort. Winners without a
+    recorded digest predate the record and are left alone.
+
+    :param Experiment experiment: Parsed experiment supplying the current contract.
+    :param str phase_name: Phase whose winner was loaded, used in the warn-once key.
+    :param str | None stored_digest: Digest recorded on the loaded winner.
+    """
+    if stored_digest is None:
+        return
+    # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
+    # read-only paths that import this module never need.
+    from phasesweep.engine.trial import _environment_identity
+
+    current_digest = _environment_identity(experiment).digest
+    if stored_digest == current_digest:
+        return
+    key = (experiment.experiment, phase_name, stored_digest)
+    if key in _ENVIRONMENT_DRIFT_WARNED:
+        return
+    _ENVIRONMENT_DRIFT_WARNED.add(key)
+    log.warning(
+        "[%s] inherited winner ran under trainer environment %s..., but this process "
+        "composes %s... under execution.inherit_env=%r. The inherited result is being "
+        "reused across an environment change; confirm the difference is irrelevant to "
+        "the metric, or re-run the phase.",
+        phase_name,
+        stored_digest[:12],
+        current_digest[:12],
+        experiment.execution.inherit_env,
+    )
+
+
 def _load_winner(
     experiment: Experiment,
     phase: Phase,
@@ -1396,6 +2269,11 @@ def _load_winner(
     (a) the stored winner has no fingerprint at all (legacy or hand-edited),
     or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
 
+    A recorded semantic environment digest that disagrees with this process is
+    a warning on this explicit skipped-phase path; ordinary study top-ups are
+    refused before allocation (see :func:`_warn_environment_drift`). Winners
+    written before those fields existed load with it set to ``None``.
+
     Args:
         experiment: Parsed experiment config.
         phase: The phase whose winner is being loaded.
@@ -1407,8 +2285,10 @@ def _load_winner(
 
     Raises:
         FileNotFoundError: ``winner.yaml`` does not exist for the phase.
-        RuntimeError: The file is unfingerprinted (legacy/hand-edited) or its
-            fingerprint disagrees with the freshly computed one.
+        WinnerIntegrityError: The file is unreadable, incomplete, ambiguously
+            scoped, or incompatible with the current partial-result policy.
+        StudyFingerprintMismatchError: The stored fingerprint disagrees with
+            the freshly computed one.
 
     """
     published_generation_id = _last_successful_generation_id(
@@ -1426,11 +2306,11 @@ def _load_winner(
     try:
         data = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc
     if not isinstance(data, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase "
             f"{phase.name!r}: top level must be a mapping."
         )
@@ -1441,7 +2321,7 @@ def _load_winner(
     stored_fp = data.get("phase_fingerprint")
 
     if stored_fp is None:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no phase_fingerprint. Refusing to use it "
             f"for --from-phase because phasesweep cannot prove it matches the "
             f"current config for skipped phase {phase.name!r}. Re-run the "
@@ -1459,12 +2339,12 @@ def _load_winner(
 
     completion = data.get("completion")
     if not isinstance(completion, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase "
             f"{phase.name!r}: missing mapping field 'completion'."
         )
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
             f"use it for skipped phase {phase.name!r} unless the current config "
             "sets allow_incomplete_on_timeout: true."
@@ -1472,21 +2352,29 @@ def _load_winner(
     generation_id = data.get("generation_id")
     attempt_id = data.get("attempt_id")
     if not isinstance(generation_id, str) or not generation_id:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid generation_id; refusing unscoped evidence."
         )
     if not isinstance(attempt_id, str) or not attempt_id:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
         )
     source_data = data.get("winner_source")
     if not isinstance(source_data, dict):
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
         )
     source_kind = source_data.get("kind")
     if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
-        raise RuntimeError(f"Winner file {path} has an invalid winner_source kind.")
+        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
+
+    stored_env_digest = data.get("trainer_env_digest")
+    if not isinstance(stored_env_digest, str) or not stored_env_digest:
+        stored_env_digest = None
+    stored_inherit_env = data.get("trainer_inherit_env")
+    if not isinstance(stored_inherit_env, str | list):
+        stored_inherit_env = None
+    _warn_environment_drift(experiment, phase.name, stored_env_digest)
 
     try:
         source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
@@ -1508,8 +2396,14 @@ def _load_winner(
                 if isinstance(data.get("objective_provenance"), dict)
                 else None
             ),
+            trainer_env_digest=stored_env_digest,
+            trainer_inherit_env=(
+                [str(name) for name in stored_inherit_env]
+                if isinstance(stored_inherit_env, list)
+                else stored_inherit_env
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
+        raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc

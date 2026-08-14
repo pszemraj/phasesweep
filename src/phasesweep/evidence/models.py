@@ -4,24 +4,66 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
-from phasesweep.config.common import _Frozen, _validate_optional_bounds
+from phasesweep.config.common import _Frozen, _require_finite, _validate_optional_bounds
+
+StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
+"""The exact set of values a JSON document can hold at a leaf position.
+
+Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
+``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
+neighbouring type. Anything outside this union — a mapping, a sequence, a
+``datetime.date`` — is not representable in parsed JSON and is rejected at
+config load rather than normalized later.
+"""
 
 
 def _validate_trial_path(value: str) -> str:
     """Require a non-empty path inside the trial directory.
 
     :param str value: Candidate trial-relative path.
-    :raises ValueError: If ``value`` is empty, absolute, or escapes upward.
+    :raises ValueError: If ``value`` is empty, absolute, escapes upward, or
+        contains a NUL byte that no filesystem call can accept.
     :return str: Validated trial-relative path.
     """
     path = Path(value)
-    if not value or path.is_absolute() or ".." in path.parts:
+    if not value or "\0" in value or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"trial-relative path required; got {value!r}.")
     return value
+
+
+def _validate_trial_file_path(value: str) -> str:
+    """Require a trial-relative path that names a descendant file location.
+
+    ``.`` legitimately names the whole trial directory for an
+    ``artifact_size`` directory gate, but every extractor and file-backed gate
+    requires a file below that root. Rejecting the root at config load avoids
+    deferring an impossible file open to the first trial.
+
+    :param str value: Candidate trial-relative file path.
+    :raises ValueError: If ``value`` violates the shared path contract or
+        resolves to the trial directory itself.
+    :return str: Validated descendant file path.
+    """
+    validated = _validate_trial_path(value)
+    if not Path(validated).parts:
+        raise ValueError(
+            "trial-relative path required; a file path must name a descendant "
+            f"of trial_dir, not {value!r}."
+        )
+    return validated
 
 
 def _validate_json_key(value: str | None) -> str | None:
@@ -52,6 +94,21 @@ class _TrialPathModel(_Frozen):
         return _validate_trial_path(value)
 
 
+class _TrialFilePathModel(_Frozen):
+    """Mixin for config models containing trial-relative file path fields."""
+
+    @field_validator("path", "file", check_fields=False)
+    @classmethod
+    def _trial_file_path_is_relative(cls, value: str) -> str:
+        """Validate trial-relative file path fields.
+
+        :param str value: Candidate trial-relative file path.
+        :raises ValueError: If the path is unsafe or names the trial root.
+        :return str: Validated descendant file path.
+        """
+        return _validate_trial_file_path(value)
+
+
 class _JsonKeyModel(_Frozen):
     """Mixin for config models containing dotted JSON key fields."""
 
@@ -66,7 +123,7 @@ class _JsonKeyModel(_Frozen):
         return _validate_json_key(value)
 
 
-class JsonExtractor(_TrialPathModel, _JsonKeyModel):
+class JsonExtractor(_TrialFilePathModel, _JsonKeyModel):
     """Extract a scalar from a JSON file via a dot-separated key path."""
 
     type: Literal["json"]
@@ -74,7 +131,7 @@ class JsonExtractor(_TrialPathModel, _JsonKeyModel):
     key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
 
 
-class JsonEnvelopeExtractor(_TrialPathModel):
+class JsonEnvelopeExtractor(_TrialFilePathModel):
     """Extract a scalar from a versioned, attempt-bound result envelope."""
 
     type: Literal["json_envelope"]
@@ -86,7 +143,7 @@ class JsonEnvelopeExtractor(_TrialPathModel):
     expected_step: int | None = Field(default=None, ge=0)
 
 
-class LogRegexExtractor(_TrialPathModel):
+class LogRegexExtractor(_TrialFilePathModel):
     """Extract a scalar from a log file via regex with a named 'value' group."""
 
     type: Literal["log_regex"]
@@ -106,15 +163,35 @@ class LogRegexExtractor(_TrialPathModel):
     select: Literal["last", "first", "min", "max"] = "last"
 
 
-class WandbExtractor(_Frozen):
+class _WandbSummarySource(_Frozen):
+    """Shared location and polling contract for one W&B run summary."""
+
+    base_url: str = Field(default="https://api.wandb.ai", min_length=1)
+    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
+    project: str = Field(min_length=1, pattern=r"^[^/]+$")
+    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalize_base_url(cls, value: str) -> str:
+        """Normalize the endpoint spelling used by the W&B public API.
+
+        :param str value: Configured W&B API base URL.
+        :raises ValueError: The value consists only of slashes.
+        :return str: Base URL without trailing slashes.
+        """
+        normalized = value.rstrip("/")
+        if not normalized:
+            raise ValueError("W&B base_url must contain a non-slash endpoint.")
+        return normalized
+
+
+class WandbExtractor(_WandbSummarySource):
     """Extract a scalar from this attempt's finished W&B run summary."""
 
     type: Literal["wandb"]
-    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
-    project: str = Field(min_length=1, pattern=r"^[^/]+$")
     metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
@@ -234,23 +311,74 @@ class _ObjectiveEvidenceFields(BaseModel):
     expected_step_value_bound: bool
 
 
-class RequiredFileGate(_TrialPathModel):
+class RequiredFileGate(_TrialFilePathModel):
     """Require a file to exist under the trial directory."""
 
     type: Literal["required_file"]
     path: str
 
 
-class JsonEqualsGate(_TrialPathModel, _JsonKeyModel):
-    """Require a JSON key to equal an expected scalar value."""
+class JsonEqualsGate(_TrialFilePathModel, _JsonKeyModel):
+    """Require a JSON key to equal an expected JSON scalar.
+
+    ``value`` must be a JSON scalar (``bool``, ``int``, ``float``, ``str``, or
+    ``null``) and is validated strictly, because *type identity is part of this
+    gate's semantics*: :func:`phasesweep.evidence.evaluation._json_equals`
+    compares with ``type(actual) is type(gate.value)``, so ``true``, ``1``, and
+    ``1.0`` are three different gates. Coercion would silently rewrite one into
+    another, so no member of the union coerces.
+
+    Non-scalars (mappings, sequences, YAML dates) are rejected outright rather
+    than merely never matching (PR #5 review / reviewer 2, blocker 4). The
+    study fingerprint hashes ``model_dump(mode="json")`` through
+    ``json.dumps(..., default=str)``, which normalizes exactly the values that
+    strict JSON cannot hold: ``{1: "x"}`` and ``{"1": "x"}`` collapse to one
+    digest, as do ``date(2024, 1, 1)`` and ``"2024-01-01"``. Since parsed JSON
+    never yields an int-keyed mapping or a ``date``, those variants could never
+    pass while their surviving twins could — two configs that judge feasibility
+    in mutually exclusive ways would share one phase fingerprint and be allowed
+    to reuse each other's study. Rejecting them at load keeps the fingerprint
+    faithful to runtime behaviour. Non-finite floats (``.nan``, ``.inf``) are
+    rejected for the same reason: JSON has no encoding for them.
+    """
 
     type: Literal["json_equals"]
     path: str
     key: str
-    value: Any
+    value: StrictJsonScalar
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _value_is_json_scalar(cls, value: object) -> object:
+        """Reject values strict JSON cannot hold, naming the offending type.
+
+        Runs before the ``StrictJsonScalar`` union purely for the message: the
+        union alone reports one "input should be a valid <member>" error per
+        member, which never says *why* a mapping or a YAML date is wrong. The
+        union remains the authority on type identity (it is what refuses to
+        coerce ``1`` into ``1.0``); this validator only front-runs the cases a
+        config author actually hits.
+
+        :param object value: Raw expected value straight from the config.
+        :raises ValueError: If ``value`` is not a JSON scalar, or is a
+            non-finite float.
+        :return object: The unchanged value, for the strict union to validate.
+        """
+        if not isinstance(value, (bool, int, float, str, type(None))):
+            raise ValueError(
+                "json_equals gate value must be a JSON scalar (bool, int, float, str, or "
+                f"null); got {type(value).__name__}. Parsed JSON never produces that type, so "
+                "such a gate could never pass, and the study fingerprint would render it "
+                "identically to a value that can — silently sharing one study between two "
+                "configs that disagree on feasibility. YAML dates are the common case: quote "
+                "them ('2024-01-01') to compare against the JSON string."
+            )
+        if isinstance(value, float):
+            _require_finite("json_equals gate value", value)
+        return value
 
 
-class JsonScalarBoundGate(_TrialPathModel, _JsonKeyModel):
+class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
     """Require a JSON key to be a finite scalar within optional bounds."""
 
     type: Literal["json_scalar_bound"]
@@ -290,6 +418,11 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
         :raises ValueError: If source/key pairing or byte bounds are invalid.
         :return ArtifactSizeGate: Validated gate config.
         """
+        if self.source != "directory" and not Path(self.path).parts:
+            raise ValueError(
+                "artifact_size gate path='.' is valid only with source=directory; "
+                f"source={self.source!r} requires a descendant file path."
+            )
         if self.source == "json" and self.key is None:
             raise ValueError("artifact_size gate with source=json must define key.")
         if self.source != "json" and self.key is not None:
@@ -302,7 +435,7 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
         return self
 
 
-class Sha256Gate(_TrialPathModel):
+class Sha256Gate(_TrialFilePathModel):
     """Require a file's SHA-256 digest to match an expected hex string."""
 
     type: Literal["sha256"]
@@ -323,15 +456,11 @@ class Sha256Gate(_TrialPathModel):
         return value.lower()
 
 
-class WandbSummaryRequiredGate(_Frozen):
+class WandbSummaryRequiredGate(_WandbSummarySource):
     """Require keys in this attempt's finished W&B run summary."""
 
     type: Literal["wandb_summary_required"]
-    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
-    project: str = Field(min_length=1, pattern=r"^[^/]+$")
     keys: list[str] = Field(min_length=1)
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
 
 
 Gate = Annotated[

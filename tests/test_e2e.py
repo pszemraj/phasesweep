@@ -47,18 +47,18 @@ def test_full_sweep_and_replay(tmp_path):
 
     # Constraint should have excluded n_layers=16 (param_bytes = 17.6 MB > 16 MiB).
     depth_winner = winners["depth"]
-    assert depth_winner.params["n_layers"] in {4, 8, 12}
+    assert depth_winner.params["model.n_layers"] in {4, 8, 12}
     # The synthetic objective minimizes at n_layers=8.
-    assert depth_winner.params["n_layers"] == 8
+    assert depth_winner.params["model.n_layers"] == 8
 
     # lr winner should be near 3e-4 (the synthetic optimum) within a decade.
-    lr = winners["lr"].params["lr"]
+    lr = winners["lr"].params["optimizer.lr"]
     assert 1e-5 < lr < 1e-2
 
     # regularization winner should be near (0.05, 0.10).
     reg = winners["regularization"].params
-    assert 0.0 <= reg["weight_decay"] <= 0.3
-    assert 0.0 <= reg["dropout"] <= 0.3
+    assert 0.0 <= reg["optimizer.weight_decay"] <= 0.3
+    assert 0.0 <= reg["model.dropout"] <= 0.3
 
     # Persistence on disk. v0.5.7: outputs are namespaced as
     # <workdir>/<experiment>/<phase>/, summary at <workdir>/<experiment>/summary.yaml.

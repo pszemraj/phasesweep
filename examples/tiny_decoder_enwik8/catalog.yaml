@@ -8,7 +8,7 @@ experiments:
     config: ./mcp_experiment.yaml
     cwd: ../..
     visible_params: all
-    description: "9-trial sweep (1000 batches/trial) over LR, weight decay, and gradient clipping"
+    description: "Nine-attempt target (1000 batches/attempt) over LR, weight decay, and gradient clipping"
     allow:
       launch: true
       cancel: true

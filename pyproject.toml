@@ -64,6 +64,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"phasesweep" = ["templates/*.yaml"]
 "phasesweep.mcp" = ["agent_prompt.md"]
 
 [tool.ruff]
@@ -91,4 +92,5 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not hardware'"
+markers = ["hardware: tests that query real host hardware and require explicit opt-in"]

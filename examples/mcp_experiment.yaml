@@ -5,8 +5,14 @@ storage: sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db
 provenance:
   revision: "phasesweep-fake-trainer-v1"
 workdir: /tmp/phasesweep-mcp-tiny-lm/runs
-trial_command: "python -m phasesweep.examples.fake_train --out {trial_dir}/result.json {overrides}"
-override_format: argparse
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
 
 metric:
   name: eval_loss
@@ -35,7 +41,7 @@ phases:
     sampler:
       type: grid
     search_space:
-      n_layers: { type: categorical, choices: [4, 8, 12, 16] }
+      model.n_layers: { type: categorical, choices: [4, 8, 12, 16] }
 
   - name: lr
     comment: "With depth locked, find the learning rate."
@@ -45,8 +51,10 @@ phases:
       type: tpe
       seed: 0
       n_startup_trials: 4
+      # TPE state is process-local: this phase's target must run in one invocation.
+      acknowledge_nonresumable: true
     search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+      optimizer.lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 
   - name: regularization
     comment: "Last, jointly tune weight_decay and dropout because they interact."
@@ -55,6 +63,8 @@ phases:
     sampler:
       type: cmaes
       seed: 1
+      # Same contract as the TPE phase above: run the full target in one go.
+      acknowledge_nonresumable: true
     search_space:
-      weight_decay: { type: float, low: 0.0, high: 0.3 }
-      dropout: { type: float, low: 0.0, high: 0.3 }
+      optimizer.weight_decay: { type: float, low: 0.0, high: 0.3 }
+      model.dropout: { type: float, low: 0.0, high: 0.3 }

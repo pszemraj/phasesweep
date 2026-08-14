@@ -19,15 +19,11 @@ July 2026; quirks worth keeping in mind:
   documented by the official Linux beta; detection gates on the directory
   actually existing.
 
-Two launcher modes render the same entry shapes with a different executable
-and leading argv (review v0.5.15 / item G): the default binds an absolute
-``phasesweep-mcp`` path from the running environment; the opt-in ``uvx`` mode
-instead writes a pinned ``uvx --from phasesweep[mcp]==<version>
-phasesweep-mcp`` invocation that survives that environment being moved or
-recreated, at the cost of requiring ``uvx`` on the client's ``PATH`` at
-launch time. :func:`is_managed_mcp_entry` recognizes entries written in
-either mode so uninstall and re-install stay reversible regardless of which
-mode created the entry.
+Generated entries bind the absolute ``phasesweep-mcp`` executable from the
+environment running the installer. :func:`is_managed_mcp_entry` recognizes
+that exact generated shape - plus the pinned ``uvx`` shape earlier versions
+wrote, which is recognized but never generated - so uninstall and re-install
+stay reversible for entries written by any released version.
 """
 
 from __future__ import annotations
@@ -37,16 +33,16 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 SERVER_NAME = "phasesweep"
-# PyPI distribution name backing the ``uvx`` pinned launcher (review v0.5.15 / item G).
-# Coincides with SERVER_NAME today but is tracked separately since one names the MCP
-# server entry and the other names a package on PyPI.
-PACKAGE_NAME = "phasesweep"
+
+# Legacy recognition only (see `_is_phasesweep_argv`): the removed ``--launcher uvx``
+# mode wrote a pinned requirement such as "phasesweep[mcp]==1.2.3" naming the PyPI
+# distribution. Nothing here is ever written by this version.
+_LEGACY_UVX_PIN_PATTERN = re.compile(r"^phasesweep\[mcp\]==[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 
 MARKDOWN_START = "<!-- PHASESWEEP_START -->"
 MARKDOWN_END = "<!-- PHASESWEEP_END -->"
@@ -55,12 +51,6 @@ TOML_END = "# PHASESWEEP_END"
 
 Scope = Literal["project", "user"]
 EntryStyle = Literal["stdio", "stdio-typed", "opencode"]
-Launcher = Literal["path", "uvx"]
-
-# Matches the pinned uvx requirement this installer writes, e.g. "phasesweep[mcp]==1.2.3".
-_UVX_PIN_PATTERN = re.compile(
-    rf"^{re.escape(PACKAGE_NAME)}\[mcp\]==(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]*)$"
-)
 
 
 @dataclass(frozen=True)
@@ -101,20 +91,15 @@ def mcp_entry(
     style: EntryStyle,
     command: str,
     catalog: Path,
-    *,
-    launcher_args: Sequence[str] = (),
 ) -> dict[str, object]:
     """Render one client's JSON server entry for the phasesweep server.
 
     :param EntryStyle style: Client entry dialect.
-    :param str command: Launcher executable: an absolute ``phasesweep-mcp`` path
-        (default mode), or ``"uvx"`` (pinned uvx launcher mode).
+    :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path catalog: Absolute catalog path passed as ``--catalog``.
-    :param Sequence[str] launcher_args: Extra argv placed before ``--catalog``;
-        empty for the default mode, the pinned uvx invocation otherwise.
     :return dict[str, object]: Entry value to store under the server name.
     """
-    args = [*launcher_args, "--catalog", str(catalog)]
+    args = ["--catalog", str(catalog)]
     if style == "opencode":
         return {
             "type": "local",
@@ -130,8 +115,9 @@ def mcp_entry(
 def is_managed_mcp_entry(style: EntryStyle, value: object) -> bool:
     """Return whether a JSON member has exactly the shape this installer writes.
 
-    Recognizes both launcher modes this installer can write: the default
-    absolute-path launcher and the pinned ``uvx`` launcher.
+    Recognizes the absolute-path launcher this installer writes, plus the
+    pinned ``uvx`` launcher earlier versions wrote, so an upgraded install can
+    still remove or repair those entries.
 
     Ownership is inferred from the exact entry shape alone; no receipt records
     which entries this installer actually wrote. A hand-authored entry that
@@ -207,10 +193,18 @@ def _entry_argv(style: EntryStyle, value: dict[str, object]) -> list[str] | None
 def _is_phasesweep_argv(argv: list[str]) -> bool:
     """Return whether a full command argv matches one recognized launcher shape.
 
-    :param list[str] argv: Candidate argv, executable first, as written by ``mcp_entry``.
-    :return bool: True for the 3-element absolute-path launcher
-        (``phasesweep-mcp --catalog PATH``) or the 6-element pinned uvx launcher
-        (``uvx --from phasesweep[mcp]==VERSION phasesweep-mcp --catalog PATH``).
+    The 3-element absolute-path shape is what :func:`mcp_entry` writes. The
+    6-element pinned-uvx shape is legacy recognition only: the ``--launcher
+    uvx`` mode that wrote it is gone, but entries it wrote are still on disk in
+    upgraded installs, and without recognizing them ``uninstall`` would refuse
+    to remove them and ``install`` would refuse to replace them, leaving no
+    phasesweep command able to repair the client config.
+
+    :param list[str] argv: Candidate argv, executable first, as written by ``mcp_entry``
+        or by the removed ``uvx`` launcher mode.
+    :return bool: True for ``phasesweep-mcp --catalog PATH`` using absolute paths,
+        or for the legacy ``uvx --from phasesweep[mcp]==VERSION phasesweep-mcp
+        --catalog PATH``.
     """
     if len(argv) == 3:
         command, flag, catalog = argv
@@ -224,7 +218,7 @@ def _is_phasesweep_argv(argv: list[str]) -> bool:
         return (
             command == "uvx"
             and from_flag == "--from"
-            and _UVX_PIN_PATTERN.match(pin) is not None
+            and _LEGACY_UVX_PIN_PATTERN.match(pin) is not None
             and entrypoint == "phasesweep-mcp"
             and flag == "--catalog"
             and _is_absolute_path(catalog)
@@ -253,22 +247,17 @@ def _is_absolute_path(value: str) -> bool:
 def codex_toml_content(
     command: str,
     catalog: Path,
-    *,
-    launcher_args: Sequence[str] = (),
 ) -> str:
     """Render the Codex ``config.toml`` table body for the phasesweep server.
 
-    :param str command: Launcher executable: an absolute ``phasesweep-mcp`` path
-        (default mode), or ``"uvx"`` (pinned uvx launcher mode).
+    :param str command: Absolute ``phasesweep-mcp`` executable path.
     :param Path catalog: Absolute catalog path passed as ``--catalog``.
-    :param Sequence[str] launcher_args: Extra argv placed before ``--catalog``;
-        empty for the default mode, the pinned uvx invocation otherwise.
     :return str: TOML table text placed between the installer markers.
     """
     # JSON and TOML basic strings share escaping for valid Unicode. Keeping
     # non-ASCII characters literal avoids JSON's non-BMP UTF-16 surrogate pairs,
     # which TOML rejects because each \u escape must be a Unicode scalar value.
-    args = [*launcher_args, "--catalog", str(catalog)]
+    args = ["--catalog", str(catalog)]
     args_literal = ", ".join(json.dumps(arg, ensure_ascii=False) for arg in args)
     return (
         f"[mcp_servers.{SERVER_NAME}]\n"

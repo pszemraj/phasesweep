@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
 import warnings
 from pathlib import Path
@@ -27,7 +28,7 @@ from phasesweep.config import (
 )
 from phasesweep.config.common import _find_prefix_collisions
 from phasesweep.engine.optuna import _build_sampler
-from tests.conftest import make_experiment, write_yaml
+from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
 
 def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
@@ -37,6 +38,7 @@ def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
         f"""
         experiment: t
         trial_command: "echo {{overrides}}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -117,13 +119,14 @@ def test_sampler_rejects_negative_n_startup_trials():
         Sampler(type="tpe", n_startup_trials=-1)
 
 
-def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
-    """`phasesweep validate` must catch CMA-ES + categorical, not first trial."""
-    p = write_yaml(
-        tmp_path,
-        """
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(
+            """
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -134,10 +137,36 @@ def test_validate_rejects_cmaes_with_categorical(tmp_path: Path) -> None:
             sampler: { type: cmaes }
             search_space:
               model: { type: categorical, choices: ["a", "b"] }
-        """,
-    )
-    with pytest.raises(ValidationError, match="cmaes.*does not support categorical"):
-        load_experiment(p)
+            """,
+            "cmaes.*does not support categorical",
+            id="cmaes-categorical",
+        ),
+        pytest.param(
+            """
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+        phases:
+          - name: p
+            n_trials: 1
+            fixed_overrides: { lr: 0.001 }
+            search_space:
+              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
+            """,
+            "both fixed_overrides and search_space",
+            id="fixed-and-sampled-collision",
+        ),
+    ],
+)
+def test_validate_rejects_incompatible_phase_settings(
+    tmp_path: Path, body: str, match: str
+) -> None:
+    """Validation rejects incompatible sampler and parameter declarations."""
+    assert_invalid_experiment_yaml(tmp_path, body, match)
 
 
 def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
@@ -224,6 +253,7 @@ def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
         """
         experiment: t
         trial_command: "echo {overrides}"
+        override_format: argparse
         metric:
           name: x
           goal: minimize
@@ -249,6 +279,7 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
                 """
                 experiment: t
                 trial_command: "echo {overrides}"
+                override_format: argparse
                 metric:
                   name: x
                   goal: minimize
@@ -267,16 +298,52 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
 
 def test_categorical_choices_reject_duplicates() -> None:
     """A repeated choice inflates cardinality and skews sampling weight."""
-    with pytest.raises(ValidationError, match="choices must be unique"):
+    with pytest.raises(ValidationError, match="must remain distinguishable"):
         CategoricalParam(type="categorical", choices=[1, 1, 2])
-    with pytest.raises(ValidationError, match="index 0 and index 2"):
+    with pytest.raises(ValidationError, match="at index 2 compares equal to 'a' at index 0"):
         CategoricalParam(type="categorical", choices=["a", "b", "a"])
 
 
-def test_categorical_duplicate_identity_is_type_aware() -> None:
-    """1, 1.0, and true compare equal in Python but are distinct trainer overrides."""
-    param = CategoricalParam(type="categorical", choices=[1, 1.0, True])
-    assert [type(c).__name__ for c in param.choices] == ["int", "float", "bool"]
+@pytest.mark.parametrize(
+    ("choices", "message"),
+    [
+        pytest.param([1, 1.0], "1.0 at index 1 compares equal to 1 at index 0", id="int_float"),
+        pytest.param([1, True], "True at index 1 compares equal to 1 at index 0", id="int_bool"),
+        pytest.param([0, False], "False at index 1 compares equal to 0 at index 0", id="zero_bool"),
+        pytest.param(
+            [0.0, -0.0], r"-0\.0 at index 1 compares equal to 0\.0 at index 0", id="signed_zero"
+        ),
+    ],
+)
+def test_categorical_rejects_equal_but_distinct_choices(
+    choices: list[object], message: str
+) -> None:
+    """Optuna's ``==`` index lookup cannot tell equal choices apart once persisted.
+
+    ``CategoricalDistribution`` records a sampled value as ``choices.index(value)``,
+    so ``1``, ``1.0``, and ``True`` all persist as the first equal choice. The
+    trainer would run one value while the published winner and every inherited
+    override claimed another (PR #5 review / reviewer 2, blocker 1).
+    """
+    with pytest.raises(ValidationError, match=message):
+        CategoricalParam(type="categorical", choices=choices)
+
+
+def test_categorical_config_error_uses_only_the_selected_union_branch(tmp_path: Path) -> None:
+    """The ``type`` discriminator keeps upgrade errors focused on categorical choices."""
+    with pytest.raises(ValidationError) as exc_info:
+        load_experiment(
+            _grid_yaml(
+                tmp_path,
+                "x: { type: categorical, choices: [1, 1.0] }",
+                n_trials=2,
+            )
+        )
+
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["loc"][-2:] == ("categorical", "choices")
+    assert "must remain distinguishable" in errors[0]["msg"]
 
 
 def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
@@ -289,29 +356,6 @@ def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> No
                 n_trials=11,
             )
         )
-
-
-def test_validate_rejects_local_fixed_and_sampled_collision(tmp_path: Path) -> None:
-    """A key cannot be both fixed_overrides and search_space in the same phase."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides: { lr: 0.001 }
-            search_space:
-              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-        """,
-    )
-    with pytest.raises(ValidationError, match="both fixed_overrides and search_space"):
-        load_experiment(p)
 
 
 def test_find_prefix_collisions() -> None:
@@ -386,6 +430,7 @@ def test_rejects_dotted_prefix_collisions() -> None:
             Experiment(
                 experiment=f"t_{case}",
                 trial_command="echo {overrides}",
+                override_format="argparse",
                 metric=Metric(
                     extractor=LogRegexExtractor(
                         type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
@@ -470,6 +515,20 @@ def test_trial_command_unbalanced_brace_rejected() -> None:
         make_experiment(trial_command="echo {trial_dir", n_trials=1)
 
 
+def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        make_experiment(
+            trial_command="python train.py --config {config_path}",
+            override_format="yaml_file",
+            trainer_config={"optimizer": {"learning_rate": float("nan")}},
+            n_trials=1,
+        )
+
+    message = str(exc_info.value)
+    assert "trainer_config and composed overrides are invalid" in message
+    assert "unbalanced braces" not in message
+
+
 def test_trial_command_accepts_supported_templates() -> None:
     """Accepted templates include normal overrides, format specs, and no-override phases."""
     cases = [
@@ -509,6 +568,7 @@ def test_trial_command_accepts_supported_templates() -> None:
             "normal_template_with_output",
             lambda: make_experiment(
                 trial_command="python train.py --out {trial_dir}/result.json {overrides}",
+                override_format="argparse",
                 n_trials=1,
             ),
         ),
@@ -535,6 +595,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -627,23 +688,37 @@ def test_search_space_accepts_well_formed_keys() -> None:
 def test_cmaes_phase_rejected_at_config_load_when_package_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CMA-ES availability is part of config validation, not first-trial launch."""
-    import builtins
+    """CMA-ES availability is part of config validation, not mid-run sampler build.
 
-    real_import = builtins.__import__
-
-    def fake_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if name == "cmaes":
-            raise ImportError("simulated missing cmaes package")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    ``cmaes`` is a declared hard dependency, but a declared dependency is not
+    an enforced one. If the preflight is dropped, a broken environment passes
+    ``phasesweep validate`` and fails inside ``_build_sampler`` instead —
+    after the generation is claimed and earlier phases have burned GPU time.
+    """
+    # A None entry makes `import cmaes` raise ImportError without touching
+    # any other import, and monkeypatch restores the real module after.
+    monkeypatch.setitem(sys.modules, "cmaes", None)
 
     with pytest.raises(ValidationError, match=r"cmaes.*not installed"):
         make_experiment(
             sampler=Sampler(type="cmaes", seed=0),
             search_space={"x": IntParam(type="int", low=0, high=10)},
         )
+
+
+def test_cmaes_missing_package_error_names_the_install_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rejection tells the operator exactly how to repair the environment."""
+    monkeypatch.setitem(sys.modules, "cmaes", None)
+
+    with pytest.raises(ValidationError) as excinfo:
+        make_experiment(
+            sampler=Sampler(type="cmaes", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    assert "pip install cmaes" in str(excinfo.value)
 
 
 def test_cmaes_phase_loads_when_package_present() -> None:
@@ -663,6 +738,7 @@ experiment: t
 storage: ":memory:"
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize

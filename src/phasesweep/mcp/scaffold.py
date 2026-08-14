@@ -89,7 +89,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             f"""\
   - id: {experiment_id_scalar}          # the only token the agent ever sends
     config: {config_path}   # resolved relative to this catalog file
-    cwd: "."                     # detached trainer cwd; change if trial_command normally starts elsewhere
+    cwd: "."                     # detached runner cwd; trainer inherits it only when execution.cwd is unset
     # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
     # Side effects default to false. Uncomment deliberately to let the agent act:

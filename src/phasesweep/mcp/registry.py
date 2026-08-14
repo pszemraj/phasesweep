@@ -19,14 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.state import _experiment_dir
-from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -42,7 +41,7 @@ from phasesweep.runtime.process import read_proc_starttime
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
 
-def _require_linux_mcp_host() -> None:
+def require_linux_mcp_host() -> None:
     """Require Linux process identity semantics for autonomous MCP control.
 
     :raises CatalogError: If the host cannot provide Linux ``/proc`` process
@@ -107,6 +106,7 @@ class _Entry(_CatalogModel):
 
         :param str value: Operator-authored catalog id.
         :return str: The validated id.
+        :raises ValueError: If the id is not ``[A-Za-z0-9_-]+``.
         """
         # The id appears in run ids and handle filenames, so keep it path-safe
         # even though the operator writes it.
@@ -121,6 +121,8 @@ class _Entry(_CatalogModel):
 
         :param VisibleParamsPolicy value: Policy string or parameter-name allowlist.
         :return VisibleParamsPolicy: A valid policy string or deduplicated, stripped allowlist.
+        :raises ValueError: If a string policy is neither ``'none'`` nor ``'all'``,
+            or an allowlist contains a blank key.
         """
         if isinstance(value, str):
             if value not in {"none", "all"}:
@@ -173,11 +175,7 @@ class RegisteredExperiment:
     @property
     def metric_payload(self) -> dict[str, Any]:
         """Return the agent-visible optimization metric descriptor."""
-        return {
-            "name": self.experiment.metric.name,
-            "goal": self.experiment.metric.goal,
-            "objective_evidence": objective_evidence_assurance(self.experiment.metric.extractor),
-        }
+        return _metric_semantics_payload(self.experiment.metric)
 
     @property
     def capabilities(self) -> dict[str, bool]:
@@ -275,6 +273,9 @@ def _require_mcp_stable_paths(
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     :param Path config_dir: Directory of the experiment config, used to compute
         concrete fix suggestions for ``phasesweep mcp check``.
+    :raises CatalogError: If storage is absent or in-memory, ``workdir`` or
+        ``execution.cwd`` is relative, the storage backend is not local SQLite
+        or JournalStorage, or its file path is empty or relative.
     """
     storage = experiment.storage
     if storage is None or storage_is_in_memory(storage):
@@ -350,10 +351,12 @@ def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return tuple[_Catalog, Path]: Parsed catalog and its base directory for
         resolving relative entry paths.
+    :raises CatalogError: If the file cannot be read, is not a YAML mapping, or
+        fails catalog schema validation.
     """
     try:
         raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError) as exc:
         raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
     try:
         catalog = _Catalog.model_validate(raw)
@@ -368,6 +371,9 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param Path base: Directory containing the catalog file.
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
+    :raises CatalogError: If the config path or ``cwd`` does not exist, the
+        config cannot be parsed, it is a suite rather than an experiment, or it
+        fails the MCP path-stability rules.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -380,7 +386,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     try:
         config_bytes = cfg_path.read_bytes()
         config = load_config_bytes(config_bytes, source=cfg_path)
-    except (ValueError, OSError, yaml.YAMLError) as exc:
+    except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
     if isinstance(config, Suite):
         raise CatalogError(
@@ -388,6 +394,14 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
             "in this version; register single-experiment configs"
         )
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
+    if config.execution.cwd is None:
+        # The detached runner enters the catalog entry's cwd before invoking
+        # the engine. Materialize that effective trainer cwd in the in-memory
+        # registry config so server-side fingerprints and drift comparisons
+        # describe the same execution context as the runner.
+        config = config.model_copy(
+            update={"execution": config.execution.model_copy(update={"cwd": str(cwd)})}
+        )
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     return RegisteredExperiment(
         id=entry.id,
@@ -473,6 +487,58 @@ class CatalogCheckReport:
         return all(entry.ok for entry in self.entries)
 
 
+def _load_catalog_entries(
+    catalog: _Catalog,
+    base: Path,
+    *,
+    collect_errors: bool,
+) -> tuple[dict[str, RegisteredExperiment], tuple[CatalogCheckEntry, ...]]:
+    """Validate catalog entries under the check or startup error policy.
+
+    :param _Catalog catalog: Parsed catalog whose entries should be loaded.
+    :param Path base: Catalog directory used to resolve relative paths.
+    :param bool collect_errors: Collect one verdict per entry when true; raise
+        the first :class:`CatalogError` when false.
+    :return tuple: Successfully loaded entries keyed by id and any collected
+        check verdicts, in catalog order.
+    :raises CatalogError: The first entry error when ``collect_errors`` is false.
+    """
+    items: dict[str, RegisteredExperiment] = {}
+    verdicts: list[CatalogCheckEntry] = []
+    seen: set[str] = set()
+    # Two catalog ids must never govern one engine experiment: the MCP busy
+    # guard keys on the id string while the engine's locks key on the output
+    # namespace and storage identity.
+    namespace_owners: dict[str, str] = {}
+    storage_owners: dict[str, str] = {}
+    for entry in catalog.experiments:
+        try:
+            if entry.id in seen:
+                raise CatalogError(f"duplicate catalog id {entry.id!r}")
+            seen.add(entry.id)
+            registered = _load_entry(base, entry)
+            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+        except CatalogError as exc:
+            if not collect_errors:
+                raise
+            verdicts.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
+            continue
+
+        items[entry.id] = registered
+        if collect_errors:
+            actions = tuple(
+                action
+                for action, allowed in (
+                    ("launch", registered.allow_launch),
+                    ("cancel", registered.allow_cancel),
+                    ("from_phase", registered.allow_from_phase),
+                )
+                if allowed
+            )
+            verdicts.append(CatalogCheckEntry(entry.id, actions=actions))
+    return items, tuple(verdicts)
+
+
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate every catalog entry, collecting per-entry verdicts.
 
@@ -486,34 +552,10 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
-    _require_linux_mcp_host()
+    require_linux_mcp_host()
     catalog, base = _parse_catalog(catalog_path)
-    seen: set[str] = set()
-    namespace_owners: dict[str, str] = {}
-    storage_owners: dict[str, str] = {}
-    entries: list[CatalogCheckEntry] = []
-    for entry in catalog.experiments:
-        if entry.id in seen:
-            entries.append(CatalogCheckEntry(entry.id, error=f"duplicate catalog id {entry.id!r}"))
-            continue
-        seen.add(entry.id)
-        try:
-            registered = _load_entry(base, entry)
-            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
-        except CatalogError as exc:
-            entries.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
-            continue
-        actions = tuple(
-            action
-            for action, allowed in (
-                ("launch", registered.allow_launch),
-                ("cancel", registered.allow_cancel),
-                ("from_phase", registered.allow_from_phase),
-            )
-            if allowed
-        )
-        entries.append(CatalogCheckEntry(entry.id, actions=actions))
-    report = CatalogCheckReport(entries=tuple(entries))
+    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
+    report = CatalogCheckReport(entries=verdicts)
     if report.ok:
         _prepare_state_dir(base, catalog.state_dir)
     return report
@@ -542,35 +584,22 @@ class Registry:
     def load(cls, catalog_path: Path) -> Registry:
         """Parse and validate a catalog file.
 
-        Raises ``CatalogError`` on any problem so the server refuses to start
-        with a bad catalog. Per entry: the config path exists, ``load_config``
-        accepts it, it is an :class:`Experiment` (suites are out of scope for
-        v1), and its storage is a persistent local SQLite/Journal file (the MCP
-        layer is local-node only in this version).
+        Every problem is reported as ``CatalogError`` so the server refuses to
+        start with a bad catalog. Per entry: the config path exists,
+        ``load_config`` accepts it, it is an :class:`Experiment` (suites are out
+        of scope for v1), and its storage is a persistent local SQLite/Journal
+        file (the MCP layer is local-node only in this version).
 
-        Args:
-            catalog_path: Path to the operator-authored catalog YAML.
-
-        Returns:
-            An immutable :class:`Registry`.
-
+        :param Path catalog_path: Path to the operator-authored catalog YAML.
+        :return Registry: Immutable registry of validated catalog entries.
+        :raises CatalogError: If the host is not a supported Linux MCP host, the
+            catalog cannot be parsed, an id is duplicated, an entry fails
+            validation, two entries claim one engine namespace, or the state
+            directory cannot be prepared.
         """
-        _require_linux_mcp_host()
+        require_linux_mcp_host()
         catalog, base = _parse_catalog(catalog_path)
-        items: dict[str, RegisteredExperiment] = {}
-        # Two catalog ids must never govern one engine experiment: the MCP
-        # busy guard keys on the id string while the engine's locks key on
-        # the output namespace and storage identity, so two entries sharing
-        # a resource would race each other's launches and split the run
-        # history across ids (review v0.5.17 gap hunt).
-        namespace_owners: dict[str, str] = {}
-        storage_owners: dict[str, str] = {}
-        for entry in catalog.experiments:
-            if entry.id in items:
-                raise CatalogError(f"duplicate catalog id {entry.id!r}")
-            loaded = _load_entry(base, entry)
-            _claim_catalog_entry_identity(loaded, namespace_owners, storage_owners)
-            items[entry.id] = loaded
+        items, _ = _load_catalog_entries(catalog, base, collect_errors=False)
         return cls(
             state_dir=_prepare_state_dir(base, catalog.state_dir),
             items=items,
@@ -582,6 +611,7 @@ class Registry:
 
         :param str experiment_id: Agent-visible catalog id.
         :return RegisteredExperiment: Validated registry entry for the id.
+        :raises UnknownExperimentError: If no catalog entry has that id.
         """
         try:
             return self._items[experiment_id]

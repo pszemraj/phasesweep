@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import IO, Literal
 from uuid import uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -24,9 +25,10 @@ from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     ensure_private_dir,
-    fsync_directory,
+    open_directory_fd,
     open_private_text,
     private_atomic_write_text,
+    read_private_text_at,
     try_lock_file,
     unlock_file,
     validate_private_dir,
@@ -38,6 +40,7 @@ RunLaunchState = Literal["launching", "spawned"]
 
 __all__ = [
     "ProcessIdentity",
+    "PreparedRun",
     "RunHandle",
     "RunLaunchState",
     "RunState",
@@ -45,6 +48,8 @@ __all__ = [
     "identity_from_earlier_boot",
     "write_status_file",
 ]
+
+log = logging.getLogger("phasesweep.mcp.runs")
 
 # Run ids are minted by ``new_run_id`` from this same character class. A lookup
 # id, however, arrives from the (untrusted) agent and is interpolated into a
@@ -55,6 +60,83 @@ __all__ = [
 # 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
+_RUN_EVIDENCE_SUFFIXES = (
+    ".cleanup_uncertain.json",
+    ".cleanup_recovery.json",
+    ".status.json",
+    ".config.yaml",
+    ".log",
+    ".launch.lock",
+)
+
+
+def _strict_fsync_directory(path: Path) -> None:
+    """Fsync one private directory and propagate any durability failure.
+
+    :param Path path: Private directory whose entries must be durable.
+    """
+    directory_fd = open_directory_fd(path, create=False, private_final=True)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _strict_atomic_create_text(path: Path, text: str) -> None:
+    """Atomically create one private file without replacing an existing identity.
+
+    :param Path path: Destination path to create exclusively.
+    :param str text: Complete UTF-8 contents to publish.
+    :raises FileExistsError: If ``path`` already exists.
+    """
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    parent_fd = -1
+    published = False
+    try:
+        with open_private_text(temporary, "x") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        parent_fd = open_directory_fd(path.parent, create=False, private_final=True)
+        os.link(
+            temporary.name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        published = True
+        os.unlink(temporary.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        if parent_fd >= 0:
+            if published:
+                with contextlib.suppress(OSError):
+                    os.unlink(path.name, dir_fd=parent_fd)
+            with contextlib.suppress(OSError):
+                os.unlink(temporary.name, dir_fd=parent_fd)
+            with contextlib.suppress(OSError):
+                os.fsync(parent_fd)
+        else:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _strict_unlink(path: Path) -> None:
+    """Unlink one private file and durably record its removal.
+
+    :param Path path: File to unlink.
+    """
+    directory_fd = open_directory_fd(path.parent, create=False, private_final=True)
+    try:
+        os.unlink(path.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _read_json_object(path: Path) -> dict | None:
@@ -126,9 +208,34 @@ class RunHandle:
     started_at: str  # ISO-8601 UTC
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
+    # ``None`` is reserved for handles written before launch-time visibility
+    # was persisted. Readers treat it as ``none`` rather than consulting the
+    # current catalog, which could reveal values hidden at launch.
+    visible_params_at_launch: Literal["none", "all"] | list[str] | None = None
     # Boot that pid/pid_starttime belong to; None off-Linux and in handles
     # written before boot ids were recorded.
     boot_id: str | None = None
+
+
+@dataclass
+class PreparedRun:
+    """Owned pre-spawn launch preparation and its inherited kernel lease."""
+
+    handle: RunHandle
+    config_snapshot_path: Path
+    lease: IO[str]
+
+    @property
+    def lease_fd(self) -> int:
+        """Return the descriptor inherited by the blocked runner.
+
+        :return int: Open launch-lease file descriptor.
+        """
+        return self.lease.fileno()
+
+    def close(self) -> None:
+        """Release this server process's copy of the launch lease."""
+        self.lease.close()
 
 
 class RunStore:
@@ -252,18 +359,116 @@ class RunStore:
         """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
+    def launch_lease_path(self, run_id: str) -> Path:
+        """Path to the kernel-backed lease for a prepared launch.
+
+        :param str run_id: Run id whose preparation lease should be returned.
+        :return Path: Private launch-lease path.
+        """
+        return self._logs_dir / f"{run_id}.launch.lock"
+
+    def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
+        """Reserve and durably prepare one run without spawning a process.
+
+        :param RunHandle handle: Launching-state handle to prepare.
+        :param bytes config_bytes: Exact verified configuration bytes for the runner.
+        :return PreparedRun: Owned preparation whose lease must cross ``Popen``.
+        :raises ValueError: If ``handle`` is not a pre-spawn handle.
+        """
+        if handle.launch_state != "launching":
+            raise ValueError("a launch preparation requires a launching-state handle")
+        config_text = config_bytes.decode("utf-8")
+        lease_path = self.launch_lease_path(handle.run_id)
+        snapshot_path = self.config_snapshot_path(handle.run_id)
+        created: list[Path] = []
+        lease: IO[str] | None = None
+        try:
+            _strict_atomic_create_text(lease_path, "")
+            created.append(lease_path)
+            lease = try_lock_file(lease_path)
+            if lease is None:
+                raise RuntimeError(f"new launch lease for run {handle.run_id!r} is already held")
+            _strict_atomic_create_text(snapshot_path, config_text)
+            created.append(snapshot_path)
+            self.create(handle)
+            created.append(self._runs_dir / f"{handle.run_id}.json")
+            return PreparedRun(handle=handle, config_snapshot_path=snapshot_path, lease=lease)
+        except BaseException as exc:
+            if lease is not None:
+                lease.close()
+            cleanup_failed = False
+            for path in reversed([path for path in created if path != lease_path]):
+                try:
+                    _strict_unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+                    log.exception("failed to roll back pre-spawn artifact %s", path)
+            unpublished_survivor = not isinstance(exc, FileExistsError) and any(
+                path.exists() or path.is_symlink()
+                for path in (
+                    snapshot_path,
+                    self._runs_dir / f"{handle.run_id}.json",
+                )
+            )
+            if lease_path in created and not cleanup_failed and not unpublished_survivor:
+                try:
+                    _strict_unlink(lease_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.exception("failed to roll back pre-spawn artifact %s", lease_path)
+            raise
+
+    def finish_launch_preparation(self, preparation: PreparedRun) -> None:
+        """Best-effort remove a launch lease after the spawn outcome is durable.
+
+        :param PreparedRun preparation: Preparation returned by :meth:`prepare_launch`.
+        """
+        try:
+            preparation.close()
+        except OSError:
+            log.warning(
+                "could not close completed launch lease for run %s",
+                preparation.handle.run_id,
+                exc_info=True,
+            )
+        self.remove_launch_lease(preparation.handle.run_id)
+
+    def remove_launch_lease(self, run_id: str) -> None:
+        """Best-effort remove a completed launch lease sidecar.
+
+        :param str run_id: Run whose durable spawned identity supersedes the lease.
+        """
+        try:
+            _strict_unlink(self.launch_lease_path(run_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning(
+                "could not remove completed launch lease for run %s",
+                run_id,
+                exc_info=True,
+            )
+
     def create(self, handle: RunHandle) -> None:
-        """Exclusively claim and persist a new run identity."""
+        """Atomically claim and strictly persist a new run identity.
+
+        :param RunHandle handle: Complete handle to publish without replacement.
+        """
         target = self._runs_dir / f"{handle.run_id}.json"
-        payload = json.dumps(asdict(handle), indent=2)
-        with open_private_text(target, "x") as output:
-            output.write(payload + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        fsync_directory(target.parent)
+        payload = json.dumps(asdict(handle), indent=2) + "\n"
+        _strict_atomic_create_text(target, payload)
 
     def update(self, handle: RunHandle) -> None:
-        """Persist the one legal launching-to-spawned identity transition."""
+        """Persist the one legal launching-to-spawned identity transition.
+
+        :param RunHandle handle: Updated identity for an already-created run.
+        :raises FileNotFoundError: If no handle was created for ``handle.run_id``.
+        :raises ValueError: If the update changes an immutable field, or is not
+            a launching-to-spawned transition.
+        """
         current = self.get(handle.run_id)
         if current is None:
             raise FileNotFoundError(f"Run {handle.run_id!r} has not been created.")
@@ -273,6 +478,7 @@ class RunStore:
             "config_sha256",
             "started_at",
             "allow_cancel",
+            "visible_params_at_launch",
         )
         changed = [
             name for name in immutable_fields if getattr(current, name) != getattr(handle, name)
@@ -286,6 +492,7 @@ class RunStore:
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
         private_atomic_write_text(target, payload + "\n")
+        _strict_fsync_directory(target.parent)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -305,17 +512,214 @@ class RunStore:
             return None
         return self._load_handle(path, expected_run_id=run_id)
 
+    def handle_exists(self, run_id: str) -> bool:
+        """Return whether a persisted handle file exists for ``run_id``, decodable or not.
+
+        :meth:`get` collapses "no such run" and "handle present but
+        undecodable" into ``None``. Authority decisions must tell them apart:
+        an undecodable handle carries frozen launch authority that can no
+        longer be read and must fail closed. A missing handle alone does *not*
+        prove the id was never an MCP run -- the file may have been deleted
+        while other per-run files survive (:meth:`run_evidence_exists`), or
+        the whole state dir replaced, which only the generation's own
+        durable id-source record can reveal (PR #5 review / P2 missing-handle
+        authority).
+
+        :param str run_id: Agent-supplied run id to look up.
+        :return bool: ``True`` when a handle file exists for a well-shaped id.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        return (self._runs_dir / f"{run_id}.json").is_file()
+
+    def run_evidence_exists(self, run_id: str) -> bool:
+        """Return whether any durable per-run file besides the handle survives.
+
+        A deleted ``runs/<run_id>.json`` removes the frozen launch-authority
+        record but usually not its siblings: the per-run config snapshot,
+        terminal status, log, and cleanup markers all live under this same
+        state dir. Any survivor proves ``run_id`` *was* a launched MCP run
+        whose authority can no longer be read, so visibility decisions must
+        fail closed instead of treating the id as a never-MCP generation and
+        applying current catalog policy (PR #5 review / P2 missing-handle
+        authority).
+
+        :param str run_id: Agent-supplied run id to look up.
+        :return bool: ``True`` when any per-run file exists for a well-shaped id.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        return any(
+            path.is_file()
+            for path in (
+                self.config_snapshot_path(run_id),
+                self.status_path(run_id),
+                self.log_path(run_id),
+                self.cleanup_uncertain_path(run_id),
+                self.cleanup_recovery_path(run_id),
+                self.launch_lease_path(run_id),
+            )
+        )
+
+    def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
+        """Load persisted handles and identify malformed handle records.
+
+        :return tuple: Readable handles and stable identities for malformed
+            handle files. Orphaned sibling evidence is intentionally outside
+            this scan and is added only by :meth:`launch_inventory`.
+        """
+        handles: list[RunHandle] = []
+        unreadable: set[str] = set()
+        for path in self._runs_dir.glob("*.json"):
+            handle = self._load_handle(path, expected_run_id=path.stem)
+            if handle is None:
+                unreadable.add(
+                    f"run:{path.stem}"
+                    if SAFE_NAME_PATTERN.fullmatch(path.stem)
+                    else f"handle:{path.name}"
+                )
+                continue
+            handles.append(handle)
+        return handles, unreadable
+
     def list_handles(self) -> list[RunHandle]:
         """Load every persisted handle, skipping any that are malformed or partial.
 
         :return list[RunHandle]: Successfully decoded run handles.
         """
-        handles = []
-        for path in self._runs_dir.glob("*.json"):
-            handle = self._load_handle(path, expected_run_id=path.stem)
-            if handle is not None:
-                handles.append(handle)
+        handles, _unreadable = self._scan_handles()
         return handles
+
+    def launch_inventory(self) -> tuple[list[RunHandle], set[str]]:
+        """Load handles and count records whose launch authority is unreadable.
+
+        Ordinary read tools intentionally skip malformed handles so one bad
+        historical record does not hide every healthy run. Launch is different:
+        capacity is a safety decision, and neither a malformed handle nor
+        per-run evidence with no readable handle can be assumed terminal.
+
+        The caller must hold :meth:`launch_lock` across this scan and the spawn.
+
+        :return tuple[list[RunHandle], set[str]]: Readable handles and stable
+            identities for malformed handles or orphan evidence.
+        """
+        handles, unreadable = self._scan_handles()
+        readable_ids = {handle.run_id for handle in handles}
+
+        for path in self._logs_dir.iterdir():
+            if not path.is_file():
+                continue
+            for suffix in _RUN_EVIDENCE_SUFFIXES:
+                if not path.name.endswith(suffix):
+                    continue
+                run_id = path.name[: -len(suffix)]
+                if SAFE_NAME_PATTERN.fullmatch(run_id) and run_id not in readable_ids:
+                    unreadable.add(f"run:{run_id}")
+                break
+        return handles, unreadable
+
+    def is_pre_spawn_orphan(self, run_id: str) -> bool:
+        """Return whether ``run_id`` is a provably abandoned preparation.
+
+        Legacy launches are recoverable only when their config snapshot is the
+        sole evidence. Transactional launches also carry a kernel lease across
+        ``Popen``. A free lease plus either no handle or a valid launching
+        handle proves that no runner can still cross the acknowledgement
+        boundary; a child that was created inherits and holds the lease until
+        it has durably replaced the handle with its process identity or exits.
+
+        :param str run_id: Candidate orphan run identity.
+        :return bool: Whether the preparation is safe to remove automatically.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        lease_path = self.launch_lease_path(run_id)
+        if lease_path.is_file() and not lease_path.is_symlink():
+            lease = self._claim_abandoned_launch_lease(run_id)
+            if lease is None:
+                return False
+            lease.close()
+            return True
+
+        handle_path = self._runs_dir / f"{run_id}.json"
+        snapshot = self.config_snapshot_path(run_id)
+        terminal_evidence = (
+            self.status_path(run_id),
+            self.cleanup_uncertain_path(run_id),
+            self.cleanup_recovery_path(run_id),
+        )
+        if any(path.exists() or path.is_symlink() for path in terminal_evidence):
+            return False
+        if handle_path.exists() or handle_path.is_symlink():
+            return False
+        if self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
+            return False
+        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+        try:
+            try:
+                read_private_text_at(directory_fd, snapshot.name, snapshot)
+            except (OSError, UnsafePrivatePathError, UnicodeError):
+                return False
+        finally:
+            os.close(directory_fd)
+        return True
+
+    def _claim_abandoned_launch_lease(self, run_id: str) -> IO[str] | None:
+        """Lock and revalidate one transactional pre-spawn preparation.
+
+        :param str run_id: Candidate prepared run identity.
+        :return IO[str] | None: Held lease when the preparation is abandoned.
+        """
+        lease_path = self.launch_lease_path(run_id)
+        if not lease_path.is_file() or lease_path.is_symlink():
+            return None
+        try:
+            lease = try_lock_file(lease_path)
+        except (OSError, UnsafePrivatePathError):
+            return None
+        if lease is None:
+            return None
+        handle_path = self._runs_dir / f"{run_id}.json"
+        handle = self.get(run_id)
+        terminal_evidence = (
+            self.status_path(run_id),
+            self.cleanup_uncertain_path(run_id),
+            self.cleanup_recovery_path(run_id),
+        )
+        invalid = any(path.exists() or path.is_symlink() for path in terminal_evidence)
+        if handle_path.exists() or handle_path.is_symlink():
+            invalid = invalid or handle is None or handle.launch_state != "launching"
+        if invalid:
+            lease.close()
+            return None
+        return lease
+
+    def clear_pre_spawn_orphan(self, run_id: str) -> None:
+        """Remove one revalidated pre-spawn preparation durably.
+
+        :param str run_id: Orphan identity previously reported by launch.
+        :raises ValueError: The evidence no longer has the provably pre-spawn shape.
+        """
+        lease: IO[str] | None = None
+        if self.launch_lease_path(run_id).is_file():
+            lease = self._claim_abandoned_launch_lease(run_id)
+            if lease is None:
+                raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+        elif not self.is_pre_spawn_orphan(run_id):
+            raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+        paths = (
+            self._runs_dir / f"{run_id}.json",
+            self.config_snapshot_path(run_id),
+            self.log_path(run_id),
+            self.launch_lease_path(run_id),
+        )
+        try:
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    _strict_unlink(path)
+        finally:
+            if lease is not None:
+                lease.close()
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.
@@ -331,13 +735,24 @@ class RunStore:
             return None
         try:
             handle = RunHandle(**payload)
-        except (TypeError, KeyError, ValueError):
+        except TypeError:
             return None
         if handle.run_id != expected_run_id:
             return None
         if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
             return None
         if type(handle.allow_cancel) is not bool:
+            return None
+        visible_params = handle.visible_params_at_launch
+        if isinstance(visible_params, str):
+            if visible_params not in {"none", "all"}:
+                return None
+        elif isinstance(visible_params, list):
+            if not all(
+                type(key) is str and key and key == key.strip() for key in visible_params
+            ) or len(set(visible_params)) != len(visible_params):
+                return None
+        elif visible_params is not None:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None
@@ -611,23 +1026,73 @@ class RunStore:
         status = self._read_status(handle)
         return status is not None and self._terminal_cleanup_uncertain(handle, status)
 
-    def cleanup_recovered_attempt_ids(self, handle: RunHandle) -> set[str]:
-        """Return exact reaped attempt IDs from valid runner and operator evidence.
+    def cleanup_recovered_attempt_evidence(
+        self,
+        handle: RunHandle,
+    ) -> tuple[set[str], dict[str, tuple[str, int, str]]]:
+        """Return recovered attempt IDs and locations from one evidence snapshot.
+
+        Runner status contributes attempt IDs only when its generation map binds
+        them to this run. Operator evidence contributes IDs and authorizes only
+        the locations whose IDs appear in that same recovery record.
 
         :param RunHandle handle: Run whose cleanup recovery evidence should be read.
-        :return set[str]: Reaped attempt identities persisted for snapshot finalization.
+        :return tuple: Reaped attempt identities and operator-authorized locations.
         """
         attempt_ids: set[str] = set()
         status = self._read_status(handle)
         if status is not None:
-            attempt_ids.update(status.get("recovered_attempt_ids", []))
+            generations = status.get("recovered_attempt_generations")
+            recovered_ids = status.get("recovered_attempt_ids")
+            if isinstance(generations, dict) and isinstance(recovered_ids, list):
+                attempt_ids.update(
+                    attempt_id
+                    for attempt_id in recovered_ids
+                    if generations.get(attempt_id) == handle.run_id
+                )
         payload = self._read_cleanup_recovery(handle)
         if payload is None:
-            return attempt_ids
-        values = payload.get("reaped_attempt_ids")
-        if isinstance(values, list):
-            attempt_ids.update(value for value in values if isinstance(value, str) and value)
-        return attempt_ids
+            return attempt_ids, {}
+        recovered_ids = payload.get("reaped_attempt_ids")
+        locations = payload.get("reaped_attempt_locations")
+        if not isinstance(recovered_ids, list):
+            return attempt_ids, {}
+        authorized = {value for value in recovered_ids if isinstance(value, str) and value}
+        attempt_ids.update(authorized)
+        if not isinstance(locations, dict):
+            return attempt_ids, {}
+        result: dict[str, tuple[str, int, str]] = {}
+        for attempt_id, raw in locations.items():
+            if attempt_id not in authorized or not isinstance(raw, dict):
+                continue
+            phase = raw.get("phase")
+            trial_number = raw.get("trial_number")
+            generation_id = raw.get("generation_id")
+            if (
+                isinstance(phase, str)
+                and phase
+                and type(trial_number) is int
+                and trial_number >= 0
+                and isinstance(generation_id, str)
+                and generation_id
+            ):
+                result[attempt_id] = (phase, trial_number, generation_id)
+        return attempt_ids, result
+
+    def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
+        """Return exact attempts the runner reported as cleanup-uncertain.
+
+        These identities bind recovery of an older-generation attempt to the
+        run whose terminal report actually named it, without letting arbitrary
+        later reconciliation serve as evidence for that run.
+
+        :param RunHandle handle: Run whose terminal cleanup cause is read.
+        :return set[str]: Persisted uncertain attempt identities.
+        """
+        status = self._read_status(handle)
+        if status is None:
+            return set()
+        return set(status.get("uncertain_attempt_ids", []))
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
@@ -700,6 +1165,21 @@ class RunStore:
             payload.get("result_snapshot"), dict
         ):
             return None
+        result_publication_state = payload.get("result_publication_state")
+        result_publication_generation_id = payload.get("result_publication_generation_id")
+        if (result_publication_state is None) != (result_publication_generation_id is None):
+            return None
+        if result_publication_state is not None:
+            if result_publication_state not in {"prepared", "committed"}:
+                return None
+            if (
+                not isinstance(result_publication_generation_id, str)
+                or not SAFE_NAME_PATTERN.fullmatch(result_publication_generation_id)
+                or not isinstance(payload.get("result_snapshot"), dict)
+            ):
+                return None
+            if result_publication_state == "prepared" and result_snapshot_state != "pending":
+                return None
         result_snapshot_error = payload.get("result_snapshot_error")
         if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
             return None
@@ -707,6 +1187,21 @@ class RunStore:
         if recovered_attempt_ids is not None and (
             not isinstance(recovered_attempt_ids, list)
             or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
+        ):
+            return None
+        recovered_attempt_generations = payload.get("recovered_attempt_generations")
+        if recovered_attempt_generations is not None and (
+            not isinstance(recovered_attempt_generations, dict)
+            or any(
+                not isinstance(key, str) or not key or not isinstance(value, str) or not value
+                for key, value in recovered_attempt_generations.items()
+            )
+        ):
+            return None
+        uncertain_attempt_ids = payload.get("uncertain_attempt_ids")
+        if uncertain_attempt_ids is not None and (
+            not isinstance(uncertain_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in uncertain_attempt_ids)
         ):
             return None
         return payload
@@ -748,6 +1243,23 @@ class RunStore:
             payload.get("run_id") == handle.run_id
             and payload.get("config_sha256") == handle.config_sha256
             and payload.get("cleanup_confirmed") is True
+        ):
+            return None
+        locations = payload.get("reaped_attempt_locations")
+        if locations is not None and (
+            not isinstance(locations, dict)
+            or any(
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or not isinstance(raw, dict)
+                or not isinstance(raw.get("phase"), str)
+                or not raw.get("phase")
+                or type(raw.get("trial_number")) is not int
+                or raw["trial_number"] < 0
+                or not isinstance(raw.get("generation_id"), str)
+                or not raw.get("generation_id")
+                for attempt_id, raw in locations.items()
+            )
         ):
             return None
         return payload

@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from phasesweep.mcp import runner as mcp_runner
-from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.server import PhaseSweepMCP
-from phasesweep.mcp.time import utc_now_iso
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
+from phasesweep.runtime import process as runtime_process
+from phasesweep.runtime.process import read_boot_id, read_proc_starttime
+from phasesweep.runtime.time import utc_now_iso
 
 
 def write_mcp_catalog(
@@ -86,9 +89,12 @@ def mcp_experiment_config_text(
     with_storage: bool = True,
 ) -> str:
     if phases is None:
+        # Seeded random: reproducible and resumable, so it satisfies the
+        # persistent-storage sampler policy without an acknowledgement.
         phases = """\
   - name: p
     n_trials: 1
+    sampler: { type: random, seed: 0 }
     search_space:
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
@@ -101,6 +107,7 @@ def mcp_experiment_config_text(
 experiment: {name}
 {storage}workdir: {tmp_path}/runs/{name}
 trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
+override_format: argparse
 metric:
   name: loss
   goal: minimize
@@ -121,7 +128,7 @@ experiment: {name}
 storage: sqlite:///{tmp_path}/{name}.db
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
-trial_command: "{sys.executable} {trainer} --out {{trial_dir}}/result.json --sleep {sleep} {{overrides}}"
+trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
 override_format: argparse
 metric:
   name: eval_loss
@@ -130,6 +137,7 @@ metric:
 phases:
   - name: p
     n_trials: 1
+    sampler: {{ type: random, seed: 0 }}
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
@@ -186,30 +194,31 @@ def make_run_handle(
     starttime: int | None = None,
     launch_state: RunLaunchState = "spawned",
     allow_cancel: bool = False,
+    visible_params_at_launch: VisibleParamsPolicy | None = "none",
 ) -> RunHandle:
     if launch_state == "launching":
-        return RunHandle(
-            run_id=run_id,
-            experiment_id=experiment_id,
-            config_sha256=config_sha256,
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
-            started_at=utc_now_iso(),
-            launch_state=launch_state,
-            allow_cancel=allow_cancel,
-        )
-    process_id = os.getpid() if pid is None else pid
+        process_id = None
+        process_group_id = None
+        process_starttime = None
+    else:
+        process_id = os.getpid() if pid is None else pid
+        # Default fixtures need a genuinely live PID so RunStore state checks
+        # see a running handle, but must never target pytest's own process
+        # group if a cancellation guard regresses. Explicit PID fixtures keep
+        # their matching PGID for process-lifecycle tests.
+        process_group_id = 2_000_000_000 if pid is None else process_id
+        process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
         run_id=run_id,
         experiment_id=experiment_id,
         config_sha256=config_sha256,
         pid=process_id,
-        pgid=process_id,
-        pid_starttime=read_proc_starttime(process_id) if starttime is None else starttime,
+        pgid=process_group_id,
+        pid_starttime=process_starttime,
         started_at=utc_now_iso(),
         launch_state=launch_state,
         allow_cancel=allow_cancel,
+        visible_params_at_launch=visible_params_at_launch,
     )
 
 
@@ -220,6 +229,7 @@ def claim_runner_handle(
     config_sha256: str,
     started_at: str,
     experiment_id: str = "srv",
+    visible_params_at_launch: VisibleParamsPolicy | None = "none",
 ) -> None:
     """Create the launch reservation a real MCP server owns before spawning."""
     store.create(
@@ -232,17 +242,74 @@ def claim_runner_handle(
             pid_starttime=None,
             started_at=started_at,
             launch_state="launching",
+            visible_params_at_launch=visible_params_at_launch,
         )
     )
 
 
 def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
-    """Invoke the detached runner in-process and restore the caller's directory."""
+    """Invoke the detached runner in-process without stealing pytest's process state.
+
+    The real runner is a process entry point and therefore owns shutdown
+    signals for its lifetime. Tests call it in pytest's process, where that
+    ownership must end with this helper just like the temporary cwd does.
+
+    :param list[str] argv: Detached runner arguments.
+    :param Path | None cwd: Runner working directory, or the current directory.
+    :return int: Runner process exit code.
+    """
     original = Path.cwd()
+    restore_signal = signal.signal
+    restore_mask = getattr(signal, "pthread_sigmask", None)
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
+    prior_owner = runtime_process._process_lifetime_owner
+    prior_depth = runtime_process._scope_depth
     try:
         return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
     finally:
         os.chdir(original)
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(
+                signal.SIG_BLOCK,
+                set(runtime_process._SHUTDOWN_SIGNALS),
+            )
+        for sig, handler in prior_handlers.items():
+            restore_signal(sig, handler)
+        if restore_mask is not None and prior_mask is not None:
+            restore_mask(signal.SIG_SETMASK, prior_mask)
+        runtime_process._process_lifetime_owner = prior_owner
+        runtime_process._scope_depth = prior_depth
+
+
+def runner_argv(
+    store: RunStore,
+    *,
+    run_id: str,
+    config: Path,
+    config_sha256: str,
+    experiment_id: str,
+    started_at: str,
+) -> list[str]:
+    """Build the detached-runner arguments shared by MCP tests.
+
+    :param RunStore store: Run store supplying status and state paths.
+    :param str run_id: Claimed run identifier.
+    :param Path config: Snapshotted experiment configuration.
+    :param str config_sha256: Expected configuration digest.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str started_at: Claimed launch timestamp.
+    :return list[str]: Runner arguments without the Python module prefix or cwd.
+    """
+    return _runner_protocol_argv(
+        run_id=run_id,
+        config_snapshot_path=config,
+        config_sha256=config_sha256,
+        status_path=store.status_path(run_id),
+        state_dir=store.log_path(run_id).parent.parent,
+        experiment_id=experiment_id,
+        started_at=started_at,
+    )
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
@@ -262,8 +329,46 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         assert kwargs.get("stderr") is subprocess.STDOUT
         assert kwargs.get("start_new_session") is True
         assert stdout is not None and not getattr(stdout, "closed", True)
+        ready_fd = int(cmd[cmd.index("--launch-ready-fd") + 1])
+        ack_fd = int(cmd[cmd.index("--launch-ack-fd") + 1])
+        lease_fd = int(cmd[cmd.index("--launch-lease-fd") + 1])
+        inherited = kwargs.get("pass_fds")
+        assert isinstance(inherited, tuple)
+        assert ready_fd in inherited
+        assert ack_fd in inherited
+        assert lease_fd in inherited
+        ack_reader = os.dup(ack_fd)
+        pending_store = RunStore(Path(cmd[cmd.index("--state-dir") + 1]))
+        run_id = cmd[cmd.index("--run-id") + 1]
+        pending = pending_store.get(run_id)
+        assert pending is not None
+        pending_store.update(
+            RunHandle(
+                run_id=run_id,
+                experiment_id=pending.experiment_id,
+                config_sha256=pending.config_sha256,
+                pid=DummyProc.pid,
+                pgid=DummyProc.pid,
+                pid_starttime=read_proc_starttime(DummyProc.pid),
+                started_at=pending.started_at,
+                launch_state="spawned",
+                allow_cancel=pending.allow_cancel,
+                visible_params_at_launch=pending.visible_params_at_launch,
+                boot_id=read_boot_id(),
+            )
+        )
+        os.write(ready_fd, b"R")
+
+        def consume_ack() -> None:
+            try:
+                os.read(ack_reader, 1)
+            finally:
+                os.close(ack_reader)
+
+        threading.Thread(target=consume_ack, daemon=True).start()
         captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
         return DummyProc()
 
     monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)

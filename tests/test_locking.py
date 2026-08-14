@@ -7,18 +7,36 @@ import signal
 import stat
 import threading
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pytest
 
-from phasesweep.config import Experiment, FloatParam, IntParam, Phase
+from phasesweep.config import Experiment, FloatParam, IntParam, Phase, Sampler
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.guards import (
     _experiment_lock,
     _run_lock_paths,
 )
+from phasesweep.errors import LockBusyError, PhaseSweepError
 from phasesweep.runtime import files as runtime_files
-from tests.conftest import make_experiment
+from tests.conftest import (
+    make_experiment,
+    patch_directory_fsync_failure,
+    raise_after_first_successful_call,
+)
+
+
+def test_missing_nofollow_is_a_platform_capability_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(runtime_files.os, "O_NOFOLLOW")
+
+    with pytest.raises(
+        runtime_files.PlatformCapabilityError,
+        match="without following symlinks",
+    ):
+        runtime_files.nofollow_flag()
 
 
 def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
@@ -94,6 +112,22 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     override.chmod(0o750)
     with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
         runtime_files.lock_dir()
+    assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
+
+
+def test_busy_generic_lock_is_an_operational_error(tmp_path: Path) -> None:
+    """Suite-style lock contention belongs to the CLI's expected boundary."""
+    lock_path = tmp_path / "busy.lock"
+    held = runtime_files.try_lock_file(lock_path)
+    assert held is not None
+    try:
+        with (
+            pytest.raises(LockBusyError, match="already busy"),
+            runtime_files.exclusive_lock(lock_path, busy_message="already busy"),
+        ):
+            pytest.fail("the held lock must not be reacquired")
+    finally:
+        runtime_files.unlock_file(held)
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
@@ -447,14 +481,7 @@ def test_private_atomic_write_logs_directory_fsync_failure(
     state.mkdir(mode=0o700)
     state.chmod(0o700)
     path = state / "status.json"
-    real_fsync = os.fsync
-
-    def fail_directory_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("simulated directory fsync failure")
-        real_fsync(fd)
-
-    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
     caplog.set_level("WARNING", logger="phasesweep.runtime.files")
 
     runtime_files.private_atomic_write_text(path, "committed")
@@ -482,21 +509,15 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
 
     target = tmp_path / "nested" / "dir"
     target.mkdir(parents=True)
-    real_close = os.close
-    fired = False
-
-    def close_then_shutdown(fd: int) -> None:
-        nonlocal fired
-        real_close(fd)
-        if not fired:
-            fired = True
-            raise InjectedShutdown
-
+    close_then_shutdown, close_calls = raise_after_first_successful_call(
+        os.close,
+        InjectedShutdown(),
+    )
     monkeypatch.setattr(os, "close", close_then_shutdown)
 
     with pytest.raises(InjectedShutdown):
         runtime_files.open_directory_fd(target, create=False, private_final=False)
-    assert fired
+    assert close_calls
 
 
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
@@ -554,12 +575,14 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
         Phase(
             name="arch",
             n_trials=1,
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=1, high=2)},
         ),
         Phase(
             name="lr",
             inherits=["arch"],
             n_trials=1,
+            sampler=Sampler(type="random", seed=1),
             search_space={
                 "lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True),
             },
@@ -569,6 +592,7 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
         Phase(
             name="arch",
             n_trials=2,  # top-up
+            sampler=Sampler(type="random", seed=0),
             search_space={"depth": IntParam(type="int", low=1, high=2)},
         ),
     ]
@@ -609,40 +633,27 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
         pass
 
 
-def test_run_lock_does_not_collide_for_different_experiment_dirs(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("storage_a_name", "storage_b_name"),
+    [
+        pytest.param("a.db", "b.db", id="different-storage-and-name"),
+        pytest.param("shared.db", "shared.db", id="shared-storage-different-name"),
+    ],
+)
+def test_run_lock_does_not_collide_for_distinct_experiment_names(
+    tmp_path: Path, storage_a_name: str, storage_b_name: str
 ) -> None:
-    """Same workdir but different experiment names → different output dirs →
-    no collision (output lock identities differ).
-    """
-    exp_a = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'a.db'}"
-    )
-    exp_b = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'b.db'}"
-    )
-    exp_b = exp_b.model_copy(update={"experiment": "other"})
-
-    with _experiment_lock(exp_a), _experiment_lock(exp_b):
-        pass  # must not raise
-
-
-def test_run_lock_does_not_collide_for_different_experiment_names(
-    tmp_path: Path,
-) -> None:
-    """Same storage, distinct experiment namespaces → no collision.
-
-    A shared SQLite store can hold multiple independent experiments; locking
-    them out of running concurrently would over-restrict the user.
-    """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
-    exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage)
+    """Distinct experiment namespaces do not share output or storage locks."""
+    storage_a = f"sqlite:///{tmp_path / storage_a_name}"
+    storage_b = f"sqlite:///{tmp_path / storage_b_name}"
+    exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_a)
+    exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_b)
     # make_experiment hardcodes experiment="t"; clone exp_b with another name.
     exp_b = exp_b.model_copy(update={"experiment": "other"})
 
-    # Both output and storage lock identities differ — sets share no element.
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
+    with _experiment_lock(exp_a), _experiment_lock(exp_b):
+        pass  # must not raise
 
 
 def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
@@ -658,7 +669,81 @@ def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
     )
 
 
-def test_run_lock_collides_for_equivalent_rdb_storage_urls(tmp_path: Path) -> None:
+def _odbc_storage(connection_string: str) -> str:
+    """Encode a readable ODBC connection string as a SQLAlchemy URL."""
+    return f"mssql+pyodbc:///?odbc_connect={quote_plus(connection_string)}"
+
+
+@pytest.mark.parametrize(
+    ("left_storage", "right_storage"),
+    [
+        (
+            "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
+            "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?password=old-secret",
+            "postgresql://sweep@db.internal/studies?password=new-secret",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?access_token=old-token",
+            "postgresql://sweep@db.internal/studies?access_token=new-token",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?sslpassword=old-secret",
+            "postgresql://sweep@db.internal/studies?sslpassword=new-secret",
+        ),
+        (
+            "postgresql://sweep@db.internal/studies?client_secret=old-secret",
+            "postgresql://sweep@db.internal/studies?client_secret=new-secret",
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=old-secret"),
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=new-secret"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;PORT=1433"),
+            _odbc_storage("PORT=1433;DATABASE=studies;SERVER=db.internal"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies"),
+            _odbc_storage("server=db.internal;database=studies"),
+        ),
+        (
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;ClientSecret=old-secret"),
+            _odbc_storage("SERVER=db.internal;DATABASE=studies;client_secret=new-secret"),
+        ),
+        (
+            _odbc_storage(
+                "DRIVER={ODBC Driver 17 for SQL Server};SERVER=db.internal;"
+                "DATABASE=studies;Encrypt=yes;TrustServerCertificate=no;"
+                "Connection Timeout=30"
+            ),
+            _odbc_storage(
+                "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.internal;"
+                "DATABASE=studies;Encrypt=no;TrustServerCertificate=yes;"
+                "Connection Timeout=60"
+            ),
+        ),
+    ],
+    ids=[
+        "authority",
+        "query-password",
+        "access-token",
+        "sslpassword",
+        "client-secret",
+        "nested-odbc-credential",
+        "nested-odbc-field-order",
+        "nested-odbc-field-case",
+        "nested-odbc-client-secret",
+        "nested-odbc-connection-options",
+    ],
+)
+def test_run_lock_collides_for_equivalent_rdb_storage_urls(
+    tmp_path: Path,
+    left_storage: str,
+    right_storage: str,
+) -> None:
     """Equivalent external-RDB URLs must land on one storage lock.
 
     ``allow_external_rdb_single_host: true`` promises that host-local locking
@@ -668,49 +753,64 @@ def test_run_lock_collides_for_equivalent_rdb_storage_urls(tmp_path: Path) -> No
     Distinct workdirs keep the output locks apart, so any shared path is the
     storage lock.
     """
-    exp_a = _rdb_experiment(
-        tmp_path / "runs_a",
-        "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
-    )
-    exp_b = _rdb_experiment(
-        tmp_path / "runs_b",
-        "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
-    )
+    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
+    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
 
     assert set(_run_lock_paths(exp_a)) & set(_run_lock_paths(exp_b))
 
 
-def test_run_lock_does_not_collide_for_different_rdb_databases(tmp_path: Path) -> None:
-    """Canonicalization must not over-collide: distinct databases stay independent."""
-    exp_a = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_a")
-    exp_b = _rdb_experiment(tmp_path / "runs", "postgresql://sweep@db.internal/studies_b")
-    exp_b = exp_b.model_copy(update={"experiment": "other"})
+@pytest.mark.parametrize(
+    ("selector", "left_value", "right_value"),
+    [
+        ("SERVER", "db-a", "db-b"),
+        ("DATABASE", "studies-a", "studies-b"),
+        ("PORT", "1433", "1434"),
+        ("DSN", "studies-a", "studies-b"),
+        ("SOCKET", "/tmp/db-a", "/tmp/db-b"),
+        ("SCHEMA", "alpha", "beta"),
+    ],
+    ids=["server", "database", "port", "dsn", "socket", "schema"],
+)
+def test_run_lock_does_not_collide_for_different_rdb_targets(
+    tmp_path: Path,
+    selector: str,
+    left_value: str,
+    right_value: str,
+) -> None:
+    """Canonicalization must not over-collide distinct RDB target selectors."""
+    left_storage = _odbc_storage(f"{selector}={left_value}")
+    right_storage = _odbc_storage(f"{selector}={right_value}")
+    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
+    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
 
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 
-def test_in_memory_run_lock_keyed_by_workdir(tmp_path: Path) -> None:
-    """In-memory storage: only the output lock applies (no shared backend).
-    Two same-workdir+experiment configs share the same output lock path.
-    """
-    exp_a = make_experiment(workdir=str(tmp_path / "runs"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"))
+@pytest.mark.parametrize(
+    ("workdir_a", "workdir_b", "same_lock"),
+    [
+        pytest.param("runs", "runs", True, id="same-workdir"),
+        pytest.param("runs_a", "runs_b", False, id="different-workdirs"),
+    ],
+)
+def test_in_memory_run_lock_is_keyed_by_workdir(
+    tmp_path: Path,
+    workdir_a: str,
+    workdir_b: str,
+    same_lock: bool,
+) -> None:
+    """In-memory storage uses one output lock whose identity follows workdir."""
+    exp_a = make_experiment(workdir=str(tmp_path / workdir_a))
+    exp_b = make_experiment(workdir=str(tmp_path / workdir_b))
 
     paths_a = _run_lock_paths(exp_a)
     paths_b = _run_lock_paths(exp_b)
     # In-memory storage means only the output lock is taken — single path.
     assert len(paths_a) == 1
-    assert paths_a == paths_b
-
-
-def test_in_memory_run_lock_does_not_collide_for_different_workdirs(
-    tmp_path: Path,
-) -> None:
-    """In-memory storage with different workdirs = independent output dirs."""
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"))
-
-    assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
+    if same_lock:
+        assert paths_a == paths_b
+    else:
+        assert set(paths_a).isdisjoint(paths_b)
 
 
 def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
@@ -756,12 +856,14 @@ def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> No
         workdir=str(tmp_path / "runs_a"),
         storage=storage,
         trial_command="true {overrides}",
+        override_format="argparse",
         n_trials=1,
     )
     exp_b = make_experiment(
         workdir=str(tmp_path / "runs_b"),
         storage=storage,
         trial_command="true {overrides}",
+        override_format="argparse",
         n_trials=1,
     )
 

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import math
 import os
+import shlex
 import stat
 import threading
 import tomllib
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from phasesweep.cli import main as cli_main
+from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.install import edits as install_edits
 from phasesweep.mcp.install import installer
 from phasesweep.mcp.install.edits import removed_marked_text, updated_marked_text
@@ -114,6 +114,74 @@ def test_merge_json_member_preserves_data_order_and_indent(tmp_path):
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
 
 
+def test_json_install_uninstall_keeps_numeric_tokens_and_normalizes_key_spacing(tmp_path):
+    path = tmp_path / "mcp.json"
+    original = '{"threshold":1e2,"mcpServers":{}}\n'
+    path.write_text(original)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
+
+    restored = path.read_text()
+    # The unrelated float keeps its source spelling; only the compact key
+    # spacing and indentation normalize, so the file is not byte-identical.
+    assert '"threshold": 1e2' in restored
+    assert restored != original
+    assert json.loads(restored) == {"threshold": 100.0, "mcpServers": {}}
+
+
+@pytest.mark.parametrize("token", ["1e2", "2.5E-3", "0.30000000000000004", "1.50", "-1.0e+02"])
+def test_json_member_edits_preserve_unrelated_float_tokens(tmp_path, token):
+    path = tmp_path / "mcp.json"
+    path.write_text('{\n  "threshold": ' + token + ',\n  "mcpServers": {}\n}\n')
+    expected = json.loads(token)
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+    installed = path.read_text()
+    assert f'"threshold": {token}' in installed
+    assert json.loads(installed) == {"threshold": expected, "mcpServers": {"phasesweep": ENTRY}}
+
+    assert remove_json_member(path, "mcpServers", "phasesweep") == "removed"
+    restored = path.read_text()
+    assert f'"threshold": {token}' in restored
+    assert json.loads(restored) == {"threshold": expected, "mcpServers": {}}
+
+
+def test_merge_json_member_preserves_nested_float_tokens(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"weights":[1.50,{"decay":2.5E-3}],"mcpServers":{}}\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+
+    installed = path.read_text()
+    assert "1.50" in installed
+    assert "2.5E-3" in installed
+    assert json.loads(installed) == {
+        "weights": [1.5, {"decay": 0.0025}],
+        "mcpServers": {"phasesweep": ENTRY},
+    }
+    # Raw float tokens elsewhere in the document leave "unchanged" detection
+    # intact: the managed entry itself contains no numbers.
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "unchanged"
+    assert path.read_text() == installed
+
+
+def test_json_member_edits_survive_a_string_colliding_with_the_float_placeholder(tmp_path):
+    path = tmp_path / "mcp.json"
+    collision = f"{install_edits._RAW_FLOAT_PREFIX}0__"
+    path.write_text('{"note":"' + collision + '","threshold":1.50,"mcpServers":{}}\n')
+
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "updated"
+
+    installed = path.read_text()
+    assert '"threshold": 1.50' in installed
+    assert json.loads(installed) == {
+        "note": collision,
+        "threshold": 1.5,
+        "mcpServers": {"phasesweep": ENTRY},
+    }
+
+
 def test_json_member_edits_preserve_crlf(tmp_path):
     path = tmp_path / "mcp.json"
     path.write_bytes(b'{\r\n  "theme": "dark",\r\n  "mcpServers": {}\r\n}\r\n')
@@ -140,20 +208,58 @@ def test_merge_json_member_preserves_literal_unicode(tmp_path):
     assert "\\u00e9" not in text
 
 
-def test_merge_json_member_skips_commented_config(tmp_path):
-    path = tmp_path / "opencode.json"
-    original = '{\n  // my settings\n  "mcp": {}\n}\n'
+@pytest.mark.parametrize(
+    ("path_name", "key", "original", "expected"),
+    [
+        pytest.param(
+            "opencode.json",
+            "mcp",
+            '{\n  // my settings\n  "mcp": {}\n}\n',
+            "skipped",
+            id="commented-config",
+        ),
+        pytest.param(
+            "mcp.json",
+            "mcpServers",
+            '{"mcpServers": {"phasesweep": {"command": "custom"}}}\n',
+            "conflict",
+            id="unmanaged-member-conflict",
+        ),
+    ],
+)
+def test_merge_json_member_preserves_uneditable_config(
+    tmp_path, path_name, key, original, expected
+):
+    path = tmp_path / path_name
     path.write_text(original)
-    assert merge_json_member(path, "mcp", "phasesweep", ENTRY) == "skipped"
+
+    assert merge_json_member(path, key, "phasesweep", ENTRY) == expected
     assert path.read_text() == original
 
 
 @pytest.mark.parametrize(
     "original",
     [
-        b'{"theme":"first","theme":"second","mcpServers":{}}\n',
-        b'{"threshold":1e400,"mcpServers":{}}\n',
-        b'{"threshold":NaN,"mcpServers":{}}\n',
+        pytest.param(
+            b'{"theme":"first","theme":"second","mcpServers":{}}\n',
+            id="duplicate-key",
+        ),
+        pytest.param(
+            b'{"threshold":1e400,"mcpServers":{}}\n',
+            id="overflow-number",
+        ),
+        pytest.param(
+            b'{"threshold":NaN,"mcpServers":{}}\n',
+            id="nan-constant",
+        ),
+        pytest.param(
+            b'{"threshold":Infinity,"mcpServers":{}}\n',
+            id="positive-infinity-constant",
+        ),
+        pytest.param(
+            b'{"threshold":-Infinity,"mcpServers":{}}\n',
+            id="negative-infinity-constant",
+        ),
     ],
 )
 def test_merge_json_member_rejects_ambiguous_or_nonfinite_json(tmp_path, original):
@@ -243,23 +349,42 @@ def test_atomic_edit_failure_preserves_original(tmp_path, monkeypatch):
 
     monkeypatch.setattr(install_edits.os, "replace", fail_replace)
 
-    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "error"
+    assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "write-error"
     assert path.read_text() == original
     assert list(tmp_path.glob(".mcp.json.*.tmp")) == []
+
+
+def test_atomic_edit_reports_post_replace_fsync_failure(tmp_path, monkeypatch):
+    """A parent-fsync failure reports that the requested edit already committed."""
+    path = tmp_path / "mcp.json"
+    path.write_text('{"mcpServers": {}}\n')
+    real_fsync = install_edits.os.fsync
+
+    def fail_parent_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(install_edits.os, "fsync", fail_parent_fsync)
+
+    result = merge_json_member(path, "mcpServers", "phasesweep", ENTRY)
+
+    assert result == "durability-error"
+    assert json.loads(path.read_text())["mcpServers"]["phasesweep"] == ENTRY
 
 
 def test_atomic_edit_refuses_external_change_before_replace(tmp_path, monkeypatch):
     path = tmp_path / "mcp.json"
     path.write_text('{"mcpServers": {"other": {"command": "x"}}}\n')
     external = '{"changed_by": "another process"}\n'
-    real_new_temporary_fd = install_edits._new_temporary_fd
+    real_new_temporary_fd = install_edits._new_exclusive_temp_fd
 
     def change_after_temp_creation(parent_fd, leaf, mode):
         fd, name = real_new_temporary_fd(parent_fd, leaf, mode)
         path.write_text(external)
         return fd, name
 
-    monkeypatch.setattr(install_edits, "_new_temporary_fd", change_after_temp_creation)
+    monkeypatch.setattr(install_edits, "_new_exclusive_temp_fd", change_after_temp_creation)
 
     assert merge_json_member(path, "mcpServers", "phasesweep", ENTRY) == "stale"
     assert path.read_text() == external
@@ -428,10 +553,23 @@ def test_server_command_preserves_lexical_symlink_name(tmp_path, monkeypatch):
 
 def test_server_command_refuses_missing_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.sys, "executable", str(tmp_path / "env" / "bin" / "python"))
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("PATH", "")
 
     with pytest.raises(FileNotFoundError, match="cannot find an executable"):
         installer.resolve_server_command()
+
+
+def test_server_command_empty_sys_executable_never_resolves_from_cwd(tmp_path, monkeypatch):
+    """An embedded interpreter with no executable cannot pin a cwd-local script."""
+    local = _executable(tmp_path, name="phasesweep-mcp")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer.sys, "executable", "")
+    monkeypatch.setenv("PATH", "")
+
+    with pytest.raises(FileNotFoundError, match="cannot find an executable"):
+        installer.resolve_server_command()
+
+    assert local.is_file()
 
 
 def test_entry_styles_and_codex_toml(tmp_path):
@@ -455,172 +593,40 @@ def test_entry_styles_and_codex_toml(tmp_path):
     }
 
 
-# --- uvx pinned launcher (review v0.5.15 / item G) ---
+# Argv the removed `--launcher uvx` mode wrote; recognized so upgraded installs can
+# still remove or repair those entries, but never generated by this version.
+LEGACY_UVX_PREFIX = ["uvx", "--from", "phasesweep[mcp]==0.5.16", "phasesweep-mcp"]
 
-UVX_LAUNCHER_ARGS = ["--from", "phasesweep[mcp]==1.2.3", "phasesweep-mcp"]
+
+def _legacy_uvx_entry(style, catalog):
+    """Render the pinned-uvx entry an earlier phasesweep version wrote for one style."""
+    command, *launcher_args = LEGACY_UVX_PREFIX
+    args = [*launcher_args, "--catalog", str(catalog)]
+    if style == "opencode":
+        return {"type": "local", "command": [command, *args], "enabled": True}
+    entry = {"command": command, "args": args}
+    if style == "stdio-typed":
+        return {"type": "stdio", **entry}
+    return entry
 
 
-def test_uvx_launcher_entries_are_recognized_managed(tmp_path):
+def test_legacy_uvx_entries_are_still_installer_managed():
     catalog = Path("/proj/catalog.yaml")
+    for style in ("stdio", "stdio-typed", "opencode"):
+        assert is_managed_mcp_entry(style, _legacy_uvx_entry(style, catalog))
 
-    stdio = mcp_entry("stdio", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert stdio == {
-        "command": "uvx",
-        "args": [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"],
-    }
-    assert is_managed_mcp_entry("stdio", stdio)
-
-    typed = mcp_entry("stdio-typed", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert is_managed_mcp_entry("stdio-typed", typed)
-
-    opencode = mcp_entry("opencode", "uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS)
-    assert opencode["command"] == [
-        "uvx",
-        *UVX_LAUNCHER_ARGS,
-        "--catalog",
-        "/proj/catalog.yaml",
-    ]
-    assert is_managed_mcp_entry("opencode", opencode)
-
-    toml_parsed = tomllib.loads(codex_toml_content("uvx", catalog, launcher_args=UVX_LAUNCHER_ARGS))
-    codex_entry = toml_parsed["mcp_servers"]["phasesweep"]
-    assert codex_entry["args"] == [*UVX_LAUNCHER_ARGS, "--catalog", "/proj/catalog.yaml"]
-    assert is_managed_mcp_entry("stdio", codex_entry)
-
-
-@pytest.mark.parametrize(
-    "launcher_args",
-    [
-        ["--from", "phasesweep[mcp]==1.2.3", "other-entrypoint"],  # wrong entrypoint
-        ["--from", "other-package[mcp]==1.2.3", "phasesweep-mcp"],  # wrong package
-        ["--from", "phasesweep[mcp]==", "phasesweep-mcp"],  # empty version
-        ["--from", "phasesweep==1.2.3", "phasesweep-mcp"],  # missing [mcp] extra
-    ],
-)
-def test_uvx_launcher_entries_reject_malformed_pins(launcher_args):
-    catalog = Path("/proj/catalog.yaml")
-    entry = mcp_entry("stdio", "uvx", catalog, launcher_args=launcher_args)
-    assert not is_managed_mcp_entry("stdio", entry)
-
-
-def test_resolve_uvx_launcher_pins_installed_version(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: "9.9.9")
-
-    command, args = installer.resolve_uvx_launcher()
-
-    assert command == "uvx"
-    assert args == ["--from", "phasesweep[mcp]==9.9.9", "phasesweep-mcp"]
-
-
-def test_resolve_uvx_launcher_requires_uvx_on_path(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
-
-    with pytest.raises(FileNotFoundError, match="cannot find 'uvx'"):
-        installer.resolve_uvx_launcher()
-
-
-def test_resolve_uvx_launcher_requires_installed_distribution(monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def missing_version(_name):
-        raise importlib.metadata.PackageNotFoundError("phasesweep")
-
-    monkeypatch.setattr(installer.importlib.metadata, "version", missing_version)
-
-    with pytest.raises(LookupError, match="not an installed distribution"):
-        installer.resolve_uvx_launcher()
-
-
-@pytest.mark.parametrize(
-    "version",
-    [
-        "0.2.1.dev237+g8d1cb1e2b",  # editable checkout: dev release and local segment
-        "1.0.0+local",  # local segment alone
-        "0.0.0",  # placeholder emitted when version discovery fails
-    ],
-)
-def test_resolve_uvx_launcher_refuses_unpublishable_versions(version, monkeypatch):
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(installer.importlib.metadata, "version", lambda _name: version)
-
-    with pytest.raises(LookupError) as exc_info:
-        installer.resolve_uvx_launcher()
-
-    message = str(exc_info.value)
-    assert version in message
-    assert "cannot resolve from a package index" in message
-    assert "omit --launcher uvx" in message
-
-
-def test_installer_uvx_launcher_round_trip_across_json_and_toml(
-    fake_home, tmp_path, capsys, monkeypatch
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-
-    def fake_uvx_launcher():
-        return "uvx", ["--from", "phasesweep[mcp]==7.7.7", "phasesweep-mcp"]
-
-    monkeypatch.setattr(installer, "resolve_uvx_launcher", fake_uvx_launcher)
-    code = installer.run(
-        "install",
-        project,
-        catalog,
-        ["claude", "codex", "opencode"],
-        "mcp",
-        yes=True,
-        allow_user_scope=True,
-        launcher="uvx",
+    # Only that exact legacy shape is recognized; near misses stay foreign.
+    for args in (
+        ["--from", "phasesweep[mcp]", "phasesweep-mcp", "--catalog", "/proj/catalog.yaml"],
+        ["--from", "other[mcp]==1.0", "phasesweep-mcp", "--catalog", "/proj/catalog.yaml"],
+        ["--from", "phasesweep[mcp]==1.0", "phasesweep", "--catalog", "/proj/catalog.yaml"],
+        ["--from", "phasesweep[mcp]==1.0", "phasesweep-mcp", "--catalog", "catalog.yaml"],
+    ):
+        assert not is_managed_mcp_entry("stdio", {"command": "uvx", "args": args})
+    assert not is_managed_mcp_entry(
+        "stdio",
+        {"command": "uv", "args": LEGACY_UVX_PREFIX[1:] + ["--catalog", "/proj/catalog.yaml"]},
     )
-    assert code == 0, capsys.readouterr().out
-
-    claude_entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
-    assert claude_entry["command"] == "uvx"
-    assert claude_entry["args"] == [
-        "--from",
-        "phasesweep[mcp]==7.7.7",
-        "phasesweep-mcp",
-        "--catalog",
-        str(catalog),
-    ]
-
-    opencode_entry = json.loads((project / "opencode.json").read_text())["mcp"]["phasesweep"]
-    assert opencode_entry["command"][0] == "uvx"
-    assert "phasesweep[mcp]==7.7.7" in opencode_entry["command"]
-
-    codex_config = fake_home / ".codex" / "config.toml"
-    codex_parsed = tomllib.loads(codex_config.read_text())
-    assert codex_parsed["mcp_servers"]["phasesweep"]["command"] == "uvx"
-    assert "phasesweep[mcp]==7.7.7" in codex_parsed["mcp_servers"]["phasesweep"]["args"]
-
-    assert (
-        installer.run("uninstall", project, None, ["claude", "codex", "opencode"], "mcp", yes=True)
-        == 0
-    )
-    assert "phasesweep" not in json.loads((project / ".mcp.json").read_text())["mcpServers"]
-    assert "phasesweep" not in json.loads((project / "opencode.json").read_text())["mcp"]
-    assert "mcp_servers" not in tomllib.loads(codex_config.read_text())
-
-
-def test_installer_refuses_uvx_launcher_before_edits_when_unresolvable(
-    fake_home, tmp_path, capsys, monkeypatch
-):
-    project = tmp_path / "proj"
-    project.mkdir()
-    catalog = _write_valid_catalog(project)
-
-    def missing_uvx():
-        raise FileNotFoundError("cannot find 'uvx' on PATH")
-
-    monkeypatch.setattr(installer, "resolve_uvx_launcher", missing_uvx)
-
-    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True, launcher="uvx")
-
-    assert code == 1
-    assert "no client config was touched" in capsys.readouterr().err
-    assert not (project / ".mcp.json").exists()
 
 
 # --- check-install (review v0.5.15 / item G) ---
@@ -652,79 +658,50 @@ def _configured_catalog(tmp_path):
     return catalog
 
 
-def test_check_install_reports_healthy_path_launcher(fake_home, tmp_path, capsys):
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param("healthy", id="healthy-path-launcher"),
+        pytest.param("missing", id="missing-executable"),
+        pytest.param("non-executable", id="non-executable-file"),
+        pytest.param("missing-shebang", id="missing-shebang-interpreter"),
+    ],
+)
+def test_check_install_reports_launcher_states(fake_home, tmp_path, capsys, state):
     project = tmp_path / "proj"
     project.mkdir()
     script = _executable(tmp_path)
+    if state == "missing":
+        script.unlink()
+    elif state == "non-executable":
+        script.chmod(0o644)
+    elif state == "missing-shebang":
+        script.write_text("#!/missing/environment/bin/python\n")
     claude = _target(project, "claude")
     _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
-
-    code = installer.check_install(project, ["claude"])
-
-    output = capsys.readouterr().out
-    assert code == 0
-    assert str(script) in output
-    assert "every configured phasesweep MCP launcher resolves" in output
-
-
-def test_check_install_reports_missing_executable_with_repair_guidance(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    missing = tmp_path / "gone" / "phasesweep-mcp"
-    claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(missing), _configured_catalog(tmp_path)))
 
     code = installer.check_install(project, ["claude"])
 
     captured = capsys.readouterr()
-    assert code == 1
-    assert "missing" in captured.out
-    assert "no longer exists" in captured.out
-    assert "--launcher uvx" in captured.out
-    assert "need attention" in captured.err
-
-
-def test_check_install_reports_non_executable_file(fake_home, tmp_path, capsys):
-    project = tmp_path / "proj"
-    project.mkdir()
-    script = _executable(tmp_path)
-    script.chmod(0o644)
-    claude = _target(project, "claude")
-    _write_json_entry(claude, mcp_entry("stdio", str(script), _configured_catalog(tmp_path)))
-
-    code = installer.check_install(project, ["claude"])
-
-    output = capsys.readouterr().out
-    assert code == 1
-    assert "not-executable" in output
-    assert "not executable" in output
-
-
-def test_check_install_reports_uvx_launcher_health(fake_home, tmp_path, capsys, monkeypatch):
-    project = tmp_path / "proj"
-    project.mkdir()
-    claude = _target(project, "claude")
-    entry = mcp_entry(
-        "stdio",
-        "uvx",
-        _configured_catalog(tmp_path),
-        launcher_args=["--from", "phasesweep[mcp]==1.0.0", "phasesweep-mcp"],
-    )
-    _write_json_entry(claude, entry)
-
-    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
-    missing_code = installer.check_install(project, ["claude"])
-    missing_output = capsys.readouterr().out
-    assert missing_code == 1
-    assert "not on PATH" in missing_output
-
-    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
-    healthy_code = installer.check_install(project, ["claude"])
-    healthy_output = capsys.readouterr().out
-    assert healthy_code == 0
-    assert "uvx" in healthy_output
-    # An on-PATH uvx says nothing about the pinned requirement; the report says so.
-    assert "not verified offline" in healthy_output
+    if state == "healthy":
+        assert code == 0
+        assert str(script) in captured.out
+        assert "every configured phasesweep MCP launcher resolves" in captured.out
+    elif state == "missing":
+        assert code == 1
+        assert "missing" in captured.out
+        assert "no longer exists" in captured.out
+        assert "correct conda environment" in captured.out
+        assert "need attention" in captured.err
+    elif state == "non-executable":
+        assert code == 1
+        assert "not-executable" in captured.out
+        assert "not executable" in captured.out
+    else:
+        assert code == 1
+        assert "not-launchable" in captured.out
+        assert "missing or non-executable interpreter" in captured.out
+        assert "recreate that environment" in captured.out
 
 
 def test_check_install_reports_missing_catalog(fake_home, tmp_path, capsys):
@@ -762,7 +739,9 @@ def test_check_install_reports_executable_before_catalog(fake_home, tmp_path, ca
     assert "no longer exists" in output
 
 
-def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_path, capsys):
+def test_check_install_reports_unconfigured_unmanaged_and_unreadable_entries(
+    fake_home, tmp_path, capsys
+):
     project = tmp_path / "proj"
     project.mkdir()
     claude = _target(project, "claude")
@@ -779,12 +758,93 @@ def test_check_install_skips_unconfigured_and_unmanaged_entries(fake_home, tmp_p
     assert "unmanaged" in output
     assert "not installer-verified" in output
 
+    claude.mcp.path.write_text("{not strict json\n")
+    code = installer.check_install(project, ["claude"])
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "unreadable" in output
+    assert str(claude.mcp.path.resolve()) in output
 
-def test_check_install_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
+
+def test_check_install_resolves_legacy_uvx_launcher_from_path(
+    fake_home, tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    uvx = _executable(tmp_path, name="uvx")
+    monkeypatch.setenv("PATH", str(uvx.parent))
+    claude = _target(project, "claude")
+    _write_json_entry(claude, _legacy_uvx_entry("stdio", _configured_catalog(tmp_path)))
+
+    code = installer.check_install(project, ["claude"])
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "unmanaged" not in output
+    assert "uvx --from" in output
+
+
+def test_check_install_reports_legacy_uvx_launcher_missing_from_path(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = _target(project, "claude")
+    _write_json_entry(claude, _legacy_uvx_entry("stdio", _configured_catalog(tmp_path)))
+
+    code = installer.check_install(project, ["claude"])  # fake_home empties PATH
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "uvx is not on PATH" in captured.out
+    assert "rerun `phasesweep mcp install`" in captured.out
+    assert "need attention" in captured.err
+
+
+def test_check_install_never_mutates_the_config_it_reports_on(
+    fake_home, tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _executable(tmp_path)
+    monkeypatch.setenv("PATH", str(_executable(tmp_path, name="uvx").parent))
+    catalog = _configured_catalog(tmp_path)
+    claude = _target(project, "claude")
+    states = {
+        "healthy": (mcp_entry("stdio", str(script), catalog), 0),
+        "legacy": (_legacy_uvx_entry("stdio", catalog), 0),
+        "stale": (mcp_entry("stdio", str(tmp_path / "gone" / "phasesweep-mcp"), catalog), 1),
+    }
+    reports = {}
+
+    for name, (entry, expected_code) in states.items():
+        _write_json_entry(claude, entry)
+        before = claude.mcp.path.read_bytes()
+        assert installer.check_install(project, ["claude"]) == expected_code, name
+        reports[name] = capsys.readouterr().out
+        assert claude.mcp.path.read_bytes() == before, name
+
+    # A legacy entry passes both probes, so it stays ok/exit 0, but never without
+    # the caveat that it is not the pinned absolute executable.
+    assert "recognized legacy launcher form" in reports["legacy"]
+    assert "rerun `phasesweep mcp install`" in reports["legacy"]
+    assert "recognized legacy launcher form" not in reports["healthy"]
+
+
+@pytest.mark.parametrize("operation", ["check", "install"], ids=["check-install", "install"])
+def test_rejects_unknown_agent_id(fake_home, tmp_path, capsys, operation):
     project = tmp_path / "proj"
     project.mkdir()
 
-    code = installer.check_install(project, ["unknown"])
+    if operation == "check":
+        code = installer.check_install(project, ["unknown"])
+    else:
+        code = installer.run(
+            "install",
+            project,
+            _write_valid_catalog(project),
+            ["unknown"],
+            "mcp",
+            yes=True,
+        )
 
     assert code == 2
     assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
@@ -940,6 +1000,60 @@ def test_shared_instructions_are_removed_only_after_last_owner(fake_home, tmp_pa
     assert instructions.read_text() == original
 
 
+def test_shared_instructions_add_second_owner_without_replacing_prompt(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert installer.run("install", project, None, ["cursor"], "instructions", yes=True) == 0
+    installed = (project / "AGENTS.md").read_text()
+    capsys.readouterr()
+
+    assert installer.run("install", project, None, ["opencode"], "instructions", yes=True) == 0
+    output = capsys.readouterr().out
+    updated = (project / "AGENTS.md").read_text()
+
+    assert "shared block currently owned by: cursor" in output
+    assert "prompt will update" not in output
+    assert updated == installed.replace(
+        "<!-- PHASESWEEP_OWNERS: cursor -->",
+        "<!-- PHASESWEEP_OWNERS: cursor,opencode -->",
+    )
+
+
+def test_shared_instructions_plan_names_owners_when_prompt_will_change(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+
+    assert installer.run("install", project, None, ["cursor"], "instructions", yes=True) == 0
+    original = instructions.read_text()
+    capsys.readouterr()
+    monkeypatch.setattr(installer, "agent_prompt_text", lambda: "Updated PhaseSweep rules.\n")
+
+    assert (
+        installer.run(
+            "install",
+            project,
+            None,
+            ["opencode"],
+            "instructions",
+            yes=True,
+            dry_run=True,
+        )
+        == 0
+    )
+    preview = capsys.readouterr().out
+    assert "shared block prompt will update for existing owners: cursor" in preview
+    assert instructions.read_text() == original
+
+    assert installer.run("install", project, None, ["opencode"], "instructions", yes=True) == 0
+    updated = instructions.read_text()
+    assert "<!-- PHASESWEEP_OWNERS: cursor,opencode -->" in updated
+    assert "Updated PhaseSweep rules." in updated
+
+
 def test_concurrent_shared_instruction_installs_preserve_both_owners(
     fake_home, tmp_path, monkeypatch
 ):
@@ -1035,6 +1149,25 @@ def test_installer_reports_repeated_instruction_markers_separately_from_ownershi
     assert instructions.read_text() == original
 
 
+def test_instruction_plan_warns_when_ownership_metadata_is_missing(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    instructions = project / "AGENTS.md"
+    original = f"{MARKDOWN_START}\nPhaseSweep rules.\n{MARKDOWN_END}\n"
+    instructions.write_text(original)
+
+    code = installer.run("install", project, None, ["cursor"], "instructions", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "apply will refuse this file" in output
+    assert "Restore a PHASESWEEP_OWNERS line" in output
+    assert "instructions block has missing or invalid ownership metadata" in output
+    assert output.index("apply will refuse this file") < output.index("instructions  error")
+    assert output.lower().count("phasesweep_owners") == 2
+    assert instructions.read_text() == original
+
+
 def test_installer_supports_shared_symlinked_instruction_file(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -1075,6 +1208,306 @@ def test_installer_refuses_missing_server_command_before_edits(
     assert "no client config was touched" in capsys.readouterr().err
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
+
+
+def test_installer_resolves_server_before_interactive_selection(
+    fake_home, tmp_path, capsys, monkeypatch
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+
+    def missing_server_command():
+        raise FileNotFoundError("missing executable")
+
+    monkeypatch.setattr(installer, "resolve_server_command", missing_server_command)
+
+    code = installer.run("install", project, catalog, None, "mcp", yes=False)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "missing executable" in captured.err
+    assert "Select coding agents" not in captured.out
+    assert "Proceed?" not in captured.out
+
+
+def test_installer_uninstalls_legacy_uvx_json_entries(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = project / "catalog.yaml"
+    for agent_id in ("claude", "vscode", "opencode"):
+        target = _target(project, agent_id)
+        _write_json_entry(target, _legacy_uvx_entry(target.mcp.style, catalog))
+
+    code = installer.run(
+        "uninstall", project, None, ["claude", "vscode", "opencode"], "mcp", yes=True
+    )
+
+    assert code == 0, capsys.readouterr().out
+    for agent_id in ("claude", "vscode", "opencode"):
+        target = _target(project, agent_id)
+        data = json.loads(target.mcp.path.read_text())
+        assert "phasesweep" not in data[target.mcp.key]
+
+
+def test_installer_uninstalls_legacy_uvx_codex_table(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    config = _target(project, "codex").mcp.path
+    config.parent.mkdir(parents=True, exist_ok=True)
+    catalog = json.dumps(str(project / "catalog.yaml"))
+    args = ", ".join(json.dumps(arg) for arg in [*LEGACY_UVX_PREFIX[1:], "--catalog"])
+    config.write_text(
+        f"{TOML_START}\n[mcp_servers.phasesweep]\n"
+        f'command = "uvx"\nargs = [{args}, {catalog}]\n{TOML_END}\n'
+    )
+
+    code = installer.run("uninstall", project, None, ["codex"], "mcp", yes=True)
+
+    assert code == 0, capsys.readouterr().out
+    assert "phasesweep" not in config.read_text()
+
+
+def test_installer_repairs_legacy_uvx_entry_on_reinstall(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, _legacy_uvx_entry("stdio", catalog))
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 0, output
+    assert "updated" in output
+    entry = json.loads(claude.mcp.path.read_text())["mcpServers"]["phasesweep"]
+    assert entry == mcp_entry("stdio", installer.resolve_server_command(), catalog)
+
+
+def test_install_plan_states_the_existing_entry_state_per_target(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    preview = partial(
+        installer.run, "install", project, catalog, ["claude"], "mcp", yes=True, dry_run=True
+    )
+
+    assert preview() == 0
+    assert "no existing phasesweep entry" in capsys.readouterr().out
+
+    assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    capsys.readouterr()
+    assert preview() == 0
+    assert "already matches this plan" in capsys.readouterr().out
+
+    _write_json_entry(claude, mcp_entry("stdio", "/elsewhere/bin/phasesweep-mcp", catalog))
+    assert preview() == 0
+    plan = capsys.readouterr().out
+    assert "WILL BE REWRITTEN" in plan
+    assert "legacy" not in plan
+    assert (
+        f"from: {shlex.join(['/elsewhere/bin/phasesweep-mcp', '--catalog', str(catalog)])}" in plan
+    )
+
+    _write_json_entry(claude, {"command": "hand-authored"})
+    assert preview() == 1
+    assert "not a shape this installer owns" in capsys.readouterr().out
+
+
+def test_install_plan_discloses_a_legacy_entry_rewrite_before_confirming(fake_home, tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, _legacy_uvx_entry("stdio", catalog))
+    before = claude.mcp.path.read_bytes()
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "install",
+            "--catalog",
+            str(catalog),
+            "--project",
+            str(project),
+            "--agent",
+            "claude",
+            "--type",
+            "mcp",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "cancelled; no client files were changed" in result.output
+    assert "a recognized legacy launcher entry WILL BE REWRITTEN" in result.output
+    legacy_argv = shlex.join([*LEGACY_UVX_PREFIX, "--catalog", str(catalog)])
+    pinned_argv = shlex.join([installer.resolve_server_command(), "--catalog", str(catalog)])
+    assert f"from: {legacy_argv}" in result.output
+    assert f"to:   {pinned_argv}" in result.output
+    # The disclosure has to reach the operator before the prompt it informs.
+    assert result.output.index("WILL BE REWRITTEN") < result.output.index("Proceed?")
+    assert claude.mcp.path.read_bytes() == before
+
+
+def test_uninstall_plan_discloses_the_managed_entry_before_removal(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    claude = _target(project, "claude")
+    before = claude.mcp.path.read_bytes()
+    capsys.readouterr()
+
+    assert installer.run("uninstall", project, None, ["claude"], "mcp", yes=True, dry_run=True) == 0
+
+    output = capsys.readouterr().out
+    invocation = shlex.join([installer.resolve_server_command(), "--catalog", str(catalog)])
+    assert "managed entry WILL BE REMOVED" in output
+    assert f"entry: {invocation}" in output
+    assert output.index("WILL BE REMOVED") < output.index("would-remove")
+    assert claude.mcp.path.read_bytes() == before
+
+
+def test_installer_verifies_written_launcher_and_catalog(fake_home, tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    real_check = installer._check_target_launcher
+    checks = 0
+
+    def observed_check(target, checked_project):
+        nonlocal checks
+        checks += 1
+        return real_check(target, checked_project)
+
+    monkeypatch.setattr(installer, "_check_target_launcher", observed_check)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 0
+    # Once to classify the existing entry for the plan, once to verify what was written.
+    assert checks == 2
+    assert "verification:" in output
+    assert "Claude Code" in output
+    assert "ok" in output
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected_code", "attention"),
+    [
+        pytest.param(
+            "missing",
+            "written entry could not be verified",
+            1,
+            True,
+            id="missing-entry-needs-attention",
+        ),
+        pytest.param("unmanaged", None, 0, False, id="unmanaged-entry-is-accepted"),
+    ],
+)
+def test_installer_verification_uses_check_install_attention_predicate(
+    fake_home, tmp_path, capsys, monkeypatch, status, detail, expected_code, attention
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    target = _target(project, "claude")
+
+    monkeypatch.setattr(
+        installer,
+        "_check_target_launcher",
+        lambda _target, _project: installer.LauncherCheck(
+            target.mcp.path, None, (), status, detail
+        ),
+    )
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == expected_code
+    assert status in captured.out
+    if detail is not None:
+        assert detail in captured.out
+    if attention:
+        assert "1 step(s) need manual attention" in captured.err
+    else:
+        assert "need manual attention" not in captured.err
+
+
+def test_installer_verifies_launchers_when_an_earlier_step_needed_attention(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    # A commented opencode config cannot be edited safely, so that target's step
+    # needs manual attention; the claude target still gets written and must
+    # still be verified.
+    (project / "opencode.json").write_text('{\n  // keep\n  "mcp": {}\n}\n')
+
+    code = installer.run("install", project, catalog, ["opencode", "claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "skipped" in captured.out
+    assert "verification:" in captured.out
+    assert "Claude Code" in captured.out
+    # The unreadable opencode config is one problem, counted once, even though
+    # verification re-reads and re-reports it.
+    assert "1 step(s) need manual attention" in captured.err
+
+
+def test_installer_counts_one_attention_for_one_unmanaged_json_entry(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    claude = _target(project, "claude")
+    _write_json_entry(claude, {"command": "hand-authored"})
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "conflict" in captured.out
+    assert "verification:" in captured.out
+    assert "unmanaged" in captured.out
+    assert "1 step(s) need manual attention" in captured.err
+
+    # `check-install` reads the same on-disk state and must not contradict the
+    # verification section it shares with `install`.
+    capsys.readouterr()
+    assert installer.check_install(project, ["claude"]) == 0
+
+
+def test_installer_counts_one_attention_for_one_unmanaged_codex_table(fake_home, tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    config = _target(project, "codex").mcp.path
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[mcp_servers.phasesweep]\ncommand = "hand-authored"\n')
+
+    code = installer.run(
+        "install",
+        project,
+        catalog,
+        ["codex", "claude"],
+        "mcp",
+        yes=True,
+        allow_user_scope=True,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "1 step(s) need manual attention" in captured.err
+    assert "hand-authored" in config.read_text()
+
+    capsys.readouterr()
+    assert installer.check_install(project, ["codex", "claude"]) == 0
 
 
 def test_installer_flags_commented_config_for_manual_merge(fake_home, tmp_path, capsys):
@@ -1140,15 +1573,24 @@ def test_installer_reports_json_config_race_as_stale(fake_home, tmp_path, capsys
     assert "config path or shape was unexpected" not in output
 
 
-def test_installer_rejects_unknown_agent_id(fake_home, tmp_path, capsys):
+def test_installer_reports_write_error_without_calling_it_a_race(
+    fake_home, tmp_path, capsys, monkeypatch
+):
     project = tmp_path / "proj"
     project.mkdir()
     catalog = _write_valid_catalog(project)
 
-    code = installer.run("install", project, catalog, ["unknown"], "mcp", yes=True)
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("disk full")
 
-    assert code == 2
-    assert "unknown coding agent id(s): unknown" in capsys.readouterr().err
+    monkeypatch.setattr(install_edits.os, "replace", fail_replace)
+
+    code = installer.run("install", project, catalog, ["claude"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "config could not be written" in output
+    assert "config changed before it could be replaced" not in output
 
 
 def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path, capsys):
@@ -1161,8 +1603,13 @@ def test_installer_supports_contained_project_config_symlink(fake_home, tmp_path
     config.symlink_to(physical_config.name)
 
     assert installer.run("install", project, catalog, ["claude"], "mcp", yes=True) == 0
+    output = capsys.readouterr().out
+    assert str(physical_config) in output
     assert config.is_symlink()
     assert "phasesweep" in json.loads(physical_config.read_text())["mcpServers"]
+
+    assert installer.check_install(project, ["claude"]) == 0
+    assert str(physical_config) in capsys.readouterr().out
 
     assert installer.run("uninstall", project, None, ["claude"], "mcp", yes=True) == 0
     assert config.is_symlink()
@@ -1251,6 +1698,46 @@ def test_installer_refuses_project_config_symlink_escape(fake_home, tmp_path, ca
     assert code == 1
     assert "resolves outside the project" in capsys.readouterr().out
     assert not (outside / "mcp.json").exists()
+
+
+def test_project_symlink_escape_is_refused_by_plan_apply_and_check_install(
+    fake_home, tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = _write_valid_catalog(project)
+    outside = tmp_path / "dotfiles"
+    outside.mkdir()
+    external_config = outside / "mcp.json"
+    external_config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "phasesweep": mcp_entry("stdio", installer.resolve_server_command(), catalog)
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    before = external_config.read_bytes()
+    (project / ".cursor").symlink_to(outside, target_is_directory=True)
+
+    code = installer.run("install", project, catalog, ["cursor"], "mcp", yes=True)
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "apply will refuse this target" in output
+    assert "refusing project config path that resolves outside the project" in output
+    assert output.index("apply will refuse this target") < output.index("    mcp           error")
+    assert external_config.read_bytes() == before
+
+    assert installer.check_install(project, ["cursor"]) == 1
+    checked = capsys.readouterr()
+    assert "unreadable" in checked.out
+    assert "refusing project config path that resolves outside the project" in checked.out
+    assert "need attention" in checked.err
+    assert external_config.read_bytes() == before
 
 
 def test_installer_reuses_containment_resolution_across_symlink_swap(
@@ -1476,6 +1963,7 @@ def test_cli_unattended_user_scope_requires_dedicated_acknowledgement(
 
     preview = runner.invoke(cli_main, [*args, "--dry-run"])
     assert preview.exit_code == 0, preview.output
+    assert "[user scope]" in preview.output
     assert not target.mcp.path.exists()
 
     refused = runner.invoke(cli_main, [*args, "--yes"])
@@ -1504,7 +1992,11 @@ def test_cli_install_uninstall_e2e_round_trip(fake_home, tmp_path, monkeypatch):
         cli_main, ["mcp", "install", "--agent", "claude", "--type", "all", "--yes"]
     )
     assert install.exit_code == 0, install.output
-    assert "restart your mcp client" in install.output.lower()
+    assert "Restart the selected client(s), then ask:" in install.output
+    assert (
+        "List the available PhaseSweep experiments and their permitted actions." in install.output
+    )
+    assert "Do not launch anything." in install.output
     entry = json.loads((project / ".mcp.json").read_text())["mcpServers"]["phasesweep"]
     assert entry["args"] == ["--catalog", str(project / "catalog.yaml")]
     claude_md = (project / "CLAUDE.md").read_text()
@@ -1583,6 +2075,10 @@ def test_cli_install_provisions_catalog_state_before_client_edits(
     preview = runner.invoke(cli_main, [*args, "--dry-run"])
     assert preview.exit_code == 0, preview.output
     assert "no client files were changed" in preview.output
+    assert f"catalog      {catalog}" in preview.output
+    assert "experiments  1" in preview.output
+    assert "example: read-only" in preview.output
+    assert "launcher" in preview.output and "phasesweep-mcp" in preview.output
     assert (state_dir / "runs").is_dir()
     assert (state_dir / "logs").is_dir()
 
@@ -1683,7 +2179,10 @@ def test_cli_install_requires_mcp_sdk_before_client_edits(
     )
 
     assert result.exit_code == 2
-    assert "pip install 'phasesweep[mcp]'" in result.output
+    assert (
+        'pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"'
+        in result.output
+    )
     assert "no client config was touched" in result.output
     assert not (project / ".mcp.json").exists()
     assert not (project / "CLAUDE.md").exists()
@@ -1754,6 +2253,7 @@ def test_install_help_is_operator_readable():
         "--dry-run",
     ):
         assert flag in install_help.output
+    assert "--launcher" not in install_help.output
     assert "claude" in install_help.output and "opencode" in install_help.output
 
     uninstall_help = runner.invoke(cli_main, ["mcp", "uninstall", "--help"], terminal_width=120)
@@ -1761,3 +2261,75 @@ def test_install_help_is_operator_readable():
     assert "--agent" in uninstall_help.output
     assert "--dry-run" in uninstall_help.output
     assert "--catalog" not in uninstall_help.output
+
+
+# --- executable resolution never depends on the current working directory ---
+
+
+def test_server_command_ignores_relative_path_entries(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    # Empty interpreter directory so the sibling short-circuit cannot answer.
+    interpreter_bin = tmp_path / "interpreter" / "bin"
+    interpreter_bin.mkdir(parents=True)
+    monkeypatch.setattr(install_mod.sys, "executable", str(interpreter_bin / "python"))
+
+    workdir = tmp_path / "workdir"
+    decoy = _executable(workdir / "decoy")
+    real = _executable(tmp_path / "real")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(decoy.parent.relative_to(workdir))
+    monkeypatch.setenv("PATH", os.pathsep.join([relative_entry, str(real.parent)]))
+
+    # The decoy is reachable from this cwd, and comes first on PATH.
+    assert Path(relative_entry, decoy.name).is_file()
+    assert install_mod.resolve_server_command() == str(real)
+
+
+def test_server_command_refuses_relative_only_path(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    interpreter_bin = tmp_path / "interpreter" / "bin"
+    interpreter_bin.mkdir(parents=True)
+    monkeypatch.setattr(install_mod.sys, "executable", str(interpreter_bin / "python"))
+
+    workdir = tmp_path / "workdir"
+    decoy = _executable(workdir / "decoy")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(decoy.parent.relative_to(workdir))
+    # "" and "." are the POSIX spellings of "the current directory".
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", relative_entry]))
+
+    assert Path(relative_entry, decoy.name).is_file()
+    with pytest.raises(FileNotFoundError, match="cannot find an executable"):
+        install_mod.resolve_server_command()
+
+
+def test_absolute_path_lookup_rejects_commands_with_a_separator(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    workdir = tmp_path / "workdir"
+    launcher = _executable(workdir / "relative")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(launcher.parent))
+
+    assert install_mod._which_on_absolute_path(f"./{launcher.name}") is None
+
+
+def test_probe_launcher_ignores_relative_path_entries(tmp_path, monkeypatch):
+    from phasesweep.mcp.install import installer as install_mod
+
+    workdir = tmp_path / "workdir"
+    launcher = _executable(workdir / "legacy")
+    monkeypatch.chdir(workdir)
+    relative_entry = str(launcher.parent.relative_to(workdir))
+
+    monkeypatch.setenv("PATH", relative_entry)
+    assert Path(relative_entry, launcher.name).is_file()
+    status, detail = install_mod._probe_launcher_executable(launcher.name)
+    assert status == "missing"
+    assert detail
+
+    # Same bare name, same executable: only the PATH entry's shape differs.
+    monkeypatch.setenv("PATH", str(launcher.parent))
+    assert install_mod._probe_launcher_executable(launcher.name) == ("ok", None)
