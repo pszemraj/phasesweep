@@ -497,20 +497,38 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
         assert parent_gid.visible_devices == "0"
 
 
-def test_unreadable_uuid_map_rejects_numeric_tokens(monkeypatch) -> None:
-    """An unverified index can expose nothing and split the host lock namespace."""
+@pytest.mark.parametrize(
+    ("explicit_ids", "explicit_devices", "error_match"),
+    [
+        pytest.param(
+            [0, 1],
+            None,
+            "Cannot validate configured CUDA device index",
+            id="numeric-indices",
+        ),
+        pytest.param(
+            None,
+            ["0", "GPU-deadbeef"],
+            "Cannot validate configured GPU UUID",
+            id="mixed-token-forms",
+        ),
+    ],
+)
+def test_unreadable_uuid_map_rejects_unverified_tokens(
+    monkeypatch,
+    explicit_ids: list[int] | None,
+    explicit_devices: list[str] | None,
+    error_match: str,
+) -> None:
+    """Unverified numeric and opaque GPU tokens fail closed, not silently."""
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
 
-    with pytest.raises(RuntimeError, match="Cannot validate configured CUDA device index"):
-        GpuPool.create(n_jobs=2, explicit_ids=[0, 1])
-
-
-def test_unreadable_uuid_map_rejects_mixed_token_forms(monkeypatch) -> None:
-    """Mixed indices and opaque tokens without nvidia-smi fail closed, not silently."""
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
-
-    with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
-        GpuPool.create(n_jobs=1, explicit_devices=["0", "GPU-deadbeef"])
+    with pytest.raises(RuntimeError, match=error_match):
+        GpuPool.create(
+            n_jobs=2 if explicit_ids is not None else 1,
+            explicit_ids=explicit_ids,
+            explicit_devices=explicit_devices,
+        )
 
 
 def test_unknown_numeric_index_fails_closed(monkeypatch) -> None:
@@ -561,14 +579,20 @@ def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
     )
 
 
-def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
-    """CUDA accepts unambiguous UUID prefixes, so "GPU-2b23" and index 0 must
-    lock the same card as the full UUID spelling (review v0.5.17 gap hunt)."""
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        pytest.param("GPU-2b23", id="uppercase-prefix"),
+        pytest.param("gpu-2b23", id="lowercase-prefix"),
+    ],
+)
+def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch, prefix) -> None:
+    """CUDA UUID prefixes, regardless of case, share the full UUID's lock."""
     uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
 
-    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
+    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=[prefix])
     index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
     full_pool = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
 
@@ -586,22 +610,6 @@ def test_abbreviated_uuid_prefix_without_map_fails_closed(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
         GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
-
-
-def test_lowercase_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch) -> None:
-    """The resolver compares UUIDs case-insensitively, so the abbreviation gate
-    must too: "gpu-2b23" locking on its own spelling would double-book the card
-    against a run configured with gpu_ids: [0]."""
-    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
-
-    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=["gpu-2b23"])
-    index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
-
-    assert _gpu_lock_path(prefix_pool._devices[0]) == _gpu_lock_path(index_pool._devices[0])
-    # PyTorch's CUDA visibility parser rejects a lowercase prefix.
-    assert prefix_pool._devices[0].visible_token == uuid
 
 
 def test_lowercase_full_uuid_shares_the_numeric_index_lock(tmp_path, monkeypatch) -> None:

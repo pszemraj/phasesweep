@@ -743,28 +743,31 @@ def test_run_lock_does_not_collide_for_different_rdb_databases(tmp_path: Path) -
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 
-def test_in_memory_run_lock_keyed_by_workdir(tmp_path: Path) -> None:
-    """In-memory storage: only the output lock applies (no shared backend).
-    Two same-workdir+experiment configs share the same output lock path.
-    """
-    exp_a = make_experiment(workdir=str(tmp_path / "runs"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"))
+@pytest.mark.parametrize(
+    ("workdir_a", "workdir_b", "same_lock"),
+    [
+        pytest.param("runs", "runs", True, id="same-workdir"),
+        pytest.param("runs_a", "runs_b", False, id="different-workdirs"),
+    ],
+)
+def test_in_memory_run_lock_is_keyed_by_workdir(
+    tmp_path: Path,
+    workdir_a: str,
+    workdir_b: str,
+    same_lock: bool,
+) -> None:
+    """In-memory storage uses one output lock whose identity follows workdir."""
+    exp_a = make_experiment(workdir=str(tmp_path / workdir_a))
+    exp_b = make_experiment(workdir=str(tmp_path / workdir_b))
 
     paths_a = _run_lock_paths(exp_a)
     paths_b = _run_lock_paths(exp_b)
     # In-memory storage means only the output lock is taken — single path.
     assert len(paths_a) == 1
-    assert paths_a == paths_b
-
-
-def test_in_memory_run_lock_does_not_collide_for_different_workdirs(
-    tmp_path: Path,
-) -> None:
-    """In-memory storage with different workdirs = independent output dirs."""
-    exp_a = make_experiment(workdir=str(tmp_path / "runs_a"))
-    exp_b = make_experiment(workdir=str(tmp_path / "runs_b"))
-
-    assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
+    if same_lock:
+        assert paths_a == paths_b
+    else:
+        assert set(paths_a).isdisjoint(paths_b)
 
 
 def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:

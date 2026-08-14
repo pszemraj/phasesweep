@@ -105,6 +105,20 @@ def _run_supervised(
         )
 
 
+def _patch_process_identity_write_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make process-identity persistence fail while preserving other atomic writes."""
+    import phasesweep.runtime.process as process
+
+    real_atomic_write_text = process.atomic_write_text
+
+    def fail_identity_write(path: Path, text: str) -> None:
+        if path.name == PROCESS_IDENTITY_FILE:
+            raise OSError("identity disk full")
+        real_atomic_write_text(path, text)
+
+    monkeypatch.setattr(process, "atomic_write_text", fail_identity_write)
+
+
 def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
     """Failing trials leave one complete atomic identity for forensic recovery."""
     if not Path("/proc/self/stat").exists():
@@ -215,16 +229,7 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
     deterministically; the loop guards against a single lucky run masking a
     reintroduced race.
     """
-    import phasesweep.runtime.process as process
-
-    real_atomic_write_text = process.atomic_write_text
-
-    def fail_pid_write(path: Path, text: str) -> None:
-        if path.name == PROCESS_IDENTITY_FILE:
-            raise OSError("identity disk full")
-        real_atomic_write_text(path, text)
-
-    monkeypatch.setattr("phasesweep.runtime.process.atomic_write_text", fail_pid_write)
+    _patch_process_identity_write_failure(monkeypatch)
 
     for i in range(30):
         trial_dir = tmp_path / f"trial_{i}"
@@ -252,20 +257,13 @@ def test_identity_write_failure_marks_launch_before_popen(
     """A missing identity after Popen cannot retain the pre-launch marker."""
     import phasesweep.runtime.process as process
 
-    real_atomic_write_text = process.atomic_write_text
-
-    def fail_pid_write(path: Path, text: str) -> None:
-        if path.name == PROCESS_IDENTITY_FILE:
-            raise OSError("identity disk full")
-        real_atomic_write_text(path, text)
-
     real_abort_launch = process._abort_launch
 
     def abort_but_report_uncertain(proc: object, pgid: int | None) -> bool:
         real_abort_launch(proc, pgid)  # type: ignore[arg-type]
         return False
 
-    monkeypatch.setattr(process, "atomic_write_text", fail_pid_write)
+    _patch_process_identity_write_failure(monkeypatch)
     monkeypatch.setattr(process, "_abort_launch", abort_but_report_uncertain)
 
     trial_dir = tmp_path / "trial"
@@ -1248,38 +1246,31 @@ def test_existing_group_with_no_inspectable_members_is_uncertain(
     assert _process_group_alive_with_members(1234, None) is True
 
 
-def test_incomplete_procfs_scan_keeps_cleanup_uncertain(
+@pytest.mark.parametrize(
+    ("scan_complete", "expected_alive"),
+    [
+        pytest.param(False, True, id="incomplete-scan-is-uncertain"),
+        pytest.param(True, False, id="complete-zombie-only-group-is-dead"),
+    ],
+)
+def test_terminal_only_group_uses_procfs_scan_completeness(
     monkeypatch: pytest.MonkeyPatch,
+    scan_complete: bool,
+    expected_alive: bool,
 ) -> None:
-    """Unreadable entries outrank an otherwise terminal observed member."""
+    """Terminal members prove cleanup only when the procfs scan was complete."""
     monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
     monkeypatch.setattr(
         "phasesweep.runtime.process._group_member_pids",
         lambda pgid: _GroupMemberScan(
             pids=(22,),
-            complete=False,
+            complete=scan_complete,
             all_members_terminal=True,
         ),
     )
     monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: False)
 
-    assert _process_group_alive_with_members(1234, None) is True
-
-
-def test_complete_zombie_only_group_is_dead(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Complete terminal evidence still lets cleanup finish without a false leak."""
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._group_member_pids",
-        lambda pgid: _GroupMemberScan(
-            pids=(22,),
-            complete=True,
-            all_members_terminal=True,
-        ),
-    )
-    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: False)
-
-    assert _process_group_alive_with_members(1234, None) is False
+    assert _process_group_alive_with_members(1234, None) is expected_alive
 
 
 @pytest.mark.parametrize(

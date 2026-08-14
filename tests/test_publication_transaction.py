@@ -21,6 +21,7 @@ import os
 import shutil
 import signal
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,13 @@ print(f"x={args.x}")
 _CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
 _REPRODUCIBILITY_NAME = "reproducibility.json"
 _SENTINEL_SECRET = "s3cr3t-sentinel-must-not-be-published"
+
+
+def _tamper_winner_artifact(path: Path) -> None:
+    """Change a winner payload without updating its recorded manifest hash."""
+    winner = yaml.safe_load(path.read_text())
+    winner["metric"]["x"] = -999.0
+    path.write_text(yaml.safe_dump(winner, sort_keys=False))
 
 
 def _stored_experiment(tmp_path: Path, *, n_trials: int = 1, env: dict[str, str] | None = None):
@@ -613,53 +621,37 @@ def test_successful_publication_never_logs_a_record_refusal(
 # --------------------------------------------------------------------------
 
 
-def test_publication_refuses_missing_winner_artifact(
+@pytest.mark.parametrize(
+    ("mutate_winner", "error_match"),
+    [
+        pytest.param(Path.unlink, "missing or unreadable", id="missing"),
+        pytest.param(_tamper_winner_artifact, "does not match its recorded hash", id="tampered"),
+    ],
+)
+def test_publication_refuses_invalid_winner_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mutate_winner: Callable[[Path], None],
+    error_match: str,
 ) -> None:
-    """A summary that claims a winner whose artifact is gone must not publish.
+    """A missing or modified winner artifact must not publish.
 
     Review v0.5.16 / blocker 3 reproduction: the old validator looped the
-    current config and silently ``continue``-d past a missing winner file, so
-    deleting the artifact immediately before validation still published an
-    officially successful generation with no winner.
+    current config and silently ``continue``-d past an invalid winner file, so
+    deleting or modifying the artifact immediately before validation still
+    published an officially successful generation with no verified winner.
     """
     experiment = _stored_experiment(tmp_path)
 
     original = engine_run._validate_generation_publishable
 
     def delete_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
-        _generation_winner_path(exp, generation_id, "p").unlink()
+        mutate_winner(_generation_winner_path(exp, generation_id, "p"))
         original(exp, generation_id)
 
     monkeypatch.setattr(engine_run, "_validate_generation_publishable", delete_winner_then_validate)
 
-    with pytest.raises(RuntimeError, match="missing or unreadable"):
-        run_experiment(experiment)
-
-    assert _last_successful_generation_id(experiment) is None
-    assert _current_pointer_state(experiment) == "publication_failed"
-
-
-def test_publication_refuses_tampered_winner_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A winner artifact whose content no longer hashes to the manifest must not publish."""
-    experiment = _stored_experiment(tmp_path)
-
-    original = engine_run._validate_generation_publishable
-
-    def tamper_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
-        winner_path = _generation_winner_path(exp, generation_id, "p")
-        winner = yaml.safe_load(winner_path.read_text())
-        winner["metric"]["x"] = -999.0
-        winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-        original(exp, generation_id)
-
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", tamper_winner_then_validate)
-
-    with pytest.raises(RuntimeError, match="does not match its recorded hash"):
+    with pytest.raises(RuntimeError, match=error_match):
         run_experiment(experiment)
 
     assert _last_successful_generation_id(experiment) is None

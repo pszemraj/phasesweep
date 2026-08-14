@@ -323,44 +323,39 @@ def test_launch_trial_pool_pinned_sentinel_binds_visibility_under_strict_contrac
     assert env["CUDA_VISIBLE_DEVICES"] == sentinel
 
 
-def test_launch_trial_inherit_env_all_still_passes_cuda_visibility(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("ambient_visibility", "experiment_env", "execution"),
+    [
+        pytest.param("-1", None, None, id="inherit-all"),
+        pytest.param(
+            "-1",
+            None,
+            ExecutionContext(inherit_env=["CUDA_VISIBLE_DEVICES"]),
+            id="inherit-explicit-list",
+        ),
+        pytest.param(
+            "7",
+            {"CUDA_VISIBLE_DEVICES": "-1"},
+            ExecutionContext(inherit_env="none"),
+            id="configured-under-strict-contract",
+        ),
+    ],
+)
+def test_launch_trial_cuda_visibility_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_visibility: str,
+    experiment_env: dict[str, str] | None,
+    execution: ExecutionContext | None,
 ) -> None:
-    """The default permissive contract keeps forwarding operator GPU selection."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
-
-    env = _capture_launch_env(tmp_path, monkeypatch, gpu_id=None)
-
-    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
-
-
-def test_launch_trial_inherit_env_list_can_opt_into_cuda_visibility(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Naming the variable in the fingerprinted contract admits it explicitly."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    """The environment contract forwards or replaces ambient CUDA visibility."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient_visibility)
 
     env = _capture_launch_env(
         tmp_path,
         monkeypatch,
-        execution=ExecutionContext(inherit_env=["CUDA_VISIBLE_DEVICES"]),
-        gpu_id=None,
-    )
-
-    assert env["CUDA_VISIBLE_DEVICES"] == "-1"
-
-
-def test_launch_trial_configured_env_binds_cuda_visibility_under_strict_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fingerprinted escape hatch beats the ambient value it replaces."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
-
-    env = _capture_launch_env(
-        tmp_path,
-        monkeypatch,
-        experiment_env={"CUDA_VISIBLE_DEVICES": "-1"},
-        execution=ExecutionContext(inherit_env="none"),
+        experiment_env=experiment_env,
+        execution=execution,
         gpu_id=None,
     )
 

@@ -1274,16 +1274,19 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     binding_before = binding_path.read_bytes()
     original_read_text = Path.read_text
 
-    def permission_denied(
-        self: Path,
-        encoding: str | None = None,
-        errors: str | None = None,
-    ) -> str:
-        if self == binding_path:
-            raise PermissionError("permission denied")
-        return original_read_text(self, encoding=encoding, errors=errors)
+    def deny_reading(target: Path):  # noqa: ANN202 - monkeypatch callback factory
+        def permission_denied(
+            self: Path,
+            encoding: str | None = None,
+            errors: str | None = None,
+        ) -> str:
+            if self == target:
+                raise PermissionError("permission denied")
+            return original_read_text(self, encoding=encoding, errors=errors)
 
-    monkeypatch.setattr(Path, "read_text", permission_denied)
+        return permission_denied
+
+    monkeypatch.setattr(Path, "read_text", deny_reading(binding_path))
 
     with pytest.raises(ArtifactRootConflictError) as read_info:
         read_status(experiment)
@@ -1309,16 +1312,7 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     assert generation_id is not None
     snapshot = _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
 
-    def snapshot_permission_denied(
-        self: Path,
-        encoding: str | None = None,
-        errors: str | None = None,
-    ) -> str:
-        if self == snapshot:
-            raise PermissionError("permission denied")
-        return original_read_text(self, encoding=encoding, errors=errors)
-
-    monkeypatch.setattr(Path, "read_text", snapshot_permission_denied)
+    monkeypatch.setattr(Path, "read_text", deny_reading(snapshot))
     with pytest.raises(ArtifactRootRebindError) as publication_info:
         _validate_artifact_root_destination(
             experiment,

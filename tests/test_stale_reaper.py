@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -807,6 +808,9 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
     assert cleanup_stale_trial_process(identity) is False
 
 
+_MISSING = object()
+
+
 def test_kill_stale_group_refuses_live_pid_without_starttime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -822,196 +826,181 @@ def test_kill_stale_group_refuses_live_pid_without_starttime(
     assert calls == []
 
 
-def test_kill_stale_group_refuses_cleanup_on_pid_reuse_without_pgid(
+@dataclass(frozen=True)
+class _KillStaleGroupCase:
+    pid: int | None
+    saved_starttime: int | None
+    pgid: int | None
+    pid_alive: bool | object = _MISSING
+    proc_starttime: int | None | object = _MISSING
+    group_exists: bool | object = _MISSING
+    proc_stat: object = _MISSING
+    group_alive: bool | object = _MISSING
+    derived_pgid: int | object = _MISSING
+    expected: bool = False
+    expected_calls: tuple[int, ...] = ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=None,
+                pid_alive=True,
+                proc_starttime=999,
+            ),
+            id="refuse-pid-reuse-without-pgid",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=True,
+                proc_starttime=None,
+                derived_pgid=7777,
+            ),
+            id="refuse-unreadable-live-pid-identity",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=None,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=True,
+                group_exists=True,
+                proc_stat=None,
+                group_alive=True,
+            ),
+            id="refuse-unreadable-live-pgid-leader",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=False,
+                group_exists=True,
+                proc_stat=SimpleNamespace(state="S", pgrp=12345, starttime=999),
+            ),
+            id="refuse-reused-pgid-leader",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=True,
+                proc_starttime=999,
+                group_exists=False,
+                expected=True,
+            ),
+            id="accept-reused-pgid-when-group-gone",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=None,
+                saved_starttime=111,
+                pgid=12345,
+                group_exists=False,
+                proc_stat=SimpleNamespace(state="S", pgrp=7777, starttime=999),
+                expected=True,
+            ),
+            id="accept-stored-pgid-when-group-gone",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=True,
+                group_exists=True,
+                proc_stat=SimpleNamespace(state="S", pgrp=7777, starttime=999),
+                group_alive=True,
+                expected=True,
+                expected_calls=(12345,),
+            ),
+            id="use-pgid-when-reused-pid-is-outside-group",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=99999,
+                saved_starttime=111,
+                pgid=42,
+                pid_alive=False,
+                group_exists=True,
+                proc_stat=None,
+                group_alive=True,
+                expected=True,
+                expected_calls=(42,),
+            ),
+            id="use-stored-pgid-when-pid-dead",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=111,
+                pgid=12345,
+                pid_alive=True,
+                proc_starttime=111,
+                group_alive=True,
+                derived_pgid=7777,
+                expected=True,
+                expected_calls=(7777,),
+            ),
+            id="use-live-pid-when-starttime-matches",
+        ),
+    ],
+)
+def test_kill_stale_group_pid_pgid_decision_matrix(
     monkeypatch: pytest.MonkeyPatch,
+    case: _KillStaleGroupCase,
 ) -> None:
-    """PID alive + starttime mismatch with no PGID leaves cleanup uncertain."""
+    """Exercise every PID/PGID identity branch and its signal decision."""
     calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 999)
+    if case.pid_alive is not _MISSING:
+        monkeypatch.setattr(
+            "phasesweep.runtime.process.is_pid_alive",
+            lambda _pid, value=case.pid_alive: value,
+        )
+    if case.proc_starttime is not _MISSING:
+        monkeypatch.setattr(
+            "phasesweep.runtime.process.read_proc_starttime",
+            lambda _pid, value=case.proc_starttime: value,
+        )
+    if case.group_exists is not _MISSING:
+        monkeypatch.setattr(
+            "phasesweep.runtime.process._process_group_exists",
+            lambda _pgid, value=case.group_exists: value,
+        )
+    if case.proc_stat is not _MISSING:
+        monkeypatch.setattr(
+            "phasesweep.runtime.process._read_proc_stat",
+            lambda _entry, value=case.proc_stat: value,
+        )
+    if case.group_alive is not _MISSING:
+        monkeypatch.setattr(
+            "phasesweep.runtime.process._process_group_alive",
+            lambda _pgid, value=case.group_alive: value,
+        )
+    if case.derived_pgid is not _MISSING:
+        monkeypatch.setattr("os.getpgid", lambda _pid, value=case.derived_pgid: value)
     monkeypatch.setattr(
         "phasesweep.runtime.process._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
-    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=None)
-
-    assert sent is False, "must refuse to advance when PID was reused and no PGID was saved"
-    assert calls == [], "no kill signal should have been issued"
-
-
-def test_kill_stale_group_refuses_unreadable_live_pid_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda _pid: None)
-    monkeypatch.setattr("os.getpgid", lambda _pid: 7777)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
+    confirmed = kill_stale_group(
+        pid=case.pid,
+        saved_starttime=case.saved_starttime,
+        pgid=case.pgid,
     )
 
-    confirmed = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
-
-    assert confirmed is False
-    assert calls == []
-
-
-def test_kill_stale_group_refuses_unreadable_live_pgid_leader(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda _pgid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._read_proc_stat", lambda _entry: None)
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda _pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    confirmed = kill_stale_group(pid=None, saved_starttime=111, pgid=12345)
-
-    assert confirmed is False
-    assert calls == []
-
-
-def test_kill_stale_group_refuses_pgid_fallback_when_group_leader_reused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Dead root PID + reused PGID leader should fail closed."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: False)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._read_proc_stat",
-        lambda proc_entry: SimpleNamespace(state="S", pgrp=12345, starttime=999),
-    )
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
-
-    assert sent is False, "must refuse reused PGID fallback"
-    assert calls == [], "no kill signal should have been issued"
-
-
-def test_kill_stale_group_accepts_pgid_reuse_when_group_is_gone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reused PID with the saved PGID number is clean if no such group exists."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 999)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: False)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
-
-    assert sent is True
-    assert calls == [], "no signal is needed after confirming the saved group is gone"
-
-
-def test_kill_stale_group_accepts_stored_pgid_reuse_when_group_is_gone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Stored PGID fallback is complete when ``killpg(pgid, 0)`` says it is gone."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: False)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._read_proc_stat",
-        lambda proc_entry: SimpleNamespace(state="S", pgrp=7777, starttime=999),
-    )
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=None, saved_starttime=111, pgid=12345)
-
-    assert sent is True
-    assert calls == [], "no signal is needed after confirming the saved group is gone"
-
-
-def test_kill_stale_group_uses_pgid_when_reused_pid_is_not_group_member(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reused PID outside the stored PGID must not block cleanup of that PGID."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._read_proc_stat",
-        lambda proc_entry: SimpleNamespace(state="S", pgrp=7777, starttime=999),
-    )
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
-
-    assert sent is True
-    assert calls == [12345]
-
-
-def test_kill_stale_group_uses_pgid_when_pid_dead(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PID gone, no starttime check possible — PGID fallback is correct here."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: False)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._read_proc_stat", lambda proc_entry: None)
-    # Force the early-out gate to see the group as alive so the test exercises
-    # the delegation to _terminate_process_group (post-v0.5.8 the gate would
-    # otherwise short-circuit when the fake pgid 42 isn't a real process).
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=99999, saved_starttime=111, pgid=42)
-
-    assert sent is True
-    assert calls == [42]
-
-
-def test_kill_stale_group_uses_live_pid_when_starttime_matches(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PID alive + starttime match => derive PGID and kill (the safe path)."""
-    calls: list[int] = []
-
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process.read_proc_starttime", lambda pid: 111)
-    monkeypatch.setattr("os.getpgid", lambda pid: 7777)
-    # Force the early-out gate (post-v0.5.8) to see the group as alive so the
-    # test exercises delegation to _terminate_process_group.
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_alive", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    sent = kill_stale_group(pid=12345, saved_starttime=111, pgid=12345)
-
-    assert sent is True
-    assert calls == [7777]
+    assert confirmed is case.expected
+    assert calls == list(case.expected_calls)
 
 
 def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) -> None:

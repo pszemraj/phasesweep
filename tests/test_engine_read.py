@@ -226,22 +226,18 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     assert transferred_rows == [1]
 
 
-def test_read_status_counts_sqlite_trials_with_url_options(tmp_path: Path) -> None:
-    db = tmp_path / "phases.db"
-    storage = f"sqlite:///{db}"
-    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
-        lambda trial: 1.0, n_trials=1
-    )
-    exp = _experiment(tmp_path, storage=f"{storage}?timeout=30")
-
-    status = read_status(exp)
-
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
-
-
-def test_read_status_counts_sqlite_trials_with_uri_filename(tmp_path: Path) -> None:
-    db = tmp_path / "uri.db"
-    storage = f"sqlite:///file:{db}?mode=rwc&uri=true"
+@pytest.mark.parametrize(
+    ("database_name", "storage_template"),
+    [
+        pytest.param("phases.db", "sqlite:///{db}?timeout=30", id="url-options"),
+        pytest.param("uri.db", "sqlite:///file:{db}?mode=rwc&uri=true", id="uri-filename"),
+    ],
+)
+def test_read_status_counts_sqlite_trials_with_storage_url_variants(
+    tmp_path: Path, database_name: str, storage_template: str
+) -> None:
+    db = tmp_path / database_name
+    storage = storage_template.format(db=db)
     optuna.create_study(study_name="read_t::p", storage=storage).optimize(
         lambda trial: 1.0, n_trials=1
     )
