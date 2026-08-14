@@ -39,7 +39,7 @@ Add another `--from` for each experiment. Use `-o` to choose another catalog fil
 phasesweep mcp install
 ```
 
-The installer validates the catalog, resolves the absolute installed `phasesweep-mcp` executable before asking any questions, detects and preselects clients, and prints a plan containing the catalog, experiment permissions, client paths, integration types, user-scoped edits, and the state of any existing phasesweep entry in each target config - including whether a recognized legacy launcher entry will be rewritten to the pinned executable. Uninstall plans print the complete managed invocation they will remove. An invalid shared-instructions ownership block is disclosed with remediation before confirmation instead of appearing only as an apply error. After confirmation the installer applies safe edits, verifies the written launcher and catalog path, and prints the restart instruction.
+The installer validates the catalog, pins the installed `phasesweep-mcp` executable, detects clients, and shows every planned target and permission before confirmation. It then applies the edits, verifies the launcher and catalog path, and prints the restart instruction. Preservation and ownership rules are described under [what the installer changes](#what-the-installer-changes).
 
 The supported clients are Claude Code, Claude Desktop, Codex, Cursor, VS Code, Gemini CLI, and opencode. A missing catalog is never created implicitly; return to the review step instead.
 
@@ -118,10 +118,6 @@ This uses the server's startup validation and, only after every catalog entry pa
 
 After replacing or recreating the conda environment, rerun `phasesweep mcp install` from the intended environment and restart each selected client so its absolute executable path and instructions are refreshed.
 
-## Breaking development installs
-
-The package is not published, and the MCP runtime carries no deprecated tool aliases or legacy launcher execution path. The installer alone recognizes earlier installer-owned launcher shapes so it can replace or remove them. If a client was configured by an earlier development build, rerun `phasesweep mcp install` and restart the client; cached old tool names disappear on restart. If the current installer reports the old entry as unmanaged, remove that one `phasesweep` client entry manually, rerun the installer, and restart. This is the complete migration policy.
-
 ## Troubleshooting
 
 - `MCP support is not installed`: activate the intended conda environment, run the install command from step 1, then retry.
@@ -132,11 +128,7 @@ The package is not published, and the MCP runtime carries no deprecated tool ali
 - Catalog path, storage, or working-directory rejection: follow [paths and the working directory](mcp.md#paths-and-the-working-directory).
 - A client config is skipped: use the manual snippet printed by the installer and review [file preservation](#file-preservation). The installer does not overwrite malformed or unmanaged data.
 
-## Advanced and manual details
-
-- [MCP operator reference](mcp.md): catalog schema, tool payloads, run lifecycle, recovery, authorization, auditing, security, and installer semantics.
-- [Runtime behavior](runtime.md): platform support, process supervision, storage, locks, GPU isolation, and output layout.
-- [Packaged agent instructions](../src/phasesweep/mcp/agent_prompt.md): the rules installed into supported project instruction files.
+## Manual entry
 
 For a manual stdio entry, use the absolute values printed by `which phasesweep-mcp` and your reviewed catalog:
 

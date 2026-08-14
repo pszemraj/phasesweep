@@ -60,4 +60,4 @@ Restart the selected client after installation, then ask it to list the availabl
 
 The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
 
-Both configs declare trainer and data provenance because they reuse persistent studies. The embedded trainer config is fingerprinted automatically; update the external provenance tokens whenever the wrapper, pinned template revision, data preparation, or dependencies change so PhaseSweep refuses an incompatible top-up.
+Both persistent full configs, `experiment.yaml` and `mcp_experiment.yaml`, declare trainer and data provenance. The embedded trainer config is fingerprinted automatically; update the external provenance tokens whenever the wrapper, pinned template revision, data preparation, or dependencies change so PhaseSweep refuses an incompatible top-up.

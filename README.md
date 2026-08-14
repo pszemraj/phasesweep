@@ -43,7 +43,7 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-In this starter, PhaseSweep copies `trainer_config`, applies each trial's sampled and inherited dotted-path values, writes `trainer_config.yaml` inside the trial directory, and substitutes its path into `{config_path}`. The packaged fake trainer reads that complete YAML and reports its objective through `report_objective(...)`. W&B is an optional evidence source, not a configuration mode; see the [trainer contract](docs/config.md#trainer-contract).
+The packaged fake trainer reads the generated YAML and reports its objective through `report_objective(...)`. W&B is an optional evidence source, not a configuration mode; see the [trainer contract](docs/config.md#trainer-contract).
 
 ## Install and try it
 
