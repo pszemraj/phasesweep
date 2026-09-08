@@ -16,8 +16,8 @@ and a run holding the whole parent device do not exclude each other.
 
 Scope caveat: "host-wide" throughout this module means "every orchestrator that
 resolves the same phasesweep lock directory". The default lock directory is
-per-user (``~/.cache/phasesweep/locks``); coordinating across users or launch
-surfaces with different ``HOME``s requires a shared ``PHASESWEEP_LOCK_DIR``.
+per-user (``.cache/phasesweep/locks`` under the OS account home); coordinating
+across users requires a shared ``PHASESWEEP_LOCK_DIR``.
 """
 
 from __future__ import annotations

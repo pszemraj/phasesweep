@@ -166,16 +166,17 @@ def phasesweep_home() -> Path | None:
 def lock_dir() -> Path:
     """Return the validated same-host phasesweep lock directory.
 
-    The default is under ``PHASESWEEP_HOME`` or the user's XDG cache home,
-    private to the current user. ``PHASESWEEP_LOCK_DIR`` selects
-    an existing operator-provisioned directory and is never created or chmodded
-    by phasesweep.
+    The default is ``.cache/phasesweep/locks`` under the effective user's
+    account home, independent of environment-based state/cache placement.
+    ``PHASESWEEP_LOCK_DIR`` selects an existing operator-provisioned directory
+    and is never created or chmodded by phasesweep.
 
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
-        ownership-and-mode check; ``PHASESWEEP_HOME`` is invalid; or the default
-        lock directory cannot be created as owner-only.
+        ownership-and-mode check; the OS account has no absolute home; or
+        the default lock directory fails the owner-only checks.
+    :raises PlatformCapabilityError: The host lacks the required POSIX runtime.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -185,11 +186,25 @@ def lock_dir() -> Path:
         _lock_policy(path)
         return path
 
+    require_posix_runtime()
+    import pwd
+
+    # Shells and services for one account must contend even when HOME or XDG
+    # settings differ. Only the explicit lock override may move this namespace.
     try:
-        root = phasesweep_home()
-        if root is None:
-            root = xdg_home("XDG_CACHE_HOME", Path.home() / ".cache") / "phasesweep"
-        path = root / "locks"
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError as exc:
+        raise UnsafeLockPathError(
+            f"No OS account home exists for uid {os.geteuid()}; provision an absolute "
+            f"lock directory and set {_LOCK_DIR_ENV}."
+        ) from exc
+    if not home.is_absolute():
+        raise UnsafeLockPathError(
+            f"The OS account home is not absolute; provision an absolute lock directory "
+            f"and set {_LOCK_DIR_ENV}."
+        )
+    path = home / ".cache" / "phasesweep" / "locks"
+    try:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
