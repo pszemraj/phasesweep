@@ -1466,10 +1466,12 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Write an annotated MCP catalog for existing experiment configs: absolute "
-        "state_dir next to the catalog, one read-only entry per --from config "
-        "(visible_params: none, no allow block). The staged catalog is validated with "
-        "the server startup path before it is published. Existing files are never overwritten; "
-        "edit the result, then re-check it with `phasesweep mcp check`."
+        "state_dir under PHASESWEEP_HOME/mcp/<catalog-digest> or "
+        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>, one read-only "
+        "entry per --from config (visible_params: none, no allow block). The staged "
+        "catalog is validated with the server startup path before it is published. "
+        "Existing files are never overwritten; edit the result, then re-check it with "
+        "`phasesweep mcp check`."
     ),
     short_help="Scaffold an MCP catalog.",
 )

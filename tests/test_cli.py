@@ -148,6 +148,10 @@ def test_help_registers_commands_and_options() -> None:
     init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "--from PATH" in init_help.output
+    compact_init_help = "".join(init_help.output.split())
+    assert "PHASESWEEP_HOME/mcp/<catalog-digest>" in compact_init_help
+    assert "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>" in compact_init_help
+    assert "state_dir next to the catalog" not in init_help.output
 
 
 def test_recover_run_expands_user_state_dir(
