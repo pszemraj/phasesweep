@@ -719,11 +719,18 @@ class Experiment(_Frozen):
 
         """
         seen: dict[str, Phase] = {}
+        seen_casefolded: dict[str, str] = {}
         locked_keys_by_phase: dict[str, set[str]] = {}
 
         for phase in self.phases:
             if phase.name in seen:
                 raise ValueError(f"Duplicate phase name {phase.name!r}.")
+            casefolded_name = phase.name.casefold()
+            if casefolded_name in seen_casefolded:
+                raise ValueError(
+                    f"Phase names {seen_casefolded[casefolded_name]!r} and "
+                    f"{phase.name!r} must be unique case-insensitively."
+                )
             for contract_name in phase.contracts:
                 if contract_name not in self.contracts:
                     raise ValueError(
@@ -872,6 +879,7 @@ class Experiment(_Frozen):
                 | set(phase.search_space)
             )
             seen[phase.name] = phase
+            seen_casefolded[casefolded_name] = phase.name
 
         names = {self.metric.name} | {c.name for c in self.constraints}
         if len(names) != 1 + len(self.constraints):

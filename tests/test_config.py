@@ -106,6 +106,35 @@ def test_phase_name_validation(name: str) -> None:
         Phase(name=name, n_trials=1, search_space={})
 
 
+def test_phase_names_reject_casefold_equivalent_spellings() -> None:
+    phases = [
+        Phase(name="Foo", n_trials=1),
+        Phase(name="foo", n_trials=1),
+    ]
+
+    with pytest.raises(
+        ValidationError,
+        match=r"Phase names 'Foo' and 'foo' must be unique case-insensitively",
+    ):
+        make_experiment(trial_command="echo", phases=phases)
+
+
+def test_phase_names_preserve_authored_case_for_inherit_selectors() -> None:
+    phases = [
+        Phase(name="Foo", n_trials=1),
+        Phase(name="next", n_trials=1, inherits=["Foo"]),
+    ]
+
+    experiment = make_experiment(trial_command="echo", phases=phases)
+
+    assert [phase.name for phase in experiment.phases] == ["Foo", "next"]
+    assert experiment.phases[1].inherits == ["Foo"]
+
+    phases[1] = Phase(name="next", n_trials=1, inherits=["foo"])
+    with pytest.raises(ValidationError, match="inherits from 'foo', which is not a prior phase"):
+        make_experiment(trial_command="echo", phases=phases)
+
+
 @pytest.mark.parametrize(
     ("pattern", "match"),
     [("(", "Invalid metric regex"), (r"loss=(?P<loss>\S+)", "requires a named")],

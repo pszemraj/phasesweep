@@ -78,7 +78,7 @@
 #   Evaluated before phase-local gates. Gate shapes are defined below.
 
 # phases: list[Phase] (required; min length 1)
-# Phase names must be unique and are evaluated in declaration order. Each Phase object accepts the following keys.
+# Phase names must be unique case-insensitively and are evaluated in declaration order. Each Phase object accepts the following keys.
 
 # PHASE OBJECT (each entry nested under `phases`)
 # Phase fingerprints exclude these run-control fields: comment, n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation, max_consecutive_failures, allow_unbounded_trials, timeout_seconds_per_phase, allow_incomplete_on_timeout, allow_partial_grid, allow_seed_search, and sampler.acknowledge_nonresumable. Their individual safety rules still apply; other phase fields are semantic unless stated otherwise.
@@ -90,7 +90,7 @@
 # Design note shown by `validate` and `show-winners`. It has no trial-runtime effect and is excluded from phase fingerprints, but suite generations retain it in their historical plan identity.
 
 # inherits: list[str] = []
-# Names prior phases whose exposed `effective_overrides` become the lowest-priority override layer; forward references are rejected.
+# Names prior phases by their exact authored spelling. Their exposed `effective_overrides` become the lowest-priority override layer; forward references are rejected.
 # Inherited keys cannot be sampled again. An exact collision from multiple parents requires a local fixed_overrides value; dotted parent/subkey collisions cannot be resolved and are rejected.
 
 # fixed_overrides: dict[str, Any] = {}
