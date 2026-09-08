@@ -56,17 +56,22 @@ def poll_wandb_summary(
     entity: str,
     project: str,
     run_id: str,
+    trial_dir: Path,
     poll_seconds: float,
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     wait_for_keys: bool = True,
 ) -> dict[str, Any]:
-    """Poll W&B until a terminal run summary is available.
+    """Poll W&B after the trial's previous subprocess has been confirmed gone.
+
+    The worker takes over the trial's durable process identity and lifecycle,
+    so normal attempt recovery can find it if polling is interrupted.
 
     :param str base_url: Explicit W&B API endpoint for this evidence source.
     :param str entity: W&B entity or team name.
     :param str project: W&B project name.
     :param str run_id: Immutable W&B run id assigned to this trial attempt.
+    :param Path trial_dir: Existing trial directory holding recovery records.
     :param float poll_seconds: Delay between polling attempts.
     :param float timeout_seconds: Maximum budget for worker startup, SDK
         initialization, requests, and retries. Process cleanup may finish afterward.
@@ -78,10 +83,12 @@ def poll_wandb_summary(
         already been built are treated as transient and retried.
     :raises WandbRunTerminalError: If the run crashes, fails, or is killed.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
-    :raises RuntimeError: If the polling worker fails or its cleanup is uncertain.
+    :raises UnsafeProcessCleanupError: If the worker's cleanup is uncertain.
+    :raises RuntimeError: If the polling worker fails unexpectedly.
     :return dict[str, Any]: Terminal run summary values.
     """
-    from phasesweep.runtime.process import run_supervised
+    from phasesweep.errors import UnsafeProcessCleanupError
+    from phasesweep.runtime.process import PROCESS_IDENTITY_FILE, run_supervised
 
     deadline = time.monotonic() + timeout_seconds
     if timeout_seconds <= 0:
@@ -110,6 +117,10 @@ def poll_wandb_summary(
             (worker_dir / "stdout.log").open("w", encoding="utf-8") as stdout,
             (worker_dir / "stderr.log").open("w", encoding="utf-8") as stderr,
         ):
+            # The preceding subprocess is already gone. Remove its identity
+            # before launching so a failed worker-identity write cannot leave
+            # recovery pointing at that earlier, safely exited process.
+            (trial_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
             # -P keeps this file's directory from shadowing the installed wandb package.
             result = run_supervised(
                 shlex.join(
@@ -125,11 +136,14 @@ def poll_wandb_summary(
                 stdout=stdout,
                 stderr=stderr,
                 timeout=max(0.0, deadline - time.monotonic()),
-                trial_dir=worker_dir,
+                trial_dir=trial_dir,
                 attempt_id=run_id,
             )
         if not result.cleanup_confirmed:
-            raise RuntimeError(f"W&B polling worker cleanup could not be confirmed for {run_id!r}.")
+            raise UnsafeProcessCleanupError(
+                f"W&B polling worker cleanup could not be confirmed for {run_id!r}. "
+                f"Recovery records remain in {trial_dir}."
+            )
         if result.timed_out:
             raise WandbPollTimeout(run_id, timeout_seconds)
         if result.return_code != 0 or result.failure_reason is not None:

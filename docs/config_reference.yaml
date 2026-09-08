@@ -256,7 +256,7 @@
 # Key in wandb.run.summary; the value must be a finite number, not a string or boolean.
 # poll_seconds: float = 2.0 (> 0 and finite)
 # timeout_seconds: float = 120.0 (>= 1 and finite)
-# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial. The polling budget includes worker startup, SDK initialization, requests, and internal retries. Expiry terminates the polling worker's process group; cleanup may finish afterward. Responses received after the deadline are rejected.
+# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial. The polling budget includes worker startup, SDK initialization, requests, and internal retries. Expiry terminates the polling worker's process group; cleanup may finish afterward. Responses received after the deadline are rejected. The worker's process identity and lifecycle remain in the trial directory; unconfirmed cleanup blocks further work until attempt recovery confirms it.
 
 # GATE OBJECTS
 # A gate must use exactly one discriminator shape. All `path` and JSON `key` fields obey the Extractor path/key invariants above.

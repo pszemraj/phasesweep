@@ -17,8 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
-from phasesweep.engine.errors import PhaseSweepError
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
+from phasesweep.errors import (
+    ProcessCleanupUncertainError as ProcessCleanupUncertainError,
+)
+from phasesweep.errors import (
+    UnsafeProcessCleanupError as UnsafeProcessCleanupError,
+)
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     ExtractorError,
@@ -318,20 +323,6 @@ class TrialExecutionError(RuntimeError):
 
     Caught by study.optimize(catch=...) so Optuna marks the trial FAIL,
     not COMPLETE with a sentinel value.
-    """
-
-
-class ProcessCleanupUncertainError(PhaseSweepError):
-    """Base class for failures where a subprocess group may still be alive."""
-
-
-class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
-    """Raised when a trial process group may still be alive after cleanup.
-
-    This must NOT be included in Optuna's ``catch`` tuple. The correct behavior
-    is to abort the phase/run, not mark one trial FAIL and continue — a leaked
-    process group can hold GPU memory, write conflicting outputs, or starve
-    the host scheduler (review v0.5.9 / blocker 3).
     """
 
 

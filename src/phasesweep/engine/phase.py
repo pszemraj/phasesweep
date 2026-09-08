@@ -920,7 +920,6 @@ def _run_phase(
                     # is already recorded and ``_raise_if_fatal_aborted`` will
                     # fire after ``study.optimize`` returns regardless.
                     with contextlib.suppress(Exception):
-                        trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
                         trial.set_user_attr(
                             FAILURE_REASON_ATTR,
                             executed.process.failure_reason
@@ -1037,6 +1036,10 @@ def _run_phase(
             raise
         except UnsafeProcessCleanupError as exc:
             _record_fatal_abort(exc)
+            # Both trainer and evidence-worker cleanup failures retain this
+            # diagnostic; the fatal policy below remains the recovery authority.
+            with contextlib.suppress(Exception):
+                trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
             _record_outcome(
                 trial,
                 "fatal",

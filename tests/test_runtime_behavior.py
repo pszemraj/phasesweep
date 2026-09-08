@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import signal
 import threading
 import time
@@ -27,6 +28,8 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from phasesweep.engine import (
     PhaseSweepError,
@@ -68,6 +71,7 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     extract_trial_result,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import (
@@ -1479,6 +1483,134 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert len(study.trials) == before + 1
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
+
+
+@pytest.mark.parametrize("wandb_source", ["metric", "gate"])
+def test_wandb_cleanup_uncertainty_blocks_topup_until_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wandb_source: str,
+) -> None:
+    """An uncertain W&B worker remains recoverable through the trial root."""
+    db = tmp_path / "wandb-abort.db"
+    trainer = write_trainer(tmp_path / "noop.py", "print('x=0.5')")
+
+    def _exp(n_trials: int) -> Experiment:
+        wandb = {
+            "entity": "team",
+            "project": "project",
+            "poll_seconds": 0.01,
+            "timeout_seconds": 1.0,
+        }
+        metric = Metric(extractor=WandbExtractor(type="wandb", metric_key="eval/loss", **wandb))
+        if wandb_source == "metric":
+            gates = []
+        else:
+            gates = [
+                WandbSummaryRequiredGate(type="wandb_summary_required", keys=["gate"], **wandb)
+            ]
+        return make_experiment(
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{db}",
+            trial_command=f"python {trainer} {{overrides}}",
+            override_format="argparse",
+            metric=metric,
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=n_trials,
+                    gpu_policy="none",
+                    sampler=Sampler(type="random", seed=7),
+                    gates=gates,
+                )
+            ],
+        )
+
+    real_worker_supervisor = runtime_process.run_supervised
+    cleanup_safe = {"value": False}
+    worker_calls = {"count": 0}
+    reports: list[TerminalReport] = []
+    failure_call = 1 if wandb_source == "metric" else 2
+
+    def supervise_wandb_worker(command: str, **kwargs: Any) -> ProcessResult:
+        worker_calls["count"] += 1
+        response_path = Path(shlex.split(command)[-1])
+        result = real_worker_supervisor("true", **kwargs)
+        if worker_calls["count"] == failure_call:
+            result.cleanup_confirmed = False
+            trial_dir = Path(kwargs["trial_dir"])
+            write_attempt_lifecycle(
+                trial_dir,
+                attempt_id=str(kwargs["attempt_id"]),
+                state="launching",
+            )
+        else:
+            response_path.write_text(
+                json.dumps(
+                    {
+                        "status": "summary",
+                        "summary": {"eval/loss": 0.5, "gate": "present"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return result
+
+    # ``poll_wandb_summary`` imports this name dynamically. The trainer keeps
+    # the original alias from ``engine.trial``, so it still has a real
+    # supervised process of its own before the W&B worker takes over the
+    # durable identity in the same trial directory.
+    monkeypatch.setattr("phasesweep.runtime.process.run_supervised", supervise_wandb_worker)
+    monkeypatch.setattr(
+        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        lambda _identity: cleanup_safe["value"],
+    )
+
+    with pytest.raises(UnsafeProcessCleanupError, match="W&B polling worker cleanup"):
+        run_experiment(_exp(1), terminal_callback=reports.append)
+
+    # The gate case completes the metric poll before its own worker takes over
+    # the same durable identity and leaves cleanup uncertain.
+    assert worker_calls["count"] == failure_call
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    unsafe_trial = study.get_trials(deepcopy=False)[0]
+    unsafe_attempt_id = unsafe_trial.user_attrs[ATTEMPT_ID_ATTR]
+    unsafe_trial_dir = Path(str(unsafe_trial.user_attrs[TRIAL_DIR_ATTR]))
+    assert isinstance(unsafe_attempt_id, str)
+    assert len(reports) == 1
+    assert reports[0].cleanup_confirmed is False
+    assert reports[0].uncertain_attempt_ids == frozenset({unsafe_attempt_id})
+    assert unsafe_trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    assert unsafe_trial.user_attrs[TRIAL_OUTCOME_ATTR]["policy"] == "unsafe_process_cleanup"
+    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unsafe_process_cleanup"
+    assert (unsafe_trial_dir / runtime_process.PROCESS_IDENTITY_FILE).is_file()
+    active_attempts = list(_attempts_dir(_exp(1)).glob("*.json"))
+    assert len(active_attempts) == 1
+    active_attempt = json.loads(active_attempts[0].read_text(encoding="utf-8"))
+    assert active_attempt["attempt_id"] == unsafe_attempt_id
+
+    # Raising the target is not cleanup authority, so the second invocation
+    # must stop before creating a new trial or worker.
+    before = len(study.trials)
+    with pytest.raises(ProcessCleanupUncertainError):
+        run_experiment(_exp(2))
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert len(study.trials) == before
+    assert worker_calls["count"] == failure_call
+    assert list(_attempts_dir(_exp(2)).glob("*.json")) == active_attempts
+
+    cleanup_safe["value"] = True
+    winners = run_experiment(_exp(2))
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    assert winners["p"].metric == pytest.approx(0.5)
+    assert worker_calls["count"] == (2 if wandb_source == "metric" else 4)
+    assert [trial.state for trial in study.get_trials(deepcopy=False)] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
+    assert list(_attempts_dir(_exp(2)).glob("*.json")) == []
 
 
 def test_stale_abort_record_cleared_before_selection_survives_selection_crash(

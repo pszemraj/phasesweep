@@ -22,6 +22,7 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import DeadlineExceededError, extractor_config_fingerprint
 from phasesweep.evidence.wandb import (
@@ -31,7 +32,12 @@ from phasesweep.evidence.wandb import (
     _poll_wandb_summary,
     poll_wandb_summary,
 )
-from phasesweep.runtime.process import is_pid_alive
+from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    is_pid_alive,
+    read_attempt_lifecycle,
+    read_stale_process_identity,
+)
 from tests.conftest import make_trial_context
 
 
@@ -52,7 +58,11 @@ class _FakeApi:
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
     """Run polling-loop unit tests inline with a fake W&B API and controllable clock."""
-    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", _poll_wandb_summary)
+
+    def poll_inline(*, trial_dir, **kwargs):
+        return _poll_wandb_summary(**kwargs)
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_inline)
 
     def install(run_for_path=None, *, api_class=None):  # noqa: ANN001, ANN202
         wandb_mod = types.ModuleType("wandb")
@@ -125,11 +135,16 @@ def test_wandb_worker_returns_summary(wandb_worker_sdk, tmp_path):
         entity="entity",
         project="project",
         run_id="attempt",
+        trial_dir=tmp_path,
         poll_seconds=0.01,
         timeout_seconds=5,
         required_keys=["loss"],
     ) == {"loss": 0.25, "extra": [1, "two"]}
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+    assert (
+        read_stale_process_identity(tmp_path, expected_attempt_id="attempt").attempt_id == "attempt"
+    )
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
@@ -171,6 +186,7 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
             entity="e",
             project="p",
             run_id="attempt",
+            trial_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=1,
         )
@@ -179,6 +195,8 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
     pids = json.loads(marker.read_text(encoding="utf-8"))
     assert all(not is_pid_alive(pid) for pid in pids)
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+    assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
 @pytest.mark.parametrize(
@@ -198,7 +216,7 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
         ),
     ],
 )
-def test_wandb_worker_preserves_typed_errors(wandb_worker_sdk, source, error, match):
+def test_wandb_worker_preserves_typed_errors(wandb_worker_sdk, tmp_path, source, error, match):
     wandb_worker_sdk(source)
     with pytest.raises(error, match=match):
         poll_wandb_summary(
@@ -206,9 +224,56 @@ def test_wandb_worker_preserves_typed_errors(wandb_worker_sdk, source, error, ma
             entity="e",
             project="p",
             run_id="attempt",
+            trial_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=5,
         )
+
+
+def test_wandb_launch_failure_cannot_recover_using_previous_process_identity(tmp_path, monkeypatch):
+    from phasesweep.runtime import process
+
+    # The completed trainer's identity must not survive a failed worker launch.
+    with (tmp_path / "trainer.log").open("w") as output:
+        result = process.run_supervised(
+            "true",
+            env=dict(os.environ),
+            stdout=output,
+            stderr=output,
+            timeout=5,
+            trial_dir=tmp_path,
+            attempt_id="attempt",
+        )
+    assert result.cleanup_confirmed
+    assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
+    real_abort_launch = process._abort_launch
+
+    def fail_identity_write(path, identity):
+        assert path == tmp_path / PROCESS_IDENTITY_FILE
+        assert not path.exists()
+        raise OSError("injected worker identity write failure")
+
+    def uncertain_abort(proc, pgid):
+        # Reap the actual helper, then simulate an unconfirmed cleanup verdict.
+        assert real_abort_launch(proc, pgid)
+        return False
+
+    monkeypatch.setattr(process, "_write_process_identity", fail_identity_write)
+    monkeypatch.setattr(process, "_abort_launch", uncertain_abort)
+    with pytest.raises(UnsafeProcessCleanupError, match="Recovery records remain"):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+    assert not (tmp_path / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
+    assert lifecycle.state == "launching"
+    assert lifecycle.cleanup_confirmed is None
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
