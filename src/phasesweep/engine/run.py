@@ -429,8 +429,8 @@ def _run_experiment_outcome(
             # even though this invocation has not claimed a generation or
             # launched anything of its own.
             raise ProcessCleanupUncertainError(
-                "Artifact ownership could not be checked because persistent study "
-                "storage is unavailable; cleanup state is therefore unknown."
+                "Artifact ownership could not be checked because required persistent "
+                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
             ) from exc
         run_stack.enter_context(_file_log_handler(_run_log_path(experiment)))
         generation_id = _claim_generation(experiment, requested_generation_id)

@@ -85,7 +85,12 @@ from phasesweep.engine.state import (
     _winner_path,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
-from phasesweep.runtime.files import atomic_text_writer
+from phasesweep.runtime.files import (
+    atomic_text_writer,
+    file_url_path,
+    sqlite_database_path,
+    storage_backend,
+)
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
@@ -1852,6 +1857,138 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     for phase in experiment.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal", "auto"])
+def test_published_phase_rejects_a_missing_storage_ledger(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    """A lost published ledger cannot be mistaken for a never-run phase."""
+    trainer = write_constant_trainer(tmp_path)
+    suffix = "db" if backend == "sqlite" else "journal"
+    configured_storage = (
+        "auto" if backend == "auto" else f"{backend}:///{tmp_path / f'studies.{suffix}'}"
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=configured_storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    assert experiment.resolved_storage is not None
+    if storage_backend(experiment.resolved_storage) == "sqlite":
+        ledger = sqlite_database_path(experiment.resolved_storage)
+        assert ledger is not None
+    else:
+        ledger = Path(file_url_path(experiment.resolved_storage))
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    ledger.unlink()
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, StudyStorageUnavailableError)
+    assert "includes a winner for phase 'p'" in str(cause)
+    assert "persistent study is missing" in str(cause)
+    assert "Restore the original complete storage ledger and study" in str(excinfo.value)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+    assert not ledger.exists()
+
+
+@pytest.mark.parametrize("replacement", ["absent", "empty"])
+def test_published_phase_rejects_a_missing_or_empty_named_study(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    """Deleting or replacing one published study cannot restart trial zero."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    optuna.delete_study(study_name="t::p", storage=storage)
+    if replacement == "empty":
+        optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, StudyStorageUnavailableError)
+    expected = "is missing" if replacement == "absent" else "contains no trials"
+    assert expected in str(cause)
+    assert "continuing would restart the phase at trial 0" in str(cause)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+
+def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The published-phase existence read keeps strict storage-error semantics."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    def fail_trial_read(*_args: object, **_kwargs: object) -> list[optuna.trial.FrozenTrial]:
+        raise RuntimeError("storage went away during trial read")
+
+    monkeypatch.setattr(optuna.Study, "get_trials", fail_trial_read)
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, StudyStorageUnavailableError)
+    assert "published phase 'p'" in str(cause)
+    assert isinstance(cause.__cause__, RuntimeError)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
 
 
 def _exception_chain(error: BaseException) -> list[BaseException]:

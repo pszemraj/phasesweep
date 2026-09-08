@@ -63,6 +63,7 @@ from phasesweep.engine.state import (
     _last_successful_generation_id,
     _last_successful_suite_generation_path,
     _phase_dir,
+    _resolve_publication_pointer,
     _suite_dir,
     _trial_dir_for,
 )
@@ -2211,15 +2212,18 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
     to the rejected root. Preflight holds the experiment lock across load,
     check, and claim, so nothing can bind in between. Phases whose study does
     not exist yet are bound by :func:`_bind_study_artifact_root` when the
-    phase creates them.
+    phase creates them. The exception is a phase with a winner in the current
+    published generation: that publication proves the phase previously had
+    trial rows, so an absent or empty replacement study means durable evidence
+    was lost rather than that the phase is new.
 
     :param Experiment experiment: Parsed experiment whose declared phase
         studies are loaded and bound to its resolved artifact root.
     :return dict[str, optuna.Study]: Existing studies keyed by phase name
         (phases with no durable study yet are omitted).
     :raises StudyStorageUnavailableError: A phase's persistent storage could
-        not be inspected, so whether its study exists -- and what root it is
-        bound to -- cannot be determined.
+        not be inspected, or a phase with a published winner has lost its
+        non-empty durable study.
     :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
         records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
@@ -2243,6 +2247,35 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
             loaded[phase.name] = study
     if not _artifact_root_binding_applies(experiment):
         return loaded
+    publication = _resolve_publication_pointer(experiment)
+    published_phases = {
+        item["name"]
+        for item in (publication.summary or {}).get("phases", ())
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    for phase in experiment.phases:
+        if phase.name not in published_phases:
+            continue
+        study = loaded.get(phase.name)
+        if study is not None:
+            try:
+                if study.get_trials(deepcopy=False):
+                    continue
+            except Exception as exc:
+                raise StudyStorageUnavailableError(
+                    "Could not inspect persistent study storage for published phase "
+                    f"{phase.name!r}."
+                ) from exc
+        missing = "is missing" if study is None else "contains no trials"
+        raise StudyStorageUnavailableError(
+            f"Published generation {publication.generation_id!r} includes a winner for "
+            f"phase {phase.name!r}, but its persistent study {missing}. That publication "
+            "proves the phase previously had durable trial rows; continuing would restart "
+            "the phase at trial 0 and could replace the current publication. Restore the "
+            "original complete storage ledger and study, or use a new experiment identity "
+            "for a fresh run. No generation was claimed, no trial ran, and nothing was "
+            "published."
+        )
     claimable = [
         study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
     ]
