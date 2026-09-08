@@ -35,6 +35,7 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
+    local_storage_url,
     storage_backend,
     storage_is_in_memory,
 )
@@ -531,13 +532,15 @@ class Experiment(_Frozen):
     storage: str | None = Field(
         default=None,
         description=(
-            "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
+            "Optuna storage URL, or auto for study.db inside the experiment artifact "
+            "namespace (study.journal when any phase has n_jobs > 1). "
+            "Use sqlite:///path.db for resumable single-job studies, "
             "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
             "(RDB backends additionally require allow_external_rdb_single_host: true; "
             "see below). Nested odbc_connect strings must name each target selector once. "
             "Null for non-resumable in-memory runs (not recommended). "
-            "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
-            "scheme intentionally so study identity stays stable across n_jobs changes."
+            "Explicit SQLite URLs are never rewritten to JournalStorage. Changing auto's "
+            "backend changes storage identity and cannot resume an existing tree."
         ),
     )
     # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
@@ -592,6 +595,21 @@ class Experiment(_Frozen):
     )
     timeout_seconds_per_run: float | None = Field(default=None, ge=0)
 
+    @property
+    def resolved_storage(self) -> str | None:
+        """Resolve auto storage within this experiment's artifact namespace.
+
+        :return str | None: Absolute auto URL, or the explicit storage unchanged.
+        """
+        if self.storage != "auto":
+            return self.storage
+        root = Path(self.workdir).expanduser().resolve() / self.experiment
+        parallel = any(phase.n_jobs > 1 for phase in self.phases)
+        return local_storage_url(
+            root / ("study.journal" if parallel else "study.db"),
+            "journal" if parallel else "sqlite",
+        )
+
     @field_validator("storage")
     @classmethod
     def _storage_identity_is_unambiguous(cls, value: str | None) -> str | None:
@@ -601,7 +619,8 @@ class Experiment(_Frozen):
         :raises ValueError: An ``odbc_connect`` target selector appears more than once.
         :return str | None: The validated locator, unchanged.
         """
-        canonical_storage_identity(value)
+        if value != "auto":
+            canonical_storage_identity(value)
         return value
 
     @model_validator(mode="after")
@@ -617,7 +636,7 @@ class Experiment(_Frozen):
         ]
         if invalid:
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
-        if not storage_is_in_memory(self.storage) and not self.provenance:
+        if not storage_is_in_memory(self.resolved_storage) and not self.provenance:
             raise ValueError(
                 "Persistent storage requires a nonempty provenance mapping that identifies "
                 "the trainer, data, and dependency revision used by this experiment."
@@ -813,14 +832,16 @@ class Experiment(_Frozen):
             # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
             # shared RDB storage across hosts silently breaks lock/generation-pointer
             # safety unless explicitly acknowledged.
-            _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
+            _validate_storage_policy(
+                self.resolved_storage, phase, self.allow_external_rdb_single_host
+            )
 
             # Sampler reproducibility/resumability contract (review v0.5.18 /
             # finding F7): a durable study outlives the process that created
             # it, so an unseeded or non-resumable sampler is a config-level
             # decision the operator must make before the first trial, not a
             # surprise the runtime guard springs on them mid-target.
-            _validate_sampler_resumability(self.storage, phase)
+            _validate_sampler_resumability(self.resolved_storage, phase)
 
             # JSON wire serializability (review v0.5.17 / finding B): the
             # template preflight below renders with write_files=False, so it

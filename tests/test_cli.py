@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import Experiment, Suite, load_config
+from phasesweep.config import ExecutionContext, Experiment, Suite, load_config
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -71,6 +71,7 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
     drop_artifact_root_binding,
+    make_experiment,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -1055,6 +1056,89 @@ studies:
     config_b = tmp_path / "suite_b.yaml"
     config_b.write_text(config_text(workdir_b))
     return config_a, config_b, workdir_a, workdir_b
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.parametrize("partial", [False, True])
+def test_auto_storage_rebind_moves_ledger_with_artifacts(
+    tmp_path: Path, n_jobs: int, partial: bool
+) -> None:
+    old_workdir = tmp_path / "old ? %20"
+    new_workdir = tmp_path / "new # 🚀"
+    original = make_experiment(
+        storage="auto",
+        workdir=old_workdir,
+        n_trials=1,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    original = original.model_copy(
+        update={"phases": [original.phases[0], original.phases[0].model_copy(update={"name": "q"})]}
+    )
+    run_experiment(original)
+    old_workdir.rename(new_workdir)
+    moved = original.model_copy(update={"workdir": str(new_workdir)})
+    config = tmp_path / "moved.yaml"
+    config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
+    if partial:
+        # Rebind must use the recorded old filename, not follow a replacement
+        # symlink when reconstructing the ledger's previous identity.
+        old_workdir.symlink_to(new_workdir, target_is_directory=True)
+        _load_existing_phase_study(moved, moved.phases[0]).set_user_attr(
+            ARTIFACT_ROOT_ATTR, str(_experiment_dir(moved))
+        )
+    with pytest.raises(ArtifactRootConflictError):
+        run_experiment(moved)
+    for _ in range(2):
+        result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+        assert result.exit_code == 0, result.output
+    run_experiment(load_experiment(config))
+    for phase in moved.phases:
+        study = _load_existing_phase_study(moved, phase)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(moved))
+        assert len(study.trials) == 1
+    assert_published_winner_evidence_local(_experiment_dir(moved))
+    if partial:
+        assert old_workdir.is_symlink()
+    else:
+        assert not old_workdir.exists()
+
+
+@pytest.mark.parametrize("damage", ["trainer_input", "running", "foreign_ledger"])
+def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> None:
+    original = make_experiment(
+        storage="auto",
+        workdir=tmp_path / "old",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    run_experiment(original)
+    new_workdir = tmp_path / "new"
+    Path(original.workdir).rename(new_workdir)
+    moved = original.model_copy(update={"workdir": str(new_workdir)})
+    if damage == "trainer_input":
+        next(_experiment_dir(moved).glob("p/trial_*/overrides_resolved.json")).unlink()
+    elif damage == "running":
+        _load_existing_phase_study(moved, moved.phases[0]).ask()
+    else:
+        foreign = original.model_copy(update={"workdir": str(tmp_path / "foreign")})
+        run_experiment(foreign)
+        shutil.copy2(_experiment_dir(foreign) / "study.db", _experiment_dir(moved) / "study.db")
+    config = tmp_path / "moved.yaml"
+    config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
+    binding = _artifact_root_binding_path(moved).read_bytes()
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+    assert result.exit_code != 0
+    expected = {
+        "trainer_input": "generated trainer input",
+        "running": "RUNNING",
+        "foreign_ledger": "another storage",
+    }[damage]
+    assert expected in str(result.exception), result.exception
+    assert _artifact_root_binding_path(moved).read_bytes() == binding
 
 
 def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(

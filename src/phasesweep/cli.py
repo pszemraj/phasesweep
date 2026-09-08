@@ -7,7 +7,6 @@ import importlib.util
 import json
 import logging
 import os
-import re
 import secrets
 import shlex
 import sys
@@ -16,7 +15,6 @@ from collections.abc import Callable, Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import click
 import yaml
@@ -206,21 +204,10 @@ def _starter_experiment_text(target: Path) -> str:
         .read_text(encoding="utf-8")
     )
     runs_dir = target.parent / "runs"
-    storage_path = quote(str(runs_dir / "phases.db"), safe="/")
     # JSON and YAML double-quoted scalars share escaping for valid Unicode.
     # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
-    # pairs; the SQLite URI percent-encodes its path for unambiguous URL parsing.
-    replacements = {
-        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir), ensure_ascii=False),
-        "__PHASESWEEP_STORAGE__": json.dumps(
-            f"sqlite:///file:{storage_path}?uri=true", ensure_ascii=False
-        ),
-    }
-    # Substitute every placeholder in one pass. Sequential str.replace calls
-    # rescan text a previous call already inserted, so a destination path that
-    # contains a placeholder literal would silently corrupt the rendered config.
-    pattern = re.compile("|".join(re.escape(placeholder) for placeholder in replacements))
-    return pattern.sub(lambda match: replacements[match.group(0)], template)
+    # pairs.
+    return template.replace("__PHASESWEEP_WORKDIR__", json.dumps(str(runs_dir), ensure_ascii=False))
 
 
 @contextlib.contextmanager
@@ -817,6 +804,10 @@ def rebind_workdir(config_path: Path) -> None:
     and the only way a study that predates the binding is adopted at all. It is
     a rebind, never a move: PhaseSweep does not copy, delete, or verify the
     original tree.
+
+    With auto storage, the database must have moved with the artifact tree.
+    Its recorded previous filename is recognized without converting backends
+    or moving an explicit external database into the namespace.
 
     What it verifies at the destination, per experiment: the namespace exists;
     every trial the study ledger holds still has its evidence directory there,

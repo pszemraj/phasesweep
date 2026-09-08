@@ -277,7 +277,7 @@ def _require_mcp_stable_paths(
         ``execution.cwd`` is relative, the storage backend is not local SQLite
         or JournalStorage, or its file path is empty or relative.
     """
-    storage = experiment.storage
+    storage = experiment.resolved_storage
     if storage is None or storage_is_in_memory(storage):
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
@@ -439,7 +439,7 @@ def _claim_catalog_entry_identity(
         )
     namespace_owners[namespace] = loaded.id
 
-    storage_identity = canonical_storage_identity(loaded.experiment.storage)
+    storage_identity = canonical_storage_identity(loaded.experiment.resolved_storage)
     if storage_identity is None:
         return
     storage_key = f"{storage_identity}::{loaded.experiment.experiment}"

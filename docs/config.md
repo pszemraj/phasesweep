@@ -48,6 +48,13 @@ Use categorical parameters for explicit choices and integer or float parameters 
 
 ## Sampler capability on persistent storage
 
+Use `storage: auto` to keep the database with the experiment artifacts. It selects
+`<workdir>/<experiment>/study.db` for sequential phases, or `study.journal` when
+any phase has `n_jobs > 1`, and handles the absolute URL spelling. Auto storage
+requires nonempty `provenance` and the sampler contract below. Explicit URLs
+retain their current behavior; omitted storage remains in-memory. A backend
+change caused by editing `n_jobs` cannot resume the existing artifact tree.
+
 The `sampler` block is optional and defaults to `type: tpe` with no seed, which is fine for an in-memory run. A persistent `storage` changes that, because the study outlives the process that created it, so each phase must state two things up front rather than discover them mid-sweep:
 
 | Sampler | Seed | `acknowledge_nonresumable` |
@@ -59,7 +66,8 @@ The `sampler` block is optional and defaults to `type: tpe` with no seed, which 
 An unseeded `tpe`, `random`, or `cmaes` phase draws a different sequence on every invocation, so the durable trials it accumulates cannot be reproduced or explained afterwards. `tpe` and `cmaes` additionally hold process-local sampler state that Optuna storage does not persist: PhaseSweep refuses to resume such a phase mid-target or to raise its `n_trials` later (see [runtime behavior](runtime.md#fingerprints-and-resume)). Setting `acknowledge_nonresumable: true` is your statement that you accept that contract and will run each target in one invocation; setting it on `grid` or `random`, which resume safely, is rejected as meaningless config.
 
 ```yaml
-storage: sqlite:///runs.db
+storage: auto
+provenance: {revision: my-trainer-and-data-v1}
 phases:
   - name: depth
     n_trials: 4

@@ -12,16 +12,21 @@
 # Nonempty ASCII `[A-Za-z0-9_-]+`; selects output paths, locks, and `<experiment>::<phase>` Optuna study names.
 
 # storage: str | None = null
+# `auto` resolves to an absolute URL for <workdir>/<experiment>/study.db, or study.journal when any phase has n_jobs > 1. The starter uses auto; omitted storage still defaults to null.
+# Auto is persistent: provenance must be nonempty, tpe/random/cmaes phases require seed, and tpe/cmaes also require acknowledge_nonresumable: true. Grid needs neither.
+# Changing n_jobs across the SQLite/journal boundary changes auto's database identity; an existing artifact tree is rejected, not migrated. Use a new experiment name or keep an explicit compatible backend.
 # `null`, `:memory:`, `sqlite://`, `sqlite:///:memory:`, and SQLite `uri=true` targets using `mode=memory` create fresh in-memory studies. Trial numbers, study state, and the current winner/summary view restart on every invocation; use persistent storage for resumable work.
 # `sqlite:///...` is persistent only with every phase at `n_jobs: 1`; `journal:///...` supports same-host parallel trials; other URLs (RDB backends such as postgresql:// or mysql://) pass through to Optuna but are rejected at config validation unless allow_external_rdb_single_host: true is also set.
 # RDB identity ignores authentication plus driver, encryption, and timeout settings. Nested `odbc_connect` target keys are case-insensitive and order-independent; each target selector may appear only once.
 # Three-slash SQLite/Journal paths are relative to the invocation cwd; absolute POSIX paths use four slashes.
+# Auto URLs use escaped file: URI filenames with uri=true, preserving punctuation and Unicode for both SQLite and journal storage. Experiment.storage retains the authored value; Experiment.resolved_storage returns the effective URL.
 
 # allow_external_rdb_single_host: bool = false
 # Acknowledges the loss of PhaseSweep's host-local-filesystem-based coordination (locks, generation pointers) when using a shared RDB storage backend. Set true only when every process that will ever touch this storage and workdir runs on a single host.
 
 # workdir: str = "./runs"
 # Output root for trial artifacts, winners, and summaries. Relative paths resolve from the invocation cwd, not the config file.
+# Newly created workdirs contain a .gitignore with *; existing directories and ignore files are untouched.
 # With persistent storage each phase study is bound to the one resolved <workdir>/<experiment> root it publishes into, so re-running the same config against a second workdir is refused instead of producing a divergent second result tree. Keep it stable across resumptions; if you genuinely relocate the artifact tree, move it first and then run `phasesweep rebind-workdir CONFIG`.
 
 # trial_command: str (required)
@@ -349,6 +354,7 @@
 
 # storage: str | None = null
 # If omitted, inherits defaults.storage; explicit null clears a persistent default and selects in-memory storage.
+# auto resolves separately for each compiled <suite>__<study> experiment, using that study's workdir and phases; it is also accepted in defaults.storage.
 
 # allow_external_rdb_single_host: bool | None = null
 # If omitted, inherits defaults.allow_external_rdb_single_host; explicit null blocks fallback and fails compilation. Follows the Experiment contract once resolved.

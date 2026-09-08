@@ -275,14 +275,14 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
     :return dict[str, str] | None: Canonical persistent-storage lock material,
         or ``None`` for in-memory storage.
     """
-    if storage_is_in_memory(experiment.storage):
+    if storage_is_in_memory(experiment.resolved_storage):
         # In-memory URLs (``sqlite:///:memory:`` and spellings thereof) have
         # no shared backend to guard; locking their canonical identity would
         # make two unrelated in-memory runs that share an experiment name
         # contend on a lock naming a backend that does not exist (review
         # v0.5.17 gap hunt).
         return None
-    storage_identity = canonical_storage_identity(experiment.storage)
+    storage_identity = canonical_storage_identity(experiment.resolved_storage)
     if storage_identity is None:
         return None
     return {
@@ -810,8 +810,8 @@ def _register_active_attempt(
             "experiment": experiment.experiment,
             "phase": phase_name,
             "study_name": study_name,
-            "storage_identity": canonical_storage_identity(experiment.storage),
-            "storage_locator": storage_recovery_locator(experiment.storage),
+            "storage_identity": canonical_storage_identity(experiment.resolved_storage),
+            "storage_locator": storage_recovery_locator(experiment.resolved_storage),
             "trial_number": trial_number,
             "trial_dir": str(trial_dir),
             "generation_id": generation_id,
@@ -1311,7 +1311,7 @@ def _preflight_active_attempts(
             outcome = _registry_attempt_fail_stale_trial(
                 entry,
                 entry_path,
-                current_storage=experiment.storage,
+                current_storage=experiment.resolved_storage,
             )
             if outcome in {"reaped", "recovered"}:
                 report.recovered_attempt_ids.add(attempt_id)
@@ -1907,7 +1907,9 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
         not outlive the process, so no later invocation can inherit them and
         no second publication root can conflict with the first.
     """
-    return experiment.storage is not None and not storage_is_in_memory(experiment.storage)
+    return experiment.resolved_storage is not None and not storage_is_in_memory(
+        experiment.resolved_storage
+    )
 
 
 ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 2
@@ -1924,7 +1926,7 @@ def _artifact_root_storage_key(experiment: Experiment) -> str:
     :param Experiment experiment: Experiment whose persistent ledger is identified.
     :return str: Full SHA-256 hex digest of the canonical storage identity.
     """
-    storage_identity = canonical_storage_identity(experiment.storage)
+    storage_identity = canonical_storage_identity(experiment.resolved_storage)
     assert storage_identity is not None
     return hashlib.sha256(storage_identity.encode("utf-8")).hexdigest()
 
@@ -2667,6 +2669,9 @@ def _plan_artifact_root_rebinds(
 def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) -> None:
     """Require an existing reverse binding to agree with the ledger being rebound.
 
+    Auto storage may retain the identity of its database under the recorded
+    previous root, provided the loaded studies agree with that source tree.
+
     :param _ArtifactRootRebindPlan plan: Planned binding mutation to validate.
     :raises ArtifactRootRebindError: The binding is unreadable, malformed, or
         cannot be validated as the current user.
@@ -2690,11 +2695,28 @@ def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) ->
         ) from exc
     expected = _artifact_root_binding_payload(plan.experiment)
     recorded_root = raw.get("artifact_root") if isinstance(raw, dict) else None
+    storage_matches = isinstance(raw, dict) and raw.get("storage_key") == expected["storage_key"]
+    if (
+        not storage_matches
+        and plan.experiment.storage == "auto"
+        and isinstance(recorded_root, str)
+        and Path(recorded_root).is_absolute()
+        and Path(recorded_root).name == plan.experiment.experiment
+        and all(entry.previous in {recorded_root, plan.destination} for entry in plan.entries)
+    ):
+        # Reconstruct the old, already-resolved filename lexically. The old
+        # tree may be gone or replaced by a symlink after the move.
+        parallel = any(phase.n_jobs > 1 for phase in plan.experiment.phases)
+        backend, filename = ("journal", "study.journal") if parallel else ("sqlite", "study.db")
+        previous_identity = f"{backend}:///{Path(recorded_root) / filename}"
+        storage_matches = (
+            raw.get("storage_key") == hashlib.sha256(previous_identity.encode("utf-8")).hexdigest()
+        )
     if (
         not isinstance(raw, dict)
         or raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
         or raw.get("experiment") != expected["experiment"]
-        or raw.get("storage_key") != expected["storage_key"]
+        or not storage_matches
         or not isinstance(recorded_root, str)
         or not Path(recorded_root).is_absolute()
     ):

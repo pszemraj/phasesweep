@@ -1,7 +1,7 @@
 # Runnable PhaseSweep starter. The human owns this file: review trainer commands,
 # paths, search spaces, and permissions before launching real workloads.
 experiment: phasesweep_starter
-storage: __PHASESWEEP_STORAGE__
+storage: auto
 provenance:
   revision: "phasesweep-starter-v1"
 workdir: __PHASESWEEP_WORKDIR__

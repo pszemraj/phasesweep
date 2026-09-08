@@ -43,6 +43,11 @@ The server speaks JSON-RPC over stdio; all logging goes to stderr.
 
 ### Paths and the working directory
 
+`storage: auto` satisfies the persistent absolute-storage requirement when paired
+with MCP's required absolute `workdir`. It selects `study.db` inside the experiment
+namespace, or `study.journal` when any phase has parallel jobs. The existing
+provenance, sampler-seed, and non-resumable-acknowledgement requirements apply.
+
 `state_dir`, `config:`, and `experiments[].cwd` paths in the catalog resolve against the catalog file when they are relative. MCP experiment configs must use absolute `workdir` values and non-empty absolute SQLite/Journal storage paths so server restarts, wrappers, IDE launches, and desktop clients monitor the same local-node artifacts and Optuna studies. External RDB storage is rejected for MCP because the current cleanup, stale-trial reaping, and GPU lock semantics are same-host only. The detached runner always runs with the catalog entry's frozen `cwd`; omission defaults to the registered config file's directory, while `init-catalog` writes `cwd: "."` so a catalog scaffolded at the project root preserves project-relative trainer commands. The runner *process* is spawned in `state_dir` and receives that `cwd` as an argument it enters only after its own process identity is durable, so interpreter startup never reads the experiment's directory (see [security model](#security-model)). Relative paths inside `trial_command` are trainer-owned shell behavior; PhaseSweep does not parse or rewrite commands. When the experiment's `execution.cwd` is unset, the trainer inherits the catalog entry's frozen `cwd`; the registry materializes that effective path for fingerprint and drift comparisons, and the generation config snapshot freezes it. Set an absolute `execution.cwd` when CLI and MCP launches must share one persistent study regardless of launch directory; when set, the catalog entry's `cwd` affects only the runner process itself.
 
 ### Concurrency and single-GPU hosts

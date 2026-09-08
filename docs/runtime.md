@@ -13,11 +13,13 @@ When a real run creates its `workdir`, PhaseSweep adds a `.gitignore` containing
 repository's own `.gitignore` is never edited. Validation, status, and engine
 dry runs do not create the workdir.
 
-The bundled [toy experiment](../examples/experiment.yaml) writes one namespace per experiment:
+With `storage: auto`, each experiment keeps its database and artifacts in one namespace:
 
 ```text
 runs/
+  .gitignore
   tiny_lm_16mb/
+    study.db                 # study.journal when any phase has n_jobs > 1
     depth/
       trial_00000__generation_<generation-id>__attempt_<attempt-id>/
         attempt_lifecycle.json
@@ -46,8 +48,23 @@ runs/
     attempts/
       <attempt-id>.json
     artifact_root_binding.json
-  phases.db
 ```
+
+The starter uses `storage: auto`. It resolves to an absolute SQLite URL for
+`<workdir>/<experiment>/study.db`, or a journal URL for `study.journal` when any
+phase has `n_jobs > 1`. Suite studies resolve independently under their compiled
+`<suite>__<study>` names. Explicit storage URLs keep their configured locations;
+omitted or null storage remains in-memory. Changing `n_jobs` across the automatic
+backend boundary changes database identity and is refused for an existing tree.
+There is no automatic database conversion.
+
+To relocate an auto-storage experiment, stop its runs, move the complete tree
+including the database, change `workdir`, and run `phasesweep rebind-workdir CONFIG`.
+Rebind recognizes the database's former location and retains the existing
+evidence, live-attempt, and suite-publication restrictions. It does not move
+files itself or migrate a shared explicit database into auto storage. Copying a
+tree including its database creates an independent ledger; rebinding that copy
+does not revoke the original copy's bindings.
 
 Every non-dry experiment invocation claims a generation ID, and every subprocess launch mints an attempt ID. Both are stored in Optuna before launch and included in the trial directory name, so a repeated in-memory study cannot read files left by an older trial with the same number. The owner-only `attempts/` registry (`0700`, entries `0600`) freezes each live attempt's recovery locator, including storage credentials; relative SQLite and journal paths become absolute so a later working-directory change cannot redirect recovery. Recovery normally uses that frozen locator, but when the current config has the same credential-free storage target identity it uses the current operational locator instead, so a rotated password or token cannot strand a stale attempt behind obsolete credentials even when its phase was renamed or removed. The ordinary `artifact_root_binding.json` contains only an opaque digest of the storage identity, never the operational URL or its query values. A generation namespace is claimed once under the experiment lock, and a reused caller-supplied ID is rejected before lifecycle or trial state changes.
 

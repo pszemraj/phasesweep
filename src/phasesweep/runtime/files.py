@@ -174,8 +174,8 @@ def lock_dir() -> Path:
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
-        ownership-and-mode check; or the default lock directory under the
-        user's cache cannot be created as owner-only.
+        ownership-and-mode check; ``PHASESWEEP_HOME`` is invalid; or the default
+        lock directory cannot be created as owner-only.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -1107,6 +1107,16 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
+def local_storage_url(path: Path, backend: str) -> str:
+    """Encode an absolute SQLite or journal filename as a local URI URL.
+
+    :param Path path: Database or journal filename.
+    :param str backend: ``sqlite`` or ``journal``.
+    :return str: Absolute URL preserving reserved characters in the filename.
+    """
+    return f"{backend}:///file:{quote(str(path.resolve()), safe='/')}?uri=true"
+
+
 def storage_backend(storage: str | None) -> str | None:
     """Return the logical backend name for an Optuna storage URL.
 
@@ -1157,6 +1167,7 @@ def file_url_path(storage: str) -> str:
         sqlite:///:memory:                -> :memory:
         journal:///relative.journal       -> relative.journal
         journal:////tmp/absolute.journal  -> /tmp/absolute.journal
+        journal:///file:/tmp/a%3Fb?uri=true -> /tmp/a?b
 
     Args:
         storage: A file-style storage URL whose scheme is already known to be
@@ -1181,8 +1192,16 @@ def file_url_path(storage: str) -> str:
     else:
         path = rest
 
-    path = path.split("?", 1)[0]
-    return path.split("#", 1)[0]
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    # Auto journal storage uses the same escaped file: URI convention as
+    # SQLite. Ordinary explicit journal paths keep their literal spelling.
+    if (
+        storage_backend(storage) == "journal"
+        and path.startswith("file:")
+        and _truthy_url_option(storage_url_query_options(storage).get("uri"))
+    ):
+        return unquote(urlsplit(path).path)
+    return path
 
 
 def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
@@ -1347,7 +1366,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
     backend = storage_backend(storage)
     if backend == "journal":
         path = Path(file_url_path(storage)).expanduser().resolve()
-        return "journal:///" + str(path)
+        return local_storage_url(path, "journal")
     if backend != "sqlite":
         return storage
 
@@ -1360,7 +1379,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         if uri_path is None:
             # A non-local ``file:`` authority is not cwd-relative.
             return storage
-        frozen_database = "file:" + str(Path(uri_path).expanduser().resolve())
+        frozen_database = "file:" + quote(str(Path(uri_path).expanduser().resolve()), safe="/")
     else:
         frozen_database = str(Path(database).expanduser().resolve())
     return url.set(database=frozen_database).render_as_string(hide_password=False)
