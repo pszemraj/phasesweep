@@ -74,6 +74,7 @@ PHASE_STATUS_KEYS = {
     "n_trials",
     "completed",
     "generation_trials",
+    "published_study_unavailable",
     "name",
     "winner",
 }

@@ -37,6 +37,7 @@ from phasesweep.engine import (
     ArtifactRootRebindError,
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
+    PublishedStudyMissingError,
     RunRequestError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
@@ -1893,13 +1894,12 @@ def test_published_phase_rejects_a_missing_storage_ledger(
 
     ledger.unlink()
 
-    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+    with pytest.raises(PublishedStudyMissingError) as excinfo:
         run_experiment(experiment)
 
-    cause = excinfo.value.__cause__
-    assert isinstance(cause, StudyStorageUnavailableError)
-    assert "includes a winner for phase 'p'" in str(cause)
-    assert "persistent study is missing" in str(cause)
+    assert "includes a winner for phase 'p'" in str(excinfo.value)
+    assert "persistent study is missing" in str(excinfo.value)
+    assert "Cleanup state is therefore unknown" not in str(excinfo.value)
     assert "Restore the original complete storage ledger and study" in str(excinfo.value)
     assert _generation_path(experiment).read_bytes() == generation_before
     assert _last_successful_generation_id(experiment) == published
@@ -1936,14 +1936,13 @@ def test_published_phase_rejects_a_missing_or_empty_named_study(
     if replacement == "empty":
         optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
 
-    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+    with pytest.raises(PublishedStudyMissingError) as excinfo:
         run_experiment(experiment)
 
-    cause = excinfo.value.__cause__
-    assert isinstance(cause, StudyStorageUnavailableError)
     expected = "is missing" if replacement == "absent" else "contains no trials"
-    assert expected in str(cause)
-    assert "continuing would restart the phase at trial 0" in str(cause)
+    assert expected in str(excinfo.value)
+    assert "continuing would restart the phase at trial 0" in str(excinfo.value)
+    assert "Cleanup state is therefore unknown" not in str(excinfo.value)
     assert _generation_path(experiment).read_bytes() == generation_before
     assert _last_successful_generation_id(experiment) == published
     assert {
@@ -1989,6 +1988,70 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     assert {
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     } == generation_dirs_before
+
+
+@pytest.mark.parametrize("replacement", ["absent", "empty"])
+@pytest.mark.parametrize("missing_phase", ["arch", "lr"])
+def test_published_study_requirement_starts_at_from_phase(
+    tmp_path: Path, replacement: str, missing_phase: str
+) -> None:
+    """Skipped winners survive ledger loss; phases that execute still need history."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
+    original = run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    optuna.delete_study(study_name=f"t::{missing_phase}", storage=storage)
+    if replacement == "empty":
+        optuna.create_study(study_name=f"t::{missing_phase}", storage=storage, direction="minimize")
+
+    if missing_phase == "lr":
+        with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
+            run_experiment(experiment, from_phase="lr")
+        assert _generation_path(experiment).read_bytes() == generation_before
+        assert _last_successful_generation_id(experiment) == published
+    else:
+        winners = run_experiment(experiment, from_phase="lr")
+        assert winners["arch"].params == original["arch"].params
+        assert winners["arch"].trial_number == original["arch"].trial_number
+        assert _last_successful_generation_id(experiment) != published
+        if replacement == "absent":
+            assert "t::arch" not in optuna.get_all_study_names(storage=storage)
+        else:
+            assert not optuna.load_study(study_name="t::arch", storage=storage).trials
+        assert len(optuna.load_study(study_name="t::lr", storage=storage).trials) == 1
+
+
+def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing study is only a static refusal when execution has not started."""
+    import phasesweep.engine.run as engine_run
+
+    trainer = write_constant_trainer(tmp_path)
+    ledger = tmp_path / "studies.db"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{ledger}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+
+    def lose_ledger(*_args: object, **_kwargs: object) -> None:
+        ledger.unlink()
+        raise RuntimeError("execution failed after the ledger disappeared")
+
+    monkeypatch.setattr(engine_run, "_run_experiment_inner", lose_ledger)
+    reports = []
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment, terminal_callback=reports.append)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert reports[0].cleanup_confirmed is False
+    assert _last_successful_generation_id(experiment) == published
 
 
 def _exception_chain(error: BaseException) -> list[BaseException]:

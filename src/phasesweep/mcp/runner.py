@@ -39,6 +39,7 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
+    PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -70,6 +71,7 @@ FailureCode: TypeAlias = Literal[
     "artifact_root_conflict",
     "study_schema_mismatch",
     "storage_unavailable",
+    "published_study_missing",
     "sampler_continuation_unsupported",
     "trial_target_regression",
     "experiment_busy",
@@ -115,9 +117,10 @@ def _base_failure_payload(
     :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report for most error types;
         clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
-        falling back to ``"execution"`` for any other value. Two error types
+        falling back to ``"execution"`` for any other value. Three error types
         override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError` always reports ``"preflight"`` and
+        :class:`ExperimentLockBusyError` and :class:`PublishedStudyMissingError`
+        always report ``"preflight"`` and
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
         ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
@@ -173,6 +176,17 @@ def _base_failure_payload(
             "remediation": (
                 "Use a new experiment name, or ask the operator to archive the "
                 "unsupported persistent study before retrying."
+            ),
+        }
+    if isinstance(error, PublishedStudyMissingError):
+        return {
+            "code": "published_study_missing",
+            "stage": "preflight",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Restore the original complete storage ledger and study, or use a new "
+                "experiment identity for a fresh run."
             ),
         }
     if isinstance(error, StudyStorageUnavailableError):

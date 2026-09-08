@@ -1207,6 +1207,7 @@ def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(
     expected = "another storage ledger" if bound else "different storage ledger"
     assert expected in str(result.exception)
     assert "the next ordinary run binds" not in str(result.exception)
+    assert "run 'phasesweep rebind-workdir" not in str(result.exception)
     assert _artifact_root_binding_path(owner).read_bytes() == owner_binding
     assert foreign_study.user_attrs.get(ARTIFACT_ROOT_ATTR) == (
         str(_experiment_dir(foreign)) if bound else None
@@ -1255,6 +1256,83 @@ def test_rebind_workdir_refuses_a_destination_without_the_recorded_publication(
     assert expected in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("target", ["absent", "empty"])
+def test_explicit_storage_to_auto_rebind_explains_the_empty_target(
+    tmp_path: Path, legacy: bool, target: str
+) -> None:
+    """The old starter ledger stays usable; rebind must not recommend itself."""
+    config, _, _, _ = _movable_experiment_configs(tmp_path)
+    owner = load_experiment(config)
+    run_experiment(owner)
+    published = _last_successful_generation_id(owner)
+    binding_path = _artifact_root_binding_path(owner)
+    if legacy:
+        binding_path.unlink()
+    binding_before = binding_path.read_bytes() if binding_path.exists() else None
+    config.write_text(config.read_text().replace(str(owner.storage), "auto"))
+    migrated = load_experiment(config)
+    ledger = _experiment_dir(migrated) / "study.db"
+    if target == "empty":
+        optuna.create_study(study_name="t::p", storage=migrated.resolved_storage)
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+
+    assert result.exit_code != 0
+    message = str(result.exception)
+    assert "keep the explicit storage setting" in message
+    assert "Rebinding does not move or convert storage ledgers" in message
+    assert "Nothing was written" in message
+    assert "run 'phasesweep rebind-workdir" not in message
+    assert "the next ordinary run binds" not in message
+    assert (binding_path.read_bytes() if binding_path.exists() else None) == binding_before
+    assert _last_successful_generation_id(migrated) == published
+    assert ledger.exists() is (target == "empty")
+    # Follow the stated remedy, including legacy adoption with the original ledger.
+    config.write_text(config.read_text().replace("storage: auto", f"storage: {owner.storage}"))
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+    assert result.exit_code == 0, result.exception
+    assert run_experiment(load_experiment(config))["p"].trial_number == 0
+
+
+@pytest.mark.parametrize("damage", ["ledger", "study", "empty_study"])
+def test_missing_published_study_is_visible_in_status_and_rebind(
+    tmp_path: Path, damage: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, _, _, _ = _movable_experiment_configs(tmp_path)
+    experiment = load_experiment(config)
+    run_experiment(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    binding_before = _artifact_root_binding_path(experiment).read_bytes()
+    ledger = tmp_path / "studies.db"
+    if damage == "ledger":
+        ledger.unlink()
+    else:
+        optuna.delete_study(study_name="t::p", storage=experiment.storage)
+        if damage == "empty_study":
+            optuna.create_study(study_name="t::p", storage=experiment.storage)
+
+    status_result = CliRunner().invoke(cli_main, ["status", str(config)])
+    assert status_result.exit_code == 0, status_result.exception
+    status = yaml.safe_load(status_result.output)
+    assert status["publication_integrity"] == "ok"
+    assert status["is_published"] is True
+    assert status["phases"][0]["published_study_unavailable"] is True
+
+    for command in ("run", "rebind-workdir"):
+        exit_code = _invoke_cli_boundary([command, str(config)], monkeypatch)
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "Published generation" in captured.err
+        assert "Restore the original complete storage ledger and study" in captured.err
+        assert "the next ordinary run binds" not in captured.err
+        assert "Cleanup state is therefore unknown" not in captured.err
+        assert "Traceback" not in captured.err
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _artifact_root_binding_path(experiment).read_bytes() == binding_before
+    assert ledger.exists() is (damage != "ledger")
 
 
 def test_rebind_workdir_refuses_when_no_study_is_bound(

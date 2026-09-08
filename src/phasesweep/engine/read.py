@@ -27,6 +27,7 @@ from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.guards import (
+    _artifact_root_binding_applies,
     _experiment_semantic_fingerprint,
     _validate_artifact_root_binding,
 )
@@ -94,6 +95,7 @@ def _phase_status_payloads(
     generation_trial_counts: Mapping[str, dict[str, int]],
     trial_data_available: Mapping[str, bool],
     running_attempts: Mapping[str, list[dict[str, Any]] | None],
+    published_phases: set[str],
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
@@ -120,6 +122,7 @@ def _phase_status_payloads(
         consumed by MCP, whose terminal snapshot must not reread studies to
         learn which rows the RUNNING count refers to (PR #5 review /
         reviewer 2, blocker 6).
+    :param set[str] published_phases: Persistent phases with a current published winner.
     :param str | None winner_scope_generation_id: Already-resolved generation id
         whose winner files are represented. When ``pinned`` is ``False``
         (default), this is treated as an already-captured last-success id and
@@ -150,6 +153,8 @@ def _phase_status_payloads(
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
             "generation_trials": generation_trial_counts[phase.name],
+            "published_study_unavailable": phase.name in published_phases
+            and not any(counts.values()),
         }
         if include_winner_path:
             payload.update(
@@ -560,6 +565,10 @@ def read_status(
     whatever else may be current by the time the read happens. ``trials``,
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
+    ``published_study_unavailable`` reports a current published phase with no
+    readable trial history (a missing, empty, or unreadable study). Executing
+    that phase is refused; earlier phases may still load saved winners via
+    ``from_phase``. Publication integrity describes the artifacts separately.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional invocation identity to pin the
@@ -719,6 +728,13 @@ def read_status(
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
+            published_phases={
+                item["name"]
+                for item in (publication.summary or {}).get("phases", ())
+                if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+            }
+            if _artifact_root_binding_applies(experiment)
+            else set(),
             include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={

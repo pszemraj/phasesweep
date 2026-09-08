@@ -56,6 +56,7 @@ def test_engine_exports_all_typed_preflight_errors() -> None:
         "StudyFingerprintMismatchError",
         "StudySchemaMismatchError",
         "StudyStorageUnavailableError",
+        "PublishedStudyMissingError",
         "TrialTargetRegressionError",
     )
 

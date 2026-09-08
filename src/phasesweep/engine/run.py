@@ -422,7 +422,7 @@ def _run_experiment_outcome(
         # returned objects are passed into preflight so storage is not reread
         # after this strict discovery-and-claim boundary.
         try:
-            existing_studies = _load_and_check_artifact_roots(experiment)
+            existing_studies = _load_and_check_artifact_roots(experiment, from_phase=from_phase)
         except StudyStorageUnavailableError as exc:
             # The ledger may contain attempts from an earlier orchestrator. A
             # failed ownership read cannot prove those processes are resolved,
@@ -1565,7 +1565,8 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
-      and ``winner`` (path string or ``None``).
+      ``winner`` (path string or ``None``), and ``published_study_unavailable``
+      (a published phase has no readable trial history, so executing it is blocked).
 
     ``read_status``'s summary-derived fields (``metric``, ``result_context``,
     ``published_config_matches_current``, ``summary_present``) are deliberately

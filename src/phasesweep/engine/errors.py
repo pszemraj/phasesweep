@@ -126,7 +126,11 @@ class TrialEvidenceMissingError(PhaseSweepError):
 
 
 class StudyStorageUnavailableError(PhaseSweepError):
-    """Raised when required persistent study state cannot be inspected or was lost."""
+    """Raised when required persistent study state cannot be inspected or persisted."""
+
+
+class PublishedStudyMissingError(PhaseSweepError):
+    """Raised before launch when a published phase's study is absent or empty."""
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):

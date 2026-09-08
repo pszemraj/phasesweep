@@ -525,6 +525,13 @@ class PhaseStatusPayload(_ToolPayload):
         description="Whether pre-run terminal history already met the configured target."
     )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
+    published_study_unavailable: bool = Field(
+        description=(
+            "Whether a current published phase has no readable trial history because its "
+            "study is missing, empty, or unreadable. Executing this phase is blocked; "
+            "earlier phases may still load validated saved winners via from_phase."
+        )
+    )
     trial_data_available: bool = Field(
         description=(
             "Whether the backing study was readable; false means zero counts are not evidence "

@@ -72,6 +72,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
+    published_study_unavailable: bool = False
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 

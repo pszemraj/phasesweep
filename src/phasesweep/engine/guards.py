@@ -26,6 +26,7 @@ from phasesweep.engine.errors import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -2034,6 +2035,7 @@ def _validate_artifact_root_binding(
     experiment: Experiment,
     *,
     claim_fresh: bool,
+    rebind: bool = False,
 ) -> None:
     """Validate or claim the storage ledger that owns an artifact tree.
 
@@ -2044,6 +2046,7 @@ def _validate_artifact_root_binding(
 
     :param Experiment experiment: Config whose root and storage must agree.
     :param bool claim_fresh: Write the record when the root has no durable state.
+    :param bool rebind: Explain empty-storage refusals for the rebind command.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
     :raises LegacyArtifactRootMigrationRequiredError: A non-empty tree predates
@@ -2058,6 +2061,15 @@ def _validate_artifact_root_binding(
     except FileNotFoundError:
         durable_entry = _root_durable_state_entry(experiment)
         if durable_entry is not None:
+            if rebind:
+                raise LegacyArtifactRootMigrationRequiredError(
+                    f"Artifact root {expected['artifact_root']!r} contains legacy PhaseSweep "
+                    "state, but the configured storage has no populated phase studies to "
+                    "adopt. Restore the original storage setting and complete ledger for "
+                    "this tree; keep the explicit storage setting when switching to "
+                    "storage: auto would select an empty ledger. Rebinding does not move "
+                    "or convert storage ledgers. Nothing was written."
+                ) from None
             raise LegacyArtifactRootMigrationRequiredError(
                 f"Artifact root {expected['artifact_root']!r} contains PhaseSweep state "
                 f"entry {durable_entry!r} but records no storage-ledger binding. An "
@@ -2091,6 +2103,15 @@ def _validate_artifact_root_binding(
         backend_conflict = _auto_storage_backend_conflict(experiment, raw)
         if backend_conflict is not None:
             raise ArtifactRootConflictError(backend_conflict)
+        if rebind:
+            raise ArtifactRootConflictError(
+                f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
+                "ledger or experiment. The configured storage has no populated phase "
+                "studies to rebind. Restore the original experiment and storage setting "
+                "and complete ledger for this tree; keep the explicit storage setting "
+                "when switching to storage: auto would select an empty ledger. Rebinding "
+                "does not move or convert storage ledgers. Nothing was written."
+            )
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. "
@@ -2191,7 +2212,9 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     _claim_study_artifact_root(study, _artifact_root_identity(experiment))
 
 
-def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.Study]:
+def _load_and_check_artifact_roots(
+    experiment: Experiment, *, from_phase: str | None = None
+) -> dict[str, optuna.Study]:
     """Load every existing phase study exactly once, then check and claim roots.
 
     Discovery on this mutating path is strict and tri-state (PR #5 review /
@@ -2215,15 +2238,18 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
     phase creates them. The exception is a phase with a winner in the current
     published generation: that publication proves the phase previously had
     trial rows, so an absent or empty replacement study means durable evidence
-    was lost rather than that the phase is new.
+    was lost rather than that the phase is new. Skipped phases load their saved
+    winners instead and do not need a non-empty study.
 
     :param Experiment experiment: Parsed experiment whose declared phase
         studies are loaded and bound to its resolved artifact root.
+    :param str | None from_phase: Resume point; earlier phases will not execute.
     :return dict[str, optuna.Study]: Existing studies keyed by phase name
         (phases with no durable study yet are omitted).
     :raises StudyStorageUnavailableError: A phase's persistent storage could
-        not be inspected, or a phase with a published winner has lost its
-        non-empty durable study.
+        not be inspected.
+    :raises PublishedStudyMissingError: A phase to execute has a published
+        winner but no non-empty durable study.
     :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
         records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
@@ -2247,35 +2273,7 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
             loaded[phase.name] = study
     if not _artifact_root_binding_applies(experiment):
         return loaded
-    publication = _resolve_publication_pointer(experiment)
-    published_phases = {
-        item["name"]
-        for item in (publication.summary or {}).get("phases", ())
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    for phase in experiment.phases:
-        if phase.name not in published_phases:
-            continue
-        study = loaded.get(phase.name)
-        if study is not None:
-            try:
-                if study.get_trials(deepcopy=False):
-                    continue
-            except Exception as exc:
-                raise StudyStorageUnavailableError(
-                    "Could not inspect persistent study storage for published phase "
-                    f"{phase.name!r}."
-                ) from exc
-        missing = "is missing" if study is None else "contains no trials"
-        raise StudyStorageUnavailableError(
-            f"Published generation {publication.generation_id!r} includes a winner for "
-            f"phase {phase.name!r}, but its persistent study {missing}. That publication "
-            "proves the phase previously had durable trial rows; continuing would restart "
-            "the phase at trial 0 and could replace the current publication. Restore the "
-            "original complete storage ledger and study, or use a new experiment identity "
-            "for a fresh run. No generation was claimed, no trial ran, and nothing was "
-            "published."
-        )
+    _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
     claimable = [
         study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
     ]
@@ -2288,6 +2286,54 @@ def _load_and_check_artifact_roots(experiment: Experiment) -> dict[str, optuna.S
     for study in claimable:
         _claim_study_artifact_root(study, offered)
     return loaded
+
+
+def _check_published_phase_studies(
+    experiment: Experiment,
+    loaded: Mapping[str, optuna.Study],
+    *,
+    from_phase: str | None = None,
+) -> None:
+    """Require trial history for published phases that would execute.
+
+    :param Experiment experiment: Experiment whose current publication is checked.
+    :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
+    :param str | None from_phase: Resume point; earlier phases only load winners.
+    :raises PublishedStudyMissingError: A reached published study is absent or empty.
+    :raises StudyStorageUnavailableError: A published study's trials cannot be read.
+    """
+    publication = _resolve_publication_pointer(experiment)
+    published_phases = {
+        item["name"]
+        for item in (publication.summary or {}).get("phases", ())
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if not reached or phase.name not in published_phases:
+            continue
+        study = loaded.get(phase.name)
+        if study is not None:
+            try:
+                if study.get_trials(deepcopy=False):
+                    continue
+            except Exception as exc:
+                raise StudyStorageUnavailableError(
+                    "Could not inspect persistent study storage for published phase "
+                    f"{phase.name!r}."
+                ) from exc
+        missing = "is missing" if study is None else "contains no trials"
+        raise PublishedStudyMissingError(
+            f"Published generation {publication.generation_id!r} includes a winner for "
+            f"phase {phase.name!r}, but its persistent study {missing}. That publication "
+            "proves the phase previously had durable trial rows; continuing would restart "
+            "the phase at trial 0 and could replace the current publication. Restore the "
+            "original complete storage ledger and study, or use a new experiment identity "
+            "for a fresh run. No generation was claimed, no trial ran, and nothing was "
+            "published."
+        )
 
 
 @dataclass(frozen=True)
@@ -2723,22 +2769,32 @@ def _plan_artifact_root_rebinds(
         )
         for experiment in persistent
     ]
-    if not any(plan.has_binding or plan.has_unbound_populated_study for plan in plans):
-        for plan in plans:
-            try:
-                _validate_artifact_root_binding(plan.experiment, claim_fresh=False)
-            except ArtifactRootConflictError as exc:
-                raise ArtifactRootRebindError(str(exc)) from exc
+    has_studies_to_rebind = any(
+        plan.has_binding or plan.has_unbound_populated_study for plan in plans
+    )
+    for plan in plans:
+        try:
+            if has_studies_to_rebind:
+                _validate_artifact_root_binding_for_rebind(plan)
+            else:
+                _validate_artifact_root_binding(plan.experiment, claim_fresh=False, rebind=True)
+            _check_published_phase_studies(
+                plan.experiment, {entry.phase_name: entry.study for entry in plan.entries}
+            )
+        except (
+            ArtifactRootConflictError,
+            PublishedStudyMissingError,
+            StudyStorageUnavailableError,
+        ) as exc:
+            raise ArtifactRootRebindError(str(exc)) from exc
+        if has_studies_to_rebind and plan.entries:
+            _validate_artifact_root_destination(plan.experiment, plan.entries)
+    if not has_studies_to_rebind:
         raise ArtifactRootRebindError(
             "No phase study in this storage is bound to an artifact root, and none holds a "
             "trial, so there is nothing to rebind or migrate; the next ordinary run binds "
             "these empty studies to the configured workdir. Nothing was written."
         )
-    for plan in plans:
-        if not plan.entries:
-            continue
-        _validate_artifact_root_binding_for_rebind(plan)
-        _validate_artifact_root_destination(plan.experiment, plan.entries)
     return plans
 
 
@@ -3338,6 +3394,8 @@ def _preflight_existing_studies(
         cannot be inferred; raised on the same terms.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
         be inspected; raised before any claim, reaping, or registry recovery.
+    :raises PublishedStudyMissingError: A reached phase has a published winner
+        but its persistent study is absent or empty.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
     :raises TrialTargetRegressionError: A phase's study already accepted a
@@ -3361,8 +3419,11 @@ def _preflight_existing_studies(
     # an unreadable ledger cannot prove its attempts are resolved.
     if preloaded_studies is None:
         try:
-            loaded = _load_and_check_artifact_roots(experiment)
-        except StudyStorageUnavailableError as exc:
+            loaded = _load_and_check_artifact_roots(experiment, from_phase=from_phase)
+        except (StudyStorageUnavailableError, PublishedStudyMissingError) as exc:
+            # This discovery also runs during post-execution reconciliation.
+            # A lost ledger then aborts recovery before the attempt registry
+            # can be inspected, so cleanup cannot be reported as confirmed.
             report.mark_uncertain(exc)
             raise
     else:

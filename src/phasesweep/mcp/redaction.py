@@ -268,6 +268,7 @@ def status_payload(
                 "target_already_satisfied": (terminal_trials_before_run >= target_terminal_trials),
                 "winner_present": phase["winner_present"],
                 "trial_data_available": phase["trial_data_available"],
+                "published_study_unavailable": phase.get("published_study_unavailable", False),
             }
         )
     return {

@@ -27,6 +27,7 @@ from phasesweep.engine import (
     ExperimentLockBusyError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
+    PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyStorageUnavailableError,
     TerminalReport,
@@ -37,6 +38,7 @@ from phasesweep.engine import (
 from phasesweep.engine.guards import _experiment_lock
 from phasesweep.engine.state import (
     Winner,
+    _experiment_dir,
     _generation_path,
     _generations_dir,
     _last_successful_generation_id,
@@ -370,6 +372,81 @@ def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None
     assert "restore write access" in failure["remediation"]
     assert "increase the affected phase's n_trials" in failure["remediation"]
     assert "new experiment name" in failure["remediation"]
+
+
+def test_missing_published_study_is_an_operator_preflight_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diagnosed absent ledger needs restoration, not process recovery."""
+    from phasesweep.mcp.redaction import status_payload
+    from phasesweep.mcp.server import GetRunStatusResult
+
+    monkeypatch.chdir(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    run_experiment(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    (_experiment_dir(experiment) / "study.db").unlink()
+
+    snapshot = mcp_runner.capture_result_snapshot(experiment)
+    assert snapshot["status"]["phases"][0]["published_study_unavailable"] is True
+    payload = status_payload(
+        experiment_id="t",
+        status=read_status(experiment),
+        run=None,
+        result_source="current_shared_study",
+        elapsed_seconds=None,
+    )
+    assert GetRunStatusResult.model_validate(payload).phases[0].published_study_unavailable
+
+    store = RunStore(tmp_path / "state")
+    run_id = "missing-published-study"
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id="t",
+    )
+    with pytest.raises(PublishedStudyMissingError):
+        runner_main(
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="t",
+                started_at=started_at,
+            ),
+            cwd=tmp_path,
+        )
+
+    status = json.loads(store.status_path(run_id).read_text())
+    assert status["failure"] == {
+        "code": "published_study_missing",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "Restore the original complete storage ledger and study, or use a new "
+            "experiment identity for a fresh run."
+        ),
+    }
+    assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
+    assert status["result_snapshot_state"] == "complete"
+    handle = store.get(run_id)
+    assert handle is not None
+    assert store.recovery_required(handle) is False
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert not (_experiment_dir(experiment) / "study.db").exists()
 
 
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
