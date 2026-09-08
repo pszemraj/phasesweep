@@ -1535,7 +1535,13 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     try:
         text = scaffold_catalog_text(output, from_configs)
-        if not _publish_staged_text(output, text, validate=Registry.load):
+
+        def validate_scaffold(staged: Path) -> None:
+            """Validate the staged catalog and identify its final origin."""
+            registry = Registry.load(staged)
+            private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
+
+        if not _publish_staged_text(output, text, validate=validate_scaffold):
             click.echo(
                 f"phasesweep mcp init-catalog: {output} already exists; refusing to "
                 "overwrite. Pass -o to choose another name.",

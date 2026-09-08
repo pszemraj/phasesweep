@@ -10,6 +10,14 @@ The server starts from a catalog: a fixed allowlist mapping opaque IDs to local 
 
 Catalog keys:
 
+`init-catalog` pins an absolute `state_dir` outside the project at
+`${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>/`. The digest
+is the first 12 hexadecimal characters of SHA-256 over the resolved catalog
+path. An owner-only `origin` file records that final catalog path. Each catalog
+gets a separate namespace, including catalogs in the same directory. The saved
+path stays fixed across server restarts and environment changes; existing
+catalogs retain their explicit paths.
+
 - `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. A catalog load that reaches state preparation creates missing directories with mode `0700`, validates existing directories without changing them, then probes each directory with a temporary file. Server startup, `mcp check`, `mcp init-catalog`, and MCP integration preflight for `mcp install` all load the catalog; even a dry run or a cancelled install can therefore create the private state layout. An unsafe existing mode fails with its observed owner/mode and a concrete `chmod 700 ...` remediation when ownership is already correct.
 - `max_concurrent_runs: int = 1` (minimum `1`): live-sweep cap across all catalog entries; see [concurrency and single-GPU hosts](#concurrency-and-single-gpu-hosts).
 - `experiments: list` (required; at least one item): allowlisted experiment entries. Entry IDs must be unique.

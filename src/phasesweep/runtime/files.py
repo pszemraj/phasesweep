@@ -130,6 +130,18 @@ def _fcntl_available() -> bool:
     return True
 
 
+def xdg_home(variable: str, fallback: Path) -> Path:
+    """Return an absolute XDG base, falling back for unset or relative values.
+
+    :param str variable: XDG environment variable name.
+    :param Path fallback: Default absolute base directory.
+    :return Path: Selected base without creating it.
+    """
+    value = os.environ.get(variable)
+    path = Path(value) if value else fallback
+    return path if path.is_absolute() else fallback
+
+
 def lock_dir() -> Path:
     """Return the validated same-host phasesweep lock directory.
 

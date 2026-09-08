@@ -1,13 +1,14 @@
 """Catalog scaffolding for ``phasesweep mcp init-catalog``.
 
 Builds an annotated MCP catalog from existing experiment
-configs: absolute ``state_dir`` next to the catalog, one read-only entry per
+configs: absolute ``state_dir`` outside the project, one read-only entry per
 config, ``visible_params: none``, and no ``allow`` block - side effects stay a
 deliberate operator edit. Operator-facing: rendered output contains real paths.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from phasesweep.mcp.errors import CatalogError
+from phasesweep.runtime.files import xdg_home
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -99,7 +101,10 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     #   from_phase: true
 """
         )
-    state_dir = catalog_dir / "runs" / ".mcp"
+    digest = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:12]
+    state_dir = (
+        xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep" / "mcp" / digest
+    )
     catalog_arg = shlex.quote(str(output.resolve()))
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the

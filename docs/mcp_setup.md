@@ -8,7 +8,7 @@ Requirements: Python 3.11+, the [MCP runtime platform requirements](runtime.md#p
 
 ### 1. Install the MCP extra
 
-Install PhaseSweep and its optional MCP dependency in the conda environment whose executable the client should use:
+Install PhaseSweep and its optional MCP dependency in the Python environment whose executable the client should use:
 
 ```bash
 pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
@@ -24,7 +24,7 @@ If you do not have an experiment yet, `phasesweep init` creates an installed-pac
 phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
-The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog). Before continuing, review:
+The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog) outside the project, under `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>/`. The catalog pins that absolute path, and the private state's `origin` file identifies the catalog. Before continuing, review:
 
 - every experiment description and config path;
 - `visible_params`, which controls sampled winner values visible to the agent;
