@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from phasesweep.mcp.errors import CatalogError
-from phasesweep.runtime.files import xdg_home
+from phasesweep.runtime.files import UnsafePrivatePathError, phasesweep_home, xdg_home
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -102,9 +102,13 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
 """
         )
     digest = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:12]
-    state_dir = (
-        xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep" / "mcp" / digest
-    )
+    try:
+        root = phasesweep_home()
+    except (OSError, UnsafePrivatePathError) as exc:
+        raise CatalogError(str(exc)) from exc
+    if root is None:
+        root = xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep"
+    state_dir = root / "mcp" / digest
     catalog_arg = shlex.quote(str(output.resolve()))
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the

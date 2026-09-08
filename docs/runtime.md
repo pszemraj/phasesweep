@@ -121,7 +121,7 @@ This recovery pass is deliberately not bounded by `timeout_seconds_per_run`: int
 
 PhaseSweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
 
-A run always takes same-host `flock`s. By default they live in the owner-only per-user directory `~/.cache/phasesweep/locks`:
+A run always takes same-host `flock`s. By default they live in the owner-only per-user directory `${XDG_CACHE_HOME:-~/.cache}/phasesweep/locks`:
 
 - Output lock: resolved `<workdir>/<experiment>/` path.
 - Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
@@ -134,7 +134,9 @@ The private default coordinates every PhaseSweep process running as the same use
 
 Upgrade note: older PhaseSweep builds used `/var/tmp/phasesweep-locks`. Those files are not consulted by the private default; use a validated explicit `PHASESWEEP_LOCK_DIR` during a staged upgrade if old and new processes must coordinate.
 
-The whole lock namespace is derived from the environment (`PHASESWEEP_LOCK_DIR`, else `$HOME`), so every orchestrator that must exclude the others has to resolve the *same* directory. An MCP server started under a launchd/systemd user unit or a confined client with a different `HOME` than the operator's shell splits every lock - experiment, storage, and GPU - between the two surfaces, and the two orchestrators will not see each other at all. When mixing launch surfaces on one host, set an explicit shared `PHASESWEEP_LOCK_DIR` for all of them.
+Lock directory precedence is `PHASESWEEP_LOCK_DIR`, then `PHASESWEEP_HOME/locks`, then `${XDG_CACHE_HOME:-~/.cache}/phasesweep/locks`. Empty overrides are unset; relative XDG values are ignored. `PHASESWEEP_HOME` must be an existing absolute directory owned by the current user with mode `0700`, without symlinked components. PhaseSweep creates private child directories but never provisions or changes that root. It also places newly scaffolded MCP state at `PHASESWEEP_HOME/mcp/<catalog-digest>/`; artifacts remain under `workdir`.
+
+Every cooperating orchestrator must resolve the same lock directory. Different `HOME`, XDG, or PhaseSweep overrides between a shell and an MCP service split experiment, storage, and GPU locks. Keep these settings consistent, and stop active runs before changing them. Small teams on one node keep separate private MCP state and use the administrator-provisioned `PHASESWEEP_LOCK_DIR` above for cross-user coordination. `PHASESWEEP_HOME` is a per-user placement override, not a shared state store.
 
 CUDA device tokens also take per-device host locks. The policies are:
 

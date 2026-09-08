@@ -150,6 +150,37 @@ def test_catalog_filenames_have_distinct_state(tmp_path: Path) -> None:
     assert states[0] != states[1]
 
 
+def test_home_override_pins_scaffold_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "private-root"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    state = Registry.load(output).state_dir
+    assert state.parent == root / "mcp"
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-but-unused")
+    assert Registry.load(output).state_dir == state
+    assert (state / "origin").read_text() == str(output.resolve()) + "\n"
+
+
+def test_scaffold_rejects_invalid_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative")
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 2
+    assert "PHASESWEEP_HOME must be an absolute path" in result.output
+    assert not output.exists()
+
+
 def test_scaffold_refuses_unsafe_state(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"

@@ -48,6 +48,7 @@ def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
     runtime_dir.mkdir(mode=0o700)
     runtime_dir.chmod(0o700)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
 
@@ -58,11 +59,63 @@ def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("xdg", [None, "", "relative", "absolute"])
+def test_lock_dir_uses_xdg_cache_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, xdg: str | None
+) -> None:
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    if xdg is None:
+        monkeypatch.delenv("XDG_CACHE_HOME")
+    else:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache") if xdg == "absolute" else xdg)
+    root = tmp_path / "cache" if xdg == "absolute" else tmp_path / "home" / ".cache"
+    path = runtime_files.lock_dir()
+    assert path == root / "phasesweep" / "locks"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("invalid", ["relative", "missing", "mode", "symlink"])
+def test_home_override_requires_private_provisioned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    root = tmp_path / "root"
+    if invalid in {"mode", "symlink"}:
+        root.mkdir(mode=0o700)
+    if invalid == "mode":
+        root.chmod(0o755)
+    elif invalid == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(root, target_is_directory=True)
+        root = link
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative" if invalid == "relative" else str(root))
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR")
+    with pytest.raises(runtime_files.UnsafeLockPathError):
+        runtime_files.lock_dir()
+    assert not (root / "locks").exists()
+    if invalid == "mode":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
+def test_private_home_override_selects_lock_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "private-root"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR")
+    assert runtime_files.lock_dir() == root / "locks"
+    monkeypatch.setenv("PHASESWEEP_HOME", "")
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "")
+    assert runtime_files.lock_dir() == tmp_path / "cache-home" / "phasesweep" / "locks"
+
+
 def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     override = tmp_path / "scheduler-shared-locks"
     override.mkdir(mode=0o700)
     override.chmod(0o700)
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-but-unused")
 
     path = runtime_files.lock_dir()
 
@@ -179,6 +232,7 @@ def test_default_lock_dir_rejects_symlink_without_chmodding_target(
     target.chmod(0o755)
     (namespace / "locks").symlink_to(target, target_is_directory=True)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe"):

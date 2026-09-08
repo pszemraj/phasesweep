@@ -146,6 +146,7 @@ def isolate_phasesweep_homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     """Keep scaffold state and default caches inside test-owned directories."""
     monkeypatch.delenv("PHASESWEEP_HOME", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache-home"))
 
 
 @pytest.fixture(autouse=True)

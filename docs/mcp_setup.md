@@ -31,7 +31,7 @@ The command writes `catalog.yaml` with side effects disabled and winner values r
 - `allow.launch`, `allow.cancel`, and `allow.from_phase`;
 - the catalog state directory and each experiment working directory.
 
-Add another `--from` for each experiment. Use `-o` to choose another catalog filename. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
+Add another `--from` for each experiment. Use `-o` to choose another catalog filename. For per-user scratch placement, provision an absolute owner-only `0700` directory and set `PHASESWEEP_HOME` before scaffolding: new MCP state goes under its `mcp/` directory and default locks under `locks/`. Keep that environment consistent for the CLI and MCP server; an existing catalog keeps its saved `state_dir`. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
 
 ### 3. Connect a client
 

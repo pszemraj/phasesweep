@@ -142,10 +142,32 @@ def xdg_home(variable: str, fallback: Path) -> Path:
     return path if path.is_absolute() else fallback
 
 
+def phasesweep_home() -> Path | None:
+    """Return the validated private root override without creating it.
+
+    :return Path | None: Operator-provisioned root, or None when unset.
+    :raises UnsafePrivatePathError: The override is relative, missing, or unsafe.
+    """
+    override = os.environ.get("PHASESWEEP_HOME")
+    if not override:
+        return None
+    path = Path(override)
+    if not path.is_absolute():
+        raise UnsafePrivatePathError(f"PHASESWEEP_HOME must be an absolute path: {path}")
+    try:
+        validate_private_dir(path)
+    except FileNotFoundError as exc:
+        raise UnsafePrivatePathError(
+            f"PHASESWEEP_HOME {path} does not exist; provision an owner-only 0700 directory first."
+        ) from exc
+    return path
+
+
 def lock_dir() -> Path:
     """Return the validated same-host phasesweep lock directory.
 
-    The default is private to the current user. ``PHASESWEEP_LOCK_DIR`` selects
+    The default is under ``PHASESWEEP_HOME`` or the user's XDG cache home,
+    private to the current user. ``PHASESWEEP_LOCK_DIR`` selects
     an existing operator-provisioned directory and is never created or chmodded
     by phasesweep.
 
@@ -163,11 +185,14 @@ def lock_dir() -> Path:
         _lock_policy(path)
         return path
 
-    path = Path.home() / ".cache" / "phasesweep" / "locks"
     try:
+        root = phasesweep_home()
+        if root is None:
+            root = xdg_home("XDG_CACHE_HOME", Path.home() / ".cache") / "phasesweep"
+        path = root / "locks"
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
-        raise UnsafeLockPathError(f"Default lock directory {path} is unsafe.") from exc
+        raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
     return path
 
 
