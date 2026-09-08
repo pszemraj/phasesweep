@@ -8,7 +8,11 @@ Field types, defaults, accepted values, and validation constraints are listed in
 
 The top level of a single experiment describes identity, storage, the trainer boundary, the objective, and the ordered phase plan. `experiment` is used in study names, output paths, and same-host lock identity, not only for display.
 
-`storage` holds Optuna study state. Use in-memory storage for disposable runs, SQLite for sequential persistent runs, Journal storage for same-host parallel work, or an external RDB under the explicit single-host contract. `workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root; use the [workdir rebind procedure](runtime.md#fingerprints-and-resume) after moving a tree. The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
+`storage` holds Optuna study state. Use in-memory storage for disposable runs, SQLite for sequential persistent runs, Journal storage for same-host parallel work, or an external RDB under the explicit single-host contract.
+
+`storage: auto` keeps that state with the experiment artifacts: it selects `<workdir>/<experiment>/study.db` for sequential phases or `study.journal` when any phase has `n_jobs > 1`, and resolves the required absolute URL. Auto storage requires nonempty `provenance` and the [persistent-storage sampler contract](#sampler-capability-on-persistent-storage); explicit URLs retain their current behavior, and omitted storage remains in-memory. Changing `n_jobs` so that auto storage selects a different backend cannot resume the existing artifact tree.
+
+`workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root. If you move a complete auto-storage tree, follow the [relocation instructions](runtime.md#output-layout). The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
 
 `trainer_config` is the trainer's ordinary base configuration, embedded directly in the PhaseSweep file. In the default `yaml_file` mode, PhaseSweep copies it for each trial, applies inherited, contract, fixed, and sampled dotted-path values, writes `<trial_dir>/trainer_config.yaml`, and exposes its shell-quoted path as `{config_path}`. Changing this mapping changes the experiment and phase fingerprints.
 
@@ -47,13 +51,6 @@ Each phase declares a search space and trial-attempt budget, with optional fixed
 Use categorical parameters for explicit choices and integer or float parameters for ranges. Categorical choices must remain distinct after both Optuna persistence and the selected trainer serialization; for example, equal Python values collapse in Optuna, while some CLI boundaries render a number and the same numeric string identically. Grid sampling is useful when every finite combination should run; CMA-ES is useful for interacting numeric dimensions. The [config reference](config_reference.yaml) defines the exact equality, wire-format, bounds, completeness, sampler, and seed-search rules.
 
 ## Sampler capability on persistent storage
-
-Use `storage: auto` to keep the database with the experiment artifacts. It selects
-`<workdir>/<experiment>/study.db` for sequential phases, or `study.journal` when
-any phase has `n_jobs > 1`, and handles the absolute URL spelling. Auto storage
-requires nonempty `provenance` and the sampler contract below. Explicit URLs
-retain their current behavior; omitted storage remains in-memory. A backend
-change caused by editing `n_jobs` cannot resume the existing artifact tree.
 
 The `sampler` block is optional and defaults to `type: tpe` with no seed, which is fine for an in-memory run. A persistent `storage` changes that, because the study outlives the process that created it, so each phase must state two things up front rather than discover them mid-sweep:
 

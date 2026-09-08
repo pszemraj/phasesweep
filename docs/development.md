@@ -5,12 +5,10 @@
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-conda create -n phasesweep-dev python=3.11 pip
-conda activate phasesweep-dev
-pip install -e ".[dev,wandb]"
+python -m pip install -e ".[dev,wandb]"
 ```
 
-The `mcp` SDK is included in the development extra. Use another conda environment name if desired; all Python-dependent commands must run in the activated environment.
+The `mcp` SDK is included in the development extra. Run Python-dependent commands in the environment where you installed the project.
 
 ## Quality gates
 

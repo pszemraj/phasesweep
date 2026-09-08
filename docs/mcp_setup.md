@@ -11,7 +11,7 @@ Requirements: Python 3.11+, the [MCP runtime platform requirements](runtime.md#p
 Install PhaseSweep and its optional MCP dependency in the Python environment whose executable the client should use:
 
 ```bash
-pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 Reinstalling the same Git ref later may require adding `--force-reinstall` to the command above or selecting a changed ref. Contributor and editable-install setup is in [development](development.md).
@@ -116,12 +116,12 @@ phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 
 This uses the server's startup validation and, only after every catalog entry passes, provisions and probes the private state layout. It launches no sweep.
 
-After replacing or recreating the conda environment, rerun `phasesweep mcp install` from the intended environment and restart each selected client so its absolute executable path and instructions are refreshed.
+After replacing or recreating the Python environment, rerun `phasesweep mcp install` from that environment and restart each selected client so its absolute executable path and instructions are refreshed.
 
 ## Troubleshooting
 
-- `MCP support is not installed`: activate the intended conda environment, run the install command from step 1, then retry.
-- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`. If its static launcher/catalog checks pass, activate the environment named by the absolute command, run `python -c 'import mcp, phasesweep.mcp.server'`, then run `phasesweep mcp check --catalog PATH`; repair the environment or rerun the installer if either check fails, then restart the client.
+- `MCP support is not installed`: install the MCP extra in the intended Python environment, then retry.
+- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`. If its static launcher/catalog checks pass, use the Python environment that provides the absolute command to run `python -c 'import mcp, phasesweep.mcp.server'`, then run `phasesweep mcp check --catalog PATH`; repair the environment or rerun the installer if either check fails, then restart the client.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the corresponding catalog flag only if that is the authority you intend, then restart the MCP client.
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
@@ -134,7 +134,7 @@ For a manual stdio entry, use the absolute values printed by `which phasesweep-m
 
 ```json
 {
-  "command": "/absolute/path/to/conda/env/bin/phasesweep-mcp",
+  "command": "/absolute/path/to/phasesweep-mcp",
   "args": ["--catalog", "/absolute/path/to/catalog.yaml"]
 }
 ```
