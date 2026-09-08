@@ -8,6 +8,11 @@ MCP operations that validate a catalog, start the server, install an MCP client 
 
 ## Output layout
 
+When a real run creates its `workdir`, PhaseSweep adds a `.gitignore` containing
+`*` inside it. Existing workdirs and ignore files are left untouched; the
+repository's own `.gitignore` is never edited. Validation, status, and engine
+dry runs do not create the workdir.
+
 The bundled [toy experiment](../examples/experiment.yaml) writes one namespace per experiment:
 
 ```text

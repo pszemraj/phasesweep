@@ -93,7 +93,7 @@ from phasesweep.engine.state import (
     _write_yaml_exclusive,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.runtime.files import file_sha256, require_posix_runtime
+from phasesweep.runtime.files import ensure_workdir, file_sha256, require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
     absorb_shutdown_signals,
@@ -406,6 +406,7 @@ def _run_experiment_outcome(
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
+    ensure_workdir(_experiment_dir(experiment).parent)
     _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     # signal_handler_scope() is the outermost context manager so shutdown-signal
     # ownership is scoped to this call tree and restored on every exit path,
@@ -1619,6 +1620,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         return results
 
     require_posix_runtime()
+    ensure_workdir(Path(suite.defaults.workdir).expanduser().resolve())
     _suite_dir(suite).mkdir(parents=True, exist_ok=True)
     # See _run_experiment_outcome: signal_handler_scope() is the outermost
     # context manager here too, so a suite installs shutdown handlers once for
