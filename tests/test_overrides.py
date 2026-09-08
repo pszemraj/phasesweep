@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime
 import shlex
 from pathlib import Path
@@ -62,7 +63,19 @@ def test_hydra_rejects_non_finite_values(value: float) -> None:
 
 def test_argparse():
     s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
-    assert s == "--lr 0.0003 --weight_decay 0.05"
+    assert s == "--lr=0.0003 --weight_decay=0.05"
+
+
+@pytest.mark.parametrize("tag", ["--other-option", "-x", "two words", "a=b", "", "$(echo hi)"])
+def test_argparse_round_trips_option_like_values(tag):
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--offset", type=float)
+    parser.add_argument("--tag")
+
+    parsed = parser.parse_args(shlex.split(format_argparse({"offset": -1e-5, "tag": tag})))
+
+    assert parsed.offset == -1e-5
+    assert parsed.tag == tag
 
 
 def test_argparse_renders_the_documented_wire_forms():
@@ -79,18 +92,12 @@ def test_argparse_renders_the_documented_wire_forms():
     )
 
     assert shlex.split(s) == [
-        "--none",
-        "None",
-        "--flag",
-        "true",
-        "--n",
-        "3",
-        "--ratio",
-        "2.5",
-        "--tag",
-        "s",
-        "--items",
-        "[1,a,false]",
+        "--none=None",
+        "--flag=true",
+        "--n=3",
+        "--ratio=2.5",
+        "--tag=s",
+        "--items=[1,a,false]",
     ]
 
 

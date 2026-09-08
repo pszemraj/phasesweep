@@ -310,8 +310,7 @@ def _extract_log_regex(
         The selected numeric value across all matches.
 
     Raises:
-        ExtractorError: Log file missing, invalid regex, missing ``value``
-            group, or no lines matched.
+        ExtractorError: Log file missing or unreadable, or no numeric matches.
 
     """
     import re
@@ -320,13 +319,7 @@ def _extract_log_regex(
     if not target.is_file():
         raise ExtractorError(f"Log file not found: {target}")
 
-    try:
-        pattern = re.compile(cfg.pattern)
-    except re.error as exc:
-        raise ExtractorError(f"Invalid regex {cfg.pattern!r}: {exc}") from exc
-
-    if "value" not in pattern.groupindex:
-        raise ExtractorError(f"Regex {cfg.pattern!r} must contain a named group 'value'.")
+    pattern = re.compile(cfg.pattern)
 
     # Stream line-by-line to avoid 500 MB RSS on large training logs. Binary
     # iteration feeds the evidence digest with the exact on-disk bytes; regex

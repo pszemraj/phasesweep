@@ -7,6 +7,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+import sqlalchemy
 import yaml
 
 import phasesweep.engine.optuna as engine_optuna
@@ -161,6 +162,83 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
 
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
+
+
+@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "empty-study"])
+def test_external_status_does_not_initialize_or_change_schema(
+    tmp_path, monkeypatch, database_state
+):
+    storage = f"sqlite:///{tmp_path / 'status.db'}"
+    if database_state != "uninitialized":
+        optuna.create_study(
+            study_name="read_t::p" if database_state == "empty-study" else "unrelated",
+            storage=storage,
+        )
+    engine = sqlalchemy.create_engine(storage)
+    before = sqlalchemy.inspect(engine).get_table_names()
+    writes = []
+
+    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
+    def observe_sql(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
+            writes.append(statement)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
+    experiment = _experiment(tmp_path).model_copy(
+        update={
+            "storage": "postgresql://localhost/status_placeholder",
+            "allow_external_rdb_single_host": True,
+        }
+    )
+
+    phase = read_status(experiment)["phases"][0]
+
+    assert phase["trials"] == {}
+    assert phase["trial_data_available"] is (database_state == "empty-study")
+    assert sqlalchemy.inspect(engine).get_table_names() == before
+    assert writes == []
+    engine.dispose()
+
+
+def test_external_status_reads_counts_and_running_identities_in_one_statement(
+    tmp_path, monkeypatch
+):
+    storage = f"sqlite:///{tmp_path / 'status.db'}"
+    study = optuna.create_study(study_name="read_t::p", storage=storage)
+    completed = study.ask()
+    completed.set_user_attr("phasesweep_generation_id", "gen-1")
+    study.tell(completed, 0.5)
+    running = study.ask()
+    running.set_user_attr("phasesweep_generation_id", "gen-1")
+    running.set_user_attr("phasesweep_attempt_id", "attempt-1")
+    study.ask()
+    engine = sqlalchemy.create_engine(storage)
+    statements = []
+
+    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
+    def observe_sql(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
+    experiment = _experiment(tmp_path).model_copy(
+        update={
+            "storage": "postgresql://localhost/status_placeholder",
+            "allow_external_rdb_single_host": True,
+        }
+    )
+
+    stats = engine_optuna._phase_trial_stats(experiment, experiment.phases[0])
+
+    assert stats.available
+    assert stats.counts == {"COMPLETE": 1, "RUNNING": 2}
+    assert stats.generation_counts == {"gen-1": {"COMPLETE": 1, "RUNNING": 1}}
+    assert sorted(stats.running_attempts, key=lambda ref: ref.trial_number) == [
+        engine_optuna._RunningTrialRef(1, "gen-1", "attempt-1"),
+        engine_optuna._RunningTrialRef(2, None, None),
+    ]
+    assert len(statements) == 1
+    assert statements[0].lstrip().startswith("WITH")
+    engine.dispose()
 
 
 def test_read_status_uses_one_sqlite_snapshot_per_phase(

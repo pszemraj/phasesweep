@@ -7,11 +7,13 @@ import json
 import logging
 import sqlite3
 import warnings
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never
 
 import optuna
+import sqlalchemy
 from optuna.exceptions import ExperimentalWarning
 
 from phasesweep.config import (
@@ -367,6 +369,39 @@ def _decoded_string_attr(value_json: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+_PHASE_TRIAL_STATS_SQL = """
+    WITH phase_trials AS (
+        SELECT trials.number,
+               trials.state,
+               generation.value_json AS generation_json,
+               attempt.value_json AS attempt_json
+        FROM trials
+        JOIN studies ON trials.study_id = studies.study_id
+        LEFT JOIN trial_user_attributes AS generation
+          ON trials.trial_id = generation.trial_id AND generation.key = :generation_key
+        LEFT JOIN trial_user_attributes AS attempt
+          ON trials.trial_id = attempt.trial_id AND attempt.key = :attempt_key
+        WHERE studies.study_name = :study_name
+    )
+    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
+    FROM phase_trials
+    GROUP BY state, generation_json
+    UNION ALL
+    SELECT 'running', number, state, generation_json, attempt_json, 1
+    FROM phase_trials
+    WHERE state = 'RUNNING'
+"""
+
+
+def _phase_trial_stats_params(experiment: Experiment, phase: Phase) -> dict[str, str]:
+    """Bind the phase and attribute names for the observational SQL query."""
+    return {
+        "generation_key": GENERATION_ID_ATTR,
+        "attempt_key": ATTEMPT_ID_ATTR,
+        "study_name": _phase_study_name(experiment, phase),
+    }
+
+
 def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
     """Return trial-state counts and RUNNING identities in one SQLite read.
 
@@ -397,38 +432,57 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
-                """
-                WITH phase_trials AS (
-                    SELECT trials.number,
-                           trials.state,
-                           generation.value_json AS generation_json,
-                           attempt.value_json AS attempt_json
-                    FROM trials
-                    JOIN studies ON trials.study_id = studies.study_id
-                    LEFT JOIN trial_user_attributes AS generation
-                      ON trials.trial_id = generation.trial_id AND generation.key = ?
-                    LEFT JOIN trial_user_attributes AS attempt
-                      ON trials.trial_id = attempt.trial_id AND attempt.key = ?
-                    WHERE studies.study_name = ?
-                )
-                SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
-                FROM phase_trials
-                GROUP BY state, generation_json
-                UNION ALL
-                SELECT 'running', number, state, generation_json, attempt_json, 1
-                FROM phase_trials
-                WHERE state = 'RUNNING'
-                """,
-                (
-                    GENERATION_ID_ATTR,
-                    ATTEMPT_ID_ATTR,
-                    _phase_study_name(experiment, phase),
-                ),
+                _PHASE_TRIAL_STATS_SQL,
+                _phase_trial_stats_params(experiment, phase),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
         return _PhaseTrialStats({}, False, {}, None)
+    return _trial_stats_from_rows(rows, study_name=_phase_study_name(experiment, phase))
+
+
+def _rdb_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+    """Inspect external SQL storage without Optuna's schema-initializing loader.
+
+    :param Experiment experiment: Config containing the external storage URL.
+    :param Phase phase: Phase whose trial counts and running identities are read.
+    :return _PhaseTrialStats: One snapshot, or an unavailable observation on read failure.
+    """
+    assert experiment.resolved_storage is not None
+    try:
+        engine = sqlalchemy.create_engine(experiment.resolved_storage)
+        try:
+            with engine.connect() as connection:
+                # A marker distinguishes an empty study from an absent one,
+                # within the same statement as the counts and identities.
+                rows = connection.execute(
+                    sqlalchemy.text(
+                        _PHASE_TRIAL_STATS_SQL
+                        + """
+                        UNION ALL
+                        SELECT 'study', NULL, NULL, NULL, NULL, 0
+                        FROM studies WHERE study_name = :study_name
+                        """
+                    ),
+                    _phase_trial_stats_params(experiment, phase),
+                ).fetchall()
+        finally:
+            engine.dispose()
+    except Exception:  # noqa: BLE001 - status reports unavailable on any connection/read failure
+        return _PhaseTrialStats({}, False, {}, None)
+    if not rows:
+        return _PhaseTrialStats({}, False, {}, None)
+    return _trial_stats_from_rows(rows, study_name=_phase_study_name(experiment, phase))
+
+
+def _trial_stats_from_rows(rows: Iterable[Sequence[Any]], *, study_name: str) -> _PhaseTrialStats:
+    """Decode aggregated counts and RUNNING identities from a SQL snapshot.
+
+    :param Iterable[Sequence[Any]] rows: Rows from the observational SQL query.
+    :param str study_name: Study name used in damaged-row diagnostics.
+    :return _PhaseTrialStats: Counts and running identities from the supplied rows.
+    """
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_RunningTrialRef] = []
@@ -452,7 +506,7 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
             log.warning(
                 "study %s has a RUNNING trial with no trial number; "
                 "omitting it from the reported running attempts",
-                _phase_study_name(experiment, phase),
+                study_name,
             )
             continue
         running_attempts.append(
@@ -468,9 +522,8 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
 def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
     """Read counts and RUNNING identities without creating a missing study.
 
-    Both facts come from the one trial list this function already loads, so a
-    caller never has to reread the study to learn which rows the RUNNING count
-    refers to (PR #5 review / reviewer 2, blocker 6).
+    SQL backends use one SELECT statement; journal storage uses one trial list.
+    Counts and RUNNING identities therefore describe the same snapshot.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
@@ -481,6 +534,8 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
     backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase)
+    if backend != "journal":
+        return _rdb_phase_trial_stats(experiment, phase)
     if (
         backend == "journal"
         and not Path(file_url_path(experiment.resolved_storage)).expanduser().exists()

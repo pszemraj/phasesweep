@@ -98,7 +98,7 @@ The default `yaml_file` mode materializes one complete `<trial_dir>/trainer_conf
 | Format | Use when |
 | --- | --- |
 | `yaml_file` | Default and primary: the trainer accepts one complete YAML config. |
-| `argparse` | Compatibility with a trainer that already accepts `--key value` tokens. |
+| `argparse` | Compatibility with a trainer that accepts flags; emits `--key=value` so negative numbers and option-like strings remain values. |
 | `json_file` | Compatibility with a trainer that already accepts an overrides-only JSON object. |
 | `hydra` | Compatibility with an existing Hydra/OmegaConf entry point. |
 

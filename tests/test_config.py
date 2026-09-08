@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment
@@ -17,7 +18,7 @@ from phasesweep.config import (
     Sampler,
     Suite,
 )
-from tests.conftest import assert_invalid_experiment_yaml, write_yaml
+from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
 
 @pytest.mark.parametrize(
@@ -103,6 +104,32 @@ def test_invalid_experiment_relationships(
 def test_phase_name_validation(name: str) -> None:
     with pytest.raises(ValidationError):
         Phase(name=name, n_trials=1, search_space={})
+
+
+@pytest.mark.parametrize(
+    ("pattern", "match"),
+    [("(", "Invalid metric regex"), (r"loss=(?P<loss>\S+)", "requires a named")],
+)
+def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, pattern, match):
+    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
+    payload["metric"]["extractor"] = {"type": "log_regex", "pattern": pattern}
+    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+
+    with pytest.raises(ValueError, match=match):
+        load_experiment(path)
+
+    assert not (tmp_path / "work").exists()
+
+
+def test_config_rejects_reserved_phase_name_before_creating_workdir(tmp_path):
+    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
+    payload["phases"][0]["name"] = "attempts"
+    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+
+    with pytest.raises(ValueError, match="reserved for the runtime recovery registry"):
+        load_experiment(path)
+
+    assert not (tmp_path / "work").exists()
 
 
 @pytest.mark.parametrize(

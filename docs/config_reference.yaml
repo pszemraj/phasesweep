@@ -46,7 +46,7 @@
 
 # override_format: Literal["yaml_file", "argparse", "json_file", "hydra"] = "yaml_file"
 # `yaml_file` is the core, default, and `phasesweep init` workflow. It requires `{config_path}` and uses trainer_config as described above; it never emits per-key CLI tokens and does not require Hydra.
-# `argparse` is explicit compatibility for an existing flag parser. It requires `{overrides}` and emits `--key value`; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load because only that set has one canonical wire form.
+# `argparse` is explicit compatibility for an existing flag parser. It requires `{overrides}` and emits shell-quoted `--key=value` tokens so negative scientific notation and option-like strings remain values; booleans are lowercase, null is `None`, and lists are bracketed (`[1,a,false]`). Values must be null, booleans, integers, finite floats, strings, or lists of those; mappings and other YAML-native types (dates, datetimes, `.nan`/`.inf`) are rejected at config load because only that set has one canonical wire form.
 # `json_file` is explicit overrides-only compatibility. It requires `{overrides_path}`, preserves JSON types, and expands dotted keys into `<trial_dir>/overrides.json`; it does not include trainer_config. Validation and dry-run do not write that file, but config loading runs every statically known contract and phase fixed value through the exact strict serializer used at launch. Values sampled from the closed parameter types are JSON-safe by construction.
 # `hydra` is compatibility support for an existing Hydra/OmegaConf entry point; PhaseSweep does not depend on Hydra or perform its config composition. It requires `{overrides}` and emits `key=value`; it accepts the same null/boolean/integer/finite-float/string/list value grammar as argparse and rejects mappings, YAML-native dates/datetimes, and `.nan`/`.inf` during config load.
 # Contract and phase fixed_overrides are validated at config load against the selected format's value grammar; yaml_file uses the portable trainer_config domain above.
@@ -84,7 +84,7 @@
 # Phase fingerprints exclude these run-control fields: comment, n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation, max_consecutive_failures, allow_unbounded_trials, timeout_seconds_per_phase, allow_incomplete_on_timeout, allow_partial_grid, allow_seed_search, and sampler.acknowledge_nonresumable. Their individual safety rules still apply; other phase fields are semantic unless stated otherwise.
 
 # name: str (required)
-# Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names.
+# Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names. `attempts` is reserved for the runtime recovery registry and rejected during validation.
 
 # comment: str | None = null
 # Design note shown by `validate` and `show-winners`. It has no trial-runtime effect and is excluded from phase fingerprints, but suite generations retain it in their historical plan identity.
@@ -242,7 +242,7 @@
 # file: str = "stdout.log"
 # stdout.log and stderr.log are captured automatically; another relative path may name a trainer-written log.
 # pattern: str (required)
-# Python regex with a named `(?P<value>...)` group. Invalid regex, a missing group, or no numeric match fails the trial.
+# Python regex with a named `(?P<value>...)` group. Invalid syntax or a missing group fails configuration validation before any trial is allocated. No numeric match in the trainer's output fails the trial.
 # select: Literal["last", "first", "min", "max"] = "last"
 # `first` stops matching at the first numeric match; every mode still reads the whole file so the frozen evidence digest covers all of it.
 
@@ -256,7 +256,7 @@
 # Key in wandb.run.summary; the value must be a finite number, not a string or boolean.
 # poll_seconds: float = 2.0 (> 0 and finite)
 # timeout_seconds: float = 120.0 (>= 1 and finite)
-# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial. W&B request deadlines use whole seconds, so an active request may finish less than one second after this polling budget expires.
+# Requires the optional W&B dependency. Polling queries the immutable WANDB_RUN_ID assigned to this attempt and accepts only `finished`; `failed`, `crashed`, or `killed` fails immediately, and absence through timeout fails the trial. The polling budget includes worker startup, SDK initialization, requests, and internal retries. Expiry terminates the polling worker's process group; cleanup may finish afterward. Responses received after the deadline are rejected.
 
 # GATE OBJECTS
 # A gate must use exactly one discriminator shape. All `path` and JSON `key` fields obey the Extractor path/key invariants above.

@@ -28,7 +28,7 @@ The final script builds a wheel in a temporary directory, asserts its packaged-d
 
 Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. There is currently no CI workflow, Makefile, or justfile wrapping these commands.
 
-The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads the local SQLite schema directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
+The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads SQL storage schemas directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
 
 ## Package map
 

@@ -162,6 +162,23 @@ class LogRegexExtractor(_TrialFilePathModel):
     )
     select: Literal["last", "first", "min", "max"] = "last"
 
+    @field_validator("pattern")
+    @classmethod
+    def _valid_pattern(cls, value: str) -> str:
+        """Require a compilable regex with the metric's named capture group.
+
+        :param str value: Configured Python regex.
+        :raises ValueError: The regex is invalid or lacks a named ``value`` group.
+        :return str: Validated pattern, unchanged.
+        """
+        try:
+            pattern = re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"Invalid metric regex: {exc}") from exc
+        if "value" not in pattern.groupindex:
+            raise ValueError("Metric regex requires a named (?P<value>...) group.")
+        return value
+
 
 class _WandbSummarySource(_Frozen):
     """Shared location and polling contract for one W&B run summary."""

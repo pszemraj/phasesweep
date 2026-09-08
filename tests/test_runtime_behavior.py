@@ -53,6 +53,7 @@ from phasesweep.engine.state import (
     PHASE_ABORT_ATTR,
     PHASE_DECISION_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
@@ -64,6 +65,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import (
     ExecutedTrial,
+    TrialExecutionError,
     extract_trial_result,
 )
 from phasesweep.evidence import TrialContext
@@ -929,6 +931,68 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
         run_experiment(experiment(4))
 
 
+def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):
+    """A scheduled worker entering after a peer abort still permits a later top-up."""
+    experiment = make_experiment(
+        workdir=tmp_path / "work",
+        storage=f"journal:///{tmp_path / 'study.journal'}",
+        n_trials=2,
+        n_jobs=2,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        max_consecutive_failures=1,
+    )
+    first_finished = threading.Event()
+    second_entered = threading.Event()
+    original_optimize = optuna.Study.optimize
+    launched = []
+
+    def optimize(study, objective, **kwargs):
+        def scheduled_objective(trial):
+            if trial.number == 0:
+                assert second_entered.wait(10)
+                try:
+                    return objective(trial)
+                finally:
+                    first_finished.set()
+            second_entered.set()
+            assert first_finished.wait(10)
+            return objective(trial)
+
+        original_optimize(study, scheduled_objective, **kwargs)
+
+    def failed_launch(**kwargs):
+        launched.append(kwargs["trial_id"])
+        raise TrialExecutionError("simulated trainer failure; no process launched")
+
+    monkeypatch.setattr("phasesweep.engine.phase.launch_trial", failed_launch)
+    with monkeypatch.context() as patch:
+        patch.setattr(optuna.Study, "optimize", optimize)
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+
+    study = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+    )
+    previous = study.trials
+    assert [trial.state.name for trial in previous] == ["FAIL", "PRUNED"]
+    for trial in previous:
+        assert trial.user_attrs[TRAINER_ENV_DIGEST_ATTR]
+        assert TRAINER_ENV_NAMES_ATTR in trial.user_attrs
+
+    updated = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}
+    )
+    # The supported retry must reach new work, without a schema/migration error.
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(updated)
+    assert launched == [0, 2]
+    assert len(study.trials) == 3
+    assert [trial.user_attrs for trial in study.trials[:2]] == [
+        trial.user_attrs for trial in previous
+    ]
+
+
 def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
     """Raising n_trials after an abort is the explicit resume path.
 
@@ -1323,6 +1387,8 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         return make_experiment(
             workdir=tmp_path / "runs",
             storage=f"sqlite:///{db}",
+            # This fixture must produce no metric, regardless of override rendering.
+            trial_command="true {overrides}",
             n_trials=n_trials,
             sampler={"type": "random", "seed": 7},
         )

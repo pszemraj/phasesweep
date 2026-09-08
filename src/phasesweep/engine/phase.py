@@ -779,14 +779,14 @@ def _run_phase(
         """
         assert generation_id is not None
 
-        if abort["flag"]:
-            raise optuna.TrialPruned("phase aborted")
-
         # Stamp the environment as the first durable fact of allocation. Even
-        # a failure while creating lifecycle/registry metadata must remain in
+        # a peer abort or failure creating lifecycle/registry metadata must remain in
         # the study's known semantic cohort on the next invocation.
         trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment_identity.digest)
         trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(environment_identity.names))
+
+        if abort["flag"]:
+            raise optuna.TrialPruned("phase aborted")
 
         sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
         overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)

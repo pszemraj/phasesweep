@@ -366,17 +366,20 @@ class Phase(_Frozen):
     @field_validator("name")
     @classmethod
     def _name_is_safe(cls, v: str) -> str:
-        """Reject empty names and any character outside ``[A-Za-z0-9_-]``.
+        """Reject unsafe names and the reserved recovery directory name.
 
         Args:
             v: The candidate phase name.
 
         Returns:
             The same name, unchanged. Raises ``ValueError`` if any character
-            is disallowed (the name is used as a filesystem path component).
+            is disallowed or the name is reserved for the recovery registry.
 
         """
-        return _validate_safe_name("Phase", v)
+        v = _validate_safe_name("Phase", v)
+        if v == "attempts":
+            raise ValueError("Phase name 'attempts' is reserved for the runtime recovery registry.")
+        return v
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Phase:

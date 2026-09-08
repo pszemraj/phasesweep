@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import textwrap
 import time
 import types
 from dataclasses import replace
+from tempfile import TemporaryDirectory
 
 import pytest
 from pydantic import ValidationError
@@ -21,6 +24,14 @@ from phasesweep.config import (
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import DeadlineExceededError, extractor_config_fingerprint
+from phasesweep.evidence.wandb import (
+    WandbPollTimeout,
+    WandbRunTerminalError,
+    WandbSetupError,
+    _poll_wandb_summary,
+    poll_wandb_summary,
+)
+from phasesweep.runtime.process import is_pid_alive
 from tests.conftest import make_trial_context
 
 
@@ -40,7 +51,8 @@ class _FakeApi:
 
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake ``wandb.apis.public.Api`` implementation."""
+    """Run polling-loop unit tests inline with a fake W&B API and controllable clock."""
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", _poll_wandb_summary)
 
     def install(run_for_path=None, *, api_class=None):  # noqa: ANN001, ANN202
         wandb_mod = types.ModuleType("wandb")
@@ -69,6 +81,163 @@ def fake_wandb(monkeypatch: pytest.MonkeyPatch):
         return timeouts
 
     return install
+
+
+@pytest.fixture
+def wandb_worker_sdk(tmp_path, monkeypatch):
+    """Put a fake SDK on the real polling worker's import path."""
+    root = tmp_path / "sdk"
+    apis = root / "wandb" / "apis"
+    apis.mkdir(parents=True)
+    (root / "wandb" / "__init__.py").write_text("", encoding="utf-8")
+    (apis / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.TemporaryDirectory",
+        lambda **kwargs: TemporaryDirectory(dir=tmp_path, **kwargs),
+    )
+
+    def install(source):
+        (apis / "public.py").write_text(textwrap.dedent(source), encoding="utf-8")
+
+    return install
+
+
+def test_wandb_worker_returns_summary(wandb_worker_sdk, tmp_path):
+    wandb_worker_sdk(
+        """
+        class Api:
+            def __init__(self, overrides=None, timeout=None):
+                assert overrides == {"base_url": "https://example.test"}
+                assert 0 < timeout <= 5
+
+            def run(self, path):
+                assert path == "entity/project/attempt"
+                class Run:
+                    state = "finished"
+                    summary = {"loss": 0.25, "extra": [1, "two"]}
+                return Run()
+        """
+    )
+
+    assert poll_wandb_summary(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+        required_keys=["loss"],
+    ) == {"loss": 0.25, "extra": [1, "two"]}
+    assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
+    wandb_worker_sdk, tmp_path, monkeypatch, stage
+):
+    marker = tmp_path / "pids.json"
+    monkeypatch.setenv("POLL_TEST_PIDS", str(marker))
+    monkeypatch.setenv("POLL_TEST_STAGE", stage)
+    wandb_worker_sdk(
+        """
+        import json, os, subprocess, sys, time
+        from pathlib import Path
+
+        def sdk_retries():
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            Path(os.environ["POLL_TEST_PIDS"]).write_text(json.dumps([os.getpid(), child.pid]))
+            retry_deadline = time.monotonic() + 30
+            while time.monotonic() < retry_deadline:
+                try:
+                    raise ConnectionError("transient transport failure")
+                except ConnectionError:
+                    time.sleep(0.05)
+
+        class Api:
+            def __init__(self, overrides=None, timeout=None):
+                if os.environ["POLL_TEST_STAGE"] == "constructor":
+                    sdk_retries()
+
+            def run(self, path):
+                sdk_retries()
+        """
+    )
+    started = time.monotonic()
+
+    with pytest.raises(WandbPollTimeout):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=1,
+        )
+
+    assert time.monotonic() - started < 3
+    pids = json.loads(marker.read_text(encoding="utf-8"))
+    assert all(not is_pid_alive(pid) for pid in pids)
+    assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "error", "match"),
+    [
+        ("raise ImportError('fake SDK missing')", ImportError, "fake SDK missing"),
+        (
+            "class Api:\n    def __init__(self, **kwargs):\n        raise ValueError('bad credentials')",
+            WandbSetupError,
+            "bad credentials",
+        ),
+        (
+            "class Api:\n    def __init__(self, **kwargs): pass\n"
+            "    def run(self, path):\n        return type('Run', (), {'state': 'crashed'})()",
+            WandbRunTerminalError,
+            "crashed",
+        ),
+    ],
+)
+def test_wandb_worker_preserves_typed_errors(wandb_worker_sdk, source, error, match):
+    wandb_worker_sdk(source)
+    with pytest.raises(error, match=match):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_poll_rejects_late_sdk_response(fake_wandb, monkeypatch, stage):
+    clock = {"now": 0.0}
+    lookups = []
+
+    class Api:
+        def __init__(self, **kwargs):
+            if stage == "constructor":
+                clock["now"] = 2.0
+
+        def run(self, path):
+            lookups.append(path)
+            clock["now"] = 2.0
+            return _FakeRun("finished", {"loss": 0.1})
+
+    fake_wandb(api_class=Api)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
+    with pytest.raises(WandbPollTimeout):
+        _poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=1,
+        )
+    assert lookups == ([] if stage == "constructor" else ["e/p/attempt"])
 
 
 def _assert_log_regex_provenance(
@@ -314,24 +483,11 @@ def test_log_regex_selects_last_or_min_value(tmp_path):
         assert run_extractor(make_trial_context(case_dir), cfg) == expected
 
 
-def test_log_regex_reports_invalid_patterns_or_no_matches(tmp_path):
-    cases = [
-        ("no_value_group", "eval_loss=1.0\n", r"eval_loss=([0-9.]+)", "named group 'value'"),
-        ("no_match", "nothing here\n", r"eval_loss=(?P<value>[0-9.]+)", "No matches"),
-    ]
-
-    for case, text, pattern, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / "stdout.log").write_text(text)
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=pattern,
-            select="last",
-        )
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+def test_log_regex_reports_no_matches(tmp_path):
+    (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")
+    with pytest.raises(ExtractorError, match="No matches"):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
