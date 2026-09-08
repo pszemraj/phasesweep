@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import sys
 import textwrap
 import time
 import types
 from dataclasses import replace
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
@@ -34,6 +36,7 @@ from phasesweep.evidence.wandb import (
 )
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
+    ProcessResult,
     is_pid_alive,
     read_attempt_lifecycle,
     read_stale_process_identity,
@@ -170,17 +173,28 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
                     time.sleep(0.05)
 
         class Api:
+            calls = 0
+
             def __init__(self, overrides=None, timeout=None):
                 if os.environ["POLL_TEST_STAGE"] == "constructor":
-                    sdk_retries()
+                    Api.calls += 1
+                    if Api.calls == 2:
+                        raise ConnectionError("transient W&B API error before blocked retry")
+                    if Api.calls > 2:
+                        sdk_retries()
 
             def run(self, path):
-                sdk_retries()
+                if os.environ["POLL_TEST_STAGE"] == "lookup":
+                    Api.calls += 1
+                    if Api.calls == 1:
+                        raise ConnectionError("transient W&B API error before blocked retry")
+                    sdk_retries()
+                return type("Run", (), {"state": "running"})()
         """
     )
     started = time.monotonic()
 
-    with pytest.raises(WandbPollTimeout):
+    with pytest.raises(WandbPollTimeout) as excinfo:
         poll_wandb_summary(
             base_url="https://example.test",
             entity="e",
@@ -191,12 +205,50 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
             timeout_seconds=1,
         )
 
+    assert str(excinfo.value.last_error) == "transient W&B API error before blocked retry"
     assert time.monotonic() - started < 3
     pids = json.loads(marker.read_text(encoding="utf-8"))
     assert all(not is_pid_alive(pid) for pid in pids)
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
     assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+
+
+@pytest.mark.parametrize(
+    ("response_text", "expected_diagnostic"),
+    [
+        (
+            json.dumps({"status": "timeout", "cause": "serialized worker timeout cause"}),
+            "serialized worker timeout cause",
+        ),
+        (
+            '{"status":"timeout","cause":"partial worker timeout cause',
+            '{"status":"timeout","cause":"partial worker timeout cause',
+        ),
+    ],
+)
+def test_wandb_worker_timeout_preserves_response_diagnostic(
+    monkeypatch, response_text, expected_diagnostic, tmp_path
+):
+    def timeout_worker(command, **kwargs):
+        kwargs["stderr"].write("stderr fallback diagnostic\n")
+        kwargs["stderr"].flush()
+        Path(shlex.split(command)[-1]).write_text(response_text, encoding="utf-8")
+        return ProcessResult(return_code=-15, timed_out=True, pid=123, duration_seconds=0.1)
+
+    monkeypatch.setattr("phasesweep.runtime.process.run_supervised", timeout_worker)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="project",
+        metric_key="eval/loss",
+        timeout_seconds=5,
+    )
+
+    with pytest.raises(ExtractorError) as excinfo:
+        run_extractor(make_trial_context(tmp_path), cfg)
+
+    assert f"Last error: {expected_diagnostic}" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -759,11 +811,15 @@ def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
-def test_wandb_timeouts_require_whole_second_transport_budget(model):
-    """Both wandb extractor models share one pydantic ``ge=1.0`` constraint on
-    ``timeout_seconds``; any sub-1.0 value hits the same validation branch, so a
-    single boundary-adjacent value (0.999) pins it without repeating instances.
+def test_wandb_timeouts_share_minimum_and_document_startup_budget(model):
+    """Both W&B models share their minimum and public startup-budget guidance.
+
+    A single boundary-adjacent value (0.999) pins the shared ``ge=1.0`` validation
+    without repeating instances.
     """
+    description = model.model_json_schema()["properties"]["timeout_seconds"]["description"]
+    assert "Worker startup and W&B SDK initialization" in description
+    assert "Short budgets can expire before the first poll" in description
     common = {
         "type": "wandb" if model is WandbExtractor else "wandb_summary_required",
         "entity": "me",

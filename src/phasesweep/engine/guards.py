@@ -1945,6 +1945,40 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
     }
 
 
+def _auto_storage_backend_conflict(experiment: Experiment, raw: Any) -> str | None:
+    """Explain when parallelism selects the other auto-storage ledger.
+
+    :param Experiment experiment: Config whose selected backend is being checked.
+    :param Any raw: Recorded artifact-root binding.
+    :return str | None: Actionable diagnostic for a backend change, otherwise ``None``.
+    """
+    if experiment.storage != "auto" or not isinstance(raw, dict):
+        return None
+    recorded_root = raw.get("artifact_root")
+    if (
+        raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+        or raw.get("experiment") != experiment.experiment
+        or not isinstance(recorded_root, str)
+        or not Path(recorded_root).is_absolute()
+    ):
+        return None
+    parallel = any(phase.n_jobs > 1 for phase in experiment.phases)
+    backend, previous = ("sqlite", "study.db") if parallel else ("journal", "study.journal")
+    selected = "study.journal" if parallel else "study.db"
+    # Reconstruct lexically: a moved tree's previous root may no longer exist.
+    identity = f"{backend}:///{Path(recorded_root) / previous}"
+    if raw.get("storage_key") != hashlib.sha256(identity.encode("utf-8")).hexdigest():
+        return None
+    return (
+        f"Artifact root {_artifact_root_identity(experiment)!r} is bound to {previous}, "
+        f"but storage: auto now selects {selected} because n_jobs changed between "
+        "sequential and parallel execution. Restore the previous n_jobs setting to "
+        "continue this tree, or use a new experiment name or workdir for the new backend. "
+        "'phasesweep rebind-workdir' does not convert study.db and study.journal. "
+        "No trial ran and nothing was published."
+    )
+
+
 def _root_durable_state_entry(experiment: Experiment) -> str | None:
     """Return the first known PhaseSweep state entry in an unbound root.
 
@@ -1968,7 +2002,7 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generations",
         "last_successful_generation.yaml",
         "summary.yaml",
-        *(phase.name for phase in experiment.phases),
+        *(phase.name.casefold() for phase in experiment.phases),
     }
     staging_prefix = f".{binding_name}."
     try:
@@ -1985,7 +2019,8 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
                 token = name[len(staging_prefix) : -len(".tmp")]
                 if len(token) == 16 and all(character in "0123456789abcdef" for character in token):
                     continue
-            if name in durable_names:
+            # These entries share a namespace on case-insensitive filesystems.
+            if name.casefold() in durable_names:
                 return name
         return None
     except OSError as exc:
@@ -2052,6 +2087,9 @@ def _validate_artifact_root_binding(
             "to combine this tree with an unverified storage ledger."
         ) from exc
     if raw != expected:
+        backend_conflict = _auto_storage_backend_conflict(experiment, raw)
+        if backend_conflict is not None:
+            raise ArtifactRootConflictError(backend_conflict)
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. "
@@ -2653,6 +2691,11 @@ def _plan_artifact_root_rebinds(
         for experiment in persistent
     ]
     if not any(plan.has_binding or plan.has_unbound_populated_study for plan in plans):
+        for plan in plans:
+            try:
+                _validate_artifact_root_binding(plan.experiment, claim_fresh=False)
+            except ArtifactRootConflictError as exc:
+                raise ArtifactRootRebindError(str(exc)) from exc
         raise ArtifactRootRebindError(
             "No phase study in this storage is bound to an artifact root, and none holds a "
             "trial, so there is nothing to rebind or migrate; the next ordinary run binds "
@@ -2694,6 +2737,9 @@ def _validate_artifact_root_binding_for_rebind(plan: _ArtifactRootRebindPlan) ->
             f"Cannot read artifact-root binding {path}: {exc}. Nothing was written."
         ) from exc
     expected = _artifact_root_binding_payload(plan.experiment)
+    backend_conflict = _auto_storage_backend_conflict(plan.experiment, raw)
+    if backend_conflict is not None:
+        raise ArtifactRootRebindError(backend_conflict)
     recorded_root = raw.get("artifact_root") if isinstance(raw, dict) else None
     storage_matches = isinstance(raw, dict) and raw.get("storage_key") == expected["storage_key"]
     if (

@@ -1174,7 +1174,10 @@ def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
     assert "Traceback" not in captured.err
 
 
-def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bound", [False, True])
+def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(
+    tmp_path: Path, bound: bool
+) -> None:
     """Explicit rebind is not an escape hatch around reverse root ownership."""
     config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
     owner = load_experiment(config_a)
@@ -1190,15 +1193,20 @@ def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(tmp_path: Pa
         storage=foreign.storage,
         direction="minimize",
     )
-    foreign_study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(foreign)))
+    if bound:
+        foreign_study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(foreign)))
 
     result = CliRunner().invoke(cli_main, ["rebind-workdir", str(foreign_config)])
 
     assert result.exit_code != 0
     assert result.exception is not None
-    assert "another storage ledger" in str(result.exception)
+    expected = "another storage ledger" if bound else "different storage ledger"
+    assert expected in str(result.exception)
+    assert "the next ordinary run binds" not in str(result.exception)
     assert _artifact_root_binding_path(owner).read_bytes() == owner_binding
-    assert foreign_study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(foreign))
+    assert foreign_study.user_attrs.get(ARTIFACT_ROOT_ATTR) == (
+        str(_experiment_dir(foreign)) if bound else None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1261,6 +1269,7 @@ def test_rebind_workdir_refuses_when_no_study_is_bound(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
+    assert "the next ordinary run binds these empty studies" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 

@@ -377,7 +377,7 @@ class Phase(_Frozen):
 
         """
         v = _validate_safe_name("Phase", v)
-        if v == "attempts":
+        if v.casefold() == "attempts":
             raise ValueError("Phase name 'attempts' is reserved for the runtime recovery registry.")
         return v
 

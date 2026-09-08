@@ -19,7 +19,7 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import read_status, run_experiment
-from phasesweep.engine.guards import _run_lock_paths
+from phasesweep.engine.guards import _plan_artifact_root_rebinds, _run_lock_paths
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
     canonical_storage_identity,
@@ -129,8 +129,11 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
-def test_auto_backend_change_refuses_existing_tree(tmp_path: Path, n_jobs: int) -> None:
-    from phasesweep.engine import ArtifactRootConflictError
+@pytest.mark.parametrize("relocated", [False, True])
+def test_auto_backend_change_refuses_existing_tree(
+    tmp_path: Path, n_jobs: int, relocated: bool
+) -> None:
+    from phasesweep.engine import ArtifactRootConflictError, ArtifactRootRebindError
 
     exp = make_experiment(
         workdir=tmp_path / "runs",
@@ -141,11 +144,26 @@ def test_auto_backend_change_refuses_existing_tree(tmp_path: Path, n_jobs: int) 
         trial_command="echo x=0.5 {overrides}",
     )
     run_experiment(exp)
+    if relocated:
+        moved_workdir = tmp_path / "moved"
+        Path(exp.workdir).rename(moved_workdir)
+        exp = exp.model_copy(update={"workdir": str(moved_workdir)})
     changed = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"n_jobs": 3 - n_jobs})]}
     )
-    with pytest.raises(ArtifactRootConflictError):
+    with pytest.raises(ArtifactRootConflictError, match="n_jobs") as run_error:
         run_experiment(changed)
+    with pytest.raises(ArtifactRootRebindError, match="n_jobs") as rebind_error:
+        _plan_artifact_root_rebinds([changed])
+    for error in (run_error, rebind_error):
+        message = str(error.value)
+        assert "auto" in message
+        assert "study.db" in message
+        assert "study.journal" in message
+        assert "Restore" in message
+        assert "new experiment name" in message
+        assert "does not convert" in message
+        assert "the next ordinary run binds" not in message
     new_database = (
         Path(file_url_path(changed.resolved_storage))
         if n_jobs == 1

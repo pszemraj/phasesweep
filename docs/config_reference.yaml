@@ -84,7 +84,7 @@
 # Phase fingerprints exclude these run-control fields: comment, n_trials, n_jobs, gpu_ids, gpu_devices, allow_no_gpu_isolation, max_consecutive_failures, allow_unbounded_trials, timeout_seconds_per_phase, allow_incomplete_on_timeout, allow_partial_grid, allow_seed_search, and sampler.acknowledge_nonresumable. Their individual safety rules still apply; other phase fields are semantic unless stated otherwise.
 
 # name: str (required)
-# Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names. `attempts` is reserved for the runtime recovery registry and rejected during validation.
+# Nonempty ASCII `[A-Za-z0-9_-]+`; used in paths and Optuna study names. `attempts` is reserved case-insensitively for the runtime recovery registry and rejected during validation.
 
 # comment: str | None = null
 # Design note shown by `validate` and `show-winners`. It has no trial-runtime effect and is excluded from phase fingerprints, but suite generations retain it in their historical plan identity.

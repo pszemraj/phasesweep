@@ -1386,15 +1386,18 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
     assert _artifact_root_binding_path(experiment).is_file()
 
 
-def test_unbound_known_phasesweep_state_names_the_blocking_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("entry", ["generations", "attempts", "Attempts", "P"])
+def test_unbound_known_phasesweep_state_names_the_blocking_entry(
+    tmp_path: Path, entry: str
+) -> None:
     """Known engine state still requires explicit adoption and is identifiable."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
     )
-    (_experiment_dir(experiment) / "generations").mkdir(parents=True)
+    (_experiment_dir(experiment) / entry).mkdir(parents=True)
 
-    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match="'generations'"):
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match=repr(entry)):
         _validate_artifact_root_binding(experiment, claim_fresh=True)
 
     assert not _artifact_root_binding_path(experiment).exists()

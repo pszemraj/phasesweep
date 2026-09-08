@@ -145,7 +145,21 @@ def poll_wandb_summary(
                 f"Recovery records remain in {trial_dir}."
             )
         if result.timed_out:
-            raise WandbPollTimeout(run_id, timeout_seconds)
+            stderr_text = (worker_dir / "stderr.log").read_text(encoding="utf-8").strip()
+            response_diagnostic = ""
+            if response_path.is_file():
+                response_text = response_path.read_text(encoding="utf-8").strip()
+                if response_text:
+                    try:
+                        response = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        response_diagnostic = response_text
+                    else:
+                        cause = response.get("cause")
+                        response_diagnostic = cause if isinstance(cause, str) else ""
+            diagnostic = response_diagnostic or stderr_text
+            last_error = RuntimeError(diagnostic) if diagnostic else None
+            raise WandbPollTimeout(run_id, timeout_seconds, last_error)
         if result.return_code != 0 or result.failure_reason is not None:
             diagnostic = (worker_dir / "stderr.log").read_text(encoding="utf-8").strip()
             raise RuntimeError(
@@ -220,6 +234,8 @@ def _poll_wandb_summary(
             if not api_constructed:
                 raise WandbSetupError(run_id, str(exc)) from exc
             last_err = exc
+            # The parent may terminate this worker before ``main`` serializes ``last_err``.
+            print(str(exc), file=sys.stderr, flush=True)
         else:
             api_constructed = True
             if time.monotonic() >= deadline:
@@ -238,6 +254,8 @@ def _poll_wandb_summary(
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
+                # The parent may terminate this worker before ``main`` serializes ``last_err``.
+                print(str(exc), file=sys.stderr, flush=True)
         sleep_seconds = max(0.0, deadline - time.monotonic())
         time.sleep(min(poll_seconds, sleep_seconds))
     raise WandbPollTimeout(run_id, timeout_seconds, last_err)

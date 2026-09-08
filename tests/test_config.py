@@ -121,9 +121,10 @@ def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, p
     assert not (tmp_path / "work").exists()
 
 
-def test_config_rejects_reserved_phase_name_before_creating_workdir(tmp_path):
+@pytest.mark.parametrize("name", ["attempts", "Attempts"])
+def test_config_rejects_reserved_phase_name_before_creating_workdir(tmp_path, name: str):
     payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
-    payload["phases"][0]["name"] = "attempts"
+    payload["phases"][0]["name"] = name
     path = write_yaml(tmp_path, yaml.safe_dump(payload))
 
     with pytest.raises(ValueError, match="reserved for the runtime recovery registry"):

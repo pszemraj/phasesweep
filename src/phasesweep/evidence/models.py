@@ -187,7 +187,16 @@ class _WandbSummarySource(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
     poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
+    timeout_seconds: float = Field(
+        default=120.0,
+        ge=1.0,
+        allow_inf_nan=False,
+        description=(
+            "Total wall-clock budget for the polling worker. Worker startup and W&B SDK "
+            "initialization consume this budget before requests and retries. Short budgets can "
+            "expire before the first poll, even when run data is already available."
+        ),
+    )
 
     @field_validator("base_url")
     @classmethod
