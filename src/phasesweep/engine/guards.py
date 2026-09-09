@@ -741,7 +741,9 @@ def _read_trial_process_identity(
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
-            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown. "
+            "Restore the original storage ledger with its durable attempt and generation "
+            "identities before retrying recovery; do not infer replacement identities."
         )
     try:
         return read_stale_process_identity(
@@ -752,7 +754,8 @@ def _read_trial_process_identity(
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: its durable "
             f"process identity is missing, malformed, partial, or belongs to another attempt. "
-            f"trial_dir={trial_dir}."
+            f"trial_dir={trial_dir}. Restore the original storage ledger and this attempt's "
+            "process-identity files before retrying recovery."
         ) from exc
 
 
@@ -1278,7 +1281,10 @@ def _registry_attempt_fail_stale_trial(
                     f"Attempt registry entry {entry_path} cannot be matched to terminal "
                     f"trial {trial.number} in study {entry['study_name']!r}: its durable "
                     "attempt or generation identity is missing. The registry entry is "
-                    "retained; cleanup recovery cannot be attributed to this trial."
+                    "retained; cleanup recovery cannot be attributed to this trial. "
+                    "Restore the original storage ledger with its durable attempt and "
+                    "generation identities before retrying recovery; do not infer "
+                    "replacement identities."
                 )
             if not recovered:
                 _record_cleanup_recovery(study, trial)

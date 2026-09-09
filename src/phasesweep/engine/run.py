@@ -433,7 +433,9 @@ def _run_experiment_outcome(
             # launched anything of its own.
             raise ProcessCleanupUncertainError(
                 "Artifact ownership could not be checked because required persistent "
-                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
+                f"study state is unavailable: {exc} Cleanup state is therefore unknown. "
+                "Restore the original complete storage ledger and access to it before "
+                "retrying. For an MCP run, then run phasesweep mcp recover-run."
             ) from exc
         run_stack.enter_context(_file_log_handler(_run_log_path(experiment)))
         generation_id = _claim_generation(experiment, requested_generation_id)

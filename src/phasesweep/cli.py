@@ -25,6 +25,7 @@ from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    StudyStorageUnavailableError,
     config_status,
     run_config,
 )
@@ -990,6 +991,17 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         and terminal_status.get("cleanup_confirmed") is False
         and cleanup_recovery_required
     )
+    failure = terminal_status.get("failure") if terminal_status is not None else None
+    failure_cause = failure.get("cause") if isinstance(failure, dict) else None
+    ownership_storage_unavailable = (
+        terminal_status is not None
+        and terminal_status.get("generation_unavailable_reason") == "engine_generation_not_claimed"
+        and isinstance(failure, dict)
+        and failure.get("code") == "cleanup_uncertain"
+        and isinstance(failure_cause, dict)
+        and failure_cause.get("code") == "storage_unavailable"
+        and failure_cause.get("stage") == "preflight"
+    )
     cleanup_already_recovered = (
         terminal_status is not None
         and terminal_status.get("cleanup_confirmed") is False
@@ -1127,7 +1139,13 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     if generation_id == run_id or attempt_id in causal_attempt_ids
                 )
                 for phase in config.phases:
-                    study = _load_existing_phase_study(config, phase)
+                    try:
+                        study = _load_existing_phase_study(config, phase)
+                    except StudyStorageUnavailableError as exc:
+                        raise click.ClickException(
+                            f"{exc} Restore the original complete storage ledger and access "
+                            "to it, then retry phasesweep mcp recover-run."
+                        ) from exc
                     if study is None:
                         continue
                     inspected_studies += 1
@@ -1188,7 +1206,14 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                         if location is not None:
                             reaped_attempt_locations[attempt_id] = location
             cleanup_evidence_count = len(reaped_attempt_ids)
-            if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
+            # An ownership read can fail before this run allocates any trial.
+            # Successful registry/study inspection above resolves that failure;
+            # there can be no trial-level cleanup evidence from this run.
+            if (
+                terminal_cleanup_uncertain
+                and cleanup_evidence_count == 0
+                and not ownership_storage_unavailable
+            ):
                 if inspected_studies == 0:
                     detail = (
                         "no existing Optuna studies could be loaded from the run snapshot storage"

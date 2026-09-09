@@ -247,7 +247,10 @@ def _base_failure_payload(
             "retryable": False,
             "actor": "operator",
             "remediation": (
-                "Ask the operator to run phasesweep mcp recover-run before another launch."
+                "Ask the operator to restore the original complete storage ledger and "
+                "access to it, then run phasesweep mcp recover-run before another launch."
+                if isinstance(error.__cause__, StudyStorageUnavailableError)
+                else "Ask the operator to run phasesweep mcp recover-run before another launch."
             ),
         }
     if isinstance(error, NoFeasibleTrialError):
@@ -315,12 +318,19 @@ def _cleanup_failure_payload(
     :param str | None cause_stage: Stage at which ``primary`` occurred, used
         when classifying it as the nested cause.
     :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
-        ``primary`` nested under ``"cause"`` unless ``primary`` is itself a
-        :class:`ProcessCleanupUncertainError`.
+        ``primary`` nested under ``"cause"``. For an existing cleanup error,
+        retain its explicit storage failure when that prevents inspection.
     """
-    cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
+    cleanup = (
+        primary
+        if isinstance(primary, ProcessCleanupUncertainError)
+        else ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
+    )
     payload = _base_failure_payload(cleanup, stage="cleanup")
-    if not isinstance(primary, ProcessCleanupUncertainError):
+    if isinstance(primary, ProcessCleanupUncertainError):
+        if isinstance(primary.__cause__, StudyStorageUnavailableError):
+            payload["cause"] = _base_failure_payload(primary.__cause__, stage=cause_stage)
+    else:
         # ``cause`` is diagnostic history, not a second action contract. It
         # intentionally retains the primary failure's own actor/retryability
         # (for example, a user cancellation) while the authoritative outer
@@ -335,11 +345,18 @@ def _terminal_error(
 ) -> tuple[BaseException, str | None]:
     """Return the engine's primary error and stage, or the caller's fallback.
 
+    A storage failure wrapped before any terminal report comes from the
+    ownership check that precedes generation allocation.
+
     :param TerminalReport | None report: Engine terminal report, when one was delivered.
     :param BaseException fallback: Exception caught by the runner.
     :return tuple[BaseException, str | None]: Authoritative error and failure stage.
     """
     if report is None:
+        if isinstance(fallback, ProcessCleanupUncertainError) and isinstance(
+            fallback.__cause__, StudyStorageUnavailableError
+        ):
+            return fallback, "preflight"
         return fallback, "execution"
     return report.primary_error or fallback, report.failure_stage
 

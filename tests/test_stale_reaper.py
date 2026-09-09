@@ -1508,8 +1508,10 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
         with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
             _preflight_active_attempts(experiment, report)
     elif identity_change in {"missing-attempt", "missing-generation"}:
-        with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
+        with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
             _preflight_active_attempts(experiment, report)
+        assert "Restore the original storage ledger" in str(exc_info.value)
+        assert "before retrying recovery" in str(exc_info.value)
     else:
         _preflight_active_attempts(experiment, report)
 
@@ -1520,8 +1522,9 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     else:
         assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
         assert report.recovered_attempt_ids == set()
-        with pytest.raises(ProcessCleanupUncertainError):
+        with pytest.raises(ProcessCleanupUncertainError) as exc_info:
             list(_iter_cleanup_uncertain_trials(study))
+        assert "Restore the original storage ledger" in str(exc_info.value)
     assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
         identity_change in {"generation", "missing-attempt", "missing-generation"}
     )

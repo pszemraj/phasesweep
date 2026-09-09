@@ -47,6 +47,7 @@ from phasesweep.engine.state import (
     _winner_path,
 )
 from phasesweep.mcp import runner as mcp_runner
+from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
@@ -60,10 +61,12 @@ from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import (
     claim_runner_handle,
+    make_mcp_app,
     make_run_handle,
     runner_argv,
     runner_main,
     slow_mcp_config_text,
+    write_mcp_catalog,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -447,6 +450,135 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     assert store.recovery_required(handle) is False
     assert _generation_path(experiment).read_bytes() == generation_before
     assert not (_experiment_dir(experiment) / "study.db").exists()
+
+
+@pytest.mark.parametrize("tail", [b"garbage\n", b'{"op_code":'])
+def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail: bytes) -> None:
+    """Repairing a pre-launch ledger failure must let operator recovery release its slot."""
+    ledger = tmp_path / "study.journal"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{ledger}",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
+    other_path = tmp_path / "other.yaml"
+    other_path.write_text(yaml.safe_dump(other.model_dump(mode="json")))
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {"t": config_path, "other": other_path}, allow={"launch": True})
+    )
+    run_experiment(experiment)
+    healthy = ledger.read_bytes()
+    generation_before = _generation_path(experiment).read_bytes()
+    ledger.write_bytes(healthy + tail)
+    refused_run = subprocess.run(
+        [sys.executable, "-m", "phasesweep", "run", str(config_path)],
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+        timeout=30,
+    )
+    assert refused_run.returncode != 0
+    assert "Restore the original complete storage ledger" in refused_run.stderr
+
+    run_id = "damaged-journal"
+    digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store, run_id=run_id, config_sha256=digest, started_at=started_at, experiment_id="t"
+    )
+    snapshot = store.config_snapshot_path(run_id)
+    snapshot.write_bytes(config_path.read_bytes())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "phasesweep.mcp.runner",
+            *runner_argv(
+                store,
+                run_id=run_id,
+                config=snapshot,
+                config_sha256=digest,
+                experiment_id="t",
+                started_at=started_at,
+            ),
+            "--cwd",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+        timeout=30,
+    )
+    assert result.returncode == 1, result.stderr
+    terminal_before = store.status_path(run_id).read_bytes()
+    status = json.loads(terminal_before)
+    assert status["cleanup_confirmed"] is False
+    assert status["failure"]["code"] == "cleanup_uncertain"
+    assert status["failure"]["retryable"] is False
+    assert status["failure"]["cause"]["code"] == "storage_unavailable"
+    assert status["failure"]["cause"]["stage"] == "preflight"
+    assert "restore the original complete storage ledger" in status["failure"]["remediation"]
+    assert "then run phasesweep mcp recover-run" in status["failure"]["remediation"]
+    assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
+    assert str(ledger) not in json.dumps(status["failure"])
+    assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
+    handle = store.get(run_id)
+    assert handle is not None
+    assert store.state(handle) == "running"
+    assert store.recovery_required(handle)
+    with pytest.raises(ConcurrencyLimitError):
+        app.launch("other")
+
+    recovery_args = [
+        "mcp",
+        "recover-run",
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--run-id",
+        run_id,
+    ]
+    for confirmation in ([], ["--confirm"]):
+        blocked = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+        assert blocked.exit_code != 0
+        assert "could not be completely read" in blocked.output
+        assert "Restore the original complete storage ledger" in blocked.output
+        assert ledger.read_bytes() == healthy + tail
+        assert store.status_path(run_id).read_bytes() == terminal_before
+        assert not store.cleanup_recovery_path(run_id).exists()
+
+    ledger.write_bytes(healthy)
+    # A storage error after generation allocation, or an unrelated failure,
+    # still requires cleanup evidence attributable to that run.
+    for changed_fact in ("generation_claimed", "unrelated_failure", "execution_failure"):
+        unrelated = json.loads(terminal_before)
+        if changed_fact == "generation_claimed":
+            unrelated.pop("generation_unavailable_reason")
+        elif changed_fact == "unrelated_failure":
+            unrelated["failure"]["cause"]["code"] = "trainer_failed"
+        else:
+            unrelated["failure"]["cause"]["stage"] = "execution"
+        store.status_path(run_id).write_text(json.dumps(unrelated))
+        refused_recovery = CliRunner().invoke(cli_main, recovery_args)
+        assert refused_recovery.exit_code != 0
+        assert "could not confirm any trial-level cleanup evidence" in refused_recovery.output
+        assert not store.cleanup_recovery_path(run_id).exists()
+    store.status_path(run_id).write_bytes(terminal_before)
+    preflight = CliRunner().invoke(cli_main, recovery_args)
+    assert preflight.exit_code == 0, preflight.output
+    assert store.recovery_required(handle)
+    confirmed = CliRunner().invoke(cli_main, [*recovery_args, "--confirm"])
+    assert confirmed.exit_code == 0, confirmed.output
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+    recovered_status = app.status(run_id=run_id)
+    assert recovered_status["run"]["state"] == "failed"
+    assert recovered_status["run"]["recovery_required"] is False
+    assert _generation_path(experiment).read_bytes() == generation_before
 
 
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
