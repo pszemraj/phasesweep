@@ -344,11 +344,14 @@ def run_experiment(
         PhaseSweepError: An expected preflight, promotion, storage,
             publication, or recovery refusal requires operator action.
         RuntimeError: An internal engine invariant fails.
-        ValueError: A caller-supplied generation id is not a safe filesystem name.
+        ValueError: A caller-supplied generation id is not a safe filesystem name,
+            or ``from_phase`` names no declared phase (rejected before state writes).
         FileNotFoundError: ``--from-phase`` requested but a prior phase has
             no persisted ``winner.yaml``.
 
     """
+    if from_phase is not None and from_phase not in {phase.name for phase in experiment.phases}:
+        raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
     if dry_run:
         return _run_experiment_inner(
             experiment,
@@ -1565,8 +1568,10 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
-      ``winner`` (path string or ``None``), and ``published_study_unavailable``
-      (a published phase has no readable trial history, so executing it is blocked).
+      ``winner`` (path string or ``None``), ``published_study_unavailable``
+      (a published phase has no readable trial history), and
+      ``trial_data_available`` (true for known counts, including confirmed
+      absence; false when inspection failed).
 
     ``read_status``'s summary-derived fields (``metric``, ``result_context``,
     ``published_config_matches_current``, ``summary_present``) are deliberately

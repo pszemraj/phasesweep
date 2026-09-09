@@ -1320,6 +1320,7 @@ def test_missing_published_study_is_visible_in_status_and_rebind(
     assert status["publication_integrity"] == "ok"
     assert status["is_published"] is True
     assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trial_data_available"] is True
 
     for command in ("run", "rebind-workdir"):
         exit_code = _invoke_cli_boundary([command, str(config)], monkeypatch)

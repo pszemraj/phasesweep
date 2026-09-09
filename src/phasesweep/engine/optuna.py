@@ -57,8 +57,8 @@ class _PhaseTrialStats:
 
     ``running_attempts`` is part of the *same* snapshot as ``counts``, not a
     second read: it lists the RUNNING trials those counts describe, and is
-    ``None`` exactly when ``available`` is ``False`` (nothing was read, so
-    an empty list would claim knowledge this snapshot does not have).
+    ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
+    A confirmed absent study has known zero counts and an empty attempt list.
     """
 
     counts: dict[str, int]
@@ -409,7 +409,8 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     Optuna's storage constructor can create the database/schema and race the
     runner's first ``create_study`` call. Opening the file in SQLite read-only
     mode avoids both side effects: a missing, locked, or still-initializing DB
-    simply reports no counts for now.
+    simply reports no counts for now. A confirmed missing file has known zero
+    counts; a failed read, including an unreadable schema, reports unavailable counts.
 
     Counts and RUNNING identities come from one CTE-backed statement, so one
     storage snapshot. SQL aggregates terminal rows by state and generation,
@@ -427,6 +428,14 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
     assert experiment.resolved_storage is not None
     uri = sqlite_readonly_uri(experiment.resolved_storage)
     if uri is None:
+        return _PhaseTrialStats({}, False, {}, None)
+    database = sqlite_database_path(experiment.resolved_storage)
+    assert database is not None
+    try:
+        database.stat()
+    except FileNotFoundError:
+        return _PhaseTrialStats({}, True, {}, [])
+    except OSError:
         return _PhaseTrialStats({}, False, {}, None)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
@@ -454,24 +463,13 @@ def _rdb_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialS
         engine = sqlalchemy.create_engine(experiment.resolved_storage)
         try:
             with engine.connect() as connection:
-                # A marker distinguishes an empty study from an absent one,
-                # within the same statement as the counts and identities.
                 rows = connection.execute(
-                    sqlalchemy.text(
-                        _PHASE_TRIAL_STATS_SQL
-                        + """
-                        UNION ALL
-                        SELECT 'study', NULL, NULL, NULL, NULL, 0
-                        FROM studies WHERE study_name = :study_name
-                        """
-                    ),
+                    sqlalchemy.text(_PHASE_TRIAL_STATS_SQL),
                     _phase_trial_stats_params(experiment, phase),
                 ).fetchall()
         finally:
             engine.dispose()
     except Exception:  # noqa: BLE001 - status reports unavailable on any connection/read failure
-        return _PhaseTrialStats({}, False, {}, None)
-    if not rows:
         return _PhaseTrialStats({}, False, {}, None)
     return _trial_stats_from_rows(rows, study_name=_phase_study_name(experiment, phase))
 
@@ -524,6 +522,8 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
 
     SQL backends use one SELECT statement; journal storage uses one trial list.
     Counts and RUNNING identities therefore describe the same snapshot.
+    Confirmed absence reports available zero counts; read failures report
+    unavailable counts.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
@@ -536,13 +536,10 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
         return _sqlite_phase_trial_stats(experiment, phase)
     if backend != "journal":
         return _rdb_phase_trial_stats(experiment, phase)
-    if (
-        backend == "journal"
-        and not Path(file_url_path(experiment.resolved_storage)).expanduser().exists()
-    ):
-        return _PhaseTrialStats({}, False, {}, None)
     try:
-        study = _load_phase_study(experiment, phase)
+        study = _load_existing_phase_study(experiment, phase)
+        if study is None:
+            return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001
         return _PhaseTrialStats({}, False, {}, None)

@@ -527,15 +527,20 @@ class PhaseStatusPayload(_ToolPayload):
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     published_study_unavailable: bool = Field(
         description=(
-            "Whether a current published phase has no readable trial history because its "
-            "study is missing, empty, or unreadable. Executing this phase is blocked; "
-            "earlier phases may still load validated saved winners via from_phase."
+            "Whether a current published phase has no readable trial history. When "
+            "trial_data_available is true, its study is confirmed missing or empty: "
+            "restore the original ledger/study or use a new experiment identity; "
+            "earlier phases may load validated saved winners via from_phase. When "
+            "trial_data_available is false, inspection failed: a run can report "
+            "cleanup_uncertain and require operator "
+            "recovery before further MCP launches."
         )
     )
     trial_data_available: bool = Field(
         description=(
-            "Whether the backing study was readable; false means zero counts are not evidence "
-            "that no trials exist."
+            "Whether trial counts are known, including confirmed absent or empty studies. "
+            "False means inspection failed or no persistent observation is available; "
+            "zero counts then do not establish that no trials exist."
         )
     )
 

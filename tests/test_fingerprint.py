@@ -2023,6 +2023,37 @@ def test_published_study_requirement_starts_at_from_phase(
         assert len(optuna.load_study(study_name="t::lr", storage=storage).trials) == 1
 
 
+@pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_invalid_from_phase_is_rejected_before_state_writes(
+    tmp_path: Path, tree_state: str, dry_run: bool
+) -> None:
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    if tree_state != "fresh":
+        run_experiment(experiment)
+        if tree_state == "missing-ledger":
+            (_experiment_dir(experiment) / "study.db").unlink()
+    pointer = _generation_path(experiment)
+    pointer_before = pointer.read_bytes() if pointer.exists() else None
+    generations = _experiment_dir(experiment) / "generations"
+    generations_before = set(generations.iterdir()) if generations.exists() else set()
+
+    with pytest.raises(ValueError, match="Unknown --from-phase value 'bogus'"):
+        run_experiment(experiment, from_phase="bogus", dry_run=dry_run)
+
+    assert (pointer.read_bytes() if pointer.exists() else None) == pointer_before
+    assert (set(generations.iterdir()) if generations.exists() else set()) == generations_before
+    if tree_state == "fresh":
+        assert not Path(experiment.workdir).exists()
+    elif tree_state == "missing-ledger":
+        assert not (_experiment_dir(experiment) / "study.db").exists()
+
+
 def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

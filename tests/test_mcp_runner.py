@@ -611,7 +611,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
-@pytest.mark.parametrize("storage_kind", ["none", "missing-sqlite"])
+@pytest.mark.parametrize("storage_kind", ["none", "corrupt-sqlite"])
 def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -623,7 +623,11 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     so an empty list would claim there are no RUNNING rows (PR #5 review /
     reviewer 2, blocker 6).
     """
-    storage = None if storage_kind == "none" else f"sqlite:///{tmp_path / 'missing' / 'studies.db'}"
+    storage = None
+    if storage_kind == "corrupt-sqlite":
+        ledger = tmp_path / "studies.db"
+        ledger.write_text("not a database\n", encoding="utf-8")
+        storage = f"sqlite:///{ledger}"
     experiment = make_experiment(workdir=tmp_path / "runs", storage=storage, n_trials=1)
 
     def fail_redundant_read(*args: object, **kwargs: object) -> None:

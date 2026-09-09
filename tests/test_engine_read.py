@@ -137,7 +137,8 @@ def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: st
 
     assert not path.exists()
     assert status["phases"][0]["trials"] == {}
-    assert status["phases"][0]["trial_data_available"] is False
+    assert status["phases"][0]["trial_data_available"] is True
+    assert status["phases"][0]["running_attempts"] == []
     assert status["metric"]["objective_evidence"] == {
         "kind": "log_regex",
         "attempt_location_scoped": True,
@@ -162,6 +163,7 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
 
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
+    assert status["phases"][0]["running_attempts"] is None
 
 
 @pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "empty-study"])
@@ -194,7 +196,7 @@ def test_external_status_does_not_initialize_or_change_schema(
     phase = read_status(experiment)["phases"][0]
 
     assert phase["trials"] == {}
-    assert phase["trial_data_available"] is (database_state == "empty-study")
+    assert phase["trial_data_available"] is (database_state != "uninitialized")
     assert sqlalchemy.inspect(engine).get_table_names() == before
     assert writes == []
     engine.dispose()
@@ -367,12 +369,73 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     tmp_path: Path, backend: str
 ) -> None:
     """Unread trial data reports no RUNNING identities, not an empty list."""
-    exp = _experiment(tmp_path, storage=f"{backend}:///{tmp_path}/missing.{backend}")
+    ledger = tmp_path / f"corrupt.{backend}"
+    # Journal tolerates a torn final record; an earlier malformed record must fail.
+    ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
+    exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
 
     phase = read_status(exp)["phases"][0]
 
     assert phase["trial_data_available"] is False
     assert phase["running_attempts"] is None
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
+@pytest.mark.parametrize("damage", ["missing-ledger", "missing-study", "empty-study", "corrupt"])
+def test_published_status_distinguishes_absent_history_from_read_failure(
+    tmp_path: Path, n_jobs: int, damage: str
+) -> None:
+    """The same status flags select the same remedy for both file backends."""
+    from phasesweep.engine import ProcessCleanupUncertainError, PublishedStudyMissingError
+    from phasesweep.mcp.redaction import status_payload
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_jobs=n_jobs,
+        n_trials=1,
+        allow_no_gpu_isolation=True,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    run_experiment(experiment)
+    ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
+    if damage == "missing-ledger":
+        ledger.unlink()
+    elif damage == "corrupt":
+        ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
+    else:
+        storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+        optuna.delete_study(study_name="t::p", storage=storage)
+        if damage == "empty-study":
+            optuna.create_study(study_name="t::p", storage=storage)
+    ledger_before = ledger.read_bytes() if ledger.exists() else None
+    generation_before = _generation_path(experiment).read_bytes()
+
+    status = read_status(experiment)
+    cli_status = experiment_status(experiment)
+    mcp_status = status_payload(
+        experiment_id="t",
+        status=status,
+        run=None,
+        result_source="current_shared_study",
+        elapsed_seconds=None,
+    )
+    snapshot = capture_result_snapshot(experiment)["status"]
+    for payload in (status, cli_status, mcp_status, snapshot):
+        assert payload["publication_integrity"] == "ok"
+        phase = payload["phases"][0]
+        assert phase["published_study_unavailable"] is True
+        assert phase["trial_data_available"] is (damage != "corrupt")
+        assert not any(phase["trials"].values())
+    assert status["phases"][0]["running_attempts"] == (None if damage == "corrupt" else [])
+    assert (ledger.read_bytes() if ledger.exists() else None) == ledger_before
+    expected_error = (
+        ProcessCleanupUncertainError if damage == "corrupt" else PublishedStudyMissingError
+    )
+    with pytest.raises(expected_error):
+        run_experiment(experiment)
+    assert _generation_path(experiment).read_bytes() == generation_before
 
 
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:

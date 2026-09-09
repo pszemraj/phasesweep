@@ -113,8 +113,8 @@ def _phase_status_payloads(
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
     :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
     :param Mapping[str, bool] trial_data_available: Storage-read
-        availability keyed by phase name. Included only in the path-free status
-        view consumed by MCP.
+        availability keyed by phase name. True includes confirmed absent studies
+        with known zero counts; false means counts could not be established.
     :param Mapping[str, list[dict[str, Any]] | None] running_attempts:
         RUNNING trial identities keyed by phase name, from the same
         storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
@@ -153,6 +153,7 @@ def _phase_status_payloads(
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
             "generation_trials": generation_trial_counts[phase.name],
+            "trial_data_available": trial_data_available[phase.name],
             "published_study_unavailable": phase.name in published_phases
             and not any(counts.values()),
         }
@@ -165,7 +166,6 @@ def _phase_status_payloads(
                 {
                     "phase": phase.name,
                     "winner_present": winner_present,
-                    "trial_data_available": trial_data_available[phase.name],
                     "running_attempts": running_attempts[phase.name],
                 }
             )
@@ -566,9 +566,12 @@ def read_status(
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
     ``published_study_unavailable`` reports a current published phase with no
-    readable trial history (a missing, empty, or unreadable study). Executing
-    that phase is refused; earlier phases may still load saved winners via
-    ``from_phase``. Publication integrity describes the artifacts separately.
+    readable trial history. When ``trial_data_available`` is true, the study
+    is confirmed missing or empty; executing it is refused, while earlier
+    phases may still load saved winners via ``from_phase``. False means the
+    history could not be inspected; a run can report cleanup uncertainty and
+    require operator recovery before further MCP launches. Publication
+    integrity describes the artifacts separately.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional invocation identity to pin the

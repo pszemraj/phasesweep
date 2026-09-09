@@ -75,6 +75,7 @@ PHASE_STATUS_KEYS = {
     "completed",
     "generation_trials",
     "published_study_unavailable",
+    "trial_data_available",
     "name",
     "winner",
 }
@@ -96,7 +97,6 @@ READ_STATUS_ONLY_KEYS = {
 READ_STATUS_ONLY_PHASE_KEYS = {
     "phase",
     "winner_present",
-    "trial_data_available",
     "running_attempts",
 }
 """Phase keys that exist only in the path-free read_status view.

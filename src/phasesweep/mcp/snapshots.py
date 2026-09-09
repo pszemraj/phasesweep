@@ -80,8 +80,8 @@ class PhaseStatusSnapshot(_SnapshotModel):
     pairs with ``trial_data_available: false`` -- an empty list would assert
     there are no RUNNING rows. Snapshots frozen before this field existed also
     parse as ``None``, which is the truthful reading: they recorded no
-    identities. A phase with readable trial data always carries a list, empty
-    when nothing is RUNNING.
+    identities. A phase with known trial counts always carries a list, empty
+    when nothing is RUNNING, including a confirmed absent study.
     """
 
 
