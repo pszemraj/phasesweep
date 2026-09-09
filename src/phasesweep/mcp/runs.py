@@ -61,11 +61,11 @@ log = logging.getLogger("phasesweep.mcp.runs")
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 _RUN_EVIDENCE_SUFFIXES = (
+    ".config.yaml",
+    ".status.json",
+    ".log",
     ".cleanup_uncertain.json",
     ".cleanup_recovery.json",
-    ".status.json",
-    ".config.yaml",
-    ".log",
     ".launch.lock",
 )
 
@@ -550,15 +550,7 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
         return any(
-            path.is_file()
-            for path in (
-                self.config_snapshot_path(run_id),
-                self.status_path(run_id),
-                self.log_path(run_id),
-                self.cleanup_uncertain_path(run_id),
-                self.cleanup_recovery_path(run_id),
-                self.launch_lease_path(run_id),
-            )
+            (self._logs_dir / f"{run_id}{suffix}").is_file() for suffix in _RUN_EVIDENCE_SUFFIXES
         )
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:

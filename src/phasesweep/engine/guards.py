@@ -1885,12 +1885,7 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
     :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
         study's already-accepted target.
     """
-    accepted_target = _accepted_trial_target(study)
-    if phase.n_trials < accepted_target:
-        raise TrialTargetRegressionError(
-            f"Phase {phase.name!r} cannot lower its accepted trial target from "
-            f"{accepted_target} to {phase.n_trials}."
-        )
+    _validate_trial_target(study, phase)
     if phase.n_trials != study.user_attrs.get(TRIAL_TARGET_ATTR):
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
@@ -2238,23 +2233,10 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
 def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     """Claim, or re-confirm, the one artifact root a single phase study publishes into.
 
-    ``workdir`` is deliberately excluded from every semantic fingerprint so an
-    artifact tree stays movable. Without a binding that mobility is unsound
-    (review v0.5.19 / finding F5): re-running the same config with a second
-    ``workdir`` matches the same fingerprints, tops up or re-selects against
-    trial directories living under the *first* root, and publishes a second,
-    divergent artifact tree — two roots each claiming to be the publication of
-    one study, with ``trial_dir`` attrs pointing into the other.
-
-    First contact claims the root only for a study that holds **no trials**,
-    mirroring the zero-trial fingerprint rebind in :func:`_verify_fingerprint`:
-    nothing was evaluated yet, so nothing can be stranded under another root.
-    A *populated* study with no binding predates the attr, and an ordinary run
-    cannot tell which workdir holds its trial directories; adopting whichever
-    workdir happened to run first would leave two trees each reporting an
-    intact publication of the same study (re-review v0.5.19 / blocker B1).
-    Migrating one is the operator's explicit statement, made against the
-    original tree with ``phasesweep rebind-workdir``.
+    ``workdir`` is excluded from semantic fingerprints so artifact trees can
+    move. The shared :func:`_artifact_root_claim_needed` check permits first
+    contact only for an empty study; moving a populated study's binding
+    requires explicit ``phasesweep rebind-workdir``.
 
     :param optuna.Study study: Phase study to bind.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
