@@ -1078,6 +1078,8 @@ class PhaseSweepMCP:
             if persisted is not None:
                 failure["cause"] = persisted
             return failure
+        # Preserve the terminal diagnosis and remediation after operator recovery;
+        # the live recovery_required field says whether recovery is still needed.
         return persisted
 
     def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:

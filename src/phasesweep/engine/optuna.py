@@ -526,6 +526,21 @@ def _phase_trial_stats_params(
     }
 
 
+def _unavailable_phase_trial_stats(
+    experiment: Experiment, phase: Phase, exc: BaseException
+) -> _PhaseTrialStats:
+    """Log a failed status read and return unavailable trial data."""
+    cause = exc.__cause__ or exc
+    log.warning(
+        "could not read status trial data from storage %s for phase %s: %s: %s",
+        experiment.resolved_storage,
+        phase.name,
+        type(cause).__name__,
+        cause,
+    )
+    return _PhaseTrialStats({}, False, {}, None)
+
+
 def _sqlite_phase_trial_stats(
     experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
 ) -> _PhaseTrialStats:
@@ -563,8 +578,8 @@ def _sqlite_phase_trial_stats(
         database.stat()
     except FileNotFoundError:
         return _PhaseTrialStats({}, True, {}, [])
-    except OSError:
-        return _PhaseTrialStats({}, False, {}, None)
+    except OSError as exc:
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
@@ -574,8 +589,8 @@ def _sqlite_phase_trial_stats(
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error:
-        return _PhaseTrialStats({}, False, {}, None)
+    except sqlite3.Error as exc:
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     return _trial_stats_from_rows(
         rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
     )
@@ -602,8 +617,8 @@ def _rdb_phase_trial_stats(
                 ).fetchall()
         finally:
             engine.dispose()
-    except Exception:  # noqa: BLE001 - status reports unavailable on any connection/read failure
-        return _PhaseTrialStats({}, False, {}, None)
+    except Exception as exc:  # noqa: BLE001 - status reports unavailable on any connection/read failure
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     return _trial_stats_from_rows(
         rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
     )
@@ -695,8 +710,8 @@ def _phase_trial_stats(
         if study is None:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
-    except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, False, {}, None)
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []

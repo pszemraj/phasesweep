@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -103,6 +104,10 @@ def test_help_registers_commands_and_options() -> None:
     assert recovery_help.exit_code == 0
     for flag in ("--state-dir", "--run-id", "--confirm", "-h, --help"):
         assert flag in recovery_help.output
+    assert (
+        "restore the original complete storage ledger and access to it before recovery"
+        in " ".join(recovery_help.output.split()).lower()
+    )
 
     run_help = runner.invoke(cli_main, ["run", "--help"], terminal_width=120).output
     assert "--from-phase PHASE" in run_help
@@ -567,6 +572,33 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     status_obj = yaml.safe_load(result.output)
     assert status_obj["current_generation_id"] is not None
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
+
+
+def test_status_logs_an_unreadable_journal_storage(tmp_path: Path) -> None:
+    """An unavailable journal leaves status usable but names the read failure in logs."""
+    ledger = tmp_path / "studies.journal"
+    ledger.write_text("not a journal record\n")
+    experiment = make_experiment(
+        storage=f"journal:///{ledger}",
+        workdir=tmp_path / "runs",
+        n_trials=1,
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "phasesweep", "status", str(config_path)],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    status = yaml.safe_load(result.stdout)
+    assert status["phases"][0]["trial_data_available"] is False
+    assert str(ledger) in result.stderr
+    assert "JSONDecodeError" in result.stderr
 
 
 def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: Path) -> None:

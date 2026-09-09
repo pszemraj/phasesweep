@@ -903,7 +903,9 @@ def _catalog_error_text(exc: CatalogError) -> str:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
-        "terminal-result finalization. --confirm performs the reported actions."
+        "terminal-result finalization. If study storage is unavailable, restore the original "
+        "complete storage ledger and access to it before recovery. "
+        "--confirm performs the reported actions."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -1147,8 +1149,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                         )
                     except (PublishedStudyMissingError, StudyStorageUnavailableError) as exc:
                         raise click.ClickException(
-                            "Storage recovery cannot confirm this experiment's published "
-                            "trial history. Restore the original complete storage ledger "
+                            f"{exc} Restore the original complete storage ledger "
                             "and study with access to it, then retry "
                             "phasesweep mcp recover-run."
                         ) from exc

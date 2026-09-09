@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 import optuna
@@ -370,9 +371,12 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     ]
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize(
+    ("backend", "cause"),
+    [("sqlite", "DatabaseError"), ("journal", "JSONDecodeError")],
+)
 def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
-    tmp_path: Path, backend: str
+    tmp_path: Path, backend: str, cause: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Unread trial data reports no RUNNING identities, not an empty list."""
     ledger = tmp_path / f"corrupt.{backend}"
@@ -380,10 +384,19 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
     exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
 
-    phase = read_status(exp)["phases"][0]
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
+        phase = read_status(exp)["phases"][0]
 
     assert phase["trial_data_available"] is False
     assert phase["running_attempts"] is None
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "phasesweep.engine.optuna"
+    ]
+    assert len(warnings) == 1
+    assert str(ledger) in warnings[0]
+    assert cause in warnings[0]
 
 
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])

@@ -327,14 +327,14 @@ def _cleanup_failure_payload(
         else ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
     )
     payload = _base_failure_payload(cleanup, stage="cleanup")
+    # ``cause`` is diagnostic history, not a second action contract. It
+    # intentionally retains the primary failure's own actor/retryability
+    # (for example, a storage error or user cancellation) while the authoritative
+    # outer cleanup_uncertain verdict blocks every relaunch pending recovery.
     if isinstance(primary, ProcessCleanupUncertainError):
         if isinstance(primary.__cause__, StudyStorageUnavailableError):
             payload["cause"] = _base_failure_payload(primary.__cause__, stage=cause_stage)
     else:
-        # ``cause`` is diagnostic history, not a second action contract. It
-        # intentionally retains the primary failure's own actor/retryability
-        # (for example, a user cancellation) while the authoritative outer
-        # cleanup_uncertain verdict blocks every relaunch pending recovery.
         payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
