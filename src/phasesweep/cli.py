@@ -25,12 +25,14 @@ from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    PublishedStudyMissingError,
     StudyStorageUnavailableError,
     config_status,
     run_config,
 )
 from phasesweep.engine.guards import (
     _apply_artifact_root_rebind,
+    _check_published_phase_studies,
     _experiment_lock,
     _experiment_semantic_fingerprint,
     _inspect_active_attempts,
@@ -932,7 +934,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         be reconciled from its pointer, runner identity cannot rule out PID
         reuse, the runner still appears live, the run config snapshot is missing or
         does not match its recorded digest, no trial-level cleanup evidence can be
-        confirmed, or study recovery fails with a ``RuntimeError``.
+        confirmed, restored storage cannot account for published history, or study
+        recovery fails with a ``RuntimeError``.
     """
     state_dir = state_dir.expanduser().resolve()
     try:
@@ -1120,6 +1123,35 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             cleanup_recovered = 0
             inspected_studies = 0
             if cleanup_recovery_needed:
+                loaded_studies = {}
+                for phase in config.phases:
+                    try:
+                        study = _load_existing_phase_study(config, phase)
+                    except StudyStorageUnavailableError as exc:
+                        raise click.ClickException(
+                            f"{exc} Restore the original complete storage ledger and access "
+                            "to it, then retry phasesweep mcp recover-run."
+                        ) from exc
+                    if study is not None:
+                        loaded_studies[phase.name] = study
+                if ownership_storage_unavailable:
+                    try:
+                        _check_published_phase_studies(
+                            config,
+                            loaded_studies,
+                            from_phase=(
+                                terminal_status.get("from_phase")
+                                if terminal_status is not None
+                                else None
+                            ),
+                        )
+                    except (PublishedStudyMissingError, StudyStorageUnavailableError) as exc:
+                        raise click.ClickException(
+                            "Storage recovery cannot confirm this experiment's published "
+                            "trial history. Restore the original complete storage ledger "
+                            "and study with access to it, then retry "
+                            "phasesweep mcp recover-run."
+                        ) from exc
                 if confirm:
                     active_report = _PreflightCleanupReport()
                     registered_attempts = _preflight_active_attempts(
@@ -1139,13 +1171,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
                     if generation_id == run_id or attempt_id in causal_attempt_ids
                 )
                 for phase in config.phases:
-                    try:
-                        study = _load_existing_phase_study(config, phase)
-                    except StudyStorageUnavailableError as exc:
-                        raise click.ClickException(
-                            f"{exc} Restore the original complete storage ledger and access "
-                            "to it, then retry phasesweep mcp recover-run."
-                        ) from exc
+                    study = loaded_studies.get(phase.name)
                     if study is None:
                         continue
                     inspected_studies += 1

@@ -788,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
 
     status: dict = {
         "run_id": args.run_id,
+        "from_phase": args.from_phase,
         "returncode": 0,
         "error_class": None,
         "cleanup_confirmed": True,

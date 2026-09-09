@@ -36,6 +36,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.guards import _experiment_lock
+from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.state import (
     Winner,
     _experiment_dir,
@@ -452,16 +453,48 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     assert not (_experiment_dir(experiment) / "study.db").exists()
 
 
-@pytest.mark.parametrize("tail", [b"garbage\n", b'{"op_code":'])
-def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail: bytes) -> None:
+@pytest.mark.parametrize("history", ["fresh", "published", "resume"])
+@pytest.mark.parametrize(
+    ("backend", "damage"),
+    [("sqlite", "header"), ("journal", "garbage"), ("journal", "truncated")],
+)
+def test_damaged_storage_recovery_restores_catalog_capacity(
+    tmp_path: Path, backend: str, damage: str, history: str
+) -> None:
     """Repairing a pre-launch ledger failure must let operator recovery release its slot."""
-    ledger = tmp_path / "study.journal"
+    published = history != "fresh"
+    from_phase = "q" if history == "resume" else None
+    ledger = tmp_path / ("study.db" if backend == "sqlite" else "study.journal")
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"journal:///{ledger}",
+        storage=f"{backend}:///{ledger}",
         n_trials=1,
         trial_command="echo x=0.5 {overrides}",
     )
+    if from_phase is not None:
+        experiment = experiment.model_copy(
+            update={
+                "phases": [
+                    *experiment.phases,
+                    Phase(name="q", n_trials=1, inherits=["p"], sampler=SEEDED_RANDOM),
+                ]
+            }
+        )
+    if published:
+        run_experiment(experiment)
+        if from_phase is not None:
+            optuna.delete_study(
+                study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+            )
+        # A later configured phase legitimately has no study to restore yet.
+        experiment = experiment.model_copy(
+            update={
+                "phases": [
+                    *experiment.phases,
+                    experiment.phases[0].model_copy(update={"name": "later"}),
+                ]
+            }
+        )
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
     other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
@@ -470,12 +503,17 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"t": config_path, "other": other_path}, allow={"launch": True})
     )
-    run_experiment(experiment)
-    healthy = ledger.read_bytes()
-    generation_before = _generation_path(experiment).read_bytes()
-    ledger.write_bytes(healthy + tail)
+    healthy = ledger.read_bytes() if published else b""
+    generation_before = _generation_path(experiment).read_bytes() if published else None
+    damaged = (
+        b"invalid sqlite header" + healthy[21:]
+        if backend == "sqlite"
+        else healthy + (b"garbage\n" if damage == "garbage" else b'{"op_code":')
+    )
+    ledger.write_bytes(damaged)
+    resume_args = ["--from-phase", from_phase] if from_phase is not None else []
     refused_run = subprocess.run(
-        [sys.executable, "-m", "phasesweep", "run", str(config_path)],
+        [sys.executable, "-m", "phasesweep", "run", str(config_path), *resume_args],
         capture_output=True,
         text=True,
         start_new_session=True,
@@ -484,7 +522,7 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
     assert refused_run.returncode != 0
     assert "Restore the original complete storage ledger" in refused_run.stderr
 
-    run_id = "damaged-journal"
+    run_id = "damaged-storage"
     digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
     started_at = utc_now_iso()
     claim_runner_handle(
@@ -507,6 +545,7 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
             ),
             "--cwd",
             str(tmp_path),
+            *resume_args,
         ],
         capture_output=True,
         text=True,
@@ -516,6 +555,7 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
     assert result.returncode == 1, result.stderr
     terminal_before = store.status_path(run_id).read_bytes()
     status = json.loads(terminal_before)
+    assert status["from_phase"] == from_phase
     assert status["cleanup_confirmed"] is False
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["retryable"] is False
@@ -544,11 +584,34 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
     for confirmation in ([], ["--confirm"]):
         blocked = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
         assert blocked.exit_code != 0
-        assert "could not be completely read" in blocked.output
+        assert "could not be" in blocked.output
         assert "Restore the original complete storage ledger" in blocked.output
-        assert ledger.read_bytes() == healthy + tail
+        assert ledger.read_bytes() == damaged
         assert store.status_path(run_id).read_bytes() == terminal_before
         assert not store.cleanup_recovery_path(run_id).exists()
+
+    if published:
+        for replacement in ("missing", "empty", "unrelated-trial"):
+            ledger.unlink()
+            if replacement != "missing":
+                study = optuna.create_study(
+                    study_name=f"t::{from_phase or 'p'}",
+                    storage=_resolve_storage(experiment.resolved_storage),
+                )
+                if replacement == "unrelated-trial":
+                    trial = study.ask()
+                    study.tell(trial, 0.5)
+            replacement_before = ledger.read_bytes() if ledger.exists() else None
+            for confirmation in ([], ["--confirm"]):
+                refused = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+                assert refused.exit_code != 0, refused.output
+                assert "Restore the original complete storage ledger" in refused.output
+                assert (ledger.read_bytes() if ledger.exists() else None) == replacement_before
+                assert store.status_path(run_id).read_bytes() == terminal_before
+                assert not store.cleanup_recovery_path(run_id).exists()
+                assert store.recovery_required(handle)
+            if replacement == "missing":
+                ledger.write_bytes(healthy)
 
     ledger.write_bytes(healthy)
     # A storage error after generation allocation, or an unrelated failure,
@@ -578,7 +641,11 @@ def test_damaged_journal_recovery_restores_catalog_capacity(tmp_path: Path, tail
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
     assert recovered_status["run"]["recovery_required"] is False
-    assert _generation_path(experiment).read_bytes() == generation_before
+    assert (
+        _generation_path(experiment).read_bytes() if _generation_path(experiment).exists() else None
+    ) == generation_before
+    if from_phase is not None:
+        assert "q" in run_experiment(experiment, from_phase=from_phase)
 
 
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
