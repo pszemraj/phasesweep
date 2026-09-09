@@ -31,7 +31,7 @@ from phasesweep.engine.guards import (
     _experiment_semantic_fingerprint,
     _validate_artifact_root_binding,
 )
-from phasesweep.engine.optuna import _phase_trial_stats
+from phasesweep.engine.optuna import _phase_trial_stats, _published_phase_trial_refs
 from phasesweep.engine.state import (
     PublicationState,
     WinnerSource,
@@ -95,7 +95,7 @@ def _phase_status_payloads(
     generation_trial_counts: Mapping[str, dict[str, int]],
     trial_data_available: Mapping[str, bool],
     running_attempts: Mapping[str, list[dict[str, Any]] | None],
-    published_phases: set[str],
+    unavailable_published_phases: set[str],
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
@@ -122,7 +122,8 @@ def _phase_status_payloads(
         consumed by MCP, whose terminal snapshot must not reread studies to
         learn which rows the RUNNING count refers to (PR #5 review /
         reviewer 2, blocker 6).
-    :param set[str] published_phases: Persistent phases with a current published winner.
+    :param set[str] unavailable_published_phases: Published phases whose local
+        trial identity could not be matched in the storage snapshot.
     :param str | None winner_scope_generation_id: Already-resolved generation id
         whose winner files are represented. When ``pinned`` is ``False``
         (default), this is treated as an already-captured last-success id and
@@ -154,8 +155,7 @@ def _phase_status_payloads(
             "completed": counts.get("COMPLETE", 0),
             "generation_trials": generation_trial_counts[phase.name],
             "trial_data_available": trial_data_available[phase.name],
-            "published_study_unavailable": phase.name in published_phases
-            and not any(counts.values()),
+            "published_study_unavailable": phase.name in unavailable_published_phases,
         }
         if include_winner_path:
             payload.update(
@@ -565,11 +565,12 @@ def read_status(
     whatever else may be current by the time the read happens. ``trials``,
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
-    ``published_study_unavailable`` reports a current published phase with no
-    readable trial history. When ``trial_data_available`` is true, the study
-    is confirmed missing or empty; executing it is refused, while earlier
-    phases may still load saved winners via ``from_phase``. False means the
-    history could not be inspected; a run can report cleanup uncertainty and
+    ``published_study_unavailable`` reports a current published phase whose local
+    trial identity could not be matched in storage. When both it and
+    ``trial_data_available`` are true, that trial is confirmed missing or replaced;
+    executing the phase is refused, while earlier phases may still load saved
+    winners via ``from_phase``. When ``trial_data_available`` is false, the history
+    could not be inspected; a run can report cleanup uncertainty and
     require operator recovery before further MCP launches. Publication
     integrity describes the artifacts separately.
 
@@ -651,7 +652,15 @@ def read_status(
     else:
         is_published = represented_generation_id == published_generation_id
 
-    phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
+    published_trials = (
+        _published_phase_trial_refs(publication.summary)
+        if _artifact_root_binding_applies(experiment)
+        else {}
+    )
+    phase_stats = {
+        phase.name: _phase_trial_stats(experiment, phase, published_trials.get(phase.name))
+        for phase in experiment.phases
+    }
     summary_path: Path | None
     if pinned:
         assert winner_scope_generation_id is not None
@@ -731,13 +740,11 @@ def read_status(
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
-            published_phases={
-                item["name"]
-                for item in (publication.summary or {}).get("phases", ())
-                if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-            }
-            if _artifact_root_binding_applies(experiment)
-            else set(),
+            unavailable_published_phases={
+                name
+                for name, stats in phase_stats.items()
+                if name in published_trials and not stats.published_trial_available
+            },
             include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={

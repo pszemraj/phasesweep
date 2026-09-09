@@ -1941,7 +1941,7 @@ def test_published_phase_rejects_a_missing_or_empty_named_study(
 
     expected = "is missing" if replacement == "absent" else "contains no trials"
     assert expected in str(excinfo.value)
-    assert "continuing would restart the phase at trial 0" in str(excinfo.value)
+    assert "continuing could reuse incomplete or unrelated trials" in str(excinfo.value)
     assert "Cleanup state is therefore unknown" not in str(excinfo.value)
     assert _generation_path(experiment).read_bytes() == generation_before
     assert _last_successful_generation_id(experiment) == published
@@ -2278,21 +2278,61 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
     assert _sqlite_study_exists(schemaless, schemaless.phases[0]) is False
 
 
-def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
-    """Nothing persists to conflict, so an in-memory run stays workdir-mobile."""
+@pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])
+def test_fresh_and_repeated_in_memory_roots_never_bind_or_conflict(
+    tmp_path: Path, storage: str | None
+) -> None:
+    """In-memory runs may repeat or move because they create no durable binding."""
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs_a",
+        storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
+    run_experiment(experiment)
     moved = experiment.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    run_experiment(moved)
     run_experiment(moved)
 
     assert _last_successful_generation_id(experiment) is not None
     assert _last_successful_generation_id(moved) is not None
+    assert not _artifact_root_binding_path(experiment).exists()
+    assert not _artifact_root_binding_path(moved).exists()
+
+
+@pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
+def test_persistent_bound_root_rejects_an_in_memory_configuration(
+    tmp_path: Path, in_memory_storage: str | None
+) -> None:
+    """A durable publication tree cannot be reused with an ephemeral ledger."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    owner = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(owner)
+    pointer_before = _generation_path(owner).read_bytes()
+    ledger_before = sqlite_database_path(storage)
+    assert ledger_before is not None
+    ledger_bytes_before = ledger_before.read_bytes()
+    status_before = read_status(owner)
+
+    offered = owner.model_copy(update={"storage": in_memory_storage})
+    with pytest.raises(ArtifactRootConflictError, match="in-memory configuration cannot reuse"):
+        run_experiment(offered)
+    with pytest.raises(ArtifactRootConflictError, match="in-memory configuration cannot reuse"):
+        read_status(offered)
+
+    assert _generation_path(owner).read_bytes() == pointer_before
+    assert ledger_before.read_bytes() == ledger_bytes_before
+    assert read_status(owner) == status_before
 
 
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:

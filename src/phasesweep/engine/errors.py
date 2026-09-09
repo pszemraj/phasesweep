@@ -130,7 +130,7 @@ class StudyStorageUnavailableError(PhaseSweepError):
 
 
 class PublishedStudyMissingError(PhaseSweepError):
-    """Raised before launch when a published phase's study is absent or empty."""
+    """Raised before launch when a published phase's local trial is absent or replaced."""
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):

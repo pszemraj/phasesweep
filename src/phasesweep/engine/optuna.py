@@ -7,7 +7,7 @@ import json
 import logging
 import sqlite3
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never
@@ -37,12 +37,12 @@ from phasesweep.runtime.files import (
 
 
 @dataclass(frozen=True)
-class _RunningTrialRef:
-    """Identity of one RUNNING trial observed in a storage snapshot.
+class _TrialRef:
+    """Identity of one trial recorded in a publication or storage snapshot.
 
-    Carries exactly the identity a caller needs to reconcile a RUNNING row
-    against external cleanup evidence: which trial it is, and which
-    generation/attempt claimed it. Values are ``None`` when the trial never
+    Reconciles a row against published evidence or external cleanup evidence:
+    which trial it is, and which generation/attempt claimed it.
+    Values are ``None`` when the trial never
     recorded that attribute (e.g. a row written by an older PhaseSweep).
     """
 
@@ -59,12 +59,60 @@ class _PhaseTrialStats:
     second read: it lists the RUNNING trials those counts describe, and is
     ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
     A confirmed absent study has known zero counts and an empty attempt list.
+    ``published_trial_available`` checks the requested published trial identity
+    in that same snapshot; false also covers unreadable or absent storage.
     """
 
     counts: dict[str, int]
     available: bool
     generation_counts: dict[str, dict[str, int]]
-    running_attempts: list[_RunningTrialRef] | None
+    running_attempts: list[_TrialRef] | None
+    published_trial_available: bool = False
+
+
+def _published_phase_trial_refs(
+    summary: Mapping[str, Any] | None,
+) -> dict[str, _TrialRef | None]:
+    """Return each published phase's local winning or promotion-candidate identity.
+
+    A continued baseline belongs to an earlier phase. Its promotion record
+    identifies the local candidate whose history must survive in this phase.
+
+    :param Mapping[str, Any] | None summary: Already-resolved publication summary.
+    :return dict[str, _TrialRef | None]: Local trial identities by phase; None
+        when a published phase does not record a complete identity.
+    """
+    refs: dict[str, _TrialRef | None] = {}
+    for item in (summary or {}).get("phases", ()):
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            continue
+        promotion = item.get("promotion")
+        source = promotion if isinstance(promotion, Mapping) else item
+        prefix = "candidate_" if isinstance(promotion, Mapping) else ""
+        number = source.get(f"{prefix}trial_number")
+        generation = source.get(f"{prefix}generation_id")
+        attempt = source.get(f"{prefix}attempt_id")
+        refs[item["name"]] = (
+            _TrialRef(number, generation, attempt)
+            if isinstance(number, int)
+            and not isinstance(number, bool)
+            and isinstance(generation, str)
+            and generation
+            and isinstance(attempt, str)
+            and attempt
+            else None
+        )
+    return refs
+
+
+def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
+    """Match a completed ledger trial to its published identity."""
+    return (
+        trial.state == optuna.trial.TrialState.COMPLETE
+        and trial.number == expected.trial_number
+        and trial.user_attrs.get(GENERATION_ID_ATTR) == expected.generation_id
+        and trial.user_attrs.get(ATTEMPT_ID_ATTR) == expected.attempt_id
+    )
 
 
 class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
@@ -390,19 +438,28 @@ _PHASE_TRIAL_STATS_SQL = """
     SELECT 'running', number, state, generation_json, attempt_json, 1
     FROM phase_trials
     WHERE state = 'RUNNING'
+    UNION ALL
+    SELECT 'published', number, state, generation_json, attempt_json, 1
+    FROM phase_trials
+    WHERE number = :published_trial_number
 """
 
 
-def _phase_trial_stats_params(experiment: Experiment, phase: Phase) -> dict[str, str]:
+def _phase_trial_stats_params(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None
+) -> dict[str, str | int]:
     """Bind the phase and attribute names for the observational SQL query."""
     return {
         "generation_key": GENERATION_ID_ATTR,
         "attempt_key": ATTEMPT_ID_ATTR,
         "study_name": _phase_study_name(experiment, phase),
+        "published_trial_number": published_trial.trial_number if published_trial else -1,
     }
 
 
-def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+def _sqlite_phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Return trial-state counts and RUNNING identities in one SQLite read.
 
     Status polling must be read-only. Passing a fresh SQLite URL through
@@ -414,13 +471,15 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
 
     Counts and RUNNING identities come from one CTE-backed statement, so one
     storage snapshot. SQL aggregates terminal rows by state and generation,
-    while the ``UNION ALL`` arm returns identities only for RUNNING rows. This
+    while the ``UNION ALL`` arms return RUNNING identities and the requested
+    published trial. This
     avoids transferring every historical trial on every status poll without
     splitting the read into two snapshots that could disagree during a live
     write (PR #5 review / reviewer 2, blocker 6).
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
         flag; counts are empty, running attempts ``None``, and availability
         false when the DB cannot be read safely.
@@ -442,20 +501,25 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
         try:
             rows = conn.execute(
                 _PHASE_TRIAL_STATS_SQL,
-                _phase_trial_stats_params(experiment, phase),
+                _phase_trial_stats_params(experiment, phase, published_trial),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
         return _PhaseTrialStats({}, False, {}, None)
-    return _trial_stats_from_rows(rows, study_name=_phase_study_name(experiment, phase))
+    return _trial_stats_from_rows(
+        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
+    )
 
 
-def _rdb_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+def _rdb_phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Inspect external SQL storage without Optuna's schema-initializing loader.
 
     :param Experiment experiment: Config containing the external storage URL.
     :param Phase phase: Phase whose trial counts and running identities are read.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: One snapshot, or an unavailable observation on read failure.
     """
     assert experiment.resolved_storage is not None
@@ -465,25 +529,31 @@ def _rdb_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialS
             with engine.connect() as connection:
                 rows = connection.execute(
                     sqlalchemy.text(_PHASE_TRIAL_STATS_SQL),
-                    _phase_trial_stats_params(experiment, phase),
+                    _phase_trial_stats_params(experiment, phase, published_trial),
                 ).fetchall()
         finally:
             engine.dispose()
     except Exception:  # noqa: BLE001 - status reports unavailable on any connection/read failure
         return _PhaseTrialStats({}, False, {}, None)
-    return _trial_stats_from_rows(rows, study_name=_phase_study_name(experiment, phase))
+    return _trial_stats_from_rows(
+        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
+    )
 
 
-def _trial_stats_from_rows(rows: Iterable[Sequence[Any]], *, study_name: str) -> _PhaseTrialStats:
+def _trial_stats_from_rows(
+    rows: Iterable[Sequence[Any]], *, study_name: str, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Decode aggregated counts and RUNNING identities from a SQL snapshot.
 
     :param Iterable[Sequence[Any]] rows: Rows from the observational SQL query.
     :param str study_name: Study name used in damaged-row diagnostics.
+    :param _TrialRef | None published_trial: Expected local trial from the publication.
     :return _PhaseTrialStats: Counts and running identities from the supplied rows.
     """
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
-    running_attempts: list[_RunningTrialRef] = []
+    running_attempts: list[_TrialRef] = []
+    published_trial_available = False
     for row_kind, number, state, generation_json, attempt_json, tally in rows:
         state_name = str(state)
         generation_id = _decoded_string_attr(generation_json)
@@ -493,6 +563,13 @@ def _trial_stats_from_rows(rows: Iterable[Sequence[Any]], *, study_name: str) ->
             if generation_id is not None:
                 states = generation_counts.setdefault(generation_id, {})
                 states[state_name] = states.get(state_name, 0) + count
+            continue
+        if row_kind == "published":
+            published_trial_available = (
+                state_name == "COMPLETE"
+                and _TrialRef(number, generation_id, _decoded_string_attr(attempt_json))
+                == published_trial
+            )
             continue
         if row_kind != "running":
             continue
@@ -508,34 +585,40 @@ def _trial_stats_from_rows(rows: Iterable[Sequence[Any]], *, study_name: str) ->
             )
             continue
         running_attempts.append(
-            _RunningTrialRef(
+            _TrialRef(
                 trial_number=number,
                 generation_id=generation_id,
                 attempt_id=_decoded_string_attr(attempt_json),
             )
         )
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
+    return _PhaseTrialStats(
+        counts, True, generation_counts, running_attempts, published_trial_available
+    )
 
 
-def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+def _phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Read counts and RUNNING identities without creating a missing study.
 
     SQL backends use one SELECT statement; journal storage uses one trial list.
-    Counts and RUNNING identities therefore describe the same snapshot.
+    Counts, RUNNING identities, and published trial verification therefore
+    describe the same snapshot.
     Confirmed absence reports available zero counts; read failures report
     unavailable counts.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.resolved_storage is None:
         return _PhaseTrialStats({}, False, {}, None)
     backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite":
-        return _sqlite_phase_trial_stats(experiment, phase)
+        return _sqlite_phase_trial_stats(experiment, phase, published_trial)
     if backend != "journal":
-        return _rdb_phase_trial_stats(experiment, phase)
+        return _rdb_phase_trial_stats(experiment, phase, published_trial)
     try:
         study = _load_existing_phase_study(experiment, phase)
         if study is None:
@@ -545,8 +628,11 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
         return _PhaseTrialStats({}, False, {}, None)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
-    running_attempts: list[_RunningTrialRef] = []
+    running_attempts: list[_TrialRef] = []
+    published_trial_available = False
     for trial in trials:
+        if published_trial is not None and _published_trial_matches(trial, published_trial):
+            published_trial_available = True
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
@@ -556,10 +642,12 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         running_attempts.append(
-            _RunningTrialRef(
+            _TrialRef(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
             )
         )
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
+    return _PhaseTrialStats(
+        counts, True, generation_counts, running_attempts, published_trial_available
+    )

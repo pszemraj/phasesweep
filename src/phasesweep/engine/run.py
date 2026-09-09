@@ -1569,7 +1569,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
       ``winner`` (path string or ``None``), ``published_study_unavailable``
-      (a published phase has no readable trial history), and
+      (a published phase's local trial identity could not be matched), and
       ``trial_data_available`` (true for known counts, including confirmed
       absence; false when inspection failed).
 

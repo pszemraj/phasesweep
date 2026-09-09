@@ -988,6 +988,41 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
     assert constructions["count"] == 3
 
 
+def test_wandb_transient_api_construction_failure_on_first_poll_is_retried(fake_wandb, tmp_path):
+    """A transport-caused authentication error on the first client is retryable."""
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    requests_connection_error = requests_exceptions.ConnectionError
+    constructions = {"count": 0}
+
+    class AuthenticationError(RuntimeError):
+        """Stand in for ``wandb.errors.AuthenticationError``."""
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            if constructions["count"] == 1:
+                try:
+                    raise requests_connection_error("temporary connection failure")
+                except requests_connection_error as exc:
+                    raise AuthenticationError("could not verify API key") from exc
+
+        def run(self, path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
+    assert constructions["count"] == 2
+
+
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
 @pytest.mark.parametrize("field", ["poll_seconds", "timeout_seconds"])
 @pytest.mark.parametrize("value", [float("inf"), float("nan")])

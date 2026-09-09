@@ -527,8 +527,8 @@ class PhaseStatusPayload(_ToolPayload):
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     published_study_unavailable: bool = Field(
         description=(
-            "Whether a current published phase has no readable trial history. When "
-            "trial_data_available is true, its study is confirmed missing or empty: "
+            "Whether a current published phase's local trial identity could not be matched. When "
+            "trial_data_available is true, its published trial is confirmed missing or replaced: "
             "restore the original ledger/study or use a new experiment identity; "
             "earlier phases may load validated saved winners via from_phase. When "
             "trial_data_available is false, inspection failed: a run can report "

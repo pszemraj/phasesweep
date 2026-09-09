@@ -21,10 +21,12 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Promotion,
     Sampler,
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
+from phasesweep.engine.guards import _plan_artifact_root_rebinds
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import (
     PUBLICATION_POINTER_SCHEMA_VERSION,
@@ -209,6 +211,7 @@ def test_external_status_reads_counts_and_running_identities_in_one_statement(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     completed = study.ask()
     completed.set_user_attr("phasesweep_generation_id", "gen-1")
+    completed.set_user_attr("phasesweep_attempt_id", "completed-attempt")
     study.tell(completed, 0.5)
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
@@ -229,14 +232,17 @@ def test_external_status_reads_counts_and_running_identities_in_one_statement(
         }
     )
 
-    stats = engine_optuna._phase_trial_stats(experiment, experiment.phases[0])
+    stats = engine_optuna._phase_trial_stats(
+        experiment, experiment.phases[0], engine_optuna._TrialRef(0, "gen-1", "completed-attempt")
+    )
 
     assert stats.available
+    assert stats.published_trial_available
     assert stats.counts == {"COMPLETE": 1, "RUNNING": 2}
     assert stats.generation_counts == {"gen-1": {"COMPLETE": 1, "RUNNING": 1}}
     assert sorted(stats.running_attempts, key=lambda ref: ref.trial_number) == [
-        engine_optuna._RunningTrialRef(1, "gen-1", "attempt-1"),
-        engine_optuna._RunningTrialRef(2, None, None),
+        engine_optuna._TrialRef(1, "gen-1", "attempt-1"),
+        engine_optuna._TrialRef(2, None, None),
     ]
     assert len(statements) == 1
     assert statements[0].lstrip().startswith("WITH")
@@ -381,12 +387,18 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
-@pytest.mark.parametrize("damage", ["missing-ledger", "missing-study", "empty-study", "corrupt"])
+@pytest.mark.parametrize(
+    "damage", ["missing-ledger", "missing-study", "empty-study", "corrupt", "stale-ledger"]
+)
 def test_published_status_distinguishes_absent_history_from_read_failure(
     tmp_path: Path, n_jobs: int, damage: str
 ) -> None:
     """The same status flags select the same remedy for both file backends."""
-    from phasesweep.engine import ProcessCleanupUncertainError, PublishedStudyMissingError
+    from phasesweep.engine import (
+        ArtifactRootRebindError,
+        ProcessCleanupUncertainError,
+        PublishedStudyMissingError,
+    )
     from phasesweep.mcp.redaction import status_payload
     from phasesweep.mcp.snapshots import capture_result_snapshot
 
@@ -396,11 +408,18 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         n_jobs=n_jobs,
         n_trials=1,
         allow_no_gpu_isolation=True,
-        trial_command="echo x=0.5 {overrides}",
+        trial_command="echo x=-{trial_id} {overrides}",
     )
     run_experiment(experiment)
     ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
-    if damage == "missing-ledger":
+    if damage == "stale-ledger":
+        backup = ledger.read_bytes()
+        experiment = experiment.model_copy(
+            update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+        )
+        assert run_experiment(experiment)["p"].trial_number == 1
+        ledger.write_bytes(backup)
+    elif damage == "missing-ledger":
         ledger.unlink()
     elif damage == "corrupt":
         ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
@@ -427,7 +446,9 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         phase = payload["phases"][0]
         assert phase["published_study_unavailable"] is True
         assert phase["trial_data_available"] is (damage != "corrupt")
-        assert not any(phase["trials"].values())
+        assert {state: count for state, count in phase["trials"].items() if count} == (
+            {"COMPLETE": 1} if damage == "stale-ledger" else {}
+        )
     assert status["phases"][0]["running_attempts"] == (None if damage == "corrupt" else [])
     assert (ledger.read_bytes() if ledger.exists() else None) == ledger_before
     expected_error = (
@@ -435,6 +456,102 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     )
     with pytest.raises(expected_error):
         run_experiment(experiment)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    if damage == "stale-ledger":
+        with pytest.raises(ArtifactRootRebindError, match="published trial identity"):
+            _plan_artifact_root_rebinds([experiment])
+        assert ledger.read_bytes() == ledger_before
+        assert _generation_path(experiment).read_bytes() == generation_before
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize("mismatch", [None, "number", "generation", "attempt", "state"])
+def test_published_trial_status_requires_the_exact_completed_attempt(
+    tmp_path: Path, backend: str, mismatch: str | None
+) -> None:
+    experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / 'ledger'}")
+    study = optuna.create_study(
+        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+    )
+    trial = study.ask()
+    trial.set_user_attr("phasesweep_generation_id", "generation")
+    trial.set_user_attr("phasesweep_attempt_id", "attempt")
+    if mismatch != "state":
+        study.tell(trial, 0.5)
+    expected = engine_optuna._TrialRef(
+        1 if mismatch == "number" else 0,
+        "different" if mismatch == "generation" else "generation",
+        "different" if mismatch == "attempt" else "attempt",
+    )
+
+    stats = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+
+    assert stats.available
+    assert stats.published_trial_available is (mismatch is None)
+    assert stats.counts == {"RUNNING" if mismatch == "state" else "COMPLETE": 1}
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
+def test_baseline_promotion_checks_local_candidate_and_allows_skipped_source_loss(
+    tmp_path: Path, n_jobs: int
+) -> None:
+    from phasesweep.engine import PublishedStudyMissingError
+
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        trial_command="echo x=-{trial_id}",
+        phases=[
+            Phase(
+                name=name,
+                n_trials=1,
+                n_jobs=n_jobs,
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(type="random", seed=0),
+                promotion=(
+                    Promotion(min_delta_vs="base", min_delta=100, on_fail="continue_baseline")
+                    if name == "candidate"
+                    else None
+                ),
+            )
+            for name in ("base", "candidate")
+        ],
+    )
+    run_experiment(experiment)
+    ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
+    backup = ledger.read_bytes()
+    experiment = experiment.model_copy(
+        update={
+            "phases": [
+                experiment.phases[0],
+                experiment.phases[1].model_copy(update={"n_trials": 2}),
+            ]
+        }
+    )
+    winners = run_experiment(experiment)
+    assert winners["candidate"].source.phase == "base"
+    assert winners["candidate"].promotion["candidate_trial_number"] == 1
+    assert all(
+        not phase["published_study_unavailable"] for phase in read_status(experiment)["phases"]
+    )
+
+    optuna.delete_study(
+        study_name="t::base", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+    )
+    resumed = run_experiment(experiment, from_phase="candidate")
+    assert resumed["candidate"].attempt_id == winners["base"].attempt_id
+
+    ledger.write_bytes(backup)
+    generation_before = _generation_path(experiment).read_bytes()
+    phases = read_status(experiment)["phases"]
+    assert phases[0]["published_study_unavailable"] is False
+    assert phases[1]["published_study_unavailable"] is True
+    assert phases[1]["trial_data_available"] is True
+    assert phases[1]["completed"] == 1
+    with pytest.raises(
+        PublishedStudyMissingError, match="phase 'candidate'.*published trial identity"
+    ):
+        run_experiment(experiment, from_phase="candidate")
     assert _generation_path(experiment).read_bytes() == generation_before
 
 

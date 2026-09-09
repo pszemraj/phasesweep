@@ -37,17 +37,42 @@ class WandbRunTerminalError(RuntimeError):
 class WandbSetupError(RuntimeError):
     """Raised when the W&B API client cannot be constructed at all.
 
-    Only a failure to construct the *first* client of a poll is classified
-    this way: nothing has worked yet, so bad credentials or broken settings
-    are the plausible cause and retrying would only burn the budget (review
-    v0.5.17 / finding D). Once one construction has succeeded, a later
-    failure inside the same poll cannot be a deterministic setup problem —
-    the SDK's constructor performs a network round-trip, so mid-poll failures
-    are transient request errors and are retried like any other poll error.
+    A non-transport failure to construct the first client is classified this
+    way because bad credentials or broken settings will not improve by retrying.
+    W&B verifies credentials over the network during construction, so connection
+    and timeout failures — including ones wrapped by ``AuthenticationError`` —
+    remain polling errors and are retried within the existing deadline.
     """
 
     run_id: str
     cause: str
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    """Return whether an exception chain contains a retryable transport failure.
+
+    :param Exception exc: W&B client-construction failure to classify.
+    :return bool: Whether the failure is a connection or timeout error.
+    """
+    try:
+        from requests.exceptions import ConnectionError as RequestsConnectionError
+        from requests.exceptions import Timeout as RequestsTimeout
+    except ImportError:  # pragma: no cover - installed W&B depends on requests
+        request_errors: tuple[type[BaseException], ...] = ()
+    else:
+        request_errors = (RequestsConnectionError, RequestsTimeout)
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (ConnectionError, TimeoutError, *request_errors),
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def poll_wandb_summary(
@@ -77,10 +102,9 @@ def poll_wandb_summary(
         initialization, requests, and retries. Process cleanup may finish afterward.
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
-    :raises WandbSetupError: If the first API client of this poll cannot be
-        constructed (bad credentials/settings) — a deterministic setup
-        failure, not retried. Construction failures after one client has
-        already been built are treated as transient and retried.
+    :raises WandbSetupError: If the first API client fails for a non-transport
+        reason such as bad credentials or settings. Connection and timeout
+        failures are retried within the polling budget.
     :raises WandbRunTerminalError: If the run crashes, fails, or is killed.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
     :raises UnsafeProcessCleanupError: If the worker's cleanup is uncertain.
@@ -221,17 +245,17 @@ def _poll_wandb_summary(
         # W&B's integer HTTP timeout does not bound SDK retries. The parent
         # supervises the whole worker against the deadline. Constructing per iteration
         # means construction failures happen mid-poll too; the SDK's
-        # constructor performs a network round-trip, so only the first
-        # failure (nothing has worked yet) is classified as a deterministic
-        # setup error — later ones are transient and must not abort a poll
-        # the budget could still absorb (review v0.5.17 / finding D).
+        # constructor performs a network round-trip, so connection and timeout
+        # failures must consume the polling budget even on the first attempt.
+        # Other first-construction failures still identify deterministic setup
+        # problems; after one successful construction, every failure is retried.
         try:
             api = Api(
                 overrides={"base_url": base_url},
                 timeout=max(1, ceil(remaining)),
             )
         except Exception as exc:  # noqa: BLE001 - classified into the typed error model
-            if not api_constructed:
+            if not api_constructed and not _is_transient_transport_error(exc):
                 raise WandbSetupError(run_id, str(exc)) from exc
             last_err = exc
             # The parent may terminate this worker before ``main`` serializes ``last_err``.

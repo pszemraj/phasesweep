@@ -34,7 +34,11 @@ from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
     TrialTargetRegressionError,
 )
-from phasesweep.engine.optuna import _load_existing_phase_study
+from phasesweep.engine.optuna import (
+    _load_existing_phase_study,
+    _published_phase_trial_refs,
+    _published_trial_matches,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -2052,9 +2056,22 @@ def _validate_artifact_root_binding(
     :raises LegacyArtifactRootMigrationRequiredError: A non-empty tree predates
         the reverse binding and requires explicit adoption.
     """
-    if not _artifact_root_binding_applies(experiment):
-        return
     path = _artifact_root_binding_path(experiment)
+    if not _artifact_root_binding_applies(experiment):
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ArtifactRootConflictError(
+                f"Cannot inspect artifact-root binding {path}: {exc}."
+            ) from exc
+        raise ArtifactRootConflictError(
+            f"Artifact root {_artifact_root_identity(experiment)!r} already records a "
+            "persistent storage binding. An in-memory configuration cannot reuse this "
+            "tree. Restore its persistent storage setting, or use a new experiment name "
+            "or workdir for an in-memory run. No trial ran and nothing was published."
+        )
     expected = _artifact_root_binding_payload(experiment)
     try:
         raw = strict_json_loads(path.read_text(encoding="utf-8"))
@@ -2237,9 +2254,9 @@ def _load_and_check_artifact_roots(
     not exist yet are bound by :func:`_bind_study_artifact_root` when the
     phase creates them. The exception is a phase with a winner in the current
     published generation: that publication proves the phase previously had
-    trial rows, so an absent or empty replacement study means durable evidence
-    was lost rather than that the phase is new. Skipped phases load their saved
-    winners instead and do not need a non-empty study.
+    trial rows with a specific generation and attempt identity. Missing or
+    replaced published trials mean durable evidence was lost rather than that
+    the phase is new. Skipped phases load their saved winners instead.
 
     :param Experiment experiment: Parsed experiment whose declared phase
         studies are loaded and bound to its resolved artifact root.
@@ -2249,17 +2266,15 @@ def _load_and_check_artifact_roots(
     :raises StudyStorageUnavailableError: A phase's persistent storage could
         not be inspected.
     :raises PublishedStudyMissingError: A phase to execute has a published
-        winner but no non-empty durable study.
+        result whose local trial identity is missing from durable storage.
     :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
         records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, or carries a binding that is not a string.
     """
-    if _artifact_root_binding_applies(experiment):
-        # Reject an existing foreign/legacy root before touching storage. A
-        # genuinely fresh root remains unclaimed until every study-side
-        # binding has also passed its read-only check below.
-        _validate_artifact_root_binding(experiment, claim_fresh=False)
+    # Reject an existing foreign/legacy root before touching storage, including
+    # an in-memory configuration offered a persistently bound root.
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:
@@ -2294,42 +2309,53 @@ def _check_published_phase_studies(
     *,
     from_phase: str | None = None,
 ) -> None:
-    """Require trial history for published phases that would execute.
+    """Require the published local trial identity for phases that would execute.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
     :param str | None from_phase: Resume point; earlier phases only load winners.
-    :raises PublishedStudyMissingError: A reached published study is absent or empty.
+    :raises PublishedStudyMissingError: A reached published trial is absent or replaced.
     :raises StudyStorageUnavailableError: A published study's trials cannot be read.
     """
     publication = _resolve_publication_pointer(experiment)
-    published_phases = {
-        item["name"]
-        for item in (publication.summary or {}).get("phases", ())
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
+    published_trials = _published_phase_trial_refs(publication.summary)
     reached = from_phase is None
     for phase in experiment.phases:
         if phase.name == from_phase:
             reached = True
-        if not reached or phase.name not in published_phases:
+        if not reached or phase.name not in published_trials:
             continue
         study = loaded.get(phase.name)
+        expected = published_trials[phase.name]
+        missing = "is missing"
         if study is not None:
             try:
-                if study.get_trials(deepcopy=False):
+                trials = study.get_trials(deepcopy=False)
+                if expected is not None and any(
+                    _published_trial_matches(trial, expected) for trial in trials
+                ):
                     continue
             except Exception as exc:
                 raise StudyStorageUnavailableError(
                     "Could not inspect persistent study storage for published phase "
                     f"{phase.name!r}."
                 ) from exc
-        missing = "is missing" if study is None else "contains no trials"
+            if not trials:
+                missing = "contains no trials"
+            else:
+                missing = "does not contain the published trial identity"
+                if expected is not None:
+                    missing += (
+                        f" (trial {expected.trial_number}, generation {expected.generation_id!r}, "
+                        f"attempt {expected.attempt_id!r})"
+                    )
+                else:
+                    missing += " because the publication records no complete local trial identity"
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} includes a winner for "
             f"phase {phase.name!r}, but its persistent study {missing}. That publication "
-            "proves the phase previously had durable trial rows; continuing would restart "
-            "the phase at trial 0 and could replace the current publication. Restore the "
+            "requires its original trial history; continuing could reuse incomplete or "
+            "unrelated trials and replace the current publication. Restore the "
             "original complete storage ledger and study, or use a new experiment identity "
             "for a fresh run. No generation was claimed, no trial ran, and nothing was "
             "published."
@@ -2757,9 +2783,9 @@ def _plan_artifact_root_rebinds(
     ]
     if not persistent:
         raise ArtifactRootRebindError(
-            "This config uses in-memory storage, so nothing is bound to an artifact root: "
-            "in-memory studies do not outlive the process that created them and can never "
-            "conflict with a second workdir. Nothing was written."
+            "This config uses in-memory storage and cannot rebind a persistent artifact "
+            "tree. Restore the owning persistent storage setting, or use a new experiment "
+            "name or workdir for an in-memory run. Nothing was written."
         )
     plans = [
         _ArtifactRootRebindPlan(
