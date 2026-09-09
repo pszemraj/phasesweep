@@ -1181,8 +1181,10 @@ def _registry_attempt_fail_stale_trial(
         to change (trial already terminal, study gone, or in-memory storage),
         or ``"unreachable"`` when the recorded storage could not be read
         and the entry must be retained for a later retry.
-    :raises StudySchemaMismatchError: The registry and RUNNING trial record
+    :raises StudySchemaMismatchError: The registry and trial record
         conflicting generation identities.
+    :raises ProcessCleanupUncertainError: A terminal trial lacks the identity
+        needed to attribute confirmed cleanup to the registry's attempt.
     :raises StudyStorageUnavailableError: The stale RUNNING trial could not be
         marked FAIL, or its durable recovery state could not be recorded; the
         study is left inconsistent rather than silently dropping the failure.
@@ -1252,21 +1254,9 @@ def _registry_attempt_fail_stale_trial(
         return "unreachable"
     if trial is None:
         return "terminal"
-    if trial.state != optuna.trial.TrialState.RUNNING:
-        if (
-            trial.state.is_finished()
-            and trial.number in _cleanup_recovered_trial_numbers(study)
-            and trial.user_attrs.get(ATTEMPT_ID_ATTR) == entry["attempt_id"]
-            and trial.user_attrs.get(GENERATION_ID_ATTR) == entry["generation_id"]
-        ):
-            return "recovered"
-        if trial.state.is_finished() and _trial_requires_cleanup_recovery(trial):
-            _record_cleanup_recovery(study, trial)
-            return "recovered"
-        return "terminal"
     stored_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if stored_attempt_id is not None and stored_attempt_id != entry["attempt_id"]:
-        # A conflicting durable id proves the RUNNING row belongs to another
+        # A conflicting durable id proves the row belongs to another
         # attempt. A missing id is different: registration is written before
         # the first Optuna attr, so it is the expected crash/storage-failure
         # window. The registry entry plus the already-validated lifecycle or
@@ -1276,10 +1266,24 @@ def _registry_attempt_fail_stale_trial(
     if stored_generation_id is not None and stored_generation_id != entry["generation_id"]:
         raise StudySchemaMismatchError(
             f"Attempt registry entry {entry_path} identifies generation "
-            f"{entry['generation_id']!r}, but its RUNNING trial {trial.number} in study "
+            f"{entry['generation_id']!r}, but its trial {trial.number} in study "
             f"{entry['study_name']!r} records {stored_generation_id!r}. Refusing to "
             "overwrite conflicting recovery identity."
         )
+    if trial.state != optuna.trial.TrialState.RUNNING:
+        recovered = trial.number in _cleanup_recovered_trial_numbers(study)
+        if trial.state.is_finished() and (recovered or _trial_requires_cleanup_recovery(trial)):
+            if stored_attempt_id is None or stored_generation_id is None:
+                raise ProcessCleanupUncertainError(
+                    f"Attempt registry entry {entry_path} cannot be matched to terminal "
+                    f"trial {trial.number} in study {entry['study_name']!r}: its durable "
+                    "attempt or generation identity is missing. The registry entry is "
+                    "retained; cleanup recovery cannot be attributed to this trial."
+                )
+            if not recovered:
+                _record_cleanup_recovery(study, trial)
+            return "recovered"
+        return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
         try:
             active_trial = optuna.Trial(study, trial._trial_id)

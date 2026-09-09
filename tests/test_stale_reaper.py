@@ -51,6 +51,7 @@ from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_ABORT_ATTR,
@@ -1448,6 +1449,82 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
     _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
     assert not entry_path.exists()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize(
+    "identity_change", [None, "attempt", "generation", "missing-attempt", "missing-generation"]
+)
+def test_registry_terminal_cleanup_requires_matching_attempt_identity(
+    tmp_path: Path, backend: str, identity_change: str | None
+) -> None:
+    """A stale registry entry cannot consume a replacement trial's cleanup evidence."""
+    from phasesweep.engine.guards import _iter_cleanup_uncertain_trials
+
+    experiment = make_experiment(
+        experiment="terminal-identity",
+        workdir=tmp_path / "runs",
+        storage=f"{backend}:///{tmp_path / 'ledger'}",
+    )
+    old_dir = tmp_path / "old-attempt"
+    old_dir.mkdir()
+    write_attempt_lifecycle(old_dir, attempt_id="old-attempt", state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id="old-attempt",
+        phase_name="p",
+        study_name="terminal-identity::p",
+        trial_number=0,
+        trial_dir=old_dir,
+        generation_id="old-generation",
+    )
+    # A restored divergent ledger can reuse the number without preserving
+    # the registry entry's attempt. Recovery must inspect that trial itself.
+    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    study = optuna.create_study(study_name="terminal-identity::p", storage=storage)
+    trial = study.ask()
+    new_dir = tmp_path / "ledger-attempt"
+    new_dir.mkdir()
+    if identity_change != "missing-attempt":
+        trial.set_user_attr(
+            ATTEMPT_ID_ATTR, "new-attempt" if identity_change == "attempt" else "old-attempt"
+        )
+    if identity_change != "missing-generation":
+        trial.set_user_attr(
+            GENERATION_ID_ATTR,
+            "new-generation" if identity_change == "generation" else "old-generation",
+        )
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(new_dir))
+    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+    # Registry recovery must keep working when this phase is no longer
+    # declared; there may be no later per-phase scan to catch missing identity.
+    experiment = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"name": "renamed"})]}
+    )
+    report = _PreflightCleanupReport()
+    if identity_change == "generation":
+        with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
+            _preflight_active_attempts(experiment, report)
+    elif identity_change in {"missing-attempt", "missing-generation"}:
+        with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
+            _preflight_active_attempts(experiment, report)
+    else:
+        _preflight_active_attempts(experiment, report)
+
+    if identity_change is None:
+        assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [0]
+        assert report.recovered_attempt_ids == {"old-attempt"}
+        assert list(_iter_cleanup_uncertain_trials(study)) == []
+    else:
+        assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
+        assert report.recovered_attempt_ids == set()
+        with pytest.raises(ProcessCleanupUncertainError):
+            list(_iter_cleanup_uncertain_trials(study))
+    assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
+        identity_change in {"generation", "missing-attempt", "missing-generation"}
+    )
 
 
 @pytest.mark.parametrize(

@@ -796,6 +796,111 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize("timeout", [None, 30.0], ids=["unbounded-read", "deadline-read"])
+def test_unexpected_status_read_failure_cleans_group_before_reraising(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: float | None,
+) -> None:
+    """A post-launch wait failure cannot leave an untracked trainer running."""
+    import phasesweep.runtime.process as process
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    real_read_frame = process._read_pipe_frame
+    frame_reads = 0
+
+    def fail_execution_status_read(_fd: int, _size: int) -> bytes:
+        raise OSError("injected execution status read failure")
+
+    def read_ready_then_arm_failure(fd: int, size: int, *, deadline: float):
+        nonlocal frame_reads
+        frame_reads += 1
+        if frame_reads == 2:
+            raise OSError("injected execution status read failure")
+        frame = real_read_frame(fd, size, deadline=deadline)
+        monkeypatch.setattr(process.os, "read", fail_execution_status_read)
+        return frame
+
+    monkeypatch.setattr(process, "_read_pipe_frame", read_ready_then_arm_failure)
+
+    with pytest.raises(OSError, match="injected execution status read failure"):
+        _run_supervised(
+            trial_dir,
+            "exec sleep 30",
+            timeout=timeout,
+            attempt_id="status-read-failure",
+        )
+
+    identity = read_stale_process_identity(
+        trial_dir,
+        expected_attempt_id="status-read-failure",
+    )
+    assert not process._process_group_alive(identity.pgid)
+    with process._lock:
+        assert identity.pgid not in process._active_children
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="status-read-failure",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+
+
+def test_unexpected_status_read_failure_reports_uncertain_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed cleanup attempt replaces an ordinary wait error with the typed stop."""
+    import phasesweep.runtime.process as process
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    real_read_frame = process._read_pipe_frame
+    frame_reads = 0
+
+    def fail_execution_status_read(_fd: int, _size: int) -> bytes:
+        raise OSError("injected execution status read failure")
+
+    def read_ready_then_arm_failure(fd: int, size: int, *, deadline: float):
+        nonlocal frame_reads
+        frame_reads += 1
+        if frame_reads == 2:
+            raise OSError("injected execution status read failure")
+        frame = real_read_frame(fd, size, deadline=deadline)
+        monkeypatch.setattr(process.os, "read", fail_execution_status_read)
+        return frame
+
+    monkeypatch.setattr(process, "_read_pipe_frame", read_ready_then_arm_failure)
+    _report_uncertain_after_real_terminate(monkeypatch)
+
+    with pytest.raises(
+        UnsafeProcessCleanupError, match="cleanup could not be confirmed"
+    ) as excinfo:
+        _run_supervised(
+            trial_dir,
+            "exec sleep 30",
+            timeout=30.0,
+            attempt_id="uncertain-status-read-failure",
+        )
+
+    assert isinstance(excinfo.value.__cause__, OSError)
+    identity = read_stale_process_identity(
+        trial_dir,
+        expected_attempt_id="uncertain-status-read-failure",
+    )
+    assert not process._process_group_alive(identity.pgid)
+    with process._lock:
+        assert identity.pgid not in process._active_children
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="uncertain-status-read-failure",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == "launching"
+
+
 def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
     """The exec'd trainer must not inherit the launcher's blocked signal mask.
 
