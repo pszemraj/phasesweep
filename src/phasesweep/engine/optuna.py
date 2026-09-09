@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
@@ -15,6 +16,8 @@ from typing import Any, assert_never
 import optuna
 import sqlalchemy
 from optuna.exceptions import ExperimentalWarning
+from optuna.storages import JournalStorage
+from optuna.storages.journal import BaseJournalBackend
 
 from phasesweep.config import (
     CategoricalParam,
@@ -264,7 +267,6 @@ def _resolve_storage(url: str | None) -> Any:
         path = Path(file_url_path(url)).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Using JournalFileStorage at %s", path)
-        from optuna.storages import JournalStorage
         from optuna.storages.journal import JournalFileBackend
 
         return JournalStorage(JournalFileBackend(str(path)))
@@ -370,6 +372,67 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     return row is not None
 
 
+@dataclass
+class _JournalSnapshot(BaseJournalBackend):
+    """Replay one captured journal without rereading or writing the live file."""
+
+    logs: list[dict[str, Any]]
+
+    def read_logs(self, log_number_from: int) -> Iterable[dict[str, Any]]:
+        """Return snapshot records starting at the requested log number.
+
+        :param int log_number_from: First record to replay.
+        :return Iterable[dict[str, Any]]: Captured records from that position.
+        """
+        return self.logs[log_number_from:]
+
+    def append_logs(self, logs: list[dict[str, Any]]) -> None:
+        """Reject writes through an observational journal snapshot.
+
+        :param list[dict[str, Any]] logs: Records the caller attempted to append.
+        :raises RuntimeError: Always; the snapshot is read-only.
+        """
+        raise RuntimeError("A journal snapshot is read-only.")
+
+
+def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
+    """Replay a complete journal snapshot before deciding whether a study exists.
+
+    Optuna tolerates an undecodable final record while another writer appends.
+    Such a snapshot is incomplete, so inspection cannot claim known counts or
+    confirmed absence. Replay also must finish before a missing-study KeyError
+    can be distinguished from a malformed journal operation.
+
+    :param str storage_url: Journal storage URL to inspect.
+    :param str study_name: Named study to load from the captured records.
+    :return optuna.Study | None: Read-only snapshot study, or confirmed absence.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
+    """
+    path = Path(file_url_path(storage_url)).expanduser()
+    try:
+        try:
+            with path.open("rb") as source:
+                size = os.fstat(source.fileno()).st_size
+                data = source.read(size)
+        except FileNotFoundError:
+            return None
+        if len(data) != size:
+            raise ValueError("The journal was truncated while its snapshot was being read.")
+        if data and not data.endswith(b"\n"):
+            raise ValueError("The journal ends with an incomplete record.")
+        records = [json.loads(line) for line in data.split(b"\n")[:-1]]
+        storage = JournalStorage(_JournalSnapshot(records))
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} could not be completely read while checking for "
+            f"study {study_name!r}."
+        ) from exc
+    try:
+        return optuna.load_study(study_name=study_name, storage=storage)
+    except KeyError:
+        return None
+
+
 def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study | None:
     """Load a phase study only if it already exists.
 
@@ -381,7 +444,7 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose stable study name should be loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
-    :raises StudyStorageUnavailableError: File-backed SQLite storage exists but
+    :raises StudyStorageUnavailableError: File-backed storage exists but
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
@@ -390,11 +453,17 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
     backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite" and not _sqlite_study_exists(experiment, phase):
         return None
-    if (
-        backend == "journal"
-        and not Path(file_url_path(experiment.resolved_storage)).expanduser().exists()
-    ):
-        return None
+    if backend == "journal":
+        if (
+            _load_journal_study_snapshot(
+                experiment.resolved_storage, _phase_study_name(experiment, phase)
+            )
+            is None
+        ):
+            return None
+        # Preflight verified a complete snapshot. Mutating callers still use
+        # Optuna's normal backend, including its concurrent-append semantics.
+        return _load_phase_study(experiment, phase)
     try:
         return _load_phase_study(experiment, phase)
     except KeyError:
@@ -620,7 +689,9 @@ def _phase_trial_stats(
     if backend != "journal":
         return _rdb_phase_trial_stats(experiment, phase, published_trial)
     try:
-        study = _load_existing_phase_study(experiment, phase)
+        study = _load_journal_study_snapshot(
+            experiment.resolved_storage, _phase_study_name(experiment, phase)
+        )
         if study is None:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)

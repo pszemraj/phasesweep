@@ -36,6 +36,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.optuna import (
     _load_existing_phase_study,
+    _load_journal_study_snapshot,
     _published_phase_trial_refs,
     _published_trial_matches,
 )
@@ -83,6 +84,7 @@ from phasesweep.runtime.files import (
     open_directory_fd,
     private_atomic_write_text,
     read_private_text_at,
+    storage_backend,
     storage_is_in_memory,
     storage_recovery_locator,
     try_lock_file,
@@ -1177,7 +1179,7 @@ def _registry_attempt_fail_stale_trial(
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger, ``"terminal"`` when nothing needed
         to change (trial already terminal, study gone, or in-memory storage),
-        or ``"unreachable"`` when the recorded storage could not be reached
+        or ``"unreachable"`` when the recorded storage could not be read
         and the entry must be retained for a later retry.
     :raises StudySchemaMismatchError: The registry and RUNNING trial record
         conflicting generation identities.
@@ -1196,23 +1198,58 @@ def _registry_attempt_fail_stale_trial(
         return "terminal"
     from phasesweep.engine.optuna import _resolve_storage
 
+    captured_trial = None
     try:
-        study = optuna.load_study(
-            study_name=entry["study_name"],
-            storage=_resolve_storage(storage_url),
-        )
-    except KeyError:
-        # The study no longer exists; there is no RUNNING trial to fix.
-        return "terminal"
+        journal = storage_backend(storage_url) == "journal"
+        if journal:
+            snapshot = _load_journal_study_snapshot(storage_url, entry["study_name"])
+            if snapshot is None:
+                return "terminal"
+            captured_trial = next(
+                (
+                    trial
+                    for trial in snapshot.get_trials(deepcopy=False)
+                    if trial.number == entry["trial_number"]
+                ),
+                None,
+            )
+            if captured_trial is None:
+                return "terminal"
+        try:
+            study = optuna.load_study(
+                study_name=entry["study_name"],
+                storage=_resolve_storage(storage_url),
+            )
+        except KeyError:
+            if journal:
+                # The captured journal contained the study. A later replay or
+                # lookup failure is uncertainty, not proof that recovery is done.
+                raise
+            return "terminal"
+        trials = study.get_trials(deepcopy=False)
     except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
         log.warning(
             "Attempt registry entry %s references storage that cannot be "
-            "reached right now; the stale trial will be retried on a later run.",
+            "read right now; the stale trial will be retried on a later run.",
             entry_path,
         )
         return "unreachable"
-    trials = study.get_trials(deepcopy=False)
     trial = next((t for t in trials if t.number == entry["trial_number"]), None)
+    if captured_trial is not None and (
+        trial is None
+        or trial._trial_id != captured_trial._trial_id
+        or any(
+            captured_trial.user_attrs.get(key) is not None
+            and trial.user_attrs.get(key) != captured_trial.user_attrs[key]
+            for key in (GENERATION_ID_ATTR, ATTEMPT_ID_ATTR)
+        )
+    ):
+        log.warning(
+            "Attempt registry entry %s changed in storage during recovery inspection; "
+            "retaining the entry for a later retry.",
+            entry_path,
+        )
+        return "unreachable"
     if trial is None:
         return "terminal"
     if trial.state != optuna.trial.TrialState.RUNNING:
@@ -2070,7 +2107,7 @@ def _validate_artifact_root_binding(
             f"Artifact root {_artifact_root_identity(experiment)!r} already records a "
             "persistent storage binding. An in-memory configuration cannot reuse this "
             "tree. Restore its persistent storage setting, or use a new experiment name "
-            "or workdir for an in-memory run. No trial ran and nothing was published."
+            "or workdir for an in-memory run. Nothing was written."
         )
     expected = _artifact_root_binding_payload(experiment)
     try:
@@ -2357,8 +2394,7 @@ def _check_published_phase_studies(
             "requires its original trial history; continuing could reuse incomplete or "
             "unrelated trials and replace the current publication. Restore the "
             "original complete storage ledger and study, or use a new experiment identity "
-            "for a fresh run. No generation was claimed, no trial ran, and nothing was "
-            "published."
+            "for a fresh run. Nothing was written."
         )
 
 

@@ -158,7 +158,7 @@ The per-run `.log` captures the detached runner's control-process stdout and std
 
 `audit.jsonl` contains best-effort append-only records for launch and cancel side effects: timestamp, local stdio actor, server session ID, tool name, bounded safe arguments, resolved IDs, outcome, safe error details, and state-transition summaries. Read-only catalog, status, await, and result calls are not logged. Audit records do not include tool result payloads, trainer logs, commands, config paths, storage URLs, environment values, sampled winner params, or effective overrides.
 
-SQLite-backed status uses a read-only direct count path. Journal-backed status goes through Optuna's full read path today, so avoid frequent polling on very large Journal-backed studies.
+SQLite-backed status uses a read-only direct count path. Journal-backed status replays a complete captured snapshot through Optuna; an incomplete final record reports unavailable trial data rather than confirmed absence. The next poll can succeed after an in-progress append finishes. This still reads the full journal, so avoid frequent polling on very large Journal-backed studies.
 
 ### Pruning terminal run history
 

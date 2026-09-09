@@ -49,7 +49,9 @@ class WandbSetupError(RuntimeError):
 
 
 def _is_transient_transport_error(exc: Exception) -> bool:
-    """Return whether an exception chain contains a retryable transport failure.
+    """Return whether the active exception chain contains a transport failure.
+
+    Follow explicit causes and unsuppressed implicit contexts.
 
     :param Exception exc: W&B client-construction failure to classify.
     :return bool: Whether the failure is a connection or timeout error.
@@ -71,7 +73,12 @@ def _is_transient_transport_error(exc: Exception) -> bool:
             (ConnectionError, TimeoutError, *request_errors),
         ):
             return True
-        current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
     return False
 
 

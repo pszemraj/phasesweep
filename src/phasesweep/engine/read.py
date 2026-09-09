@@ -570,7 +570,8 @@ def read_status(
     ``trial_data_available`` are true, that trial is confirmed missing or replaced;
     executing the phase is refused, while earlier phases may still load saved
     winners via ``from_phase``. When ``trial_data_available`` is false, the history
-    could not be inspected; a run can report cleanup uncertainty and
+    could not be completely inspected, including an incomplete journal append;
+    a run can report cleanup uncertainty and
     require operator recovery before further MCP launches. Publication
     integrity describes the artifacts separately.
 

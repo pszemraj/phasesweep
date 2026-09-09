@@ -18,6 +18,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config import (
     Experiment,
     IntParam,
@@ -1351,6 +1352,102 @@ def _fabricate_registered_attempt(
         generation_id="old-generation",
     )
     return study, trial_dir, number
+
+
+def _fabricate_registered_journal_attempt(
+    tmp_path: Path,
+    *,
+    attempt_id: str,
+) -> tuple[Experiment, Path, Path]:
+    """Create an allocated registry entry backed by a journal study."""
+    ledger = tmp_path / "attempts.journal"
+    experiment = make_experiment(
+        experiment="journal-attempt",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{ledger}",
+    )
+    study = optuna.create_study(
+        study_name="journal-attempt::p",
+        storage=engine_optuna._resolve_storage(experiment.resolved_storage),
+        direction="minimize",
+    )
+    trial = study.ask()
+    trial_dir = _trial_dir_for(
+        experiment,
+        "p",
+        trial.number,
+        generation_id="old-generation",
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name="p",
+        study_name=study.study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="old-generation",
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    return experiment, ledger, _attempts_dir(experiment) / f"{attempt_id}.json"
+
+
+@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n", b"not-json", b'{"unterminated"'])
+def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
+    tmp_path: Path, tail: bytes
+) -> None:
+    """Malformed journal tails cannot discard a stale-attempt recovery record."""
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="journal-attempt"
+    )
+    ledger.write_bytes(ledger.read_bytes() + tail)
+    ledger_before = ledger.read_bytes()
+    entry_before = entry_path.read_bytes()
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert ledger.read_bytes() == ledger_before
+    assert entry_path.read_bytes() == entry_before
+
+
+def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later live replay cannot erase snapshot-proven recovery evidence."""
+    import phasesweep.engine.guards as guards_mod
+
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="changed-journal-attempt"
+    )
+    create_study_only = ledger.read_bytes().splitlines(keepends=True)[0]
+    entry_before = entry_path.read_bytes()
+    real_snapshot = guards_mod._load_journal_study_snapshot
+
+    def snapshot_then_truncate(storage_url: str, study_name: str):
+        snapshot = real_snapshot(storage_url, study_name)
+        ledger.write_bytes(create_study_only)
+        return snapshot
+
+    monkeypatch.setattr(guards_mod, "_load_journal_study_snapshot", snapshot_then_truncate)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert ledger.read_bytes() == create_study_only
+    assert entry_path.read_bytes() == entry_before
+
+
+def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_path: Path) -> None:
+    """A valid journal can still prove that a named stale study is gone."""
+    experiment, _ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="missing-journal-attempt"
+    )
+    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    optuna.delete_study(study_name="journal-attempt::p", storage=storage)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert not entry_path.exists()
 
 
 @pytest.mark.parametrize(

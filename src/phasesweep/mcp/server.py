@@ -539,7 +539,8 @@ class PhaseStatusPayload(_ToolPayload):
     trial_data_available: bool = Field(
         description=(
             "Whether trial counts are known, including confirmed absent or empty studies. "
-            "False means inspection failed or no persistent observation is available; "
+            "False means inspection failed, a journal snapshot is incomplete, or no "
+            "persistent observation is available; "
             "zero counts then do not establish that no trials exist."
         )
     )

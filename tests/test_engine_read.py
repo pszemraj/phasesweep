@@ -386,6 +386,103 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert phase["running_attempts"] is None
 
 
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
+@pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline", "operation"])
+def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
+    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
+) -> None:
+    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
+    from phasesweep.mcp.redaction import status_payload
+
+    ledger = tmp_path / "study.journal"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{ledger}",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    if published:
+        run_experiment(experiment)
+    else:
+        optuna.create_study(
+            study_name="t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+        )
+    original = ledger.read_bytes()
+    tail = {
+        "garbage": b"not a journal record\n",
+        "partial-json": b"{",
+        "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
+        "operation": b"{}\n",
+    }[damage]
+    damaged = (original if keep_prefix else b"") + tail
+    ledger.write_bytes(damaged)
+    root = tmp_path / "runs" / "t"
+    root.mkdir(parents=True, exist_ok=True)
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    status = read_status(experiment)
+    mcp_status = status_payload(
+        "exp", status, None, result_source="current_shared_study", elapsed_seconds=None
+    )
+    for payload in (status, experiment_status(experiment), mcp_status):
+        phase = payload["phases"][0]
+        assert phase["trial_data_available"] is False
+        assert phase["published_study_unavailable"] is published
+        assert not any(phase["trials"].values())
+    assert status["phases"][0]["running_attempts"] is None
+    with pytest.raises(StudyStorageUnavailableError):
+        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
+    with pytest.raises(ProcessCleanupUncertainError):
+        run_experiment(experiment)
+
+    assert ledger.read_bytes() == damaged
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("change", ["append", "finish-partial", "truncate"])
+def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    ledger = tmp_path / "study.journal"
+    experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
+    study = optuna.create_study(
+        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+    )
+    trial = study.ask()
+    trial.set_user_attr("phasesweep_generation_id", "generation")
+    trial.set_user_attr("phasesweep_attempt_id", "attempt")
+    study.tell(trial, 0.5)
+    complete = ledger.read_bytes()
+    if change == "finish-partial":
+        ledger.write_bytes(complete[:-1])
+    expected = engine_optuna._TrialRef(0, "generation", "attempt")
+    real_fstat = engine_optuna.os.fstat
+
+    def change_after_capture(fd):
+        captured = real_fstat(fd)
+        if change == "append":
+            with ledger.open("ab") as target:
+                target.write(b"{")
+        elif change == "finish-partial":
+            ledger.write_bytes(complete)
+        else:
+            ledger.write_bytes(b"")
+        return captured
+
+    with monkeypatch.context() as patched:
+        patched.setattr(engine_optuna.os, "fstat", change_after_capture)
+        first = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+    second = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+
+    assert first.available is (change == "append")
+    assert first.published_trial_available is (change == "append")
+    assert first.counts == ({"COMPLETE": 1} if change == "append" else {})
+    assert first.running_attempts == ([] if change == "append" else None)
+    assert second.available is (change != "append")
+    assert second.published_trial_available is (change == "finish-partial")
+
+
 @pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
 @pytest.mark.parametrize(
     "damage", ["missing-ledger", "missing-study", "empty-study", "corrupt", "stale-ledger"]
@@ -458,8 +555,9 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         run_experiment(experiment)
     assert _generation_path(experiment).read_bytes() == generation_before
     if damage == "stale-ledger":
-        with pytest.raises(ArtifactRootRebindError, match="published trial identity"):
+        with pytest.raises(ArtifactRootRebindError, match="published trial identity") as excinfo:
             _plan_artifact_root_rebinds([experiment])
+        assert str(excinfo.value).endswith("Nothing was written.")
         assert ledger.read_bytes() == ledger_before
         assert _generation_path(experiment).read_bytes() == generation_before
 

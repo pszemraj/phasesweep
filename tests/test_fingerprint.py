@@ -2325,10 +2325,16 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
     status_before = read_status(owner)
 
     offered = owner.model_copy(update={"storage": in_memory_storage})
-    with pytest.raises(ArtifactRootConflictError, match="in-memory configuration cannot reuse"):
+    with pytest.raises(
+        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+    ) as excinfo:
         run_experiment(offered)
-    with pytest.raises(ArtifactRootConflictError, match="in-memory configuration cannot reuse"):
+    assert str(excinfo.value).endswith("Nothing was written.")
+    with pytest.raises(
+        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+    ) as excinfo:
         read_status(offered)
+    assert str(excinfo.value).endswith("Nothing was written.")
 
     assert _generation_path(owner).read_bytes() == pointer_before
     assert ledger_before.read_bytes() == ledger_bytes_before

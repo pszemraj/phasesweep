@@ -988,8 +988,11 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
     assert constructions["count"] == 3
 
 
-def test_wandb_transient_api_construction_failure_on_first_poll_is_retried(fake_wandb, tmp_path):
-    """A transport-caused authentication error on the first client is retryable."""
+@pytest.mark.parametrize("chain_kind", ["explicit", "implicit"])
+def test_wandb_first_constructor_retries_transport_in_active_exception_chain(
+    fake_wandb, tmp_path, chain_kind
+):
+    """Explicit causes and unsuppressed implicit contexts both justify a retry."""
     requests_exceptions = pytest.importorskip("requests.exceptions")
     requests_connection_error = requests_exceptions.ConnectionError
     constructions = {"count": 0}
@@ -1004,7 +1007,9 @@ def test_wandb_transient_api_construction_failure_on_first_poll_is_retried(fake_
                 try:
                     raise requests_connection_error("temporary connection failure")
                 except requests_connection_error as exc:
-                    raise AuthenticationError("could not verify API key") from exc
+                    if chain_kind == "explicit":
+                        raise AuthenticationError("could not verify API key") from exc
+                    raise AuthenticationError("could not verify API key")  # noqa: B904
 
         def run(self, path):
             return _FakeRun(state="finished", summary={"eval/loss": 0.123})
@@ -1021,6 +1026,45 @@ def test_wandb_transient_api_construction_failure_on_first_poll_is_retried(fake_
 
     assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
     assert constructions["count"] == 2
+
+
+@pytest.mark.parametrize("chain_kind", ["from_none", "explicit_nontransport_cause"])
+def test_wandb_first_constructor_ignores_suppressed_transport_context(
+    fake_wandb, tmp_path, chain_kind
+):
+    """A transport error outside the active exception chain does not justify retrying."""
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    requests_connection_error = requests_exceptions.ConnectionError
+    constructions = {"count": 0}
+
+    class AuthenticationError(RuntimeError):
+        """Stand in for ``wandb.errors.AuthenticationError``."""
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            try:
+                raise requests_connection_error("irrelevant earlier failure")
+            except requests_connection_error:
+                if chain_kind == "from_none":
+                    raise AuthenticationError("permanent authentication failure") from None
+                raise AuthenticationError("permanent authentication failure") from ValueError(
+                    "explicit permanent cause"
+                )
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(ExtractorError, match="W&B client setup failed"):
+        run_extractor(make_trial_context(tmp_path), cfg)
+    assert constructions["count"] == 1
 
 
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
