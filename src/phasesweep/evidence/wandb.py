@@ -93,6 +93,9 @@ def _is_transient_transport_error(exc: Exception) -> bool:
         if isinstance(current, service_api_errors):
             response = cast(Any, current).response
             status = response.http_status if response is not None else None
+            # Missing/zero status can also mean a core initialization failure.
+            # The SDK does not distinguish it from a lost response here, so
+            # ambiguous sidecar errors consume the bounded polling budget.
             if status in (None, 0, 408, 504):
                 return True
         if current.__cause__ is not None:

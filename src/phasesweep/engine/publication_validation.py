@@ -225,10 +225,6 @@ def _validate_generation_manifest(
     for kind, name in listed:
         if kind == "winner" and name not in phase_items:
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
-        if kind == "promotion" and name not in decision_items:
-            raise _fail(
-                f"artifact manifest lists a promotion decision absent from the summary for phase {name!r}"
-            )
 
     for (kind, name), entry in listed.items():
         artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
@@ -291,6 +287,44 @@ def _validate_generation_manifest(
             if payload.get("action") != decision_items[name].get("action"):
                 raise _fail(
                     f"promotion decision for phase {name!r} disagrees with the summary action"
+                )
+        else:
+            # Older schema-2 resumes listed projected promotions only in the
+            # manifest. Accept only a copy of the named earlier generation's
+            # decision; this generation's decisions must appear in its summary.
+            source_generation = payload.get("generation_id")
+            if (
+                not isinstance(source_generation, str)
+                or not SAFE_NAME_PATTERN.fullmatch(source_generation)
+                or source_generation == generation_id
+            ):
+                raise _fail(
+                    f"artifact manifest lists a promotion decision absent from the summary for phase {name!r}"
+                )
+            source_path = (
+                generation_dir.parent
+                / source_generation
+                / "phases"
+                / name
+                / _ARTIFACT_FILENAMES["promotion"]
+            )
+            try:
+                source_payload = yaml.safe_load(source_path.read_bytes())
+            except PermissionError as exc:
+                raise _permission_fail(
+                    _unreadable_artifact_permission_detail(
+                        f"source promotion artifact for phase {name!r}"
+                    )
+                ) from exc
+            except (OSError, yaml.YAMLError) as exc:
+                raise _fail(
+                    f"promotion decision for phase {name!r} cites source generation "
+                    f"{source_generation!r} with no readable promotion artifact"
+                ) from exc
+            if source_payload != payload:
+                raise _fail(
+                    f"promotion decision for phase {name!r} disagrees with "
+                    f"source generation {source_generation!r}"
                 )
 
     phases_dir = generation_dir / "phases"
