@@ -104,6 +104,9 @@ def recover_run(
     if handle is None:
         _recover_pre_spawn_orphan(store, run_id, confirm=confirm, emit=emit)
         return
+    if handle.launch_state == "launching" and store.is_pre_spawn_orphan(run_id):
+        _recover_pre_spawn_orphan(store, run_id, confirm=confirm, emit=emit)
+        return
     handle, terminal_status = _resolve_launch_state(store, handle)
     needs = _recovery_needs(store, handle, terminal_status)
     if (
@@ -153,10 +156,12 @@ def recover_run(
 def _recover_pre_spawn_orphan(
     store: RunStore, run_id: str, *, confirm: bool, emit: Callable[[str], None]
 ) -> None:
-    """Inspect or remove a config snapshot whose run handle was never created.
+    """Inspect or remove an abandoned launch preparation.
 
-    Acquires the launch lock before checking the orphan state. With confirmation, clears only a
-    confirmed pre-spawn orphan while holding that lock.
+    Acquires the launch lock before checking the orphan state. With confirmation,
+    clears only a confirmed pre-spawn orphan while holding that lock. The orphan
+    may be a legacy config snapshot without a handle or a transactional launch
+    whose persisted launching handle has a free inherited lease.
 
     :param RunStore store: Existing run store that owns the launch reservation.
     :param str run_id: Identity of the possible pre-spawn orphan.
@@ -172,9 +177,9 @@ def _recover_pre_spawn_orphan(
         if store.is_pre_spawn_orphan(run_id):
             if not confirm:
                 emit(
-                    f"Recovery preflight for {run_id}: would remove the orphaned config "
-                    "snapshot left before any runner could spawn. Re-run with --confirm "
-                    "to perform that action."
+                    f"Recovery preflight for {run_id}: would remove the abandoned launch "
+                    "preparation after verifying no runner can still start a trainer under "
+                    "this identity. Re-run with --confirm to perform that action."
                 )
                 return
             try:
@@ -182,8 +187,8 @@ def _recover_pre_spawn_orphan(
             except ValueError as exc:
                 raise RunRecoveryError(str(exc)) from None
             emit(
-                f"Removed pre-spawn orphan config snapshot for {run_id}; no runner or "
-                "trainer was launched under that identity."
+                f"Removed abandoned launch preparation for {run_id}; no runner can still "
+                "start a trainer under this identity."
             )
             return
     raise RunRecoveryError(f"unknown run id: {run_id}")

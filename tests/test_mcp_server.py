@@ -576,7 +576,7 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
         ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
     assert preflight.exit_code == 0, preflight.output
-    assert "before any runner could spawn" in preflight.output
+    assert "no runner can still start a trainer under this identity" in preflight.output
     assert snapshot.is_file()
 
     confirmed = CliRunner().invoke(
@@ -592,8 +592,75 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
         ],
     )
     assert confirmed.exit_code == 0, confirmed.output
-    assert "no runner or trainer was launched" in confirmed.output
+    assert "no runner can still start a trainer under this identity" in confirmed.output
     assert not snapshot.exists()
+
+
+def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: Path) -> None:
+    """A free launch lease makes a persisted launching handle recoverable."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    del app
+    reg = registry.get("srv")
+    run_id = "srv-abandoned-preparation"
+    pending = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    preparation = store.prepare_launch(pending, config.read_bytes())
+    artifacts = (
+        registry.state_dir / "runs" / f"{run_id}.json",
+        store.config_snapshot_path(run_id),
+        store.launch_lease_path(run_id),
+    )
+    original = {path: path.read_bytes() for path in artifacts}
+
+    held = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert held.exit_code != 0
+    assert "launch outcome is unresolved" in held.output
+    assert {path: path.read_bytes() for path in artifacts} == original
+
+    preparation.close()
+
+    preflight = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+
+    assert preflight.exit_code == 0, preflight.output
+    assert "no runner can still start a trainer under this identity" in preflight.output
+    assert {path: path.read_bytes() for path in artifacts} == original
+
+    confirmed = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "no runner can still start a trainer under this identity" in confirmed.output
+    assert all(not path.exists() for path in artifacts)
 
 
 @pytest.mark.parametrize("evidence", ["log", "dangling_handle"])
