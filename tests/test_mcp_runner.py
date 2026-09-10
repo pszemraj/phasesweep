@@ -1909,42 +1909,71 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
 ) -> None:
     """``--cwd`` replaces the ambient cwd the server used to hand the child.
 
-    The chdir happens after ``_persist_spawned_handle``, so the first thing
-    that can observe the project directory already has a durable identity the
-    server can find and terminate.
+    The inherited lease stays held through ``_persist_spawned_handle``. The
+    subsequent chdir therefore exposes the project only after the server has
+    a durable identity it can find and terminate.
     """
     store = RunStore(tmp_path / "state")
     project = tmp_path / "project"
     project.mkdir()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
+    pending = make_run_handle(
         run_id="r-cwd",
         config_sha256="a" * 64,
-        started_at=started_at,
         experiment_id="cancel_me",
+        launch_state="launching",
     )
+    preparation = store.prepare_launch(pending, b"experiment: unread\n")
+    inherited_lease_fd = os.dup(preparation.lease_fd)
+    preparation.close()
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    assert os.write(ack_write, b"A") == 1
+    os.close(ack_write)
+    ack_write = -1
     observed: dict[str, object] = {}
+    real_persist = mcp_runner._persist_spawned_handle
+
+    def persist_with_held_lease(*args: object, **kwargs: object) -> None:
+        os.fstat(inherited_lease_fd)
+        assert not store.is_pre_spawn_orphan("r-cwd")
+        real_persist(*args, **kwargs)
 
     def record_cwd(*_args: object, **_kwargs: object) -> None:
         observed["cwd"] = Path.cwd()
         observed["handle"] = store.get("r-cwd")
         raise ValueError("stop once the project directory is in effect")
 
+    monkeypatch.setattr(mcp_runner, "_persist_spawned_handle", persist_with_held_lease)
     monkeypatch.setattr(mcp_runner, "load_experiment_snapshot", record_cwd)
 
-    with pytest.raises(RuntimeError, match="stop once the project directory"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id="r-cwd",
-                config=tmp_path / "unread.yaml",
-                config_sha256="a" * 64,
-                experiment_id="cancel_me",
-                started_at=started_at,
-            ),
-            cwd=project,
-        )
+    try:
+        with pytest.raises(RuntimeError, match="stop once the project directory"):
+            runner_main(
+                [
+                    *runner_argv(
+                        store,
+                        run_id="r-cwd",
+                        config=preparation.config_snapshot_path,
+                        config_sha256="a" * 64,
+                        experiment_id="cancel_me",
+                        started_at=pending.started_at,
+                    ),
+                    "--launch-ready-fd",
+                    str(ready_write),
+                    "--launch-ack-fd",
+                    str(ack_read),
+                    "--launch-lease-fd",
+                    str(inherited_lease_fd),
+                ],
+                cwd=project,
+            )
+        os.set_blocking(ready_read, False)
+        assert os.read(ready_read, 1) == b"R"
+    finally:
+        for fd in (ready_read, ready_write, ack_read, ack_write, inherited_lease_fd):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
 
     assert observed["cwd"] == project.resolve()
     handle = observed["handle"]

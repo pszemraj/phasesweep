@@ -597,7 +597,7 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
 
 
 def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: Path) -> None:
-    """A free launch lease makes a persisted launching handle recoverable."""
+    """A free launch lease makes a persisted launch recoverable without losing its log."""
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     del app
@@ -610,10 +610,15 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: 
         launch_state="launching",
     )
     preparation = store.prepare_launch(pending, config.read_bytes())
+    log_path = store.log_path(run_id)
+    recovered_log = log_path.with_suffix(".log.recovered")
+    log_bytes = b"runner failed before persisting its process identity\n"
+    log_path.write_bytes(log_bytes)
     artifacts = (
         registry.state_dir / "runs" / f"{run_id}.json",
         store.config_snapshot_path(run_id),
         store.launch_lease_path(run_id),
+        log_path,
     )
     original = {path: path.read_bytes() for path in artifacts}
 
@@ -643,7 +648,9 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: 
 
     assert preflight.exit_code == 0, preflight.output
     assert "no runner can still start a trainer under this identity" in preflight.output
+    assert f" runner log {log_path} as {recovered_log}." in preflight.output
     assert {path: path.read_bytes() for path in artifacts} == original
+    assert not recovered_log.exists()
 
     confirmed = CliRunner().invoke(
         cli_main,
@@ -660,7 +667,64 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: 
 
     assert confirmed.exit_code == 0, confirmed.output
     assert "no runner can still start a trainer under this identity" in confirmed.output
+    assert str(recovered_log) in confirmed.output
     assert all(not path.exists() for path in artifacts)
+    assert recovered_log.read_bytes() == log_bytes
+    assert store.launch_inventory() == ([], set())
+
+
+@pytest.mark.parametrize(
+    "terminal_evidence",
+    ["status", "cleanup_uncertain", "cleanup_recovery"],
+)
+def test_operator_recovery_refuses_leased_preparation_with_terminal_evidence(
+    tmp_path: Path,
+    terminal_evidence: str,
+) -> None:
+    """Terminal evidence prevents a launch lease from proving a pre-spawn orphan."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    del app
+    reg = registry.get("srv")
+    run_id = f"srv-leased-{terminal_evidence.replace('_', '-')}"
+    pending = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    preparation = store.prepare_launch(pending, config.read_bytes())
+    preparation.close()
+    evidence_path = {
+        "status": store.status_path(run_id),
+        "cleanup_uncertain": store.cleanup_uncertain_path(run_id),
+        "cleanup_recovery": store.cleanup_recovery_path(run_id),
+    }[terminal_evidence]
+    evidence_path.write_text(json.dumps({"run_id": run_id}) + "\n")
+    artifacts = (
+        registry.state_dir / "runs" / f"{run_id}.json",
+        store.config_snapshot_path(run_id),
+        store.launch_lease_path(run_id),
+        evidence_path,
+    )
+    original = {path: path.read_bytes() for path in artifacts}
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "launch outcome is unresolved" in result.output
+    assert {path: path.read_bytes() for path in artifacts} == original
 
 
 @pytest.mark.parametrize("evidence", ["log", "dangling_handle"])
@@ -1120,7 +1184,7 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server crash before Popen leaves a provably removable preparation."""
+    """A retry preserves diagnostics from an abandoned launch preparation."""
     config = _config(tmp_path)
     _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1132,7 +1196,11 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
         launch_state="launching",
     )
     preparation = store.prepare_launch(pending, config.read_bytes())
-    preparation.close()  # Simulate the launching server disappearing before Popen.
+    abandoned_log = store.log_path(abandoned_id)
+    recovered_log = abandoned_log.with_suffix(".log.recovered")
+    log_bytes = b"runner import failed before the launch receipt\n"
+    abandoned_log.write_bytes(log_bytes)
+    preparation.close()  # Simulate both server and child disappearing before a receipt.
 
     restarted_store = RunStore(registry.state_dir)
     restarted = PhaseSweepMCP(registry, restarted_store)
@@ -1145,6 +1213,11 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
     assert restarted_store.get(abandoned_id) is None
     assert not restarted_store.config_snapshot_path(abandoned_id).exists()
     assert not restarted_store.launch_lease_path(abandoned_id).exists()
+    assert not abandoned_log.exists()
+    assert recovered_log.read_bytes() == log_bytes
+    handles, unreadable = restarted_store.launch_inventory()
+    assert [handle.run_id for handle in handles] == ["srv-retry"]
+    assert unreadable == set()
 
 
 def test_missing_runner_receipt_fails_without_reserving_retry_capacity(

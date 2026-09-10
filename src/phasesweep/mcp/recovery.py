@@ -176,19 +176,29 @@ def _recover_pre_spawn_orphan(
             )
         if store.is_pre_spawn_orphan(run_id):
             if not confirm:
+                log_path = store.log_path(run_id)
+                log_action = (
+                    f" Would preserve runner log {log_path} as "
+                    f"{log_path.with_suffix('.log.recovered')}."
+                    if log_path.exists() or log_path.is_symlink()
+                    else ""
+                )
                 emit(
                     f"Recovery preflight for {run_id}: would remove the abandoned launch "
                     "preparation after verifying no runner can still start a trainer under "
-                    "this identity. Re-run with --confirm to perform that action."
+                    f"this identity.{log_action} Re-run with --confirm to perform that action."
                 )
                 return
             try:
-                store.clear_pre_spawn_orphan(run_id)
+                recovered_log = store.clear_pre_spawn_orphan(run_id)
             except ValueError as exc:
                 raise RunRecoveryError(str(exc)) from None
+            log_result = (
+                f" Preserved runner log at {recovered_log}." if recovered_log is not None else ""
+            )
             emit(
                 f"Removed abandoned launch preparation for {run_id}; no runner can still "
-                "start a trainer under this identity."
+                f"start a trainer under this identity.{log_result}"
             )
             return
     raise RunRecoveryError(f"unknown run id: {run_id}")

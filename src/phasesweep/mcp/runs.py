@@ -686,11 +686,12 @@ class RunStore:
             return None
         return lease
 
-    def clear_pre_spawn_orphan(self, run_id: str) -> None:
-        """Remove one revalidated pre-spawn preparation durably.
+    def clear_pre_spawn_orphan(self, run_id: str) -> Path | None:
+        """Preserve any runner log and remove a revalidated preparation durably.
 
         :param str run_id: Orphan identity previously reported by launch.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
+        :return Path | None: Preserved runner log path, or None when no log existed.
         """
         lease: IO[str] | None = None
         if self.launch_lease_path(run_id).is_file():
@@ -702,16 +703,34 @@ class RunStore:
         paths = (
             self._runs_dir / f"{run_id}.json",
             self.config_snapshot_path(run_id),
-            self.log_path(run_id),
             self.launch_lease_path(run_id),
         )
+        recovered_log: Path | None = None
         try:
+            log_path = self.log_path(run_id)
+            if log_path.exists() or log_path.is_symlink():
+                recovered_log = log_path.with_suffix(".log.recovered")
+                # A child can fail before recording its identity. Keep its only
+                # diagnostic outside the active-run evidence namespace, and
+                # make the rename durable before removing the launch reservation.
+                directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+                try:
+                    os.rename(
+                        log_path.name,
+                        recovered_log.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             for path in paths:
                 with contextlib.suppress(FileNotFoundError):
                     _strict_unlink(path)
         finally:
             if lease is not None:
                 lease.close()
+        return recovered_log
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.
