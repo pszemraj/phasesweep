@@ -8,10 +8,14 @@ MCP operations that validate a catalog, start the server, install an MCP client 
 
 ## Output layout
 
-When a real run creates its `workdir`, PhaseSweep adds a `.gitignore` containing
-`*` inside it. Existing workdirs and ignore files are left untouched; the
+When a real run uses its `workdir`, PhaseSweep adds a missing `.gitignore` containing
+`*` inside it, including in existing workdirs. Existing ignore files are preserved; the
 repository's own `.gitignore` is never edited. Validation, status, and engine
 dry runs do not create the workdir.
+
+To commit selected summaries or winners, edit `<workdir>/.gitignore` because its
+rules override root-level negations; `git clean -fdx` deletes ignored output,
+including any study database stored in the workdir.
 
 With `storage: auto`, each experiment keeps its database and artifacts in one namespace:
 

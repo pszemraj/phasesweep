@@ -99,8 +99,9 @@ Review before launching real workloads: `phasesweep run experiment.yaml --dry-ru
 
 The starter uses `storage: auto`: the database lives with its artifacts under
 `<workdir>/<experiment>/`, using SQLite for sequential phases and a journal when
-any phase has parallel jobs. A newly created workdir ignores its own contents,
-so integrating PhaseSweep does not require editing your repository's `.gitignore`.
+any phase has parallel jobs. A real run adds a missing `<workdir>/.gitignore`,
+including in an existing workdir, so integrating PhaseSweep does not require
+editing your repository's `.gitignore`. Existing workdir ignore files are preserved.
 Set `workdir` to an absolute scratch path to move the complete output tree.
 
 ```bash

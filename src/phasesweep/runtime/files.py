@@ -32,16 +32,11 @@ SHARED_FILE_MODE = 0o660
 
 
 def ensure_workdir(path: Path) -> None:
-    """Create a self-ignoring workdir, leaving existing directories untouched.
+    """Ensure a workdir ignores its contents without replacing an existing ignore file.
 
     :param Path path: Resolved artifact workdir to create.
     """
-    try:
-        path.mkdir(parents=True)
-    except FileExistsError:
-        if not path.is_dir():
-            raise
-        return
+    path.mkdir(parents=True, exist_ok=True)
     try:
         with (path / ".gitignore").open("x", encoding="utf-8") as handle:
             handle.write("*\n")

@@ -61,7 +61,10 @@ def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
     assert not str(b_dir).startswith(str(a_dir) + "/")
 
 
-def test_run_experiment_writes_summary_at_namespaced_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("existing_workdir", [False, True])
+def test_run_experiment_writes_summary_at_namespaced_path(
+    tmp_path: Path, existing_workdir: bool
+) -> None:
     """End-to-end: a real run must write ``summary.yaml`` under the
     ``<workdir>/<experiment>/`` tree, not directly under ``<workdir>``.
     """
@@ -71,6 +74,8 @@ def test_run_experiment_writes_summary_at_namespaced_path(tmp_path: Path) -> Non
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
     )
+    if existing_workdir:
+        Path(exp.workdir).mkdir()
     run_experiment(exp)
     assert (_summary_path(exp)).is_file()
     # The pre-v0.5.7 location must NOT be created.
@@ -79,18 +84,16 @@ def test_run_experiment_writes_summary_at_namespaced_path(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("existing_ignore", [None, "keep-me\n"])
-def test_existing_workdir_is_untouched(tmp_path: Path, existing_ignore: str | None) -> None:
+def test_existing_workdir_adds_only_missing_ignore(
+    tmp_path: Path, existing_ignore: str | None
+) -> None:
     workdir = tmp_path / "runs"
     workdir.mkdir()
     ignore = workdir / ".gitignore"
     if existing_ignore is not None:
         ignore.write_text(existing_ignore)
     ensure_workdir(workdir)
-    assert (
-        ignore.read_text() == existing_ignore
-        if existing_ignore is not None
-        else not ignore.exists()
-    )
+    assert ignore.read_text() == (existing_ignore if existing_ignore is not None else "*\n")
 
 
 def test_new_workdir_does_not_modify_repository_ignore(tmp_path: Path) -> None:
