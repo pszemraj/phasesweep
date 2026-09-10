@@ -42,7 +42,7 @@ The package is organized by behavior:
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
 
-Within the engine, use these modules to follow ownership and publication:
+Within the engine, use these modules to follow ownership and publication. Module names in this table are relative to `phasesweep.engine`: its `evidence` module validates saved trial artifacts, while the separate `phasesweep.evidence` package extracts metrics and evaluates gates.
 
 | Responsibility | Modules |
 | --- | --- |
