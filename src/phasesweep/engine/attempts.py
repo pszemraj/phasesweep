@@ -54,7 +54,7 @@ from phasesweep.runtime.process import (
 )
 
 _TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "cancelled", "fatal"})
-log = logging.getLogger("phasesweep.engine.guards")
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

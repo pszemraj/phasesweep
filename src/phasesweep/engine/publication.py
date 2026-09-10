@@ -17,7 +17,7 @@ from phasesweep.engine.state import (
     PublicationState,
 )
 
-log = logging.getLogger("phasesweep.engine.state")
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

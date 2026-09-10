@@ -25,7 +25,7 @@ from phasesweep.runtime.process import absorb_shutdown_signals
 if TYPE_CHECKING:
     from phasesweep.engine.run import PublicationHook
 
-log = logging.getLogger("phasesweep.engine.run")
+log = logging.getLogger(__name__)
 
 
 def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:

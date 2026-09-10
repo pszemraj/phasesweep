@@ -363,7 +363,7 @@ def test_record_write_failure_after_commit_leaves_run_successful(
 
     monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -371,7 +371,9 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     assert second_generation is not None
     assert second_generation != first_generation
     assert any(
-        "failed to write the immutable generation record" in r.message for r in caplog.records
+        r.name == "phasesweep.engine.generation"
+        and "failed to write the immutable generation record" in r.message
+        for r in caplog.records
     )
     # The record itself never got created; publication still succeeded.
     assert not _generation_record_path(experiment, second_generation).is_file()
@@ -398,7 +400,7 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
 
     monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -699,7 +701,7 @@ def test_successful_publication_never_logs_a_record_refusal(
     noise on every publication.
     """
     experiment = _stored_experiment(tmp_path)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
         run_experiment(experiment)
         run_experiment(experiment)  # republish onto the same storage
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
@@ -1370,7 +1372,7 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
 
     monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         results = run_suite(suite)
 
     assert set(results) == {"one"}
@@ -1571,7 +1573,7 @@ def test_suite_state_write_failure_preserves_cancellation(
     )
 
     with (
-        caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"),
+        caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"),
         pytest.raises(PhaseSweepShutdown) as exc_info,
     ):
         run_suite(config)

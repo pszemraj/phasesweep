@@ -33,7 +33,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.json import strict_json_loads
 
-log = logging.getLogger("phasesweep.engine.guards")
+log = logging.getLogger(__name__)
 
 
 def _artifact_root_identity(experiment: Experiment) -> str:

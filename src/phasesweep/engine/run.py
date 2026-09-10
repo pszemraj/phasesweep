@@ -226,9 +226,6 @@ def config_status(config: Config) -> dict[str, Any]:
     return experiment_status(config)
 
 
-log = logging.getLogger("phasesweep.engine.run")
-
-
 def run_experiment(
     experiment: Experiment,
     *,

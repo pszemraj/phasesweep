@@ -294,4 +294,4 @@ def _verify_fingerprint(
     return fp
 
 
-log = logging.getLogger("phasesweep.engine.guards")
+log = logging.getLogger(__name__)

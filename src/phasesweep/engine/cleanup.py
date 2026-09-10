@@ -33,7 +33,7 @@ from phasesweep.runtime.process import (
     cleanup_stale_trial_process,
 )
 
-log = logging.getLogger("phasesweep.engine.guards")
+log = logging.getLogger(__name__)
 
 
 def _reap_stale_trials(

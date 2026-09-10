@@ -38,7 +38,7 @@ from phasesweep.runtime.process import (
 )
 from phasesweep.runtime.time import utc_now_iso
 
-log = logging.getLogger("phasesweep.engine.run")
+log = logging.getLogger(__name__)
 
 
 def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Winner]]:

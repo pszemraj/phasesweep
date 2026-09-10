@@ -27,7 +27,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.runtime.files import atomic_text_writer, fsync_directory
 
-log = logging.getLogger("phasesweep.engine.state")
+log = logging.getLogger(__name__)
 
 
 def _write_yaml_atomic(path: Path, payload: Any) -> None:

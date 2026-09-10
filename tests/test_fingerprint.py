@@ -2771,12 +2771,14 @@ def test_load_winner_warns_once_on_inherited_environment_drift(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.state"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.artifacts"):
         for _ in range(2):
             _load_winner(exp, exp.phases[0], {})
 
     warnings = [r for r in caplog.records if "environment" in r.getMessage()]
     assert len(warnings) == (1 if diverged else 0)
+    if warnings:
+        assert warnings[0].name == "phasesweep.engine.artifacts"
 
 
 def test_save_winner_replace_failure_preserves_existing_file(
