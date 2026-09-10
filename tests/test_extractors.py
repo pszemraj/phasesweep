@@ -11,6 +11,7 @@ import types
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -48,6 +49,7 @@ class _FakeRun:
     def __init__(self, state: str, summary: dict):
         self.state = state
         self.summary = summary
+        self.summary_metrics = summary
 
 
 class _FakeApi:
@@ -116,9 +118,12 @@ def wandb_worker_sdk(tmp_path, monkeypatch):
     return install
 
 
-def test_wandb_worker_returns_summary(wandb_worker_sdk, tmp_path):
+def test_wandb_worker_returns_raw_sdk_summary_metrics(wandb_worker_sdk, tmp_path):
     wandb_worker_sdk(
         """
+        class SummarySubDict:
+            pass
+
         class Api:
             def __init__(self, overrides=None, timeout=None):
                 assert overrides == {"base_url": "https://example.test"}
@@ -128,7 +133,8 @@ def test_wandb_worker_returns_summary(wandb_worker_sdk, tmp_path):
                 assert path == "entity/project/attempt"
                 class Run:
                     state = "finished"
-                    summary = {"loss": 0.25, "extra": [1, "two"]}
+                    summary = {"loss": 0.25, "_wandb": SummarySubDict()}
+                    summary_metrics = {"loss": 0.25, "_wandb": {"runtime": 1}}
                 return Run()
         """
     )
@@ -142,12 +148,26 @@ def test_wandb_worker_returns_summary(wandb_worker_sdk, tmp_path):
         poll_seconds=0.01,
         timeout_seconds=5,
         required_keys=["loss"],
-    ) == {"loss": 0.25, "extra": [1, "two"]}
+    ) == {"loss": 0.25, "_wandb": {"runtime": 1}}
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
     assert (
         read_stale_process_identity(tmp_path, expected_attempt_id="attempt").attempt_id == "attempt"
     )
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+
+
+def test_wandb_sdk_summary_metrics_avoid_nested_summary_wrapper(tmp_path):
+    """Current W&B's raw summary avoids its nested mapping wrapper."""
+    summary_module = pytest.importorskip("wandb.apis.public.summary")
+    raw_summary = {"loss": 0.25, "_wandb": {"runtime": 1}}
+    summary = summary_module.HTTPSummary(
+        types.SimpleNamespace(dir=str(tmp_path), id="attempt", entity="entity", project="project"),
+        Mock(),
+        summary=raw_summary,
+    )
+
+    assert isinstance(dict(summary)["_wandb"], summary_module.SummarySubDict)
+    assert json.loads(json.dumps(raw_summary)) == raw_summary
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
@@ -864,12 +884,9 @@ def test_wandb_request_timeout_shrinks_with_poll_budget(
     assert timeouts == [10, 3]
 
 
-def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path):
-    """WandbExtractor rejects any terminal state via one
-    ``run.state in {"crashed", "failed", "killed"}`` set-membership check; one
-    representative value (``"failed"``) pins that single branch.
-    """
-    state = "failed"
+@pytest.mark.parametrize("state", ["failed", "preempted"])
+def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path, state):
+    """Only a finished W&B run can provide selectable objective evidence."""
     fake_wandb(lambda _path: _FakeRun(state=state, summary={"eval/loss": 99.0}))
     cfg = WandbExtractor(
         type="wandb",
@@ -883,6 +900,22 @@ def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path)
     with pytest.raises(ExtractorError, match=rf"state '{state}'.*only finished"):
         ctx = make_trial_context(tmp_path)
         run_extractor(ctx, cfg)
+
+
+def test_wandb_extractor_keeps_preempting_active(fake_wandb, tmp_path):
+    """Preemption in progress may still resolve to a finished summary."""
+    states = iter(["preempting", "finished"])
+    fake_wandb(lambda _path: _FakeRun(state=next(states), summary={"eval/loss": 0.123}))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
 
 
 def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wandb, tmp_path):
@@ -1063,6 +1096,135 @@ def test_wandb_first_constructor_retries_severed_sidecar_timeout(monkeypatch, tm
         timeout_seconds=1.0,
     ) == {"eval/loss": 0.123}
     assert constructions["count"] == 2
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("wrapper", ["service", "requests"])
+def test_wandb_lookup_fails_fast_for_actual_wrapped_authorization_status(
+    monkeypatch, status, wrapper
+):
+    """Both current and older SDKs wrap HTTP denials in ``CommError``."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    if wrapper == "service":
+        service = pytest.importorskip("wandb.sdk.lib.service.service_connection")
+        api_proto = pytest.importorskip("wandb.proto.wandb_api_pb2")
+        cause = service.WandbApiFailedError(
+            f"HTTP {status}", api_proto.ApiErrorResponse(http_status=status)
+        )
+    else:
+        requests = pytest.importorskip("requests")
+        response = requests.Response()
+        response.status_code = status
+        cause = requests.exceptions.HTTPError(f"HTTP {status}", response=response)
+        # W&B 0.16 has CommError.exc but no service_connection module.
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, **kwargs):
+            constructions["count"] += 1
+
+        def run(self, path):
+            raise errors.CommError(f"HTTP {status}", cause)
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    with pytest.raises(WandbSetupError, match=rf"HTTP {status}"):
+        _poll_wandb_summary(
+            base_url="https://example.test",
+            entity="me",
+            project="proj",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+
+    assert constructions["count"] == 1
+
+
+@pytest.mark.parametrize("wrapper", ["service", "requests"])
+def test_wandb_lookup_retries_actual_wrapped_404(monkeypatch, wrapper):
+    """A freshly created run can remain unavailable while W&B catches up."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    if wrapper == "service":
+        service = pytest.importorskip("wandb.sdk.lib.service.service_connection")
+        api_proto = pytest.importorskip("wandb.proto.wandb_api_pb2")
+        cause = service.WandbApiFailedError(
+            "run not yet visible", api_proto.ApiErrorResponse(http_status=404)
+        )
+    else:
+        requests = pytest.importorskip("requests")
+        response = requests.Response()
+        response.status_code = 404
+        cause = requests.exceptions.HTTPError("run not yet visible", response=response)
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    lookups = {"count": 0}
+
+    class Api:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, path):
+            lookups["count"] += 1
+            if lookups["count"] == 1:
+                raise errors.CommError("run not yet visible", cause)
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    ) == {"eval/loss": 0.123}
+    assert lookups["count"] == 2
+
+
+@pytest.mark.parametrize("service_module_available", [True, False])
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_retries_actual_wrapped_transport_error(monkeypatch, service_module_available, stage):
+    """A ``CommError`` keeps its transport cause outside normal exception chaining."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    if not service_module_available:
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    calls = {"count": 0}
+
+    def fail_once():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise errors.CommError(
+                "temporary connection failure",
+                requests_exceptions.ConnectionError("temporary connection failure"),
+            )
+
+    class Api:
+        def __init__(self, **kwargs):
+            if stage == "constructor":
+                fail_once()
+
+        def run(self, path):
+            if stage == "lookup":
+                fail_once()
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    ) == {"eval/loss": 0.123}
+    assert calls["count"] == 2
 
 
 @pytest.mark.parametrize("chain_kind", ["from_none", "explicit_nontransport_cause"])

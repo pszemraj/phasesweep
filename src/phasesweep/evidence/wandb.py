@@ -35,13 +35,14 @@ class WandbRunTerminalError(RuntimeError):
 
 @dataclass(frozen=True)
 class WandbSetupError(RuntimeError):
-    """Raised when the W&B API client cannot be constructed at all.
+    """Raised for permanent W&B setup or authentication failures.
 
     A non-transport failure to construct the first client is classified this
     way because bad credentials or broken settings will not improve by retrying.
     W&B verifies credentials over the network during construction, so connection
     and timeout failures — including ones wrapped by ``AuthenticationError`` —
     remain polling errors and are retried within the existing deadline.
+    HTTP 401 and 403 run-lookup failures are also setup errors.
     """
 
     run_id: str
@@ -67,8 +68,15 @@ def _is_transient_transport_error(exc: Exception) -> bool:
         request_errors = (RequestsConnectionError, RequestsTimeout)
 
     try:
-        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
+        from wandb.errors import CommError
     except ImportError:  # pragma: no cover - W&B is optional
+        comm_errors: tuple[type[BaseException], ...] = ()
+    else:
+        comm_errors = (CommError,)
+
+    try:
+        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
+    except ImportError:  # Older supported SDKs use requests errors inside CommError.
         service_api_errors: tuple[type[BaseException], ...] = ()
     else:
         service_api_errors = (WandbApiFailedError,)
@@ -89,8 +97,56 @@ def _is_transient_transport_error(exc: Exception) -> bool:
                 return True
         if current.__cause__ is not None:
             current = current.__cause__
-        elif not current.__suppress_context__:
+        elif current.__context__ is not None and not current.__suppress_context__:
             current = current.__context__
+        elif isinstance(current, comm_errors):
+            current = cast(Any, current).exc
+        else:
+            current = None
+    return False
+
+
+def _is_nonretryable_authorization_error(exc: Exception) -> bool:
+    """Return whether a W&B API error reports an HTTP authentication denial.
+
+    Public API calls wrap the underlying service or requests error in ``CommError``.
+    Status 404 remains retriable because a newly created run may not be visible yet.
+
+    :param Exception exc: W&B public-API lookup failure.
+    :return bool: Whether the error has a 401 or 403 response status.
+    """
+    try:
+        from requests.exceptions import HTTPError
+        from wandb.errors import CommError
+    except ImportError:  # pragma: no cover - installed W&B depends on requests
+        return False
+
+    try:
+        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
+    except ImportError:  # W&B 0.16 has CommError but no service API error class.
+        service_api_errors: tuple[type[BaseException], ...] = ()
+    else:
+        service_api_errors = (WandbApiFailedError,)
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status: int | None = None
+        if isinstance(current, service_api_errors):
+            response = cast(Any, current).response
+            status = response.http_status if response is not None else None
+        elif isinstance(current, HTTPError):
+            response = current.response
+            status = response.status_code if response is not None else None
+        if status in (401, 403):
+            return True
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+        elif isinstance(current, CommError) and current.exc is not None:
+            current = current.exc
         else:
             current = None
     return False
@@ -124,9 +180,10 @@ def poll_wandb_summary(
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
     :raises WandbSetupError: If the first API client fails for a non-transport
-        reason such as bad credentials or settings. Connection and timeout
-        failures are retried within the polling budget.
-    :raises WandbRunTerminalError: If the run crashes, fails, or is killed.
+        reason such as bad credentials or settings, or a run lookup reports HTTP
+        401 or 403. Connection and timeout failures are retried within the polling
+        budget.
+    :raises WandbRunTerminalError: If the run crashes, fails, is killed, or is preempted.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
     :raises UnsafeProcessCleanupError: If the worker's cleanup is uncertain.
     :raises RuntimeError: If the polling worker fails unexpectedly.
@@ -287,10 +344,10 @@ def _poll_wandb_summary(
                 break
             try:
                 run = api.run(path)
-                if run.state in {"crashed", "failed", "killed"}:
+                if run.state in {"crashed", "failed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
-                    summary = dict(run.summary)
+                    summary = run.summary_metrics
                     if not wait_for_keys or all(key in summary for key in required):
                         if time.monotonic() >= deadline:
                             break
@@ -298,6 +355,8 @@ def _poll_wandb_summary(
             except WandbRunTerminalError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if _is_nonretryable_authorization_error(exc):
+                    raise WandbSetupError(run_id, str(exc)) from exc
                 last_err = exc
                 # The parent may terminate this worker before ``main`` serializes ``last_err``.
                 print(str(exc), file=sys.stderr, flush=True)
