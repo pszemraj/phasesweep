@@ -29,14 +29,16 @@ from phasesweep.engine import (
     read_status,
 )
 from phasesweep.engine.optuna import _phase_study_name
-from phasesweep.engine.state import (
-    TRAINER_INPUT_ATTR,
+from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
     _generations_dir,
-    _last_successful_generation_id,
     _last_successful_generation_path,
     _phase_dir,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.state import (
+    TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
 

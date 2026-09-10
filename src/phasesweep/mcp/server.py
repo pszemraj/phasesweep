@@ -32,9 +32,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import generation_id_source, read_status, read_winners
-from phasesweep.engine.guards import _experiment_semantic_fingerprint
+from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
-from phasesweep.engine.state import Winner, WinnerSourceKind, _load_winner
+from phasesweep.engine.state import Winner, WinnerSourceKind
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AuditLogger

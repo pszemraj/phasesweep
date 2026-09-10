@@ -10,7 +10,7 @@ Reads here are permissive about partial run state and never raise on a missing
 winner. They still fail closed when the artifact root belongs to another
 storage ledger: combining one database's trial counts with another database's
 publication is not a partial result. They do NOT re-verify phase fingerprints:
-that check belongs to the resume path in ``engine.state._load_winner``, not to
+that check belongs to the resume path in ``engine.artifacts._load_winner``, not to
 a status read.
 """
 
@@ -26,25 +26,29 @@ import yaml
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.guards import (
+from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_applies,
-    _experiment_semantic_fingerprint,
     _validate_artifact_root_binding,
 )
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _phase_trial_stats, _published_phase_trial_refs
-from phasesweep.engine.state import (
-    PublicationState,
-    WinnerSource,
-    WinnerSourceKind,
+from phasesweep.engine.paths import (
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
+)
+from phasesweep.engine.publication import (
     _last_successful_generation_id,
-    _parse_winner_source,
     _published_summary_path_for,
     _published_winner_path,
     _published_winner_path_for,
     _resolve_publication_pointer,
+)
+from phasesweep.engine.state import (
+    PublicationState,
+    WinnerSource,
+    WinnerSourceKind,
+    _parse_winner_source,
 )
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
@@ -102,7 +106,7 @@ def _phase_status_payloads(
     """Build per-phase status payloads for CLI and MCP readers.
 
     ``winner_scope_generation_id`` must already be resolved by the caller
-    exactly once (e.g. a single :func:`phasesweep.engine.state._resolve_publication_pointer`
+    exactly once (e.g. a single :func:`phasesweep.engine.publication._resolve_publication_pointer`
     call, or a caller-pinned id) and is reused for every phase in this one
     call -- this function never re-resolves the last-success pointer itself,
     so one status object spanning several phases can never mix identities
@@ -275,7 +279,7 @@ def read_winner(
             consistent with this module's permissive contract and with
             ``_phase_trial_stats`` swallowing transient backend errors. The
         strict, fingerprint-verifying read used for ``--from-phase`` resume
-        lives in ``engine.state._load_winner`` and is intentionally not
+        lives in ``engine.artifacts._load_winner`` and is intentionally not
         relaxed here.
 
     """

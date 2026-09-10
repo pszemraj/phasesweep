@@ -11,8 +11,8 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.artifacts import _winner_source_or_default
 from phasesweep.engine.read import ResultContext
-from phasesweep.engine.state import _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState
 

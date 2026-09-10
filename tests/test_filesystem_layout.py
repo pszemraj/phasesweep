@@ -16,12 +16,12 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import run_experiment, run_suite
-from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import (
+from phasesweep.engine.paths import (
     _experiment_dir,
     _phase_dir,
     _summary_path,
 )
+from phasesweep.engine.run import experiment_status
 from phasesweep.runtime.files import (
     atomic_text_writer,
     atomic_write_text,

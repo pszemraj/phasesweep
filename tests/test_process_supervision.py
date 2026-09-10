@@ -20,7 +20,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.engine.guards import _reap_stale_trials
+from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
@@ -1501,19 +1501,30 @@ def test_reaper_raises_when_cleanup_uncertain(
     which let new trials launch onto a potentially-leaked GPU.
     """
 
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._read_trial_process_identity",
-        lambda *_args, **_kwargs: StaleProcessIdentity(
+    def fake_identity(*_args: object, **_kwargs: object) -> StaleProcessIdentity:
+        return StaleProcessIdentity(
             schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
             attempt_id="uncertain-attempt",
             pid=99999,
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-        ),
+        )
+
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts._read_trial_process_identity",
+        fake_identity,
     )
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.cleanup._read_trial_process_identity",
+        fake_identity,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: False,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: False,
     )
 

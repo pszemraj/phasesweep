@@ -12,9 +12,9 @@ import optuna
 import pytest
 import yaml
 
-from phasesweep.engine.guards import _validate_artifact_root_binding
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
-from phasesweep.engine.state import _generation_winner_path, _winner_path
+from phasesweep.engine.paths import _generation_winner_path, _winner_path
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (

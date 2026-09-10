@@ -12,15 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
-from phasesweep.engine.guards import _experiment_semantic_fingerprint
+from phasesweep.engine.artifacts import _winner_source_or_default
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
     PublicationState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _generation_record_path,
-    _winner_source_or_default,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 

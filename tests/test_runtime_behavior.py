@@ -40,12 +40,18 @@ from phasesweep.engine import (
     read_status,
     read_winner,
 )
-from phasesweep.engine.guards import _load_phase_policy_state
+from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.optuna import (
     _build_sampler,
     _create_phase_study,
     _resolve_storage,
     _suggest,
+)
+from phasesweep.engine.paths import (
+    _attempts_dir,
+    _last_successful_generation_path,
+    _summary_path,
+    _winner_path,
 )
 from phasesweep.engine.phase import CsvSnapshotThrottle
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -60,12 +66,8 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
-    _attempts_dir,
-    _last_successful_generation_path,
-    _load_winner,
-    _summary_path,
-    _winner_path,
 )
+from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import (
     ExecutedTrial,
     TrialExecutionError,
@@ -447,7 +449,7 @@ def test_terminal_callback_reports_success_evidence(
         cleanup_report.uncertain_attempt_ids.add("attempt-uncertain")
         return {}
 
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr(
         "phasesweep.engine.run._run_experiment_inner",
         lambda *_args, **_kwargs: {},
@@ -480,7 +482,7 @@ def test_terminal_callback_preserves_failure_when_callback_raises(
         raise CallbackError("snapshot failed")
 
     monkeypatch.setattr(
-        "phasesweep.engine.run._preflight_existing_studies",
+        "phasesweep.engine.guards._preflight_existing_studies",
         lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
@@ -514,7 +516,7 @@ def test_terminal_callback_failure_cannot_fail_published_run(
         raise CallbackError("snapshot failed")
 
     monkeypatch.setattr(
-        "phasesweep.engine.run._preflight_existing_studies",
+        "phasesweep.engine.guards._preflight_existing_studies",
         lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
@@ -1433,7 +1435,11 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", uncertain_on_second)
     monkeypatch.setattr(optuna.Trial, "set_user_attr", maybe_refuse_cleanup_attr)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: cleanup_safe["value"],
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: cleanup_safe["value"],
     )
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
@@ -1562,7 +1568,11 @@ def test_wandb_cleanup_uncertainty_blocks_topup_until_recovery(
     # durable identity in the same trial directory.
     monkeypatch.setattr("phasesweep.runtime.process.run_supervised", supervise_wandb_worker)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: cleanup_safe["value"],
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: cleanup_safe["value"],
     )
 

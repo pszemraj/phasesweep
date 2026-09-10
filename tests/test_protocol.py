@@ -33,16 +33,18 @@ from phasesweep.engine import (
     read_winner,
     run_experiment,
 )
-from phasesweep.engine.run import ExperimentRunOutcome
-from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
-from phasesweep.engine.state import (
-    Winner,
+from phasesweep.engine.paths import (
     _generation_path,
     _generation_promotion_decision_path,
     _generation_summary_path,
     _last_successful_generation_path,
     _promotion_decision_path,
     _trial_dir_for,
+)
+from phasesweep.engine.run import ExperimentRunOutcome
+from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
+from phasesweep.engine.state import (
+    Winner,
 )
 from phasesweep.evidence.evaluation import evaluate_gates
 from phasesweep.mcp.redaction import winners_payload

@@ -19,7 +19,8 @@ import phasesweep.engine as engine
 import phasesweep.evidence as evidence
 from phasesweep.engine import errors as engine_errors
 from phasesweep.engine import run_experiment
-from phasesweep.engine.state import _generation_dir, _last_successful_generation_id
+from phasesweep.engine.paths import _generation_dir
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.evidence import evaluation as evidence_evaluation
 from tests.conftest import make_experiment, write_constant_trainer
 

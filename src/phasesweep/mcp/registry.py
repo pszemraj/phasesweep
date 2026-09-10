@@ -25,7 +25,7 @@ from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.state import _experiment_dir
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (

@@ -38,9 +38,25 @@ from phasesweep.engine import (
     TrialTargetRegressionError,
     UnsafeProcessCleanupError,
 )
-from phasesweep.engine.guards import _register_active_attempt
+from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.run import run_suite
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _attempts_dir,
+    _experiment_dir,
+    _generation_dir,
+    _generation_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _phase_dir,
+    _suite_generation_summary_path,
+    _winner_path,
+)
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_suite_publication_pointer,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -50,20 +66,8 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
-    _artifact_root_binding_path,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_dir,
-    _generation_path,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_id,
-    _last_successful_generation_path,
-    _phase_dir,
-    _resolve_suite_publication_pointer,
-    _suite_generation_summary_path,
-    _winner_path,
 )
+from phasesweep.engine.suite import run_suite
 from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -1648,7 +1652,11 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
         return _load_existing_phase_study(experiment, phase)
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards._load_existing_phase_study",
+        "phasesweep.engine.artifact_roots._load_existing_phase_study",
+        _flaky_load,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.relocation._load_existing_phase_study",
         _flaky_load,
     )
 

@@ -562,7 +562,7 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
     distinct JSON-mode dumps — so no two configs that render different commands
     can share a study identity."""
     # Import only: the fingerprint code itself is deliberately untouched.
-    from phasesweep.engine.guards import _phase_fingerprint
+    from phasesweep.engine.fingerprints import _phase_fingerprint
 
     fingerprints: dict[str, str] = {}
     for label, literal in {"int": "1", "str": '"1"', "bool": "true", "float": "1.0"}.items():

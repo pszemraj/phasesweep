@@ -49,18 +49,38 @@ from phasesweep.engine import (
     read_winner,
     read_winners,
 )
-from phasesweep.engine.guards import (
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.artifacts import _load_winner, _save_winner
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
+    _phase_fingerprint,
+)
+from phasesweep.engine.optuna import _sqlite_study_exists
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _attempts_dir,
+    _experiment_dir,
+    _generation_path,
+    _generation_record_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _phase_dir,
+    _summary_path,
+    _winner_path,
+)
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _published_winner_path,
+)
+from phasesweep.engine.relocation import (
     _artifact_root_rebind_entries,
     _ArtifactRootRebindPlan,
-    _phase_fingerprint,
-    _register_active_attempt,
-    _validate_artifact_root_binding,
     _validate_artifact_root_binding_for_rebind,
     _validate_artifact_root_destination,
 )
-from phasesweep.engine.optuna import _sqlite_study_exists
-from phasesweep.engine.run import _reject_bound_descendant_topups
+from phasesweep.engine.resume import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -69,21 +89,6 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
-    _artifact_root_binding_path,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_path,
-    _generation_record_path,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_id,
-    _last_successful_generation_path,
-    _load_winner,
-    _phase_dir,
-    _published_winner_path,
-    _save_winner,
-    _summary_path,
-    _winner_path,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import (
@@ -320,8 +325,8 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     """
     trainer = write_constant_trainer(tmp_path)
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
-    run_module = importlib.import_module("phasesweep.engine.run")
-    real_copy = run_module._copy_yaml_projection
+    generation_ops = importlib.import_module("phasesweep.engine.generation")
+    real_copy = generation_ops._copy_yaml_projection
     copied = 0
 
     def interrupt_after_first_projection(source: Path, destination: Path) -> None:
@@ -331,7 +336,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
         real_copy(source, destination)
         copied += 1
 
-    monkeypatch.setattr(run_module, "_copy_yaml_projection", interrupt_after_first_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", interrupt_after_first_projection)
 
     winners = run_experiment(experiment)
 
@@ -582,7 +587,10 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     changes, and must not move when the operator merely spells out the
     default block.
     """
-    from phasesweep.engine.guards import _experiment_semantic_fingerprint, _phase_semantic_payload
+    from phasesweep.engine.fingerprints import (
+        _experiment_semantic_fingerprint,
+        _phase_semantic_payload,
+    )
 
     invocation_a = tmp_path / "invocation-a"
     invocation_b = tmp_path / "invocation-b"
@@ -813,7 +821,7 @@ def test_suite_fingerprint_includes_effective_invocation_cwd(
     first.mkdir()
     second.mkdir()
 
-    from phasesweep.engine.guards import _suite_fingerprint
+    from phasesweep.engine.fingerprints import _suite_fingerprint
 
     monkeypatch.chdir(first)
     first_fingerprint = _suite_fingerprint(suite)
@@ -830,7 +838,7 @@ def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
     acknowledging an existing study's sampler (review v0.5.18 / finding F7)
     must not invalidate that study.
     """
-    from phasesweep.engine.guards import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_semantic_payload
 
     plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
     acknowledged = make_experiment(
@@ -1834,21 +1842,22 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     studies would invent a binding for an invocation that never ran a trial
     (re-review v0.5.19 / blocker B3).
     """
-    import phasesweep.engine.guards as guards
+    import phasesweep.engine.artifact_roots as artifact_roots
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     for phase in experiment.phases:
         optuna.create_study(study_name=f"t::{phase.name}", storage=storage, direction="minimize")
-    real_loader = guards._load_existing_phase_study
+    real_loader = artifact_roots._load_existing_phase_study
 
     def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
         return real_loader(exp, phase)
 
-    monkeypatch.setattr(guards, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr(artifact_roots, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr("phasesweep.engine.relocation._load_existing_phase_study", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -2157,7 +2166,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     unpatched second invocation pins the same refusal for the ordinary
     wrong-root case: it conflicts before the registry scan can reap anything.
     """
-    import phasesweep.engine.guards as guards
+    import phasesweep.engine.artifact_roots as artifact_roots
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
@@ -2176,7 +2185,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = guards._load_existing_phase_study
+    real_loader = artifact_roots._load_existing_phase_study
     calls = {"count": 0}
 
     def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
@@ -2186,7 +2195,8 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         return real_loader(exp, phase)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(guards, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr(artifact_roots, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr("phasesweep.engine.relocation._load_existing_phase_study", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 
@@ -2376,7 +2386,7 @@ def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     """
     from importlib.metadata import version as pkg_version
 
-    from phasesweep.engine.guards import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_semantic_payload
 
     assert __version__ == pkg_version("phasesweep")
 
@@ -2498,8 +2508,10 @@ def test_from_phase_preflight_consumes_run_deadline(
     resumed = experiment.model_copy(update={"timeout_seconds_per_run": 1.0})
 
     run_module = importlib.import_module("phasesweep.engine.run")
+    resume_ops = importlib.import_module("phasesweep.engine.resume")
+    artifact_io = importlib.import_module("phasesweep.engine.artifacts")
     clock = {"now": 100.0}
-    original_load_winner = run_module._load_winner
+    original_load_winner = artifact_io._load_winner
 
     def delayed_load_winner(*args: object, **kwargs: object) -> Winner:
         winner = original_load_winner(*args, **kwargs)
@@ -2511,7 +2523,8 @@ def test_from_phase_preflight_consumes_run_deadline(
         "time",
         SimpleNamespace(monotonic=lambda: clock["now"]),
     )
-    monkeypatch.setattr(run_module, "_load_winner", delayed_load_winner)
+    monkeypatch.setattr(resume_ops, "time", run_module.time)
+    monkeypatch.setattr(artifact_io, "_load_winner", delayed_load_winner)
 
     with pytest.raises(TimeoutError, match="before phase 'lr' could start"):
         run_experiment(resumed, from_phase="lr")
@@ -2543,7 +2556,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
         "time",
         SimpleNamespace(monotonic=lambda: clock["now"]),
     )
-    monkeypatch.setattr(run_module, "_preflight_existing_studies", delayed_preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", delayed_preflight)
 
     with pytest.raises(TimeoutError, match="before phase 'p' could start"):
         run_experiment(experiment)
@@ -2749,7 +2762,7 @@ def test_load_winner_warns_once_on_inherited_environment_drift(
     diverged: bool,
 ) -> None:
     """Inheriting a winner produced under a different environment is reported once."""
-    monkeypatch.setattr("phasesweep.engine.state._ENVIRONMENT_DRIFT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.artifacts._ENVIRONMENT_DRIFT_WARNED", set())
     exp = make_experiment(workdir=tmp_path / "runs")
     payload = _environment_free_winner_payload(exp)
     payload["trainer_env_digest"] = "0" * 64 if diverged else _environment_identity(exp).digest

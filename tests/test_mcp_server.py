@@ -43,16 +43,27 @@ from phasesweep.engine import (
     TerminalReport,
     run_experiment,
 )
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.guards import (
-    _experiment_lock,
+from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _phase_fingerprint,
-    _reap_stale_trials,
-    _register_active_attempt,
-    _validate_artifact_root_binding,
 )
-from phasesweep.engine.run import _write_generation_state
+from phasesweep.engine.generation import _write_generation_state
+from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.paths import (
+    _attempts_dir,
+    _experiment_dir,
+    _generation_record_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _trial_dir_for,
+    _winner_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -61,15 +72,6 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     PUBLICATION_POINTER_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_record_path,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_id,
-    _last_successful_generation_path,
-    _trial_dir_for,
-    _winner_path,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.evidence.models import objective_evidence_assurance
@@ -341,7 +343,11 @@ def _stage_stale_running_recovery_scaffold(
     )
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", kill_stale_group_stub)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        cleanup_trial_stub,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         cleanup_trial_stub,
     )
     command = [
@@ -3644,7 +3650,11 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         _counting_success_callback(runner_cleanup_calls),
     )
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        trial_cleanup,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         trial_cleanup,
     )
     runner = CliRunner()
@@ -3775,7 +3785,11 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     )
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
@@ -4006,7 +4020,11 @@ def test_operator_recovery_clears_cleanup_uncertainty(
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        fake_trial_cleanup,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         fake_trial_cleanup,
     )
 
@@ -4183,7 +4201,11 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     reconciled_attempt_ids: set[str] = set()
     reconciled_attempt_generations: dict[str, str] = {}
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     assert (
@@ -4314,7 +4336,8 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         return True
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
     first_handle = make_run_handle(
         run_id=first_run,
@@ -4426,7 +4449,8 @@ def _stage_terminal_uncertain_run(
         return True
 
     monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
     command = [
         "mcp",
         "recover-run",

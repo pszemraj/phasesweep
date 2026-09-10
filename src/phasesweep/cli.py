@@ -30,34 +30,37 @@ from phasesweep.engine import (
     config_status,
     run_config,
 )
-from phasesweep.engine.guards import (
-    _apply_artifact_root_rebind,
+from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
-    _experiment_lock,
-    _experiment_semantic_fingerprint,
+    _validate_artifact_root_binding,
+)
+from phasesweep.engine.attempts import (
     _inspect_active_attempts,
-    _inspect_cleanup_uncertain_trials,
-    _inspect_stale_running_trials,
-    _plan_artifact_root_rebinds,
     _preflight_active_attempts,
     _PreflightCleanupReport,
+    _retire_active_attempt,
+)
+from phasesweep.engine.cleanup import (
+    _inspect_cleanup_uncertain_trials,
+    _inspect_stale_running_trials,
     _previously_recovered_attempt_locations,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
-    _retire_active_attempt,
-    _suite_fingerprint,
-    _suite_lock,
-    _validate_artifact_root_binding,
-    _validate_suite_artifact_root_rebind,
 )
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _suite_fingerprint
+from phasesweep.engine.locking import _experiment_lock, _suite_lock
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import (
-    _experiment_dir,
+from phasesweep.engine.paths import _experiment_dir, _suite_dir
+from phasesweep.engine.publication import (
     _published_summary_path_for,
     _published_winner_path_for,
     _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
-    _suite_dir,
+)
+from phasesweep.engine.relocation import (
+    _apply_artifact_root_rebind,
+    _plan_artifact_root_rebinds,
+    _validate_suite_artifact_root_rebind,
 )
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot

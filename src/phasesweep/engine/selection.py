@@ -11,6 +11,7 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
+from phasesweep.engine.artifacts import _winner_common_payload, _winner_source_or_default
 from phasesweep.engine.errors import PhaseSweepError, PromotionError, TrialEvidenceMissingError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -23,8 +24,6 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _winner_common_payload,
-    _winner_source_or_default,
     constraint_attr,
 )
 

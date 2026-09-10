@@ -36,17 +36,18 @@ from phasesweep.engine import (
     StudyStorageUnavailableError,
     run_experiment,
 )
-from phasesweep.engine.guards import (
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.attempts import (
     ATTEMPT_REGISTRY_SCHEMA_VERSION,
     _inspect_active_attempts,
     _preflight_active_attempts,
-    _preflight_existing_studies,
     _PreflightCleanupReport,
-    _reap_stale_trials,
     _record_stale_trial_failure,
     _register_active_attempt,
-    _validate_artifact_root_binding,
 )
+from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.guards import _preflight_existing_studies
+from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _generation_path, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -61,10 +62,6 @@ from phasesweep.engine.state import (
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_path,
-    _trial_dir_for,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import canonical_storage_identity
@@ -450,9 +447,17 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
     )
 
     if stage == "load":
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            raise shutdown
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
     elif stage == "get_trials":
         study = SimpleNamespace(
@@ -460,15 +465,31 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
             user_attrs={},
             get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
         )
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            return study
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: study,
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
     else:
         study = optuna.create_study(direction="minimize")
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            return study
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: study,
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
         if stage == "stale_reaper":
             monkeypatch.setattr(
@@ -509,9 +530,17 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         phase.name: optuna.create_study(study_name=phase.name, direction="minimize")
         for phase in experiment.phases
     }
+
+    def loader(_experiment: object, phase: Phase) -> optuna.Study:
+        return studies[phase.name]
+
     monkeypatch.setattr(
-        "phasesweep.engine.guards._load_existing_phase_study",
-        lambda _experiment, phase: studies[phase.name],
+        "phasesweep.engine.artifact_roots._load_existing_phase_study",
+        loader,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.relocation._load_existing_phase_study",
+        loader,
     )
 
     def reap(_study: optuna.Study, _experiment: Experiment, phase_name: str, **_kwargs) -> int:
@@ -1061,16 +1090,20 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
             boot_id="test-boot",
         )
 
-    import phasesweep.engine.guards as _reaper
+    import phasesweep.engine.attempts as attempt_mod
+    import phasesweep.engine.cleanup as _reaper
 
-    real_read = _reaper.read_stale_process_identity
-    _reaper.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_read = attempt_mod.read_stale_process_identity
+    attempt_mod.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_attempt_cleanup = attempt_mod.cleanup_stale_trial_process
     real_cleanup = _reaper.cleanup_stale_trial_process
+    attempt_mod.cleanup_stale_trial_process = lambda _identity: True
     _reaper.cleanup_stale_trial_process = lambda _identity: True
     try:
         _reap_stale_trials(study, exp, "p")
     finally:
-        _reaper.read_stale_process_identity = real_read  # type: ignore[assignment]
+        attempt_mod.read_stale_process_identity = real_read  # type: ignore[assignment]
+        attempt_mod.cleanup_stale_trial_process = real_attempt_cleanup
         _reaper.cleanup_stale_trial_process = real_cleanup
 
     assert seen_dirs == [str(persisted_trial_dir)], (
@@ -1094,7 +1127,7 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
     expected_trial_dir = _trial_dir_for(exp, exp.phases[0].name, trial.number)
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards.read_stale_process_identity",
+        "phasesweep.engine.attempts.read_stale_process_identity",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("prelaunch trials must not read process identity")
         ),
@@ -1156,18 +1189,20 @@ def test_reaper_reports_storage_failures_after_cleanup(
     trial.set_user_attr(ATTEMPT_ID_ATTR, "tell-failure-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
 
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._read_trial_process_identity",
-        lambda *_args, **_kwargs: StaleProcessIdentity(
+    def fake_identity(*_args: object, **_kwargs: object) -> StaleProcessIdentity:
+        return StaleProcessIdentity(
             schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
             attempt_id="tell-failure-attempt",
             pid=99999,
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-        ),
-    )
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)
+        )
+
+    monkeypatch.setattr("phasesweep.engine.attempts._read_trial_process_identity", fake_identity)
+    monkeypatch.setattr("phasesweep.engine.cleanup._read_trial_process_identity", fake_identity)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: True)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _: True)
 
     if failure_site == "outcome":
         patch_rejected_trial_user_attr(
@@ -1306,7 +1341,8 @@ def test_exited_attempt_recovers_without_signalling(
     def _no_signal(*_args: object, **_kwargs: object) -> bool:
         raise AssertionError("an 'exited' attempt must never be signalled")
 
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", _no_signal)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", _no_signal)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", _no_signal)
 
     assert _reap_stale_trials(study, exp, "p") == 1
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
@@ -1416,21 +1452,21 @@ def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A later live replay cannot erase snapshot-proven recovery evidence."""
-    import phasesweep.engine.guards as guards_mod
+    import phasesweep.engine.attempts as attempts_mod
 
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path, attempt_id="changed-journal-attempt"
     )
     create_study_only = ledger.read_bytes().splitlines(keepends=True)[0]
     entry_before = entry_path.read_bytes()
-    real_snapshot = guards_mod._load_journal_study_snapshot
+    real_snapshot = attempts_mod._load_journal_study_snapshot
 
     def snapshot_then_truncate(storage_url: str, study_name: str):
         snapshot = real_snapshot(storage_url, study_name)
         ledger.write_bytes(create_study_only)
         return snapshot
 
-    monkeypatch.setattr(guards_mod, "_load_journal_study_snapshot", snapshot_then_truncate)
+    monkeypatch.setattr(attempts_mod, "_load_journal_study_snapshot", snapshot_then_truncate)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
@@ -1459,7 +1495,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     tmp_path: Path, backend: str, identity_change: str | None
 ) -> None:
     """A stale registry entry cannot consume a replacement trial's cleanup evidence."""
-    from phasesweep.engine.guards import _iter_cleanup_uncertain_trials
+    from phasesweep.engine.cleanup import _iter_cleanup_uncertain_trials
 
     experiment = make_experiment(
         experiment="terminal-identity",
@@ -1987,10 +2023,10 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
         )
 
     attempts_dir = tmp_path / "runs" / "unregistrable" / "attempts"
-    import phasesweep.engine.guards as guards_mod
+    import phasesweep.engine.attempts as attempts_mod
     import phasesweep.engine.phase as phase_mod
 
-    real_atomic_write_text = guards_mod.private_atomic_write_text
+    real_atomic_write_text = attempts_mod.private_atomic_write_text
     real_write_attempt_lifecycle = phase_mod.write_attempt_lifecycle
     if failure_site == "registry":
 
@@ -1999,7 +2035,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
                 raise OSError(errno.EACCES, "injected registry write failure")
             real_atomic_write_text(path, text)
 
-        monkeypatch.setattr(guards_mod, "private_atomic_write_text", refuse_registry_writes)
+        monkeypatch.setattr(attempts_mod, "private_atomic_write_text", refuse_registry_writes)
     else:
 
         def refuse_lifecycle_write(*_args: object, **_kwargs: object) -> None:
@@ -2029,7 +2065,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_persistence"
 
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
-    monkeypatch.setattr(guards_mod, "private_atomic_write_text", real_atomic_write_text)
+    monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
         run_experiment(_exp(2))

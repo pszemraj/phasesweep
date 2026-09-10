@@ -148,7 +148,7 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
     """Return the ``inherit_env`` contract in its canonical persisted form.
 
     A list contract is a *set* of names — order carries no meaning — so it is
-    sorted, matching how :func:`phasesweep.engine.guards._execution_identity`
+    sorted, matching how :func:`phasesweep.engine.fingerprints._execution_identity`
     canonicalises the same field for fingerprints.
 
     :param Experiment experiment: Parsed experiment supplying the contract.

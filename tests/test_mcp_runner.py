@@ -36,17 +36,19 @@ from phasesweep.engine import (
     read_status,
     run_experiment,
 )
-from phasesweep.engine.guards import _experiment_lock
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _resolve_storage
-from phasesweep.engine.state import (
-    Winner,
+from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
     _generations_dir,
-    _last_successful_generation_id,
     _summary_path,
     _trial_dir_for,
     _winner_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.state import (
+    Winner,
 )
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
@@ -1066,7 +1068,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     The detached runner must still record returncode 0 with a complete frozen
     snapshot, and the run store must derive ``succeeded``.
     """
-    import phasesweep.engine.run as engine_run
+    import phasesweep.engine.generation as generation_ops
 
     trainer = write_constant_trainer(tmp_path)
     config_path = tmp_path / "exp.yaml"
@@ -1091,7 +1093,7 @@ phases:
     def fail_record_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated record write failure")
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", fail_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"
@@ -1338,7 +1340,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
 
     with pytest.raises(ProcessCleanupUncertainError) as exc_info:
@@ -1401,7 +1403,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
         raise shutdown
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", cancel_run)
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:
@@ -1445,7 +1447,7 @@ def test_shutdown_during_post_error_reconciliation_remains_cancellation(
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:

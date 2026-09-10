@@ -16,7 +16,7 @@ import pytest
 from phasesweep.config import Experiment, FloatParam, IntParam, Phase, Sampler
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
-from phasesweep.engine.guards import (
+from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
 )

@@ -973,7 +973,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
        accumulates cannot be reproduced or explained afterwards.
     2. Resumability. ``tpe`` and ``cmaes`` suggestions depend on process-local
        RNG/optimizer state Optuna storage does not persist, so
-       :func:`phasesweep.engine.guards._validate_sampler_continuation` hard-rejects
+       :func:`phasesweep.engine.study_policy._validate_sampler_continuation` hard-rejects
        resuming such a phase mid-target. That guard fires only *after* the
        operator has been interrupted; requiring ``acknowledge_nonresumable``
        here puts the run-the-target-in-one-invocation contract in front of them

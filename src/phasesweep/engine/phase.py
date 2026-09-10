@@ -17,30 +17,23 @@ import optuna
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.models import _iter_fixed_override_layers
 from phasesweep.config.search import _placeholder_values_for
+from phasesweep.engine.artifact_roots import _bind_study_artifact_root
+from phasesweep.engine.artifacts import _write_trials_csv
+from phasesweep.engine.attempts import (
+    _register_active_attempt,
+    _retire_active_attempt,
+    _trial_requires_cleanup_recovery,
+)
+from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.guards import (
-    _accepted_trial_target,
-    _AcceptedPartialDecision,
-    _bind_study_artifact_root,
-    _load_accepted_partial_decision,
-    _load_phase_policy_state,
-    _reap_stale_trials,
-    _record_trial_target,
-    _register_active_attempt,
-    _retire_active_attempt,
-    _trial_requires_cleanup_recovery,
-    _validate_environment_cohort,
-    _validate_study_direction,
-    _validate_study_schema,
-    _validate_trial_target,
-    _verify_fingerprint,
-    _verify_winner_objective_evidence,
-)
+from phasesweep.engine.evidence import _verify_winner_objective_evidence
+from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
+from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -66,10 +59,18 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
-    _phase_dir,
-    _trial_dir_for,
-    _write_trials_csv,
     constraint_attr,
+)
+from phasesweep.engine.study_policy import (
+    _accepted_trial_target,
+    _AcceptedPartialDecision,
+    _load_accepted_partial_decision,
+    _load_phase_policy_state,
+    _record_trial_target,
+    _validate_environment_cohort,
+    _validate_study_direction,
+    _validate_study_schema,
+    _validate_trial_target,
 )
 from phasesweep.engine.trial import (
     TrialExecutionError,

@@ -16,8 +16,9 @@ from pathlib import Path
 from phasesweep import config_status, load_config, run_experiment
 from phasesweep.config import Suite
 from phasesweep.engine import read_status
+from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import _generation_winner_path, _last_successful_generation_id
 from tests.conftest import write_trainer, write_yaml
 
 EXPERIMENT_STATUS_KEYS = [

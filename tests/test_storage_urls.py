@@ -19,8 +19,9 @@ from phasesweep.config import (
     Suite,
 )
 from phasesweep.engine import read_status, run_experiment
-from phasesweep.engine.guards import _plan_artifact_root_rebinds, _run_lock_paths
+from phasesweep.engine.locking import _run_lock_paths
 from phasesweep.engine.optuna import _resolve_storage
+from phasesweep.engine.relocation import _plan_artifact_root_rebinds
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,

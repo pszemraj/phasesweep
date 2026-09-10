@@ -42,25 +42,38 @@ The package is organized by behavior:
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
 
+Within the engine, use these modules to follow ownership and publication:
+
+| Responsibility | Modules |
+| --- | --- |
+| Experiment, suite, and phase orchestration | `run`, `suite`, `phase` |
+| Resume selection and continuation preflight | `resume` |
+| Preflight ordering, lock ownership, and study continuation policy | `guards`, `locking`, `study_policy` |
+| Active-attempt ownership and stale or uncertain trial cleanup | `attempts`, `cleanup` |
+| Artifact-root ownership, relocation, and trial-evidence checks | `artifact_roots`, `relocation`, `evidence` |
+| Shared state types, direct paths, and semantic fingerprints | `state`, `paths`, `fingerprints` |
+| Publication validation and pointer resolution | `publication_validation`, `publication` |
+| Provenance, winner artifacts, and generation publication writes | `provenance`, `artifacts`, `generation` |
+
 The control flow of a typical run is:
 
 ```mermaid
 flowchart TD
-    cli["CLI run"] --> dispatch["run_config"]
-    dispatch -->|Experiment| experiment["execute experiment"]
-    dispatch -->|Suite| suite["run_suite"]
+    cli["CLI run"] --> dispatch["run.run_config"]
+    dispatch -->|Experiment| experiment["run: execute experiment"]
+    dispatch -->|Suite| suite["suite.run_suite"]
     suite -->|"declaration order; dependencies must name prior studies"| experiment
-    experiment --> phase["_run_phase"]
+    experiment --> phase["phase._run_phase"]
     phase --> optimize["study.optimize / objective"]
     optimize --> launch["launch_trial / supervised trainer"]
     launch --> evidence["extract_trial_result"]
     evidence --> select["select_winner"]
     select --> promote["_apply_promotion"]
-    promote --> winner["_save_winner"]
+    promote --> winner["artifacts._save_winner"]
     winner --> more{"more phases?"}
     more -->|yes| phase
     more -->|no| summary["write generation summary"]
-    summary --> publish["_publish_generation validates result graph"]
+    summary --> publish["generation._publish_generation validates result graph"]
     publish --> sidecar["optional hook: prepare frozen MCP result"]
     sidecar --> pointer["commit last_successful_generation pointer"]
     pointer --> receipt["optional hook: record MCP commit receipt"]

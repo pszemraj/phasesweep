@@ -27,17 +27,19 @@ from phasesweep.config import (
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winner, read_winners
-from phasesweep.engine.guards import _plan_artifact_root_rebinds
-from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import (
-    PUBLICATION_POINTER_SCHEMA_VERSION,
+from phasesweep.engine.paths import (
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
-    _resolve_publication_pointer,
     _winner_path,
+)
+from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.relocation import _plan_artifact_root_rebinds
+from phasesweep.engine.run import experiment_status
+from phasesweep.engine.state import (
+    PUBLICATION_POINTER_SCHEMA_VERSION,
 )
 from tests.conftest import make_experiment, write_trainer
 
@@ -669,7 +671,7 @@ def test_baseline_promotion_checks_local_candidate_and_allows_skipped_source_los
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
     """Publish an immutable generation (summary + record + phase winner) on disk.
 
-    Pointer validation (:func:`phasesweep.engine.state._last_successful_generation_id`)
+    Pointer validation (:func:`phasesweep.engine.publication._last_successful_generation_id`)
     now reads back the generation's own immutable *summary*, not the
     lifecycle record's state, so a summary naming this owner and id is
     required for the pointer to resolve as published (review v0.5.15 /
