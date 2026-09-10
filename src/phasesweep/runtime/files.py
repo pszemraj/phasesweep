@@ -1446,6 +1446,7 @@ _RDB_CREDENTIAL_OPTION_NAMES = frozenset(
         "accesstoken",
         "apikey",
         "authtoken",
+        "passfile",
         "password",
         "passwd",
         "pwd",

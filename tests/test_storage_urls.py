@@ -572,6 +572,16 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
             "postgresql://sweep@db.internal/studies?PASSWORD=new-secret",
         ),
         (
+            "password-file rotation",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/old.pgpass",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/new.pgpass",
+        ),
+        (
+            "default versus explicit password file",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/new.pgpass",
+        ),
+        (
             "access token rotation",
             "postgresql://sweep@db.internal/studies?access_token=old-token",
             "postgresql://sweep@db.internal/studies?ACCESS-TOKEN=new-token",
