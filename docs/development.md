@@ -37,7 +37,7 @@ The package is organized by behavior:
 - `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
 - `phasesweep.reporting`: the trainer-side objective-envelope writer.
 - `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
-- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, and the client-config installer (`phasesweep.mcp.install`).
+- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, operator recovery, and the client-config installer (`phasesweep.mcp.install`).
 - `phasesweep.cli`: Click command surface.
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
@@ -54,6 +54,8 @@ Within the engine, use these modules to follow ownership and publication:
 | Shared state types, direct paths, and semantic fingerprints | `state`, `paths`, `fingerprints` |
 | Publication validation and pointer resolution | `publication_validation`, `publication` |
 | Provenance, winner artifacts, and generation publication writes | `provenance`, `artifacts`, `generation` |
+
+`mcp.recovery.recover_run` coordinates operator recovery: resolve the recorded launch, determine the required repair, and check runner identity. Confirmed recovery holds the experiment lock through cleanup, evidence persistence, and stored-result finalization; preflight only reports the proposed actions. The CLI handles options and renders the service's messages and errors. Internal callers import each helper from its owning module.
 
 The control flow of a typical run is:
 

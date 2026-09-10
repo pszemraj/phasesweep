@@ -341,7 +341,7 @@ def _stage_stale_running_recovery_scaffold(
         result_snapshot_state="complete",
         result_snapshot=snapshot,
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", kill_stale_group_stub)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", kill_stale_group_stub)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         cleanup_trial_stub,
@@ -3356,7 +3356,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
         signalled.append((args, kwargs))
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", spy_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", spy_kill_stale_group)
 
     runner = CliRunner()
     dry = runner.invoke(
@@ -3409,7 +3409,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
         cleanup_calls += 1
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", unexpected_cleanup)
     with _experiment_lock(reg.experiment):
         result = CliRunner().invoke(
             cli_main,
@@ -3561,7 +3561,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
         raise AssertionError("pre-spawn launch failure must not run process cleanup")
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", unexpected_cleanup)
 
     result = CliRunner().invoke(
         cli_main,
@@ -3646,7 +3646,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         return trial_cleanup_allowed
 
     monkeypatch.setattr(
-        "phasesweep.cli.kill_stale_group",
+        "phasesweep.mcp.recovery.kill_stale_group",
         _counting_success_callback(runner_cleanup_calls),
     )
     monkeypatch.setattr(
@@ -3783,7 +3783,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         uncertain_attempt_ids=[attempt_id] if causally_reported else [],
         **status_kwargs,
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: True,
@@ -4018,7 +4018,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         fake_trial_cleanup,
@@ -4147,7 +4147,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
             confirmed_attempt_locations=confirmed_attempt_locations,
         )
 
-    monkeypatch.setattr("phasesweep.cli.finalize_result_snapshot", flaky_snapshot)
+    monkeypatch.setattr("phasesweep.mcp.recovery.finalize_result_snapshot", flaky_snapshot)
 
     runner = CliRunner()
     first = runner.invoke(cli_main, command)
@@ -4243,7 +4243,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(experiment),
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
 
     result = CliRunner().invoke(
         cli_main,
@@ -4335,7 +4335,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     def fake_cleanup(*args: object, **kwargs: object) -> bool:
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
@@ -4448,7 +4448,7 @@ def _stage_terminal_uncertain_run(
     def fake_cleanup(*args: object, **kwargs: object) -> bool:
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
     command = [
@@ -4484,7 +4484,9 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
             raise RuntimeError("simulated crash before the recovery record")
         real_write(path, text)
 
-    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", crash_on_recovery_record)
+    monkeypatch.setattr(
+        "phasesweep.mcp.recovery.private_atomic_write_text", crash_on_recovery_record
+    )
     runner = CliRunner()
 
     first = runner.invoke(cli_main, command)
@@ -4496,7 +4498,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
     assert not recovery_record.exists()
 
-    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", real_write)
+    monkeypatch.setattr("phasesweep.mcp.recovery.private_atomic_write_text", real_write)
 
     retry = runner.invoke(cli_main, command)
 
