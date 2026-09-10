@@ -767,15 +767,15 @@ def _preflight_active_attempts(
             inspected[attempt_id] = entry["generation_id"]
             try:
                 _registry_attempt_process_is_resolved(entry, entry_path)
+                outcome = _registry_attempt_fail_stale_trial(
+                    entry,
+                    entry_path,
+                    current_storage=experiment.resolved_storage,
+                )
             except ProcessCleanupUncertainError as exc:
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
                 raise
-            outcome = _registry_attempt_fail_stale_trial(
-                entry,
-                entry_path,
-                current_storage=experiment.resolved_storage,
-            )
             if outcome in {"reaped", "recovered"}:
                 report.recovered_attempt_ids.add(attempt_id)
                 report.recovered_attempt_generations[attempt_id] = entry["generation_id"]

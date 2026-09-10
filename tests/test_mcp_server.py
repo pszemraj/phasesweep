@@ -43,7 +43,10 @@ from phasesweep.engine import (
     TerminalReport,
     run_experiment,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.artifact_roots import (
+    _bind_study_artifact_root,
+    _validate_artifact_root_binding,
+)
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
@@ -596,7 +599,10 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
     assert not snapshot.exists()
 
 
-def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("interrupted_recovery", [False, True])
+def test_operator_recovery_clears_abandoned_transactional_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_recovery: bool
+) -> None:
     """A free launch lease makes a persisted launch recoverable without losing its log."""
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
@@ -641,6 +647,20 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: 
 
     preparation.close()
 
+    if interrupted_recovery:
+
+        def interrupt_unlink(_path: Path) -> None:
+            raise OSError("interrupted after archiving runner log")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(mcp_runs, "_strict_unlink", interrupt_unlink)
+            with pytest.raises(OSError, match="interrupted after archiving"):
+                store.clear_pre_spawn_orphan(run_id)
+        assert recovered_log.read_bytes() == log_bytes
+        assert not log_path.exists()
+        original.pop(log_path)
+        original[recovered_log] = log_bytes
+
     preflight = CliRunner().invoke(
         cli_main,
         ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
@@ -648,9 +668,12 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(tmp_path: 
 
     assert preflight.exit_code == 0, preflight.output
     assert "no runner can still start a trainer under this identity" in preflight.output
-    assert f" runner log {log_path} as {recovered_log}." in preflight.output
-    assert {path: path.read_bytes() for path in artifacts} == original
-    assert not recovered_log.exists()
+    if interrupted_recovery:
+        assert f"Runner log already preserved at {recovered_log}." in preflight.output
+    else:
+        assert f" runner log {log_path} as {recovered_log}." in preflight.output
+        assert not recovered_log.exists()
+    assert {path: path.read_bytes() for path in original} == original
 
     confirmed = CliRunner().invoke(
         cli_main,
@@ -1183,6 +1206,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
 def test_restarted_server_reaps_abandoned_transaction_before_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A retry preserves diagnostics from an abandoned launch preparation."""
     config = _config(tmp_path)
@@ -1207,9 +1231,16 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
     monkeypatch.setattr(restarted_store, "new_run_id", lambda _experiment_id: "srv-retry")
     patch_popen_capture(monkeypatch)
 
-    result = restarted.launch("srv")
+    with caplog.at_level(logging.INFO, logger="phasesweep.mcp.server"):
+        result = restarted.launch("srv")
 
     assert result["run_id"] == "srv-retry"
+    assert set(result) == {"experiment_id", "run_id", "state"}
+    assert (
+        "phasesweep.mcp.server",
+        logging.INFO,
+        f"preserved abandoned launch log run={abandoned_id} at {recovered_log}",
+    ) in caplog.record_tuples
     assert restarted_store.get(abandoned_id) is None
     assert not restarted_store.config_snapshot_path(abandoned_id).exists()
     assert not restarted_store.launch_lease_path(abandoned_id).exists()
@@ -3140,6 +3171,74 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["failure"]["actor"] == "operator"
     assert status["failure"]["cause"]["code"] == "trainer_failed"
     assert status["failure"]["cause"]["stage"] == "execution"
+
+
+def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
+    """A terminal trial missing its attempt id remains attributable to recover-run."""
+    config = _config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "r-terminal-identity"
+    status_path = store.status_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
+
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    phase = experiment.phases[0]
+    study = optuna.create_study(
+        study_name=f"{experiment.experiment}::{phase.name}",
+        storage=experiment.storage,
+        direction="minimize",
+    )
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    _bind_study_artifact_root(study, experiment)
+    trial = study.ask()
+    attempt_id = "terminal-identity-attempt"
+    generation_id = "earlier-generation"
+    trial_dir = _trial_dir_for(
+        experiment,
+        phase.name,
+        trial.number,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase.name,
+        study_name=study.study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id=generation_id,
+    )
+
+    with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
+        runner_main(
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["cleanup_confirmed"] is False
+    assert status["uncertain_attempt_ids"] == [attempt_id]
 
 
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:

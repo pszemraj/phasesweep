@@ -1548,6 +1548,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
             _preflight_active_attempts(experiment, report)
         assert "Restore the original storage ledger" in str(exc_info.value)
         assert "before retrying recovery" in str(exc_info.value)
+        assert report.uncertain_attempt_ids == {"old-attempt"}
     else:
         _preflight_active_attempts(experiment, report)
 

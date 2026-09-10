@@ -177,12 +177,12 @@ def _recover_pre_spawn_orphan(
         if store.is_pre_spawn_orphan(run_id):
             if not confirm:
                 log_path = store.log_path(run_id)
-                log_action = (
-                    f" Would preserve runner log {log_path} as "
-                    f"{log_path.with_suffix('.log.recovered')}."
-                    if log_path.exists() or log_path.is_symlink()
-                    else ""
-                )
+                archive_path = log_path.with_suffix(".log.recovered")
+                log_action = ""
+                if log_path.exists() or log_path.is_symlink():
+                    log_action = f" Would preserve runner log {log_path} as {archive_path}."
+                elif archive_path.exists() or archive_path.is_symlink():
+                    log_action = f" Runner log already preserved at {archive_path}."
                 emit(
                     f"Recovery preflight for {run_id}: would remove the abandoned launch "
                     "preparation after verifying no runner can still start a trainer under "

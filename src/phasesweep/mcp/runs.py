@@ -691,7 +691,8 @@ class RunStore:
 
         :param str run_id: Orphan identity previously reported by launch.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
-        :return Path | None: Preserved runner log path, or None when no log existed.
+        :return Path | None: Preserved runner log path, including an archive from an
+            interrupted recovery, or None when no log existed.
         """
         lease: IO[str] | None = None
         if self.launch_lease_path(run_id).is_file():
@@ -708,11 +709,14 @@ class RunStore:
         recovered_log: Path | None = None
         try:
             log_path = self.log_path(run_id)
+            archive_path = log_path.with_suffix(".log.recovered")
             if log_path.exists() or log_path.is_symlink():
-                recovered_log = log_path.with_suffix(".log.recovered")
+                recovered_log = archive_path
                 # A child can fail before recording its identity. Keep its only
                 # diagnostic outside the active-run evidence namespace, and
                 # make the rename durable before removing the launch reservation.
+                # Run IDs include a fresh UUID and are never reused by the server;
+                # this rename is not an exclusive archive operation for reused IDs.
                 directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
                 try:
                     os.rename(
@@ -724,6 +728,8 @@ class RunStore:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
+            elif archive_path.exists() or archive_path.is_symlink():
+                recovered_log = archive_path
             for path in paths:
                 with contextlib.suppress(FileNotFoundError):
                     _strict_unlink(path)

@@ -1652,7 +1652,13 @@ class PhaseSweepMCP:
                     and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
                 )
                 for abandoned_run_id in sorted(abandoned):
-                    self._runs.clear_pre_spawn_orphan(abandoned_run_id)
+                    recovered_log = self._runs.clear_pre_spawn_orphan(abandoned_run_id)
+                    if recovered_log is not None:
+                        log.info(
+                            "preserved abandoned launch log run=%s at %s",
+                            abandoned_run_id,
+                            recovered_log,
+                        )
                 if abandoned:
                     handles, unreadable = self._runs.launch_inventory()
                 if unreadable:
