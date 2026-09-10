@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,13 +20,14 @@ from phasesweep.engine import run_experiment, run_suite
 from phasesweep.engine.paths import (
     _experiment_dir,
     _phase_dir,
+    _suite_dir,
     _summary_path,
 )
 from phasesweep.engine.run import experiment_status
 from phasesweep.runtime.files import (
     atomic_text_writer,
     atomic_write_text,
-    ensure_workdir,
+    ensure_artifact_dir,
     private_atomic_write_text,
 )
 from tests.conftest import make_experiment, temporary_umask, write_constant_trainer
@@ -61,47 +63,71 @@ def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
     assert not str(b_dir).startswith(str(a_dir) + "/")
 
 
-@pytest.mark.parametrize("existing_workdir", [False, True])
+@pytest.mark.parametrize(
+    ("workdir_name", "existing_workdir"), [("runs", False), ("runs", True), (".", True)]
+)
 def test_run_experiment_writes_summary_at_namespaced_path(
-    tmp_path: Path, existing_workdir: bool
+    tmp_path: Path, workdir_name: str, existing_workdir: bool
 ) -> None:
     """End-to-end: a real run must write ``summary.yaml`` under the
     ``<workdir>/<experiment>/`` tree, not directly under ``<workdir>``.
     """
+    # Keep the test fixture's host lock directory outside this source repository.
+    tmp_path = tmp_path / "repository"
+    tmp_path.mkdir()
     trainer = write_constant_trainer(tmp_path)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = tmp_path / "experiment.yaml"
+    source.write_text("# operator-authored configuration\n")
     exp = make_experiment(
-        workdir=str(tmp_path / "runs"),
+        workdir=str(tmp_path / workdir_name),
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
     )
     if existing_workdir:
-        Path(exp.workdir).mkdir()
+        Path(exp.workdir).mkdir(exist_ok=True)
     run_experiment(exp)
     assert (_summary_path(exp)).is_file()
     # The pre-v0.5.7 location must NOT be created.
     assert not (Path(exp.workdir).resolve() / "summary.yaml").exists()
-    assert (Path(exp.workdir) / ".gitignore").read_text() == "*\n"
+    assert (_experiment_dir(exp) / ".gitignore").read_text() == "*\n"
+    assert not (Path(exp.workdir) / ".gitignore").exists()
+    visible = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert set(visible) == {f"?? {trainer.name}", f"?? {source.name}"}
 
 
 @pytest.mark.parametrize("existing_ignore", [None, "keep-me\n"])
-def test_existing_workdir_adds_only_missing_ignore(
+def test_existing_artifact_dir_adds_only_missing_ignore(
     tmp_path: Path, existing_ignore: str | None
 ) -> None:
-    workdir = tmp_path / "runs"
-    workdir.mkdir()
-    ignore = workdir / ".gitignore"
+    artifact_dir = tmp_path / "runs" / "experiment"
+    artifact_dir.mkdir(parents=True)
+    ignore = artifact_dir / ".gitignore"
     if existing_ignore is not None:
         ignore.write_text(existing_ignore)
-    ensure_workdir(workdir)
+    ensure_artifact_dir(artifact_dir)
     assert ignore.read_text() == (existing_ignore if existing_ignore is not None else "*\n")
 
 
-def test_new_workdir_does_not_modify_repository_ignore(tmp_path: Path) -> None:
+def test_new_artifact_dir_does_not_modify_repository_ignore(tmp_path: Path) -> None:
     ignore = tmp_path / ".gitignore"
     ignore.write_text("existing-rule\n")
-    ensure_workdir(tmp_path / "nested" / "runs")
+    ensure_artifact_dir(tmp_path / "nested" / "runs" / "experiment")
     assert ignore.read_text() == "existing-rule\n"
-    assert (tmp_path / "nested" / "runs" / ".gitignore").read_text() == "*\n"
+    assert (tmp_path / "nested" / "runs" / "experiment" / ".gitignore").read_text() == "*\n"
 
 
 def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
@@ -111,7 +137,7 @@ def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
     assert not Path(exp.workdir).exists()
 
 
-def test_suite_creates_self_ignoring_workdirs(tmp_path: Path) -> None:
+def test_suite_creates_self_ignoring_artifact_namespaces(tmp_path: Path) -> None:
     exp = make_experiment(
         workdir=str(tmp_path / "component"), trial_command="echo x=0.5 {overrides}", n_trials=1
     )
@@ -128,8 +154,11 @@ def test_suite_creates_self_ignoring_workdirs(tmp_path: Path) -> None:
     run_suite(suite, dry_run=True)
     assert not (tmp_path / "runs").exists()
     run_suite(suite)
+    compiled = suite.experiment_for_study(suite.studies[0])
+    for artifact_dir in (_suite_dir(suite), _experiment_dir(compiled)):
+        assert (artifact_dir / ".gitignore").read_text() == "*\n"
     for workdir in (tmp_path / "runs", Path(exp.workdir)):
-        assert (workdir / ".gitignore").read_text() == "*\n"
+        assert not (workdir / ".gitignore").exists()
 
 
 @pytest.mark.parametrize(

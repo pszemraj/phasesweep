@@ -386,6 +386,8 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     ("database_name", "storage_template"),
     [
         pytest.param("phases.db", "sqlite:///{db}?timeout=30", id="url-options"),
+        pytest.param("study#experiment.db", "sqlite:///{db}", id="literal-hash"),
+        pytest.param("study#experiment.db", "sqlite+pysqlite:///{db}", id="driver-literal-hash"),
         pytest.param("uri.db", "sqlite:///file:{db}?mode=rwc&uri=true", id="uri-filename"),
     ],
 )
@@ -462,6 +464,28 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert len(warnings) == 1
     assert str(ledger) in warnings[0]
     assert cause in warnings[0]
+
+
+def test_external_status_warning_omits_storage_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage = "postgresql://private-user:private-password@example.invalid/study?token=private-token"
+    exp = _experiment(tmp_path).model_copy(
+        update={"storage": storage, "allow_external_rdb_single_host": True}
+    )
+
+    def unavailable_engine(*args: object, **kwargs: object) -> None:
+        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError(storage))
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
+        phase = read_status(exp)["phases"][0]
+
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
+    assert "postgresql storage for phase p: OperationalError" in caplog.text
+    for secret in ("private-user", "private-password", "private-token", storage):
+        assert secret not in caplog.text
 
 
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])

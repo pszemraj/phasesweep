@@ -31,10 +31,10 @@ SHARED_DIR_MODE = 0o3770
 SHARED_FILE_MODE = 0o660
 
 
-def ensure_workdir(path: Path) -> None:
-    """Ensure a workdir ignores its contents without replacing an existing ignore file.
+def ensure_artifact_dir(path: Path) -> None:
+    """Create a self-ignoring artifact namespace without replacing its ignore file.
 
-    :param Path path: Resolved artifact workdir to create.
+    :param Path path: Managed experiment or suite directory, not its shared workdir.
     """
     path.mkdir(parents=True, exist_ok=True)
     try:
@@ -1202,7 +1202,11 @@ def file_url_path(storage: str) -> str:
     else:
         path = rest
 
-    path = path.split("?", 1)[0].split("#", 1)[0]
+    path = path.split("?", 1)[0]
+    # SQLAlchemy treats '#' as a literal character in ordinary SQLite filenames.
+    # It becomes a fragment only when SQLite's file: URI handling is enabled.
+    if storage_backend(storage) != "sqlite" or _sqlite_uri_filename_enabled(storage, path):
+        path = path.split("#", 1)[0]
     # Auto journal storage uses the same escaped file: URI convention as
     # SQLite. Ordinary explicit journal paths keep their literal spelling.
     if (

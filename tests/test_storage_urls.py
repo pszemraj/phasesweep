@@ -116,7 +116,7 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
     run_experiment(exp)
     database = root / exp.experiment / ("study.journal" if n_jobs > 1 else "study.db")
     assert database.is_file()
-    assert (root / ".gitignore").read_text() == "*\n"
+    assert (root / exp.experiment / ".gitignore").read_text() == "*\n"
     assert not (tmp_path / "runs ").exists()
     locator = storage_recovery_locator(exp.resolved_storage)
     monkeypatch.chdir(tmp_path)
@@ -451,6 +451,7 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     ("storage", "expected_backend", "expected_name"),
     [
         ("sqlite+pysqlite:///studies.db?timeout=30", "sqlite", "studies.db"),
+        ("sqlite:///study#experiment.db", "sqlite", "study#experiment.db"),
         (
             "sqlite:///file:uri.db?mode=rwc&cache=shared&uri=true",
             "sqlite",
@@ -483,6 +484,32 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
     assert str(registration_cwd) in locator
     if expected_backend == "sqlite" and "?" in storage:
         assert "timeout=30" in locator or "cache=shared" in locator
+
+
+@pytest.mark.parametrize("scheme", ["sqlite", "sqlite+pysqlite"])
+def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scheme: str
+) -> None:
+    import optuna
+
+    monkeypatch.chdir(tmp_path)
+    storage = f"{scheme}:///study#experiment.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    run_experiment(exp)
+    assert (tmp_path / "study#experiment.db").is_file()
+    assert read_status(exp)["phases"][0]["trials"] == {"COMPLETE": 1}
+    topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    run_experiment(topup)
+    assert read_status(topup)["phases"][0]["published_study_unavailable"] is False
+    locator = storage_recovery_locator(storage)
+    monkeypatch.chdir(tmp_path.parent)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    assert len(study.trials) == 2
 
 
 def test_sqlite_parallel_error_does_not_say_multi_host() -> None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -30,7 +29,7 @@ from phasesweep.engine.state import (
     SUITE_SUMMARY_SCHEMA_VERSION,
     Winner,
 )
-from phasesweep.runtime.files import ensure_workdir, file_sha256, require_posix_runtime
+from phasesweep.runtime.files import ensure_artifact_dir, file_sha256, require_posix_runtime
 from phasesweep.runtime.process import (
     absorb_shutdown_signals,
     service_pending_shutdown,
@@ -62,8 +61,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         return results
 
     require_posix_runtime()
-    ensure_workdir(Path(suite.defaults.workdir).expanduser().resolve())
-    path_ops._suite_dir(suite).mkdir(parents=True, exist_ok=True)
+    ensure_artifact_dir(path_ops._suite_dir(suite))
     # See _run_experiment_outcome: signal_handler_scope() is the outermost
     # context manager here too, so a suite installs shutdown handlers once for
     # the whole component sequence and each component's own scope (entered

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
+import yaml
+
 import phasesweep.engine.artifact_roots as artifact_root_ops
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
@@ -37,7 +39,7 @@ from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _apply_promotion, _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.runtime.files import ensure_workdir, require_posix_runtime
+from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
 
 log = logging.getLogger("phasesweep.engine.run")
@@ -349,7 +351,6 @@ def _run_experiment_outcome(
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
-    ensure_workdir(path_ops._experiment_dir(experiment).parent)
     path_ops._experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     # signal_handler_scope() is the outermost context manager so shutdown-signal
     # ownership is scoped to this call tree and restored on every exit path,
@@ -379,6 +380,7 @@ def _run_experiment_outcome(
                 "Restore the original complete storage ledger and access to it before "
                 "retrying. For an MCP run, then run phasesweep mcp recover-run."
             ) from exc
+        ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
         generation_id = generation_ops._claim_generation(experiment, requested_generation_id)
         terminal_error: BaseException | None = None
@@ -656,12 +658,15 @@ def _run_experiment_inner(
                         experiment, phase.name
                     )
                     if prior_promotion is not None and prior_promotion.is_file():
+                        prior_promotion_payload = yaml.safe_load(prior_promotion.read_text())
                         generation_ops._copy_yaml_projection(
                             prior_promotion,
                             path_ops._generation_promotion_decision_path(
                                 experiment, generation_id, phase.name
                             ),
                         )
+                        if isinstance(prior_promotion_payload, dict):
+                            promotion_decisions[phase.name] = prior_promotion_payload
                 log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             else:
                 try:

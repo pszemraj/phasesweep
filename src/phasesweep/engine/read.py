@@ -31,7 +31,11 @@ from phasesweep.engine.artifact_roots import (
     _validate_artifact_root_binding,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.optuna import _phase_trial_stats, _published_phase_trial_refs
+from phasesweep.engine.optuna import (
+    _phase_trial_stats,
+    _published_phase_trial_refs,
+    _published_trial_history_available,
+)
 from phasesweep.engine.paths import (
     _generation_path,
     _generation_summary_path,
@@ -570,12 +574,12 @@ def read_status(
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
     ``published_study_unavailable`` reports a current published phase whose local
-    trial identity could not be matched in storage. When both it and
-    ``trial_data_available`` are true, that trial is confirmed missing or replaced;
-    executing the phase is refused, while earlier phases may still load saved
-    winners via ``from_phase``. When ``trial_data_available`` is false, the history
-    could not be completely inspected, including an incomplete journal append;
-    a run can report cleanup uncertainty and
+    trial identity or recorded completion boundary could not be matched in storage.
+    When both it and ``trial_data_available`` are true, history is confirmed missing,
+    replaced, or incomplete; executing the phase is refused, while earlier phases
+    may still load saved winners via ``from_phase``. When ``trial_data_available``
+    is false, the history could not be completely inspected, including an incomplete
+    journal append; a run can report cleanup uncertainty and
     require operator recovery before further MCP launches. Publication
     integrity describes the artifacts separately.
 
@@ -748,7 +752,8 @@ def read_status(
             unavailable_published_phases={
                 name
                 for name, stats in phase_stats.items()
-                if name in published_trials and not stats.published_trial_available
+                if name in published_trials
+                and not _published_trial_history_available(stats, published_trials[name])
             },
             include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},

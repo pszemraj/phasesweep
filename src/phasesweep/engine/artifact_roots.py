@@ -441,12 +441,13 @@ def _check_published_phase_studies(
     *,
     from_phase: str | None = None,
 ) -> None:
-    """Require the published local trial identity for phases that would execute.
+    """Require published trial identity and history for phases that would execute.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
     :param str | None from_phase: Resume point; earlier phases only load winners.
-    :raises PublishedStudyMissingError: A reached published trial is absent or replaced.
+    :raises PublishedStudyMissingError: A reached published trial is absent,
+        replaced, or its recorded history boundary is missing.
     :raises StudyStorageUnavailableError: A published study's trials cannot be read.
     """
     publication = _resolve_publication_pointer(experiment)
@@ -463,26 +464,48 @@ def _check_published_phase_studies(
         if study is not None:
             try:
                 trials = study.get_trials(deepcopy=False)
-                if expected is not None and any(
+                matched = expected is not None and any(
                     _published_trial_matches(trial, expected) for trial in trials
-                ):
-                    continue
+                )
+                if matched and expected is not None:
+                    finished = sum(trial.state.is_finished() for trial in trials)
+                    completed = sum(
+                        trial.state == optuna.trial.TrialState.COMPLETE for trial in trials
+                    )
+                    if (
+                        expected.finished_trials is None or finished >= expected.finished_trials
+                    ) and (
+                        expected.completed_trials is None or completed >= expected.completed_trials
+                    ):
+                        continue
+                    missing = (
+                        f"has only {finished} terminal and {completed} complete trials, below "
+                        "the published completion boundary"
+                    )
+                    if expected.finished_trials is not None:
+                        missing += f" ({expected.finished_trials} terminal"
+                        if expected.completed_trials is not None:
+                            missing += f", {expected.completed_trials} complete"
+                        missing += ")"
             except Exception as exc:
                 raise StudyStorageUnavailableError(
                     "Could not inspect persistent study storage for published phase "
                     f"{phase.name!r}."
                 ) from exc
-            if not trials:
-                missing = "contains no trials"
-            else:
-                missing = "does not contain the published trial identity"
-                if expected is not None:
-                    missing += (
-                        f" (trial {expected.trial_number}, generation {expected.generation_id!r}, "
-                        f"attempt {expected.attempt_id!r})"
-                    )
+            if not matched:
+                if not trials:
+                    missing = "contains no trials"
                 else:
-                    missing += " because the publication records no complete local trial identity"
+                    missing = "does not contain the published trial identity"
+                    if expected is not None:
+                        missing += (
+                            f" (trial {expected.trial_number}, generation {expected.generation_id!r}, "
+                            f"attempt {expected.attempt_id!r})"
+                        )
+                    else:
+                        missing += (
+                            " because the publication records no complete local trial identity"
+                        )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} includes a winner for "
             f"phase {phase.name!r}, but its persistent study {missing}. That publication "

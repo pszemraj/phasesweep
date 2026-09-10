@@ -26,7 +26,7 @@
 
 # workdir: str = "./runs"
 # Output root for trial artifacts, winners, and summaries. Relative paths resolve from the invocation cwd, not the config file.
-# Newly created workdirs contain a .gitignore with *; existing directories and ignore files are untouched.
+# Real runs add a missing .gitignore with * inside each experiment/suite artifact namespace; shared workdirs and existing ignore files are untouched.
 # With persistent storage each phase study is bound to the one resolved <workdir>/<experiment> root it publishes into, so re-running the same config against a second workdir is refused instead of producing a divergent second result tree. Keep it stable across resumptions; if you genuinely relocate the artifact tree, move it first and then run `phasesweep rebind-workdir CONFIG`.
 
 # trial_command: str (required)

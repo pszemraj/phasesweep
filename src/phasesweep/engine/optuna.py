@@ -9,7 +9,7 @@ import os
 import sqlite3
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, assert_never
 
@@ -45,13 +45,17 @@ class _TrialRef:
 
     Reconciles a row against published evidence or external cleanup evidence:
     which trial it is, and which generation/attempt claimed it.
-    Values are ``None`` when the trial never
-    recorded that attribute (e.g. a row written by an older PhaseSweep).
+    Values are ``None`` when the trial never recorded that attribute (e.g. a
+    row written by an older PhaseSweep). Published references additionally
+    carry their terminal and complete count boundary. Those count fields are
+    not part of a trial-row identity comparison.
     """
 
     trial_number: int
     generation_id: str | None
     attempt_id: str | None
+    finished_trials: int | None = field(default=None, compare=False)
+    completed_trials: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -82,8 +86,9 @@ def _published_phase_trial_refs(
     identifies the local candidate whose history must survive in this phase.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
-    :return dict[str, _TrialRef | None]: Local trial identities by phase; None
-        when a published phase does not record a complete identity.
+    :return dict[str, _TrialRef | None]: Local trial identities by phase, with
+        their known terminal-count boundary; None when a published phase does
+        not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}
     for item in (summary or {}).get("phases", ()):
@@ -95,8 +100,23 @@ def _published_phase_trial_refs(
         number = source.get(f"{prefix}trial_number")
         generation = source.get(f"{prefix}generation_id")
         attempt = source.get(f"{prefix}attempt_id")
+        completion = item.get("completion")
+        finished_trials = (
+            completion.get("finished_trials")
+            if isinstance(completion, Mapping)
+            and type(completion.get("finished_trials")) is int
+            and completion["finished_trials"] >= 0
+            else None
+        )
+        completed_trials = (
+            completion.get("completed_trials")
+            if isinstance(completion, Mapping)
+            and type(completion.get("completed_trials")) is int
+            and completion["completed_trials"] >= 0
+            else None
+        )
         refs[item["name"]] = (
-            _TrialRef(number, generation, attempt)
+            _TrialRef(number, generation, attempt, finished_trials, completed_trials)
             if isinstance(number, int)
             and not isinstance(number, bool)
             and isinstance(generation, str)
@@ -106,6 +126,26 @@ def _published_phase_trial_refs(
             else None
         )
     return refs
+
+
+def _published_trial_history_available(
+    stats: _PhaseTrialStats, published_trial: _TrialRef | None
+) -> bool:
+    """Return whether one storage snapshot retains a published trial history.
+
+    :param _PhaseTrialStats stats: Counts and identity result from one storage read.
+    :param _TrialRef | None published_trial: Published trial and count boundary.
+    :return bool: ``True`` when identity and every recorded count boundary survive.
+    """
+    if not stats.available or not stats.published_trial_available or published_trial is None:
+        return False
+    finished = sum(stats.counts.get(state, 0) for state in ("COMPLETE", "PRUNED", "FAIL"))
+    completed = stats.counts.get("COMPLETE", 0)
+    return (
+        published_trial.finished_trials is None or finished >= published_trial.finished_trials
+    ) and (
+        published_trial.completed_trials is None or completed >= published_trial.completed_trials
+    )
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
@@ -578,20 +618,32 @@ def _unavailable_phase_trial_stats(
 ) -> _PhaseTrialStats:
     """Log a storage-read failure and return an unavailable phase-trial snapshot.
 
-    :param Experiment experiment: Config whose resolved storage is reported in the warning.
+    External RDB URLs and driver messages can contain credentials, so those
+    warnings report only the backend and exception type.
+
+    :param Experiment experiment: Config whose storage backend or local path is reported.
     :param Phase phase: Phase whose status read failed.
     :param BaseException exc: Read exception whose direct cause is reported when present.
     :return _PhaseTrialStats: Empty count maps and ``running_attempts=None`` with
         ``available=False``.
     """
     cause = exc.__cause__ or exc
-    log.warning(
-        "could not read status trial data from storage %s for phase %s: %s: %s",
-        experiment.resolved_storage,
-        phase.name,
-        type(cause).__name__,
-        cause,
-    )
+    backend = storage_backend(experiment.resolved_storage)
+    if backend in {"sqlite", "journal"}:
+        log.warning(
+            "could not read status trial data from storage %s for phase %s: %s: %s",
+            experiment.resolved_storage,
+            phase.name,
+            type(cause).__name__,
+            cause,
+        )
+    else:
+        log.warning(
+            "could not read status trial data from %s storage for phase %s: %s",
+            backend,
+            phase.name,
+            type(cause).__name__,
+        )
     return _PhaseTrialStats({}, False, {}, None)
 
 

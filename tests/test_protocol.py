@@ -9,6 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import load_config, load_experiment, run_config
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
@@ -28,6 +29,7 @@ from phasesweep.config import (
 from phasesweep.engine import (
     PhaseSweepError,
     PromotionError,
+    PublicationIntegrityError,
     RunRequestError,
     read_status,
     read_winner,
@@ -605,6 +607,15 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
         _generation_promotion_decision_path(experiment, resumed, "candidate").read_text()
     )
     assert copied == authoritative
+    summary = yaml.safe_load(_generation_summary_path(experiment, resumed).read_text())
+    assert summary["promotion_decisions"] == [authoritative]
+    summary["promotion_decisions"] = []
+    with pytest.raises(PublicationIntegrityError, match="absent from the summary"):
+        validation_ops._validate_generation_manifest(
+            _generation_summary_path(experiment, resumed).parent,
+            resumed,
+            summary,
+        )
 
 
 def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:

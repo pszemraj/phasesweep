@@ -225,6 +225,10 @@ def _validate_generation_manifest(
     for kind, name in listed:
         if kind == "winner" and name not in phase_items:
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
+        if kind == "promotion" and name not in decision_items:
+            raise _fail(
+                f"artifact manifest lists a promotion decision absent from the summary for phase {name!r}"
+            )
 
     for (kind, name), entry in listed.items():
         artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]

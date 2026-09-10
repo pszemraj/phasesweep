@@ -1959,6 +1959,55 @@ def test_published_phase_rejects_a_missing_or_empty_named_study(
     } == generation_dirs_before
 
 
+def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
+    """A retained winner row alone cannot authorize replacement trials."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=3,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    with sqlite3.connect(tmp_path / "studies.db") as connection:
+        trial_ids = connection.execute("SELECT trial_id FROM trials WHERE number > 0").fetchall()
+        assert len(trial_ids) == 2
+        for statement in (
+            "DELETE FROM trial_heartbeats WHERE trial_id = ?",
+            "DELETE FROM trial_intermediate_values WHERE trial_id = ?",
+            "DELETE FROM trial_params WHERE trial_id = ?",
+            "DELETE FROM trial_system_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_user_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_values WHERE trial_id = ?",
+            "DELETE FROM trials WHERE trial_id = ?",
+        ):
+            connection.executemany(statement, trial_ids)
+
+    status = read_status(experiment)
+    assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+
 def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
