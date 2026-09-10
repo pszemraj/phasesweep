@@ -1908,7 +1908,7 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
     assert results.published_config_matches_current is None
 
 
-@pytest.mark.parametrize("method_name", ["status", "winners"])
+@pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,
     method_name: str,
@@ -1927,7 +1927,10 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     )
 
     with pytest.raises(Exception, match="saved config snapshot"):
-        getattr(app, method_name)(run_id=run_id)
+        if method_name == "await_run":
+            asyncio.run(app.await_run(run_id))
+        else:
+            getattr(app, method_name)(run_id=run_id)
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])
@@ -2283,12 +2286,21 @@ def test_run_scoped_snapshot_survives_publication_pointer_removal(
     assert results.winner_count == 1
 
 
-def test_run_scoped_snapshot_survives_artifact_tree_relocation(tmp_path: Path) -> None:
-    """Completed run reads use frozen evidence even when the live tree moved."""
+@pytest.mark.parametrize("config_snapshot_damage", ["missing", "corrupt"])
+def test_run_scoped_snapshot_survives_artifact_tree_relocation(
+    tmp_path: Path,
+    config_snapshot_damage: str,
+) -> None:
+    """Completed run reads use frozen evidence without mutable sibling artifacts."""
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, _store = make_mcp_app(catalog)
+    app, _registry, store = make_mcp_app(catalog)
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
+    config_snapshot = store.config_snapshot_path(run_id)
+    if config_snapshot_damage == "missing":
+        config_snapshot.unlink()
+    else:
+        config_snapshot.write_text("not: a valid experiment snapshot\n")
     source = _experiment_dir(experiment)
     relocated = tmp_path / "relocated" / source.name
     relocated.parent.mkdir()
@@ -3621,6 +3633,55 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     assert "Cleared cleanup uncertainty" in confirmed.output
     assert signalled == []
     assert not store.cleanup_uncertain_path(run_id).exists()
+
+
+def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebooted no-status run frees capacity without borrowing later results."""
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-earlier-boot-no-status"
+    earlier_boot = "0" * len(current_boot)
+    if earlier_boot == current_boot:
+        earlier_boot = "1" * len(current_boot)
+    handle = replace(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+        ),
+        boot_id=earlier_boot,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    later_trial = _write_stale_running_trial(config, generation_id="srv-later-run")
+
+    assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    status = app.status(run_id=run_id)
+    winners = app.winners(run_id=run_id)
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
+
+    for payload in (status, awaited):
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["represented_generation_id"] is None
+        assert payload["run"]["state"] == "failed"
+        assert payload["run"]["recovery_required"] is False
+        assert payload["phases"][0]["running_trials_total"] == 0
+        assert payload["phases"][0]["trial_data_available"] is False
+    assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["represented_generation_id"] is None
+    assert awaited["reason"] == "terminal"
 
 
 def test_operator_recovery_refuses_engine_lock_contention_before_signalling(

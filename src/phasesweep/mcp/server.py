@@ -1203,19 +1203,15 @@ class PhaseSweepMCP:
             include_run=True,
         )
         snapshot, result_source = self._result_snapshot_view(experiment, handle)
-        status = (
-            self._snapshot_status_payload(
+        if snapshot is not None:
+            status = self._snapshot_status_payload(
                 target_id,
                 snapshot,
                 result_source=result_source,
             )
-            if snapshot is not None
-            else self._live_status_payload(
-                target_id,
-                experiment,
-                handle,
-            )
-        )
+        else:
+            assert experiment is not None
+            status = self._live_status_payload(target_id, experiment, handle)
         return target_id, status, run, handle, result_source
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
@@ -1326,13 +1322,14 @@ class PhaseSweepMCP:
         experiment_id: str | None,
         run_id: str | None,
         include_run: bool,
-    ) -> tuple[str, Experiment, dict[str, Any] | None, RunHandle | None]:
+    ) -> tuple[str, Experiment | None, dict[str, Any] | None, RunHandle | None]:
         """Resolve status/winner reads to the catalog config or immutable run snapshot.
 
         :param str | None experiment_id: Catalog id for current experiment-level reads.
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
-        :return tuple: Target id, parsed experiment, optional run payload, and handle.
+        :return tuple: Target id, parsed experiment when a live read needs it, optional run
+            payload, and handle.
         :raises McpToolError: If neither or both of ``experiment_id`` and
             ``run_id`` were provided.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
@@ -1348,7 +1345,15 @@ class PhaseSweepMCP:
             handle = self._runs.get(run_id)
             if handle is None:
                 raise UnknownRunError(run_id)
-            experiment = self._load_run_experiment(handle)
+            try:
+                frozen_snapshot = self._terminal_result_snapshot(handle)
+            except RunResultSnapshotUnavailableError:
+                frozen_snapshot = None
+            # A complete terminal result snapshot contains every historical
+            # status and winner fact this read exposes. The sibling config
+            # snapshot is only needed for a live read or unavailable-result
+            # placeholder.
+            experiment = None if frozen_snapshot is not None else self._load_run_experiment(handle)
             run = None
             if include_run:
                 run = self._run_payload(handle)
@@ -1442,6 +1447,7 @@ class PhaseSweepMCP:
                 else snapshot.winner_views()
             )
         else:
+            assert experiment is not None
             # Resolve the represented generation once via read_status, then
             # reuse that exact id for read_winners: two independent pointer
             # resolutions here could otherwise mix identities from different
@@ -1474,7 +1480,10 @@ class PhaseSweepMCP:
             authority_unreadable = authority_handle is None and (
                 self._runs.handle_exists(represented_generation_id)
                 or self._runs.run_evidence_exists(represented_generation_id)
-                or generation_id_source(experiment, represented_generation_id) == "caller"
+                or (
+                    experiment is not None
+                    and generation_id_source(experiment, represented_generation_id) == "caller"
+                )
             )
         if authority_unreadable:
             # The represented generation WAS an MCP-launched run, but its
@@ -1526,7 +1535,7 @@ class PhaseSweepMCP:
 
     def _result_snapshot_view(
         self,
-        experiment: Experiment,
+        experiment: Experiment | None,
         handle: RunHandle | None,
     ) -> tuple[RunResultSnapshot | None, ResultSource]:
         """Resolve one run result without falling back to mutable terminal state.
@@ -1536,7 +1545,9 @@ class PhaseSweepMCP:
         monitoring return the terminal run and an actionable failure while
         every phase count remains explicitly untrusted.
 
-        :param Experiment experiment: Exact catalog or saved run configuration.
+        :param Experiment | None experiment: Exact catalog or saved run configuration when a
+            current-state read or unavailable-result placeholder needs one. A complete terminal
+            snapshot is self-contained and does not require it.
         :param RunHandle | None handle: Optional detached run being read.
         :return tuple: Optional result view and its agent-visible provenance.
         """
@@ -1545,6 +1556,7 @@ class PhaseSweepMCP:
         try:
             snapshot = self._terminal_result_snapshot(handle)
         except RunResultSnapshotUnavailableError:
+            assert experiment is not None
             placeholder = capture_pre_generation_result_snapshot(experiment)
             return (
                 RunResultSnapshot.model_validate(placeholder),
@@ -1561,12 +1573,22 @@ class PhaseSweepMCP:
         :param RunHandle handle: Resolved run whose terminal status should be inspected.
         :return RunResultSnapshot | None: Validated snapshot, or ``None`` while
             the run remains non-terminal.
-        :raises RunResultSnapshotUnavailableError: Terminal status exists but
-            its immutable result snapshot is absent or invalid.
+        :raises RunResultSnapshotUnavailableError: A terminal run has no
+            terminal status, or its immutable result snapshot is absent or invalid.
         """
         terminal_status = self._runs.recorded_terminal_status(handle)
         if terminal_status is None:
-            return None
+            # A reboot proves a spawned runner and every descendant are gone,
+            # so it can release capacity even when a hard exit prevented the
+            # runner from writing status.json. It cannot, however, make the
+            # mutable shared study a historical result for that run. Re-read
+            # after deriving state: the runner may have completed its status
+            # write between the first read and the state check.
+            if self._runs.state(handle) == "running":
+                return None
+            terminal_status = self._runs.recorded_terminal_status(handle)
+            if terminal_status is None:
+                raise RunResultSnapshotUnavailableError(handle.run_id)
         if terminal_status.get("result_snapshot_state") == "pending":
             return None
         snapshot = parse_result_snapshot(terminal_status)
