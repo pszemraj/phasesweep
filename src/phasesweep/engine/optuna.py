@@ -109,7 +109,12 @@ def _published_phase_trial_refs(
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
-    """Match a completed ledger trial to its published identity."""
+    """Return whether a completed trial has the published identity.
+
+    :param optuna.trial.FrozenTrial trial: Ledger trial to compare.
+    :param _TrialRef expected: Published trial number, generation, and attempt identity.
+    :return bool: ``True`` when the trial is complete and all identity fields match.
+    """
     return (
         trial.state == optuna.trial.TrialState.COMPLETE
         and trial.number == expected.trial_number
@@ -517,7 +522,15 @@ _PHASE_TRIAL_STATS_SQL = """
 def _phase_trial_stats_params(
     experiment: Experiment, phase: Phase, published_trial: _TrialRef | None
 ) -> dict[str, str | int]:
-    """Bind the phase and attribute names for the observational SQL query."""
+    """Return bind parameters for the observational phase-trial SQL query.
+
+    :param Experiment experiment: Config providing the phase's stable study name.
+    :param Phase phase: Phase whose study is queried.
+    :param _TrialRef | None published_trial: Published local trial whose number is included,
+        or ``None`` to bind ``published_trial_number`` to ``-1``.
+    :return dict[str, str | int]: Attribute keys, study name, and published trial number;
+        only the trial number from ``published_trial`` is used.
+    """
     return {
         "generation_key": GENERATION_ID_ATTR,
         "attempt_key": ATTEMPT_ID_ATTR,
@@ -529,7 +542,14 @@ def _phase_trial_stats_params(
 def _unavailable_phase_trial_stats(
     experiment: Experiment, phase: Phase, exc: BaseException
 ) -> _PhaseTrialStats:
-    """Log a failed status read and return unavailable trial data."""
+    """Log a storage-read failure and return an unavailable phase-trial snapshot.
+
+    :param Experiment experiment: Config whose resolved storage is reported in the warning.
+    :param Phase phase: Phase whose status read failed.
+    :param BaseException exc: Read exception whose direct cause is reported when present.
+    :return _PhaseTrialStats: Empty count maps and ``running_attempts=None`` with
+        ``available=False``.
+    """
     cause = exc.__cause__ or exc
     log.warning(
         "could not read status trial data from storage %s for phase %s: %s: %s",

@@ -153,7 +153,17 @@ def recover_run(
 def _recover_pre_spawn_orphan(
     store: RunStore, run_id: str, *, confirm: bool, emit: Callable[[str], None]
 ) -> None:
-    """Recover a config snapshot whose run handle was never created."""
+    """Inspect or remove a config snapshot whose run handle was never created.
+
+    Acquires the launch lock before checking the orphan state. With confirmation, clears only a
+    confirmed pre-spawn orphan while holding that lock.
+
+    :param RunStore store: Existing run store that owns the launch reservation.
+    :param str run_id: Identity of the possible pre-spawn orphan.
+    :param bool confirm: Remove the orphan when true; otherwise only report the action.
+    :param Callable[[str], None] emit: Callback that receives the operator-facing result.
+    :raises RunRecoveryError: A launch is in progress, the run is unknown, or removal fails.
+    """
     with store.launch_lock() as acquired:
         if not acquired:
             raise RunRecoveryError(
@@ -182,7 +192,17 @@ def _recover_pre_spawn_orphan(
 def _resolve_launch_state(
     store: RunStore, handle: RunHandle
 ) -> tuple[RunHandle, dict[str, Any] | None]:
-    """Re-read an unsettled launch once before refusing ambiguous recovery."""
+    """Resolve a recorded launch state, retrying one unsettled launch read.
+
+    Reads the handle and status again only when the initial state is ``launching`` without a
+    terminal status, then refuses recovery if that state remains unresolved.
+
+    :param RunStore store: Existing run store containing the durable handle and status.
+    :param RunHandle handle: Initially loaded handle for the requested run.
+    :raises RunRecoveryError: A launching run still has no terminal status after the refresh.
+    :return tuple[RunHandle, dict[str, Any] | None]: Resolved handle and its terminal status,
+        if recorded.
+    """
     terminal_status = store.recorded_terminal_status(handle)
     if handle.launch_state == "launching" and terminal_status is None:
         refreshed_handle = store.get(handle.run_id)
@@ -205,7 +225,17 @@ def _resolve_launch_state(
 def _recovery_needs(
     store: RunStore, handle: RunHandle, terminal_status: dict[str, Any] | None
 ) -> _RecoveryNeeds:
-    """Derive cleanup and snapshot actions without mutating the recorded run."""
+    """Derive cleanup, publication, and snapshot recovery decisions from stored evidence.
+
+    Inspects run-store recovery state and parses the recorded status; it does not persist a
+    recovery result.
+
+    :param RunStore store: Existing run store used to inspect recovery markers.
+    :param RunHandle handle: Resolved durable handle for the run.
+    :param dict[str, Any] | None terminal_status: Recorded terminal status, if available.
+    :raises RunRecoveryError: No immutable snapshot remains for a result that cannot be rebuilt.
+    :return _RecoveryNeeds: Decisions and parsed terminal evidence used by later recovery steps.
+    """
     cleanup_required = store.cleanup_recovery_required(handle)
     snapshot_recovery_required = store.snapshot_recovery_required(handle)
     terminal_cleanup_uncertain = (
@@ -267,7 +297,16 @@ def _recovery_needs(
 def _require_dead_runner(
     identity: ProcessIdentity, *, earlier_boot: bool, cleanup_needed: bool
 ) -> None:
-    """Reject live or unverifiable runner identities before reading recovery config."""
+    """Reject a live runner or an identity that cannot be checked safely.
+
+    A prior boot proves recorded processes are gone. Otherwise, a cleanup requiring a PID must
+    include its Linux start time before the live-process check can safely distinguish PID reuse.
+
+    :param ProcessIdentity identity: Recorded runner PID, start time, process group, and boot ID.
+    :param bool earlier_boot: Whether the recorded boot predates the current host boot.
+    :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
+    :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
+    """
     # PID and /proc start time are unique only within one boot. An earlier boot
     # proves the runner and descendants are gone without signalling a recycled PID.
     if (
@@ -285,7 +324,13 @@ def _require_dead_runner(
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
-    """Load the config whose digest is bound to the run handle."""
+    """Load and verify the configuration snapshot bound to a run.
+
+    :param RunStore store: Existing run store containing the config snapshot path.
+    :param RunHandle handle: Handle whose run ID and config digest select the snapshot.
+    :raises RunRecoveryError: The snapshot is missing, unreadable, invalid, or digest-mismatched.
+    :return Experiment: Parsed experiment configuration from the verified stored snapshot.
+    """
     snapshot = store.config_snapshot_path(handle.run_id)
     if not snapshot.is_file():
         raise RunRecoveryError(f"run config snapshot is missing: {snapshot}")
@@ -302,7 +347,17 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
 def _cleanup_runner(
     identity: ProcessIdentity, needs: _RecoveryNeeds, *, confirm: bool, earlier_boot: bool
 ) -> None:
-    """Re-check liveness and clean the runner group under the experiment lock."""
+    """Re-check and, when confirmed, clean the recorded runner process group.
+
+    For confirmed calls, the caller holds the experiment lock across this liveness re-check and
+    any signals so study recovery and recovery-state writes cannot race the runner.
+
+    :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
+    :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
+    :param bool confirm: Enable liveness checks and any required process-group cleanup.
+    :param bool earlier_boot: Whether the recorded process belongs to an earlier system boot.
+    :raises RunRecoveryError: A runner is still live or process-group cleanup remains uncertain.
+    """
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
@@ -319,7 +374,15 @@ def _cleanup_runner(
 
 
 def _publication_recovery_action(config: Experiment, needs: _RecoveryNeeds) -> str | None:
-    """Resolve a prepared publication against its current last-success pointer."""
+    """Choose how to reconcile a prepared result publication.
+
+    :param Experiment config: Experiment whose last-success publication pointer is inspected.
+    :param _RecoveryNeeds needs: Recorded prepared generation and other recovery decisions.
+    :raises RunRecoveryError: The publication pointer cannot be interpreted safely.
+    :return str | None: ``"commit"`` when the pointer names the prepared generation,
+        ``"abort"`` when it names another generation or is absent, or ``None`` when none was
+        prepared.
+    """
     if isinstance(needs.prepared_publication_generation, str):
         publication = _resolve_publication_pointer(config)
         if publication.generation_id == needs.prepared_publication_generation:
@@ -335,7 +398,16 @@ def _publication_recovery_action(config: Experiment, needs: _RecoveryNeeds) -> s
 
 
 def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[str, optuna.Study]:
-    """Load every phase and require its published history before trial cleanup."""
+    """Load phase studies needed to inspect or reconcile trial cleanup evidence.
+
+    When ownership storage was unavailable during the run, verifies the published phase history
+    before allowing recovery to treat the run as having no owned trial.
+
+    :param Experiment config: Experiment defining phase names and storage locations.
+    :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
+    :raises RunRecoveryError: Required storage or published studies cannot be read.
+    :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
+    """
     loaded_studies = {}
     for phase in config.phases:
         try:
@@ -375,7 +447,22 @@ def _recover_trial_evidence(
     *,
     confirm: bool,
 ) -> _CleanupEvidence:
-    """Inspect or reconcile registry and phase evidence before releasing capacity."""
+    """Collect attributable cleanup evidence, optionally reconciling attempts and trials.
+
+    When cleanup is needed, both modes read run, registry, and study evidence. Confirmed recovery
+    invokes the cleanup helpers; preflight uses their inspection counterparts and does not
+    persist the collected run evidence.
+
+    :param RunStore store: Existing run store containing prior cleanup evidence and attempt IDs.
+    :param RunHandle handle: Durable handle for the run being recovered.
+    :param Experiment config: Experiment used to load attempt registries and phase studies.
+    :param _RecoveryNeeds needs: Decisions indicating whether trial cleanup is required.
+    :param bool confirm: Reconcile registered attempts and trials when true; otherwise inspect
+        the corresponding evidence for the preflight report.
+    :raises RunRecoveryError: Required studies are unavailable or evidence cannot support cleanup.
+    :return _CleanupEvidence: Cleanup counts, run-attributable evidence, and registered attempts
+        to retire.
+    """
     run_id = handle.run_id
     reaped_ids, reaped_locations = store.cleanup_recovered_attempt_evidence(handle)
     evidence = _CleanupEvidence(reaped_ids, reaped_locations)
@@ -463,7 +550,16 @@ def _recover_trial_evidence(
 def _require_cleanup_evidence(
     needs: _RecoveryNeeds, evidence: _CleanupEvidence, inspected_studies: int
 ) -> None:
-    """Require attributable trial evidence unless an unclaimed run only failed its storage read."""
+    """Require evidence before clearing terminal cleanup uncertainty.
+
+    An ownership storage failure may have occurred before a trial was allocated, so it is allowed
+    to proceed without reaped attempts after the applicable registry and study inspection.
+
+    :param _RecoveryNeeds needs: Decisions including terminal uncertainty and storage ownership.
+    :param _CleanupEvidence evidence: Attributable attempts and trial cleanup results observed.
+    :param int inspected_studies: Number of phase studies examined for cleanup evidence.
+    :raises RunRecoveryError: Terminal uncertainty lacks attributable cleanup evidence.
+    """
     # An ownership read can fail before this run allocates a trial. Successful
     # registry/study inspection resolves that failure without run-owned trials.
     if (
@@ -489,7 +585,14 @@ def _require_cleanup_evidence(
 def _preflight_message(
     run_id: str, needs: _RecoveryNeeds, evidence: _CleanupEvidence, publication_action: str | None
 ) -> str:
-    """Describe the actions a confirmed recovery would perform."""
+    """Format the operator message describing a confirmed recovery's planned actions.
+
+    :param str run_id: Identity of the run named in the operator message.
+    :param _RecoveryNeeds needs: Decisions determining which recovery actions are described.
+    :param _CleanupEvidence evidence: Counts included for proposed attempt and trial recovery.
+    :param str | None publication_action: Prepared-publication action, if one is required.
+    :return str: Preflight message instructing the operator to re-run with confirmation.
+    """
     actions = []
     if needs.cleanup_needed:
         actions.append(
@@ -526,7 +629,17 @@ def _persist_cleanup_recovery(
     *,
     emit: Callable[[str], None],
 ) -> None:
-    """Persist trial evidence before retiring attempts and clearing uncertainty."""
+    """Persist cleanup evidence, then retire recovered attempts and clear uncertainty.
+
+    Atomically writes the evidence record before retiring registered attempts and then clears the
+    run's cleanup-uncertain marker.
+
+    :param RunStore store: Existing run store that receives the cleanup recovery record.
+    :param RunHandle handle: Durable handle whose cleanup uncertainty is being cleared.
+    :param Experiment config: Experiment used to retire registered active attempts.
+    :param _CleanupEvidence evidence: Attributable cleanup counts, IDs, and trial locations.
+    :param Callable[[str], None] emit: Callback that receives the completed-recovery message.
+    """
     run_id = handle.run_id
     payload = {
         "run_id": run_id,
@@ -572,7 +685,21 @@ def _finish_result_recovery(
     *,
     emit: Callable[[str], None],
 ) -> None:
-    """Reconcile publication and finalize the already-stored terminal snapshot."""
+    """Persist terminal snapshot recovery and reconcile a prepared publication.
+
+    May write a failed state for interrupted finalization, update publication fields, and persist
+    finalization of the immutable stored snapshot. It reports an unavailable historical snapshot
+    without rebuilding it from mutable shared study state.
+
+    :param RunStore store: Existing run store containing the terminal status file.
+    :param str run_id: Identity of the run whose result state is being recovered.
+    :param dict[str, Any] terminal_status: Mutable recorded status updated during recovery.
+    :param _RecoveryNeeds needs: Decisions governing unavailable, pending, and final snapshots.
+    :param _CleanupEvidence evidence: Confirmed attempt IDs and locations for finalization.
+    :param str | None publication_action: ``"commit"``, ``"abort"``, or no publication action.
+    :param Callable[[str], None] emit: Callback that receives result-recovery messages.
+    :raises RunRecoveryError: Finalizing a required stored snapshot fails.
+    """
     if needs.snapshot_recovery_required and needs.stored_snapshot is None:
         terminal_status["result_snapshot_state"] = "failed"
         terminal_status["result_snapshot_error"] = "InterruptedFinalization"
